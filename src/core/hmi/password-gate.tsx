@@ -117,7 +117,7 @@ function GateShell({ children }: { children: React.ReactNode }) {
       fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
     }}>
       <Paper elevation={8} sx={{
-        width: 380, maxWidth: '90vw', p: 4, borderRadius: 2,
+        width: 380, maxWidth: '90vw', p: 4, borderRadius: 1,
         bgcolor: 'rgba(20,26,34,0.96)', border: '1px solid rgba(255,255,255,0.08)',
         display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2,
       }}>
@@ -348,6 +348,11 @@ export async function decryptModelData(
 
 // ─── Boot gate of a hosted deploy (plan-759 F5) ────────────────────────────
 
+/** Headline of the hosted-link gate and the tab title while it is open. */
+export const GATE_TITLE = 'realvirtual Digital Twin';
+/** Neutral one-liner of the hosted-link gate: the project is encrypted and protected. */
+export const GATE_SUBTITLE = 'This project is encrypted and password protected. Enter the password to open it.';
+
 function base64ToBytes(b64: string): Uint8Array {
   const bin = atob(b64);
   const out = new Uint8Array(bin.length);
@@ -386,7 +391,9 @@ export async function requireHostedPassword(cfg: RVAppConfig): Promise<void> {
     return new Promise<void>(() => { /* terminal: the card is the answer */ });
   }
 
-  const projectName = typeof document !== 'undefined' ? (document.title || '').trim() : '';
+  // The page title (index.html: "… 3D HMI & Digital Twin Viewer") would pitch the
+  // viewer as an HMI only; an encrypted link leads with the product name instead.
+  if (typeof document !== 'undefined') document.title = GATE_TITLE;
   return new Promise<void>((resolve) => {
     const onSubmit = async (password: string): Promise<{ ok: boolean; msg?: string }> => {
       let key: CryptoKey;
@@ -412,8 +419,8 @@ export async function requireHostedPassword(cfg: RVAppConfig): Promise<void> {
     mountGate(
       <PasswordOverlay
         onSubmit={onSubmit}
-        title={projectName ? `${projectName}` : 'Password protected'}
-        subtitle="This project is password protected. Enter the password to open it."
+        title={GATE_TITLE}
+        subtitle={GATE_SUBTITLE}
       />,
     );
   });

@@ -39,12 +39,21 @@
  * Every replay PULLS the current store value; nothing cached at wire time is
  * ever replayed, and an address that is still unresolved is skipped rather than
  * turned into a NaN write.
+ *
+ * UNWIRED SLOTS: every helper takes an optional {@link SlotRef}. With an empty
+ * address and a slot reference it declares the field as a SlotIO `setter` slot
+ * (`rv-slot-io.ts`): a viewer binding then commands the setter directly, with
+ * the helper's coercion. Neutralize follows the slot's PLC type — the bool
+ * helper applies `false` (or `slot.unbound`), the numeric and raw helpers leave
+ * the authored value standing unless `slot.unbound` names one. The returned
+ * `unsubscribe` drops the declaration again.
  */
 
 import type { SignalStore } from './rv-signal-store';
 import type { NodeRegistry, ComponentRef } from './rv-node-registry';
 import type { SignalApplyContext, SignalReapplyRegistry } from './rv-signal-reapply-registry';
 import { debug } from './rv-debug';
+import { slotDeclare, slotUndeclare, type SlotRef } from './rv-slot-io';
 
 const NOOP = () => {};
 
@@ -56,6 +65,22 @@ export interface WireResult {
 }
 
 const EMPTY: WireResult = { addr: null, unsubscribe: NOOP };
+
+/**
+ * Declare an unwired field as a SlotIO setter slot (see the module header);
+ * EMPTY when the caller passed no slot reference.
+ */
+function declareUnwired(
+  slot: SlotRef | undefined,
+  apply: (value: boolean | number, ctx?: SignalApplyContext) => void,
+  neutral: (() => void) | undefined,
+  reapply: SignalReapplyRegistry | undefined,
+): WireResult {
+  if (!slot) return EMPTY;
+  const { instance, field } = slot;
+  slotDeclare(instance, field, 'setter', { apply, neutral, reapply });
+  return { addr: null, unsubscribe: () => slotUndeclare(instance, field) };
+}
 
 /** Bundle the store unsubscribe and the registry unregister into one handle. */
 function combine(unsubStore: () => void, unsubReapply: () => void): () => void {
@@ -78,6 +103,7 @@ function combine(unsubStore: () => void, unsubReapply: () => void): () => void {
  *                and on every re-apply (then with `ctx.replay === true`)
  * @param label   Optional debug label (address is appended automatically)
  * @param reapply Optional viewer-owned re-apply registry (`ComponentContext.reapply`)
+ * @param slot    Optional slot reference — declares the field directly bindable while unwired
  */
 export function wireBoolSignal(
   store: SignalStore,
@@ -85,8 +111,12 @@ export function wireBoolSignal(
   setter: (value: boolean, ctx?: SignalApplyContext) => void,
   label?: string,
   reapply?: SignalReapplyRegistry,
+  slot?: SlotRef,
 ): WireResult {
-  if (!addr || typeof addr !== 'string') return EMPTY;
+  if (!addr || typeof addr !== 'string') {
+    const unbound = slot?.unbound === true;
+    return declareUnwired(slot, (value, ctx) => setter(value === true, ctx), () => setter(unbound), reapply);
+  }
 
   setter(store.getBoolByPath(addr));
 
@@ -128,6 +158,7 @@ export function wireBoolSignal(
  * @param setter  Called with the numeric value on every change and on replay
  * @param label   Optional debug label
  * @param reapply Optional viewer-owned re-apply registry
+ * @param slot    Optional slot reference — declares the field directly bindable while unwired
  */
 export function wireNumberSignal(
   store: SignalStore,
@@ -135,11 +166,12 @@ export function wireNumberSignal(
   setter: (value: number, ctx?: SignalApplyContext) => void,
   label?: string,
   reapply?: SignalReapplyRegistry,
+  slot?: SlotRef,
 ): WireResult {
   return wireRawSignal(
     store, addr,
     (value, ctx) => { setter(Number(value), ctx); },
-    label, reapply, /* readInitial */ false,
+    label, reapply, /* readInitial */ false, slot,
   );
 }
 
@@ -159,8 +191,9 @@ export function wireValueSignal(
   setter: (value: boolean | number, ctx?: SignalApplyContext) => void,
   label?: string,
   reapply?: SignalReapplyRegistry,
+  slot?: SlotRef,
 ): WireResult {
-  return wireRawSignal(store, addr, setter, label, reapply, /* readInitial */ true);
+  return wireRawSignal(store, addr, setter, label, reapply, /* readInitial */ true, slot);
 }
 
 /**
@@ -179,8 +212,12 @@ function wireRawSignal(
   label: string | undefined,
   reapply: SignalReapplyRegistry | undefined,
   readInitial: boolean,
+  slot?: SlotRef,
 ): WireResult {
-  if (!addr || typeof addr !== 'string') return EMPTY;
+  if (!addr || typeof addr !== 'string') {
+    const unbound = slot?.unbound;
+    return declareUnwired(slot, setter, unbound === undefined ? undefined : () => setter(unbound), reapply);
+  }
 
   let armed = false;
 

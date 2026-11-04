@@ -199,6 +199,20 @@ export interface SdkStatsBackend {
   state?(name: string): void;
 }
 
+/** Statistics-window rows behind `self.statValue`, scoped to one script instance. */
+/**
+ * One published `self.statValue` row as the DES snapshot carries it (plan-2212
+ * Phase 3): `[key, value, unit, group]`, `null` for an absent unit/group.
+ */
+export type SdkStatRow = [key: string, value: number | string | null, unit: string | null, group: string | null];
+
+export interface SdkStatRowsBackend {
+  /** Set the last value for a key; units are display-only, group defaults to the owner path. */
+  set(key: string, value: number | string | null, unit?: string, group?: string): void;
+  /** Remove this instance's rows when it is disposed. */
+  clear(): void;
+}
+
 /** Info snapshot of ANOTHER script component (`self.component(path)`). */
 export interface SdkScriptComponentInfo {
   readonly path: string;
@@ -384,6 +398,8 @@ export interface SdkEnvironment {
   flow?: SdkFlowBackend;
   /** Statistics sink (phase 1b). Absent ⇒ stat calls are no-ops. */
   stats?: SdkStatsBackend;
+  /** Statistics-window rows. Absent means statValue calls are no-ops; cleared on dispose. */
+  statRows?: SdkStatRowsBackend;
   /** Script→script access (`self.component`/`broadcast`). Wired by the registry. */
   scripts?: SdkScriptComponentAccess;
   /** Typed-connection access (`self.connection(...)`, plan-259). */
@@ -442,6 +458,28 @@ function defaultPathOf(node: Object3D): string {
  *  self-triggering loop is an author bug; we drop and warn instead of hanging. */
 const MAX_NOTIFY_CASCADE = 1000;
 
+/** Problem/warning code of a state write refused in a DES frame hook (plan-2212 Phase 4). */
+export const DES_FRAME_HOOK_WRITE_CODE = 'des-frame-hook-write';
+
+/**
+ * plan-2212 Phase 4 — the host ops a FRAME hook may use during a DES run
+ * ("display only, never state"): reads of the scene, nodes, components,
+ * signals, ports, paths and flow, plus logging. Everything else — timers,
+ * FSM state, KPIs (`statValue`/`stat`), signal/component/scene writes,
+ * subscriptions, material flow, zones, messages, connections, errors,
+ * `disable` — would change DES state or results and is refused. An allowlist
+ * on purpose: a new host op is refused in frame hooks until it is listed here.
+ */
+export const DISPLAY_HOST_OPS: ReadonlySet<string> = new Set([
+  'scene.list', 'scene.read', 'now', 'log', 'log.warn', 'log.error',
+  'node.self', 'node.resolve', 'node.parent', 'node.children', 'node.read',
+  'node.worldDirection', 'node.worldToLocal', 'node.localToWorld',
+  'comp.resolve', 'comp.resolveAll', 'comp.read', 'sig.get',
+  'ports.list', 'port.read', 'paths.list', 'paths.get', 'paths.successors', 'zone.isHolder',
+  'flow.mus', 'flow.load', 'flow.downstreamOccupied', 'flow.downstreamCanAccept',
+  'mu.node', 'script.get',
+]);
+
 /**
  * The host-side whitelist dispatcher behind the single exposed guest function
  * `__rvHostCall`. Owns the opaque handle tables (node ids / component ids /
@@ -486,6 +524,11 @@ export class SdkBridge {
   private disposed = false;
   /** Port targets by id — refreshed on every `ports.list` (fresh topology). */
   private readonly portTargets = new Map<string, SdkPortTarget>();
+  /**
+   * plan-2212 Phase 3: the rows this instance published (`self.statValue`), in
+   * first-publish order — guest-visible KPI state the DES snapshot carries.
+   */
+  private readonly statRowValues = new Map<string, SdkStatRow>();
 
   /** Set by the façade: delivers guest-callback notifications (`__cb`). */
   private notifier: ((subId: number, args: unknown[]) => void) | null = null;
@@ -507,6 +550,26 @@ export class SdkBridge {
   /** Number of not-yet-cancelled timer registrations (leak tests). */
   get pendingTimerCount(): number {
     return this.pendingTimers.size;
+  }
+
+  /** The published `self.statValue` rows (DES snapshot capture, plan-2212 Phase 3). */
+  captureStatRows(): SdkStatRow[] {
+    return [...this.statRowValues.values()].map(r => [...r] as SdkStatRow);
+  }
+
+  /**
+   * Replace the published rows with a captured set (DES restore): the KPI rows
+   * show the snapshot values at once, before the script's next event.
+   */
+  restoreStatRows(rows: readonly SdkStatRow[]): void {
+    this.statRowValues.clear();
+    this.env.statRows?.clear();
+    for (const [key, value, unit, group] of rows) this.publishStatRow(key, value, unit, group);
+  }
+
+  private publishStatRow(key: string, value: number | string | null, unit: string | null, group: string | null): void {
+    this.statRowValues.set(key, [key, value, unit, group]);
+    this.env.statRows?.set(key, value, unit ?? undefined, group ?? undefined);
   }
 
   /** Number of live host-side subscriptions taken by the guest (leak tests). */
@@ -536,17 +599,46 @@ export class SdkBridge {
     for (const id of this.pendingTimers) {
       try { this.env.scheduler.cancel(id); } catch { /* scheduler already gone */ }
     }
+    // plan-2212 Phase 4c: the recurring `self.every` timers live host-side.
+    try { this.env.scheduler.everyTimers?.cancelAll(); } catch { /* scheduler already gone */ }
     this.pendingTimers.clear();
+    this.env.statRows?.clear();
+    this.statRowValues.clear();
     this.deferredNotifies.length = 0;
     this.nodes.clear();
     this.comps.clear();
     this.portTargets.clear();
   }
 
+  /**
+   * plan-2212 Phase 4: true while the guest runs a FRAME hook of a DES run
+   * (`continuous.fixedUpdate` / `lateFixedUpdate` in animated DES) — display
+   * only. Every host op outside {@link DISPLAY_HOST_OPS} is refused (throws).
+   */
+  private displayOnly = false;
+  private readonly displayRefusedOps: string[] = [];
+
+  /** Arm / release the display-only fence (the kernel adapter brackets every DES frame hook). */
+  setDisplayOnly(on: boolean): void {
+    this.displayOnly = on;
+  }
+
+  /** Every op refused under the display-only fence since the last call (one entry per call), then cleared. */
+  takeDisplayRefusals(): string[] {
+    return this.displayRefusedOps.splice(0);
+  }
+
   /** The `__rvHostCall(op, …args)` entry point (exposed via the whitelist bridge). */
   hostCall = (...raw: unknown[]): unknown => {
     this.hostCallDepth++;
     try {
+      if (this.displayOnly) {
+        const op = String(raw[0]);
+        if (!DISPLAY_HOST_OPS.has(op)) {
+          this.displayRefusedOps.push(op);
+          throw new Error(`${DES_FRAME_HOOK_WRITE_CODE}: '${op}' is refused in a frame hook during a DES run - frame hooks are display only; change state in DES events (self.in/at/every, sink/sensor callbacks)`);
+        }
+      }
       return this.dispatchHostCall(raw);
     } finally {
       this.hostCallDepth--;
@@ -591,10 +683,18 @@ export class SdkBridge {
         this.pendingTimers.add(id);
         return id;
       }
+      case 'timer.every': {
+        // plan-2212 Phase 4c: the host owns the CLOCK of recurring timers (negative
+        // public id, the scheduler re-arms each slice before the guest sees it); the
+        // payload never crosses, the guest keeps it. Teardown: `everyTimers.cancelAll()`.
+        const every = this.env.scheduler.every;
+        if (!every) throw new Error('self.every is unavailable on this scheduler');
+        return every.call(this.env.scheduler, Number(a[0]), String(a[1]));
+      }
       case 'timer.cancel': {
         const id = Number(a[0]);
         this.pendingTimers.delete(id);
-        this.env.scheduler.cancel(id);
+        this.env.scheduler.cancel(id);   // negative = an every timer of this scheduler
         return undefined;
       }
       // ── nodes ────────────────────────────────────────────────────────
@@ -707,7 +807,16 @@ export class SdkBridge {
         const unsub = this.unsubs.get(token);
         if (unsub) {
           this.unsubs.delete(token);
-          try { unsub(); } catch { /* target gone */ }
+          try { unsub(); } catch (err) {
+            // plan-2212 Phase 2: a target may REFUSE an unsubscribe (DES sink
+            // outside setup()): the subscription stays (token kept for dispose),
+            // and the guest sees the error, so its callback stays registered.
+            // Anything else: target gone.
+            if ((err as { refused?: boolean } | null)?.refused === true) {
+              this.unsubs.set(token, unsub);
+              throw err;
+            }
+          }
         }
         return undefined;
       }
@@ -811,6 +920,15 @@ export class SdkBridge {
         return n ? this.nodeId(n) : null;
       }
       // ── Tier 1: statistics (phase 1b) ────────────────────────────────
+      case 'stat.row': {
+        const value = a[1];
+        if (value !== null && typeof value !== 'number' && typeof value !== 'string') {
+          throw new Error('statValue value must be a number, string or null');
+        }
+        this.publishStatRow(String(a[0]), value,
+          a[2] == null ? null : String(a[2]), a[3] == null ? null : String(a[3]));
+        return undefined;
+      }
       case 'stat': {
         const stats = this.env.stats;
         switch (String(a[0])) {
@@ -1107,6 +1225,12 @@ export const SDK_SELF_SOURCE = String.raw`
   var _cbs = {};
   var _cbNext = 1;
   function regCb(fn) { var id = _cbNext++; _cbs[id] = fn; return id; }
+  // A host call that takes a registered callback: when the host refuses it
+  // (e.g. the DES frame-hook fence, plan-2212 Phase 4), the registration is
+  // rolled back — a refused call leaves no unreachable callback behind.
+  function callWithCb(id, args) {
+    try { return call.apply(null, args); } catch (e) { delete _cbs[id]; throw e; }
+  }
   globalThis.__rvDispatchCb = function (id, args) {
     var fn = _cbs[id];
     if (fn) return fn.apply(null, args || []);
@@ -1135,7 +1259,7 @@ export const SDK_SELF_SOURCE = String.raw`
 
   function subOn(c, cb) {
     var id = regCb(cb);
-    var tok = call('comp.on', c, id);
+    var tok = callWithCb(id, ['comp.on', c, id]);
     return function () { if (tok !== null) call('unsub', tok); delete _cbs[id]; };
   }
 
@@ -1278,22 +1402,45 @@ export const SDK_SELF_SOURCE = String.raw`
     return { id: mu.id, type: mu.type || '', prop: mu.prop || {} };
   }
 
-  // ── Recurring timers (self.every) — guest-side re-scheduling ─────────
-  // Public ids are NEGATIVE (they never collide with host event ids), the
-  // record tracks the CURRENT host event id so cancel + auto-teardown work:
-  // every scheduled slice is a normal pending timer in the bridge register.
-  var _every = {};
-  var _everyNext = 1;
+  // ── Recurring timers (self.every) — plan-2212 Phase 4c ──────────────
+  // The HOST owns the clock (record + re-arm before dispatch, negative public
+  // ids). The guest keeps only pid -> { hook, data } with the ORIGINAL data
+  // object, so mutations reach later slices exactly as before 4c. A slice
+  // arrives as '__rv.every' with { pid }: no payload marshalling, no host call.
+  var _everyData = {};
+  globalThis.__rvEveryData = {
+    add: function (pid, hook, data) { _everyData[pid] = { hook: hook, data: data }; },
+    remove: function (pid) { delete _everyData[pid]; },
+    clear: function () { _everyData = {}; },
+    // Snapshot export in creation order (negative-integer keys keep insertion order).
+    // pids (optional): only these entries - the live host records - so a
+    // guest-only leftover never reaches the payload validator.
+    items: function (pids) {
+      var keys = Object.keys(_everyData);
+      if (Array.isArray(pids)) {
+        var live = {};
+        pids.forEach(function (p) { live[p] = true; });
+        keys = keys.filter(function (pid) { return live[pid] === true; });
+      }
+      return keys.map(function (pid) {
+        return { pid: Number(pid), hook: _everyData[pid].hook, data: _everyData[pid].data };
+      });
+    },
+    replace: function (items) {
+      var next = {};
+      items.forEach(function (it) { next[it.pid] = { hook: it.hook, data: it.data }; });
+      _everyData = next;
+    },
+  };
 
-  // Internal hook router: consumes '__rv.every' (re-schedule + user hook) and
-  // '__rv.msg' (onMessage), hydrates MU refs for everything else. Called by
-  // the synthesized des.on in the setup wrapper.
+  // Internal hook router: consumes '__rv.every' (user hook of a recurring
+  // timer) and '__rv.msg' (onMessage), hydrates MU refs for everything else.
+  // Called by the synthesized des.on in the setup wrapper. Returns false only
+  // for an every slice the guest holds no entry for (the host then drops it).
   globalThis.__rvRouteHook = function (hook, mu, data, handlers) {
     if (hook === '__rv.every') {
-      var pid = data ? data.pid : undefined;
-      var rec = _every[pid];
-      if (!rec) return; // cancelled — stale slice
-      rec.current = call('timer.in', rec.interval, '__rv.every', null, { pid: pid });
+      var rec = data ? _everyData[data.pid] : undefined;
+      if (!rec) return false;
       if (handlers.on) handlers.on(rec.hook, null, rec.data);
       return;
     }
@@ -1326,22 +1473,6 @@ export const SDK_SELF_SOURCE = String.raw`
   };
   globalThis.__rvHydrateMu = muHandle;
   globalThis.__rvHydratePort = portHandle;
-  globalThis.__rvEvery = {
-    add: function (interval, hook, data) {
-      var pid = -(_everyNext++);
-      var rec = { interval: interval, hook: hook, data: data === undefined ? null : data, current: 0 };
-      _every[pid] = rec;
-      rec.current = call('timer.in', interval, '__rv.every', null, { pid: pid });
-      return pid;
-    },
-    cancel: function (pid) {
-      var rec = _every[pid];
-      if (!rec) return false;
-      call('timer.cancel', rec.current);
-      delete _every[pid];
-      return true;
-    },
-  };
 
   function signalHandle(name) {
     return {
@@ -1354,11 +1485,59 @@ export const SDK_SELF_SOURCE = String.raw`
       set: function (v) { call('sig.set', name, v); },
       on: function (cb) {
         var id = regCb(cb);
-        var tok = call('sig.on', name, id);
+        var tok = callWithCb(id, ['sig.on', name, id]);
         return function () { if (tok !== null) call('unsub', tok); delete _cbs[id]; };
       },
     };
   }
+
+  // Trusted persist/timer validator (plan-2059 3b). Every intrinsic is captured HERE, before any
+  // user code runs, and the result is serialized by hand from a detached walk — user code that
+  // replaces Object/Reflect/JSON/Array methods or adds toJSON can neither fake a verdict nor
+  // change what is serialized. Non-writable, non-configurable on the global.
+  (function () {
+    var uncurry = Function.prototype.bind.bind(Function.prototype.call);
+    var gopd = Object.getOwnPropertyDescriptor, ownKeys = Reflect.ownKeys, getProto = Object.getPrototypeOf;
+    var isArray = Array.isArray, isFinite_ = Number.isFinite, is = Object.is, stringify = JSON.stringify;
+    var ObjectProto = Object.prototype, ArrayProto = Array.prototype, Num = Number, Str = String, Err = Error;
+    var SetCtor = Set, setHas = uncurry(Set.prototype.has), setAdd = uncurry(Set.prototype.add);
+    function validatedText(value) {
+      var seen = new SetCtor();
+      function visit(v, path) {
+        function bad(reason) { throw new Err(path + ': ' + reason); }
+        if (v === null) return 'null';
+        if (typeof v === 'string') return stringify(v);
+        if (typeof v === 'boolean') return v ? 'true' : 'false';
+        if (typeof v === 'number') {
+          if (!isFinite_(v) || is(v, -0)) bad('unsupported number');
+          return stringify(v);
+        }
+        if (typeof v !== 'object') bad('unsupported value');
+        if (setHas(seen, v)) bad('alias or cycle');
+        setAdd(seen, v);
+        var array = isArray(v), proto = getProto(v);
+        if (proto !== (array ? ArrayProto : ObjectProto) && !(proto === null && !array)) bad('non-plain container');
+        var keys = ownKeys(v), out = '';
+        if (array && keys.length !== v.length + 1) bad('sparse array or extra keys');
+        var first = true;
+        for (var i = 0; i < keys.length; i++) {
+          var key = keys[i];
+          if (array && key === 'length') continue;
+          if (typeof key !== 'string') bad('symbol key');
+          if (key === '$map' || key === '$set' || key === '$num') bad('reserved tag');
+          if (array) { var n = Num(key); if (!(n >= 0 && n < v.length && n % 1 === 0 && Str(n) === key)) bad('array key'); }
+          var d = gopd(v, key);
+          if (!d.enumerable || !('value' in d)) bad('accessor or hidden property');
+          var item = visit(d.value, path + '.' + key);
+          out += (first ? '' : ',') + (array ? '' : stringify(key) + ':') + item;
+          first = false;
+        }
+        return array ? '[' + out + ']' : '{' + out + '}';
+      }
+      return visit(value, '$');
+    }
+    Object.defineProperty(globalThis, '__rvValidatedText', { value: validatedText, writable: false, configurable: false, enumerable: false });
+  })();
 
   globalThis.__rvCreateSelf = function (meta) {
     // mulberry32, seeded per component (deterministic, kernel-agnostic).
@@ -1372,6 +1551,9 @@ export const SDK_SELF_SOURCE = String.raw`
 
     var _state = 'idle';
     var _enabled = true;
+    // plan-2212 Phase 4b (C): the time of the dispatch the guest is running in,
+    // handed in by the host with the dispatch; undefined outside one (host call).
+    var _dispatchNow;
     var selfNodeId = call('node.self');
 
     return {
@@ -1399,9 +1581,9 @@ export const SDK_SELF_SOURCE = String.raw`
       },
 
       get state() { return _state; },
-      setState: function (n) { _state = String(n); call('setState', _state); },
+      setState: function (n) { var s = String(n); call('setState', s); _state = s; },
       prop: meta.props || {},
-      get now() { return call('now'); },
+      get now() { return _dispatchNow !== undefined ? _dispatchNow : call('now'); },
       random: random,
 
       drive: function (p) { return resolveComp('drive', p); },
@@ -1425,7 +1607,8 @@ export const SDK_SELF_SOURCE = String.raw`
       vec3: M.vec3, quat: M.quat, mat4: M.mat4, aabb: M.aabb,
       DEG2RAD: M.DEG2RAD, RAD2DEG: M.RAD2DEG, clamp: M.clamp,
 
-      disable: function (reason) { _enabled = false; call('disable', reason); },
+      // Host first (plan-2212 Phase 4): a refused disable leaves self.enabled true.
+      disable: function (reason) { call('disable', reason); _enabled = false; },
       get enabled() { return _enabled; },
       log: function () {
         call.apply(null, ['log'].concat(Array.prototype.slice.call(arguments)));
@@ -1472,7 +1655,9 @@ export const SDK_SELF_SOURCE = String.raw`
                 if (remaining <= 0) delete _cbs[cbId];
               });
             }
-            var n = call('conn.call', type, params === undefined ? null : params, cbId);
+            var n = cbId === null
+              ? call('conn.call', type, params === undefined ? null : params, cbId)
+              : callWithCb(cbId, ['conn.call', type, params === undefined ? null : params, cbId]);
             if (cbId !== null) {
               // Replies are always deferred (scheduled on the target's event
               // list) — never synchronous within call(), so this is race-free.
@@ -1492,11 +1677,18 @@ export const SDK_SELF_SOURCE = String.raw`
         return call('timer.at', t, hook, deflateMu(mu), data === undefined ? null : data);
       },
       every: function (interval, hook, data) {
-        return globalThis.__rvEvery.add(interval, hook, data);
+        // plan-2212 Phase 4c: host first (one op, clock only) - a refused timer
+        // (DES frame hook) leaves no host record, no entry here, no pid step.
+        var pid = call('timer.every', interval, hook);
+        globalThis.__rvEveryData.add(pid, hook, data === undefined ? null : data);
+        return pid;
       },
       cancel: function (id) {
-        if (id < 0 && globalThis.__rvEvery.cancel(id)) return;
+        // Host first (negative = a recurring timer, host clock): a refused cancel
+        // (DES frame hook fence) throws here and leaves BOTH halves intact; the
+        // guest entry goes only after the host record is gone (review 2).
         call('timer.cancel', id);
+        if (id < 0) globalThis.__rvEveryData.remove(id);
       },
 
       // ── Tier 1: ports / topology (snap-graph backend, phase 1b) ────────
@@ -1565,6 +1757,7 @@ export const SDK_SELF_SOURCE = String.raw`
       get currentLoad() { return call('flow.load'); },
 
       // ── Tier 1: statistics ──────────────────────────────────────────────
+      statValue: function (key, value, unit, group) { call('stat.row', String(key), value, unit, group); },
       statState: function (name) { call('stat', 'state', String(name)); },
       statOutput: function (n) { call('stat', 'output', n === undefined ? 1 : n); },
       statCycleStart: function () { call('stat', 'cycleStart'); },
@@ -1576,8 +1769,15 @@ export const SDK_SELF_SOURCE = String.raw`
       // so the host can capture and re-inject the self.random() position and
       // the FSM state across a DES snapshot round-trip.
       __rvGetRng: function () { return _rs | 0; },
+      __rvCbCount: function () { return Object.keys(_cbs).length; },
       __rvSetRng: function (v) { _rs = v | 0; },
       __rvGetState: function () { return _state; },
+      // plan-2212 Phase 4b: enter/leave a dispatch at host time t (returns the previous value).
+      __rvSetDispatchNow: function (t) {
+        var prev = _dispatchNow;
+        _dispatchNow = (typeof t === 'number' && t === t) ? t : undefined;
+        return prev;
+      },
       __rvSetState: function (v) { _state = String(v); call('setState', _state); },
     };
   };
@@ -1603,14 +1803,23 @@ export const SDK_SELF_SOURCE = String.raw`
  *    handles (park/release/node, occupied/…), built from the plain value refs
  *    that crossed the boundary.
  *  - **Synthesized `des.on`:** ALWAYS present, routing internal hooks —
- *    `__rv.every` (recurring timers, re-scheduled guest-side) and `__rv.msg`
+ *    `__rv.every` (recurring timers; re-armed host-side since plan-2212 Phase 4c) and `__rv.msg`
  *    (`onMessage(topic, data, fromPath)`) — before the user's own `on`.
  */
 export const SDK_SETUP_WRAPPER_SOURCE = String.raw`
 globalThis.__rvUserSetup = setup;
 globalThis.setup = function () {
   var self = globalThis.__rvCreateSelf(globalThis.__rvMeta);
+  var persistCalled = false, persistValue, setupDone = false;
+  var validatedText = globalThis.__rvValidatedText; // trusted, captured before any user code
+  self.persist = function (initial) {
+    if (persistCalled || setupDone) throw new Error('self.persist must be called once during setup');
+    validatedText(initial);
+    persistCalled = true; persistValue = initial;
+    return initial;
+  };
   var h = globalThis.__rvUserSetup(self);
+  setupDone = true;
   if (h === null || typeof h !== 'object') h = {};
 
   function guard(fn, phase) {
@@ -1634,30 +1843,45 @@ globalThis.setup = function () {
   var userMsg = guard(h.onMessage, 'message');
   var userArrival = guard(h.onArrival, 'hook');
   var userRequest = guard(h.onRequest, 'hook');
+  // plan-2212 Phase 4b (C): host dispatches pass the current time as their last
+  // argument; inside the dispatch self.now answers from it (no host call). The
+  // previous value is restored, so nesting and the time outside stay unchanged.
+  var setDispatchNow = self.__rvSetDispatchNow;
   var des = {};
   if (typeof userDes.canAccept === 'function') {
     var gCanAccept = guard(userDes.canAccept, 'hook');
-    des.canAccept = function (mu, port) {
-      return gCanAccept(globalThis.__rvHydrateMu(mu), globalThis.__rvHydratePort(port));
+    des.canAccept = function (mu, port, now) {
+      var prev = setDispatchNow(now);
+      try { return gCanAccept(globalThis.__rvHydrateMu(mu), globalThis.__rvHydratePort(port)); }
+      finally { setDispatchNow(prev); }
     };
   }
   if (typeof userDes.onAccept === 'function') {
     var gOnAccept = guard(userDes.onAccept, 'hook');
-    des.onAccept = function (mu, port) {
-      return gOnAccept(globalThis.__rvHydrateMu(mu), globalThis.__rvHydratePort(port));
+    des.onAccept = function (mu, port, now) {
+      var prev = setDispatchNow(now);
+      try { return gOnAccept(globalThis.__rvHydrateMu(mu), globalThis.__rvHydratePort(port)); }
+      finally { setDispatchNow(prev); }
     };
   }
   if (typeof userDes.onDownstreamReady === 'function') {
     var gDown = guard(userDes.onDownstreamReady, 'hook');
-    des.onDownstreamReady = function (port) {
-      return gDown(globalThis.__rvHydratePort(port));
+    des.onDownstreamReady = function (port, now) {
+      var prev = setDispatchNow(now);
+      try { return gDown(globalThis.__rvHydratePort(port)); }
+      finally { setDispatchNow(prev); }
     };
   }
-  des.on = function (hook, mu, data) {
-    globalThis.__rvRouteHook(hook, mu, data, {
-      on: userOn, onMessage: userMsg, onArrival: userArrival, onRequest: userRequest,
-    });
+  des.on = function (hook, mu, data, now) {
+    var prev = setDispatchNow(now);
+    try {
+      return globalThis.__rvRouteHook(hook, mu, data, {
+        on: userOn, onMessage: userMsg, onArrival: userArrival, onRequest: userRequest,
+      });
+    } finally { setDispatchNow(prev); }
   };
+  // plan-2212 Phase 4b (A): the explicit settle opt-in 'des: { samplesLiveGeometry: true }'.
+  var samplesLiveGeometry = userDes.samplesLiveGeometry === true;
   h.des = des;
 
   if (h.continuous !== null && typeof h.continuous === 'object') {
@@ -1691,7 +1915,39 @@ globalThis.setup = function () {
   // self.random() position (_rs) and the FSM state. Namespaced under '__rv'
   // so user-defined top-level handler keys can never collide.
   h.__rv = {
+    // plan-2212 Phase 4c: the guest half of the every table (pid -> hook + data).
+    every: {
+      get: function (pids) { return validatedText(globalThis.__rvEveryData.items(pids)); },
+      set: function (text) { globalThis.__rvEveryData.replace(JSON.parse(text)); },
+      clear: function () { globalThis.__rvEveryData.clear(); },
+    },
+    persist: {
+      get: function () {
+        var out = {};
+        if (persistCalled) out.persist = persistValue;
+        if (typeof h.onSnapshot === 'function') out.legacy = h.onSnapshot();
+        return validatedText(out);
+      },
+      set: function (text) {
+        var value = JSON.parse(text);
+        if (persistCalled && value !== null && typeof value === 'object' && persistValue !== null && typeof persistValue === 'object') {
+          if (Array.isArray(persistValue)) persistValue.length = 0;
+          Object.keys(persistValue).forEach(function (key) { delete persistValue[key]; });
+          Object.keys(value).forEach(function (key) {
+            Object.defineProperty(persistValue, key, {value: value[key], writable: true, enumerable: true, configurable: true});
+          });
+        } else persistValue = value;
+      },
+    },
+    // Registered guest callbacks (leak checks, plan-2212 Phase 4).
+    cbs: { count: function () { return self.__rvCbCount(); } },
+    des: { samplesLiveGeometry: function () { return samplesLiveGeometry; } },
+    // An uncatchable abort (call deadline) skips the 'finally' that leaves a
+    // dispatch: the host calls this after a failed dispatch so a stale time can
+    // never answer self.now outside a dispatch.
+    dispatch: { clear: function () { setDispatchNow(undefined); } },
     rng: {
+      initial: function () { return (globalThis.__rvMeta.seed >>> 0) || 1; },
       get: function () { return self.__rvGetRng(); },
       set: function (v) { self.__rvSetRng(v); },
     },
@@ -1701,7 +1957,10 @@ globalThis.setup = function () {
     },
   };
 
-  h.__cb = function (id, args) { return globalThis.__rvDispatchCb(id, args); };
+  h.__cb = function (id, args, now) {
+    var prev = setDispatchNow(now);
+    try { return globalThis.__rvDispatchCb(id, args); } finally { setDispatchNow(prev); }
+  };
   return h;
 };
 'ok';

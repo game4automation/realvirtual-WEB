@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "description": "Contact profile library of plan-673: one entry per ContactProfile role, carrying condim, friction[3], solref[2], solimp[5], contype/conaffinity and priority. The library lives BESIDE the model, never in it — a second home for friction values is the inconsistency source this plan avoids elsewhere. Every entry declares its own provenance, because almost none of these numbers are measured yet: a slip-angle measurement per surface is still an open item of the plan. A 'declared' number is a starting assumption that behaves plausibly, NOT a datasheet value, and it must not be quoted as one.",
+  "provenanceKinds": {
+    "measured": "Taken from a measurement on the real surface (slip angle, pull-off force).",
+    "derived": "Computed from other measured quantities with a stated rule.",
+    "declared": "A starting assumption. Plausible, reproducible, and explicitly not measured."
+  },
+  "pairingRule": "MuJoCo MAXIMISES friction element-wise and averages solref/solimp weighted by solmix, so a pairing cannot be expressed by two per-geom entries: the rougher side always wins. The library therefore gives priority 1 to the side that sets the tone (GripperJaw, FixtureBore, StopperFace) and 0 to everything else, and keeps the explicit pairs below for named special cases only.",
+  "collisionClassRule": "contype/conaffinity are the COLLISION CLASSES, and they live here because the class is a property of the ROLE — a bore guides parts, a frame carries them. plan-673 Phase 2 decided deliberately that this gets no component property, and Phase 3 (the MJCF writer) reads these two numbers through resolveContactProfile() like every other number of a role. Three bits, and a pair is generated when (contype_a AND conaffinity_b) OR (contype_b AND conaffinity_a) is non-zero: 1 = SUPPORT (floor, frame, belt — what a part stands on), 2 = PART (loose parts and pallets), 4 = GUIDE (bore, jaw, stop — surfaces that guide a part). Support meets support and parts (1/3); a part meets everything (2/7); a guide meets parts and other guides but NOT support (4/6). WHY, measured in the plan-673 Phase-1 gate: a segmented free body pays for EVERY segment's floor contact — 28 plate boxes lying on one plane produced up to 112 contacts that carry no information at all, while the same plate standing on one underside box has the 4 contacts a flat plate really has. Giving the guiding segments their own class and the feet the support class is what buys that back, and it needs no extra geometry. Geoms of the SAME body never collide in MuJoCo, so a decomposition's own primitives need no exclusion.",
+  "profiles": {
+    "Pallet": {
+      "condim": 4,
+      "friction": [0.3, 0.005, 0.0001],
+      "solref": [0.02, 1],
+      "solimp": [0.9, 0.95, 0.001, 0.5, 2],
+      "contype": 2,
+      "conaffinity": 7,
+      "priority": 0,
+      "provenance": "declared",
+      "note": "Aluminium transfer pallet on a steel or plastic belt: low but not negligible friction, so a pallet is carried along without sticking when it meets a stop."
+    },
+    "Workpiece": {
+      "condim": 4,
+      "friction": [0.5, 0.005, 0.0001],
+      "solref": [0.02, 1],
+      "solimp": [0.9, 0.95, 0.001, 0.5, 2],
+      "contype": 2,
+      "conaffinity": 7,
+      "priority": 0,
+      "provenance": "declared",
+      "note": "Default role of a loose part. condim 4 rather than MuJoCo's own 3: without spin friction a gripped part rotates out of the jaws within seconds and nothing is reported."
+    },
+    "BeltSurface": {
+      "condim": 4,
+      "friction": [0.8, 0.005, 0.0001],
+      "solref": [0.02, 1],
+      "solimp": [0.9, 0.95, 0.001, 0.5, 2],
+      "contype": 1,
+      "conaffinity": 3,
+      "priority": 0,
+      "provenance": "declared",
+      "note": "Rubberised belt top. The 0.8 matches the existing WebPhysicsZone friction default, so a part behaves the same whichever engine carries it."
+    },
+    "StopperFace": {
+      "condim": 3,
+      "friction": [0.2, 0.005, 0.0001],
+      "solref": [0.01, 1],
+      "solimp": [0.95, 0.99, 0.001, 0.5, 2],
+      "contype": 4,
+      "conaffinity": 6,
+      "priority": 1,
+      "provenance": "declared",
+      "note": "Hardened stop face: deliberately stiff (short solref time constant, high solimp) so a pallet stops at an exact point instead of sinking in, and deliberately slippery so it releases cleanly. priority 1 — the stop decides the pairing, not the pallet."
+    },
+    "GripperJaw": {
+      "condim": 4,
+      "friction": [0.7, 0.02, 0.0001],
+      "solref": [0.02, 1],
+      "solimp": [0.9, 0.95, 0.001, 0.5, 2],
+      "contype": 4,
+      "conaffinity": 6,
+      "priority": 1,
+      "provenance": "declared",
+      "note": "Grippy pad. priority 1 is what makes a pad work at all — the same choice the Robotiq 2F-85 model makes on its pads. This number, not the gripping force, decides the holding capacity: a verified force-closure calculation for a 15 mm two-finger gripper gives 0.51 kg at 0.1 and 3.57 kg at 0.7, a factor of seven."
+    },
+    "MachineFrame": {
+      "condim": 3,
+      "friction": [0.4, 0.005, 0.0001],
+      "solref": [0.01, 1],
+      "solimp": [0.95, 0.99, 0.001, 0.5, 2],
+      "contype": 1,
+      "conaffinity": 3,
+      "priority": 0,
+      "provenance": "declared",
+      "note": "Painted steel frame, guards, chutes. Stiff, because a frame is not supposed to give."
+    },
+    "FixtureBore": {
+      "condim": 4,
+      "friction": [0.15, 0.005, 0.0001],
+      "solref": [0.03, 1],
+      "solimp": [0.8, 0.9, 0.001, 0.5, 2],
+      "contype": 4,
+      "conaffinity": 6,
+      "priority": 1,
+      "provenance": "declared",
+      "note": "Guided bore or slot a part is inserted into: slippery and slightly compliant, so a small misalignment is corrected by the geometry instead of jamming. priority 1 — the bore sets the tone against whatever part enters it."
+    }
+  },
+  "pairs": [
+    {
+      "a": "GripperJaw",
+      "b": "Workpiece",
+      "friction": [0.7, 0.02, 0.0001],
+      "condim": 4,
+      "provenance": "declared",
+      "note": "Stated explicitly although priority already produces it, because this is THE pairing the first case depends on: if it loses its spin friction, a successful run turns silently into a jam."
+    }
+  ]
+}

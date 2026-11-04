@@ -17,6 +17,7 @@
 import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
 import {
   describeComponentType,
+  ensureDescriptions,
   listComponentTypes,
 } from '../../core/engine/rv-component-schema-info';
 
@@ -45,11 +46,13 @@ export class McpComponentSchemaTool {
     return this._spec;
   }
 
-  @McpTool('List authorable component types, or with type get its fields (type, default, unit, enum, refType) and authoring rules. Read before web_editor_add_component.', { readOnly: true })
+  @McpTool('List authorable component types, or with type get its fields (type, default, unit, enum, refType) and authoring rules. Read before editor.addComponent.', { readOnly: true })
   async webComponentSchema(
     @McpParam('type', 'Component type, e.g. Drive_Cylinder (omit to list all types).', 'string', false) type: string,
   ): Promise<string> {
     const key = (type ?? '').trim();
+    // Descriptions are a lazy chunk; a failed load degrades to empty descriptions (like the spec).
+    await ensureDescriptions().catch(() => undefined);
     if (!key) return JSON.stringify({ types: listComponentTypes() });
     let spec: string | null = null;
     try {

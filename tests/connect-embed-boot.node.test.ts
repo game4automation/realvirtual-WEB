@@ -38,7 +38,7 @@ describe('CONNECT embedded boot gate', () => {
     // The resume keys are written from the model IDENTITY, not the byte source:
     // `identityUrl` differs from `url` only on the stored-body resume path,
     // where `url` is a throwaway `blob:` UUID (see main.ts loadModel).
-    expect(loaderBody).toContain('localStorage.setItem(LS_KEY_MODEL, identityUrl)');
+    expect(loaderBody).toContain('writeLocalStorage(LS_KEY_MODEL, identityUrl)');
     expect(loaderBody).toContain('sceneStore.markGlbActive(identityUrl, label)');
   });
 });

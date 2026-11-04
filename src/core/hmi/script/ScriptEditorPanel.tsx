@@ -38,7 +38,7 @@ import { DIRTY_INK } from '../rv-dirty-dot';
 import type { UISlotProps } from '../../rv-ui-plugin';
 import type { RVViewer } from '../../rv-viewer';
 import { getSceneStore } from '../scene/scene-store-singleton';
-import { lintDesSafety, type DesLintDiagnostic } from '../../sdk/rv-des-lint';
+import { loadDesAstCheck, lintDesSafety, type DesLintDiagnostic } from '../../sdk/rv-des-lint';
 import { computeWebComponentNodePath } from '../../engine/rv-web-component-registry';
 import {
   loadScriptEditorMonaco, transpileModel, SCRIPT_LANGUAGE_ID, type Monaco,
@@ -149,7 +149,7 @@ function MonacoHost({ initialCode, readOnly, desSafe, onEditor, onDirty, onSaveS
     let lintTimer: ReturnType<typeof setTimeout> | null = null;
     let resizeObserver: ResizeObserver | null = null;
 
-    loadScriptEditorMonaco()
+    loadDesAstCheck().then(() => loadScriptEditorMonaco())
       .then((monaco) => {
         if (disposed || !containerRef.current) return;
         setLoading(false);
@@ -169,7 +169,7 @@ function MonacoHost({ initialCode, readOnly, desSafe, onEditor, onDirty, onSaveS
 
         const applyLint = () => {
           if (!editor) return;
-          const diagnostics = lintDesSafety(editor.getValue(), { desSafe });
+          const diagnostics = lintDesSafety(editor.getValue(), { desSafe, checkState: true });
           applyLintMarkers(monaco, editor, diagnostics, 'rv-des-lint');
         };
 
@@ -318,8 +318,10 @@ export function ScriptEditorPanel({ viewer }: UISlotProps) {
       // [5] Validate BEFORE the swap (parse + DES lint + apiVersion).
       const target = findNodeByPath(viewer, nodePath);
       const targetRaw = readWebComponentRaw(target);
+      await loadDesAstCheck();
       const validation = validateScriptForSave(transpiled.js, {
         desSafe: targetRaw?.DesSafe === true,
+        checkState: true,
         apiVersion: typeof targetRaw?.ApiVersion === 'number' ? (targetRaw.ApiVersion as number) : 1,
       });
       applyLintMarkers(monaco, editor, validation.diagnostics, 'rv-script-save');

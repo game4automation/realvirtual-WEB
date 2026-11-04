@@ -69,7 +69,7 @@ function StateBadge({ state }: { state: MachineState }) {
   return (
     <Box sx={{
       display: 'flex', alignItems: 'center', gap: 1,
-      px: 1.5, py: 0.75, borderRadius: 1.5,
+      px: 1.5, py: 0.75, borderRadius: 1,
       bgcolor: `${color}15`,
       border: `1px solid ${color}30`,
     }}>
@@ -177,7 +177,7 @@ function SubsystemButton({ icon, label, active, onClick }: {
       onClick={onClick}
       sx={{
         display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 0.25,
-        flex: 1, py: 1, px: 0.5, borderRadius: 1.5, cursor: 'pointer',
+        flex: 1, py: 1, px: 0.5, borderRadius: 1, cursor: 'pointer',
         bgcolor: active ? 'rgba(102,187,106,0.12)' : 'rgba(255,255,255,0.04)',
         border: `1px solid ${active ? 'rgba(102,187,106,0.3)' : 'rgba(255,255,255,0.08)'}`,
         transition: 'all 0.15s',

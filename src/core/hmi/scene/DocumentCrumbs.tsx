@@ -125,6 +125,9 @@ const MIN_CURRENT = '5ch';
  */
 const MIN_LEGIBLE_PREFIX = 40;
 
+/** Shared by every segment of the row — see the row's `sx`. */
+const LINE_HEIGHT = 1.5;
+
 const ELLIPSIZE = {
   overflow: 'hidden',
   textOverflow: 'ellipsis',
@@ -189,7 +192,13 @@ function useLegiblePrefix(refs: PrefixRefs, signature: string) {
 function Chevron() {
   return (
     <ChevronRight
-      sx={{ fontSize: 14, color: 'text.disabled', flexShrink: 0, verticalAlign: 'middle' }}
+      sx={{
+        fontSize: 14, color: 'text.disabled', flexShrink: 0,
+        // `middle` lands the glyph on the x-height centre of the 1.5 line —
+        // the same centre the flex row aligns the standalone chevron to, so
+        // inline and standalone separators sit at one height.
+        verticalAlign: 'middle', mx: '1px',
+      }}
     />
   );
 }
@@ -221,7 +230,8 @@ export function DocumentCrumbs({
   const CLOSED = { flexGrow: 0, maxWidth: 0 } as const;
 
   const chipSx = (c: RvStackCrumb, clickable: boolean) => ({
-    fontSize,
+    fontSize: 'inherit',
+    lineHeight: 'inherit',
     fontWeight: c.current ? 600 : 400,
     color: c.current ? 'text.primary' : 'text.secondary',
     fontStyle: c.stale ? 'italic' : 'normal',
@@ -270,6 +280,12 @@ export function DocumentCrumbs({
         // and they live inside the group they belong to.
         flex: 1, minWidth: 0, display: 'flex', alignItems: 'center',
         overflow: 'hidden', whiteSpace: 'nowrap',
+        // ONE line box for every segment. The prefix groups are blocks whose
+        // strut used to come from the inherited body line-height while the
+        // chips carried Typography's own, so the dim folder run and the bold
+        // name sat on different baselines. Font size and line height are set
+        // here once and every segment inherits them.
+        fontSize, lineHeight: LINE_HEIGHT,
       }}
     >
       {segments.length > 0 && (
@@ -287,7 +303,7 @@ export function DocumentCrumbs({
               key={`loc:${i}:${segment}`}
               data-testid="document-location-crumb"
               component="span"
-              sx={{ fontSize, fontWeight: 400, color: 'text.disabled' }}
+              sx={{ fontSize: 'inherit', lineHeight: 'inherit', fontWeight: 400, color: 'text.disabled' }}
             >
               {segment}
               {i < segments.length - 1 && <Chevron />}

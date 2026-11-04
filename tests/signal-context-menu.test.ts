@@ -58,6 +58,11 @@ function fixture(planner?: unknown): Fixture {
     behaviors: { getActiveBinds: () => [] },
     getPlugin: (id: string) => (id === 'layout-planner' ? planner : undefined),
     contextMenu: menu,
+    // plan-2010 phase 3: the plugin's init() subscribes to 'mode-changed' to
+    // rest the link mode in DES. This fixture never switches mode, so the
+    // subscription is a no-op with a no-op unsubscribe — but it has to EXIST,
+    // or init() throws before it registers the menu this file is about.
+    on: () => () => {},
   } as unknown as RVViewer;
   return { scene, root, registry, store, manager, viewer, menu };
 }

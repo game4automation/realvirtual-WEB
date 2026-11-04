@@ -114,7 +114,7 @@ async function buildCell(): Promise<Cell | null> {
     if (REQUIRE_WASM) {
       throw new Error(
         '[plan-467 F15] RV_PHYSICS_REQUIRE_WASM=1 but @dimforge/rapier3d-compat is not usable — '
-        + 'install it out-of-band (npm i --no-save @dimforge/rapier3d-compat@0.19.3)',
+        + 'run npm install in Assets/realvirtual-WebViewer-Private~',
       );
     }
     console.warn('[physics-467] @dimforge/rapier3d-compat not installed (out-of-band) — skipping');

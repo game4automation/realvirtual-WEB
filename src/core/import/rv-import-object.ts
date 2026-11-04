@@ -11,11 +11,11 @@
  *     existing scene stays untouched.
  *   - {@link objectToGlb} → the ONE place a Three.js tree becomes GLB bytes.
  *     Used by the CAD providers (STEP/USD conversion) and by
- *     `exportAssetGlb` (asset save).
+ *     `exportAssetGlb` (editor save).
  *
  * There is deliberately no "replace" / "open as new scene" sink. Editor mode
  * edits ONE library object and has no scene, so an import there is always an
- * addition to the current asset document; "open an arbitrary GLB as the scene"
+ * addition to the editor's current document; "open an arbitrary GLB as the scene"
  * is the model picker's job (`hmi/settings/ModelTab`, `hmi/scene/SceneWindow`).
  *
  * v1 note (plan-238 §2.2 review): `importObject` is a thin facade over the
@@ -39,7 +39,7 @@ export interface ImportPlannerLike {
   placeComponent(
     entry: LibraryCatalogEntry,
     position: [number, number, number],
-    opts?: { skipAutoAlign?: boolean },
+    opts?: { skipAutoAlign?: boolean; locked?: boolean },
   ): Promise<string>;
 }
 
@@ -64,6 +64,14 @@ export interface ImportObjectOptions {
   skipAutoAlign?: boolean;
   /** Base name for the persisted GLB / catalog entry (default: item name). */
   name?: string;
+  /**
+   * Place the imported object as a LOCKED layout instance
+   * (`LayoutObject.Locked`), so transform and delete actions skip it. This is
+   * what a reference underlay wants — an imported DXF hall floor plan the user
+   * builds a layout ON TOP of, not something to nudge around (plan-741).
+   * Planner sink only; the editor sink has no layout objects. Default: false.
+   */
+  locked?: boolean;
 }
 
 export interface ImportObjectOutcome {
@@ -288,7 +296,15 @@ export async function importObject(
   const planner = await resolvePlanner(viewer);
 
   const position = options?.position ?? [0, 0, 0] as [number, number, number];
-  const placeOpts = options?.skipAutoAlign ? { skipAutoAlign: true } : undefined;
+  // Build from BOTH flags — a locked import must not lose its lock just because
+  // it also wants the auto-align, and vice versa.
+  const placeOpts =
+    options?.skipAutoAlign || options?.locked
+      ? {
+          ...(options?.skipAutoAlign ? { skipAutoAlign: true } : {}),
+          ...(options?.locked ? { locked: true } : {}),
+        }
+      : undefined;
 
   const outcome: ImportObjectOutcome = { placedIds: [], persisted: true, warnings: [] };
 
@@ -307,6 +323,9 @@ export async function importObject(
 
     // Welded first (`rv-glb-weld`), like the editor sink — the stored catalog
     // asset is the small form, whichever provider or route produced the bytes.
+    // plan-650 Phase 5b: a shared family carries its child families - unpack
+    // them into the library BEFORE the weld rewrites the parent's buffers.
+    await importChildFamilyBundle(item.bytes, name, outcome.warnings);
     const persistResult = await persistImportedGlb(name, weldImportedGlb(item.bytes, name));
     if (!persistResult.persisted) {
       outcome.persisted = false;
@@ -319,4 +338,30 @@ export async function importObject(
   }
 
   return outcome;
+}
+
+/**
+ * plan-650 Phase 5b: write the bundled child families of `bytes` verbatim into
+ * the project library and report declared children that are still missing.
+ * Never fails the import - the parent is placed either way.
+ */
+async function importChildFamilyBundle(bytes: ArrayBuffer, name: string, warnings: string[]): Promise<void> {
+  try {
+    const share = await import('../editor/rv-parametric-share');
+    const glb = new Uint8Array(bytes);
+    if (!share.hasChildFamilyBundle(glb)) return;
+    const io = await share.projectChildFamilyImportIO();
+    if (!io) {
+      warnings.push(`"${name}" carries child families, but no writable project is open - they were not added to the library.`);
+      return;
+    }
+    const report = await share.importBundledChildFamilies(glb, io);
+    if (report.missing.length > 0) {
+      const { reportParametricBundleMissing } = await import('../hmi/problems-store');
+      reportParametricBundleMissing({ families: report.missing, phase: 'import', document: name });
+      warnings.push(`"${name}": child families missing - ${report.missing.join(', ')}.`);
+    }
+  } catch (e) {
+    warnings.push(`"${name}": the child families could not be imported (${e instanceof Error ? e.message : String(e)}).`);
+  }
 }

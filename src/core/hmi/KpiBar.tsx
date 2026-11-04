@@ -6,6 +6,17 @@ import { useViewer } from '../../hooks/use-viewer';
 import { useSlot } from '../../hooks/use-slot';
 import { useViewportInsets } from '../../hooks/use-viewport-insets';
 import { FLOATING_TOP_MARGIN } from './layout-constants';
+import { isMobileDevice, useMobileLayout } from '../../hooks/use-mobile-layout';
+import type { UIVisibilityRule } from './ui-context-store';
+
+/**
+ * Default visibility of the KPI bar. 'mode:commissioning' (plan-423) drops the
+ * operator HMI; a plugin may lift single contexts while it is registered
+ * (see `SimulatedKpiPlugin.showInModes`).
+ */
+export const KPI_BAR_DEFAULT_RULE: UIVisibilityRule = {
+  hiddenIn: ['fpv', 'planner', 'xr', 'mode:editor', 'mode:viewer', 'mode:commissioning'],
+};
 
 /** Core layout container for the KPI bar (top center). Renders 'kpi-bar' slot entries. */
 export function KpiBar() {
@@ -14,7 +25,8 @@ export function KpiBar() {
   // Center over the actual 3D view (between the docked windows), not the whole
   // window, so the cards stay centered on the viewport as panels open/resize.
   const insets = useViewportInsets();
-  if (entries.length === 0) return null;
+  const compact = useMobileLayout();
+  if (compact || isMobileDevice() || entries.length === 0) return null;
 
   return (
     <Box

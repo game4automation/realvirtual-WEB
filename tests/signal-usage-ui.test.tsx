@@ -17,6 +17,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { queryCommand } from './helpers/query-command';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { SignalStore } from '../src/core/engine/rv-signal-store';
 import { SignalUsageService, type SignalUsage } from '../src/core/engine/rv-signal-usage-index';
@@ -24,7 +25,6 @@ import { SignalUsageButton, SignalUsageSection } from '../src/core/hmi/rv-signal
 import { buildSignalTooltipModel } from '../src/core/hmi/rv-signal-badge';
 import { registerPlcNavigation } from '../src/core/plc-control';
 import { getConnectBridges, requestConnectBridgeReveal } from '../src/core/hmi/connect-store';
-import { McpSignalUsageTools } from '../src/plugins/mcp-bridge/rv-mcp-signal-usage-tools';
 import { registerSignal } from '../src/core/engine/rv-signal-construction';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { Object3D } from 'three';
@@ -157,12 +157,12 @@ describe('tooltip and MCP', () => {
 
   it('web_signal_usage returns the same grouped list (F8)', async () => {
     const v = makeViewer();
-    const tools = new McpSignalUsageTools(() => asViewer(v));
-    const out = JSON.parse(await tools.webSignalUsage('BT2_OpMode'));
+
+    const out = await queryCommand(asViewer(v), 'signal.usage', { name: 'BT2_OpMode' });
     expect(out.signal).toBe('BT2_OpMode');
     expect(out.count).toBe(3);
     expect(out.groups.map((g: { kind: string }) => g.kind)).toEqual(['component-field', 'logic-step', 'plc-program']);
     expect(out.groups[2].usages[0]).toMatchObject({ line: 14, access: 'read', navigable: false });
-    expect(JSON.parse(await tools.webSignalUsage(''))).toEqual({ error: 'name is required' });
+    expect(await queryCommand(asViewer(v), 'signal.usage', { name: '' })).toEqual({ error: 'name is required' });
   });
 });

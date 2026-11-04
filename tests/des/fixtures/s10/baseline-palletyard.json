@@ -1,0 +1,310 @@
+{
+ "plan": "559",
+ "measurement": "M3 PalletYard null measurement (Phase 0)",
+ "date": "2026-10-21",
+ "state": {
+  "webviewer": "767841af",
+  "private": "76ce464",
+  "preconditions": "612 Phase 4 + CP1d-a/b + CP2, 631 Phase 2, 634 on main"
+ },
+ "command": "npx vitest run --config node_modules/.m3/vitest.m3.config.ts (in Assets/realvirtual-WebViewer~; config extends vite.config.ts, include = m3-palletyard.test.ts only; one run per process)",
+ "script": "m3-palletyard.test.ts (copy next to this file); scene via tests/pallet-yard-scene-load.ts (viewer, placements), DESRunner fastforward 28800 s, bindDesYard + startDesRuntime, tick 1/60",
+ "orderTimes": "exact sim time per started job via wrapping the runtime instance's logJob (no source change)",
+ "deterministic": true,
+ "wallMsInformative": [
+  5628,
+  4934
+ ],
+ "note": "Two runs inside ONE vitest process are not comparable: the second run shipped 1 pallet (shared singleton state carries over). Parity runs in Phase 8 must use one process per run.",
+ "result": {
+  "simTimeSec": 28800,
+  "palletsShipped": 419,
+  "counters": {
+   "produced": 429,
+   "blockedTakts": 424,
+   "picks": 427,
+   "delivered": 421,
+   "stored": 8,
+   "retrieved": 2,
+   "bufferPeak": 6,
+   "forkWaits": 858,
+   "maxForkWaitSec": 2.6133333333345945,
+   "goArounds": 0
+  },
+  "perVehicle": {
+   "Stapler_1": {
+    "ordersDone": 161,
+    "charges": 9,
+    "minSoc": 27.622556
+   },
+   "Stapler_2": {
+    "ordersDone": 143,
+    "charges": 11,
+    "minSoc": 26.96251
+   },
+   "Stapler_3": {
+    "ordersDone": 125,
+    "charges": 14,
+    "minSoc": 26.951463
+   }
+  },
+  "first50": [
+   {
+    "i": 0,
+    "t": 5.813024059478759,
+    "job": "Stapler_1:pick:A1>V1"
+   },
+   {
+    "i": 1,
+    "t": 86.066819079774,
+    "job": "Stapler_1:pick:A2>V2"
+   },
+   {
+    "i": 2,
+    "t": 163.73285352763287,
+    "job": "Stapler_2:pick:A1>V1"
+   },
+   {
+    "i": 3,
+    "t": 186.17454294165393,
+    "job": "Stapler_1:pick:A2>P1"
+   },
+   {
+    "i": 4,
+    "t": 292.01427220084264,
+    "job": "Stapler_2:pick:A1>V2"
+   },
+   {
+    "i": 5,
+    "t": 331.03039601344983,
+    "job": "Stapler_1:pick:A2>P2"
+   },
+   {
+    "i": 6,
+    "t": 424.81284823543075,
+    "job": "Stapler_2:pick:A1>P3"
+   },
+   {
+    "i": 7,
+    "t": 430.5023487109397,
+    "job": "Stapler_3:pick:A2>P4"
+   },
+   {
+    "i": 8,
+    "t": 463.8289720480379,
+    "job": "Stapler_1:retrieve:P1>V2"
+   },
+   {
+    "i": 9,
+    "t": 498.90722360843694,
+    "job": "Stapler_2:pick:A1>P5"
+   },
+   {
+    "i": 10,
+    "t": 566.691695909918,
+    "job": "Stapler_3:pick:A2>P6"
+   },
+   {
+    "i": 11,
+    "t": 587.3253380885508,
+    "job": "Stapler_1:pick:A1>P1"
+   },
+   {
+    "i": 12,
+    "t": 597.0616141427708,
+    "job": "Stapler_2:retrieve:P2>V2"
+   },
+   {
+    "i": 13,
+    "t": 618.5362713948451,
+    "job": "Stapler_3:pick:A2>V1"
+   },
+   {
+    "i": 14,
+    "t": 689.296766014015,
+    "job": "Stapler_1:pick:A1>P2"
+   },
+   {
+    "i": 15,
+    "t": 689.397766014015,
+    "job": "Stapler_3:charge:L1"
+   },
+   {
+    "i": 16,
+    "t": 742.2214800183856,
+    "job": "Stapler_2:pick:A2>V1"
+   },
+   {
+    "i": 17,
+    "t": 779.5974653115491,
+    "job": "Stapler_1:pick:A1>V2"
+   },
+   {
+    "i": 18,
+    "t": 857.6428726722708,
+    "job": "Stapler_2:pick:A2>V1"
+   },
+   {
+    "i": 19,
+    "t": 954.9172632008177,
+    "job": "Stapler_2:pick:A1>V1"
+   },
+   {
+    "i": 20,
+    "t": 1052.1916537293641,
+    "job": "Stapler_2:pick:A2>V1"
+   },
+   {
+    "i": 21,
+    "t": 1149.4660442579088,
+    "job": "Stapler_2:pick:A1>V1"
+   },
+   {
+    "i": 22,
+    "t": 1205.8130240594787,
+    "job": "Stapler_1:pick:A2>V2"
+   },
+   {
+    "i": 23,
+    "t": 1246.7404347864535,
+    "job": "Stapler_2:pick:A1>V1"
+   },
+   {
+    "i": 24,
+    "t": 1303.0874145880234,
+    "job": "Stapler_1:pick:A2>V2"
+   },
+   {
+    "i": 25,
+    "t": 1344.0148253149982,
+    "job": "Stapler_2:pick:A1>V1"
+   },
+   {
+    "i": 26,
+    "t": 1400.3618051165681,
+    "job": "Stapler_1:pick:A2>V2"
+   },
+   {
+    "i": 27,
+    "t": 1441.289215843543,
+    "job": "Stapler_2:pick:A1>V1"
+   },
+   {
+    "i": 28,
+    "t": 1497.6361956451128,
+    "job": "Stapler_1:pick:A2>V2"
+   },
+   {
+    "i": 29,
+    "t": 1594.9105861736575,
+    "job": "Stapler_1:pick:A1>V2"
+   },
+   {
+    "i": 30,
+    "t": 1692.1849767022022,
+    "job": "Stapler_1:pick:A2>V2"
+   },
+   {
+    "i": 31,
+    "t": 1789.459367230747,
+    "job": "Stapler_1:pick:A1>V2"
+   },
+   {
+    "i": 32,
+    "t": 1805.8130240594787,
+    "job": "Stapler_2:pick:A2>V1"
+   },
+   {
+    "i": 33,
+    "t": 1902.0370095667752,
+    "job": "Stapler_1:pick:A1>V2"
+   },
+   {
+    "i": 34,
+    "t": 1905.1001207547697,
+    "job": "Stapler_2:pick:A2>V1"
+   },
+   {
+    "i": 35,
+    "t": 2015.2144769442946,
+    "job": "Stapler_1:pick:A1>V2"
+   },
+   {
+    "i": 36,
+    "t": 2018.2775881322889,
+    "job": "Stapler_2:pick:A2>V1"
+   },
+   {
+    "i": 37,
+    "t": 2018.2775881322889,
+    "job": "Stapler_3:charge:L1"
+   },
+   {
+    "i": 38,
+    "t": 2131.4550555098094,
+    "job": "Stapler_2:pick:A1>V1"
+   },
+   {
+    "i": 39,
+    "t": 2231.476104872433,
+    "job": "Stapler_2:pick:A2>V1"
+   },
+   {
+    "i": 40,
+    "t": 2328.75049540098,
+    "job": "Stapler_2:pick:A1>V1"
+   },
+   {
+    "i": 41,
+    "t": 2405.8130240594787,
+    "job": "Stapler_1:pick:A2>V2"
+   },
+   {
+    "i": 42,
+    "t": 2426.024885929527,
+    "job": "Stapler_2:pick:A1>V1"
+   },
+   {
+    "i": 43,
+    "t": 2503.087414588026,
+    "job": "Stapler_1:pick:A2>V2"
+   },
+   {
+    "i": 44,
+    "t": 2523.299276458074,
+    "job": "Stapler_2:pick:A1>V1"
+   },
+   {
+    "i": 45,
+    "t": 2600.3618051165736,
+    "job": "Stapler_1:pick:A2>V2"
+   },
+   {
+    "i": 46,
+    "t": 2620.573666986621,
+    "job": "Stapler_2:pick:A1>V1"
+   },
+   {
+    "i": 47,
+    "t": 2697.636195645121,
+    "job": "Stapler_1:pick:A2>V2"
+   },
+   {
+    "i": 48,
+    "t": 2794.9105861736684,
+    "job": "Stapler_1:pick:A1>V2"
+   },
+   {
+    "i": 49,
+    "t": 2892.184976702216,
+    "job": "Stapler_1:pick:A2>V2"
+   }
+  ],
+  "workCounters": {
+   "desEvents": 44606,
+   "jobsStarted": 461,
+   "runnerTicks": 23
+  },
+  "wallMsInformative": null
+ }
+}

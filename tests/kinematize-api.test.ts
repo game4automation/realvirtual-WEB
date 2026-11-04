@@ -235,3 +235,30 @@ describe('applyKinematicsSpec — Signals', () => {
     expect(list[1].Type).toBe('PLCInputBool');
   });
 });
+
+describe('editor.kinematize — path lists with commas (rv-path-list)', () => {
+  type Resolve = (ctx: unknown, a: Record<string, unknown>) => Record<string, unknown>;
+  const ctxOver = (root: Object3D) => ({ viewer: { currentModelRoot: root, registry: null }, selection: [] });
+
+  it('resolveArgs keeps a comma-named part as ONE path (JSON only then; plain names stay plain)', async () => {
+    const { editorKinematizeImpl } = await import('../src/plugins/mcp-bridge/rv-mcp-editor-tools');
+    const { parsePathList } = await import('../src/core/hmi/rv-path-list');
+    const resolve = editorKinematizeImpl.resolveArgs as unknown as Resolve;
+    const root = new Object3D(); root.name = 'Asset';
+    const r = resolve(ctxOver(root), { paths: '["Asset/LINK,PLATE"]', groupName: 'Axis' });
+    expect(r['paths']).toBe('["Asset/LINK,PLATE"]');
+    // Replay parses the stored line back to the same single path.
+    expect(parsePathList(r['paths'])).toEqual(['Asset/LINK,PLATE']);
+    // Legacy comma input still means two paths, stored byte-identical to before.
+    const legacy = resolve(ctxOver(root), { paths: 'A,B', groupName: 'Axis' })['paths'];
+    expect(legacy).toBe('A\nB');
+    expect(parsePathList(legacy)).toEqual(['A', 'B']);
+  });
+
+  it('resolveArgs refuses an invalid JSON list instead of splitting it', async () => {
+    const { editorKinematizeImpl } = await import('../src/plugins/mcp-bridge/rv-mcp-editor-tools');
+    const resolve = editorKinematizeImpl.resolveArgs as unknown as Resolve;
+    const root = new Object3D(); root.name = 'Asset';
+    expect(() => resolve(ctxOver(root), { paths: '["Asset/LINK,PLATE"', groupName: 'Axis' })).toThrow(/not valid JSON/);
+  });
+});

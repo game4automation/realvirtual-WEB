@@ -34,6 +34,8 @@
  */
 
 import type { RVViewer } from '../../core/rv-viewer';
+import { fromStoredMapping } from '../../core/engine/rv-signal-mapping-address';
+import type { Object3D } from 'three';
 import type { RVViewerPlugin } from '../../core/rv-plugin';
 import type { SignalStore } from '../../core/engine/rv-signal-store';
 import { getFieldDescriptor, getSchemaDefaults, type FieldDescriptor } from '../../core/engine/rv-component-registry';
@@ -422,10 +424,13 @@ function readUserDataField(viewer: RVViewer, nodePath: string, componentType: st
   return rv?.[componentType]?.[field];
 }
 
-function readNodeMappings(target: SignalBindTarget): SignalMapping[] {
+function readNodeMappings(target: SignalBindTarget, viewer: RVViewer): SignalMapping[] {
   const rv = target.node.userData?.realvirtual as Record<string, unknown> | undefined;
   const links = rv?.SignalLinks as { Mappings?: unknown } | undefined;
-  return Array.isArray(links?.Mappings) ? links!.Mappings as SignalMapping[] : [];
+  if (!Array.isArray(links?.Mappings)) return [];
+  // plan-769 F15: the stored record names the component by address — read it back.
+  return (links!.Mappings as SignalMapping[]).map((m) =>
+    fromStoredMapping(m, target.node as Object3D, viewer.registry ?? null, viewer.signalStore ?? null));
 }
 
 function sameUnitScale(a: SignalMapping['unitScale'], b: SignalMapping['unitScale']): boolean {
@@ -460,7 +465,7 @@ interface BracketPlan {
  */
 function verifyApplied(plan: BracketPlan): void {
   const { viewer, target, row, finalMapping, scale } = plan;
-  const docMapping = readNodeMappings(target).find((m) => mappingMatchesRow(m, row));
+  const docMapping = readNodeMappings(target, viewer).find((m) => mappingMatchesRow(m, row));
   if (!docMapping || docMapping.signal !== finalMapping.signal) {
     throw new Error(`the mapping of slot "${row.slot}" did not reach the document`);
   }

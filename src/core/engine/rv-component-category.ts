@@ -100,6 +100,7 @@ const BUILTIN_RULES: readonly BuiltinRule[] = [
   { match: 'GripTarget', category: 'robotics', label: 'Grip Targets' },
   // Signals
   { match: 'ConnectSignal', category: 'signals' },
+  { match: 'SignalConnector', category: 'signals', label: 'Signal Connectors' },
   { match: 'PLCInput', prefix: true, category: 'signals' },
   { match: 'PLCOutput', prefix: true, category: 'signals' },
   // Logic
@@ -113,6 +114,16 @@ const BUILTIN_RULES: readonly BuiltinRule[] = [
   // Physics
   { match: 'BoxCollider', category: 'physics', label: 'Box Colliders' },
   { match: 'WebPhysicsZone', category: 'physics', label: 'Physics Zones' },
+  { match: 'WebPhysicsZone2D', category: 'physics', label: '2D Physics Zones' },
+  // plan-673 — detail physics (MuJoCo)
+  { match: 'WebMuJoCoRegion', category: 'physics', label: 'Detail Physics Regions' },
+  { match: 'DynamicAxis', category: 'physics', label: 'Dynamic Axes' },
+  { match: 'ContactProfile', category: 'physics', label: 'Contact Profiles' },
+  { match: 'CollisionShapeSet', category: 'physics', label: 'Collision Shape Sets' },
+  { match: 'FreeBody', category: 'physics', label: 'Free Bodies' },
+  { match: 'GripLoad', category: 'physics', label: 'Grip Loads' },
+  { match: 'Movable', category: 'physics', label: 'Movable' },
+  { match: 'LocomotionPolicy', category: 'physics', label: 'Locomotion Policies' },
 ];
 
 const EXACT_RULES = new Map<string, BuiltinRule>();

@@ -19,6 +19,8 @@
  * SceneStore op queue is single-flight, so two ops never run concurrently.
  */
 
+import type { Object3D } from 'three';
+import { isUnsafeObjectKey, ownValue } from '../../engine/rv-safe-keys';
 import type { RVViewer } from '../../rv-viewer';
 import type { LayoutPlannerPlugin } from '../../../plugins/layout-planner';
 import type {
@@ -47,12 +49,18 @@ import { saveStartPos, clearStartPos } from '../camera-startpos-store';
 import { deriveModelKey } from '../../../plugins/camera-startpos-plugin';
 import { applySchema, getRegisteredFactories, resolveComponentRefs } from '../../engine/rv-component-registry';
 import type { NodeRegistry } from '../../engine/rv-node-registry';
-import { applyLocalPose } from '../../engine/rv-node-transform';
+import { applyLocalPose, refreshWorldMatricesDeep } from '../../engine/rv-node-transform';
+import { removeAuthoredSubtree } from '../../engine/rv-scene-loader';
+import { mintFromIdMap } from '../../engine/rv-subtree-instantiate';
+import { identityIdOf } from '../../engine/rv-decode-identity';
+import { addressedReferenceValue } from '../../engine/rv-reference-writer';
+import { reportReferenceTargetUnsaved } from '../problems-store';
 import type { SignalMapping } from '../../../plugins/layout-planner/rv-layout-store';
 import { syncNodeSignalBindingPersistence } from '../../../plugins/signal-bind/signal-binding-persistence';
 import {
   beginSignalSyncWave, endSignalSyncWave, syncSignalSubtree,
 } from '../../engine/rv-signal-editor-sync';
+import { PARAMETRIC_COMPONENT_TYPE, emitParametricValuesChanged } from '../../engine/rv-parametric-component';
 
 export interface ExecutorContext {
   viewer: RVViewer;
@@ -191,8 +199,19 @@ function removeConnectionTypeInverse(op: RemoveConnectionTypeOp): void {
 
 // ─── addNode / removeNode ───────────────────────────────────────────────
 
+/**
+ * plan-769 Phase 2 (F11): the id of the node an `addNode` creates / a `removeNode`
+ * re-creates on undo — `op.idMap.node`, minted on the first apply and written back
+ * onto the op (the store records it after the apply), so undo/redo, a reloaded op
+ * log and a remote peer give the node the SAME id. Runtime only (F17).
+ */
+function opNodeId(op: AddNodeOp | RemoveNodeOp): string {
+  if (!op.idMap || typeof op.idMap !== 'object') op.idMap = {};
+  return mintFromIdMap(op.idMap, 'node');
+}
+
 function addNodeForward(op: AddNodeOp, ctx: ExecutorContext): void {
-  ctx.viewer.createComponentNode(op.spec);
+  ctx.viewer.createComponentNode(op.spec, opNodeId(op));
   syncSignalsAt(ctx, op.nodePath);
   ctx.viewer.rebuildIKPaths?.();
   ctx.viewer.markRenderDirty?.();
@@ -205,13 +224,27 @@ function addNodeInverse(op: AddNodeOp, ctx: ExecutorContext): void {
 }
 
 function removeNodeForward(op: RemoveNodeOp, ctx: ExecutorContext): void {
-  removeNodeAndReleaseSignals(ctx, op.nodePath);
+  // Remember the identity the node had, so undo re-creates THAT node (refs by
+  // address to it resolve again) — unless the op already carries it.
+  if (!op.idMap?.node) {
+    const live = ctx.viewer.registry?.getNode(op.nodePath) ?? null;
+    const id = live ? identityIdOf(live) : null;
+    if (id) op.idMap = { ...(op.idMap ?? {}), node: id };
+  }
+  if (op.authored === true) removeAuthoredNodeAndReleaseSignals(ctx, op.nodePath);
+  else removeNodeAndReleaseSignals(ctx, op.nodePath);
   ctx.viewer.rebuildIKPaths?.();
   ctx.viewer.markRenderDirty?.();
 }
 
 function removeNodeInverse(op: RemoveNodeOp, ctx: ExecutorContext): void {
-  ctx.viewer.createComponentNode(op.spec);
+  ctx.viewer.createComponentNode(op.spec, opNodeId(op));
+  if (op.authored === true) {
+    // plan-628 8.7: the restored node is the AUTHORED node again, not an
+    // op-created one — a later delete must be persisted as an authored removal.
+    const node = ctx.viewer.registry?.getNode(op.nodePath);
+    if (node) delete node.userData.__rvAdded;
+  }
   syncSignalsAt(ctx, op.nodePath);
   ctx.viewer.rebuildIKPaths?.();
   ctx.viewer.markRenderDirty?.();
@@ -252,6 +285,27 @@ function removeNodeAndReleaseSignals(ctx: ExecutorContext, nodePath: string): vo
   }
 }
 
+/**
+ * plan-628 8.7: the authored twin of {@link removeNodeAndReleaseSignals}. The
+ * eligibility rule lives in the core (`isAuthoredRemovalEligible`); an
+ * ineligible target stays untouched — the protection of every other authored
+ * node is unchanged.
+ */
+function removeAuthoredNodeAndReleaseSignals(ctx: ExecutorContext, nodePath: string): void {
+  const registry = ctx.viewer.registry;
+  const node = registry?.getNode(nodePath) ?? null;
+  if (!registry || !node) return;
+  if (!removeAuthoredSubtree(registry, nodePath)) {
+    console.warn(`[scene-edits] authored removeNode refused for ${nodePath}: not an eligible path-network node`);
+    return;
+  }
+  try {
+    syncSignalSubtree(ctx.viewer, node);
+  } catch (e) {
+    console.warn(`[scene-edits] signal release failed for ${nodePath}:`, e);
+  }
+}
+
 // ─── transformNode ──────────────────────────────────────────────────────
 //
 // `transform.scale` is read by NEITHER function, and that is the whole scene
@@ -267,6 +321,8 @@ function transformNodeForward(op: RvTransformNodeOp, ctx: ExecutorContext): void
   const node = ctx.viewer.registry?.getNode(op.nodePath);
   if (!node) return; // tolerate — base GLB may have changed
   applyLocalPose(node, op.transform.position, op.transform.quaternion);
+  // Baked placement content is matrix-frozen: recompose the whole subtree, as the gizmo does.
+  refreshWorldMatricesDeep(node);
   ctx.viewer.markRenderDirty?.();
 }
 
@@ -274,16 +330,34 @@ function transformNodeInverse(op: RvTransformNodeOp, ctx: ExecutorContext): void
   const node = ctx.viewer.registry?.getNode(op.nodePath);
   if (!node) return;
   applyLocalPose(node, op.prev.position, op.prev.quaternion);
+  refreshWorldMatricesDeep(node);
   ctx.viewer.markRenderDirty?.();
 }
 
 // ─── setField / unsetField ──────────────────────────────────────────────
 
 function setFieldForward(op: SetFieldOp, ctx: ExecutorContext): void {
+  // plan-769 Phase 3b: a ComponentReference the writer can pin is stored as its
+  // ADDRESS — and written back onto the op (recorded after the apply, the Phase-2
+  // idMap pattern), so the draft and the overlay the planner save bakes carry it too.
+  const registry = ctx.viewer.registry;
+  const owner = registry?.getNode(op.nodePath) ?? null;
+  if (registry && owner) {
+    const addressed = addressedReferenceValue(registry, owner, op.componentType, op.fieldName, op.value, {
+      // F21: a reference into another document's not-yet-saved id is visible now.
+      onUnsavedTarget: (t) => reportReferenceTargetUnsaved({
+        referrerPath: op.nodePath, address: t.address,
+        targetPath: registry.getPathForNode(t.target) ?? t.target.name,
+        documentName: t.documentRoot?.name ?? 'the referenced document',
+      }),
+    });
+    if (addressed !== op.value) (op as { value: unknown }).value = addressed;
+  }
   writeUserDataField(ctx.viewer, op.nodePath, op.componentType, op.fieldName, op.value);
   reapplySchemaForComponent(ctx.viewer, op.nodePath, op.componentType);
   syncSignalLinksRuntime(ctx.viewer, op.nodePath, op.componentType, op.fieldName, op.value);
   syncSignalsAt(ctx, op.nodePath);
+  notifyParametricValues(ctx.viewer, op);
   ctx.viewer.markRenderDirty?.();
 }
 
@@ -298,6 +372,7 @@ function setFieldInverse(op: SetFieldOp, ctx: ExecutorContext): void {
   reapplySchemaForComponent(ctx.viewer, op.nodePath, op.componentType);
   syncSignalLinksRuntime(ctx.viewer, op.nodePath, op.componentType, op.fieldName, op.prev);
   syncSignalsAt(ctx, op.nodePath);
+  notifyParametricValues(ctx.viewer, op);
   ctx.viewer.markRenderDirty?.();
 }
 
@@ -306,6 +381,7 @@ function unsetFieldForward(op: UnsetFieldOp, ctx: ExecutorContext): void {
   reapplySchemaForComponent(ctx.viewer, op.nodePath, op.componentType);
   syncSignalLinksRuntime(ctx.viewer, op.nodePath, op.componentType, op.fieldName, undefined);
   syncSignalsAt(ctx, op.nodePath);
+  notifyParametricValues(ctx.viewer, op);
   ctx.viewer.markRenderDirty?.();
 }
 
@@ -315,7 +391,18 @@ function unsetFieldInverse(op: UnsetFieldOp, ctx: ExecutorContext): void {
   reapplySchemaForComponent(ctx.viewer, op.nodePath, op.componentType);
   syncSignalLinksRuntime(ctx.viewer, op.nodePath, op.componentType, op.fieldName, op.prev);
   syncSignalsAt(ctx, op.nodePath);
+  notifyParametricValues(ctx.viewer, op);
   ctx.viewer.markRenderDirty?.();
+}
+
+/**
+ * plan-650 Phase 5: a write to `ParametricComponent.Values` (do, undo or redo)
+ * re-materialises the placement that holds the family — the listener lives in
+ * the lazily loaded placement module and is absent until it ran once.
+ */
+function notifyParametricValues(viewer: RVViewer, op: { nodePath: string; componentType: string; fieldName: string }): void {
+  if (op.componentType !== PARAMETRIC_COMPONENT_TYPE || op.fieldName !== 'Values') return;
+  emitParametricValuesChanged(viewer, op.nodePath);
 }
 
 function syncSignalLinksRuntime(
@@ -342,7 +429,7 @@ export function writeUserDataField(
   viewer: RVViewer, nodePath: string, componentType: string, fieldName: string, value: unknown,
 ): void {
   const node = viewer.registry?.getNode(nodePath);
-  if (!node) return;
+  if (!node || isUnsafeObjectKey(componentType) || isUnsafeObjectKey(fieldName)) return;
   const ud = node.userData as Record<string, unknown>;
   let rv = ud['realvirtual'] as Record<string, Record<string, unknown>> | undefined;
   if (!rv) { rv = {}; ud['realvirtual'] = rv; }
@@ -350,7 +437,7 @@ export function writeUserDataField(
   // property inspector — which memoises its field rows on the `data` object
   // reference — re-renders with the new value. Covers undo/redo and any
   // op-driven edit that doesn't go through the inspector's optimistic path.
-  rv[componentType] = { ...rv[componentType], [fieldName]: value };
+  rv[componentType] = { ...(ownValue(rv, componentType) as Record<string, unknown> | undefined), [fieldName]: value };
 }
 
 /** Exported for the asset editor's executors (same clone-on-write semantics). */
@@ -376,7 +463,18 @@ export function deleteUserDataField(
  * the new value at runtime — not just inside userData).
  * Exported for the asset editor's executors.
  */
-export function reapplySchemaForComponent(viewer: RVViewer, nodePath: string, componentType: string): void {
+export function reapplySchemaForComponent(
+  viewer: RVViewer,
+  nodePath: string,
+  componentType: string,
+  /**
+   * plan-610: the authoring scope for reference resolution — a node; the
+   * registry walks to its enclosing registered scope root, exactly like the
+   * loader (`initSubtree` → `registerScopeNames`). Omitted = the unscoped
+   * resolution every other caller has always had.
+   */
+  opts?: { scope?: Object3D | null },
+): void {
   const reg = viewer.registry;
   if (!reg) return;
   // plan-502 F13: LogicSteps are built by the logic engine, not the component
@@ -396,21 +494,29 @@ export function reapplySchemaForComponent(viewer: RVViewer, nodePath: string, co
   if (!node) return;
   const rv = node.userData?.realvirtual as Record<string, Record<string, unknown>> | undefined;
   const data = rv?.[componentType] ?? {};
+  // IKTarget grip references live outside the schema; undo must restore the live pointer too.
+  if (componentType === 'IKTarget') {
+    (instance as import('../../engine/rv-ik-target').RVIKTarget).refreshGrip(reg);
+  }
 
   // Find the schema. Most components register via `getRegisteredFactories`;
   // a few (Drive, drive behaviors) have their schema on the class itself.
   const factory = getRegisteredFactories().get(componentType);
   if (factory) {
     applySchema(instance as unknown as Record<string, unknown>, factory.schema, data);
-    resolveRefs(instance, reg);
+    resolveRefs(instance, reg, opts?.scope);
     reapplyConfig(instance);
+    // Path edits and their inverses must refresh the filtered runtime order together.
+    if (componentType === 'IKPath') {
+      (instance as import('../../engine/rv-ik-path').RVIKPath).rebuildTargets(reg);
+    }
     return;
   }
   // Fallback: instance carries a static `schema` field (Drive / drive behaviors).
   const ctor = (instance as object).constructor as { schema?: Record<string, unknown> } | undefined;
   if (ctor?.schema) {
     applySchema(instance as unknown as Record<string, unknown>, ctor.schema as never, data);
-    resolveRefs(instance, reg);
+    resolveRefs(instance, reg, opts?.scope);
     reapplyConfig(instance);
   }
 }
@@ -424,9 +530,9 @@ export function reapplySchemaForComponent(viewer: RVViewer, nodePath: string, co
  * working until the next reload (plan-411 §2.1). Same call, same order as
  * rv-scene-loader's `constructComponentOnNode`.
  */
-function resolveRefs(instance: unknown, registry: NodeRegistry): void {
+function resolveRefs(instance: unknown, registry: NodeRegistry, scope?: Object3D | null): void {
   try {
-    resolveComponentRefs(instance as Record<string, unknown>, registry);
+    resolveComponentRefs(instance as Record<string, unknown>, registry, scope ?? undefined);
   } catch (e) {
     console.warn('[scene-exec] component ref resolution failed after reapplySchema:', e);
   }

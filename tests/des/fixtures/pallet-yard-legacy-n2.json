@@ -1,0 +1,1670 @@
+{
+  "stationGeometry": [
+    {
+      "id": "A1",
+      "kind": "pick",
+      "straight": "south",
+      "side": "outside",
+      "x": -6.6
+    },
+    {
+      "id": "P1",
+      "kind": "buffer",
+      "straight": "south",
+      "side": "inside",
+      "x": -6.6
+    },
+    {
+      "id": "P2",
+      "kind": "buffer",
+      "straight": "south",
+      "side": "inside",
+      "x": -3.2
+    },
+    {
+      "id": "P3",
+      "kind": "buffer",
+      "straight": "south",
+      "side": "outside",
+      "x": -3.2
+    },
+    {
+      "id": "P4",
+      "kind": "buffer",
+      "straight": "south",
+      "side": "inside",
+      "x": 0.2
+    },
+    {
+      "id": "P5",
+      "kind": "buffer",
+      "straight": "south",
+      "side": "outside",
+      "x": 0.2
+    },
+    {
+      "id": "A2",
+      "kind": "pick",
+      "straight": "south",
+      "side": "outside",
+      "x": 3.6
+    },
+    {
+      "id": "P6",
+      "kind": "buffer",
+      "straight": "south",
+      "side": "inside",
+      "x": 3.6
+    },
+    {
+      "id": "W",
+      "kind": "wait",
+      "straight": "north",
+      "side": "inside",
+      "x": 5.3
+    },
+    {
+      "id": "L1",
+      "kind": "charger",
+      "straight": "north",
+      "side": "inside",
+      "x": 1.9
+    },
+    {
+      "id": "V1",
+      "kind": "drop",
+      "straight": "north",
+      "side": "outside",
+      "x": 1.9
+    },
+    {
+      "id": "L2",
+      "kind": "charger",
+      "straight": "north",
+      "side": "inside",
+      "x": -1.5
+    },
+    {
+      "id": "V2",
+      "kind": "drop",
+      "straight": "north",
+      "side": "outside",
+      "x": -1.5
+    }
+  ],
+  "pathGraph": [
+    {
+      "id": "South_1",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            -7.5,
+            0,
+            -4
+          ],
+          "to": [
+            -6.9,
+            0,
+            -4
+          ]
+        }
+      ],
+      "successors": [
+        "South_A1_P1_In"
+      ]
+    },
+    {
+      "id": "South_A1_P1_In",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            -6.9,
+            0,
+            -4
+          ],
+          "to": [
+            -5.1,
+            0,
+            -4
+          ]
+        }
+      ],
+      "successors": [
+        "South_A1_P1_Out"
+      ],
+      "zone": "Merge_A1_P1",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "South_A1_P1_Out",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            -5.1,
+            0,
+            -4
+          ],
+          "to": [
+            -4.5,
+            0,
+            -4
+          ]
+        }
+      ],
+      "successors": [
+        "South_2"
+      ],
+      "zone": "Merge_A1_P1",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "South_2",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            -4.5,
+            0,
+            -4
+          ],
+          "to": [
+            -3.5,
+            0,
+            -4
+          ]
+        }
+      ],
+      "successors": [
+        "South_P2_P3_In"
+      ]
+    },
+    {
+      "id": "South_P2_P3_In",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            -3.5,
+            0,
+            -4
+          ],
+          "to": [
+            -1.7,
+            0,
+            -4
+          ]
+        }
+      ],
+      "successors": [
+        "South_P2_P3_Out"
+      ],
+      "zone": "Merge_P2_P3",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "South_P2_P3_Out",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            -1.7,
+            0,
+            -4
+          ],
+          "to": [
+            -1.1,
+            0,
+            -4
+          ]
+        }
+      ],
+      "successors": [
+        "South_3"
+      ],
+      "zone": "Merge_P2_P3",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "South_3",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            -1.1,
+            0,
+            -4
+          ],
+          "to": [
+            -0.1,
+            0,
+            -4
+          ]
+        }
+      ],
+      "successors": [
+        "South_P4_P5_In"
+      ]
+    },
+    {
+      "id": "South_P4_P5_In",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            -0.1,
+            0,
+            -4
+          ],
+          "to": [
+            1.7,
+            0,
+            -4
+          ]
+        }
+      ],
+      "successors": [
+        "South_P4_P5_Out"
+      ],
+      "zone": "Merge_P4_P5",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "South_P4_P5_Out",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            1.7,
+            0,
+            -4
+          ],
+          "to": [
+            2.3,
+            0,
+            -4
+          ]
+        }
+      ],
+      "successors": [
+        "South_4"
+      ],
+      "zone": "Merge_P4_P5",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "South_4",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            2.3,
+            0,
+            -4
+          ],
+          "to": [
+            3.3,
+            0,
+            -4
+          ]
+        }
+      ],
+      "successors": [
+        "South_A2_P6_In"
+      ]
+    },
+    {
+      "id": "South_A2_P6_In",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            3.3,
+            0,
+            -4
+          ],
+          "to": [
+            5.1,
+            0,
+            -4
+          ]
+        }
+      ],
+      "successors": [
+        "South_A2_P6_Out"
+      ],
+      "zone": "Merge_A2_P6",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "South_A2_P6_Out",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            5.1,
+            0,
+            -4
+          ],
+          "to": [
+            5.7,
+            0,
+            -4
+          ]
+        }
+      ],
+      "successors": [
+        "South_5"
+      ],
+      "zone": "Merge_A2_P6",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "South_5",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            5.7,
+            0,
+            -4
+          ],
+          "to": [
+            7.5,
+            0,
+            -4
+          ]
+        }
+      ],
+      "successors": [
+        "East"
+      ]
+    },
+    {
+      "id": "East",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            7.5,
+            0,
+            0
+          ],
+          "radius": 4,
+          "startAngle": -90,
+          "degrees": 30,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "East_2"
+      ]
+    },
+    {
+      "id": "East_2",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            7.5,
+            0,
+            0
+          ],
+          "radius": 4,
+          "startAngle": -60,
+          "degrees": 30,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "East_3"
+      ]
+    },
+    {
+      "id": "East_3",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            7.5,
+            0,
+            0
+          ],
+          "radius": 4,
+          "startAngle": -30,
+          "degrees": 30,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "East_4"
+      ]
+    },
+    {
+      "id": "East_4",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            7.5,
+            0,
+            0
+          ],
+          "radius": 4,
+          "startAngle": 0,
+          "degrees": 30,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "East_5"
+      ]
+    },
+    {
+      "id": "East_5",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            7.5,
+            0,
+            0
+          ],
+          "radius": 4,
+          "startAngle": 30,
+          "degrees": 30,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "East_6"
+      ]
+    },
+    {
+      "id": "East_6",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            7.5,
+            0,
+            0
+          ],
+          "radius": 4,
+          "startAngle": 60,
+          "degrees": 30,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "North_1"
+      ]
+    },
+    {
+      "id": "North_1",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            7.5,
+            0,
+            4
+          ],
+          "to": [
+            5.6,
+            0,
+            4
+          ]
+        }
+      ],
+      "successors": [
+        "North_W_In"
+      ]
+    },
+    {
+      "id": "North_W_In",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            5.6,
+            0,
+            4
+          ],
+          "to": [
+            3.8,
+            0,
+            4
+          ]
+        }
+      ],
+      "successors": [
+        "North_W_Out"
+      ],
+      "zone": "Merge_W",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "North_W_Out",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            3.8,
+            0,
+            4
+          ],
+          "to": [
+            3.2,
+            0,
+            4
+          ]
+        }
+      ],
+      "successors": [
+        "North_2"
+      ],
+      "zone": "Merge_W",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "North_2",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            3.2,
+            0,
+            4
+          ],
+          "to": [
+            2.2,
+            0,
+            4
+          ]
+        }
+      ],
+      "successors": [
+        "North_L1_V1_In"
+      ]
+    },
+    {
+      "id": "North_L1_V1_In",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            2.2,
+            0,
+            4
+          ],
+          "to": [
+            0.4,
+            0,
+            4
+          ]
+        }
+      ],
+      "successors": [
+        "North_L1_V1_Out"
+      ],
+      "zone": "Merge_L1_V1",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "North_L1_V1_Out",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            0.4,
+            0,
+            4
+          ],
+          "to": [
+            -0.2,
+            0,
+            4
+          ]
+        }
+      ],
+      "successors": [
+        "North_3"
+      ],
+      "zone": "Merge_L1_V1",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "North_3",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            -0.2,
+            0,
+            4
+          ],
+          "to": [
+            -1.2,
+            0,
+            4
+          ]
+        }
+      ],
+      "successors": [
+        "North_L2_V2_In"
+      ]
+    },
+    {
+      "id": "North_L2_V2_In",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            -1.2,
+            0,
+            4
+          ],
+          "to": [
+            -3,
+            0,
+            4
+          ]
+        }
+      ],
+      "successors": [
+        "North_L2_V2_Out"
+      ],
+      "zone": "Merge_L2_V2",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "North_L2_V2_Out",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            -3,
+            0,
+            4
+          ],
+          "to": [
+            -3.6,
+            0,
+            4
+          ]
+        }
+      ],
+      "successors": [
+        "North_4"
+      ],
+      "zone": "Merge_L2_V2",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "North_4",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            -3.6,
+            0,
+            4
+          ],
+          "to": [
+            -5.55,
+            0,
+            4
+          ]
+        }
+      ],
+      "successors": [
+        "North_4_2"
+      ]
+    },
+    {
+      "id": "North_4_2",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            -5.55,
+            0,
+            4
+          ],
+          "to": [
+            -7.5,
+            0,
+            4
+          ]
+        }
+      ],
+      "successors": [
+        "West"
+      ]
+    },
+    {
+      "id": "West",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            -7.5,
+            0,
+            0
+          ],
+          "radius": 4,
+          "startAngle": 90,
+          "degrees": 30,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "West_2"
+      ]
+    },
+    {
+      "id": "West_2",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            -7.5,
+            0,
+            0
+          ],
+          "radius": 4,
+          "startAngle": 120,
+          "degrees": 30,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "West_3"
+      ]
+    },
+    {
+      "id": "West_3",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            -7.5,
+            0,
+            0
+          ],
+          "radius": 4,
+          "startAngle": 150,
+          "degrees": 30,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "West_4"
+      ]
+    },
+    {
+      "id": "West_4",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            -7.5,
+            0,
+            0
+          ],
+          "radius": 4,
+          "startAngle": 180,
+          "degrees": 30,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "West_5"
+      ]
+    },
+    {
+      "id": "West_5",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            -7.5,
+            0,
+            0
+          ],
+          "radius": 4,
+          "startAngle": 210,
+          "degrees": 30,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "West_6"
+      ]
+    },
+    {
+      "id": "West_6",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            -7.5,
+            0,
+            0
+          ],
+          "radius": 4,
+          "startAngle": 240,
+          "degrees": 30,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "South_1"
+      ]
+    },
+    {
+      "id": "Stich_A1",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            -6.6,
+            0,
+            -7
+          ],
+          "to": [
+            -6.6,
+            0,
+            -5.5
+          ]
+        }
+      ],
+      "successors": [
+        "Stich_A1_Arc"
+      ],
+      "zone": "Stich_A1",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_A1_Arc",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            -5.1,
+            0,
+            -5.5
+          ],
+          "radius": 1.5,
+          "startAngle": 180,
+          "degrees": -90,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "South_A1_P1_Out"
+      ],
+      "zone": "Merge_A1_P1",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_P1",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            -6.6,
+            0,
+            -1
+          ],
+          "to": [
+            -6.6,
+            0,
+            -2.5
+          ]
+        }
+      ],
+      "successors": [
+        "Stich_P1_Arc"
+      ],
+      "zone": "Stich_P1",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_P1_Arc",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            -5.1,
+            0,
+            -2.5
+          ],
+          "radius": 1.5,
+          "startAngle": 180,
+          "degrees": 90,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "South_A1_P1_Out"
+      ],
+      "zone": "Merge_A1_P1",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_P2",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            -3.2,
+            0,
+            -1
+          ],
+          "to": [
+            -3.2,
+            0,
+            -2.5
+          ]
+        }
+      ],
+      "successors": [
+        "Stich_P2_Arc"
+      ],
+      "zone": "Stich_P2",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_P2_Arc",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            -1.7,
+            0,
+            -2.5
+          ],
+          "radius": 1.5,
+          "startAngle": 180,
+          "degrees": 90,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "South_P2_P3_Out"
+      ],
+      "zone": "Merge_P2_P3",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_P3",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            -3.2,
+            0,
+            -7
+          ],
+          "to": [
+            -3.2,
+            0,
+            -5.5
+          ]
+        }
+      ],
+      "successors": [
+        "Stich_P3_Arc"
+      ],
+      "zone": "Stich_P3",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_P3_Arc",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            -1.7,
+            0,
+            -5.5
+          ],
+          "radius": 1.5,
+          "startAngle": 180,
+          "degrees": -90,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "South_P2_P3_Out"
+      ],
+      "zone": "Merge_P2_P3",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_P4",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            0.2,
+            0,
+            -1
+          ],
+          "to": [
+            0.2,
+            0,
+            -2.5
+          ]
+        }
+      ],
+      "successors": [
+        "Stich_P4_Arc"
+      ],
+      "zone": "Stich_P4",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_P4_Arc",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            1.7,
+            0,
+            -2.5
+          ],
+          "radius": 1.5,
+          "startAngle": 180,
+          "degrees": 90,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "South_P4_P5_Out"
+      ],
+      "zone": "Merge_P4_P5",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_P5",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            0.2,
+            0,
+            -7
+          ],
+          "to": [
+            0.2,
+            0,
+            -5.5
+          ]
+        }
+      ],
+      "successors": [
+        "Stich_P5_Arc"
+      ],
+      "zone": "Stich_P5",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_P5_Arc",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            1.7,
+            0,
+            -5.5
+          ],
+          "radius": 1.5,
+          "startAngle": 180,
+          "degrees": -90,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "South_P4_P5_Out"
+      ],
+      "zone": "Merge_P4_P5",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_A2",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            3.6,
+            0,
+            -7
+          ],
+          "to": [
+            3.6,
+            0,
+            -5.5
+          ]
+        }
+      ],
+      "successors": [
+        "Stich_A2_Arc"
+      ],
+      "zone": "Stich_A2",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_A2_Arc",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            5.1,
+            0,
+            -5.5
+          ],
+          "radius": 1.5,
+          "startAngle": 180,
+          "degrees": -90,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "South_A2_P6_Out"
+      ],
+      "zone": "Merge_A2_P6",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_P6",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            3.6,
+            0,
+            -1
+          ],
+          "to": [
+            3.6,
+            0,
+            -2.5
+          ]
+        }
+      ],
+      "successors": [
+        "Stich_P6_Arc"
+      ],
+      "zone": "Stich_P6",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_P6_Arc",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            5.1,
+            0,
+            -2.5
+          ],
+          "radius": 1.5,
+          "startAngle": 180,
+          "degrees": 90,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "South_A2_P6_Out"
+      ],
+      "zone": "Merge_A2_P6",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_W",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            5.3,
+            0,
+            1
+          ],
+          "to": [
+            5.3,
+            0,
+            2.5
+          ]
+        }
+      ],
+      "successors": [
+        "Stich_W_Arc"
+      ],
+      "zone": "Stich_W",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_W_Arc",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            3.8,
+            0,
+            2.5
+          ],
+          "radius": 1.5,
+          "startAngle": 0,
+          "degrees": 90,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "North_W_Out"
+      ],
+      "zone": "Merge_W",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_L1",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            1.9,
+            0,
+            1
+          ],
+          "to": [
+            1.9,
+            0,
+            2.5
+          ]
+        }
+      ],
+      "successors": [
+        "Stich_L1_Arc"
+      ],
+      "zone": "Stich_L1",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_L1_Arc",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            0.4,
+            0,
+            2.5
+          ],
+          "radius": 1.5,
+          "startAngle": 0,
+          "degrees": 90,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "North_L1_V1_Out"
+      ],
+      "zone": "Merge_L1_V1",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_V1",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            1.9,
+            0,
+            7
+          ],
+          "to": [
+            1.9,
+            0,
+            5.5
+          ]
+        }
+      ],
+      "successors": [
+        "Stich_V1_Arc"
+      ],
+      "zone": "Stich_V1",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_V1_Arc",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            0.4,
+            0,
+            5.5
+          ],
+          "radius": 1.5,
+          "startAngle": 0,
+          "degrees": -90,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "North_L1_V1_Out"
+      ],
+      "zone": "Merge_L1_V1",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_L2",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            -1.5,
+            0,
+            1
+          ],
+          "to": [
+            -1.5,
+            0,
+            2.5
+          ]
+        }
+      ],
+      "successors": [
+        "Stich_L2_Arc"
+      ],
+      "zone": "Stich_L2",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_L2_Arc",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            -3,
+            0,
+            2.5
+          ],
+          "radius": 1.5,
+          "startAngle": 0,
+          "degrees": 90,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "North_L2_V2_Out"
+      ],
+      "zone": "Merge_L2_V2",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_V2",
+      "segments": [
+        {
+          "kind": "line",
+          "from": [
+            -1.5,
+            0,
+            7
+          ],
+          "to": [
+            -1.5,
+            0,
+            5.5
+          ]
+        }
+      ],
+      "successors": [
+        "Stich_V2_Arc"
+      ],
+      "zone": "Stich_V2",
+      "zoneCapacity": 1
+    },
+    {
+      "id": "Stich_V2_Arc",
+      "segments": [
+        {
+          "kind": "arc",
+          "center": [
+            -3,
+            0,
+            5.5
+          ],
+          "radius": 1.5,
+          "startAngle": 0,
+          "degrees": -90,
+          "plane": "XZ"
+        }
+      ],
+      "successors": [
+        "North_L2_V2_Out"
+      ],
+      "zone": "Merge_L2_V2",
+      "zoneCapacity": 1
+    }
+  ],
+  "vehicles": [
+    {
+      "id": "Stapler_1",
+      "startPathId": "West"
+    },
+    {
+      "id": "Stapler_2",
+      "startPathId": "East"
+    },
+    {
+      "id": "Stapler_3",
+      "startPathId": "West_4"
+    }
+  ],
+  "config": {
+    "stations": [
+      {
+        "id": "A1",
+        "kind": "pick",
+        "pathId": "Stich_A1",
+        "stichLengthM": 3.856194490192345,
+        "conveyor": "Conveyor_A1",
+        "handlingHeightMm": 512
+      },
+      {
+        "id": "P1",
+        "kind": "buffer",
+        "pathId": "Stich_P1",
+        "stichLengthM": 3.856194490192345,
+        "slot": "Slot_P1",
+        "handlingHeightMm": 12
+      },
+      {
+        "id": "P2",
+        "kind": "buffer",
+        "pathId": "Stich_P2",
+        "stichLengthM": 3.856194490192345,
+        "slot": "Slot_P2",
+        "handlingHeightMm": 12
+      },
+      {
+        "id": "P3",
+        "kind": "buffer",
+        "pathId": "Stich_P3",
+        "stichLengthM": 3.856194490192345,
+        "slot": "Slot_P3",
+        "handlingHeightMm": 12
+      },
+      {
+        "id": "P4",
+        "kind": "buffer",
+        "pathId": "Stich_P4",
+        "stichLengthM": 3.856194490192345,
+        "slot": "Slot_P4",
+        "handlingHeightMm": 12
+      },
+      {
+        "id": "P5",
+        "kind": "buffer",
+        "pathId": "Stich_P5",
+        "stichLengthM": 3.856194490192345,
+        "slot": "Slot_P5",
+        "handlingHeightMm": 12
+      },
+      {
+        "id": "A2",
+        "kind": "pick",
+        "pathId": "Stich_A2",
+        "stichLengthM": 3.856194490192345,
+        "conveyor": "Conveyor_A2",
+        "handlingHeightMm": 512
+      },
+      {
+        "id": "P6",
+        "kind": "buffer",
+        "pathId": "Stich_P6",
+        "stichLengthM": 3.856194490192345,
+        "slot": "Slot_P6",
+        "handlingHeightMm": 12
+      },
+      {
+        "id": "L1",
+        "kind": "charger",
+        "pathId": "Stich_L1",
+        "stichLengthM": 3.856194490192345,
+        "handlingHeightMm": 0
+      },
+      {
+        "id": "V1",
+        "kind": "drop",
+        "pathId": "Stich_V1",
+        "stichLengthM": 3.856194490192345,
+        "conveyor": "Conveyor_V1",
+        "handlingHeightMm": 512
+      },
+      {
+        "id": "L2",
+        "kind": "charger",
+        "pathId": "Stich_L2",
+        "stichLengthM": 3.856194490192345,
+        "handlingHeightMm": 0
+      },
+      {
+        "id": "V2",
+        "kind": "drop",
+        "pathId": "Stich_V2",
+        "stichLengthM": 3.856194490192345,
+        "conveyor": "Conveyor_V2",
+        "handlingHeightMm": 512
+      }
+    ],
+    "waitPointPathId": "Stich_W",
+    "vehicles": [
+      "Stapler_1",
+      "Stapler_2",
+      "Stapler_3"
+    ],
+    "production": {
+      "intervalSec": 90,
+      "phaseSec": [
+        0,
+        45
+      ]
+    },
+    "shippingPauses": {
+      "everySec": 1200,
+      "durationSec": 300,
+      "offsetSec": [
+        300,
+        900
+      ]
+    },
+    "vehicle": {
+      "travelSpeedMmS": 1200,
+      "reverseSpeedMmS": 300,
+      "liftSpeedLoadedMmS": 150,
+      "liftSpeedEmptyMmS": 300,
+      "travelHeightMm": 150,
+      "handlingDeltaMm": 30
+    },
+    "battery": {
+      "startSoc": [
+        90,
+        70,
+        50
+      ],
+      "drivePerMin": 1.2,
+      "liftPerM": 0.05,
+      "idlePerMin": 0.2,
+      "threshold": 30,
+      "target": 80,
+      "chargePerMin": 5,
+      "reserveToCharger": 5,
+      "travelSlack": 1.5,
+      "chargerWaitReserveSec": 600
+    }
+  },
+  "agv": {
+    "Stapler_1": {
+      "PathId": "West",
+      "StartPosition": 600,
+      "TargetSpeed": 1200,
+      "Acceleration": 500,
+      "Deceleration": 500,
+      "LateralAcceleration": 500,
+      "SafetyGap": 300,
+      "DockingSpeed": 300,
+      "DockingDistance": 500,
+      "VehicleLength": 1750,
+      "VehicleWidth": 860,
+      "AllowReverse": true,
+      "ReverseSpeed": 300,
+      "ScannerFields": true,
+      "ScannerReactionTime": 0.2,
+      "ProtectiveMargin": 200,
+      "WarningMargin": 1000
+    },
+    "Stapler_2": {
+      "PathId": "East",
+      "StartPosition": 600,
+      "TargetSpeed": 1200,
+      "Acceleration": 500,
+      "Deceleration": 500,
+      "LateralAcceleration": 500,
+      "SafetyGap": 300,
+      "DockingSpeed": 300,
+      "DockingDistance": 500,
+      "VehicleLength": 1750,
+      "VehicleWidth": 860,
+      "AllowReverse": true,
+      "ReverseSpeed": 300,
+      "ScannerFields": true,
+      "ScannerReactionTime": 0.2,
+      "ProtectiveMargin": 200,
+      "WarningMargin": 1000
+    },
+    "Stapler_3": {
+      "PathId": "West_4",
+      "StartPosition": 600,
+      "TargetSpeed": 1200,
+      "Acceleration": 500,
+      "Deceleration": 500,
+      "LateralAcceleration": 500,
+      "SafetyGap": 300,
+      "DockingSpeed": 300,
+      "DockingDistance": 500,
+      "VehicleLength": 1750,
+      "VehicleWidth": 860,
+      "AllowReverse": true,
+      "ReverseSpeed": 300,
+      "ScannerFields": true,
+      "ScannerReactionTime": 0.2,
+      "ProtectiveMargin": 200,
+      "WarningMargin": 1000
+    }
+  }
+}

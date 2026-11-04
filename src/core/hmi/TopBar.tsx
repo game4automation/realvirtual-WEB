@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage } from '../rv-safe-storage';
+
+import { FIELD_BORDER, PANEL_SURFACE } from './shared-sx';
 import { useState, useEffect, useSyncExternalStore, useRef, type ReactElement } from 'react';
 import { useEditorPlugin } from '../../hooks/use-editor-plugin';
 import { Typography, Box, Paper } from '@mui/material';
@@ -16,6 +19,7 @@ import { useLeftWindowWidth, useRightWindowWidth } from '../../hooks/use-left-wi
 import { useViewportInsets } from '../../hooks/use-viewport-insets';
 import { useUIVisible } from './ui-context-store';
 import { ModeDropdown } from './ModeDropdown';
+import { DocumentNavBar } from './DocumentNavBar';
 import {
   useCameraSegments, useFollowSegments, HmiToggleButton,
   useFpvActive, useFpvToggle, FPV_ICON,
@@ -26,6 +30,7 @@ import {
   type ActionDropdownItem,
 } from './action-group';
 import { useRenderModeSegment } from './RenderModeBar';
+import { useSoundSegment } from './SoundSegment';
 import { SettingsPanel } from './SettingsPanel';
 import { getSceneStore } from './scene/scene-store-singleton';
 import { MachineControlPanel } from './MachineControlPanel';
@@ -198,7 +203,7 @@ export function TopBar() {
   // next to an open left-docked window (shared with the floating tool toolbar).
   const openWindowWidth = useLeftWindowWidth();
   const modeLeftOffset = ACTIVITY_BAR_WIDTH + (openWindowWidth > 0 ? openWindowWidth + 8 : 8);
-  // A mode-locked (kiosk / single-purpose HMI like Mauser) workspace hides the
+  // A mode-locked (kiosk / single-purpose HMI like a customer kiosk 3D-HMI) workspace hides the
   // Play/Pause + Reset sim controls along with the mode dropdown — there is no
   // workspace to drive, only a fixed display.
   const { locked: modeLocked } = useMode();
@@ -234,6 +239,8 @@ export function TopBar() {
   const cameraSegments = useCameraSegments();
   const followSegments = useFollowSegments();
   const renderModeSegment = useRenderModeSegment();
+  // plan-2019: only while the scene carries a Sound component.
+  const soundSegments = useSoundSegment();
   const overflowSegment = useViewOverflowSegment({
     showVr: !isMobile,
     showFpv: !isMobileDevice(),
@@ -319,10 +326,16 @@ export function TopBar() {
           display: 'flex',
           alignItems: 'center',
           gap: 0.5,
+          // Phones: the cluster wraps below the mode switcher instead of running off-screen.
+          flexWrap: { xs: 'wrap', sm: 'nowrap' },
+          maxWidth: { xs: 'calc(100vw - 16px)', sm: 'none' },
           pointerEvents: 'none',
           '& > *': { pointerEvents: 'auto' },
         }}
       >
+        {/* The way back after a reference's asset was opened in this tab —
+            first, so the chain reads left to right into the current mode. */}
+        <DocumentNavBar viewer={viewer} />
         <ModeDropdown />
         {/* Project context — one level ABOVE the model selection: it scopes the
             Models panel, it does not replace it (§4.5). Rendered inline rather
@@ -333,7 +346,7 @@ export function TopBar() {
         {/* Sim-control action group (Play/Pause + Reset) — renders the
             toolbar-button-leading slot as its own glassy pill. */}
         {hasSimControls && (
-          <ActionGroupPill>
+          <ActionGroupPill sx={{ maxWidth: { xs: '100%', sm: 'none' }, overflowX: { xs: 'auto', sm: 'hidden' }, scrollbarWidth: 'none' }}>
             <SlotRenderer slot="toolbar-button-leading" />
           </ActionGroupPill>
         )}
@@ -384,6 +397,7 @@ export function TopBar() {
             cameraSegments,
             [
               <HmiToggleButton key="hmi-toggle" />,
+              ...soundSegments,
               ...(displayPanelReachable
                 ? [
                     <ActionSegment
@@ -411,7 +425,7 @@ export function TopBar() {
           "Baked geometry" section (plan-505 F7). */}
       {showPropertyInspector && !isMobile && !settingsOpen && pluginState.showInspector
         && (pluginState.selectedNodePath || pluginState.selectedNode)
-        && (hierarchyOpen || localStorage.getItem('rv-inspector-detached') === 'true')
+        && (hierarchyOpen || readLocalStorage('rv-inspector-detached') === 'true')
         && <PropertyInspector viewer={viewer} />}
 
       {/* Machine Control Panel */}
@@ -460,8 +474,8 @@ function VRModal({ onClose }: { onClose: () => void }) {
       onClick={onClose}
     >
       <Paper
-        elevation={12}
-        sx={{ borderRadius: 2, width: 420, maxWidth: '95vw', p: { xs: 2.5, sm: 4 }, display: 'flex', flexDirection: 'column', gap: 2.5, alignItems: 'center', maxHeight: '90dvh', overflow: 'auto' }}
+        elevation={0}
+        sx={{ bgcolor: `${PANEL_SURFACE} !important`, border: `1px solid ${FIELD_BORDER}`, boxShadow: 'none', borderRadius: 1, width: 420, maxWidth: '95vw', p: { xs: 2.5, sm: 4 }, display: 'flex', flexDirection: 'column', gap: 2.5, alignItems: 'center', maxHeight: '90dvh', overflow: 'auto' }}
         onClick={(e: React.MouseEvent) => e.stopPropagation()}
       >
         <Typography variant="h6" sx={{ fontWeight: 700, color: '#4fc3f7' }}>

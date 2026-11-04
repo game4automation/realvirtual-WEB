@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 
+import { loadDesAstCheck } from '../sdk/rv-des-lint';
+
 /**
  * rv-script-host — shared QuickJS runtime with one guest context per script
  * component (plan-210 phase 0, generalising the plan-242 sandbox).
@@ -133,6 +135,7 @@ export class RVScriptHost {
    * QuickJS-WASM module (dynamic import, cached module-wide with the sandbox).
    */
   static async create(options: RVScriptHostOptions = {}): Promise<RVScriptHost> {
+    await loadDesAstCheck();
     const module = await loadQuickJSModule();
     const runtime = module.newRuntime();
     try {

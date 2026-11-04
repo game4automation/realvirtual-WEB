@@ -5,9 +5,84 @@
   "description": "Machine-readable specification of the realvirtual Open Digital Twin Format. Component data is carried per glTF node under extras.realvirtual. Where the human-readable specification.md and this file disagree, this file is normative. Licensed under CC BY 4.0 (see schema/LICENSE).",
   "formatVersion": "1.0",
   "$defs": {
+    "BlockageBudget": {
+      "type": "object",
+      "description": "Inherited progress and wait budgets for blockage diagnostics. Missing numeric values inherit from ancestors and document defaults.",
+      "properties": {
+        "Exempt": {
+          "type": "boolean",
+          "description": "Exclude this subtree from checking."
+        },
+        "Scope": {
+          "type": "string",
+          "enum": [
+            "node",
+            "subtree"
+          ],
+          "default": "subtree"
+        },
+        "ExpectFlow": {
+          "type": "boolean",
+          "description": "Require sinks in this subtree to consume during an active run."
+        },
+        "MaxWaitSec": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "exclusiveMinimum": 0,
+          "unit": "s",
+          "description": "Wait age considered overdue. Inherited default: 60 s."
+        },
+        "MaxIdleSec": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "exclusiveMinimum": 0,
+          "unit": "s",
+          "description": "Minimum time without progress; at least MaxWaitSec. Inherited default: 120 s."
+        },
+        "WarmupSec": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "unit": "s",
+          "description": "Run warmup before findings. Inherited default: 30 s."
+        },
+        "ExpectedWaits": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Expected wait kinds; inherited default: charge, setup, failure, empty."
+        },
+        "Severity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "info"
+          ],
+          "description": "Finding severity; inherited default: warning."
+        },
+        "SignalSuppress": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputBool",
+          "description": "True means expected waiting throughout this subtree."
+        },
+        "SignalBlockageFound": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Reports a finding in the declared scope at a checker sample."
+        }
+      }
+    },
     "ComponentReference": {
       "type": "object",
-      "description": "Reference to a component or PLC signal on another glTF node, identified by its scene path. The 'path' field is the ONLY identity carried today; a stable node-id field may be added alongside it in a future minor version, in which case 'path' remains valid and consumers prefer the id when both are present.",
+      "description": "Reference to a component or PLC signal on another glTF node. EXACTLY ONE of three stored forms (plan-769, rv-ODT 5a): 'path' — a node path (what Unity and every file WITHOUT 'idVersion' write; migrated on load to an address through the file's authored index, never by a guessing stage); 'address' — '<occurrence>#<NodeId>' relative to the document holding the reference ('#<id>' = a node of the same file, '<p>#<id>' = a node inside the placement whose reference node has id p, '<p>/<b>#<id>' one level deeper); 'unresolvedPath' + 'reason' — a path the writer could not resolve, kept verbatim and never guessed. A file whose scenes[0].extras.realvirtual.idVersion is 1 stores 'address' / 'unresolvedPath' only (a web save); consumers read all three.",
       "properties": {
         "type": {
           "const": "ComponentReference"
@@ -16,6 +91,20 @@
           "type": "string",
           "minLength": 1,
           "description": "Node path identifying the target, built from glTF node NAMES. NORMATIVE RULES. (1) Root inclusion: the path is absolute and STARTS AT the exported scene root node — the root's own name is the first segment, so a reference to the root itself is exactly that name and a reference to a same-named direct child is 'X/X'. The glTF scene object itself contributes no segment. (2) Separator: '/'. glTF node names may legally contain '/', but Three.js' GLTFLoader strips it from every name it loads (see rule 3), so a conforming path is unambiguously splittable on '/'; producers MUST NOT emit a name containing '/'. (3) Which name: the node's glTF name as written in the file (nodes[i].name), BEFORE any consumer-side transformation. Three.js in particular applies PropertyBinding.sanitizeNodeName (whitespace to '_', then the reserved characters [ ] . : / removed) and then appends a '_N' suffix to make names unique FILE-GLOBALLY. Neither the sanitization nor the dedup suffix belongs in this field. (4) Uniqueness: producers SHOULD ensure paths are unique within the file; where two nodes anywhere in the file share a name, producers SHOULD warn, because consumers that dedup names will break every path leading THROUGH such a node. (5) Consumer fallbacks, permitted in this order and no other: (a) exact match on the written path; (b) match after applying the consumer's own name transformation to the query (e.g. space to '_'); (c) match against a pre-transformation alias the consumer recorded for a node it renamed, including for that node's descendants; (d) unique proper-suffix match, i.e. a registered path ending in '/' + the query. A consumer MUST NOT resolve step (d) when more than one distinct target matches — it MUST report the ambiguity and treat the reference as unresolved rather than pick one. Steps (b) to (d) are tolerance for imperfect producers, not part of the contract: a conforming producer is resolved entirely by step (a)."
+        },
+        "address": {
+          "type": "string",
+          "minLength": 2,
+          "pattern": "#[^#/]+$",
+          "description": "plan-769: '<occurrence>#<NodeId>' relative to the document that holds the reference. The occurrence is the chain of reference-node NodeIds below that document, '/'-separated, empty for a node of the same file ('#<id>'). NodeIds are unique within their file (rv-ODT 5a)."
+        },
+        "unresolvedPath": {
+          "type": "string",
+          "description": "plan-769 D7: the written path a writer could not resolve to a node — kept so it can heal on a later load, never resolved by a guess."
+        },
+        "reason": {
+          "enum": ["missing", "ambiguous", "synthetic-target"],
+          "description": "Why 'unresolvedPath' has no address: no such node, more than one node, or a node the viewer generated (a bake chunk / partition)."
         },
         "componentType": {
           "type": "string",
@@ -28,8 +117,20 @@
       },
       "required": [
         "type",
-        "path",
         "componentType"
+      ],
+      "oneOf": [
+        { "required": ["path"] },
+        { "required": ["address"] },
+        { "required": ["unresolvedPath", "reason"] }
+      ]
+    },
+    "StoredPathValue": {
+      "description": "plan-769: the stored form of a declared path-string field (Kinematic.Parent, CustomRuntimeInstruction steps.targetObjects, WebPhysicsZone.StaticColliders, Connections source/target, LogicStep_Enable.Target) and of a NAME field (Source.ThisObjectAsMU) in a file with idVersion 1: '{ address }' or '{ unresolvedPath, reason }'. Files without idVersion store the plain string.",
+      "oneOf": [
+        { "type": "string" },
+        { "type": "object", "properties": { "address": { "type": "string" } }, "required": ["address"], "additionalProperties": false },
+        { "type": "object", "properties": { "unresolvedPath": { "type": "string" }, "reason": { "enum": ["missing", "ambiguous", "synthetic-target"] } }, "required": ["unresolvedPath", "reason"], "additionalProperties": false }
       ]
     },
     "Vector3": {
@@ -1280,6 +1381,14 @@
           "unit": "mm",
           "description": "Raycast length in millimeters."
         },
+        "AdditionalRayCastLayers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Layer names the raycast hits (Unity layers). A part's layer index (extras layer) is resolved to a name through the layer table: the realvirtual standard layers plus the file's own table at scenes[0].extras.realvirtual.layerNames. The sensor's own layer is added. Empty, or no known name, hits every layer. Only the nearest hit counts. Collision mode ignores it."
+        },
         "SensorOccupied": {
           "$ref": "#/$defs/ComponentReference",
           "signal": "PLCInputBool",
@@ -1354,10 +1463,85 @@
           "unit": "mm",
           "description": "Minimum front gap in millimeters kept between accumulated MUs."
         },
+        "VerticalReach": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "minimum": 0,
+          "description": "How far above its top the surface still takes over an MU, in millimeters; 0 = the transport default (100 mm). A part hanging higher - let go by a gripper in mid-air - is not caught, stays where it is and is reported by a DropDetection, which uses the same value to decide whether the surface carries a part."
+        },
         "PhysicsMode": {
           "type": "boolean",
           "default": false,
           "description": "If true and the surface lies fully inside a physics zone, the surface runs in physics mode: a kinematic conveyor body carries MUs via friction and jams/stacking are simulated physically. Ignored on Radial surfaces (v1 exclusion) and when the deployment switch simulation.physicsSurfaceDefault is false."
+        }
+      }
+    },
+    "TransportGuided": {
+      "type": "object",
+      "description": "Guided conveyor that leads MUs along a straight line or a circular arc at the linear speed of the Drive on the same node (port of the Unity TransportGuided + GuideCircle/GuideLine). The path starts at the node origin along local +X (Unity convention); an arc bends around the centre -forward * sign(Angle) * Radius.",
+      "properties": {
+        "Circular": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true the MUs follow a circular arc (Radius, Angle); otherwise a straight line of Length."
+        },
+        "Length": {
+          "type": "number",
+          "default": 1,
+          "unit": "m",
+          "minimum": 0.0001,
+          "description": "Length of the straight guide in meters (only when Circular is off)."
+        },
+        "Radius": {
+          "type": "number",
+          "default": 1,
+          "unit": "m",
+          "minimum": 0.0001,
+          "description": "Radius of the arc in meters (only when Circular is on)."
+        },
+        "Angle": {
+          "type": "number",
+          "default": 90,
+          "unit": "deg",
+          "minimum": -360,
+          "maximum": 360,
+          "description": "Arc angle in degrees; positive bends counter-clockwise, negative clockwise (Unity convention). 0 disables the arc."
+        },
+        "Height": {
+          "type": "number",
+          "default": 0.5,
+          "unit": "m",
+          "minimum": 0,
+          "description": "Height of the contact box below the transport plane in meters."
+        },
+        "Width": {
+          "type": "number",
+          "default": 0.5,
+          "unit": "m",
+          "minimum": 0,
+          "description": "Width of the contact box of a straight guide in meters."
+        },
+        "ColliderBorderX": {
+          "type": "number",
+          "default": 0.2,
+          "unit": "m",
+          "minimum": 0,
+          "description": "Additional contact-box border along X of an arc in meters."
+        },
+        "ColliderBorderZ": {
+          "type": "number",
+          "default": 0.2,
+          "unit": "m",
+          "minimum": 0,
+          "description": "Additional contact-box border along Z of an arc in meters."
+        },
+        "DistanceCollider": {
+          "type": "number",
+          "default": 0.005,
+          "unit": "m",
+          "minimum": 0,
+          "description": "Offset of the straight guide's contact box below the transport plane in meters."
         }
       }
     },
@@ -1402,6 +1586,11 @@
           "type": "string",
           "default": "",
           "description": "Name of the GameObject used as the MU prototype; defaults to this node when empty."
+        },
+        "Destination": {
+          "type": "string",
+          "default": "",
+          "description": "Scene path of the node new MUs are parented to; they start at the source pose and then move with it. Empty = scene root."
         },
         "CollisionRoleForMUs": {
           "type": "string",
@@ -1484,6 +1673,21 @@
           "$ref": "#/$defs/ComponentReference",
           "refType": "Sensor",
           "description": "Sensor identifying the MU to be gripped; when empty, auto-detection uses GripRange."
+        },
+        "DirectlyGrip": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true every MU entering PartToGrip is gripped immediately, without a pick signal, also when another grip holds it."
+        },
+        "PickAlignWithObject": {
+          "type": "string",
+          "default": "",
+          "description": "Scene path of the node a picked MU is aligned to (world position, and rotation when AlignRotation is set). Empty = no alignment."
+        },
+        "AlignRotation": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true a pick with PickAlignWithObject also takes over the node's world rotation."
         }
       }
     },
@@ -1515,6 +1719,152 @@
         "ConnectedSignal": {
           "$ref": "#/$defs/ComponentReference",
           "description": "Source signal whose value is copied onto this node's own signal on every change."
+        }
+      }
+    },
+    "SignalConnector": {
+      "type": "object",
+      "description": "Couples one source signal to one target signal with a small explicit conversion (copy, INT to BOOL, BOOL to INT, one bit from or into a word, scale, invert) - e.g. a robot PLC output onto an input of another PLC. One source, one target per connector; the source is a PLC output, the target a PLC input. Only the two slots the Mode uses are active.",
+      "properties": {
+        "Mode": {
+          "type": "string",
+          "enum": ["Copy", "IntToBool", "BoolToInt", "BitFromWord", "BitToWord", "Scale"],
+          "default": "Copy",
+          "description": "Conversion: Copy (BOOL, INT, REAL, INT to REAL), IntToBool, BoolToInt, BitFromWord (one bit of an INT), BitToWord (one bit into an INT word; the bits of all BitToWord connectors on the same target form the word), Scale (value * Factor + Offset)."
+        },
+        "Enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "When false the connector writes nothing and takes part in no check."
+        },
+        "SourceBool": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputBool",
+          "description": "BOOL source (Copy BOOL, BoolToInt, BitToWord)."
+        },
+        "SourceInt": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputInt",
+          "description": "INT source (Copy INT and INT to REAL, IntToBool, BitFromWord, Scale)."
+        },
+        "SourceFloat": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputFloat",
+          "description": "REAL source (Copy REAL, Scale)."
+        },
+        "TargetBool": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "BOOL target (Copy BOOL, IntToBool, BitFromWord)."
+        },
+        "TargetInt": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputInt",
+          "description": "INT target (Copy INT, BoolToInt, BitToWord, Scale)."
+        },
+        "TargetFloat": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputFloat",
+          "description": "REAL target (Copy INT to REAL and REAL, Scale)."
+        },
+        "Condition": {
+          "type": "string",
+          "enum": ["NotZero", "Equals", "GreaterOrEqual"],
+          "default": "NotZero",
+          "description": "IntToBool: true when the INT is not 0 (negative counts), equals CompareValue, or is at least CompareValue."
+        },
+        "CompareValue": {
+          "type": "number",
+          "default": 0,
+          "step": 1,
+          "description": "IntToBool: the value Equals and GreaterOrEqual compare with."
+        },
+        "TrueValue": {
+          "type": "number",
+          "default": 1,
+          "step": 1,
+          "description": "BoolToInt: INT written for true."
+        },
+        "FalseValue": {
+          "type": "number",
+          "default": 0,
+          "step": 1,
+          "description": "BoolToInt: INT written for false."
+        },
+        "Bit": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 31,
+          "step": 1,
+          "description": "BitFromWord / BitToWord: bit number, 0 = least significant; must be below the Width (8, 16 or 32 bits)."
+        },
+        "Width": {
+          "type": "string",
+          "enum": ["Byte", "Word", "DWord"],
+          "default": "Word",
+          "description": "Width of the INT (8, 16, 32 bit): the range of Bit, how Scale reads an INT source and the clamp range of an INT target."
+        },
+        "Signed": {
+          "type": "boolean",
+          "default": true,
+          "description": "Read and write the INT as signed at Width (Byte -128..127) instead of unsigned (Byte 0..255)."
+        },
+        "Factor": {
+          "type": "number",
+          "default": 1,
+          "description": "Scale: multiplier (dimensionless)."
+        },
+        "Offset": {
+          "type": "number",
+          "default": 0,
+          "description": "Scale: added after the multiplication (dimensionless)."
+        },
+        "Rounding": {
+          "type": "string",
+          "enum": ["Round", "Truncate"],
+          "default": "Round",
+          "description": "Scale to an INT target: Round = half away from zero, Truncate = towards zero."
+        },
+        "Invert": {
+          "type": "boolean",
+          "default": false,
+          "description": "Inverts the BOOL result (Copy BOOL, IntToBool, BitFromWord) or the bit a BitToWord connector contributes."
+        }
+      }
+    },
+    "Sound": {
+      "type": "object",
+      "description": "Procedural drive sound: makes the Drive on the same node audible (electric motor, pneumatic cylinder or hydraulic axis). Speed, stroke times and end positions come from the Drive / Drive_Cylinder; the component only selects the kind, the type and the volume.",
+      "properties": {
+        "Kind": {
+          "enum": ["Auto", "Drive", "Cylinder", "Hydraulic"],
+          "default": "Auto",
+          "description": "What the sound models. Auto = Cylinder when the node carries a Drive_Cylinder, otherwise Drive (electric motor). Hydraulic is only used when set explicitly."
+        },
+        "Variant": {
+          "enum": ["Auto", "Large", "Medium", "Small", "Hard", "Cushioned"],
+          "default": "Auto",
+          "description": "Type of the sound. Drive: Large, Medium or Small motor. Cylinder: Hard or Cushioned end stop. Hydraulic: Auto only. Auto = Medium (Drive) or Cushioned (Cylinder)."
+        },
+        "Volume": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Relative volume of this sound from 0 to 1."
+        },
+        "SoundType": {
+          "enum": ["Robot1", "Robot2", "SmallElectric1", "SmallElectric2", "AirPressure"],
+          "enumMap": { "Robot1": "Robot1", "Robot2": "Robot2", "SmallElectric1": "SmallElectric1", "SmallElectric2": "SmallElectric2", "AirPressure": "AirPressure", "0": "Robot1", "1": "Robot2", "2": "SmallElectric1", "3": "SmallElectric2", "4": "AirPressure" },
+          "scope": "none",
+          "description": "Legacy Unity sound clip. Read only when Kind and Variant are absent: Robot1/Robot2 -> Drive/Medium, SmallElectric1/SmallElectric2 -> Drive/Small, AirPressure -> Cylinder/Cushioned."
+        },
+        "Mode": {
+          "enum": ["Drive", "Pick"],
+          "enumMap": { "Drive": "Drive", "Pick": "Pick", "0": "Drive", "1": "Pick" },
+          "scope": "none",
+          "description": "Legacy Unity playback mode. Read for compatibility only; Pick is ignored."
         }
       }
     },
@@ -2526,6 +2876,78 @@
         }
       }
     },
+    "DropDetection": {
+      "type": "object",
+      "description": "Scene-wide detection of unsupported MUs: a part that nothing holds, no transport surface plausibly carries, no GripTarget seats and no carrier MU bears gets reported after a grace time - with the pulsing status silhouette and a card in the messages panel. A diagnostic tool, never a safety mechanism: the simulation is not stopped. Without this component the detection is off.",
+      "properties": {
+        "Enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Runs the detection. Off keeps the component authored but reports nothing."
+        },
+        "GraceTime": {
+          "type": "number",
+          "default": 0.5,
+          "unit": "s",
+          "minimum": 0,
+          "maximum": 60,
+          "description": "How long a part must be unsupported before it is reported. Bridges the handover moment in which a part belongs to neither of two belts."
+        },
+        "SupportProbeDistance": {
+          "type": "number",
+          "default": 50,
+          "unit": "mm",
+          "minimum": 1,
+          "maximum": 5000,
+          "description": "How far below the part the support ray looks for geometry. A hit within this distance counts as support - including opaque geometry without any component (a table, a chute, a shelf plate)."
+        },
+        "SupportMode": {
+          "type": "string",
+          "enum": [
+            "GeometryBelow",
+            "StateOnly"
+          ],
+          "default": "GeometryBelow",
+          "description": "GeometryBelow casts the support ray; StateOnly reports on the state conditions alone (no rays) and therefore also reports a part lying on geometry that is not a transport surface."
+        },
+        "SupportRecheckInterval": {
+          "type": "number",
+          "default": 0.5,
+          "unit": "s",
+          "minimum": 0.05,
+          "maximum": 10,
+          "description": "Shortest interval between two support rays for the same part. Keeps the ray off the per-tick path."
+        },
+        "DeleteUnsupported": {
+          "type": "boolean",
+          "default": false,
+          "description": "Deletes a reported part after DeleteDelay. Off by default, because deleting destroys the very evidence the report is about; switch it on for long runs in which the part count would otherwise grow without bound. The card stays and names the deleted part."
+        },
+        "DeleteDelay": {
+          "type": "number",
+          "default": 1,
+          "unit": "s",
+          "minimum": 0,
+          "maximum": 60,
+          "description": "Delay between the report and the deletion. Only read while DeleteUnsupported is on."
+        },
+        "SignalDropActive": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Bool signal written true while at least one report is latched."
+        },
+        "SignalDropCount": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputInt",
+          "description": "Int signal written with the number of latched reports."
+        },
+        "SignalResetDrops": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputBool",
+          "description": "Bool signal whose rising edge clears every card and silhouette. A part that is still unsupported is reported again on the next tick."
+        }
+      }
+    },
     "MachiningVolume": {
       "type": "object",
       "description": "Workpiece with real-time CSG material removal: an SDF voxel grid that the listed MachiningTools subtract from every tick (result = max(workpiece, -sweptTool)). The changed 16^3 chunks are re-tessellated into per-chunk meshes. Requires the private machining provider (rv_csg WASM kernel); without it the authored mesh stays untouched.",
@@ -2834,6 +3256,15 @@
           "default": 0,
           "description": "Bounciness of MUs inside the zone (0 = none)."
         },
+        "SoftCcdPrediction": {
+          "type": "number",
+          "default": 0.03,
+          "minimum": 0,
+          "maximum": 0.2,
+          "step": 0.005,
+          "unit": "m",
+          "description": "Look-ahead distance against tunnelling through thin floors; 0 = off"
+        },
         "RemoveBelowY": {
           "type": "number",
           "default": -10,
@@ -2844,12 +3275,505 @@
           "type": "boolean",
           "default": true,
           "description": "Shows the zone as a wireframe box in the viewer."
+        },
+        "LimitToLayers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "MU filter by Unity layer name: only MUs whose layer (extras layer of the MU root, resolved through the layer table: realvirtual standard plus scenes[0].extras.realvirtual.layerNames) is in this list become rigid bodies in the zone; every other MU passes the zone kinematically. An MU without a layer does not match a set filter. Empty, or no known name, = every MU (no filter)."
         }
       },
       "rawFields": {
         "StaticColliders": {
           "type": "array",
           "description": "Node paths (string array) of additional static collision geometry (chutes, bins, machine frames); resolved via the node registry at zone build time; read raw (no string-array field type)."
+        }
+      }
+    },
+    "WebPhysicsZone2D": {
+      "type": "object",
+      "description": "2D interaction zone: box volume on a conveyor line inside which MUs are simulated in the plane by Box2D (jam fronts, buffer tables, diverters, merges). MUs never fall or tip inside such a zone. The zone volume comes from the node's BoxCollider extras.",
+      "properties": {
+        "Kind": {
+          "type": "string",
+          "enum": ["Jam", "BufferTable", "Diverter", "Merge"],
+          "default": "Jam",
+          "description": "What the zone simulates: Jam (accumulation front), BufferTable (free table with run-out), Diverter or Merge (moving switch bodies)."
+        },
+        "Surface": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Destination / discharge transport surface the MUs return to when they leave the zone."
+        },
+        "KinematicDrives": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ComponentReference"
+          },
+          "default": [],
+          "description": "Diverter / merge: drives whose pose the zone follows as moving 2D bodies."
+        },
+        "Damping": {
+          "type": "number",
+          "default": 0,
+          "unit": "1/s",
+          "description": "Linear damping of MUs inside the zone (buffer-table run-out); 0 = none."
+        },
+        "SleepThreshold": {
+          "type": "number",
+          "default": 0.05,
+          "unit": "m/s",
+          "description": "Speed below which a resting MU may fall asleep."
+        },
+        "ForceReturnAfter": {
+          "type": "number",
+          "default": 0,
+          "unit": "s",
+          "description": "Returns an MU to transport after this time ONLY for a detected faulty pose (tipped / outside the guides) at an allowed exit; never dissolves a standing jam. 0 = never."
+        },
+        "ShowGizmo": {
+          "type": "boolean",
+          "default": true,
+          "description": "Shows the zone as a wireframe box in the viewer."
+        }
+      },
+      "rawFields": {
+        "Guides": {
+          "type": "array",
+          "description": "Node references (ComponentReference array) of guide rails; their BoxCollider extras become static Box2D shapes; read raw."
+        }
+      }
+    },
+    "WebMuJoCoRegion": {
+      "type": "object",
+      "description": "Detail-physics region (plan-673): the subtree below this node is simulated by MuJoCo instead of the standard engine — soft regulated contacts (solref/solimp), separate slide/torsional/rolling friction (friction + condim) and force-limited actuators, so a dynamic axis has an honest following error. Replaces the free extras key rv_mujoco of the plan-659 spike: as a component it is authorable, schema-validated, claims its node in the bake and reports through the Problems panel. The region volume (where MUs change engine) is the node's own BoxCollider extras, the same rule as WebPhysicsZone. The WASM locations are deliberately NOT model content — they are resolved at runtime, because a delivered GLB that points at node_modules is wrong after every bundler or deploy change.",
+      "properties": {
+        "RegionEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Switches the region off without removing it; a disabled region loads no MuJoCo runtime."
+        },
+        "TimestepS": {
+          "type": "number",
+          "default": 0.002,
+          "minimum": 0.0001,
+          "maximum": 0.1,
+          "unit": "s",
+          "description": "MuJoCo integration step <option timestep>. 0.002 s is nine steps per 60 Hz frame, the value the plan-673 Phase-1 cost gate measured; it must match the training timestep of any LocomotionPolicy in the region."
+        },
+        "ExitBandM": {
+          "type": "number",
+          "default": 0.5,
+          "minimum": 0,
+          "unit": "m",
+          "description": "Hysteresis band outside the region volume an MU has to clear before it is handed back to the standard engine; prevents ping-pong at the border."
+        },
+        "LoadTreeMode": {
+          "type": "string",
+          "enum": ["composite", "separate"],
+          "default": "composite",
+          "description": "How a carrier and its load enter the region: 'composite' as one rigid body with merged mass properties, 'separate' as individual bodies that may shift relative to each other."
+        },
+        "MjcfSource": {
+          "type": "string",
+          "default": "",
+          "description": "Project-relative path of a hand-maintained MJCF document that takes precedence over the model generated from rv_extras; empty = generate from the components (the normal case)."
+        },
+        "MeshBase": {
+          "type": "string",
+          "default": "",
+          "description": "Project-relative base folder the MJCF resolves its mesh assets against; only meaningful together with MjcfSource."
+        },
+        "Contract": {
+          "type": "string",
+          "default": "",
+          "description": "Project-relative path of the contract document that carries the trained numbers (observation layout, scales, default pose) of the policies in this region; versioned with the .onnx files."
+        },
+        "TrunkBody": {
+          "type": "string",
+          "default": "",
+          "description": "MJCF name of the floating base body of a legged robot in this region — a name, never an index."
+        },
+        "TrunkFreeJoint": {
+          "type": "string",
+          "default": "",
+          "description": "MJCF name of the free joint of TrunkBody — a name, never an index."
+        },
+        "GyroSensor": {
+          "type": "string",
+          "default": "",
+          "description": "MJCF name of the gyro sensor whose reading feeds the base_ang_vel observation segment; it is read from the sensor, never from qvel."
+        },
+        "ShowGizmo": {
+          "type": "boolean",
+          "default": true,
+          "description": "Shows the region volume as a wireframe box in the viewer."
+        }
+      }
+    },
+    "DynamicAxis": {
+      "type": "object",
+      "description": "Marks the Drive on this node as DYNAMIC (plan-673): its setpoint becomes the ctrl of a force-limited MuJoCo actuator, the solver moves the body, and the resulting joint position is written back as the drive's actual position. A kinematic axis has structurally no following error; a dynamic one has, and on a real machine that error is the overload signal. ctrlrange is not a field here — it follows from Drive.LowerLimit / Drive.UpperLimit.",
+      "properties": {
+        "SetpointSource": {
+          "type": "string",
+          "enum": ["planner", "signal", "operator", "policy"],
+          "default": "planner",
+          "description": "Who writes the setpoint, and therefore whether the axis is claimed: 'planner' = an IK path or mechanism path, 'signal' = a PLC output signal, 'operator' = manual cartesian jogging, 'policy' = a LocomotionPolicy."
+        },
+        "ActuatorKind": {
+          "type": "string",
+          "enum": ["position", "velocity", "motor"],
+          "default": "position",
+          "description": "MuJoCo actuator type: 'position' (P+D servo on the position, the normal case), 'velocity' (servo on the speed) or 'motor' (direct force / torque)."
+        },
+        "Kp": {
+          "type": "number",
+          "default": 80000,
+          "minimum": 0,
+          "description": "Proportional gain of the position servo. The default is the value the plan-673 Phase-1 gate measured for a 39 kg six-axis arm: the Menagerie stock gain of 5000 left 14.9 mm of pure gravity sag at the tool, indistinguishable from a contact refusal, while 80000 keeps the servo share at 0.9 mm."
+        },
+        "Kv": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Derivative (damping) gain of the servo; 0 leaves the damping to Armature and Damping."
+        },
+        "ForceRangeMin": {
+          "type": "number",
+          "default": 0,
+          "unit": "Nm",
+          "description": "Lower force / torque limit of the actuator. ForceRangeMin = ForceRangeMax = 0 means unlimited. For the first three axes of an articulated arm no datasheet value exists — the limit is derived from the static gravity term and must cover the task poses, not just the canonical ones."
+        },
+        "ForceRangeMax": {
+          "type": "number",
+          "default": 0,
+          "unit": "Nm",
+          "description": "Upper force / torque limit of the actuator; see ForceRangeMin. Too small a limit does not look like an error: the axis simply saturates and the arm stops short of its target."
+        },
+        "Gear": {
+          "type": "number",
+          "default": 1,
+          "description": "Transmission ratio between actuator and joint; 1 = direct drive."
+        },
+        "Armature": {
+          "type": "number",
+          "default": 0.1,
+          "minimum": 0,
+          "unit": "kgm2",
+          "description": "Reflected rotor inertia added to the joint. 0.1 is a DECLARED starting assumption taken from the Menagerie Universal Robots models, not a measurement; it is what keeps a stiff servo stable."
+        },
+        "Damping": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Viscous joint damping (torque per unit joint velocity)."
+        },
+        "FrictionLoss": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "unit": "Nm",
+          "description": "Constant friction torque the joint has to overcome before it moves (stiction)."
+        },
+        "BaseFollowingError": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "unit": "mm",
+          "description": "Declared STRUCTURAL share of the following error at the working point, IN THE DRIVE'S OWN UNIT (millimetres for a linear axis, DEGREES for a rotary one - same convention as Drive.LowerLimit). A MuJoCo position actuator is P+D without an integral term, so a permanent gravity sag of torque/Kp remains even without any contact. An overload model that does not subtract this share reports permanent overload. Measured on a 39 kg six-axis arm: 1.07 deg of axis sag at the Menagerie stock gain (= 14.9 mm at the tool) against 0.10 deg at the gain above (= 0.92 mm). Declare the AXIS figure here - the millimetre figure is the tool projection and subtracting it from a rotary following error would mask every real overload."
+        },
+        "FollowingErrorLimit": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "unit": "mm",
+          "description": "Following-error window of the axis in millimetres or degrees, measured on the NET error (raw error minus BaseFollowingError). 0 switches the monitoring off. Exceeding the window for longer than FollowingErrorTimeMs raises the Saturated/Overload signals and a Problems entry - it does NOT stop the motion path (plan-673 Phase 4, decision of 2026-10-24: report, never trip)."
+        },
+        "FollowingErrorTimeMs": {
+          "type": "number",
+          "default": 200,
+          "minimum": 0,
+          "unit": "ms",
+          "description": "How long the net following error has to stay outside FollowingErrorLimit before the axis is reported as overloaded. A window without a time would fire on every acceleration edge."
+        },
+        "ArrivalTolerance": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "unit": "mm",
+          "description": "Arrival tolerance of the axis in millimetres or degrees. A dynamic axis never reaches its setpoint exactly (the P+D servo keeps the base sag), so a LogicStep or an IK path waiting for the kinematic 0.01 tolerance would wait forever - the most common practical stumbling block. 0 derives the tolerance from BaseFollowingError plus FollowingErrorLimit, never below the kinematic 0.01."
+        }
+      }
+    },
+    "ContactProfile": {
+      "type": "object",
+      "description": "Contact role of the collision geometry on this node (plan-673): a named profile from the project profile library rather than a loose set of numbers. MuJoCo MAXIMISES friction element-wise between two geoms and averages solref/solimp weighted by solmix, so a pairing table built from per-geom profiles is not representable — the rougher side always wins and one grippy pad pulls every other pairing up with it. The expressible form is Priority on the side that sets the tone (what the Robotiq gripper does on its pads), which is why Priority is a field here and not an implementation detail.",
+      "properties": {
+        "Profile": {
+          "type": "string",
+          "enum": ["Pallet", "Workpiece", "BeltSurface", "StopperFace", "GripperJaw", "MachineFrame", "FixtureBore", "Custom"],
+          "default": "Workpiece",
+          "description": "Role this surface plays. Every role except 'Custom' takes its numbers from the project profile library; 'Custom' uses the values below, and only those should be set by hand where they have actually been measured."
+        },
+        "Priority": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "step": 1,
+          "description": "Geom priority. The side with the higher priority supplies friction, solref and solimp for the whole pairing, instead of the element-wise maximum. 0 = no priority; set 1 on the side that sets the tone (a gripper pad, a fixture bore)."
+        },
+        "Solmix": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0,
+          "description": "Weight of this geom when solref/solimp of a pairing are averaged. It has NO effect on friction (which is maximised) and none at all once Priority decides the pairing."
+        },
+        "FrictionSlide": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0,
+          "description": "Sliding friction coefficient (tangential). Read only with Profile 'Custom'. On a gripper pad this number, not the gripping force, decides the holding capacity — a pad measured at 0.1 against 0.7 changes it by a factor of seven."
+        },
+        "FrictionSpin": {
+          "type": "number",
+          "default": 0.005,
+          "minimum": 0,
+          "description": "Torsional (spin) friction coefficient about the contact normal. Read only with Profile 'Custom' and only effective from CondDim 'SlidingTorsional' upwards."
+        },
+        "FrictionRoll": {
+          "type": "number",
+          "default": 0.0001,
+          "minimum": 0,
+          "description": "Rolling friction coefficient. Read only with Profile 'Custom' and only effective with CondDim 'Full'."
+        },
+        "CondDim": {
+          "type": "string",
+          "enum": ["Frictionless", "Sliding", "SlidingTorsional", "Full"],
+          "default": "SlidingTorsional",
+          "description": "Contact dimensionality (MuJoCo condim 1/3/4/6): 'Frictionless', 'Sliding' (tangential friction only), 'SlidingTorsional' (plus spin friction) or 'Full' (plus rolling friction). The default is deliberately NOT 'Sliding', which is MuJoCo's own default: without spin friction a gripped part rotates out of the jaws within seconds and a successful run turns silently into a jam."
+        },
+        "SolrefTimeConst": {
+          "type": "number",
+          "default": 0.02,
+          "minimum": 0,
+          "unit": "s",
+          "description": "Time constant of the contact's reference spring-damper (solref[0]) — how softly the contact is regulated. Read only with Profile 'Custom'."
+        },
+        "SolrefDampRatio": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0,
+          "description": "Damping ratio of the contact's reference spring-damper (solref[1]); 1 = critically damped. Read only with Profile 'Custom'."
+        }
+      }
+    },
+    "CollisionShapeSet": {
+      "type": "object",
+      "description": "Collision geometry of this node as an arrangement of CONVEX primitives (plan-673). MuJoCo convexifies every collision mesh, so any concave shape whose behaviour relies on its concavity is silently ineffective — a part with a hole and the board it should pass through are BOTH concave. The decomposition is therefore authored content, not something a solver derives: a convexified part is a construction error, not a numerical problem. The probe is the minimum width of the convex hull against the narrowest point of the opening; for a three-armed star it is 83.7 mm against a 21 mm slot, so the negative case cannot slip through by accident.",
+      "properties": {
+        "Shapes": {
+          "type": "array",
+          "default": [],
+          "description": "The convex primitives, in author order. Each one is a box, sphere, capsule, cylinder or ellipsoid placed in the node's local frame. An empty list means the node contributes no collision geometry of its own.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "Kind": {
+                "type": "string",
+                "enum": ["box", "sphere", "capsule", "cylinder", "ellipsoid"],
+                "default": "box",
+                "description": "Primitive type; it decides how many components of Size are read."
+              },
+              "Center": {
+                "$ref": "#/$defs/Vector3",
+                "unit": "mm",
+                "description": "Centre of the primitive in the node's local frame, in millimetres."
+              },
+              "Size": {
+                "$ref": "#/$defs/Vector3",
+                "unit": "mm",
+                "description": "Size in millimetres, read TYPE-DEPENDENTLY and as HALF extents: box = three half extents (x, y, z), sphere = radius (x), capsule and cylinder = radius (x) and half length (y), ellipsoid = three radii. This is NOT the Unity convention of the existing colliders[] extras, which are full sizes in metres."
+              },
+              "Rotation": {
+                "$ref": "#/$defs/Vector3",
+                "unit": "deg",
+                "description": "Rotation of the primitive in the node's local frame as Euler angles in degrees."
+              }
+            },
+            "required": ["Kind"],
+            "additionalProperties": false
+          }
+        },
+        "ReplacesMesh": {
+          "type": "boolean",
+          "default": false,
+          "description": "true = the visual mesh of this node does not collide and the primitives are the only collision geometry. Default false keeps visual mesh and collision geometry separate, which is what the hand-built Menagerie models do."
+        }
+      }
+    },
+    "FreeBody": {
+      "type": "object",
+      "description": "This node is a FREE rigid body in a detail-physics region (plan-673): a block, a pallet, an obstacle — something the simulation moves rather than a mechanism. It fills the gap in KinematicJointType, which knows Revolute, Prismatic, Spherical and Universal but no free joint. The physical quantities of such a body are properties with a unit and a default, right here on the object, NOT entries in a central obstacles[] list inside a generator: a list entry is neither clickable in the viewer, nor addressable over MCP, nor movable by the user.",
+      "properties": {
+        "Enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Switches the free body off without removing it; a disabled body stays where it is."
+        },
+        "MassKg": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "unit": "kg",
+          "description": "Mass of the body. 0 = derive it from the MechanismBody of this node (density preset times the mesh volume). An explicit value wins, because the derivation needs a closed hull and silently falls back to the bounding box when it has none — which on a 24 % filled pallet assembly is a factor of four."
+        },
+        "CondDim": {
+          "type": "string",
+          "enum": ["Frictionless", "Sliding", "SlidingTorsional", "Full"],
+          "default": "SlidingTorsional",
+          "description": "Contact dimensionality of this body's contacts (MuJoCo condim 1/3/4/6). The default is deliberately NOT 'Sliding': MuJoCo's own default has no spin friction, and a gripped part then rotates out of the jaws within seconds without any error being reported. A ContactProfile on the same node wins over this value."
+        },
+        "FrictionSlide": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0,
+          "description": "Sliding friction coefficient of this body's contacts. A ContactProfile on the same node wins over this value — the profile is the single place for a measured surface, this field is for a loose obstacle that has none."
+        },
+        "LinearDamping": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "unit": "1/s",
+          "description": "Linear velocity damping of the body; 0 = none."
+        },
+        "AngularDamping": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "unit": "1/s",
+          "description": "Angular velocity damping of the body; 0 = none."
+        },
+        "Restitution": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Bounciness, 0 = fully damped. MuJoCo has no direct restitution parameter; the writer expresses it through the contact solver reference, so a value near 1 is an approximation and not a measured coefficient."
+        }
+      }
+    },
+    "GripLoad": {
+      "type": "object",
+      "description": "Declares HOW the Grip on this node holds a part, and measures whether it still does (plan-673 Phase 4, F7). The plan-673 Phase-1 gate measured that a jam becomes visible AT THE GRIPPER, not at the axes: in two of three failure cases the axis following error was 0.07-0.08 deg, identical to the successful run, while the part slid 17-20 mm between the jaws. An overload model that knows only following error and torque therefore shows nothing in two of three failure cases, which is why the slip and the clamping force are properties and signals of their own.",
+      "properties": {
+        "Mode": {
+          "type": "string",
+          "enum": ["formfit", "forcefit"],
+          "default": "formfit",
+          "description": "'formfit' = the Grip parents the part as it does today (the part cannot slip by construction, so PartSlip stays 0 and says so); 'forcefit' = the physics contact holds the part, the Grip only reports, and PartSlip is the real measurement. Mixing the two is not possible - Grip structurally refuses a physics-owned MU."
+        },
+        "GripForce": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "unit": "N",
+          "description": "Declared clamping force per jaw. 0 means the force is not declared here and the measured actuator force of the jaw axes is the only figure shown. The Phase-0 force-closure calculation hit the printed catalogue value exactly and found that the PAD FRICTION decides the holding capacity by a factor of 7, not the clamping force (mu 0.1 -> 0.51 kg, mu 0.7 -> 3.57 kg) - so this number alone never explains a dropped part; the ContactProfile of the pads does."
+        },
+        "SlipLimit": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "unit": "mm",
+          "description": "How far the part may travel inside the jaws before it is reported as slipping. 0 switches the slip monitoring off. The measured failure cases slid 16.7-20.3 mm against -1.5 to 2.2 mm of axis refusal, so a limit of a few millimetres separates them cleanly."
+        },
+        "SlipTimeMs": {
+          "type": "number",
+          "default": 200,
+          "minimum": 0,
+          "unit": "ms",
+          "description": "How long the slip has to stay above SlipLimit before it is reported. Like the axis window, a limit without a time fires on the first acceleration edge."
+        }
+      }
+    },
+    "Movable": {
+      "type": "object",
+      "description": "This node may be grabbed and moved by the user in the viewer (plan-673). It is the honest replacement for the Drive with Direction 'Virtual' that obstacles used to carry only so the destructive bake would keep their node: a Movable claims its own node, and an obstacle is not a drive. Movable describes who may move the node by hand; FreeBody describes whether the physics moves it. Both may sit on the same node.",
+      "properties": {
+        "Enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Switches the move mode off without removing it."
+        },
+        "Axes": {
+          "type": "string",
+          "enum": ["XZ", "XYZ", "X", "Y", "Z"],
+          "default": "XZ",
+          "description": "Which directions the user may drag the node along. 'XZ' is the floor plane, the normal case for an obstacle standing on the ground."
+        },
+        "SnapMm": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "unit": "mm",
+          "description": "Grid the drag snaps to; 0 = free movement."
+        },
+        "ResetOnStop": {
+          "type": "boolean",
+          "default": false,
+          "description": "true = the node returns to its authored position when the simulation stops, so a moved obstacle does not silently become the new initial state."
+        }
+      }
+    },
+    "LocomotionPolicy": {
+      "type": "object",
+      "description": "A trained locomotion policy on the root node of a legged robot (plan-673): the counterpart of RobotIK one level deeper in the physics — RobotIK computes a pose from geometry, LocomotionPolicy computes joint setpoints from a state. The observation layout is DATA, not code: a named profile here, the ordered segment list in the contract document, and no third place. The point of the component is that a duck needs no script of its own.",
+      "properties": {
+        "Enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Switches the policy off without removing it; the axes then keep whatever setpoint they had."
+        },
+        "Policy": {
+          "type": "string",
+          "default": "",
+          "description": "Project-relative path of the trained policy document, e.g. 'policies/walking.onnx'."
+        },
+        "FallbackPolicy": {
+          "type": "string",
+          "default": "",
+          "description": "Project-relative path of the policy that takes over when the main policy loses control — standing up after a fall. Empty = no fallback."
+        },
+        "Observation": {
+          "type": "string",
+          "default": "",
+          "description": "Name of the expected observation profile. It is checked against the observation_layout of the contract document on load; a contradiction is a problems entry (policy-observation-mismatch), never a silent run with the wrong numbers."
+        },
+        "Contract": {
+          "type": "string",
+          "default": "",
+          "description": "Project-relative path of the contract document that carries the segment list and the trained numbers. Empty = the Contract of the enclosing WebMuJoCoRegion applies."
+        },
+        "Decimation": {
+          "type": "number",
+          "default": 4,
+          "minimum": 1,
+          "step": 1,
+          "description": "Physics steps per policy step. Together with the region's TimestepS it DETERMINES the policy rate (1 / (TimestepS * Decimation)); the rate itself is therefore not a field — it would be a third number that can contradict the other two."
+        },
+        "ActionScale": {
+          "type": "number",
+          "default": 1,
+          "description": "Factor applied to the policy output before it becomes a joint setpoint; it must match the value the policy was trained with."
+        },
+        "Axes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ComponentReference"
+          },
+          "default": [],
+          "description": "The driven drives IN POLICY ORDER — Axes[i] is the drive of the i-th policy actuator. The ORDER is the contract, which is why this is a reference list with add, remove and reorder and not a list of names: a reference claims its target node in the bake, survives renaming, placing and nesting, and shows up in the reference audit. A length that differs from the contract is a problems entry (policy-axis-count-mismatch), never half a run."
         }
       }
     },
@@ -3262,6 +4186,26 @@
           "default": true,
           "readonly": true,
           "description": "If true the CAD source used Z-up orientation."
+        },
+        "Converter": {
+          "enum": ["connect", "browser", "solidcraft"],
+          "readonly": true,
+          "description": "Optional. What produced the geometry: 'browser' (absent = browser), 'connect' (converted by realvirtual CONNECT) or 'solidcraft' (live link to a SolidCraft design, one body per node). Consumers that do not know a value ignore it."
+        },
+        "SolidCraft": {
+          "type": "object",
+          "readonly": true,
+          "description": "Optional. Identity of a node mirrored live from a SolidCraft design (Converter 'solidcraft'). Role is 'root' (sync root: DesignPath, DesignName), 'occurrence' (OccurrenceId), 'body' (OccurrenceId, BodyKey = stable SolidCraft feature id, BodyName for display) or 'joint' (JointId). Matching uses the ids only, never node names or paths.",
+          "properties": {
+            "Role": { "enum": ["root", "occurrence", "body", "joint"] },
+            "DesignPath": { "type": "string" },
+            "DesignName": { "type": "string" },
+            "OccurrenceId": { "type": "integer" },
+            "BodyKey": { "type": "string" },
+            "BodyName": { "type": "string" },
+            "JointId": { "type": "integer" }
+          },
+          "required": ["Role"]
         }
       }
     },
@@ -4030,6 +4974,10 @@
           "unit": "mm",
           "description": "Destination position in millimeters or degrees."
         },
+        "DestinationFromPLCOutput": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Optional PLCOutputFloat signal (Unity label 'Get Position from Signal'). If its value is not 0 when the logic is built, the destination is taken from the signal and follows it; a change during a running move takes effect on the next start. If it is 0, Destination is used."
+        },
         "Relative": {
           "type": "boolean",
           "default": false,
@@ -4372,6 +5320,49 @@
           "type": "string",
           "readonly": true,
           "description": "Scene path of a node whose name prefixes GroupName (resolved group name = prefixNode.name + GroupName). Shown when present in the GLB, never stamped on newly authored components."
+        }
+      }
+    },
+    "MUPusher": {
+      "type": "object",
+      "description": "Pushes the MU reported by Sensor out of a station in front of the MU a grip carries in, position-based without physics: when Drive moves to ReleasePosition, the couple position is computed from the geometry (grip travel per drive mm, gap between the two MUs along the push); from there the standing MU moves with the grip and is released at ReleasePosition onto the surface below.",
+      "properties": {
+        "Drive": {
+          "$ref": "#/$defs/ComponentReference",
+          "refType": "Drive",
+          "description": "Axis whose position decides coupling and release; the grip travel per mm includes every Drive_Gear slave of this drive."
+        },
+        "Pusher": {
+          "$ref": "#/$defs/ComponentReference",
+          "refType": "Grip",
+          "description": "Grip that carries the pushing MU."
+        },
+        "Sensor": {
+          "$ref": "#/$defs/ComponentReference",
+          "refType": "Sensor",
+          "description": "Sensor that reports the MU to be pushed; an empty sensor means nothing is pushed. Empty = the Sensor on the same node."
+        },
+        "ReleasePosition": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Drive position at which the pushed MU is released; a move of Drive to this position arms the push."
+        },
+        "ReleaseSurface": {
+          "$ref": "#/$defs/ComponentReference",
+          "refType": "TransportSurface",
+          "description": "Optional transport surface that takes the released MU over; a release beside it is reported."
+        }
+      }
+    },
+    "MUSwitcher": {
+      "type": "object",
+      "description": "Switches the visible variant of an MU when it enters the Sensor on the same node (Unity MUSwitcher): inside the entering MU, nodes of the group SwitchToGroup become visible and nodes of every other group become hidden. Requires a Sensor component on the same node.",
+      "properties": {
+        "SwitchToGroup": {
+          "type": "string",
+          "default": "",
+          "description": "Name of the group to show in an MU entering the sensor; all other groups of that MU are hidden."
         }
       }
     },
@@ -4935,6 +5926,71 @@
         }
       }
     },
+    "ParametricComponent": {
+      "type": "object",
+      "description": "WEB-only parametric part family: hidden base parts, a parameter schema and a JavaScript rule generate(values, parts) that builds variants by duplicating, stretching and placing the base parts. The default variant is stored baked as plain geometry.",
+      "properties": {
+        "ApiVersion": {
+          "type": "number",
+          "const": 1,
+          "default": 1,
+          "description": "Contract version of the rule API; only 1 is defined."
+        },
+        "Params": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "object",
+            "properties": {
+              "Name": { "type": "string", "description": "Unique parameter name; key in Values." },
+              "Label": { "type": "string", "description": "Display label." },
+              "Type": { "type": "string", "enum": ["number", "int", "bool", "enum"], "description": "Value type. Parameters can never be bound to signals." },
+              "Unit": { "type": "string", "enum": ["mm", "deg", ""], "description": "Display unit of number/int parameters." },
+              "Min": { "type": "number", "description": "Lower bound (number/int)." },
+              "Max": { "type": "number", "description": "Upper bound (number/int)." },
+              "Step": { "type": "number", "description": "Grid step (number/int), measured from Min (or 0); > 0." },
+              "Enum": { "type": "array", "items": { "type": ["number", "string"] }, "description": "Allowed values (enum only, non-empty)." },
+              "Default": { "type": ["number", "boolean", "string"], "description": "Default value; inside Min/Max on the Step grid, or one of Enum." }
+            },
+            "required": ["Name", "Type", "Default"]
+          },
+          "description": "Parameter schema, authored with the family."
+        },
+        "Values": {
+          "type": "object",
+          "default": {},
+          "description": "Parameter values of the baked variant (name to number, boolean or string)."
+        },
+        "Code": {
+          "type": "string",
+          "default": "",
+          "description": "JavaScript source defining function generate(values, parts); runs as a pure function without scene or signal access."
+        },
+        "CodeHash": {
+          "type": "string",
+          "default": "",
+          "description": "SHA-256 of Code (hex), shown in the inspector and part of the variant cache key."
+        },
+        "PartsRoot": {
+          "type": "string",
+          "default": "_Parts",
+          "description": "Name of the hidden child holding the base parts."
+        },
+        "GeneratedRoot": {
+          "type": "string",
+          "default": "_Generated",
+          "description": "Name of the child holding the baked variant."
+        },
+        "BakedInputHash": {
+          "type": "string",
+          "description": "Input fingerprint (ApiVersion, CodeHash, normalized Values, parts hash) of the baked variant."
+        },
+        "DesignResource": {
+          "type": "string",
+          "description": "SHA-256 of the embedded SolidCraft design of the base parts (optional)."
+        }
+      }
+    },
     "Path": {
       "type": "object",
       "description": "WebViewer-native arc-length path (plan-268): a chain of line/arc segments for path-based movement (AGV/FTS, overhead conveyors). parsePathExtras() in rv-path.ts is the executable TS-SSOT for the structured field shapes ('segments', 'successors', 'align'); they are declared here as generic JSON fields so the inspector, the overlay editor and the MCP tools can author them. Detection is coupled to this payload (inner type 'Path' or absent), never to node names.",
@@ -4979,6 +6035,66 @@
         "zoneCapacity": {
           "type": "number",
           "description": "Explicit zone capacity (>= 0; 0 = never enterable). Absent = default capacity 1."
+        },
+        "connectCheck": {
+          "type": "boolean",
+          "default": true,
+          "description": "Take part in the load-time successor check (plan-633): false marks a deliberate crossing or bridge whose ends touch other paths without being connected, so no path-successor-mismatch / path-end-near-miss is reported for it."
+        }
+      }
+    },
+    "PathBlock": {
+      "type": "object",
+      "description": "WEB-only path-network building block (plan-628): an empty node PN_Block_<n> under PathNetwork whose child Path nodes form one straight, curve, diverge, merge or stub. The pose is data - the node transform stays the identity and moving the block rewrites the absolute segments of its paths. parsePathBlockExtras() in rv-path-block.ts is the executable SSOT of the structured fields.",
+      "properties": {
+        "version": {
+          "type": "number",
+          "default": 1,
+          "description": "PathBlock schema version (migration anchor)."
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "straight",
+            "curve",
+            "diverge",
+            "merge",
+            "stub"
+          ],
+          "default": "straight",
+          "description": "Block kind. diverge, merge and stub are junction blocks set onto a host path."
+        },
+        "params": {
+          "type": "object",
+          "default": {},
+          "description": "Block parameters { lengthM?, radiusM?, degrees?, side?: 'left'|'right', stubStraightM?, twin? } in meters / degrees; absent fields take the catalog defaults."
+        },
+        "pose": {
+          "type": "array",
+          "default": [
+            0,
+            0,
+            0
+          ],
+          "description": "[x, z, headingDeg] of the block origin (input port, or the node on the host for junctions) in meters / degrees."
+        },
+        "y": {
+          "type": "number",
+          "default": 0,
+          "unit": "m",
+          "description": "Elevation of the block in meters."
+        },
+        "host": {
+          "type": "string",
+          "description": "Junction block: node name of the host block; empty = a block-free host path."
+        },
+        "hostPathId": {
+          "type": "string",
+          "description": "Junction block: id of the host piece after the node (it keeps the original path id)."
+        },
+        "frontPathId": {
+          "type": "string",
+          "description": "Junction block: id of the host piece before the node (the new front fragment)."
         }
       }
     },
@@ -5187,15 +6303,23 @@
     },
     "AssetOverrides": {
       "type": "object",
-      "description": "Sits on the SAME node as an AssetReference and carries what THIS file changes in the referenced subtree. The referenced file is never modified. Each patch is an RFC 7396 JSON Merge Patch over 'extras.realvirtual' of the target node - componentType to fieldName to value, where null DELETES the field. Addressing is by the target node's reserved 'NodeId' key, which is unique WITHIN the referenced file; the occurrence a node belongs to comes from the chain of reference nodes at composition time and is never written into a file, so the same asset may be referenced any number of times and each occurrence is overridden independently. An override whose target no longer exists is ORPHANED: consumers MUST report it and MUST NOT discard it silently. Strength ordering when several layers touch one field, weakest first: values in the referenced file, then overrides of the inner referencing file, then overrides of the outer referencing file, then the running session's edit log - the outer file always wins.",
+      "description": "Sits on the SAME node as an AssetReference and carries what THIS file changes in the referenced subtree - component VALUES only. The referenced file is never modified. Each patch is an RFC 7396 JSON Merge Patch over 'extras.realvirtual' of the target node - componentType to fieldName to value, where null DELETES the field. Writers store 'byAddress' only (plan-769, rv-ODT 5b): keys are ADDRESSES relative to the referenced asset - '#<NodeId>' a node of that asset, '<b>#<NodeId>' a node inside its nested reference b (b = the nested reference node's NodeId), '<b>/<c>#<NodeId>' one level deeper. The occurrence a node belongs to comes from the chain of reference nodes at composition time and is never written into a file, so the same asset may be referenced any number of times and each occurrence is overridden independently. An override whose target no longer exists - or whose nested occurrence never materialises - is ORPHANED: consumers MUST report it and MUST NOT discard it silently; an address that names more than one node is reported as ambiguous and never guessed. Strength ordering when several layers touch one field, weakest first: values in the referenced file, then overrides of inner referencing files (deeper first), then overrides of the outer referencing file, then the running session's edit log - the outer file always wins.",
       "properties": {
+        "byAddress": {
+          "type": "object",
+          "description": "Address relative to the referenced asset ('#<NodeId>', '<b>#<NodeId>', ...) to an RFC 7396 merge patch over that node's extras.realvirtual. The only map a writer produces."
+        },
         "byNodeId": {
           "type": "object",
-          "description": "NodeId of a node in the referenced subtree to an RFC 7396 merge patch over that node's extras.realvirtual."
+          "description": "LEGACY (read only, pre-769 files): NodeId of a node of the referenced asset to a merge patch - read as byAddress['#<NodeId>']; a byAddress entry of the same address wins field by field. Never written."
         },
         "byPath": {
           "type": "object",
-          "description": "Fallback addressing for targets without a NodeId: node path RELATIVE TO THE REFERENCE NODE to the same merge-patch shape. Consulted only after byNodeId misses."
+          "description": "LEGACY (read only, pre-769 files): node path RELATIVE TO THE REFERENCE NODE to the same merge-patch shape. Resolved when applied and then written back as its address; a path that resolves nowhere is kept (and reported) so an orphan is never dropped."
+        },
+        "trsByNodeId": {
+          "type": "object",
+          "description": "REMOVED (plan-769): plan-444 part moves (local TRS by NodeId). Readers MUST NOT apply them - a part inside placed content keeps the transform its asset gives it - SHOULD report how many a file carried, and writers MUST NOT write the key."
         }
       }
     },
@@ -5310,7 +6434,7 @@
     },
     "WebOperatorPanel": {
       "type": "object",
-      "description": "3D-HMI marker: an operator panel window (illuminated push buttons, selector switches, E-stops, stack light, status line) described as JSON. Every WebOperatorPanel of a model opens one window; buttons write PLC inputs, lamps show PLC outputs. No Unity runtime function.",
+      "description": "3D-HMI marker: an operator panel window (illuminated push buttons, selector switches, E-stops, setpoint sliders, numeric readouts, stack light, status line) described as JSON. Every WebOperatorPanel of a model opens one window; buttons write PLC inputs, lamps show PLC outputs, a slider writes a number, a readout shows one. No Unity runtime function.",
       "properties": {
         "Title": {
           "type": "string",
@@ -5320,7 +6444,7 @@
         "Config": {
           "type": "string",
           "default": "",
-          "description": "The operator panel as a JSON string (version, id, title, buttons, selectors, estops, stackLight, chips, status, restart). Must parse and validate; every signal it names must exist in the model."
+          "description": "The operator panel as a JSON string (version, id, title, resizable, height, buttons, selectors, estops, sliders, readouts, stackLight, chips, status, restart). Must parse and validate; every signal it names must exist in the model."
         },
         "Dock": {
           "type": "string",
@@ -5334,9 +6458,20 @@
           "description": "If true the window starts collapsed to its title bar (chips, stack light and the E-stop stay reachable)."
         }
       }
+    },
+    "InstanceScope": {
+      "type": "object",
+      "description": "Signal scope of an embedded copy: signals generated below this node are prefixed with the name of PrefixNode, like a placed copy with its placement root name. Authored signal names stay unchanged.",
+      "properties": {
+        "PrefixNode": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Node whose name is the signal prefix; empty uses the node carrying the component."
+        }
+      }
     }
   },
   "components": {
+    "BlockageBudget": { "$ref": "#/$defs/BlockageBudget" },
     "Drive": {
       "$ref": "#/$defs/Drive"
     },
@@ -5391,8 +6526,17 @@
     "Sensor": {
       "$ref": "#/$defs/Sensor"
     },
+    "MUSwitcher": {
+      "$ref": "#/$defs/MUSwitcher"
+    },
+    "MUPusher": {
+      "$ref": "#/$defs/MUPusher"
+    },
     "TransportSurface": {
       "$ref": "#/$defs/TransportSurface"
+    },
+    "TransportGuided": {
+      "$ref": "#/$defs/TransportGuided"
     },
     "Source": {
       "$ref": "#/$defs/Source"
@@ -5409,8 +6553,14 @@
     "ConnectSignal": {
       "$ref": "#/$defs/ConnectSignal"
     },
+    "SignalConnector": {
+      "$ref": "#/$defs/SignalConnector"
+    },
     "Lamp": {
       "$ref": "#/$defs/Lamp"
+    },
+    "Sound": {
+      "$ref": "#/$defs/Sound"
     },
     "SceneButtonBase": {
       "$ref": "#/$defs/SceneButtonBase"
@@ -5474,6 +6624,9 @@
     "CollisionRole": {
       "$ref": "#/$defs/CollisionRole"
     },
+    "DropDetection": {
+      "$ref": "#/$defs/DropDetection"
+    },
     "MachiningVolume": {
       "$ref": "#/$defs/MachiningVolume"
     },
@@ -5494,6 +6647,33 @@
     },
     "WebPhysicsZone": {
       "$ref": "#/$defs/WebPhysicsZone"
+    },
+    "WebPhysicsZone2D": {
+      "$ref": "#/$defs/WebPhysicsZone2D"
+    },
+    "WebMuJoCoRegion": {
+      "$ref": "#/$defs/WebMuJoCoRegion"
+    },
+    "DynamicAxis": {
+      "$ref": "#/$defs/DynamicAxis"
+    },
+    "GripLoad": {
+      "$ref": "#/$defs/GripLoad"
+    },
+    "ContactProfile": {
+      "$ref": "#/$defs/ContactProfile"
+    },
+    "CollisionShapeSet": {
+      "$ref": "#/$defs/CollisionShapeSet"
+    },
+    "FreeBody": {
+      "$ref": "#/$defs/FreeBody"
+    },
+    "Movable": {
+      "$ref": "#/$defs/Movable"
+    },
+    "LocomotionPolicy": {
+      "$ref": "#/$defs/LocomotionPolicy"
     },
     "WebError": {
       "$ref": "#/$defs/WebError"
@@ -5537,8 +6717,14 @@
     "WebComponent": {
       "$ref": "#/$defs/WebComponent"
     },
+    "ParametricComponent": {
+      "$ref": "#/$defs/ParametricComponent"
+    },
     "Path": {
       "$ref": "#/$defs/Path"
+    },
+    "PathBlock": {
+      "$ref": "#/$defs/PathBlock"
     }
   },
   "signals": {
@@ -5692,6 +6878,9 @@
     },
     "WebOperatorPanel": {
       "$ref": "#/$defs/WebOperatorPanel"
+    },
+    "InstanceScope": {
+      "$ref": "#/$defs/InstanceScope"
     }
   },
   "recording": {

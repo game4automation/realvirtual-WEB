@@ -40,7 +40,6 @@ import {
   type AasResolution,
 } from '../src/plugins/aas-resolution';
 import { resetIndex, resetCache } from '../src/plugins/aas-link-parser';
-import { attachDriveDatasheets, SEW_DRIVE_AAS } from '../src/behaviors/_shared/aas-link';
 import { OrderManagerPlugin, _resetOrderStore } from '../src/plugins/order-manager-plugin';
 import { tooltipRegistry } from '../src/core/hmi/tooltip/tooltip-registry';
 
@@ -253,11 +252,11 @@ describe('surface: sidebar AAS button', () => {
     expect(screen.getByText('1')).toBeInTheDocument();
   });
 
-  it.each(HIDDEN_STATES)('neither counts nor highlights when %s', (state) => {
-    const viewer = renderSidebar(state);
+  // plan-682 F2: without a resolvable link the button is not rendered at all.
+  it.each(HIDDEN_STATES)('neither counts nor shows the button when %s', (state) => {
+    renderSidebar(state);
     expect(screen.queryByText('1')).not.toBeInTheDocument();
-    screen.getByRole('button').click();
-    expect(viewer.highlighter.highlightMultiple).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button')).toBeNull();
   });
 });
 
@@ -346,27 +345,11 @@ describe('resolveAasSubtree', () => {
     expect(getAasResolution(root.children[0])).toBe('resolved');
   });
 
-  it('marks links attached after the model load (attachDriveDatasheets)', async () => {
-    mockIndexFetch(JSON.stringify({ [SEW_DRIVE_AAS.aasId]: { file: 'sew.aasx', idShort: 'SEW' } }), { status: 200 });
-    const root = new Object3D();
-    const motor = new Object3D();
-    motor.name = 'Motor';
-    root.add(motor);
-
-    attachDriveDatasheets(root);
-    expect(getAasResolution(motor)).toBe('pending'); // never unmarked
-
-    await resolveAasSubtree(root, undefined, beginAasLoadGeneration());
-    expect(getAasResolution(motor)).toBe('resolved');
-  });
-
   it('marks links added by a layout-planner placement (layout-content-added root)', async () => {
     mockIndexFetch(null, { status: 404 });
     const placed = new Object3D();
-    const motor = new Object3D();
-    motor.name = 'DriveMesh';
+    const motor = aasNode('pending');
     placed.add(motor);
-    attachDriveDatasheets(placed);
 
     await resolveAasSubtree(placed, undefined, currentAasLoadGeneration());
 

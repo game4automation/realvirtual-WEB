@@ -41,6 +41,30 @@ describe('startup modal coordinator', () => {
     expect(mayShowStartupModal('welcome')).toBe(true);
   });
 
+  it('ranks the public-demo welcome window after welcome and projects, before every incidental dialog (plan-646)', () => {
+    setStartupModalOpen('demo-welcome', true);
+    expect(mayShowStartupModal('demo-welcome')).toBe(true);
+    for (const lower of ['opener', 'autoquality', 'news'] as const) {
+      expect(mayShowStartupModal(lower), lower).toBe(false);
+    }
+    setStartupModalOpen('projects', true);
+    expect(mayShowStartupModal('demo-welcome')).toBe(false);
+    setStartupModalOpen('projects', false);
+    setWelcomeModalOpen(true);
+    expect(mayShowStartupModal('demo-welcome')).toBe(false);
+    setWelcomeModalOpen(false);
+    expect(mayShowStartupModal('demo-welcome')).toBe(true);
+    setStartupModalOpen('demo-welcome', false);
+    expect(mayShowStartupModal('news')).toBe(true);
+  });
+
+  it('releases the demo-welcome slot when its registrant unmounts', () => {
+    const view = render(<Probe id="demo-welcome" register />);
+    expect(mayShowStartupModal('news')).toBe(false);
+    view.unmount();
+    expect(mayShowStartupModal('news')).toBe(true);
+  });
+
   it('updates a waiting hook when a higher-priority modal opens and closes', () => {
     render(<Probe id="news" register />);
     expect(screen.getByTestId('may-show').textContent).toBe('yes');

@@ -71,7 +71,7 @@ export function SceneTransitionOverlay() {
         elevation={8}
         sx={{
           display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1.5,
-          px: 4, py: 3, borderRadius: 3, minWidth: 240, maxWidth: '80vw',
+          px: 4, py: 3, borderRadius: 1, minWidth: 240, maxWidth: '80vw',
           bgcolor: 'rgba(28,28,30,0.92)',
           backdropFilter: 'blur(calc(16px * var(--rv-ui-blur-scale, 1)))',
           color: 'rgba(255,255,255,0.95)',

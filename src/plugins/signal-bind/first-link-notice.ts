@@ -37,7 +37,7 @@ export function noteSignalMappingsWritten(prevCount: number, nextCount: number):
   shown = true;
   showInstruction({
     id: NOTICE_ID,
-    text: 'Externes Signal verknüpft — interne Steuerung nun nicht mehr aktiv.',
+    text: 'External signal linked — internal control is no longer active.',
     anchor: { kind: 'edge', edge: 'bottom' },
     style: 'info',
     autoClearAfterMs: 9000,

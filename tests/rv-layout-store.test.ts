@@ -218,19 +218,19 @@ describe('LayoutStore', () => {
     });
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(catalogJson));
     const store = new LayoutStore();
-    await store.addCatalog('https://cdn.example.com/library/catalog.json');
-    const catalog = store.getSnapshot().catalogs.get('https://cdn.example.com/library/catalog.json');
+    await store.addCatalog('https://cdn.example.com/partner/catalog.json');
+    const catalog = store.getSnapshot().catalogs.get('https://cdn.example.com/partner/catalog.json');
     expect(catalog).toBeDefined();
     expect(catalog!.entries).toHaveLength(2);
     // First entry: auto-derived id and name, resolved URL
     expect(catalog!.entries[0].id).toBe('robot');
     expect(catalog!.entries[0].name).toBe('Robot');
-    expect(catalog!.entries[0].glbUrl).toBe('https://cdn.example.com/library/Robot.glb');
+    expect(catalog!.entries[0].glbUrl).toBe('https://cdn.example.com/partner/Robot.glb');
     expect(catalog!.entries[0].category).toBe('custom');
     // Second entry: explicit name and category preserved
     expect(catalog!.entries[1].name).toBe('My Conveyor');
     expect(catalog!.entries[1].category).toBe('conveyor');
-    expect(catalog!.entries[1].glbUrl).toBe('https://cdn.example.com/library/Conveyor.glb');
+    expect(catalog!.entries[1].glbUrl).toBe('https://cdn.example.com/partner/Conveyor.glb');
   });
 });
 
@@ -320,5 +320,21 @@ describe('normalizeCatalogEntry', () => {
       'https://cdn.example.com/',
     );
     expect(entry.collections).toEqual(['Hall1']);
+  });
+});
+
+describe('LayoutStore.setPreparingEntries', () => {
+  test('publishes the preparing ids and notifies only on a real change', () => {
+    const store = new LayoutStore();
+    expect(store.getSnapshot().preparingEntryIds).toEqual([]);
+    const listener = vi.fn();
+    store.subscribe(listener);
+    store.setPreparingEntries(['project:machine.glb']);
+    expect(store.getSnapshot().preparingEntryIds).toEqual(['project:machine.glb']);
+    store.setPreparingEntries(['project:machine.glb']);
+    expect(listener).toHaveBeenCalledTimes(1);
+    store.setPreparingEntries([]);
+    expect(store.getSnapshot().preparingEntryIds).toEqual([]);
+    expect(listener).toHaveBeenCalledTimes(2);
   });
 });

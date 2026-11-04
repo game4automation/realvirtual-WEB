@@ -8,8 +8,178 @@ import { lastPathSegment } from './rv-constants';
 import { sanitizeLikeThree } from './rv-three-names';
 import { RV_SYNTHETIC_KEY } from './rv-bake-chunk';
 import { tooltipRegistry } from '../hmi/tooltip/tooltip-registry';
-import { ROOT_OCCURRENCE, ROOT_SOURCE_KEY, fullNodeAddress, getNodeId } from './rv-node-id';
-import { resolveReferencePath, scopeOf, type ReferenceScope } from './rv-reference-resolver';
+import {
+  ROOT_OCCURRENCE, ROOT_SOURCE_KEY, childOccurrence, fullNodeAddress, occurrenceSegments, parseNodeAddress,
+} from './rv-node-id';
+import { identityIdOf, type FileIdentity } from './rv-decode-identity';
+import { storedValueOfLabel } from './rv-stored-ref-label';
+import { getDeferredPlacement, isUnresolvedReferenceNode } from './rv-asset-reference';
+import { resolveReferencePath, scopeOf, type PathLookup, type ReferenceScope } from './rv-reference-resolver';
+import {
+  isComponentReference,
+  storedReferenceForm,
+  storedReferenceLabel,
+  storedReferenceValue,
+  type ReferenceLookupStage,
+  type ReferenceSpelling,
+} from './rv-node-path-rewrite.mjs';
+
+/**
+ * A stored reference as {@link NodeRegistry.resolveRef} reads it (plan-769 F6): the
+ * address form `{ address }`, the kept form `{ unresolvedPath, reason }`, or a legacy
+ * `ComponentReference` / `{ path }` record / path string of a file without `idVersion`.
+ */
+export type StoredReferenceLike =
+  | string
+  | {
+    address?: unknown; unresolvedPath?: unknown; reason?: unknown; path?: unknown;
+    type?: unknown; componentType?: unknown; componentIndex?: unknown;
+  }
+  | null
+  | undefined;
+
+/** A stored reference that reached its node. */
+export interface ResolvedRef {
+  status: 'resolved';
+  node: Object3D;
+  /** The ABSOLUTE address it resolved to (`<occurrence>#<id>`). */
+  address: string;
+  /** `address` = stored as an address; `migrated` = a legacy path, migrated on load (F3). */
+  via: 'address' | 'migrated';
+}
+
+/** Outcome of {@link NodeRegistry.resolveRef}. */
+export type RefResolution =
+  | ResolvedRef
+  /** The target's occurrence exists but its content is not registered yet (§2.3 rule 3). */
+  | { status: 'pending'; address: string; occurrence: string; blocking: Object3D }
+  | {
+    status: 'unresolved';
+    /**
+     * `missing` / `ambiguous` / `synthetic-target` — the reference has no target;
+     * `no-document` — the referrer lies in no registered document;
+     * `no-identity` — a legacy path in a document without an identity record (the
+     * caller's old path chain still applies).
+     */
+    reason: 'missing' | 'ambiguous' | 'synthetic-target' | 'no-document' | 'no-identity';
+    address?: string;
+    path?: string;
+  };
+
+/**
+ * What a READER of a stored reference does with it (plan-769 Phase 1b, {@link NodeRegistry.readStoredRef}):
+ *
+ *  - `resolved` / `pending` / `unresolved` — the verdict of the reference's FILE
+ *    (its address, or its path migrated through the file's authored index): final.
+ *    An unresolved stored reference is never handed to a guessing stage;
+ *  - `legacy` — there is no file to judge it by: the document has no identity
+ *    record (`no-identity`: a test fake, a runtime tree), the referrer lies in no
+ *    registered document (`no-document`), or the path is not one the file carried
+ *    but one the web wrote into the live extras this session (`web-written`: an
+ *    editor rename rewrite, the reference field, MCP — a path INPUT in runtime
+ *    spelling, D6, until Phase 3 writes addresses). The caller's path lookup applies.
+ */
+export type StoredRead =
+  | ResolvedRef
+  | { status: 'pending'; address: string; occurrence: string; blocking: Object3D }
+  | { status: 'unresolved'; reason: 'missing' | 'ambiguous' | 'synthetic-target'; address?: string; path?: string }
+  | { status: 'legacy'; path: string; reason: 'no-identity' | 'no-document' | 'web-written' };
+
+/** Why a queued reference was dropped without a node (F13). */
+export type PendingDropReason = 'missing' | 'placement-missing' | 'placement-cap' | 'unloaded';
+
+/** One queued reference of {@link NodeRegistry.whenResolved}. */
+interface PendingRef {
+  referrer: Object3D;
+  ref: StoredReferenceLike;
+  kind: 'path' | 'name' | undefined;
+  onResolved: (node: Object3D, resolution: ResolvedRef) => void;
+  onDropped: ((reason: PendingDropReason) => void) | undefined;
+  /** The reference node whose content the target waits for. */
+  blocking: Object3D;
+}
+
+/** One located migration finding of {@link NodeRegistry.identityProblemsOf} (plan-769 F4). */
+export interface IdentityProblem {
+  kind: 'ambiguous' | 'legacySpelling' | 'syntheticTarget';
+  referrerPath: string;
+  componentType: string;
+  field: string;
+  writtenPath: string;
+}
+
+/** Outcome of {@link NodeRegistry.findNodeForUser} (plan-769 F9). */
+export interface UserPathResolution {
+  node: Object3D;
+  /**
+   * `runtime` — the registry path as typed; `authored` — the file's authored path
+   * (Unity spelling); `legacy-three` — the exact loader spelling; `guess` — only a
+   * guessing stage matched (until plan-770): never store it unchecked.
+   */
+  via: 'runtime' | 'authored' | 'legacy-three' | 'guess';
+  /** Absolute address, for `authored` / `legacy-three`. */
+  address?: string;
+  /** The guessing stage, for `guess`. */
+  stage?: ReferenceLookupStage;
+}
+
+/**
+ * One entry of the reverse reference index (plan-610): `sourcePath` holds a
+ * `ComponentReference` in `componentType.fieldName` that resolves to the key's
+ * node. `index` is set for an element of an array field.
+ */
+export interface ReverseRefEntry {
+  sourcePath: string;
+  fieldName: string;
+  componentType: string;
+  index?: number;
+}
+
+/**
+ * A reference resolved WITH its lookup stage (plan-610, {@link NodeRegistry.resolveWithStage}).
+ *
+ *  - `node`          — the target node (for a component reference: the node carrying it);
+ *  - `stage`         — the lookup that actually hit: `exact`, or a fallback
+ *                      (`alias` / `space` / `suffix` / `sanitized` / `name-in-scope`);
+ *  - `spelling`      — how the written path relates to `scopeRootPath`
+ *                      (relative to it, or root-prefixed with the scope root's name);
+ *  - `scopeRootPath` — canonical path of the scope root the spelling refers to
+ *                      (`''` = written as an absolute registry path).
+ */
+export interface StagedReferenceResolution {
+  node: Object3D;
+  stage: ReferenceLookupStage;
+  spelling: ReferenceSpelling;
+  scopeRootPath: string;
+}
+
+/**
+ * How many prefix aliases one lookup may chain (plan-610 Phase 5c) — a moved
+ * node inside a moved subtree is one hop. The same bound as the reference
+ * depth limit; it also ends any cycle.
+ */
+const PREFIX_ALIAS_MAX_CHAIN = 16;
+
+/** Internal: a node lookup with the stage that hit. */
+interface StagedNode {
+  node: Object3D;
+  stage: ReferenceLookupStage;
+}
+
+/** Internal: where the type-dependent resolution chain landed, and with what value. */
+interface ChainHit {
+  /**
+   * The target node; `null` only for a typed hit whose instance is registered
+   * at a path without a `nodes` entry — `resolve` still hands that instance out
+   * (the pre-plan-610 contract, plan-614 F4), `resolveWithStage` reports a miss.
+   */
+  node: Object3D | null;
+  /** What `resolve` hands out (the instance, the node). */
+  value: unknown;
+  stage: ReferenceLookupStage;
+  spelling: ReferenceSpelling;
+  scopeRootPath: string;
+}
 
 /**
  * Search result from NodeRegistry.search().
@@ -31,7 +201,10 @@ export interface NodeSearchResult {
  */
 export interface ComponentRef {
   type: string;        // "ComponentReference"
-  path: string;        // Hierarchy path in GLB
+  path?: string;       // Hierarchy path in GLB (legacy / Unity form; absent on the address forms)
+  address?: string;    // plan-769 Phase 3: `#id`, `p#id`, `p/b#id` relative to the file
+  unresolvedPath?: string; // plan-769 F4: kept, never guessed
+  reason?: string;
   componentType: string; // e.g. "realvirtual.Drive", "realvirtual.PLCOutputBool"
 }
 
@@ -122,6 +295,28 @@ export class NodeRegistry {
    */
   private aliasPaths = new Map<Object3D, string[]>();
   /**
+   * PREFIX aliases (plan-610 Phase 5c): the AUTHORED path of a subtree a
+   * pre-bake hook re-parented → the moved node. A path `<prefix>/<rest>` that
+   * misses exactly resolves `<rest>` under the moved node's CURRENT path —
+   * segment by segment through the registered entries (canonical paths, dedup
+   * and sanitize aliases, further prefix aliases for a moved node inside the
+   * moved subtree), never by suffix or name. One entry per moved node instead
+   * of one alias per descendant. Registered by the place step only
+   * ({@link registerPrefixAlias}); an editor move never adds one — there the old
+   * path is genuinely gone (`rv-asset-executors.ts` `_remapSubtreePaths`).
+   */
+  private prefixAliases = new Map<string, Object3D>();
+  /** node → its prefix alias paths, so `unregisterSubtree` takes them down with the node. */
+  private prefixAliasPaths = new Map<Object3D, string[]>();
+  /**
+   * AMBIGUOUS re-parent paths (plan-610 Phase 5c): one authored path claimed by
+   * two or more DIFFERENT moved nodes → every claimant. Such a path names no
+   * node — neither as prefix alias nor as the moved node's exact alias — so the
+   * result never depends on which node was registered first; the conflict is
+   * reported once ({@link ambiguousPrefixAliasPaths}, `console.warn`).
+   */
+  private ambiguousPrefixAliases = new Map<string, Set<Object3D>>();
+  /**
    * Asset roots the ONE resolver (plan-757 F7, `rv-reference-resolver.ts`)
    * may be relative to, with every name the root is or was known by: the
    * main model root, every placement root, every editor-rebuilt subtree.
@@ -154,8 +349,14 @@ export class NodeRegistry {
   private _sanitizedIndexBuilds = 0;
   /** Stage-4 keys already warned about as ambiguous (once per key per registry). */
   private _warnedSanitizedKeys = new Set<string>();
-  /** targetPath → Set of {sourcePath, fieldName, componentType} (reverse ref index) */
-  private reverseRefs = new Map<string, Array<{ sourcePath: string; fieldName: string; componentType: string }>>();
+  /**
+   * CANONICAL target path → referrers (reverse ref index, plan-610). A reference
+   * is keyed by the registry path of the node it resolves to WITH its authoring
+   * scope (the raw written path only when it resolves nowhere), so an
+   * asset-relative and a root-prefixed spelling of the same target land on one
+   * key. Array elements carry their `index`.
+   */
+  private reverseRefs = new Map<string, ReverseRefEntry[]>();
   /** Whether the reverse-ref index has been built (built lazily on first getReferencesTo). */
   private _reverseRefsBuilt = false;
 
@@ -224,6 +425,8 @@ export class NodeRegistry {
   registerAlias(aliasPath: string, node: Object3D): boolean {
     const existing = this.nodes.get(aliasPath);
     if (existing) return false; // Don't overwrite an existing node registration
+    // An ambiguous re-parent path names none of its claimants (plan-610 Phase 5c).
+    if (this.ambiguousPrefixAliases.size > 0 && this.ambiguousPrefixAliases.get(aliasPath)?.has(node)) return false;
 
     this.nodes.set(aliasPath, node);
 
@@ -245,6 +448,100 @@ export class NodeRegistry {
     }
     aliases.push(aliasPath);
     return true;
+  }
+
+  /**
+   * Register `prefixPath` — the authored path of a subtree that was RE-PARENTED
+   * while the asset was prepared — as a PREFIX alias of `node` (plan-610 Phase
+   * 5c): every `<prefixPath>/<rest>` that misses exactly resolves `<rest>` under
+   * `node`'s current path, as stage `alias`. Call {@link registerAlias} for the
+   * path itself as well; this covers only what lies below it.
+   *
+   * Exact always wins: the path is refused when a DIFFERENT node owns it (a
+   * live registration at the authored path, which then also owns its
+   * children), and a prefix alias falls silent the moment a node is registered
+   * at its path later. Only for load/bake re-parenting — the interactive
+   * editor never calls it.
+   *
+   * Two DIFFERENT moved nodes with the same authored path (duplicate sibling
+   * names) make the path AMBIGUOUS: it then names neither node — the prefix
+   * alias is withdrawn and so is the exact alias {@link registerAlias} gave the
+   * first claimant — so the outcome does not depend on the registration order.
+   * The conflict is reported once with `console.warn` and stays listed in
+   * {@link ambiguousPrefixAliasPaths}; a lookup through it falls to the later,
+   * reported stages like any other miss.
+   *
+   * @returns `false` when the path was refused or is ambiguous.
+   */
+  registerPrefixAlias(prefixPath: string, node: Object3D): boolean {
+    if (prefixPath === '') return false;
+    const claimants = this.ambiguousPrefixAliases.get(prefixPath);
+    if (claimants) {
+      if (!claimants.has(node)) {
+        claimants.add(node);
+        this._rememberPrefixPath(node, prefixPath);
+      }
+      this._dropAmbiguousExactAlias(prefixPath, claimants);
+      return false;
+    }
+    const existing = this.prefixAliases.get(prefixPath);
+    if (existing === node) return true;
+    if (existing !== undefined) {
+      // One authored path, two moved nodes: name neither, whichever came first.
+      this.prefixAliases.delete(prefixPath);
+      const both = new Set<Object3D>([existing, node]);
+      this.ambiguousPrefixAliases.set(prefixPath, both);
+      this._rememberPrefixPath(node, prefixPath);
+      this._dropAmbiguousExactAlias(prefixPath, both);
+      const where = [...both].map((n) => this.nodePaths.get(n) ?? n.name).sort();
+      console.warn(`[NodeRegistry] ambiguous re-parent path "${prefixPath}": claimed by ${where.map((w) => `"${w}"`).join(' and ')} — it resolves to neither (plan-610 Phase 5c)`);
+      return false;
+    }
+    const owner = this.nodes.get(prefixPath);
+    if (owner !== undefined && owner !== node) return false;
+    this.prefixAliases.set(prefixPath, node);
+    this._rememberPrefixPath(node, prefixPath);
+    return true;
+  }
+
+  /** Number of registered (unambiguous) prefix aliases (diagnostics, tests). */
+  prefixAliasCount(): number {
+    return this.prefixAliases.size;
+  }
+
+  /**
+   * Authored re-parent paths claimed by more than one moved node, sorted — they
+   * resolve to none of them ({@link registerPrefixAlias}). Diagnostics, tests.
+   */
+  ambiguousPrefixAliasPaths(): string[] {
+    return [...this.ambiguousPrefixAliases.keys()].sort();
+  }
+
+  private _rememberPrefixPath(node: Object3D, prefixPath: string): void {
+    let paths = this.prefixAliasPaths.get(node);
+    if (!paths) {
+      paths = [];
+      this.prefixAliasPaths.set(node, paths);
+    }
+    if (!paths.includes(prefixPath)) paths.push(prefixPath);
+  }
+
+  /**
+   * Withdraw the exact alias an ambiguous re-parent path gave one of its
+   * claimants (first come in {@link registerAlias}); a canonical registration
+   * or an alias of a non-claimant at that path is left alone.
+   */
+  private _dropAmbiguousExactAlias(prefixPath: string, claimants: ReadonlySet<Object3D>): void {
+    const holder = this.nodes.get(prefixPath);
+    if (holder === undefined || !claimants.has(holder) || this.nodePaths.get(holder) === prefixPath) return;
+    this.nodes.delete(prefixPath);
+    this._dropFromSuffixMap(prefixPath);
+    const aliases = this.aliasPaths.get(holder);
+    if (aliases) {
+      const i = aliases.indexOf(prefixPath);
+      if (i >= 0) aliases.splice(i, 1);
+      if (aliases.length === 0) this.aliasPaths.delete(holder);
+    }
   }
 
   /**
@@ -363,6 +660,18 @@ export class NodeRegistry {
   }
 
   /**
+   * The node registered under exactly `path` — its canonical path, a
+   * registered alias, or a path into a subtree re-parented at load (prefix
+   * alias) — and nothing else: no space normalisation, no suffix match, no
+   * sanitized-name stage. plan-774 review fix E6: what a CLASSIFICATION
+   * ("does this path lie inside a placed reference?") must use, where a
+   * guessing stage would answer for a different node.
+   */
+  getNodeExact(path: string): Object3D | null {
+    return this.nodes.get(path) ?? this._resolvePrefixAlias(path, 0);
+  }
+
+  /**
    * @param warnOnAmbiguity Emit the F10 "refusing to guess" warning. Suppressed
    *   for the internal probe in {@link getByPath}, which does its OWN ambiguity
    *   check over component instances: an ambiguous node lookup there is not yet
@@ -370,15 +679,29 @@ export class NodeRegistry {
    *   warning would put a scary message next to a perfectly good result.
    */
   private _getNode(path: string, warnOnAmbiguity: boolean): Object3D | null {
-    // Direct lookup (most common case)
+    return this._getNodeStaged(path, warnOnAmbiguity)?.node ?? null;
+  }
+
+  /**
+   * {@link _getNode} with the stage that hit (plan-610) — the ONE implementation
+   * of the node lookup chain; `_getNode` is this without the stage.
+   */
+  private _getNodeStaged(path: string, warnOnAmbiguity: boolean): StagedNode | null {
+    // Direct lookup (most common case). A hit under a path that is not the
+    // node's canonical one is an ALIAS hit.
     const direct = this.nodes.get(path);
-    if (direct) return direct;
+    if (direct) return { node: direct, stage: this.nodePaths.get(direct) === path ? 'exact' : 'alias' };
+
+    // A path INTO a subtree re-parented at load (plan-610 Phase 5c): exact
+    // through the prefix alias of the moved node, therefore an ALIAS hit.
+    const viaPrefix = this._resolvePrefixAlias(path, 0);
+    if (viaPrefix) return { node: viaPrefix, stage: 'alias' };
 
     // Normalize path: Three.js GLTF loader sanitizes names (spaces → underscores)
     const [, normalized] = this._lookupSpellings(path);
     if (normalized !== path) {
-      const normDirect = this.nodes.get(normalized);
-      if (normDirect) return normDirect;
+      const normDirect = this.nodes.get(normalized) ?? this._resolvePrefixAlias(normalized, 0);
+      if (normDirect) return { node: normDirect, stage: 'space' };
     }
 
     // Suffix match using the suffix map for O(1) lookup.
@@ -415,7 +738,7 @@ export class NodeRegistry {
         }
         return null;
       }
-      if (found) return found;
+      if (found) return { node: found, stage: 'suffix' };
     }
 
     // Stage 4: sanitize-normalized full-path match (plan-734 F4).
@@ -430,7 +753,44 @@ export class NodeRegistry {
     // registration predates plan-734, still resolves its authored paths —
     // `sanitizeLikeThree` is the one transform that maps both the authored and
     // the loader-assigned spelling onto the same key.
-    return this._resolveSanitized(path, warnOnAmbiguity);
+    const sanitized = this._resolveSanitized(path, warnOnAmbiguity);
+    return sanitized ? { node: sanitized, stage: 'sanitized' } : null;
+  }
+
+  /**
+   * The prefix-alias stage (plan-610 Phase 5c, {@link registerPrefixAlias}):
+   * the LONGEST proper prefix of `path` that is a prefix alias names the moved
+   * node; the rest is looked up under the node's current canonical path —
+   * exactly (a registered canonical or alias entry), else through a further
+   * prefix alias (a moved node that was itself inside a moved subtree). No
+   * suffix, no name, no shorter prefix after the longest one matched: the
+   * authored prefix names its node definitively, and a miss below it is a miss.
+   *
+   * Scope-correct by construction: a prefix alias is registered with the
+   * instance root's registry path in front, and every candidate key it builds
+   * lies under the moved node's own canonical path — so it cannot land in
+   * another placement. `depth` bounds a chain (and any cycle) like the
+   * reference depth limit does.
+   */
+  private _resolvePrefixAlias(path: string, depth: number): Object3D | null {
+    if ((this.prefixAliases.size === 0 && this.ambiguousPrefixAliases.size === 0) || depth > PREFIX_ALIAS_MAX_CHAIN) return null;
+    for (let cut = path.lastIndexOf('/'); cut > 0; cut = path.lastIndexOf('/', cut - 1)) {
+      const prefix = path.slice(0, cut);
+      const target = this.prefixAliases.get(prefix);
+      if (target === undefined) {
+        // An ambiguous authored prefix names no node: a miss, never a shorter guess.
+        if (this.ambiguousPrefixAliases.has(prefix)) return null;
+        continue;
+      }
+      // A node registered at the authored path since then owns its children.
+      const owner = this.nodes.get(prefix);
+      if (owner !== undefined && owner !== target) return null;
+      const canonical = this.nodePaths.get(target);
+      if (canonical === undefined) return null;
+      const candidate = `${canonical}/${path.slice(cut + 1)}`;
+      return this.nodes.get(candidate) ?? this._resolvePrefixAlias(candidate, depth + 1);
+    }
+    return null;
   }
 
   /**
@@ -560,10 +920,23 @@ export class NodeRegistry {
 
   /** Get typed instance by full path and type */
   getByPath<T = unknown>(type: string, path: string): T | null {
+    const hit = this._getByPathStaged(type, path, true);
+    return hit ? (hit.instance as T) : null;
+  }
+
+  /**
+   * {@link getByPath} with the canonical path and the lookup stage that hit
+   * (plan-610) — the ONE implementation of the typed lookup chain.
+   */
+  private _getByPathStaged(
+    type: string,
+    path: string,
+    warnOnAmbiguity: boolean,
+  ): { instance: unknown; path: string; stage: ReferenceLookupStage } | null {
     const compMap = this.components.get(path);
     if (compMap) {
       const instance = compMap.get(type);
-      if (instance !== undefined) return instance as T;
+      if (instance !== undefined) return { instance, path, stage: 'exact' };
     }
     // Normalize path: Three.js GLTF loader sanitizes names (spaces → underscores)
     const [, normalized] = this._lookupSpellings(path);
@@ -571,7 +944,7 @@ export class NodeRegistry {
       const normMap = this.components.get(normalized);
       if (normMap) {
         const instance = normMap.get(type);
-        if (instance !== undefined) return instance as T;
+        if (instance !== undefined) return { instance, path: normalized, stage: 'space' };
       }
     }
 
@@ -581,14 +954,16 @@ export class NodeRegistry {
     // Resolve the node via the alias-aware getNode and retry with its
     // canonical path — this is what lets recorder playback find a Drive by
     // its authored path after re-parenting.
-    const aliasNode = this._getNode(path, false);
-    if (aliasNode) {
-      const canonical = this.nodePaths.get(aliasNode);
+    const aliasHit = this._getNodeStaged(path, false);
+    if (aliasHit) {
+      const canonical = this.nodePaths.get(aliasHit.node);
       if (canonical && canonical !== path) {
         const cm = this.components.get(canonical);
         if (cm) {
           const instance = cm.get(type);
-          if (instance !== undefined) return instance as T;
+          if (instance !== undefined) {
+            return { instance, path: canonical, stage: aliasHit.stage === 'exact' ? 'alias' : aliasHit.stage };
+          }
         }
       }
     }
@@ -603,27 +978,31 @@ export class NodeRegistry {
     const querySuffix = lastPathSegment(path);
     const candidates = this.suffixMap.get(querySuffix);
     if (candidates) {
-      let found: T | null = null;
+      let found: unknown = null;
+      let foundPath: string | null = null;
       let matchedPaths: string[] | null = null;
       for (const registeredPath of candidates) {
         if (!this._suffixMatches(registeredPath, path, normalized)) continue;
         const instance = this.components.get(registeredPath)?.get(type);
         if (instance === undefined) continue;
         if (found === null) {
-          found = instance as T;
+          found = instance;
+          foundPath = registeredPath;
           matchedPaths = [registeredPath];
         } else if (instance !== found) {
           matchedPaths!.push(registeredPath);
         }
       }
       if (matchedPaths && matchedPaths.length > 1) {
-        console.warn(
-          `[NodeRegistry] Ambiguous suffix match for "${type}" at "${path}": ${matchedPaths.length} candidates `
-          + `(${matchedPaths.map((p) => `"${p}"`).join(', ')}) — refusing to guess.`,
-        );
+        if (warnOnAmbiguity) {
+          console.warn(
+            `[NodeRegistry] Ambiguous suffix match for "${type}" at "${path}": ${matchedPaths.length} candidates `
+            + `(${matchedPaths.map((p) => `"${p}"`).join(', ')}) — refusing to guess.`,
+          );
+        }
         return null;
       }
-      if (found !== null) return found;
+      if (found !== null && foundPath !== null) return { instance: found, path: foundPath, stage: 'suffix' };
     }
     return null;
   }
@@ -750,8 +1129,18 @@ export class NodeRegistry {
    *   alias / suffix / sanitized) run, and last a NAME match to a descendant
    *   of `scope` carrying the requested component (legacy tolerance for an
    *   authored hierarchy that no longer exists).
+   * @param referrer plan-769 F6: the node carrying the reference. A STORED
+   *   reference — one whose document is known through `referrer` or `scope` — is
+   *   read by {@link readStoredRef} FIRST: its address, or its legacy `path`
+   *   through the file's migration (authored index). That verdict is FINAL
+   *   (Phase 1b): a stored reference the file does not resolve is a miss, never
+   *   handed to the guessing stages above; a typed miss on the addressed node is
+   *   a miss too. The path chain runs only for a `legacy` read (no identity
+   *   record, no document, or a path the web wrote this session — an input) and
+   *   for a call without referrer AND scope (the plugin API with a bare path).
+   *   An address-form ref (`{ address }`, `{ unresolvedPath }`) never reaches it.
    */
-  resolve(ref: ComponentRef | undefined | null, scope?: Object3D | ReferenceScope | null): {
+  resolve(ref: ComponentRef | undefined | null, scope?: Object3D | ReferenceScope | null, referrer?: Object3D | null): {
     drive?: RVDrive | null;
     sensor?: RVSensor | null;
     signalAddress?: string | null;
@@ -765,71 +1154,252 @@ export class NodeRegistry {
      * additive and can never turn a working late resolution into a null.
      */
     component?: unknown;
+    /** plan-769: the node came from the address index (`address` stored, `migrated` legacy path). */
+    resolvedVia?: 'address' | 'migrated';
   } {
-    if (!ref || ref.type !== 'ComponentReference' || !ref.path) {
-      return {};
+    if (!ref || ref.type !== 'ComponentReference') return {};
+    const stored = ref as unknown as { address?: unknown; unresolvedPath?: unknown };
+    const addressForm = typeof stored.address === 'string' || typeof stored.unresolvedPath === 'string';
+    if (!addressForm && !ref.path) return {};
+    const chain = this._resolveChain(ref, scope, true, referrer ?? null, addressForm, true);
+    const hit = chain.hit;
+    if (chain.via && hit?.node === chain.addressed) {
+      const out = this._resolveOutcome(ref, chain);
+      out.resolvedVia = chain.via;
+      return out;
     }
+    if (addressForm && !hit) return {};
+    return this._resolveOutcome(ref, chain);
+  }
 
+  /** The typed result of {@link resolve} for one chain outcome. */
+  private _resolveOutcome(ref: ComponentRef, chain: ReturnType<NodeRegistry['_resolveChain']>): {
+    drive?: RVDrive | null;
+    sensor?: RVSensor | null;
+    signalAddress?: string | null;
+    node?: Object3D | null;
+    component?: unknown;
+    resolvedVia?: 'address' | 'migrated';
+  } {
+    const hit = chain.hit;
+    // plan-769 Phase 3: the label of any stored form (path, address, kept path).
+    const label = storedReferenceLabel(ref) ?? '';
+
+    switch (chain.kind) {
+      case 'drive': {
+        const drive = (hit?.value ?? null) as RVDrive | null;
+        if (!drive) console.warn(`[NodeRegistry] Drive not found: "${label}"`);
+        return { drive };
+      }
+      case 'sensor': {
+        const sensor = (hit?.value ?? null) as RVSensor | null;
+        if (!sensor) console.warn(`[NodeRegistry] Sensor not found: "${label}"`);
+        return { sensor };
+      }
+      case 'signal': {
+        const resolvedPath = hit?.node ? this.nodePaths.get(hit.node) : undefined;
+        if (resolvedPath) return { signalAddress: resolvedPath };
+        // Fallback: return the raw path. It MAY still work — the SignalStore runs
+        // its own normalization/suffix resolution over `pathToName`, and a
+        // process-image signal legitimately has no scene node at all. But when it
+        // does not, the component silently binds to an address nobody writes and
+        // the drive simply never moves, with nothing in the console to show for
+        // it (plan-381 F6). Hence: say so, without claiming more than we know.
+        console.warn(
+          `[NodeRegistry] Signal node not found: "${label}" — `
+          + 'falling back to the raw path; the signal may not be driven.',
+        );
+        return { signalAddress: ref.path ?? label };
+      }
+      case 'node': {
+        if (!hit) console.warn(`[NodeRegistry] Node not found: "${label}"`);
+        return { node: hit?.node ?? null };
+      }
+      case 'component': {
+        if (hit) return { component: hit.value };
+        console.warn(`[NodeRegistry] ${chain.ct} not found: "${label}"`);
+        break;
+      }
+      case 'unknown':
+        // The warning is about the TYPE, not about the resolution: a component type
+        // this registry actually knows is a supported pass-through and must stay silent
+        // (before the namespace was stripped, `realvirtual.MachiningTool` was reported as
+        // unknown on every load — plan-405 live finding F2). A type nothing in the scene
+        // carries is still worth flagging, because then nobody will resolve it later.
+        console.warn(`[NodeRegistry] Unknown componentType: "${ref.componentType}" at "${label}"`);
+        break;
+    }
+    // RAW PATH pass-through: `resolveComponentRefs()` keeps `ref.path` for array
+    // fields when nothing is returned here, and the consuming component resolves
+    // it against the registry itself (two-phase construction — the target
+    // instance need not exist yet at this point).
+    return {};
+  }
+
+  /**
+   * Resolve a reference like {@link resolve} — the SAME type-dependent chain —
+   * but report WHERE it landed instead of the runtime value (plan-610): the
+   * target node, the lookup stage that actually hit, the spelling of the
+   * written path and the scope root that spelling refers to. Quiet (no
+   * warnings) and side-effect free; `null` when the chain misses (where
+   * `resolve` would fall back to the raw path or to `null`).
+   *
+   * `componentType` overrides `ref.componentType` (the plan-610 rewrite passes
+   * `undefined` → `''` for a declared path-string field, i.e. a plain node).
+   */
+  resolveWithStage(
+    ref: { path: string; componentType?: string | null } | null | undefined,
+    componentType: string | null | undefined,
+    scope?: Object3D | ReferenceScope | null,
+  ): StagedReferenceResolution | null {
+    if (!ref || typeof ref.path !== 'string' || ref.path === '') return null;
+    const chain = this._resolveChain(
+      { type: 'ComponentReference', path: ref.path, componentType: componentType ?? ref.componentType ?? '' },
+      scope,
+      false,
+    );
+    const hit = chain.hit;
+    if (!hit || !hit.node) return null;
+    const { spelling, scopeRootPath } = hit;
+    return { node: hit.node, stage: hit.stage, spelling, scopeRootPath };
+  }
+
+  /**
+   * THE type-dependent resolution chain of {@link resolve} / {@link resolveWithStage}:
+   * the ONE resolver inside the authoring scope first, then the registry-wide
+   * stages (exact / alias / space / suffix / sanitized), last the NAME match to
+   * a descendant of the scope root. `warn` keeps the ambiguity warnings of the
+   * lookup stages exactly where `resolve` always emitted them.
+   */
+  private _resolveChain(
+    ref: ComponentRef,
+    scope: Object3D | ReferenceScope | null | undefined,
+    warn: boolean,
+    referrer: Object3D | null = null,
+    addressOnly = false,
+    stored = false,
+  ): {
+    kind: 'drive' | 'sensor' | 'signal' | 'node' | 'component' | 'unknown';
+    ct: string;
+    hit: ChainHit | null;
+    /** plan-769: set when the address index named the node ({@link addressed}). */
+    via?: 'address' | 'migrated';
+    addressed?: Object3D;
+  } {
     // Unity writes the componentType NAMESPACED (`realvirtual.MachiningTool`), and
     // every lookup below compares against the bare TypeScript component name. The
     // known kinds got away with it only because they match via `includes()`; any
     // exact comparison — and every component type added later — has to see the bare
     // name. Strip once, here, so there is exactly one place that knows about it.
     const ct = stripComponentNamespace(ref.componentType ?? '');
+    // The path branches below run only for the PATH form (an address-form ref is
+    // answered by the address index above them, or not at all).
+    const refPath = ref.path ?? '';
 
-    // plan-757 F7: the ONE resolver inside the authoring scope comes first.
+    // plan-757 F7: the ONE resolver inside the authoring scope comes first. The
+    // lookup it is handed records the stage of the node lookup that hit
+    // (plan-610: a root-prefixed path can still land via a suffix fallback).
     const refScope = this._scopeArg(scope);
-    const scopedNode = refScope ? resolveReferencePath(this, ref.path, refScope).node : null;
+    let scopedStage: ReferenceLookupStage = 'exact';
+    let scopedSpelling: ReferenceSpelling = 'relative';
+    let scopedNode: Object3D | null = null;
+    // plan-769 F6: the address index first — for an address-form ref always, for
+    // a legacy path when the referrer or the scope names its document (its file's
+    // migration, no guessing). Phase 1b: that verdict is FINAL for a reference the
+    // file carries; only a `legacy` read goes on to the path chain below.
+    let via: 'address' | 'migrated' | undefined;
+    if (referrer || addressOnly || (stored && scope)) {
+      const r = this.readStoredRef(referrer, ref as unknown as StoredReferenceLike, { scope });
+      if (r.status === 'resolved') { scopedNode = r.node; via = r.via; }
+      else if (r.status !== 'legacy' || addressOnly) {
+        // A stored reference that names no node is unresolved — never guessed.
+        return { kind: addressOnly ? 'unknown' : this._chainKind(ct), ct, hit: null };
+      }
+    }
+    if (refScope && !scopedNode) {
+      const lookup: PathLookup = {
+        getNode: (p: string) => {
+          const r = this._getNodeStaged(p, warn);
+          scopedStage = r?.stage ?? 'exact';
+          return r?.node ?? null;
+        },
+      };
+      const res = resolveReferencePath(lookup, refPath, refScope);
+      scopedNode = res.node;
+      if (res.step === 'root-stripped') {
+        scopedSpelling = 'root-prefixed';
+        // The scope root itself (`Machine` alone) is found without a lookup.
+        if (res.node === refScope.root && res.lookupPath === refScope.rootPath) scopedStage = 'exact';
+      }
+    }
     const scopeRoot = refScope?.root ?? null;
+    const scopeRootPath = refScope?.rootPath ?? '';
+
+    type Hit = ChainHit;
+    const fromScope = (value: unknown): Hit => ({
+      node: scopedNode!, value, stage: scopedStage, spelling: scopedSpelling, scopeRootPath,
+    });
+    // A registry-wide hit: an EXACT one was written as the absolute path; a
+    // fallback one is healed relative to the authoring scope when it lies in it.
+    const fromRegistry = (node: Object3D, value: unknown, stage: ReferenceLookupStage): Hit => {
+      if (stage === 'exact' || !refScope) return { node, value, stage, spelling: 'relative', scopeRootPath: '' };
+      const p = this.nodePaths.get(node) ?? '';
+      const inScope = scopeRootPath === '' || p === scopeRootPath || p.startsWith(scopeRootPath + '/');
+      return { node, value, stage, spelling: 'relative', scopeRootPath: inScope ? scopeRootPath : '' };
+    };
+    const typed = (type: string): Hit | null => {
+      if (scopedNode) {
+        const inst = this.componentOn<unknown>(scopedNode, type);
+        if (inst !== null) return fromScope(inst);
+      }
+      // The address named the node: a missing component there is a miss, not a
+      // reason to look for one elsewhere by path or name (plan-769 1b).
+      if (addressOnly || via) return null;
+      const byPath = this._getByPathStaged(type, refPath, warn);
+      if (byPath) {
+        // plan-614 F4: an instance found by path is THE answer, exactly as
+        // before plan-610 — also when its path has no node entry (then there is
+        // no node to report, and no later stage is consulted).
+        const node = this.nodes.get(byPath.path) ?? null;
+        return node
+          ? fromRegistry(node, byPath.instance, byPath.stage)
+          : { node: null, value: byPath.instance, stage: byPath.stage, spelling: 'relative', scopeRootPath: '' };
+      }
+      if (scopeRoot) {
+        const byName = this.findComponentNodeInScope(type, refPath, scopeRoot);
+        if (byName) return fromRegistry(byName.node, byName.instance, 'name-in-scope');
+      }
+      return null;
+    };
+    // `registeredOnly`: the signal branch only accepts a node with a registry
+    // path (its address) and then tries the next stage — exactly as before.
+    const plainNode = (registeredOnly: boolean): Hit | null => {
+      const ok = (n: Object3D | null): n is Object3D => !!n && (!registeredOnly || this.nodePaths.has(n));
+      if (addressOnly || via) return scopedNode && ok(scopedNode) ? fromScope(scopedNode) : null;
+      const r = scopedNode ? null : this._getNodeStaged(refPath, warn);
+      if (scopedNode) {
+        if (ok(scopedNode)) return fromScope(scopedNode);
+      } else if (r && ok(r.node)) {
+        return fromRegistry(r.node, r.node, r.stage);
+      }
+      if (scopeRoot) {
+        const byName = this.findNodeInScope(refPath, scopeRoot);
+        if (ok(byName)) return fromRegistry(byName, byName, 'name-in-scope');
+      }
+      return null;
+    };
 
     // Drive reference
-    if (ct.includes('Drive')) {
-      let drive = scopedNode ? this.componentOn<RVDrive>(scopedNode, 'Drive') : null;
-      if (!drive) drive = this.getByPath<RVDrive>('Drive', ref.path);
-      if (!drive && scopeRoot) drive = this.findComponentInScope<RVDrive>('Drive', ref.path, scopeRoot);
-      if (!drive) console.warn(`[NodeRegistry] Drive not found: "${ref.path}"`);
-      return { drive };
-    }
-
+    const addr = via && scopedNode ? { via, addressed: scopedNode } : {};
+    if (ct.includes('Drive')) return { kind: 'drive', ct, hit: typed('Drive'), ...addr };
     // Sensor reference
-    if (ct.includes('Sensor')) {
-      let sensor = scopedNode ? this.componentOn<RVSensor>(scopedNode, 'Sensor') : null;
-      if (!sensor) sensor = this.getByPath<RVSensor>('Sensor', ref.path);
-      if (!sensor && scopeRoot) sensor = this.findComponentInScope<RVSensor>('Sensor', ref.path, scopeRoot);
-      if (!sensor) console.warn(`[NodeRegistry] Sensor not found: "${ref.path}"`);
-      return { sensor };
-    }
-
+    if (ct.includes('Sensor')) return { kind: 'sensor', ct, hit: typed('Sensor'), ...addr };
     // Signal reference (PLCOutputBool, PLCInputBool, etc.)
     // Resolve the C# path to the actual registered Three.js path
     // (handles root prefix mismatch and space→underscore sanitization)
     if (ct.includes('Signal') || ct.includes('PLC')) {
-      const node = scopedNode ?? this.getNode(ref.path);
-      if (node) {
-        const resolvedPath = this.nodePaths.get(node);
-        if (resolvedPath) return { signalAddress: resolvedPath };
-      }
-      // Scoped fallback: signal node by name inside the authoring subtree.
-      if (scopeRoot) {
-        const byName = this.findNodeInScope(ref.path, scopeRoot);
-        if (byName) {
-          const resolvedPath = this.nodePaths.get(byName);
-          if (resolvedPath) return { signalAddress: resolvedPath };
-        }
-      }
-      // Fallback: return the raw path. It MAY still work — the SignalStore runs
-      // its own normalization/suffix resolution over `pathToName`, and a
-      // process-image signal legitimately has no scene node at all. But when it
-      // does not, the component silently binds to an address nobody writes and
-      // the drive simply never moves, with nothing in the console to show for
-      // it (plan-381 F6). Hence: say so, without claiming more than we know.
-      console.warn(
-        `[NodeRegistry] Signal node not found: "${ref.path}" — `
-        + 'falling back to the raw path; the signal may not be driven.',
-      );
-      return { signalAddress: ref.path };
+      return { kind: 'signal', ct, hit: plainNode(true), ...addr };
     }
-
     // Generic NODE reference (plan-362). A Unity `public Transform Anchor`
     // field serializes with componentType `UnityEngine.Transform`; very old
     // exports wrote no componentType at all. Exactly those two cases resolve
@@ -839,13 +1409,7 @@ export class NodeRegistry {
     // Every OTHER non-empty componentType deliberately keeps today's behavior
     // (unresolved + warning) — treating "unknown" as legacy would silently
     // bend a future reference type onto a node instead of failing visibly.
-    if (ct === 'UnityEngine.Transform' || ct === '') {
-      let node = scopedNode ?? this.getNode(ref.path);
-      if (!node && scopeRoot) node = this.findNodeInScope(ref.path, scopeRoot);
-      if (!node) console.warn(`[NodeRegistry] Node not found: "${ref.path}"`);
-      return { node: node ?? null };
-    }
-
+    if (ct === 'UnityEngine.Transform' || ct === '') return { kind: 'node', ct, hit: plainNode(false), ...addr };
     // GENERIC component reference (plan-411 §2.2). Every type the registry knows
     // resolves the same way the Drive/Sensor branches do — exact path, alias,
     // suffix (all inside getByPath) and finally the scoped name fallback.
@@ -856,30 +1420,23 @@ export class NodeRegistry {
     // reason plan-404 had to keep the raw path in a component-specific
     // `mechanismRefPath` workaround.
     //
-    // A MISS deliberately falls through to the pass-through below instead of
-    // returning `{ component: null }`: `MachiningVolume.Tools` and the DES
-    // references resolve their raw path LATER, when the target may finally
-    // exist. Reporting a miss as a hard null here would break that contract for
+    // A MISS deliberately falls through to the pass-through in `resolve`
+    // instead of returning `{ component: null }`: `MachiningVolume.Tools` and the
+    // DES references resolve their raw path LATER, when the target may finally
+    // exist. Reporting a miss as a hard null there would break that contract for
     // the sake of a nicer-looking API.
-    if (this.typeIndex.has(ct)) {
-      let component = scopedNode ? this.componentOn<unknown>(scopedNode, ct) : null;
-      if (component === null) component = this.getByPath<unknown>(ct, ref.path);
-      if (component === null && scopeRoot) component = this.findComponentInScope<unknown>(ct, ref.path, scopeRoot);
-      if (component !== null && component !== undefined) return { component };
-      console.warn(`[NodeRegistry] ${ct} not found: "${ref.path}"`);
-    } else {
-      // The warning is about the TYPE, not about the resolution: a component type
-      // this registry actually knows is a supported pass-through and must stay silent
-      // (before the namespace was stripped, `realvirtual.MachiningTool` was reported as
-      // unknown on every load — plan-405 live finding F2). A type nothing in the scene
-      // carries is still worth flagging, because then nobody will resolve it later.
-      console.warn(`[NodeRegistry] Unknown componentType: "${ref.componentType}" at "${ref.path}"`);
-    }
-    // RAW PATH pass-through: `resolveComponentRefs()` keeps `ref.path` for array
-    // fields when nothing is returned here, and the consuming component resolves
-    // it against the registry itself (two-phase construction — the target
-    // instance need not exist yet at this point).
-    return {};
+    if (this.typeIndex.has(ct)) return { kind: 'component', ct, hit: typed(ct), ...addr };
+    return { kind: 'unknown', ct, hit: null };
+  }
+
+  /** The branch {@link _resolveChain} takes for a (namespace-stripped) component type. */
+  private _chainKind(ct: string): 'drive' | 'sensor' | 'signal' | 'node' | 'component' | 'unknown' {
+    if (ct.includes('Drive')) return 'drive';
+    if (ct.includes('Sensor')) return 'sensor';
+    if (ct.includes('Signal') || ct.includes('PLC')) return 'signal';
+    if (ct === 'UnityEngine.Transform' || ct === '') return 'node';
+    if (this.typeIndex.has(ct)) return 'component';
+    return 'unknown';
   }
 
   /**
@@ -915,23 +1472,26 @@ export class NodeRegistry {
   /**
    * Scope-limited resolution fallback: first descendant of `scope` whose NAME
    * equals the ref path's last segment and carries a registered component of
-   * `type`. Used by resolve() when every path-based lookup misses.
+   * `type`. Used by resolve() when every path-based lookup misses. Returns the
+   * node with the instance (plan-610 reports where the fallback landed).
    */
-  private findComponentInScope<T>(type: string, refPath: string, scope: Object3D): T | null {
+  private findComponentNodeInScope(
+    type: string, refPath: string, scope: Object3D,
+  ): { node: Object3D; instance: unknown } | null {
     const name = lastPathSegment(refPath);
     if (!name) return null;
-    let found: T | null = null;
+    let found: { node: Object3D; instance: unknown } | null = null;
     scope.traverse((n: Object3D) => {
       if (found !== null || n.name !== name) return;
       const path = this.nodePaths.get(n);
       if (!path) return;
       const instance = this.components.get(path)?.get(type);
-      if (instance !== undefined) found = instance as T;
+      if (instance !== undefined) found = { node: n, instance };
     });
     return found;
   }
 
-  /** Name-match twin of {@link findComponentInScope} for plain node refs (signals). */
+  /** Name-match twin of {@link findComponentNodeInScope} for plain node refs (signals). */
   private findNodeInScope(refPath: string, scope: Object3D): Object3D | null {
     const name = lastPathSegment(refPath);
     if (!name) return null;
@@ -1000,24 +1560,32 @@ export class NodeRegistry {
    * Built lazily on first getReferencesTo() access (no longer called eagerly
    * on the model-load critical path). Replaces the O(n*m) scan in
    * PropertyInspector's referencedBy useMemo with O(1) lookup.
+   *
+   * plan-610: keyed by the CANONICAL target — every reference is resolved with
+   * its authoring scope through the same chain as {@link resolve} (typed, then
+   * as a plain node), so `Mount/Kine` and `Machine/Mount/Kine` meet on one key;
+   * only a reference that resolves nowhere is keyed by its raw path. Scalar
+   * fields and the elements of array fields (with `index`) are indexed; alias
+   * registrations are skipped (one node, one walk).
    */
   buildReverseRefIndex(): void {
     this.reverseRefs.clear();
     for (const [sourcePath, node] of this.nodes) {
+      if (this.nodePaths.get(node) !== sourcePath) continue; // alias entry
       const rv = node.userData?.realvirtual as Record<string, Record<string, unknown>> | undefined;
       if (!rv) continue;
       for (const [compType, compData] of Object.entries(rv)) {
-        if (typeof compData !== 'object' || compData === null) continue;
+        if (typeof compData !== 'object' || compData === null || Array.isArray(compData)) continue;
         for (const [fieldName, value] of Object.entries(compData as Record<string, unknown>)) {
-          if (
-            value && typeof value === 'object' && !Array.isArray(value) &&
-            (value as Record<string, unknown>).type === 'ComponentReference' &&
-            typeof (value as Record<string, unknown>).path === 'string'
-          ) {
-            const targetPath = (value as Record<string, unknown>).path as string;
-            let list = this.reverseRefs.get(targetPath);
-            if (!list) { list = []; this.reverseRefs.set(targetPath, list); }
-            list.push({ sourcePath, fieldName, componentType: compType });
+          if (isComponentReference(value)) {
+            this._indexReverseRef(node, value, { sourcePath, fieldName, componentType: compType });
+          } else if (Array.isArray(value)) {
+            for (let index = 0; index < value.length; index++) {
+              const el: unknown = value[index];
+              if (isComponentReference(el)) {
+                this._indexReverseRef(node, el, { sourcePath, fieldName, componentType: compType, index });
+              }
+            }
           }
         }
       }
@@ -1025,12 +1593,48 @@ export class NodeRegistry {
     this._reverseRefsBuilt = true;
   }
 
+  private _indexReverseRef(
+    referrer: Object3D,
+    ref: { path?: string; address?: string; unresolvedPath?: string; componentType?: unknown },
+    entry: ReverseRefEntry,
+  ): void {
+    const form = storedReferenceForm(ref);
+    if (!form) return;
+    let targetPath: string;
+    if (form.form !== 'path') {
+      // plan-769 Phase 3: an address-form reference names its target by id — the
+      // index key is the target's CURRENT path (a kept path keys itself).
+      const r = this.readStoredRef(referrer, storedReferenceValue(ref)!);
+      targetPath = (r.status === 'resolved' ? this.nodePaths.get(r.node) : undefined) ?? storedReferenceLabel(ref)!;
+    } else {
+      const query = { path: form.path };
+      const ct = typeof ref.componentType === 'string' ? ref.componentType : '';
+      const hit = this.resolveWithStage(query, ct, referrer)
+        ?? (ct !== '' ? this.resolveWithStage(query, '', referrer) : null);
+      targetPath = (hit ? this.nodePaths.get(hit.node) : undefined) ?? form.path;
+    }
+    let list = this.reverseRefs.get(targetPath);
+    if (!list) { list = []; this.reverseRefs.set(targetPath, list); }
+    list.push(entry);
+  }
+
+  /**
+   * Drop the reverse-ref index; it is rebuilt lazily on the next lookup. Called
+   * whenever paths or stored references change (plan-610: a re-key in
+   * {@link recomputePathsForSubtrees}, the end of every reference-rewrite
+   * composite) — never rebuilt eagerly.
+   */
+  invalidateReverseRefs(): void {
+    this.reverseRefs.clear();
+    this._reverseRefsBuilt = false;
+  }
+
   /**
    * O(1) lookup of which nodes reference the given path via ComponentReference.
    * Returns empty array if none. The reverse-ref index is built lazily on
-   * first access.
+   * first access. `targetPath` is a canonical registry path.
    */
-  getReferencesTo(targetPath: string): ReadonlyArray<{ sourcePath: string; fieldName: string; componentType: string }> {
+  getReferencesTo(targetPath: string): ReadonlyArray<ReverseRefEntry> {
     if (!this._reverseRefsBuilt) this.buildReverseRefIndex();
     return this.reverseRefs.get(targetPath) ?? [];
   }
@@ -1227,11 +1831,8 @@ export class NodeRegistry {
       // registration failed part-way), and leaving its address behind would keep
       // handing out an Object3D that is no longer in the scene — the same leak
       // `aliasPaths` had.
-      const address = this.nodeAddresses.get(node);
-      if (address !== undefined) {
-        if (this.nodeIdIndex.get(address) === node) this.nodeIdIndex.delete(address);
-        this.nodeAddresses.delete(node);
-      }
+      // plan-769: forward-only entries and registered occurrences go with it too.
+      this.unregisterNodeId(node);
 
       // A reference scope goes with its root (plan-757 F7).
       this.scopeNames.delete(node);
@@ -1279,6 +1880,19 @@ export class NodeRegistry {
         }
         this.aliasPaths.delete(node);
       }
+      // Prefix aliases (plan-610 Phase 5c) go with their node the same way.
+      const prefixes = this.prefixAliasPaths.get(node);
+      if (prefixes) {
+        for (const p of prefixes) {
+          if (this.prefixAliases.get(p) === node) this.prefixAliases.delete(p);
+          const claimants = this.ambiguousPrefixAliases.get(p);
+          if (claimants) {
+            claimants.delete(node);
+            if (claimants.size === 0) this.ambiguousPrefixAliases.delete(p);
+          }
+        }
+        this.prefixAliasPaths.delete(node);
+      }
     });
 
     return removed;
@@ -1318,7 +1932,7 @@ export class NodeRegistry {
    * Call after kinematic re-parenting (Phase 8b) to fix stale paths.
    *
    * Updates: nodes, nodePaths, components, typeIndex, suffixMap maps.
-   * Does NOT update reverseRefs (built later in Phase 14+).
+   * Invalidates the reverse-ref index (plan-610: it is keyed by canonical paths).
    *
    * Structural node paths change here → the signal-name index (keyed by
    * consumer sourcePath) is stale. Invalidate its built flag so it is rebuilt
@@ -1385,8 +1999,12 @@ export class NodeRegistry {
     }
 
     // Consumer sourcePaths may have moved — invalidate the signal-name index so
-    // it is rebuilt lazily on the next lookup (never eagerly here).
-    if (updated > 0) this._signalNameIndexBuilt = false;
+    // it is rebuilt lazily on the next lookup (never eagerly here). The
+    // reverse-ref index is keyed by canonical paths, so it goes too (plan-610).
+    if (updated > 0) {
+      this._signalNameIndexBuilt = false;
+      this.invalidateReverseRefs();
+    }
 
     return { count: updated, remap };
   }
@@ -1399,6 +2017,9 @@ export class NodeRegistry {
     this.typeIndex.clear();
     this.suffixMap.clear();
     this.aliasPaths.clear();
+    this.prefixAliases.clear();
+    this.prefixAliasPaths.clear();
+    this.ambiguousPrefixAliases.clear();
     this.scopeNames.clear();
     // Back to "never built": a reloaded scene registers its own paths, and the
     // next stage-4 miss builds the index over them. This is NOT the forbidden
@@ -1423,6 +2044,12 @@ export class NodeRegistry {
     this.nodeIdIndex.clear();
     this.nodeAddresses.clear();
     this.nodeIdRemap.clear();
+    // plan-769: the address book is per load as well; a queued reference of the
+    // dropped scene is told why it never resolves.
+    this.occurrences.clear();
+    this.contentOccurrences.clear();
+    this.forwardOnly.clear();
+    this.dropPendingRefs('unloaded');
   }
 
   // ─── NodeId index — (occurrence, NodeId) → node ─────────────────
@@ -1465,7 +2092,8 @@ export class NodeRegistry {
    * @returns The full address it was registered under, or null when skipped.
    */
   registerNodeId(node: Object3D, occurrence: string = ROOT_OCCURRENCE): string | null {
-    const nodeId = getNodeId(node);
+    // plan-769: the node's IDENTITY — its authored NodeId, else the id seeded at decode.
+    const nodeId = identityIdOf(node);
     if (!nodeId) return null;
     const address = fullNodeAddress(occurrence, nodeId);
 
@@ -1532,6 +2160,708 @@ export class NodeRegistry {
   /** All full addresses currently indexed (diagnostics, orphan reporting). */
   getRegisteredAddresses(): string[] {
     return [...this.nodeIdIndex.keys()];
+  }
+
+  // ─── Address book (plan-769 F5/F6/F9) ───────────────────────────
+
+  /**
+   * Every occurrence whose content is registered: occurrence → the node it is
+   * rooted at (the main model root for `''`, the reference node of a placement /
+   * frame) and the identity record of the file it came from. The O(1) answer to
+   * "is this occurrence there yet?" (spike condition d — no address scan).
+   */
+  private occurrences = new Map<string, { root: Object3D; identity: FileIdentity | null }>();
+
+  /** Reference node → the occurrence its CONTENT is registered under. */
+  private contentOccurrences = new Map<Object3D, string>();
+
+  /**
+   * Forward-only entries: `<occurrence>#<content root id>` → the reference node a
+   * placement instance is rooted at (spike condition b). The reverse map keeps the
+   * node's OWN address (where its file put it) — the address the reference node's
+   * own components resolve relative to.
+   */
+  private forwardOnly = new Map<Object3D, string[]>();
+
+  /** References waiting for a late-materialised occurrence (F13 / §2.3 rule 3). Per load. */
+  private pendingRefs: PendingRef[] = [];
+
+  /**
+   * Register the nodes of ONE document under `occurrence` (`''` = the main model):
+   * `root` and everything below it, STOPPING at reference nodes — a reference node
+   * belongs to this file (registered), its content is another occurrence (spike
+   * condition a). `identity` is the file's record (migration of legacy paths).
+   * Index maintenance hook: re-registering is idempotent per node.
+   * @returns How many nodes were indexed.
+   */
+  registerDocument(root: Object3D, occurrence: string = ROOT_OCCURRENCE, identity?: FileIdentity | null): number {
+    const count = this._registerDocumentNodes(root, occurrence, true);
+    this.occurrences.set(occurrence, { root, identity: identity ?? null });
+    return count;
+  }
+
+  /**
+   * Register the CONTENT of a placement or composed frame under its occurrence
+   * (F5, spike conditions b + c — call it BEFORE the content's init):
+   *
+   *  - a placement instance is rooted AT the reference node (`instantiate` maps the
+   *    asset's template root onto it): the node keeps its own address in the parent
+   *    occurrence, the asset's root id becomes a FORWARD-ONLY entry
+   *    `<occurrence>#<contentRootId>` → node, and the children are walked;
+   *  - a composed frame grafts a CLONE below the reference node: pass it as
+   *    `contentRoot`, it is registered like a document root.
+   *
+   * Nested reference nodes inside the content are registered, their content is not.
+   */
+  registerOccurrence(
+    referenceNode: Object3D,
+    occurrence: string,
+    opts?: { identity?: FileIdentity | null; contentRootId?: string | null; contentRoot?: Object3D | null },
+  ): number {
+    let count = 0;
+    if (opts?.contentRoot) {
+      count = this._registerDocumentNodes(opts.contentRoot, occurrence, true);
+    } else {
+      const rootId = opts?.contentRootId ?? null;
+      if (rootId) {
+        const address = fullNodeAddress(occurrence, rootId);
+        if (!this.nodeIdIndex.has(address)) {
+          this.nodeIdIndex.set(address, referenceNode);
+          const list = this.forwardOnly.get(referenceNode) ?? [];
+          list.push(address);
+          this.forwardOnly.set(referenceNode, list);
+          count++;
+        }
+      }
+      for (const child of referenceNode.children) count += this._registerDocumentNodes(child, occurrence, false);
+    }
+    this.contentOccurrences.set(referenceNode, occurrence);
+    this.occurrences.set(occurrence, { root: referenceNode, identity: opts?.identity ?? null });
+    return count;
+  }
+
+  /**
+   * Index maintenance for a subtree an OP attached (plan-769 Phase 2, F5): created,
+   * cloned, imported, restored from the trash, rebuilt by a separate / merge. The
+   * subtree belongs to the document its parent lies in — registered under that
+   * occurrence ({@link docOccurrenceOf} of the parent; a reference node met as the
+   * parent's ancestor opens its content), stopping at reference nodes below `root`
+   * like {@link registerDocument}. Idempotent per node; a subtree outside every
+   * document (no registered ancestor) is left out. The removal side is
+   * {@link unregisterSubtree}.
+   * @returns How many nodes were indexed.
+   */
+  registerSubtreeIds(root: Object3D): number {
+    const occ = this._parentDocumentOccurrence(root);
+    if (occ === null) return 0;
+    return this._registerDocumentNodes(root, occ, false);
+  }
+
+  /**
+   * Index ONE node — a reference node a live operation placed (planner drop,
+   * duplicate, paste) — under the document its parent lies in. Its content is its
+   * own occurrence ({@link registerOccurrence}); nothing below it is walked.
+   * @returns The address, or null (no identity / no registered parent document).
+   */
+  registerNodeIdInParentDocument(node: Object3D): string | null {
+    const occ = this._parentDocumentOccurrence(node);
+    return occ === null ? null : this.registerNodeId(node, occ);
+  }
+
+  /** The occurrence of the document `node`'s PARENT lies in (a reference node parent opens its content), or null. */
+  private _parentDocumentOccurrence(node: Object3D): string | null {
+    const parent = node.parent;
+    if (!parent) return null;
+    return this.isReferenceNode(parent) ? this.contentOccurrenceOf(parent) : this.docOccurrenceOf(parent);
+  }
+
+  /** The walk of {@link registerDocument}: index, then descend unless a reference node. */
+  private _registerDocumentNodes(node: Object3D, occurrence: string, isRoot: boolean): number {
+    let n = 0;
+    const visit = (cur: Object3D, top: boolean): void => {
+      if (this.registerNodeId(cur, occurrence)) n++;
+      if (!top && this.isReferenceNode(cur)) return;
+      for (const c of cur.children) visit(c, false);
+    };
+    visit(node, isRoot);
+    return n;
+  }
+
+  /**
+   * plan-769 F15: the id a placement's reference node answers to INSIDE its content — the
+   * asset's content root id of its forward-only entry (`<occ>#<id>`), or null.
+   */
+  contentRootIdOf(referenceNode: Object3D): string | null {
+    const forward = this.forwardOnly.get(referenceNode);
+    const first = forward?.[0];
+    return first ? parseNodeAddress(first).nodeId : null;
+  }
+
+  /** Is the occurrence's content registered? */
+  hasOccurrence(occurrence: string): boolean {
+    return this.occurrences.has(occurrence);
+  }
+
+  /** The identity record of the file registered under `occurrence`, or null. */
+  identityOfOccurrence(occurrence: string): FileIdentity | null {
+    return this.occurrences.get(occurrence)?.identity ?? null;
+  }
+
+  /** The root node an occurrence is registered at (main model root / reference node), or null. */
+  rootOfOccurrence(occurrence: string): Object3D | null {
+    return this.occurrences.get(occurrence)?.root ?? null;
+  }
+
+  /** Registered occurrences (diagnostics, tests). */
+  getRegisteredOccurrences(): string[] {
+    return [...this.occurrences.keys()];
+  }
+
+  /**
+   * Remove one node from the id index (index maintenance for ops that delete or
+   * replace nodes — Phase 2 wires them; `unregisterSubtree` does it for subtrees).
+   */
+  unregisterNodeId(node: Object3D): boolean {
+    let removed = false;
+    const address = this.nodeAddresses.get(node);
+    if (address !== undefined) {
+      if (this.nodeIdIndex.get(address) === node) this.nodeIdIndex.delete(address);
+      this.nodeAddresses.delete(node);
+      removed = true;
+    }
+    const forward = this.forwardOnly.get(node);
+    if (forward) {
+      for (const a of forward) if (this.nodeIdIndex.get(a) === node) this.nodeIdIndex.delete(a);
+      this.forwardOnly.delete(node);
+      removed = true;
+    }
+    const occ = this.contentOccurrences.get(node);
+    if (occ !== undefined) {
+      if (this.occurrences.get(occ)?.root === node) this.occurrences.delete(occ);
+      this.contentOccurrences.delete(node);
+    }
+    if (this.occurrences.get(ROOT_OCCURRENCE)?.root === node) this.occurrences.delete(ROOT_OCCURRENCE);
+    return removed;
+  }
+
+  /**
+   * A non-embedded reference node: its content is another file, another occurrence.
+   * A node whose content was registered as an occurrence, or a placement root
+   * (planner record / nested placement markers), counts too.
+   */
+  isReferenceNode(node: Object3D): boolean {
+    if (this.contentOccurrences.has(node)) return true;
+    if (isUnresolvedReferenceNode(node)) return true;
+    const ud = node.userData as Record<string, unknown> | undefined;
+    return typeof ud?._layoutId === 'string' || typeof ud?._layoutNestedOf === 'string';
+  }
+
+  /**
+   * The occurrence the CONTENT of a reference node lives in: where it was
+   * registered, else the deferred mark compose assigned, else the reference node's
+   * own address extended by its id. `null` when none can be named.
+   */
+  contentOccurrenceOf(referenceNode: Object3D): string | null {
+    const registered = this.contentOccurrences.get(referenceNode);
+    if (registered !== undefined) return registered;
+    const mark = getDeferredPlacement(referenceNode);
+    if (mark?.occurrence) return mark.occurrence;
+    const id = identityIdOf(referenceNode);
+    const own = this.nodeAddresses.get(referenceNode);
+    if (!id || own === undefined) return null;
+    return childOccurrence(parseNodeAddress(own).occurrence, id);
+  }
+
+  /**
+   * plan-774 F7: the reference node whose MATERIALISED (registered) content a
+   * stored reference of `referrer` points into — or `null` when the target lies
+   * in the referrer's own file, its placement is not registered (still loading,
+   * failed: those are `pending` / `missing-reference`), or nothing says so.
+   *
+   * `address` is the full address an unresolved read reports (`<occ>#<id>`);
+   * `path` a written path, checked by its proper prefixes (innermost first) —
+   * the first prefix that resolves, in the referrer's scope, to a reference node
+   * with registered content. Used by the audit to tell "the target was baked
+   * away inside a placed asset" (`reference-target-baked-away`) from an
+   * ordinary unresolved reference.
+   */
+  placedContentOfTarget(target: { address?: string; path?: string }, referrer: Object3D): Object3D | null {
+    if (target.address) {
+      const { occurrence } = parseNodeAddress(target.address);
+      if (!occurrence || !this.occurrences.has(occurrence)) return null;
+      if (this.docOccurrenceOf(referrer) === occurrence) return null;
+      for (const [node, occ] of this.contentOccurrences) if (occ === occurrence) return node;
+      return null;
+    }
+    const written = (target.path ?? '').trim().replace(/^\/+/, '');
+    if (!written) return null;
+    const segments = written.split('/');
+    const scope = this.enclosingScope(referrer);
+    for (let i = segments.length - 1; i >= 1; i--) {
+      const node = resolveReferencePath(this, segments.slice(0, i).join('/'), scope).node;
+      if (node && this.contentOccurrences.has(node)) {
+        const occ = this.contentOccurrences.get(node)!;
+        return this.occurrences.has(occ) ? node : null;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * F6: `O_doc` of a referrer — the occurrence of the file whose bytes hold it: its
+   * own registered address, else the nearest registered ancestor; a REFERENCE node
+   * met as an ancestor opens its content occurrence (spike finding). `null` when no
+   * ancestor is registered (a node outside every document).
+   */
+  docOccurrenceOf(referrer: Object3D): string | null {
+    for (let n: Object3D | null = referrer; n; n = n.parent) {
+      if (n !== referrer && this.isReferenceNode(n)) return this.contentOccurrenceOf(n);
+      const a = this.nodeAddresses.get(n);
+      if (a !== undefined) return parseNodeAddress(a).occurrence;
+    }
+    return null;
+  }
+
+  /**
+   * THE resolution of a STORED reference (plan-769 F6): every stored ref of a file
+   * is relative to that file, so `referrer` names it (`O_doc`, {@link docOccurrenceOf}).
+   *
+   *  - `{ address }` (`#id`, `p#id`, `p/b#id`) → `O_doc` + relative → the id index;
+   *  - `{ unresolvedPath, reason }` → unresolved, never guessed;
+   *  - a legacy `{ path }` / path string (a file without `idVersion`) → the file's
+   *    migration (F3: authored index, exact legacy Three spelling — NO rate stage)
+   *    → address → id index (`via: 'migrated'`);
+   *  - `kind: 'name'` for a NAME field (`Source.ThisObjectAsMU`).
+   *
+   * A target whose occurrence exists but has not registered its content yet is
+   * `pending`, not missing (§2.3 rule 3). `no-identity` = a legacy path in a
+   * document the decode identity never saw (test fakes, runtime trees) — the
+   * caller keeps its old path chain for it.
+   */
+  resolveRef(referrer: Object3D, ref: StoredReferenceLike, opts?: { kind?: 'path' | 'name' }): RefResolution {
+    const docOcc = this.docOccurrenceOf(referrer);
+    if (docOcc === null) return { status: 'unresolved', reason: 'no-document' };
+    return this.resolveRefInOccurrence(docOcc, ref, referrer, opts);
+  }
+
+  /**
+   * {@link resolveRef} with `O_doc` given — the occurrence of the document the
+   * reference is stored in. `nameOwner` is the node a NAME field belongs to.
+   */
+  resolveRefInOccurrence(
+    docOcc: string,
+    ref: StoredReferenceLike,
+    nameOwner?: Object3D | null,
+    opts?: { kind?: 'path' | 'name' },
+  ): RefResolution {
+    if (ref && typeof ref === 'object') {
+      if (typeof ref.address === 'string' && ref.address) return this._resolveAddress(docOcc, ref.address, 'address');
+      if (typeof ref.unresolvedPath === 'string') {
+        const reason = ref.reason === 'ambiguous' || ref.reason === 'synthetic-target' ? ref.reason : 'missing';
+        return { status: 'unresolved', reason, path: ref.unresolvedPath };
+      }
+    }
+    const written = typeof ref === 'string' ? ref : (ref && typeof ref.path === 'string' ? ref.path : '');
+    if (!written) return { status: 'unresolved', reason: 'missing', path: '' };
+    const identity = this.occurrences.get(docOcc)?.identity ?? null;
+    // 9.19: a file with an `idVersion` is NOT migrated — its legacy path has no file
+    // verdict (the reader's path lookup applies, exactly as without a record).
+    if (!identity || !identity.migrated) return { status: 'unresolved', reason: 'no-identity', path: written };
+    let ownerId: string | null = null;
+    if (opts?.kind === 'name' && nameOwner) {
+      ownerId = this._nearestIdentityId(nameOwner);
+      // plan-769 Phase 2: a NAME names a node in its owner's subtree. An owner the
+      // web created (a duplicate, an op-built node: its id is no node of the file)
+      // carries no name of the file — the copied string equals one, but its subtree
+      // is the COPY's. The reader's own subtree lookup answers it (`legacy`).
+      if (ownerId !== null && identity.indexOfId(ownerId) === undefined) {
+        return { status: 'unresolved', reason: 'no-identity', path: written };
+      }
+    }
+    const migrated = opts?.kind === 'name'
+      ? identity.migrateName(written, ownerId)
+      : identity.migratePath(written);
+    if (migrated.address === undefined) return { status: 'unresolved', reason: migrated.reason, path: written };
+    return this._resolveAddress(docOcc, migrated.address, 'migrated', written);
+  }
+
+  /**
+   * THE read of a STORED reference by its reader (plan-769 Phase 1b — CRI, Source,
+   * PhysicsZone, WebVisibility, the logic engine, `resolveComponentRefs`, the
+   * audit, …): {@link resolveRef} relative to `referrer` — else to `scope` (a
+   * reference node as scope opens its content occurrence) — and the one rule that
+   * decides whether the reader's own path lookup may run at all ({@link StoredRead}):
+   * only for `legacy`. A reference the FILE carries is resolved, pending or
+   * unresolved by its file, and an unresolved one stays unresolved (D7) — the
+   * guessing stages are for path INPUTS ({@link findNodeForUser}), not for it.
+   */
+  readStoredRef(
+    referrer: Object3D | null,
+    ref: StoredReferenceLike,
+    opts?: { kind?: 'path' | 'name'; scope?: Object3D | ReferenceScope | null },
+  ): StoredRead {
+    // plan-769 Phase 3: a STRING may be the label a component keeps for an address-form
+    // reference of `referrer` (`storedRefString`) — read the stored value behind it.
+    if (typeof ref === 'string' && referrer) {
+      const behind = storedValueOfLabel(referrer, ref);
+      if (behind !== undefined) ref = behind;
+    }
+    const addressForm = !!ref && typeof ref === 'object'
+      && (typeof ref.address === 'string' || typeof ref.unresolvedPath === 'string');
+    const written = addressForm ? '' : (typeof ref === 'string' ? ref : (ref && typeof ref.path === 'string' ? ref.path : ''));
+    let docOcc: string | null = null;
+    let owner: Object3D | null = referrer;
+    if (referrer) docOcc = this.docOccurrenceOf(referrer);
+    else if (opts?.scope) {
+      const scope = opts.scope;
+      const root = (scope as ReferenceScope).rootNames instanceof Set ? (scope as ReferenceScope).root : scope as Object3D;
+      owner = root;
+      docOcc = this.isReferenceNode(root) ? this.contentOccurrenceOf(root) : this.docOccurrenceOf(root);
+    }
+    if (docOcc === null) {
+      return written
+        ? { status: 'legacy', path: written, reason: 'no-document' }
+        : { status: 'unresolved', reason: 'missing' };
+    }
+    const r = this.resolveRefInOccurrence(docOcc, ref, owner, { kind: opts?.kind });
+    if (r.status !== 'unresolved') return r;
+    if (r.reason === 'no-identity' || r.reason === 'no-document') {
+      return written ? { status: 'legacy', path: written, reason: r.reason } : { status: 'unresolved', reason: 'missing' };
+    }
+    if (written) {
+      const identity = this.occurrences.get(docOcc)?.identity ?? null;
+      if (identity && !identity.isFileReference(written, opts?.kind ?? 'path')) {
+        return { status: 'legacy', path: written, reason: 'web-written' };
+      }
+    }
+    return { status: 'unresolved', reason: r.reason, ...(r.address !== undefined ? { address: r.address } : {}), ...(r.path !== undefined ? { path: r.path } : {}) };
+  }
+
+  /**
+   * The NODE a stored reference names ({@link readStoredRef}); for a `legacy` read
+   * `legacy(path)` — default {@link getNode}, the caller's historic lookup. `null`
+   * for pending / unresolved.
+   */
+  storedNode(
+    referrer: Object3D | null,
+    ref: StoredReferenceLike,
+    opts?: {
+      kind?: 'path' | 'name';
+      scope?: Object3D | ReferenceScope | null;
+      legacy?: (path: string) => Object3D | null;
+    },
+  ): Object3D | null {
+    const r = this.readStoredRef(referrer, ref, opts);
+    if (r.status === 'resolved') return r.node;
+    if (r.status === 'legacy') return opts?.legacy ? opts.legacy(r.path) : this.getNode(r.path);
+    return null;
+  }
+
+  /**
+   * The component of `type` a stored reference names: the instance on the addressed
+   * node — a typed miss there is a miss — or, for a `legacy` read, `legacy(path)`
+   * (default {@link getByPath}).
+   */
+  storedComponent<T = unknown>(
+    referrer: Object3D | null,
+    ref: StoredReferenceLike,
+    type: string,
+    opts?: { scope?: Object3D | ReferenceScope | null; legacy?: (path: string) => T | null },
+  ): T | null {
+    const r = this.readStoredRef(referrer, ref, opts);
+    if (r.status === 'resolved') return this.componentOn<T>(r.node, type);
+    if (r.status === 'legacy') return opts?.legacy ? opts.legacy(r.path) : this.getByPath<T>(type, r.path);
+    return null;
+  }
+
+  /**
+   * The audit's judgement of one stored reference (plan-769 Phase 1b): a FILE
+   * reference by its file — resolved (stage `exact`, the address is the path as
+   * written) or unresolved (`null` + its reason; `pending` is no finding yet) —
+   * and a `legacy` one through the old chain ({@link resolveWithStage}), whose
+   * fallback stages still surface as `reference-rescued`.
+   */
+  auditStoredReference(
+    ref: { path: string; componentType?: string | null },
+    componentType: string | null | undefined,
+    referrer: Object3D,
+  ): { verdict: 'file'; hit: StagedReferenceResolution | null; reason?: 'missing' | 'ambiguous' | 'synthetic-target' | 'pending'; address?: string }
+    | { verdict: 'legacy' } {
+    const r = this.readStoredRef(referrer, ref.path);
+    if (r.status === 'legacy') return { verdict: 'legacy' };
+    if (r.status === 'resolved') {
+      return { verdict: 'file', hit: { node: r.node, stage: 'exact', spelling: 'relative', scopeRootPath: '' } };
+    }
+    if (r.status === 'pending') return { verdict: 'file', hit: null, reason: 'pending' };
+    let reason = r.reason;
+    if (reason === 'missing') {
+      // A written path that names a node the bake MADE (a partition / chunk) is
+      // `reference-target-synthetic` — the migration problem, not the audit's.
+      const hit = resolveReferencePath(this, ref.path, this.enclosingScope(referrer)).node;
+      if (hit && (hit.userData as Record<string, unknown> | undefined)?.[RV_SYNTHETIC_KEY] === true) reason = 'synthetic-target';
+    }
+    void componentType;
+    return { verdict: 'file', hit: null, reason, ...(r.address !== undefined ? { address: r.address } : {}) };
+  }
+
+  /**
+   * An ADDRESS relative to the document `scopeRoot` opens (a placement root: its
+   * content; any other node: the document it lies in) → node, or null. The read
+   * side of the Phase-3 forms outside a GLB (`SignalMapping.componentAddress`,
+   * an annotation's `nodeAddress`, F19).
+   */
+  resolveAddressIn(scopeRoot: Object3D, address: string): Object3D | null {
+    if (typeof address !== 'string' || !address) return null;
+    const r = this.readStoredRef(null, { address }, { scope: scopeRoot });
+    return r.status === 'resolved' ? r.node : null;
+  }
+
+  /** The identity id of `node` or its nearest ancestor that has one. */
+  private _nearestIdentityId(node: Object3D): string | null {
+    for (let n: Object3D | null = node; n; n = n.parent) {
+      const id = identityIdOf(n);
+      if (id) return id;
+    }
+    return null;
+  }
+
+  /** `O_doc` + relative address → node | pending | missing. */
+  private _resolveAddress(docOcc: string, relative: string, via: 'address' | 'migrated', path?: string): RefResolution {
+    const { occurrence: rel, nodeId } = parseNodeAddress(relative);
+    const occ = rel ? (docOcc ? `${docOcc}/${rel}` : rel) : docOcc;
+    const address = fullNodeAddress(occ, nodeId);
+    const node = this.getNodeByAddress(nodeId, occ);
+    if (node) return { status: 'resolved', node, address, via };
+    const blocking = this._pendingBlocker(occ);
+    if (blocking) return { status: 'pending', address, occurrence: occ, blocking };
+    return { status: 'unresolved', reason: 'missing', address, ...(path !== undefined ? { path } : {}) };
+  }
+
+  /**
+   * The reference node that keeps `occurrence` from being registered — its chain
+   * exists up to that node, the node's content does not (yet). `null` when the
+   * occurrence is registered or its chain breaks (missing).
+   */
+  private _pendingBlocker(occurrence: string): Object3D | null {
+    if (this.occurrences.has(occurrence)) return null;
+    let parent = ROOT_OCCURRENCE;
+    for (const seg of occurrenceSegments(occurrence)) {
+      const child = childOccurrence(parent, seg);
+      if (!this.occurrences.has(child)) {
+        if (!this.occurrences.has(parent)) return null;
+        const refNode = this.nodeIdIndex.get(fullNodeAddress(parent, seg)) ?? null;
+        return refNode && this.isReferenceNode(refNode) ? refNode : null;
+      }
+      parent = child;
+    }
+    return null;
+  }
+
+  /**
+   * Resolve now, or queue until the target's occurrence registers (§2.3 rule 3, F13).
+   * `onDropped(reason)` fires when the queue is flushed without a node:
+   * `missing` (orphan verdict once no placement is pending), `placement-missing`,
+   * `placement-cap` or `unloaded`.
+   */
+  whenResolved(
+    referrer: Object3D,
+    ref: StoredReferenceLike,
+    onResolved: (node: Object3D, resolution: ResolvedRef) => void,
+    onDropped?: (reason: PendingDropReason) => void,
+    opts?: { kind?: 'path' | 'name' },
+  ): RefResolution {
+    const r = this.resolveRef(referrer, ref, opts);
+    if (r.status === 'resolved') onResolved(r.node, r);
+    else if (r.status === 'pending') {
+      this.pendingRefs.push({ referrer, ref, kind: opts?.kind, onResolved, onDropped, blocking: r.blocking });
+    }
+    return r;
+  }
+
+  /** How many references wait for an occurrence. */
+  pendingRefCount(): number {
+    return this.pendingRefs.length;
+  }
+
+  /**
+   * Retry every queued reference — the `occurrence-registered` moment: the viewer
+   * calls this on `layout-content-added`, after the new content's components exist.
+   * Resolved ones fire; the rest stay, re-keyed to their current blocker — also one
+   * that is now plainly missing: the orphan verdict is {@link settlePendingRefs}'s,
+   * once no placement is pending.
+   * @returns How many resolved.
+   */
+  flushPendingRefs(): number {
+    if (this.pendingRefs.length === 0) return 0;
+    const queue = this.pendingRefs;
+    this.pendingRefs = [];
+    let resolved = 0;
+    for (const p of queue) {
+      const r = this.resolveRef(p.referrer, p.ref, { kind: p.kind });
+      if (r.status === 'resolved') {
+        resolved++;
+        try { p.onResolved(r.node, r); } catch (e) { console.warn('[NodeRegistry] pending reference handler failed:', e); }
+        continue;
+      }
+      if (r.status === 'pending') p.blocking = r.blocking;
+      this.pendingRefs.push(p);
+    }
+    return resolved;
+  }
+
+  /**
+   * Drop queued references with `reason` — all of them, or those blocked by one of
+   * `blockers` (a placement that failed to load / was refused by the cap).
+   * @returns How many were dropped.
+   */
+  dropPendingRefs(reason: PendingDropReason, blockers?: Iterable<Object3D>): number {
+    if (this.pendingRefs.length === 0) return 0;
+    const set = blockers ? new Set(blockers) : null;
+    const keep: PendingRef[] = [];
+    const drop: PendingRef[] = [];
+    for (const p of this.pendingRefs) {
+      if (!set || (p.blocking && set.has(p.blocking))) drop.push(p); else keep.push(p);
+    }
+    this.pendingRefs = keep;
+    for (const p of drop) {
+      try { p.onDropped?.(reason); } catch (e) { console.warn('[NodeRegistry] pending reference drop handler failed:', e); }
+    }
+    return drop.length;
+  }
+
+  /**
+   * The orphan verdict (F13): no placement is pending any more, so a reference that
+   * still does not resolve is missing. Retries once, then drops the rest as `missing`.
+   * @returns How many were dropped.
+   */
+  settlePendingRefs(): number {
+    this.flushPendingRefs();
+    return this.dropPendingRefs('missing');
+  }
+
+  /**
+   * F9: a PATH as a person or a caller types it (MCP, plugin, UI, URL) → node:
+   * the runtime registry path exactly → the AUTHORED path in the file it lies in
+   * (through the file's identity: the placement whose runtime root path prefixes it,
+   * the main model last) → the exact legacy Three.js spelling → (until plan-770) the
+   * registry's guessing stages, with a console warning — a guessed hit must not
+   * become a stored address unnoticed (`via: 'guess'`). `null` when nothing answers,
+   * or when the authored path is ambiguous (never guessed past).
+   */
+  findNodeForUser(path: string): UserPathResolution | null {
+    const p = typeof path === 'string' ? path.trim().replace(/^\/+/, '') : '';
+    if (!p) return null;
+    const exact = this.nodes.get(p);
+    if (exact) return { node: exact, via: 'runtime' };
+    let ambiguous = false;
+    const candidates: Array<{ rel: string; occ: string; identity: FileIdentity }> = [];
+    for (const [occ, rec] of this.occurrences) {
+      if (!rec.identity) continue;
+      if (occ === ROOT_OCCURRENCE) { candidates.push({ rel: p, occ, identity: rec.identity }); continue; }
+      const rootPath = this.nodePaths.get(rec.root);
+      if (rootPath && p.startsWith(rootPath + '/')) candidates.push({ rel: p.slice(rootPath.length + 1), occ, identity: rec.identity });
+    }
+    // Most specific file first: the deepest placement prefix leaves the shortest rest.
+    candidates.sort((a, b) => a.rel.length - b.rel.length);
+    for (const want of ['authored', 'legacy-three'] as const) {
+      for (const c of candidates) {
+        const m = c.identity.migratePath(c.rel);
+        if (m.address === undefined) {
+          if (m.reason === 'ambiguous') ambiguous = true;
+          continue;
+        }
+        if (!m.via.startsWith(want)) continue;
+        const { nodeId } = parseNodeAddress(m.address);
+        const node = this.getNodeByAddress(nodeId, c.occ);
+        if (node) return { node, via: want, address: fullNodeAddress(c.occ, nodeId) };
+      }
+    }
+    if (ambiguous) return null;
+    const guessed = this._getNodeStaged(p, true);
+    if (!guessed) return null;
+    console.warn(
+      `[NodeRegistry] findNodeForUser("${p}") matched "${this.nodePaths.get(guessed.node) ?? guessed.node.name}" only `
+      + `through the "${guessed.stage}" lookup stage — a guess (plan-769 F9). Used for this input; check it before `
+      + 'it is stored as a reference.',
+    );
+    return { node: guessed.node, via: 'guess', stage: guessed.stage };
+  }
+
+  /** The raw authored path (Unity spelling) of a node in its file, or null (no identity). */
+  getAuthoredPath(node: Object3D): string | null {
+    const id = identityIdOf(node);
+    const a = this.nodeAddresses.get(node);
+    if (!id || a === undefined) return null;
+    const identity = this.occurrences.get(parseNodeAddress(a).occurrence)?.identity;
+    return identity?.authoredPathOf(id) ?? null;
+  }
+
+  /**
+   * plan-769 F4: the migration findings of one registered occurrence, located in
+   * the live scene — what the Problems panel shows (`reportReferenceMigrationProblems`).
+   * Ambiguous and legacy-spelling references come from the decode; a MISSING one
+   * becomes `syntheticTarget` when its written path names a node the bake made
+   * (`_rvSynthetic`), and is left to the path audit (`reference-unresolved`) otherwise.
+   */
+  identityProblemsOf(occurrence: string): IdentityProblem[] {
+    const rec = this.occurrences.get(occurrence);
+    const identity = rec?.identity;
+    if (!rec || !identity || identity.findings.length === 0) return [];
+    const rootPath = this.nodePaths.get(rec.root) ?? NodeRegistry.computeNodePath(rec.root);
+    const scope = this.scopeFor(rec.root);
+    const out: IdentityProblem[] = [];
+    for (const f of identity.findings) {
+      let kind: IdentityProblem['kind'] | null = null;
+      if (f.outcome === 'ambiguous') kind = 'ambiguous';
+      else if (f.outcome === 'legacy-spelling') kind = 'legacySpelling';
+      else if (f.kind !== 'name') {
+        const hit = resolveReferencePath(this, f.writtenPath, scope).node;
+        if (hit && (hit.userData as Record<string, unknown> | undefined)?.[RV_SYNTHETIC_KEY] === true) kind = 'syntheticTarget';
+      }
+      if (!kind) continue;
+      const referrer = this.getNodeByAddress(f.referrerId, occurrence)
+        ?? (f.referrerId === identity.rootId || f.referrerId === identity.contentRootId ? rec.root : null);
+      const referrerPath = (referrer ? this.nodePaths.get(referrer) : undefined)
+        ?? (f.referrerAuthoredPath ? `${rootPath}/${f.referrerAuthoredPath}` : rootPath);
+      out.push({ kind, referrerPath, componentType: f.componentType, field: f.field, writtenPath: f.writtenPath });
+    }
+    return out;
+  }
+
+  /**
+   * The invariant "index == traversal" (F5, test 9.21) over the registered
+   * occurrences: every node an occurrence's document walk reaches that has an
+   * identity is indexed under exactly its address, and every indexed node is still
+   * attached below a registered occurrence root. Empty arrays = it holds.
+   */
+  auditIdIndex(): { unindexed: string[]; stale: string[]; wrong: string[] } {
+    const unindexed: string[] = [];
+    const stale: string[] = [];
+    const wrong: string[] = [];
+    for (const [occ, rec] of this.occurrences) {
+      const walk = (n: Object3D, top: boolean): void => {
+        const id = identityIdOf(n);
+        if (id) {
+          const got = this.nodeAddresses.get(n);
+          const want = fullNodeAddress(occ, id);
+          if (got === undefined) unindexed.push(want);
+          else if (got !== want) wrong.push(`${want} (indexed as ${got})`);
+        }
+        if (!top && this.isReferenceNode(n)) return;
+        for (const c of n.children) walk(c, false);
+      };
+      // The main model root is its own document's node; a reference node (placement
+      // / frame) belongs to its PARENT document — its content starts below it.
+      if (occ === ROOT_OCCURRENCE) walk(rec.root, true);
+      else for (const c of rec.root.children) walk(c, false);
+    }
+    const roots = [...this.occurrences.values()].map((r) => r.root);
+    for (const [address, node] of this.nodeIdIndex) {
+      let attached = false;
+      for (let n: Object3D | null = node; n && !attached; n = n.parent) if (roots.includes(n)) attached = true;
+      if (!attached) stale.push(address);
+    }
+    return { unindexed, stale, wrong };
   }
 
   // ─── glTF source indices ────────────────────────────────────────
@@ -1681,6 +3011,18 @@ export class NodeRegistry {
     const index = this.gltfNodeIndices.get(node);
     if (index === undefined) return null;
     return { sourceKey: this.gltfNodeSources.get(node) ?? ROOT_SOURCE_KEY, index };
+  }
+
+  /**
+   * plan-769 Phase 4b: the node loaded from `nodes[index]` of the file `sourceKey`
+   * (default: the scene's own file), or null. A linear scan - for the rare writer
+   * that has an index and needs the live node (the planner save's override migration).
+   */
+  getNodeAtGltfIndex(index: number, sourceKey: string = ROOT_SOURCE_KEY): Object3D | null {
+    for (const [node, i] of this.gltfNodeIndices) {
+      if (i === index && (this.gltfNodeSources.get(node) ?? ROOT_SOURCE_KEY) === sourceKey) return node;
+    }
+    return null;
   }
 
   /** Get registry stats */

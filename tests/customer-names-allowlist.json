@@ -1,0 +1,285 @@
+{
+  "_comment": "Per-file allowlist for customer-names-guard.node.test.ts. Every entry needs a reason; stale entries fail the test. Prefer neutralizing over allowlisting.",
+  "files": {
+    "doc-deploy.md": {
+      "names": [
+        "mauser",
+        "toray"
+      ],
+      "reason": "Documentation example: real CLI invocation, project path or identifier that must stay literal"
+    },
+    "doc-document-linking.md": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Festo as product/vendor (FHPP drive profile, Festo AX/PLCnext interface, Festo AAS demo data); not a customer reference"
+    },
+    "doc-entity-stream.md": {
+      "names": [
+        "axite"
+      ],
+      "reason": "Documentation example: real CLI invocation, project path or identifier that must stay literal"
+    },
+    "doc-extending-webviewer.md": {
+      "names": [
+        "festo",
+        "mauser"
+      ],
+      "reason": "Documentation example: real CLI invocation, project path or identifier that must stay literal"
+    },
+    "doc-scripting.md": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Documentation example: real CLI invocation, project path or identifier that must stay literal"
+    },
+    "doc-unity-to-web.md": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Festo as product/vendor (FHPP drive profile, Festo AX/PLCnext interface, Festo AAS demo data); not a customer reference"
+    },
+    "doc-webviewer.md": {
+      "names": [
+        "festo",
+        "mauser"
+      ],
+      "reason": "Documentation example: real CLI invocation, project path or identifier that must stay literal"
+    },
+    "features.catalog.json": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Festo as product/vendor (FHPP drive profile, Festo AX/PLCnext interface, Festo AAS demo data); not a customer reference"
+    },
+    "README.md": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Festo as product/vendor (FHPP drive profile, Festo AX/PLCnext interface, Festo AAS demo data); not a customer reference"
+    },
+    "src/core/engine/rv-drive-festo-fhpp.ts": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Festo as product/vendor (FHPP drive profile, Festo AX/PLCnext interface, Festo AAS demo data); not a customer reference"
+    },
+    "src/core/engine/rv-layers.ts": {
+      "names": [
+        "mauser"
+      ],
+      "reason": "Identifier, project path or case-sensitivity example (Toray/toray, mauser3dhmi, MauserParts) that must stay literal"
+    },
+    "src/core/engine/rv-signal-construction.ts": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Festo as product/vendor (FHPP drive profile, Festo AX/PLCnext interface, Festo AAS demo data); not a customer reference"
+    },
+    "src/core/hmi/connect-panel-shared.tsx": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Festo as product/vendor (FHPP drive profile, Festo AX/PLCnext interface, Festo AAS demo data); not a customer reference"
+    },
+    "src/core/hmi/connect-store.ts": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Festo as product/vendor (FHPP drive profile, Festo AX/PLCnext interface, Festo AAS demo data); not a customer reference"
+    },
+    "src/core/hmi/ConnectPanel.tsx": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Festo as product/vendor (FHPP drive profile, Festo AX/PLCnext interface, Festo AAS demo data); not a customer reference"
+    },
+    "src/core/hmi/metadata-tooltip-config-store.ts": {
+      "names": [
+        "mauser"
+      ],
+      "reason": "Identifier, project path or case-sensitivity example (Toray/toray, mauser3dhmi, MauserParts) that must stay literal"
+    },
+    "src/core/hmi/pdf-viewer-store.tsx": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Festo as product/vendor (FHPP drive profile, Festo AX/PLCnext interface, Festo AAS demo data); not a customer reference"
+    },
+    "src/core/hmi/WelcomeModal.tsx": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Festo as product/vendor (FHPP drive profile, Festo AX/PLCnext interface, Festo AAS demo data); not a customer reference"
+    },
+    "src/core/project/rv-project-documents.ts": {
+      "names": [
+        "festo",
+        "mauser",
+        "toray",
+        "wmyb"
+      ],
+      "reason": "Identifier, project path or case-sensitivity example (Toray/toray, mauser3dhmi, MauserParts) that must stay literal"
+    },
+    "src/core/rv-model-plugin-manager.ts": {
+      "names": [
+        "toray"
+      ],
+      "reason": "Identifier, project path or case-sensitivity example (Toray/toray, mauser3dhmi, MauserParts) that must stay literal"
+    },
+    "src/main.ts": {
+      "names": [
+        "toray"
+      ],
+      "reason": "Identifier, project path or case-sensitivity example (Toray/toray, mauser3dhmi, MauserParts) that must stay literal"
+    },
+    "src/plugins/aas-detail.ts": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Festo as product/vendor (FHPP drive profile, Festo AX/PLCnext interface, Festo AAS demo data); not a customer reference"
+    },
+    "src/plugins/aas-link-parser.ts": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Festo as product/vendor (FHPP drive profile, Festo AX/PLCnext interface, Festo AAS demo data); not a customer reference"
+    },
+    "src/plugins/demo/demo-hmi-plugin.tsx": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Festo as product/vendor (FHPP drive profile, Festo AX/PLCnext interface, Festo AAS demo data); not a customer reference"
+    },
+    "src/plugins/mcp-bridge/help/commands.md": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Documentation example: real CLI invocation, project path or identifier that must stay literal"
+    },
+    "src/plugins/mcp-bridge/rv-frame-fit-math.ts": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Festo as product/vendor (FHPP drive profile, Festo AX/PLCnext interface, Festo AAS demo data); not a customer reference"
+    },
+    "scripts/audit-asset-overrides.mjs": {
+      "names": [
+        "mauser",
+        "toray",
+        "wmyb"
+      ],
+      "reason": "Customer-register / delivery / guard logic or CLI example; functional, must not change (recommendation: read names from the register)"
+    },
+    "scripts/build-bosch-aasx.mjs": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Festo as product/vendor (FHPP drive profile, Festo AX/PLCnext interface, Festo AAS demo data); not a customer reference"
+    },
+    "scripts/deliver.mjs": {
+      "names": [
+        "mauser",
+        "toray"
+      ],
+      "reason": "Customer-register / delivery / guard logic or CLI example; functional, must not change (recommendation: read names from the register)"
+    },
+    "scripts/generate-customer-workspace.mjs": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Customer-register / delivery / guard logic or CLI example; functional, must not change (recommendation: read names from the register)"
+    },
+    "scripts/migrate-delivery-config.mjs": {
+      "names": [
+        "mauser"
+      ],
+      "reason": "Customer-register / delivery / guard logic or CLI example; functional, must not change (recommendation: read names from the register)"
+    },
+    "scripts/perf-bake-gates.mjs": {
+      "names": [
+        "mauser"
+      ],
+      "reason": "Customer-register / delivery / guard logic or CLI example; functional, must not change (recommendation: read names from the register)"
+    },
+    "scripts/validate-project.mjs": {
+      "names": [
+        "toray",
+        "wmyb"
+      ],
+      "reason": "Customer-register / delivery / guard logic or CLI example; functional, must not change (recommendation: read names from the register)"
+    },
+    "scripts/_rv-customers.mjs": {
+      "names": [
+        "heilbronn",
+        "iotsolution",
+        "mauser",
+        "toray",
+        "wmyb"
+      ],
+      "reason": "Customer-register / delivery / guard logic or CLI example; functional, must not change (recommendation: read names from the register)"
+    },
+    "scripts/_rv-guards.mjs": {
+      "names": [
+        "festo",
+        "toray"
+      ],
+      "reason": "Customer-register / delivery / guard logic or CLI example; functional, must not change (recommendation: read names from the register)"
+    },
+    "scripts/_workspace-lib.mjs": {
+      "names": [
+        "festo",
+        "heilbronn",
+        "iotsolution",
+        "mauser",
+        "toray",
+        "wmyb"
+      ],
+      "reason": "Customer-register / delivery / guard logic or CLI example; functional, must not change (recommendation: read names from the register)"
+    },
+    "schema/v1/rv-odt.descriptions.json": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Festo as product/vendor (FHPP drive profile, Festo AX/PLCnext interface, Festo AAS demo data); not a customer reference"
+    },
+    "schema/v1/rv-odt.json": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Festo as product/vendor (FHPP drive profile, Festo AX/PLCnext interface, Festo AAS demo data); not a customer reference"
+    },
+    "schema/v1/specification.md": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Festo as product/vendor (FHPP drive profile, Festo AX/PLCnext interface, Festo AAS demo data); not a customer reference"
+    },
+    "examples/scripts/random-source-step.js": {
+      "names": [
+        "festo"
+      ],
+      "reason": "Documentation example: real CLI invocation, project path or identifier that must stay literal"
+    },
+    "scripts/rv-reference-baseline.mjs": {
+      "names": [
+        "mauser"
+      ],
+      "reason": "Identifier, project path or case-sensitivity example (Toray/toray, mauser3dhmi, MauserParts) that must stay literal"
+    }
+  },
+  "testTrees": {
+    "tolerated": [
+      "axite",
+      "clover",
+      "cptc",
+      "festo",
+      "heilbronn",
+      "iotsolution",
+      "mauser",
+      "toray",
+      "wmyb"
+    ],
+    "reason": "Names already public in the mirror (released fixtures, project paths, register-logic tests). Any other register name - a project slug, a field-report customer, a new customer - must not enter tests/, e2e/, spikes/ or docs/."
+  }
+}

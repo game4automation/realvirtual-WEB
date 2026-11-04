@@ -31,7 +31,16 @@
  */
 
 import type { RVViewer } from '../../core/rv-viewer';
-import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
+import { valueOrThrowToolJson } from '../../core/hmi/rv-command-context';
+import {
+  commandRegistry,
+  type CommandDescriptor,
+  type CommandImpl,
+  type CommandRegistry,
+} from '../../core/hmi/rv-command-registry';
+
+/** Command id of the document-description write (alias `web_document_info_set`, plan-641 Nachtrag). */
+export const DOCUMENT_INFO_SET_COMMAND = 'document.infoSet';
 import {
   MAX_DESCRIPTION_CHARS,
   MAX_SUMMARY_CHARS,
@@ -57,7 +66,10 @@ interface DocumentRowLike {
 }
 
 export class McpDocumentInfoTools {
-  constructor(private readonly getViewer: () => RVViewer | undefined) {}
+  constructor(private readonly getViewer: () => RVViewer | undefined) {
+    // plan-641 Nachtrag: the bound `web_document_info_set` needs its command before discover.
+    ensureDocumentInfoCommandsRegistered();
+  }
 
   private get viewer(): RVViewer | undefined { return this.getViewer(); }
 
@@ -101,14 +113,8 @@ export class McpDocumentInfoTools {
     return { row, projectId: snapshot.project.id };
   }
 
-  @McpTool(
-    'Read the DESCRIPTION of a document (summary + Markdown, stored in its GLB). document: id or '
-    + 'project-relative path; omit for the open document. info null = no description (normal for '
-    + 'Unity exports). source: "manifest" (project cache) or "glb" (loaded file, no project open).',
-    { readOnly: true },
-  )
-  async webDocumentInfoGet(
-    @McpParam('document', 'Document id or project-relative path; omit for the open document.', 'string', false)
+  /** Read-only command body; preserves the original JSON value contract. */
+  async queryDocumentInfoGet(
     document?: string,
   ): Promise<string> {
     const resolved = await this._resolve(document);
@@ -129,18 +135,8 @@ export class McpDocumentInfoTools {
     });
   }
 
-  @McpTool(
-    'Write the DESCRIPTION of any document of the open project into its GLB. Omitted field = kept, '
-    + '"" = removed. summary: one line; description: Markdown. Say what the model IS, not session '
-    + 'state. Read-only documents are refused. Returns the block read back; openInEditor:true '
-    + 'warns that an editor Save of that document would restore its loaded text.',
-    { readOnly: false },
-  )
-  async webDocumentInfoSet(
-    @McpParam('document', 'Document id or project-relative path.') document: string,
-    @McpParam('summary', `One line, max ${MAX_SUMMARY_CHARS} chars.`, 'string', false) summary?: string,
-    @McpParam('description', `Markdown, max ${MAX_DESCRIPTION_CHARS} chars.`, 'string', false) description?: string,
-  ): Promise<string> {
+  /** The description write itself — the body of `document.infoSet`. JSON, `{error}` on refusal. */
+  async setInfo(document: string, summary?: string, description?: string): Promise<string> {
     if (summary === undefined && description === undefined) {
       return err('Pass summary and/or description — nothing to write.');
     }
@@ -197,4 +193,71 @@ export class McpDocumentInfoTools {
       } : {}),
     });
   }
+}
+
+// --- plan-641 Nachtrag 2026-10-21: the `document.infoSet` command ---
+
+interface DocumentInfoSetArgs {
+  readonly document: string;
+  readonly summary?: string | null;
+  readonly description?: string | null;
+}
+
+const documentInfoSet: CommandImpl<DocumentInfoSetArgs, Record<string, unknown>> = {
+  enabled: (_ctx, a) => (String(a?.document ?? '').trim() ? true : { reason: 'document is required (id or project-relative path).' }),
+  run: async (ctx, a) => valueOrThrowToolJson(
+    await new McpDocumentInfoTools(() => ctx.viewer).setInfo(a.document, a.summary ?? undefined, a.description ?? undefined),
+  ),
+};
+
+/**
+ * Build the description command (testable seam: no registry side effect). NOT a
+ * macro command: it writes the project file of ANY document (manifest + GLB),
+ * not the op log of the document being modelled, so a replay into another
+ * document would rewrite a foreign file.
+ */
+export function createDocumentInfoCommandDescriptors(): CommandDescriptor<never, unknown>[] {
+  const set: CommandDescriptor<DocumentInfoSetArgs, Record<string, unknown>> = {
+    id: DOCUMENT_INFO_SET_COMMAND,
+    label: 'Set document description',
+    readOnly: false,
+    scope: 'none',
+    available: true,
+    unavailableReason: 'Not available',
+    mcp: {
+      tool: 'web_document_info_set',
+      params: [
+        { name: 'document', type: 'string', required: true },
+        { name: 'summary', type: 'string', required: false },
+        { name: 'description', type: 'string', required: false },
+      ],
+    },
+    argsSchema: { document: 'string', summary: 'string', description: 'string' },
+    eagerImpl: documentInfoSet,
+    impl: () => Promise.resolve(documentInfoSet),
+  };
+  return [
+    set,
+    {
+      id: 'document.infoGet', label: 'document.infoGet', readOnly: true, scope: 'none',
+      available: true, unavailableReason: 'Not available',
+      argsSchema: { document: 'string' },
+      impl: async () => {
+        const impl: CommandImpl<{ document?: string }, unknown> = {
+          enabled: () => true,
+          run: async (ctx, a) => JSON.parse(await new McpDocumentInfoTools(() => ctx.viewer).queryDocumentInfoGet(a?.document)),
+        };
+        return impl;
+      },
+    },
+  ] as unknown as CommandDescriptor<never, unknown>[];
+}
+
+const registeredDocumentInfo = new WeakSet<CommandRegistry>();
+
+/** Idempotent eager registration of the description command. */
+export function ensureDocumentInfoCommandsRegistered(registry: CommandRegistry = commandRegistry): void {
+  if (registeredDocumentInfo.has(registry)) return;
+  registeredDocumentInfo.add(registry);
+  for (const d of createDocumentInfoCommandDescriptors()) registry.register(d);
 }

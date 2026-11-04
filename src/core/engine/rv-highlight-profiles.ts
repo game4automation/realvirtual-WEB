@@ -14,7 +14,8 @@
  * Mode → visual (product decision):
  *   - HMI, DES    → 'overlay'  (fill + edges — never OutlinePass)
  *   - Planner     → 'outline'  (green silhouette)
- *   - Editor      → 'outline'  (yellow silhouette)
+ *   - Editor      → 'overlay'  (yellow fill only — `edges: false`, no
+ *                   EdgesGeometry anywhere in the editor, plan-766 F6)
  *
  * The overlay styles double as the outline-mode FALLBACK look (WebGPU without
  * a TSL host, or a fully batched root).
@@ -46,6 +47,14 @@ export interface HighlightProfile {
   /** Optional per-mode override of the legacy-overlay mesh budget
    *  (`RVHighlightManager.maxHoverMeshes`, default 200). */
   maxHoverMeshes?: number;
+  /** Optional per-mode override of the chunk-proxy budget of the overlay
+   *  family (`RVHighlightManager.maxHoverChunks`, default 2048, plan-774). */
+  maxHoverChunks?: number;
+  /** Whether overlay pairs may carry crease-edge LineSegments (default
+   *  `true`). `false` makes every overlay pair fill-only — profile styles,
+   *  per-call styles (`showEdges`), aux sets and flashes alike — so no
+   *  `EdgesGeometry` is built while the profile is active (plan-766 F6). */
+  edges?: boolean;
 }
 
 // ─── Planner styles (GREEN) — moved from plugins/layout-planner/index.ts ──
@@ -203,11 +212,14 @@ export const MODE_HIGHLIGHT_PROFILES: Readonly<Record<string, HighlightProfile>>
     selectionOutline: PLANNER_OUTLINE_STYLE,
   }),
   editor: Object.freeze({
-    // Fill overlay + edges rather than an OutlinePass silhouette: authoring
-    // needs to see WHICH surfaces belong to the hovered/selected node inside
-    // a dense assembly, which a silhouette (outer contour only) cannot show.
+    // Fill overlay rather than an OutlinePass silhouette: authoring needs to
+    // see WHICH surfaces belong to the hovered/selected node inside a dense
+    // assembly, which a silhouette (outer contour only) cannot show.
     // The outline styles below stay for the flash channel.
     visual: 'overlay' as const,
+    // plan-766 F6: fill-only. No crease edges — this also overrides the
+    // per-call kinematic/group styles above (their showEdges is ignored).
+    edges: false,
     hoverStyle: EDITOR_HOVER_STYLE,
     selectionStyle: EDITOR_SELECTION_STYLE,
     hoverOutline: EDITOR_HOVER_OUTLINE_STYLE,

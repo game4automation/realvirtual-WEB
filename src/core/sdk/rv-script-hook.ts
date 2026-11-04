@@ -15,12 +15,12 @@
  *    `in/at/cancel/now` timer surface, with TWO implementations:
  *      * `createHeapScheduler()` (public) — backed by the shared
  *        `RVEventHeap`, drained by the continuous kernel each tick;
- *      * the private DES runner's `makeScriptHookScheduler()` — schedules a
+ *      * the DES runner's `makeScriptHookScheduler()` — schedules a
  *        generic `Script.Hook` named action on the DES event queue whose
  *        wrapper calls BACK through `ScriptHookDispatcher` into the VM.
- *  - PRIVATE (…-Private~/src/plugins/des/rv-des-script-hook.ts): the generic
- *    `ScriptHook` action type (registerAction pattern) — the ONLY private
- *    piece, minimal by design.
+ *  - DES (src/plugins/des/rv-des-script-hook.ts, core since plan-680): the
+ *    generic `ScriptHook` action type (registerAction pattern), minimal by
+ *    design.
  *
  * Because both schedulers implement the SAME interface, a script component
  * never knows which kernel serves its timers ("write once, run both speeds").
@@ -56,8 +56,9 @@ export interface ScriptPortDesc {
 /**
  * INTERNAL hook names riding the normal timer/event pipeline (never delivered
  * to a user's `des.on` directly — the guest-side router consumes them):
- *  - `RV_EVERY_HOOK`: recurring `self.every()` slice; the guest re-schedules
- *    the next slice and calls the user hook.
+ *  - `RV_EVERY_HOOK`: recurring `self.every()` slice, payload `{ pid }`. The
+ *    HOST re-arms the next slice (`SdkEveryTimers.fire`, plan-2212 Phase 4c);
+ *    the guest looks up hook + data under the pid and calls the user hook.
  *  - `RV_MSG_HOOK`: script→script message (`self.component(path).send` /
  *    `self.broadcast`); routed to the `onMessage(topic, data, fromPath)`
  *    handler. Delivery goes through the target's event list (time = now,
@@ -108,10 +109,127 @@ export interface SdkScheduler {
   in(delaySec: number, hook: string, mu?: ScriptMuRef | null, data?: unknown): number;
   /** Schedule `hook` at ABSOLUTE virtual time `timeSec`. Returns an event id. */
   at(timeSec: number, hook: string, mu?: ScriptMuRef | null, data?: unknown): number;
-  /** Cancel a pending event by id (no-op for unknown/fired ids). */
+  /** Cancel a pending event by id (no-op for unknown/fired ids). A NEGATIVE id
+   *  names a recurring `every` timer of this scheduler (plan-2212 Phase 4c). */
   cancel(eventId: number): void;
+  /**
+   * Start a recurring timer (`self.every`, plan-2212 Phase 4c): a slice of
+   * `hook` comes due every `intervalSec` seconds. Returns the NEGATIVE public
+   * id. The host owns only the CLOCK: it re-arms the next slice itself before
+   * the slice reaches the script. The payload never crosses — the guest keeps
+   * it (identity preserved) under the pid. Optional only for minimal test
+   * schedulers; both kernel schedulers implement it.
+   */
+  every?(intervalSec: number, hook: string): number;
+  /** The recurring-timer records behind {@link every} (dispatch, snapshot, teardown). */
+  readonly everyTimers?: SdkEveryTimers;
   /** Current virtual sim time in seconds. */
   readonly now: number;
+}
+
+/** One recurring `self.every` timer as the host keeps it (plan-2212 Phase 4c): clock only, no payload. */
+export interface SdkEveryRecord {
+  /** Public id (negative). */
+  pid: number;
+  /** Interval in seconds. */
+  interval: number;
+  /** The user hook a slice delivers (the snapshot table carries it). */
+  hook: string;
+  /** Event id of the pending slice. */
+  current: number;
+}
+
+/** The host half of the recurring-timer table (the guest adds `data` per pid). */
+export interface SdkEveryTable {
+  next: number;
+  items: SdkEveryRecord[];
+}
+
+/**
+ * Host-side clock of the recurring `self.every` timers of ONE script component
+ * (plan-2212 Phase 4c: the clock belongs to the kernel, not to the script
+ * engine). Each slice is an ordinary `RV_EVERY_HOOK` event with payload
+ * `{ pid }`, scheduled through the owning kernel's `in()`. When a slice comes
+ * due, the dispatcher calls {@link fire}, which re-arms the NEXT slice before
+ * the user hook runs: the same order the former guest-side re-scheduling used,
+ * so event ids, event order and results stay unchanged.
+ *
+ * Public ids are negative (`-1, -2, ...` in creation order) and never collide
+ * with kernel event ids; a cancelled id is never reused.
+ */
+export class SdkEveryTimers {
+  private records = new Map<number, SdkEveryRecord>();
+  private next = 1;
+
+  constructor(
+    private readonly arm: (intervalSec: number, pid: number) => number,
+    private readonly disarm: (eventId: number) => void,
+  ) {}
+
+  /** Number of live recurring timers. */
+  get size(): number {
+    return this.records.size;
+  }
+
+  /** True when `pid` is a live timer. */
+  has(pid: number): boolean {
+    return this.records.has(pid);
+  }
+
+  /**
+   * Create a timer and schedule its first slice. The kernel schedules FIRST:
+   * a refused schedule throws before a record exists or the id counter moves.
+   */
+  add(intervalSec: number, hook: string): number {
+    const pid = -this.next;
+    const current = this.arm(intervalSec, pid);
+    this.next++;
+    this.records.set(pid, { pid, interval: intervalSec, hook, current });
+    return pid;
+  }
+
+  /** A slice of `pid` came due: re-arm the next slice, return the record (null = cancelled, stale slice). */
+  fire(pid: unknown): SdkEveryRecord | null {
+    const rec = typeof pid === 'number' ? this.records.get(pid) : undefined;
+    if (!rec) return null;
+    rec.current = this.arm(rec.interval, rec.pid);
+    return rec;
+  }
+
+  /** Cancel a timer by public id. False for an unknown or already cancelled id. */
+  cancel(pid: number): boolean {
+    const rec = this.records.get(pid);
+    if (!rec) return false;
+    this.records.delete(pid);
+    this.disarm(rec.current);
+    return true;
+  }
+
+  /** Cancel every timer (auto-teardown on dispose). The id counter stays. */
+  cancelAll(): void {
+    const recs = [...this.records.values()];
+    this.records.clear();
+    for (const rec of recs) {
+      try { this.disarm(rec.current); } catch { /* kernel already gone */ }
+    }
+  }
+
+  /** Drop the records without touching the kernel (its pending slices were already cleared). */
+  clear(): void {
+    this.records.clear();
+  }
+
+  /** Snapshot copy of the host half (creation order). */
+  export(): SdkEveryTable {
+    return { next: this.next, items: [...this.records.values()].map(r => ({ ...r })) };
+  }
+
+  /** Replace the host half with a captured one (snapshot restore; the kernel restores the queued slices). */
+  replace(table: SdkEveryTable): void {
+    this.records = new Map(table.items.map((r): [number, SdkEveryRecord] =>
+      [r.pid, { pid: r.pid, interval: r.interval, hook: r.hook, current: r.current }]));
+    this.next = table.next;
+  }
 }
 
 /**
@@ -137,6 +255,10 @@ export interface ScriptHookEventData {
  * component's `ScriptHookDispatcher`).
  */
 export function createHeapScheduler(heap: RVEventHeap, getNow: () => number): SdkScheduler {
+  const everyTimers = new SdkEveryTimers(
+    (intervalSec, pid) => heap.schedule(getNow() + intervalSec, RV_EVERY_HOOK, null, { pid }),
+    eventId => { heap.cancel(eventId); },
+  );
   return {
     in(delaySec, hook, mu, data): number {
       return heap.schedule(getNow() + delaySec, hook, mu ?? null, data);
@@ -145,8 +267,13 @@ export function createHeapScheduler(heap: RVEventHeap, getNow: () => number): Sd
       return heap.schedule(timeSec, hook, mu ?? null, data);
     },
     cancel(eventId: number): void {
+      if (eventId < 0) { everyTimers.cancel(eventId); return; }
       heap.cancel(eventId);
     },
+    every(intervalSec, hook): number {
+      return everyTimers.add(intervalSec, hook);
+    },
+    everyTimers,
     get now(): number {
       return getNow();
     },

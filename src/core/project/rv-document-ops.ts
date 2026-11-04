@@ -50,6 +50,7 @@ import {
   documentsOf,
   stableDocumentId,
 } from './rv-project-documents';
+import { copyThumbnailSidecar, deleteThumbnailSidecar } from '../library/resolve-document-thumbnail';
 
 /**
  * Where a document is placed when the caller names no folder: the project ROOT.
@@ -311,12 +312,24 @@ export async function duplicateDocument(
   });
   await backend.writeDocument(target.relPath, bytes, { expectedRevision: 'create' });
 
+  // The picture travels as BYTES under the copy's own id (plan-776 F5) — a
+  // duplicate is the same file content, so it is the same picture, and nothing
+  // is rendered. A copy that fails leaves the row without a pointer.
+  const thumbnail = await copyThumbnailSidecar(
+    { read: async (p) => (await backend.readDocument(p).catch(() => null))?.bytes ?? null },
+    { write: async (p, b) => { await backend.writeDocument(p, b, { expectedRevision: 'any' }); } },
+    source.thumbnail,
+    source.id,
+    target.documentId,
+  );
+
   const at = (opts.now ?? (() => new Date().toISOString()))();
   await commitDocuments(host, [
     ...documentsOf(project),
     documentRowFor(target, at, {
       copiedFrom: source.id,
       ...(Array.isArray(source.collections) ? { collections: [...source.collections] } : {}),
+      ...(thumbnail ? { thumbnail } : {}),
     }),
   ]);
   return target;
@@ -364,6 +377,11 @@ export async function retireDocument(
   }
 
   await commitDocuments(host, documentsOf(project).filter(d => d.id !== documentId));
+  // The picture goes AFTER the row (plan-776 F5): it is derived from the file,
+  // not part of it, so it is not kept in the trash with the bytes. Only the
+  // document's own sidecar is ever deleted (F3 delete safety); an old hash-less
+  // PNG stays a dead file (#18).
+  await deleteThumbnailSidecar(backend, row.thumbnail, documentId);
   return true;
 }
 

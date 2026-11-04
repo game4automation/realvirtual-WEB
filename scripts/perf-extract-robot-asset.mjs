@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 /**
- * Cut the six-axis robot out of the demo model and write it as a library asset
- * for the cell-matrix performance benchmark (plan-492).
+ * Cut the six-axis robot out of the demo model and write it as THE library
+ * robot (written first for the plan-492 cell-matrix benchmark).
  *
  *   node scripts/perf-extract-robot-asset.mjs [--source <glb>] [--out <glb>] [--no-catalog]
  *
@@ -14,9 +14,11 @@
  *      `AASLink`, `Grip`, and every ComponentReference that leaves the subtree
  *      (gripper `Out`/`IsOut` signals); references INTO the subtree (`MasterDrive`)
  *      are rewritten onto the new root name. Keeps the axis and gripper `Drive`s.
- *   4. Adds `Drive_ErraticPosition` to A1..A6 with `IterateBetweenMaxAndMin`
- *      and no `SignalEnable`, so every axis sweeps back and forth on its own
- *      the moment the scene is initialised — deterministic, no PLC, no seed.
+ *   4. Adds NO motion of its own any more. Until 2026-10-25 this step put
+ *      `Drive_ErraticPosition` on A1..A6; Thomas decided the library robot gets
+ *      a logical robot definition instead (RobotIK + demo IKPath,
+ *      `author-robot-ik.mjs`) and the benchmark its own sweeping copy
+ *      (`build-perf-robot-asset.mjs`, which now owns the sweep table).
  *   5. Prunes unused meshes/materials/textures and writes
  *      `public/library/Robots/FanucCRX-10iA-L.glb`, then rebuilds the local catalog
  *      (`build-local-library-catalog.mjs`, entry id `robots-fanuccrx-10ia-l`).
@@ -24,6 +26,21 @@
  * The result is a plain library asset like the PalletHandling conveyors: a
  * single root, no PlacementMeta (the planner adds that on placement), no
  * snap ports (the robot is placed freely beside a lane).
+ *
+ * RE-RUNNING THIS DROPS THE PHYSICS AND IK AUTHORING. The full chain is
+ *
+ *   node scripts/perf-extract-robot-asset.mjs
+ *   node scripts/author-robot-physics.mjs
+ *   node scripts/author-robot-ik.mjs
+ *   node scripts/build-perf-robot-asset.mjs
+ *
+ * and `tests/robot-library-asset.node.test.ts` fails if a step is missing.
+ * Since plan-673 Phase 4b the same
+ * asset also carries `MechanismBody`, `CollisionShapeSet`, `ContactProfile`,
+ * `DynamicAxis` and `GripLoad`, written by `scripts/author-robot-physics.mjs`
+ * from the demo model's geometry. This script rebuilds the file from the demo
+ * scene and knows nothing about them, so run the authoring script again right
+ * after it; `tests/crx-library-physics.node.test.ts` fails if you forget.
  */
 import { NodeIO } from '@gltf-transform/core';
 import { ALL_EXTENSIONS } from '@gltf-transform/extensions';
@@ -51,37 +68,6 @@ const ROOT_NAME = 'FanucCRX-10iA-L';
 /** Extras keys that tie the robot to the demo cell — dropped on every node. */
 const STRIP_KEYS = new Set(['rigidbody', 'AASLink', 'Grip', 'colliders', 'ConnectSignal', 'PLCInputBool', 'PLCOutputBool']);
 
-/**
- * Sweep range per axis in degrees and speed in deg/s. Chosen so the arm stays
- * clear of its own base and of a conveyor standing beside it, and so the six
- * periods differ (no two axes reverse in the same tick).
- */
-const ERRATIC = {
-  A1: { MinPos: -60, MaxPos: 60, Speed: 40 },
-  A2: { MinPos: -25, MaxPos: 25, Speed: 25 },
-  A3: { MinPos: -35, MaxPos: 35, Speed: 30 },
-  A4: { MinPos: -90, MaxPos: 90, Speed: 60 },
-  A5: { MinPos: -45, MaxPos: 45, Speed: 45 },
-  A6: { MinPos: -180, MaxPos: 180, Speed: 90 },
-};
-
-function erraticExtras(spec) {
-  return {
-    _fullTypeName: 'realvirtual.Drive_ErraticPosition',
-    _version: 2,
-    _enabled: true,
-    MinPos: spec.MinPos,
-    MaxPos: spec.MaxPos,
-    Speed: spec.Speed,
-    Driving: false,
-    IterateBetweenMaxAndMin: true,
-    SignalEnable: null,
-    ConnectionInfo: [],
-    Name: '',
-    Active: 'Always',
-  };
-}
-
 // The demo model is Draco-compressed (KHR_draco_mesh_compression is REQUIRED),
 // so the reader needs the decoder; the writer re-encodes the same way, like
 // scripts/compress-glb.mjs does, to keep the library asset small.
@@ -105,7 +91,7 @@ robot.setTranslation([0, 0, 0]).setRotation([0, 0, 0, 1]).setScale([1, 1, 1]);
 robot.setName(ROOT_NAME);
 scene.addChild(robot);
 
-// 2. Walk the subtree: strip demo bindings, add the erratic behaviour.
+// 2. Walk the subtree: strip demo bindings.
 //
 //    ComponentReferences (`{ type: 'ComponentReference', path, … }`) are the
 //    second way the demo cell reaches into the robot: the gripper cylinder's
@@ -115,7 +101,7 @@ scene.addChild(robot);
 //    a reference anywhere else is dropped (set to null), so the asset carries
 //    no path into a scene it will never be loaded with.
 const OLD_PREFIX = 'Robot/' + ROBOT_NODE;
-const report = { nodes: 0, stripped: {}, erratic: [], drives: [], refsRewritten: [], refsDropped: [] };
+const report = { nodes: 0, stripped: {}, drives: [], refsRewritten: [], refsDropped: [] };
 const fixRefs = (obj, where) => {
   if (!obj || typeof obj !== 'object') return obj;
   if (obj.type === 'ComponentReference' && typeof obj.path === 'string') {
@@ -145,19 +131,11 @@ const walk = (node) => {
     }
     rv = fixRefs(rv, node.getName());
     if (rv.Drive) report.drives.push(node.getName());
-    const spec = ERRATIC[node.getName()];
-    if (spec && rv.Drive) {
-      rv.Drive_ErraticPosition = erraticExtras(spec);
-      report.erratic.push(node.getName());
-    }
     node.setExtras({ ...extras, realvirtual: rv });
   }
   for (const c of node.listChildren()) walk(c);
 };
 walk(robot);
-if (report.erratic.length !== 6) {
-  throw new Error(`expected Drive_ErraticPosition on 6 axes, got ${report.erratic.length}: ${report.erratic.join(', ')}`);
-}
 
 // 3. Drop every node that is no longer reachable from the scene, then prune
 //    the meshes/materials/textures/accessors nothing references any more.
@@ -198,7 +176,6 @@ console.log(`  nodes       ${nodes.length} (walked ${report.nodes})`);
 console.log(`  triangles   ${triangles}`);
 console.log(`  materials   ${check.getRoot().listMaterials().length}, textures ${check.getRoot().listTextures().length}`);
 console.log(`  drives      ${report.drives.join(', ')}`);
-console.log(`  erratic on  ${report.erratic.join(', ')}`);
 console.log(`  stripped    ${JSON.stringify(report.stripped)}`);
 console.log(`  refs        rewritten ${report.refsRewritten.length}, dropped ${report.refsDropped.length}`);
 for (const r of report.refsRewritten) console.log(`              ~ ${r}`);
@@ -216,9 +193,9 @@ const scanRefs = (o, where) => {
 for (const n of nodes) scanRefs(n.getExtras()?.realvirtual, n.getName());
 if (leaks.length) throw new Error(`verification: references leave the asset:\n  ${leaks.join('\n  ')}`);
 
-// 6. Catalog: `build-local-library-catalog.mjs` regenerates catalog.json from the
+// 6. Library: `build-local-library-catalog.mjs` regenerates library/project.json from the
 //    folder scan (id = slug of the path, e.g. `robots-fanuccrx-10ia-l`), so a
-//    hand-written entry would be overwritten on its next run. Run it instead.
+//    hand-written row would be overwritten on its next run. Run it instead.
 if (WRITE_CATALOG) {
   const { execFileSync } = await import('node:child_process');
   execFileSync(process.execPath, [resolve(HERE, 'build-local-library-catalog.mjs')], { stdio: 'inherit' });

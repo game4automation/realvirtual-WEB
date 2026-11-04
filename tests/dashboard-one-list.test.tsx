@@ -30,6 +30,18 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import type { RVViewer } from '../src/core/rv-viewer';
+import { queryCommand } from './helpers/query-command';
+
+import { ensureDocumentCommandsRegistered } from '../src/core/hmi/document-commands';
+import { McpCommandTools } from '../src/plugins/mcp-bridge/rv-mcp-command-tools';
+
+async function exec(command: string, args: Record<string, unknown> = {}) {
+  ensureDocumentCommandsRegistered();
+  const r = JSON.parse(await new McpCommandTools(() => ({} as never)).webExecute(command, JSON.stringify(args)));
+  return r.value ?? { error: r.error };
+}
+
 import { render, screen, cleanup } from '@testing-library/react';
 
 // ─── A recording SceneStore, for the MCP contract half ──────────────────
@@ -59,6 +71,8 @@ const sceneStoreFake = {
   openDocument: async (id: string) => { h.calls.push({ verb: 'openDocument', arg: id }); },
   openScene: async (id: string) => { h.calls.push({ verb: 'openScene', arg: id }); },
   createEmpty: async () => { h.calls.push({ verb: 'createEmpty' }); return h.createdId; },
+  adoptDocumentRename: () => { h.calls.push({ verb: 'adoptDocumentRename' }); },
+  openScratch: async () => { h.calls.push({ verb: 'openScratch' }); },
   newEmpty: async () => { h.calls.push({ verb: 'newEmpty' }); },
   save: async () => { h.calls.push({ verb: 'save' }); return { status: 'saved' }; },
   saveAs: async (name: string) => { h.calls.push({ verb: 'saveAs', arg: name }); return 'doc_saved_as'; },
@@ -114,10 +128,12 @@ const HOST_CODE = HOST_SOURCE
   .join('\n');
 
 describe('the dashboard has no second list left (F8)', () => {
-  it('reads `project.scenes` nowhere', () => {
-    // The snapshot field itself survives until Phase 6 — this is about the
-    // dashboard, which is the surface the plan moves in Phase 5.
+  it('reads `project.scenes` and `project.models` nowhere', () => {
+    // Both snapshot views are gone — `scenes` with plan-716 Phase 6, `models`
+    // with plan-777 (P3). The detail pane resolves a path selection through
+    // `documentForSelectedPath` over the one document list instead.
     expect(HOST_CODE).not.toContain('project.scenes');
+    expect(HOST_CODE).not.toContain('project.models');
   });
 
   it('reads `project.documents` instead, in more than one place', () => {
@@ -146,7 +162,9 @@ describe('the dashboard has no second list left (F8)', () => {
     // spaces, and the detail pane had to branch on which one it was holding.
     expect(HOST_CODE).not.toContain("'published:'");
     expect(HOST_CODE).not.toContain("startsWith('published:')");
-    expect(HOST_CODE).toContain("'scene:' + doc.id");
+    expect(HOST_CODE).toContain("'document:' + doc.id");
+    expect(HOST_CODE).not.toContain("'scene:'");
+    expect(HOST_CODE).not.toContain("'model:'");
   });
 
   it('opens a row through the one document verb, with no published fork', () => {
@@ -276,6 +294,35 @@ function manifestRows(): RvDocumentEntry[] {
 describe('MCP — web_document_list is THE one list', () => {
   beforeEach(() => { resetProjectStore(); h.calls.length = 0; });
 
+  it('empty opens scratch twice without creating project documents', async () => {
+    const fake = installFakeDocumentProject();
+    try {
+      const tools = new McpProjectTools(() => undefined);
+      expect(JSON.parse(await tools.webDocumentOpen('empty')).kind).toBe('scratch');
+      expect(JSON.parse(await tools.webDocumentOpen('empty')).kind).toBe('scratch');
+      expect(h.calls.map(c => c.verb)).toEqual(['openScratch', 'openScratch']);
+      expect(fake.documents()).toEqual([]);
+      expect(fake.writes).toEqual([]);
+    } finally { fake.restore(); }
+  });
+
+  it('rename persists the same id before rescan and the next list', async () => {
+    const fake = installFakeDocumentProject({ documents: [{ id: 'doc_part', name: 'Part', path: 'Part.glb' }] });
+    fake.backend.statDocuments = async () => [...fake.files].map(([path, bytes]) => ({ path, size: bytes.length, mtime: 1 }));
+    try {
+      const result = await exec('document.rename', { relPath: 'Part.glb', newName: 'Named' });
+      expect(result).toMatchObject({ renamed: true, documentId: 'doc_part', relPath: 'Named.glb' });
+      expect((await fake.backend.readManifest())?.documents).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: 'doc_part', name: 'Named', path: 'Named.glb' }),
+      ]));
+      const listed = JSON.parse(await new McpProjectTools(() => undefined).webDocumentList());
+      expect(listed.documents).toHaveLength(1);
+      expect(listed.documents[0]).toMatchObject({ id: 'doc_part', name: 'Named', path: 'Named.glb' });
+      expect([...fake.files.keys()]).toEqual(['Named.glb']);
+      expect(h.calls.some(c => c.verb === 'adoptDocumentRename')).toBe(true);
+    } finally { fake.restore(); }
+  });
+
   it('returns every document with its section, not the scenes/ third', async () => {
     const fake = installFakeDocumentProject({ documents: manifestRows() });
     try {
@@ -339,9 +386,10 @@ describe('MCP — the web_document_* verbs own the document ops (old names retir
    * capability. `webScene*` and `webModel*` are gone from both delegate
    * classes — asset = document = model, and the document verbs carry it all.
    */
-  it('announces the document verbs on the scene delegate', () => {
+  it('keeps document save and exposes the layout snapshot through web_query', async () => {
     const plugin = new McpSceneTools(() => undefined);
-    for (const verb of ['webDocumentSave', 'webDocumentNew', 'webLayoutExport'] as const) {
+    expect(await queryCommand({ getPlugin: () => undefined } as unknown as RVViewer, 'layout.export')).toHaveProperty('error');
+    for (const verb of ['webDocumentSave'] as const) {
       expect(typeof plugin[verb]).toBe('function');
     }
   });
@@ -350,7 +398,9 @@ describe('MCP — the web_document_* verbs own the document ops (old names retir
     const scene = new McpSceneTools(() => undefined) as unknown as Record<string, unknown>;
     const project = new McpProjectTools(() => undefined) as unknown as Record<string, unknown>;
     for (const gone of ['webSceneOpen', 'webSceneList', 'webSceneSave', 'webSceneNew',
-      'webSceneExport', 'webLibraryAssets', 'webLibraryUpdate', 'webLibraryList',
+      // webLibraryList is re-admitted by plan-655 with a narrower meaning (the project's
+      // attached part libraries, domain `library`) — no longer the retired catalog listing.
+      'webSceneExport', 'webLibraryAssets', 'webLibraryUpdate',
       'webLibraryDescribe'] as const) {
       expect(scene[gone], `${gone} must be gone from McpSceneTools`).toBeUndefined();
     }
@@ -383,8 +433,8 @@ describe('MCP — the web_document_* verbs own the document ops (old names retir
     } finally { fake.restore(); }
   });
 
-  it('web_document_new places a DOCUMENT and opens it, instead of clearing to a draft', async () => {
-    const out = JSON.parse(await new McpSceneTools(() => undefined).webDocumentNew()) as {
+  it('document.create places a DOCUMENT and opens it, instead of clearing to a draft', async () => {
+    const out = (await exec('document.create')) as {
       ok: boolean; documentId: string;
     };
     expect(out).toEqual({ ok: true, documentId: 'doc_created' });

@@ -3,7 +3,7 @@
 
 /**
  * §9.7 — F8: structural ops never reach into a reference; value ops do and land
- * in `AssetOverrides.byNodeId` of the reference node (plan-703 Phase 7).
+ * in `AssetOverrides.byAddress` (`#<id>`) of the reference node (plan-703 Phase 7, plan-769).
  *
  * The two halves are tested against the SAME node, because that is the whole
  * claim: the boundary is not around a node, it is around a KIND of change. A
@@ -220,12 +220,12 @@ describe('setField on the same node is ACCEPTED and routes to the reference', ()
     expect(overrideTargetOf(s.ref, s.root)).toBeNull();
   });
 
-  it('the value lands in AssetOverrides.byNodeId of the reference node', () => {
+  it('the value lands in AssetOverrides.byAddress of the reference node', () => {
     const s = buildScene();
     writeOverride(s.ref, 'n-inner', 'Drive', 'TargetSpeed', 250);
 
     const overrides = getAssetOverrides(s.ref);
-    expect(overrides?.byNodeId).toEqual({ 'n-inner': { Drive: { TargetSpeed: 250 } } });
+    expect(overrides?.byAddress).toEqual({ '#n-inner': { Drive: { TargetSpeed: 250 } } });
     expect(readOverride(s.ref, 'n-inner')).toEqual({ Drive: { TargetSpeed: 250 } });
     expect(overriddenFieldsOf(s.ref, 'n-inner', 'Drive')).toEqual(['TargetSpeed']);
     // …and NOT on the node it describes.
@@ -238,8 +238,8 @@ describe('setField on the same node is ACCEPTED and routes to the reference', ()
     writeOverride(s.ref, 'n-inner', 'Drive', 'Acceleration', 10);
     writeOverride(s.ref, 'n-inner', 'Sensor', 'Enabled', false);
 
-    expect(getAssetOverrides(s.ref)?.byNodeId).toEqual({
-      'n-inner': { Drive: { TargetSpeed: 250, Acceleration: 10 }, Sensor: { Enabled: false } },
+    expect(getAssetOverrides(s.ref)?.byAddress).toEqual({
+      '#n-inner': { Drive: { TargetSpeed: 250, Acceleration: 10 }, Sensor: { Enabled: false } },
     });
   });
 
@@ -278,7 +278,7 @@ describe('revert', () => {
     writeOverride(s.ref, 'n-inner', 'Sensor', 'Enabled', false);
 
     revertComponentOverride(s.ref, 'n-inner', 'Drive');
-    expect(getAssetOverrides(s.ref)?.byNodeId).toEqual({ 'n-inner': { Sensor: { Enabled: false } } });
+    expect(getAssetOverrides(s.ref)?.byAddress).toEqual({ '#n-inner': { Sensor: { Enabled: false } } });
   });
 
   it('reverting a field that was never overridden changes nothing', () => {

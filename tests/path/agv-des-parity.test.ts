@@ -33,7 +33,7 @@ import { clearLiveControl } from '../../src/core/engine/rv-live-control';
 import { AgvFlow } from '../../src/behaviors/Agv';
 import { getDefaultMovementAuthority } from '../../src/core/engine/rv-movement-authority';
 import { getDefaultAgvFleet } from '../../src/core/engine/rv-agv-fleet';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
+import { DESRunner } from '@rv/plugins/des/des-runner';
 import { makeHost, makeAgvRoot as makeAgv, bindContinuous, bindDes, clearShared, sig,
   type AgvTestHost as Host,
 } from '../helpers/agv-harness';

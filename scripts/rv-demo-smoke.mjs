@@ -16,6 +16,9 @@
  *                     polled with backoff                          → stale-cdn
  *   4. playwright   — `node cli.js test --project=prod-demo --reporter=json,line`
  *                     (no npm lifecycle, F9)                       → timeout | crashed
+ *                     Every spec opens its document with `&welcome=0` (plan-646 F14):
+ *                     the `/demo` build shows a welcome window on each start, and the
+ *                     smoke must measure the same page on `/demo` and `/dev`.
  *   5. report       — recursive flatten, three verdicts: completeness, result, frame
  *                                                     → report-unreadable | incomplete | tests
  *   6. result       — smoke-result.json written on EVERY path.

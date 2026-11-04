@@ -92,6 +92,8 @@ function makeFixture(): Fixture {
     version: 1, root, clones, credentialsFiles: [credentials], nodePath: process.execPath, workspaceRoot: base,
     watcherLockName: unique('watcher'), taskName: unique('task'), deployArgs: ['--demo', '--path', 'dev'],
     fetchTimeoutMs: 120000, prepublishTimeoutSeconds: 900, branch: 'main',
+    // Load guards off: these cases are about the smoke, not about machine load.
+    lowPriority: false, minFreeMemoryMb: 0, deferWhileTestLockHeld: false, maxCpuPercent: 0,
     browsersPath: join(root, 'playwright-browsers'), smokeOutDir: outDir,
   };
   const configPath = join(root, 'config.json');
@@ -355,6 +357,37 @@ describe.skipIf(!isWindows)('dev-deploy-watch — demo smoke (plan-503 §9.3)', 
     // Without expected.json there is nothing to retry.
     rmSync(join(fx.outDir, 'expected.json'));
     await expect(W.retrySmoke(fx.config, { out: () => {} })).rejects.toThrow(/nothing to retry/);
+  }, 120_000);
+
+  it('Test_NoSmokeInDeployArgs_SkipsRuntimeAndSmokeBookkeeping', async () => {
+    const off = { ...fx.config, deployArgs: ['--demo', '--path', 'dev', '--no-smoke'] };
+    expect(W.smokeDisabled(off)).toBe(true);
+    expect(W.smokeDisabled(fx.config)).toBe(false);
+    expect(W.smokeDisabled({})).toBe(false);
+    let ensured = 0;
+    // A stale result must neither be read nor matter: the child writes none (bunny-deploy skips the smoke).
+    mkdirSync(fx.outDir, { recursive: true });
+    writeFileSync(join(fx.outDir, 'smoke-result.json'), JSON.stringify(RED));
+    const result = await W.runTick(off, tickDeps({
+      startDeploy: deployChild(0, null),
+      runtimePresent: () => ({ cli: false, browser: false }),
+      ensureRuntime: () => { ensured += 1; return { runtime: null, action: 'installed' }; },
+    }));
+    expect(result).toMatchObject({ outcome: 'deployed', smoke: null });
+    expect(ensured).toBe(0);
+    expect(runs).toEqual([]);
+    const state = fx.state();
+    expect(state.lastDeployed).toEqual(result.pair);
+    expect(state.lastSmoke).toBeNull();
+    expect(fx.log()).toMatch(/runtime: skipped \(smoke disabled\)/);
+    expect(fx.log()).not.toMatch(/RUNTIME|SMOKE (OK|FAILED|SKIPPED)/);
+    expect(notes).toEqual([]);
+    // --retry-smoke says so and runs nothing, even with an expected.json on disk.
+    writeFileSync(join(fx.outDir, 'expected.json'), JSON.stringify({ pair: result.pair, baseUrl: 'x', demos: {}, fingerprint: {} }));
+    const lines: string[] = [];
+    const retry = await W.retrySmoke(off, { out: (line: string) => lines.push(line), runSmoke: async () => { throw new Error('must not run'); } });
+    expect(retry).toMatchObject({ smoke: null, disabled: true });
+    expect(lines.join(' ')).toMatch(/smoke is disabled/);
   }, 120_000);
 
   it('kills the whole smoke process tree on timeout (taskkill /T on win32)', async () => {

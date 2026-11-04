@@ -8,6 +8,7 @@
         "GenerateIfDistance": 450,
         "PlaceOnTransportSurface": true,
         "ThisObjectAsMU": "",
+        "Destination": "",
         "CollisionRoleForMUs": "None",
         "Enabled": true,
         "GenerateMU": true,

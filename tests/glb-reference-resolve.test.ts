@@ -35,7 +35,8 @@ import {
   type ResolvedReference,
 } from '../src/core/engine/rv-glb-compose';
 import { setAssetReference, setAssetOverrides } from '../src/core/engine/rv-asset-reference';
-import { getNodeId, fullNodeAddress } from '../src/core/engine/rv-node-id';
+import { fullNodeAddress } from '../src/core/engine/rv-node-id';
+import { identityIdOf } from '../src/core/engine/rv-decode-identity';
 
 // ─── Fixtures ────────────────────────────────────────────────────────────
 
@@ -206,7 +207,7 @@ describe('Referenzauflösung', () => {
     const plant = plantWithReferences(10, 'press');
     const result = await compose(plant, { baseUrl: 'plant.glb', resolve: tableResolver({ press }) });
 
-    const motorIds = result.frames.map((f) => getNodeId(findByName(f.subtreeRoot, 'Motor')!));
+    const motorIds = result.frames.map((f) => identityIdOf(findByName(f.subtreeRoot, 'Motor')!));
     expect(motorIds.every((id) => id && id === motorIds[0])).toBe(true);
     // The occurrences, however, are all different — which is what makes the
     // composite address unique.
@@ -224,11 +225,11 @@ describe('Referenzauflösung', () => {
     // reference node, which is what keeps it local.
     const probe = plantWithReferences(1, 'press');
     const probeResult = await compose(probe, { baseUrl: 'plant.glb', resolve: tableResolver({ press }) });
-    const motorId = getNodeId(findByName(probeResult.frames[0].subtreeRoot, 'Motor')!)!;
+    const motorId = identityIdOf(findByName(probeResult.frames[0].subtreeRoot, 'Motor')!)!;
     probeResult.dispose();
 
     const plant = plantWithReferences(10, 'press');
-    setAssetOverrides(plant.children[2], { byNodeId: { [motorId]: { Drive: { TargetSpeed: 999 } } } });
+    setAssetOverrides(plant.children[2], { byAddress: { [`#${motorId}`]: { Drive: { TargetSpeed: 999 } } } });
 
     const result = await compose(plant, { baseUrl: 'plant.glb', resolve: tableResolver({ press }) });
     expect(result.orphanedOverrides).toHaveLength(0);
@@ -305,7 +306,7 @@ describe('Referenzauflösung', () => {
     plant.add(referenceNode('ARef', { assetId: 'a' }));
 
     await expect(compose(plant, { baseUrl: 'plant.glb', resolve: tableResolver({ a, b }) }))
-      .rejects.toThrow(/Referenzzyklus/);
+      .rejects.toThrow(/Reference cycle/);
   });
 
   it('erkennt auch die Selbstreferenz der Wurzeldatei als Zyklus', async () => {
@@ -418,11 +419,11 @@ describe('Referenzauflösung', () => {
   it('meldet einen verwaisten Override statt ihn still zu verwerfen (F9)', async () => {
     const press = await assetFixture(buildPart('Press'), 'lib/press.glb', 'sha-press');
     const plant = plantWithReferences(1, 'press');
-    setAssetOverrides(plant.children[0], { byNodeId: { deadbeefdeadbeef: { Drive: { TargetSpeed: 5 } } } });
+    setAssetOverrides(plant.children[0], { byAddress: { '#deadbeefdeadbeef': { Drive: { TargetSpeed: 5 } } } });
 
     const result = await compose(plant, { baseUrl: 'plant.glb', resolve: tableResolver({ press }) });
     expect(result.orphanedOverrides).toHaveLength(1);
-    expect(result.orphanedOverrides[0].key).toBe('deadbeefdeadbeef');
+    expect(result.orphanedOverrides[0].key).toBe('#deadbeefdeadbeef');
     expect(result.orphanedOverrides[0].assetId).toBe('press');
     result.dispose();
   });
@@ -435,7 +436,7 @@ describe('Referenzauflösung', () => {
     probeRoot.name = 'Probe';
     probeRoot.add(referenceNode('PartRef', { assetId: 'part' }));
     const probe = await compose(probeRoot, { baseUrl: 'p.glb', resolve: tableResolver({ part }) });
-    const motorId = getNodeId(findByName(probe.frames[0].subtreeRoot, 'Motor')!)!;
+    const motorId = identityIdOf(findByName(probe.frames[0].subtreeRoot, 'Motor')!)!;
     probe.dispose();
 
     const assemblyTree = new Group();
@@ -447,7 +448,7 @@ describe('Referenzauflösung', () => {
     base.name = 'Base';
     assemblyTree.add(base);
     const innerRef = referenceNode('PartRef', { assetId: 'part' });
-    setAssetOverrides(innerRef, { byNodeId: { [motorId]: { Drive: { TargetSpeed: 200 } } } });
+    setAssetOverrides(innerRef, { byAddress: { [`#${motorId}`]: { Drive: { TargetSpeed: 200 } } } });
     assemblyTree.add(innerRef);
     const assembly = await assetFixture(assemblyTree, 'lib/assembly.glb', 'sha-asm');
 
@@ -456,7 +457,7 @@ describe('Referenzauflösung', () => {
     const plant = new Group();
     plant.name = 'Plant';
     const outerRef = referenceNode('AsmRef', { assetId: 'assembly' });
-    setAssetOverrides(outerRef, { byNodeId: {}, byPath: { 'PartRef/Part/Motor': { Drive: { TargetSpeed: 300 } } } });
+    setAssetOverrides(outerRef, { byAddress: {}, legacyByPath: { 'PartRef/Part/Motor': { Drive: { TargetSpeed: 300 } } } });
     plant.add(outerRef);
 
     const result = await compose(plant, { baseUrl: 'plant.glb', resolve: tableResolver({ assembly, part }) });

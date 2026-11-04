@@ -9,3 +9,6 @@ tests/fixtures/news-contract-v1.sample.json -text
 # LFS free tier allows 1 GB of bandwidth a month. If a new large model ever
 # has to ship publicly, add its path here explicitly rather than a blanket
 # rule: ~198 MB of GLBs are tracked as plain blobs and must stay that way.
+
+# The generated rv-odt split must stay byte-identical across checkouts (drift guard compares text).
+schema/v1/rv-odt*.json text eol=lf

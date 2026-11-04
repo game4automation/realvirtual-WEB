@@ -20,6 +20,9 @@ import {
   DialogTitle,
 } from '@mui/material';
 
+/** How far a guard dialog sits above the default modal layer (see `aboveModals`). */
+export const GUARD_Z_OFFSET = 10;
+
 interface SceneConfirmDialogProps {
   open: boolean;
   sceneName: string;
@@ -39,6 +42,13 @@ interface SceneConfirmDialogProps {
   onSaveAs: () => void;
   onDiscard: () => void;
   onCancel: () => void;
+  /**
+   * Raise the dialog above other open modals. The project switch guard needs
+   * it: it opens WHILE the dashboard's "Open project…" progress dialog is up,
+   * and at an equal z-index the progress dialog covered it — the switch then
+   * waited forever on a question nobody could see.
+   */
+  aboveModals?: boolean;
 }
 
 export function SceneConfirmDialog({
@@ -50,9 +60,11 @@ export function SceneConfirmDialog({
   onSaveAs,
   onDiscard,
   onCancel,
+  aboveModals,
 }: SceneConfirmDialogProps) {
   return (
-    <Dialog open={open} onClose={onCancel} maxWidth="xs" fullWidth>
+    <Dialog open={open} onClose={onCancel} maxWidth="xs" fullWidth
+      sx={aboveModals ? { zIndex: theme => theme.zIndex.modal + GUARD_Z_OFFSET } : undefined}>
       <DialogTitle sx={{ fontSize: 14, fontWeight: 600 }}>Unsaved changes</DialogTitle>
       <DialogContent>
         <DialogContentText sx={{ fontSize: 13 }}>

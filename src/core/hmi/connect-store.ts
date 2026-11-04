@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage, readLocalStorage, removeLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * connect-store.ts — Zustand-style pub/sub store for the realvirtual CONNECT panel.
  *
@@ -14,6 +16,7 @@ import { createStore } from './create-store';
 import { deriveWireType, type S7Tag, type ParsedTopic } from '../import/s7-tag-table';
 import {
   buildInterfaceSignals,
+  legacyAdoptOps,
   matchPlcSignals,
   mergeDataBlockFilter,
   sameSignals,
@@ -31,9 +34,20 @@ import {
   SEW_DEFAULT_RECEIVE_TOPIC,
   type SewJsonTopicOptions,
   type SewSymbolRow,
+  type UdpImportSignal,
 } from '../import/sew-symbol-table';
 import { reconcileSignals, type ReconcileReport } from '../import/rv-signal-reconcile';
+import { fillAddressOps, planFillAddresses, type FillAddressPlan } from '../import/rv-fill-addresses';
+import {
+  addressImportOps,
+  planAddressTableImport,
+  rowsToValidate,
+  type AddressImportOptions,
+  type AddressImportPlan,
+  type ParsedAddressTable,
+} from '../import/rv-address-table-import';
 import { connectRestFetch } from './connect-rest';
+import { configOpsLimitError, rawRowLimitError } from './connect-ops-limits';
 import { clearLicenseStatus, fetchLicenseStatus } from './license-store';
 import { fetchConnectNews } from '../news-store';
 import { getProjectStore } from '../project/project-store';
@@ -57,6 +71,15 @@ export interface ConnectInterfaceSignal {
   /** Free-text comment from the imported tag table (column 4). Shown in the signal browse list. */
   comment?: string;
   record: boolean;
+  /**
+   * OPC UA acquisition (CONNECT `SignalConfig.SubscribeValue`, plan-235 B2). Carried through every
+   * edit so a dialog save never resets it to the gateway default (plan-2025 F10).
+   */
+  subscribeValue?: boolean;
+  /** OPC UA acquisition: poll the value instead of / in addition to the subscription. */
+  pollValue?: boolean;
+  /** OPC UA acquisition: poll cycle in milliseconds. */
+  pollCycleMs?: number;
 }
 
 /**
@@ -628,7 +651,19 @@ export interface ConnectInterface {
 }
 
 export interface DiscoveredSignal {
+  /**
+   * What goes verbatim into `SignalConfig.ProtocolAddress` (plan-2025 F8): the OPC UA NodeId, the
+   * ADS symbol, the S7 address. Read from the gateway's `protocolAddress`; an older CONNECT without
+   * the field falls back to `browsePath || name`, which was the only choice before.
+   */
   protocolAddress: string;
+  /**
+   * Exact matching key against a model signal name (plan-589 "Name = Symbol"). Empty when the
+   * gateway is too old to report one ({@link DiscoveredSignal.contract} `legacy`).
+   */
+  symbolKey?: string;
+  /** `current` = the gateway reported `symbolKey` + `protocolAddress`; `legacy` = derived from `name`/`browsePath`. */
+  contract?: 'current' | 'legacy';
   displayName: string;
   dataType: string;
   direction: 'input' | 'output' | 'unknown';
@@ -977,7 +1012,7 @@ export function resolveInitialGatewayUrl(
 function _readInitialUrl(): string {
   try {
     return resolveInitialGatewayUrl(
-      localStorage.getItem(LS_KEY_URL), window.location, isServedByConnectOrigin());
+      getLocalStorage()!.getItem(LS_KEY_URL), window.location, isServedByConnectOrigin());
   } catch {
     return defaultGatewayUrl();
   }
@@ -1094,11 +1129,7 @@ export function isSourceConnectedLive(source: string): boolean {
  * (the user connected via the ConnectPanel at least once).
  */
 export function hasStoredServerUrl(): boolean {
-  try {
-    return !!localStorage.getItem(LS_KEY_URL);
-  } catch {
-    return false;
-  }
+  return !!readLocalStorage(LS_KEY_URL);
 }
 
 /**
@@ -1106,17 +1137,13 @@ export function hasStoredServerUrl(): boolean {
  * auto-probe honours this, so a Disconnect survives a reload.
  */
 export function hasAutoConnectOptOut(): boolean {
-  try {
-    return localStorage.getItem(LS_KEY_AUTOCONNECT_OPTOUT) === '1';
-  } catch {
-    return false;
-  }
+  return readLocalStorage(LS_KEY_AUTOCONNECT_OPTOUT) === '1';
 }
 
 function _setAutoConnectOptOut(optOut: boolean): void {
   try {
-    if (optOut) localStorage.setItem(LS_KEY_AUTOCONNECT_OPTOUT, '1');
-    else localStorage.removeItem(LS_KEY_AUTOCONNECT_OPTOUT);
+    if (optOut) writeLocalStorage(LS_KEY_AUTOCONNECT_OPTOUT, '1');
+    else removeLocalStorage(LS_KEY_AUTOCONNECT_OPTOUT);
   } catch { /* ignore */ }
 }
 
@@ -1126,17 +1153,11 @@ function _setAutoConnectOptOut(optOut: boolean): void {
  * auto-probe insists on this before contacting a local gateway from a hosted origin.
  */
 export function hasUserConnectedBefore(): boolean {
-  try {
-    return localStorage.getItem(LS_KEY_USER_CONNECTED) === '1';
-  } catch {
-    return false;
-  }
+  return readLocalStorage(LS_KEY_USER_CONNECTED) === '1';
 }
 
 function _recordUserConnected(): void {
-  try {
-    localStorage.setItem(LS_KEY_USER_CONNECTED, '1');
-  } catch { /* ignore */ }
+  writeLocalStorage(LS_KEY_USER_CONNECTED, '1');
 }
 
 /** Loopback host names, in the spellings a URL or `window.location` can carry. */
@@ -1289,9 +1310,7 @@ export async function canSilentlyProbeGateway(): Promise<boolean> {
 }
 
 export function setServerUrl(url: string): void {
-  try {
-    localStorage.setItem(LS_KEY_URL, url);
-  } catch { /* ignore */ }
+  writeLocalStorage(LS_KEY_URL, url);
   if (_store.getSnapshot().serverUrl !== url) {
     // A `/status` answer still in flight belongs to the previous gateway.
     _statusGeneration++;
@@ -1300,6 +1319,8 @@ export function setServerUrl(url: string): void {
     // and owes the card nothing the previous one reported.
     _activeDocumentUnsupported = false;
     clearActiveDocumentState();
+    // A config refresh (or explicit load) still in flight belongs to the previous gateway (plan-2024).
+    _resetConfigRefresh();
   }
   _store.set({ serverUrl: url });
 }
@@ -1435,6 +1456,408 @@ async function _errorMessage(resp: Response): Promise<string> {
   }
 }
 
+// ── Config write core client (plan-2025 F10) ─────────────────────────────
+//
+// Every signal / bridge / interface-settings write of the browser goes through ONE gateway entry,
+// `POST /config/ops` — a batch of patch operations applied atomically by CONNECT's write core, with
+// optimistic concurrency on the store revision CONNECT sends in the `X-Config-Revision` /
+// `X-Config-Instance` headers of every `GET /config*`.
+//
+// Why not the old routes: `PUT /config/interfaces/{id}` replaces the WHOLE interface from this tab's
+// snapshot, so a signal edit silently reverted whatever another tab, the tray or an AI tool had
+// written in between (the write-gate switch included, plan-2025 matrix B1). An op names only the
+// field it changes; the revision makes a stale snapshot a visible 409 instead of a lost update.
+//
+// Feature detection: an older CONNECT has no `/config/ops`. The first write to a gateway tries it;
+// a 404 / 405, a non-JSON answer or a JSON answer that is not the ops contract marks the gateway as
+// "no ops" until the target changes, and every write falls back to the route it used before.
+
+/** Store revision of a configuration snapshot, as CONNECT reports it (plan-2025 F1). */
+export interface ConnectConfigRevision {
+  revision: number;
+  instance: string;
+}
+
+/** Response headers of every `GET /config*` and of `POST /config/ops`. */
+export const CONFIG_REVISION_HEADER = 'X-Config-Revision';
+export const CONFIG_INSTANCE_HEADER = 'X-Config-Instance';
+
+/** The revision a response carries, or null (older gateway, mocked response without headers). */
+export function readConfigRevision(resp: Pick<Response, 'headers'> | null | undefined): ConnectConfigRevision | null {
+  const headers = resp?.headers;
+  if (!headers || typeof headers.get !== 'function') return null;
+  const raw = headers.get(CONFIG_REVISION_HEADER);
+  const instance = headers.get(CONFIG_INSTANCE_HEADER);
+  if (!raw || !instance) return null;
+  const revision = Number(raw);
+  return Number.isFinite(revision) ? { revision, instance } : null;
+}
+
+/** One operation of a `/config/ops` batch (CONNECT `ConfigOpRequest`, camelCase on the wire). */
+export interface ConnectConfigOp {
+  op:
+    | 'signal.upsert' | 'signal.remove'
+    | 'interface.add' | 'interface.patch'
+    | 'container.replace'
+    | 'mirror.upsert' | 'mirror.remove'
+    | 'mapping.upsert' | 'mapping.remove';
+  interfaceId?: string;
+  /** MQTT topic container; absent = the interface-level `signals` list. */
+  topic?: string;
+  name?: string;
+  type?: string;
+  dataType?: string;
+  protocolAddress?: string;
+  /** `fillEmpty` (default on the gateway), `keep` or `overwrite`. */
+  addressMode?: 'fillEmpty' | 'keep' | 'overwrite';
+  comment?: string;
+  record?: boolean;
+  subscribeValue?: boolean;
+  pollValue?: boolean;
+  pollCycleMs?: number;
+  /** interface.patch: JSON merge patch of interface fields. */
+  patch?: Record<string, unknown>;
+  /** interface.add: the whole new interface (topics / signals included). */
+  interface?: Partial<ConnectInterface> & { id: string; type: string };
+  /** container.replace: the container's new signal list. */
+  signals?: ConnectInterfaceSignal[];
+  /** container.replace: a whole MQTT topic (settings + signals). */
+  topicConfig?: ConnectMqttTopic;
+  mirror?: ConnectMirrorRule;
+  /** mirror.remove: rule id. */
+  id?: string;
+  mapping?: ConnectSignalMapping;
+  sourceSignal?: string;
+  destSignal?: string;
+}
+
+/** Result of one operation (CONNECT `ConfigOpResult`). */
+export interface ConnectConfigOpResult {
+  index: number;
+  op: string;
+  outcome: 'created' | 'updated' | 'unchanged' | 'removed' | 'error';
+  /** signal.upsert: an address was supplied, the existing (different) one was kept. */
+  addressKept?: boolean;
+  id?: string;
+  error?: string;
+}
+
+/** A batch the gateway accepted. */
+export interface ConnectConfigOpsCommit {
+  outcome: 'committed' | 'unchanged';
+  revision: number;
+  instance: string;
+  results: ConnectConfigOpResult[];
+  warnings: string[];
+}
+
+/** Said to the user when a write meets a configuration that moved on since it was loaded. */
+export const CONNECT_CONFIG_CONFLICT_MESSAGE =
+  'The CONNECT configuration was changed elsewhere (another tab, the tray or an AI tool) since it was '
+  + 'loaded. Nothing was saved. The current configuration has been reloaded — check it and save again.';
+
+/** Said where an action needs the write core and the gateway is older. */
+export const CONNECT_OPS_REQUIRED_MESSAGE =
+  'This needs a newer realvirtual CONNECT (configuration write core, POST /config/ops) — update CONNECT and try again.';
+
+/** `409 revision-conflict`: nothing happened; the caches were reloaded before this was thrown. */
+export class ConnectConfigConflictError extends Error {
+  readonly code = 'revision-conflict';
+  constructor(message = CONNECT_CONFIG_CONFLICT_MESSAGE) {
+    super(message);
+    this.name = 'ConnectConfigConflictError';
+  }
+}
+
+/** `400 ops-rejected`: one operation or the end-state validation failed; nothing happened. */
+export class ConnectConfigOpsRejectedError extends Error {
+  readonly code = 'ops-rejected';
+  readonly errors: string[];
+  readonly results: ConnectConfigOpResult[];
+  constructor(errors: string[], results: ConnectConfigOpResult[]) {
+    super(`CONNECT rejected the change, nothing was saved: ${errors.length > 0 ? errors.join('; ') : 'validation failed'}`);
+    this.name = 'ConnectConfigOpsRejectedError';
+    this.errors = errors;
+    this.results = results;
+  }
+}
+
+/** Said when a batch's answer broke off: whether it was saved is unknown. */
+export const CONNECT_CONFIG_OUTCOME_UNKNOWN_MESSAGE =
+  'Result unknown: the answer from CONNECT broke off, so it is not known whether the change was saved. '
+  + 'The current configuration has been reloaded — check it before saving again.';
+
+/** The answer of a batch broke off (or was not CONNECT's): it may have been committed. Reloaded before thrown. */
+export class ConnectConfigOutcomeUnknownError extends Error {
+  readonly code = 'outcome-unknown';
+  constructor(message = CONNECT_CONFIG_OUTCOME_UNKNOWN_MESSAGE) {
+    super(message);
+    this.name = 'ConnectConfigOutcomeUnknownError';
+  }
+}
+
+/** A batch over CONNECT's size limits (`connect-ops-limits.ts`): nothing was sent. */
+export class ConnectConfigLimitError extends Error {
+  readonly code = 'ops-limit';
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConnectConfigLimitError';
+  }
+}
+
+/** Said when a preview was computed on a configuration that is no longer the shown one. */
+export const CONNECT_PLAN_STALE_MESSAGE =
+  'The CONNECT configuration changed since this preview was computed (or another gateway is connected). '
+  + 'Nothing was saved — compute the preview again and check it.';
+
+/** A fill / import plan whose base (revision, instance, gateway) is not the current one: nothing sent. */
+export class ConnectConfigPlanStaleError extends Error {
+  readonly code = 'plan-stale';
+  constructor(message = CONNECT_PLAN_STALE_MESSAGE) {
+    super(message);
+    this.name = 'ConnectConfigPlanStaleError';
+  }
+}
+
+/** Revision of the interfaces / bridges this tab shows (null = unknown: older gateway or a local write). */
+let _interfacesRevision: ConnectConfigRevision | null = null;
+let _bridgesRevision: ConnectConfigRevision | null = null;
+/** Does the current gateway target have `/config/ops`? null = not probed yet. */
+let _opsSupport: boolean | null = null;
+
+/** Revision of the shown interface list and bridges (for diagnosis and tests). */
+export function getConnectConfigRevisions(): { interfaces: ConnectConfigRevision | null; bridges: ConnectConfigRevision | null } {
+  return { interfaces: _interfacesRevision, bridges: _bridgesRevision };
+}
+
+/** Whether the connected CONNECT has the write core (`true`), lacks it (`false`) or was not asked yet (`null`). */
+export function getConnectOpsSupport(): boolean | null {
+  return _opsSupport;
+}
+
+/** What a batch is based on: the interface list, the bridges, or an explicit revision (rename step 2). */
+type OpsBase = 'interfaces' | 'bridges' | { explicit: ConnectConfigRevision | null };
+
+function _expectedRevision(base: OpsBase): ConnectConfigRevision | null {
+  if (base === 'interfaces') return _interfacesRevision;
+  if (base === 'bridges') return _bridgesRevision;
+  return base.explicit;
+}
+
+/** Error codes only the write core answers with — a 4xx/5xx carrying one proves the endpoint exists. */
+const OPS_KNOWN_CODES = new Set([
+  'revision-conflict', 'ops-rejected', 'invalid-request', 'payload-too-large', 'unsupported-charset', 'CONFIG_BUSY',
+]);
+
+/**
+ * Body of a `/config/ops` answer. `read-failed` = the connection broke while the body was read
+ * (after the status line — the batch may have been committed); `invalid` = a body that is not JSON.
+ */
+type OpsBody =
+  | { kind: 'json'; body: Record<string, unknown> | null }
+  | { kind: 'invalid' }
+  | { kind: 'read-failed' };
+
+async function _readOpsBody(resp: Response): Promise<OpsBody> {
+  // A test double without a body reader is not a broken connection: treat it as "no body".
+  if (typeof (resp as Partial<Response>).text !== 'function') return { kind: 'json', body: null };
+  let text: string;
+  try {
+    text = await resp.text();
+  } catch {
+    return { kind: 'read-failed' };
+  }
+  if (!text) return { kind: 'json', body: null };
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return { kind: 'json', body: parsed !== null && typeof parsed === 'object' ? parsed as Record<string, unknown> : null };
+  } catch {
+    return { kind: 'invalid' };
+  }
+}
+
+/** Does a response say "JSON" in its content type? */
+function _isJsonResponse(resp: Response): boolean {
+  const type = typeof resp.headers?.get === 'function' ? resp.headers.get('Content-Type') ?? '' : '';
+  return /json/i.test(type);
+}
+
+/**
+ * A batch whose outcome the browser cannot know (the answer broke off after CONNECT accepted the
+ * request): it may or may not have been committed. The configuration is reloaded before this throws;
+ * nothing is retried and no older route is tried.
+ */
+async function _outcomeUnknown(target: { epoch: number; baseUrl: string }): Promise<never> {
+  if (_isConfigTarget(target)) {
+    try { await _reloadAfterConflict(); } catch { /* the message below still applies */ }
+  }
+  throw new ConnectConfigOutcomeUnknownError();
+}
+
+/**
+ * Send one batch to `POST /config/ops`. Returns null when the gateway has no write core (the caller
+ * then uses its pre-ops route); throws {@link ConnectConfigConflictError} on a revision conflict (after
+ * reloading interfaces and bridges), {@link ConnectConfigOpsRejectedError} on a rejected batch,
+ * {@link ConnectConfigOutcomeUnknownError} when the answer broke off (after reloading),
+ * {@link ConnectConfigLimitError} for a batch over CONNECT's size limits (nothing sent) and a plain
+ * Error for everything else.
+ *
+ * "No write core" is decided only on a gateway whose write core was never seen (plan-2025 P7 review
+ * fix 1): a 404/405, or a 200 that is unmistakably something else (an HTML page, JSON without the ops
+ * fields, no store revision headers). Once one valid ops answer was seen for this target, no answer
+ * ever takes that back.
+ */
+async function _postConfigOps(ops: ConnectConfigOp[], base: OpsBase): Promise<ConnectConfigOpsCommit | null> {
+  if (_opsSupport === false) return null;
+  const limit = configOpsLimitError(ops);
+  if (limit) throw new ConnectConfigLimitError(limit);
+  const baseUrl = _store.getSnapshot().serverUrl;
+  const target = _configTarget();
+  const expected = _expectedRevision(base);
+  const confirmed = _opsSupport === true;
+  let resp: Response;
+  try {
+    resp = await connectRestFetch(`${baseUrl}/config/ops`, {
+      method: 'POST',
+      body: JSON.stringify({
+        ...(expected ? { expectedRevision: expected.revision, expectedInstance: expected.instance } : {}),
+        ops,
+      }),
+    });
+  } catch (err) {
+    // No answer at all (the request may not even have left): never a reason to fall back.
+    throw new Error(_friendlyError(err, baseUrl));
+  }
+  const markSupported = (): void => { if (_isConfigTarget(target)) _opsSupport = true; };
+  const legacy = (): null => { if (_isConfigTarget(target)) _opsSupport = false; return null; };
+
+  if (resp.status === 404 || resp.status === 405) {
+    if (!confirmed) return legacy();
+    throw new Error(`CONNECT answered HTTP ${resp.status} on its configuration write route — nothing was saved. Reload and try again.`);
+  }
+  const read = await _readOpsBody(resp);
+  // The ops answer carries the store revision headers; a page that is not CONNECT's does not.
+  const opsHeaders = readConfigRevision(resp) !== null;
+  if (read.kind === 'read-failed') {
+    if (opsHeaders) markSupported();
+    // 2xx: accepted, maybe committed. 5xx: CONNECT may have persisted before failing. Both unknown.
+    if (resp.ok || resp.status >= 500) return _outcomeUnknown(target);
+    throw new Error(`HTTP ${resp.status}: ${resp.statusText} — nothing was saved.`);
+  }
+  const body = read.kind === 'json' ? read.body : null;
+  const code = typeof body?.code === 'string' ? body.code : null;
+  if (resp.ok) {
+    const outcome = body?.outcome;
+    if (outcome !== 'committed' && outcome !== 'unchanged') {
+      // Unmistakably not the ops contract (an SPA fallback page, JSON of another route) on a gateway
+      // whose write core was never seen and whose answer carries no store revision: an older CONNECT.
+      const plainlyOther = read.kind === 'invalid' ? !_isJsonResponse(resp) : true;
+      if (!confirmed && !opsHeaders && plainlyOther) return legacy();
+      if (opsHeaders) markSupported();
+      return _outcomeUnknown(target);
+    }
+    markSupported();
+    const commit: ConnectConfigOpsCommit = {
+      outcome,
+      revision: Number(body!.revision),
+      instance: typeof body!.instance === 'string' ? body!.instance : '',
+      results: Array.isArray(body!.results) ? body!.results as ConnectConfigOpResult[] : [],
+      warnings: Array.isArray(body!.warnings)
+        ? (body!.warnings as unknown[]).filter((w): w is string => typeof w === 'string')
+        : [],
+    };
+    if (_isConfigTarget(target)) _advanceRevisions(expected, commit);
+    return commit;
+  }
+  if (!code || !OPS_KNOWN_CODES.has(code)) {
+    // A 5xx of a gateway known to have the write core: it may have persisted before failing.
+    if (resp.status >= 500 && (confirmed || opsHeaders)) return _outcomeUnknown(target);
+    throw new Error(typeof body?.error === 'string' && body.error ? body.error : `HTTP ${resp.status}: ${resp.statusText}`);
+  }
+  markSupported();
+  if (code === 'revision-conflict') {
+    if (_isConfigTarget(target)) await _reloadAfterConflict();
+    throw new ConnectConfigConflictError();
+  }
+  if (code === 'ops-rejected') {
+    const errors = Array.isArray(body?.errors)
+      ? (body!.errors as unknown[]).filter((e): e is string => typeof e === 'string')
+      : [];
+    const results = Array.isArray(body?.results) ? body!.results as ConnectConfigOpResult[] : [];
+    throw new ConnectConfigOpsRejectedError(errors, results);
+  }
+  if (code === 'CONFIG_BUSY') throw new Error('CONNECT is busy with another configuration change — try again in a moment.');
+  throw new Error(typeof body?.error === 'string' && body.error ? body.error : code);
+}
+
+/** Does a batch touch the bridges (mirror / mapping ops)? */
+function _opsTouchBridges(ops: readonly ConnectConfigOp[]): boolean {
+  return ops.some(o => o.op.startsWith('mirror.') || o.op.startsWith('mapping.'));
+}
+
+/** Does a batch touch the interface list (every op that is not a bridge op)? */
+function _opsTouchInterfaces(ops: readonly ConnectConfigOp[]): boolean {
+  return ops.some(o => !o.op.startsWith('mirror.') && !o.op.startsWith('mapping.'));
+}
+
+/**
+ * After an accepted batch: a part whose shown revision was exactly the one the batch was based on is
+ * now at the batch's revision — nobody else wrote in between, the gateway checked that.
+ */
+function _advanceRevisions(expected: ConnectConfigRevision | null, commit: ConnectConfigOpsCommit): void {
+  if (commit.outcome !== 'committed' || !expected || !commit.instance || !Number.isFinite(commit.revision)) return;
+  const next: ConnectConfigRevision = { revision: commit.revision, instance: commit.instance };
+  const same = (r: ConnectConfigRevision | null) =>
+    !!r && r.instance === expected.instance && r.revision === expected.revision;
+  if (same(_interfacesRevision)) _interfacesRevision = next;
+  if (same(_bridgesRevision)) _bridgesRevision = next;
+}
+
+/** A conflict: show the gateway's state again before the user is told to look at it. */
+async function _reloadAfterConflict(): Promise<void> {
+  _bridgesInFlight = null;
+  await Promise.all([fetchInterfaces(), reloadConnectBridges()]);
+}
+
+/** Re-read what an accepted batch changed, so the caches show what the gateway stored (ids, normalised values). */
+async function _refreshAfterOps(commit: ConnectConfigOpsCommit, ops: readonly ConnectConfigOp[]): Promise<void> {
+  if (commit.outcome !== 'committed') return;
+  const work: Promise<void>[] = [];
+  if (_opsTouchInterfaces(ops)) work.push(fetchInterfaces());
+  if (_opsTouchBridges(ops)) {
+    // A load that started before the batch must not be handed out as the fresh one.
+    _bridgesInFlight = null;
+    work.push(reloadConnectBridges());
+  }
+  await Promise.all(work);
+}
+
+/**
+ * Run a batch through the write core; null = the gateway has none (use the old route). An accepted
+ * batch has already been re-read into the caches when this resolves.
+ */
+async function _runConfigOps(ops: ConnectConfigOp[], base: OpsBase): Promise<ConnectConfigOpsCommit | null> {
+  const commit = await _postConfigOps(ops, base);
+  if (commit) await _refreshAfterOps(commit, ops);
+  return commit;
+}
+
+/**
+ * Public batch entry for the address sources (Fill from controller, table import): one atomic batch
+ * on the interface list the user saw. Throws {@link CONNECT_OPS_REQUIRED_MESSAGE} when the gateway
+ * has no write core — those actions exist only with it (FillEmpty and the end-state validation are
+ * gateway semantics, there is no honest pre-ops equivalent).
+ */
+export async function applyConnectConfigOps(ops: ConnectConfigOp[]): Promise<ConnectConfigOpsCommit> {
+  if (ops.length === 0) {
+    const r = _interfacesRevision;
+    return { outcome: 'unchanged', revision: r?.revision ?? -1, instance: r?.instance ?? '', results: [], warnings: [] };
+  }
+  const commit = await _runConfigOps(ops, 'interfaces');
+  if (!commit) throw new Error(CONNECT_OPS_REQUIRED_MESSAGE);
+  return commit;
+}
+
 // ── Actions ────────────────────────────────────────────────────────────
 
 /**
@@ -1552,9 +1975,7 @@ export function shouldAdoptFallbackGateway(
 /** {@link shouldAdoptFallbackGateway} against the live page origin and `localStorage`. */
 function _mayAdoptFallbackGateway(attemptedUrl: string): boolean {
   let stored: string | null = null;
-  try {
-    stored = localStorage.getItem(LS_KEY_URL);
-  } catch { /* ignore */ }
+  stored = readLocalStorage(LS_KEY_URL);
   return shouldAdoptFallbackGateway(attemptedUrl, defaultGatewayUrl(), stored);
 }
 
@@ -1618,6 +2039,7 @@ export async function connectToServer(opts?: { explicit?: boolean }): Promise<vo
       errorMessage: _friendlyError(err, _store.getSnapshot().serverUrl),
       interfaces: [],
     });
+    _markInterfacesWritten();
   }
 }
 
@@ -1740,6 +2162,7 @@ export function disconnectFromServer(): void {
   // it would resurrect an interface map for a gateway the user just left.
   _statusGeneration++;
   clearConnectBridges();
+  _resetConfigRefresh();
   _store.set({
     state: 'disconnected',
     errorMessage: '',
@@ -1767,11 +2190,70 @@ export function disconnectFromServer(): void {
   });
 }
 
+/** A string field of a signal as the panel expects it: `null` / non-string → `''`. */
+function _signalString(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+/**
+ * One signal as the HMI may rely on it (plan-2022 P0).
+ *
+ * A config file written by hand or by an older gateway can carry `null` in any string field
+ * (`"protocolAddress": null` was the customer field finding). The panel calls string methods on these
+ * fields, so a single null used to throw out of a signal row and unmount the whole HMI root.
+ * Required strings become `''`; the optional ones become `''` when sent as `null` and stay
+ * absent when absent.
+ */
+function _normalizeSignal(sig: ConnectInterfaceSignal): ConnectInterfaceSignal {
+  const out: ConnectInterfaceSignal = {
+    ...sig,
+    protocolAddress: _signalString(sig.protocolAddress),
+    name: _signalString(sig.name),
+    type: _signalString(sig.type),
+  };
+  if (sig.dataType !== undefined) out.dataType = _signalString(sig.dataType);
+  if (sig.comment !== undefined) out.comment = _signalString(sig.comment);
+  return out;
+}
+
+/** A signal list as sent: an array is normalised entry by entry, `null` becomes `[]`. */
+function _normalizeSignalList(list: unknown): ConnectInterfaceSignal[] {
+  return Array.isArray(list)
+    ? list.filter(s => s !== null && typeof s === 'object').map(s => _normalizeSignal(s as ConnectInterfaceSignal))
+    : [];
+}
+
+/**
+ * An interface from `/config/interfaces` with every signal list and signal string made safe
+ * (plan-2022 P0). Fields that were absent stay absent; only `null` and non-string values change.
+ */
+export function normalizeConnectInterface(iface: ConnectInterface): ConnectInterface {
+  const out: ConnectInterface = { ...iface };
+  if (iface.signals !== undefined) out.signals = _normalizeSignalList(iface.signals);
+  if (Array.isArray(iface.topics)) {
+    out.topics = iface.topics
+      .filter(t => t !== null && typeof t === 'object')
+      .map(t => (t.signals === undefined ? t : { ...t, signals: _normalizeSignalList(t.signals) }));
+  } else if (iface.topics === null) {
+    delete out.topics;
+  }
+  return out;
+}
+
 /** Fetch the list of configured interfaces from the CONNECT REST API. */
 export async function fetchInterfaces(): Promise<void> {
+  // Shared writer sequence (plan-2024): an answer that started before a newer write lands as a no-op,
+  // and one for a previous gateway target writes nothing. Errors are still logged and swallowed.
+  const seq = ++_configSeq;
+  const target = _configTarget();
   try {
-    const ifaces = await _fetchJson<ConnectInterface[]>('/config/interfaces');
-    _store.set({ interfaces: ifaces });
+    const baseUrl = _store.getSnapshot().serverUrl;
+    const resp = await connectRestFetch(`${baseUrl}/config/interfaces`);
+    if (!resp.ok) throw new Error(await _errorMessage(resp));
+    const raw = await _readGatewayJson<ConnectInterface[]>(resp, baseUrl);
+    const ifaces = Array.isArray(raw) ? raw.map(normalizeConnectInterface) : [];
+    // plan-2025 F1: the revision of exactly this list — the base of the next write from this tab.
+    if (_isConfigTarget(target)) _commitInterfaces(seq, ifaces, readConfigRevision(resp));
   } catch (err) {
     console.error('[connect-store] Failed to fetch interfaces:', err);
   }
@@ -2014,6 +2496,12 @@ export interface ConnectSignalRenameResult {
   storeRenamed: boolean;
   /** Preview: the old name is live in the gateway. Commit: the new name is. */
   liveInGateway: boolean;
+  /**
+   * plan-2025 F10 (SOL R2-3): the STORE revision / instance of the commit — the base of the dialog's
+   * second step. Absent on an older gateway.
+   */
+  storeRevision?: number;
+  instance?: string;
 }
 
 /**
@@ -2241,11 +2729,12 @@ export async function addInterface(
   iface: Omit<ConnectInterface, 'id' | 'signals'> & { id?: string },
 ): Promise<ConnectInterface> {
   try {
-    const created = await _fetchJson<ConnectInterface>('/config/interfaces', {
+    const created = normalizeConnectInterface(await _fetchJson<ConnectInterface>('/config/interfaces', {
       method: 'POST',
       body: JSON.stringify(iface),
-    });
+    }));
     _store.set(prev => ({ ...prev, interfaces: [...prev.interfaces, created] }));
+    _markInterfacesWritten();
     return created;
   } catch (err) {
     console.error('[connect-store] Failed to add interface:', err);
@@ -2723,6 +3212,13 @@ export const CONNECT_INTERFACE_TYPES: ConnectInterfaceTypeDef[] = [
     defaults: { udp: { ...UDP_SETTINGS_DEFAULTS } },
   },
   {
+    type: 'Udp',
+    preset: 'SEW-UDP',
+    label: 'SEW MOVI-C (UDP)',
+    description: 'Fixed binary UDP telegrams of a SEW MOVI-C station (Unity SEW UDP layout); SEW symbol table import',
+    defaults: { udp: { ...UDP_SETTINGS_DEFAULTS }, updateCycleMs: 20 },
+  },
+  {
     type: 'WebSocketRealtime',
     label: 'WebSocket Realtime (realvirtual v2)',
     description: 'Signal exchange with Unity, another CONNECT or the ctrlX bridge over the realvirtual WebSocket protocol v2 — server or client',
@@ -2871,6 +3367,11 @@ export function nextInterfaceId(type: ConnectInterfaceType, preset?: string): st
 export async function updateInterface(id: string, patch: Partial<ConnectInterface>): Promise<void> {
   try {
     const existing = _store.getSnapshot().interfaces.find(i => i.id === id);
+    // plan-2025 F10 (matrix B1/B8): through the write core, only the fields that really change travel
+    // — a stale snapshot can no longer revert another writer's `allowWebToPlc` or signal edit, and
+    // the revision turns a snapshot that moved on into a visible conflict.
+    if (await _runConfigOps([{ op: 'interface.patch', interfaceId: id, patch: interfacePatchOf(existing, patch) }], 'interfaces')) return;
+    // Older CONNECT: the whole interface, merged from the snapshot (the pre-ops route).
     const body: Partial<ConnectInterface> = existing ? { ...existing, ...patch, id } : { ...patch, id };
     await _fetchJson<unknown>(`/config/interfaces/${id}`, {
       method: 'PUT',
@@ -2882,6 +3383,24 @@ export async function updateInterface(id: string, patch: Partial<ConnectInterfac
     console.error('[connect-store] Failed to update interface:', err);
     throw err;
   }
+}
+
+/**
+ * The `interface.patch` body for `patch` on `existing`: only the fields whose value differs from the
+ * snapshot (JSON comparison), never `id`, never an `undefined`. An interface the snapshot does not
+ * know gets the whole patch. An empty result is a valid patch — the gateway answers `unchanged`.
+ */
+export function interfacePatchOf(
+  existing: ConnectInterface | undefined,
+  patch: Partial<ConnectInterface>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(patch)) {
+    if (key === 'id' || value === undefined) continue;
+    if (existing && JSON.stringify(existing[key]) === JSON.stringify(value)) continue;
+    out[key] = value;
+  }
+  return out;
 }
 
 /** Remove an interface via REST API. */
@@ -2913,37 +3432,74 @@ export function setActiveInterface(id: string | null): void {
   });
 }
 
-/** Start signal discovery for the active interface. */
-export async function startDiscovery(interfaceId: string): Promise<void> {
+/**
+ * Run a discovery bound to the gateway it was started on (plan-2025 P7 recheck). Gateway address and
+ * connection epoch are held BEFORE the request; an answer that arrives after the tab moved to another
+ * gateway (or reconnected) is discarded - it never reaches the store. Returns `stale: true` then.
+ */
+async function _discoverBound(interfaceId: string): Promise<{ stale: boolean }> {
+  const target = _configTarget();
   _store.set({ discoveryLoading: true, discoveredSignals: [] });
 
   try {
     // POST runs discovery (subscribe to '#' for a window) and returns the signals directly.
-    // The gateway's DiscoveredSignal uses name/browsePath (no protocolAddress) — map it here.
-    const resp = await _fetchJson<{
-      signals?: Array<{ name?: string; displayName?: string; dataType?: string; direction?: string; browsePath?: string; currentValue?: unknown }>;
-    }>(`/discover/${interfaceId}/start`, { method: 'POST' });
-
-    const discovered: DiscoveredSignal[] = (resp.signals ?? []).map(s => {
-      const addr = s.browsePath || s.name || '';
-      const dir: DiscoveredSignal['direction'] =
-        s.direction === 'input' || s.direction === 'output' ? s.direction : 'unknown';
-      return {
-        protocolAddress: addr,
-        displayName: s.displayName || s.name || addr,
-        dataType: s.dataType || '',
-        direction: dir,
-        browsePath: s.browsePath || addr,
-        currentValue: s.currentValue,
-        selected: false,
-      };
-    });
-
+    const resp = await _fetchJson<{ signals?: WireDiscoveredSignal[] }>(`/discover/${interfaceId}/start`, { method: 'POST' });
+    if (!_isConfigTarget(target)) return { stale: true };
+    const discovered = (resp.signals ?? []).map(mapDiscoveredSignal);
     _store.set({ discoveredSignals: discovered, discoveryLoading: false });
   } catch (err) {
+    if (!_isConfigTarget(target)) return { stale: true };
     console.error('[connect-store] Discovery failed:', err);
     _store.set({ discoveryLoading: false });
   }
+  return { stale: false };
+}
+
+/** Start signal discovery for the active interface (an answer of a gateway no longer connected is dropped). */
+export async function startDiscovery(interfaceId: string): Promise<void> {
+  await _discoverBound(interfaceId);
+}
+
+/** One discovered signal as the gateway serialises it (`Core/WsMessage.cs` `DiscoveredSignal`). */
+export interface WireDiscoveredSignal {
+  /** Legacy (pre plan-2025 P3): OPC UA NodeId, TwinCAT instance path, S7 symbol, … */
+  name?: string;
+  displayName?: string;
+  dataType?: string;
+  direction?: string;
+  /** Legacy: display path (OPC UA) or address (S7). Never an OPC UA address. */
+  browsePath?: string;
+  currentValue?: unknown;
+  /** plan-2025 F8: exact matching key against a model signal name. */
+  symbolKey?: string | null;
+  /** plan-2025 F8: the value that goes verbatim into `ProtocolAddress`. */
+  protocolAddress?: string | null;
+}
+
+/**
+ * The browser's view of one discovered signal (plan-2025 F8).
+ *
+ * A current gateway sends `symbolKey` and `protocolAddress`; those win. The legacy fields are only
+ * the fallback for an older CONNECT, where `browsePath || name` was the address the browser wrote —
+ * wrong for OPC UA (a display path), which is exactly why the contract exists.
+ */
+export function mapDiscoveredSignal(s: WireDiscoveredSignal): DiscoveredSignal {
+  const current = typeof s.protocolAddress === 'string';
+  const legacyAddress = s.browsePath || s.name || '';
+  const addr = current ? s.protocolAddress as string : legacyAddress;
+  const dir: DiscoveredSignal['direction'] =
+    s.direction === 'input' || s.direction === 'output' ? s.direction : 'unknown';
+  return {
+    protocolAddress: addr,
+    symbolKey: typeof s.symbolKey === 'string' ? s.symbolKey : '',
+    contract: current && typeof s.symbolKey === 'string' ? 'current' : 'legacy',
+    displayName: s.displayName || s.name || addr,
+    dataType: s.dataType || '',
+    direction: dir,
+    browsePath: s.browsePath || legacyAddress,
+    currentValue: s.currentValue,
+    selected: false,
+  };
 }
 
 /** Toggle selection of a discovered signal. */
@@ -3081,7 +3637,39 @@ export async function addSignal(
   topic?: string,
 ): Promise<void> {
   const iface = _ifaceOrThrow(interfaceId);
+  if (topic !== undefined && !(iface.topics ?? []).some(t => t.topic === topic)) {
+    throw new Error(`Interface '${interfaceId}' has no topic '${topic}'`);
+  }
+  // plan-2025 F10: an upsert would silently UPDATE a same-named entry — "add" keeps its meaning.
+  if (findSignalInContainer(iface, signal.name, topic)) {
+    throw new Error(`Signal '${signal.name}' already exists on '${interfaceId}'${topic !== undefined ? ` (topic '${topic}')` : ''}`);
+  }
+  if (await _runConfigOps([signalUpsertOp(interfaceId, signal, topic)], 'interfaces')) return;
   await updateInterface(interfaceId, _signalContainerPatch(iface, topic, s => [...s, signal]));
+}
+
+/**
+ * The `signal.upsert` that makes the stored entry EQUAL to `signal` (plan-2025 F10, patch semantics
+ * §3): every editable field is sent explicitly — the address with `overwrite`, an absent data type /
+ * comment as `""` (clear) — and the OPC UA acquisition fields only when the signal carries them, so
+ * an editor that does not know them can never reset them to the gateway default.
+ */
+export function signalUpsertOp(interfaceId: string, signal: ConnectInterfaceSignal, topic?: string): ConnectConfigOp {
+  return {
+    op: 'signal.upsert',
+    interfaceId,
+    ...(topic !== undefined ? { topic } : {}),
+    name: signal.name,
+    type: signal.type,
+    protocolAddress: signal.protocolAddress ?? '',
+    addressMode: 'overwrite',
+    dataType: signal.dataType ?? '',
+    comment: signal.comment ?? '',
+    record: !!signal.record,
+    ...(typeof signal.subscribeValue === 'boolean' ? { subscribeValue: signal.subscribeValue } : {}),
+    ...(typeof signal.pollValue === 'boolean' ? { pollValue: signal.pollValue } : {}),
+    ...(typeof signal.pollCycleMs === 'number' ? { pollCycleMs: signal.pollCycleMs } : {}),
+  };
 }
 
 /**
@@ -3096,15 +3684,83 @@ export async function updateSignal(
   topic?: string,
 ): Promise<void> {
   const iface = _ifaceOrThrow(interfaceId);
-  await updateInterface(interfaceId, _signalContainerPatch(iface, topic,
+  if (originalName !== signal.name) {
+    // plan-2025 F10 / SOL #4: a rename goes through /config/signals/rename (mappings + live value move
+    // along), never as a replaced entry. The resumable two-step lives in saveSignalFromDialog.
+    const outcome = await saveSignalFromDialog({ interfaceId, topic, originalName, signal });
+    if (outcome.kind !== 'saved') throw new Error(outcome.message);
+    return;
+  }
+  if (await _runConfigOps([signalUpsertOp(interfaceId, signal, topic)], 'interfaces')) return;
+  await _updateSignalLegacy(iface, originalName, signal, topic);
+}
+
+/** Pre-ops route of a signal edit: the container array, edited on the snapshot, PUT as a whole. */
+async function _updateSignalLegacy(
+  iface: ConnectInterface,
+  originalName: string,
+  signal: ConnectInterfaceSignal,
+  topic?: string,
+): Promise<void> {
+  await updateInterface(iface.id, _signalContainerPatch(iface, topic,
     s => s.map(entry => (entry.name === originalName ? signal : entry))));
 }
 
 /** Remove a signal from an interface — from `topic`'s own list when given, else from the flat one. */
 export async function removeSignal(interfaceId: string, name: string, topic?: string): Promise<void> {
+  await removeSignals(interfaceId, [{ name, ...(topic !== undefined ? { topic } : {}) }]);
+}
+
+/**
+ * Remove several signals of one interface in ONE write (bulk delete): one `signal.remove` per entry
+ * in one atomic batch; an older CONNECT gets the edited container arrays in one PUT as before.
+ */
+export async function removeSignals(
+  interfaceId: string,
+  entries: ReadonlyArray<{ name: string; topic?: string }>,
+): Promise<void> {
+  if (entries.length === 0) return;
   const iface = _ifaceOrThrow(interfaceId);
+  const ops: ConnectConfigOp[] = entries.map(e => ({
+    op: 'signal.remove', interfaceId, name: e.name, ...(e.topic !== undefined ? { topic: e.topic } : {}),
+  }));
+  if (await _runConfigOps(ops, 'interfaces')) return;
+  const flat = new Set(entries.filter(e => e.topic === undefined).map(e => e.name));
+  const byTopic = new Map<string, Set<string>>();
+  for (const e of entries) {
+    if (e.topic === undefined) continue;
+    if (!(iface.topics ?? []).some(t => t.topic === e.topic)) {
+      throw new Error(`Interface '${iface.id}' has no topic '${e.topic}'`);
+    }
+    const set = byTopic.get(e.topic) ?? new Set<string>();
+    set.add(e.name);
+    byTopic.set(e.topic, set);
+  }
+  const patch: Partial<ConnectInterface> = {};
+  if (flat.size > 0) patch.signals = (iface.signals ?? []).filter(s => !flat.has(s.name));
+  if (byTopic.size > 0) {
+    patch.topics = (iface.topics ?? []).map((t) => {
+      const drop = byTopic.get(t.topic);
+      return drop ? { ...t, signals: (t.signals ?? []).filter(s => !drop.has(s.name)) } : t;
+    });
+  }
+  await updateInterface(interfaceId, patch);
+}
+
+/** Switch historian recording of one signal (`signal.upsert{record}`; the pre-ops route PUTs the container). */
+export async function setSignalRecord(
+  interfaceId: string,
+  name: string,
+  record: boolean,
+  topic?: string,
+): Promise<void> {
+  const iface = _ifaceOrThrow(interfaceId);
+  const op: ConnectConfigOp = {
+    op: 'signal.upsert', interfaceId, name, record, ...(topic !== undefined ? { topic } : {}),
+  };
+  if (await _runConfigOps([op], 'interfaces')) return;
   await updateInterface(interfaceId, _signalContainerPatch(iface, topic,
-    s => s.filter(entry => entry.name !== name)));
+    s => s.map(entry => (entry.name === name ? { ...entry, record } : entry))));
 }
 
 /** The signal named `name` in the container `topic` of `iface`, or null. */
@@ -3165,6 +3821,27 @@ export async function applySignalBinding(request: SignalBindingRequest): Promise
   }
 
   const address = request.protocolAddress?.trim() ?? '';
+  if (!existing && !request.type) {
+    throw new Error(`Signal '${name}' does not exist on '${interfaceId}' — a wire type is required to create it`);
+  }
+  // plan-2025 F10 (matrix B2): a PATCH of exactly the fields the caller knows — `record`, `comment`
+  // and the OPC UA acquisition fields stay as the gateway has them, whatever this tab's snapshot says.
+  const commit = await _runConfigOps([{
+    op: 'signal.upsert',
+    interfaceId,
+    ...(topic !== undefined ? { topic } : {}),
+    name,
+    protocolAddress: address,
+    addressMode: 'overwrite',
+    ...(request.type ? { type: request.type } : {}),
+    ...(request.dataType !== undefined ? { dataType: request.dataType } : {}),
+    ...(!existing ? { record: false } : {}),
+  }], 'interfaces');
+  if (commit) {
+    const outcome = commit.results[0]?.outcome;
+    return outcome === 'created' ? 'added' : outcome === 'updated' || outcome === 'unchanged' ? 'updated' : existing ? 'updated' : 'added';
+  }
+
   if (existing) {
     const next: ConnectInterfaceSignal = {
       ...existing,
@@ -3208,6 +3885,355 @@ export async function validateSignalAddress(
   } catch {
     return null; // endpoint missing (404 on older gateways) or network hiccup — never block the dialog
   }
+}
+
+// ── Signal dialog save with rename (plan-2025 F10, SOL #4) ───────────────
+//
+// A dialog save that also renames is TWO gateway commits, made explicit and resumable:
+//   (1) the rename through `/config/signals/rename` (preview revision + operation id, unchanged
+//       contract — mappings and the live value move along), then
+//   (2) a `signal.upsert` of the other fields under the NEW name, based on the store revision the
+//       rename answer carries.
+// When (2) fails the rename stays done and the dialog says so ("Renamed to X — other changes not
+// saved") with the draft kept and a Retry, which repeats only (2) — idempotent, an upsert of the same
+// fields is `unchanged`. A rename whose answer got lost is resumed by its operation id.
+
+/** Where a rename-with-save stands; handed back to the dialog and passed in again on Retry. */
+export interface SignalRenameProgress {
+  operationId: string;
+  from: string;
+  to: string;
+  /**
+   * The `renameRevision` the apply was sent with. A repeated apply with the same operation id and this
+   * revision returns CONNECT's remembered outcome of the first one — the way to get a lost answer's
+   * `storeRevision` back (`SignalRenameOperations` caches it per id). Null before the apply was sent.
+   */
+  renameRevision: string | null;
+  /** The rename is committed on the gateway (step 1 done). */
+  committed: boolean;
+  /**
+   * Store revision of the rename commit — the base of step 2. Null after a failed step 2 (the Retry
+   * is the user's, on the reloaded configuration they now see).
+   */
+  storeRevision: ConnectConfigRevision | null;
+}
+
+export interface SignalDialogSaveRequest {
+  interfaceId: string;
+  /** MQTT topic container; absent = the interface-level list. */
+  topic?: string;
+  /** Name before the edit; null = the dialog ADDS a signal. */
+  originalName: string | null;
+  /** The signal as the dialog wants it stored (name = the new name). */
+  signal: ConnectInterfaceSignal;
+  /** Retry of an earlier save that stopped between the two steps. */
+  resume?: SignalRenameProgress | null;
+}
+
+export type SignalDialogSaveOutcome =
+  | { kind: 'saved' }
+  /** Step 1 done, step 2 failed: the draft stays, Retry resumes with `progress`. */
+  | { kind: 'renamed-not-saved'; progress: SignalRenameProgress; message: string }
+  /** Step 1's answer was lost and the gateway cannot say yet: Retry asks again by operation id. */
+  | { kind: 'rename-unconfirmed'; progress: SignalRenameProgress; message: string }
+  /**
+   * Step 1's outcome cannot be recovered (CONNECT no longer has the result of the operation id): step 2
+   * was NOT run. The configuration was reloaded; the user checks it and saves again.
+   */
+  | { kind: 'rename-unverified'; progress: null; message: string };
+
+function _newOperationId(): string {
+  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  if (c?.randomUUID) return c.randomUUID();
+  return `op-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** The rename answer's store revision, when the gateway sends one (SOL R2-3). */
+function _renameStoreRevision(result: ConnectSignalRenameResult): ConnectConfigRevision | null {
+  return typeof result.storeRevision === 'number' && typeof result.instance === 'string' && result.instance
+    ? { revision: result.storeRevision, instance: result.instance }
+    : null;
+}
+
+type RenameStep =
+  | { kind: 'committed'; progress: SignalRenameProgress }
+  | { kind: 'unsupported' }
+  | { kind: 'unconfirmed'; progress: SignalRenameProgress }
+  | { kind: 'unverified' };
+
+/**
+ * A lost / unconfirmed apply: get its RESULT back by operation id (plan-2025 P7 review fix 2). CONNECT
+ * answers a repeated apply with the same id with the remembered first outcome — including the commit's
+ * `storeRevision` / `instance`, which is what step 2 must be based on. The current revision of a GET
+ * is never a substitute: a write by someone else after the rename would be silently overwritten.
+ */
+async function _recoverRename(progress: SignalRenameProgress): Promise<RenameStep | { kind: 'rerun' }> {
+  const status = await fetchSignalRenameStatus(progress.operationId);
+  if (status === null) return { kind: 'unconfirmed', progress };
+  if (status === 'rejected') return { kind: 'rerun' };
+  if (!progress.renameRevision) return { kind: 'unverified' };
+  // committed / pending / failed-after-persist / unknown: ask for the result under the same id.
+  // `unknown` = CONNECT forgot the id (or never saw it): a replay with the old revision either runs
+  // for the first time (configuration unchanged — a legitimate first apply) or is refused.
+  const replay = await renameSignal(progress.from, progress.to, progress.renameRevision, false, progress.operationId);
+  if (replay.kind === 'ok' && replay.result?.status === 'committed') {
+    const storeRevision = _renameStoreRevision(replay.result);
+    if (!storeRevision && _opsSupport !== false) return { kind: 'unverified' };
+    return { kind: 'committed', progress: { ...progress, committed: true, storeRevision } };
+  }
+  if (replay.kind === 'error') return { kind: 'unconfirmed', progress };
+  // failed-after-persist (renamed, no revision of the commit), revision-mismatch (the id's result is
+  // gone and the configuration moved on), anything else: the outcome cannot be tied to a revision.
+  return { kind: 'unverified' };
+}
+
+/** Step 1: rename (or confirm a rename) by operation id. Throws on a definite refusal. */
+async function _renameStep(
+  from: string,
+  to: string,
+  resume: SignalRenameProgress | null | undefined,
+): Promise<RenameStep> {
+  if (resume && !resume.committed) {
+    // The answer of an earlier apply got lost: get its result back.
+    const recovered = await _recoverRename(resume);
+    if (recovered.kind !== 'rerun') return recovered;
+    // Rejected: the rename did not happen. Run it again under a NEW id (CONNECT remembers the refusal).
+  }
+  const operationId = _newOperationId();
+
+  const preview = await renameSignal(from, to, null, true);
+  if (preview.kind === 'unsupported') return { kind: 'unsupported' };
+  if (preview.kind !== 'ok') throw new Error(_renameRefusal(preview, to));
+  // A 200 that is not the rename contract (a proxy page, an SPA fallback) is not a rename route.
+  if (preview.result?.status !== 'preview' || typeof preview.result.renameRevision !== 'string') return { kind: 'unsupported' };
+  const pending: SignalRenameProgress = {
+    operationId, from, to, renameRevision: preview.result.renameRevision, committed: false, storeRevision: null,
+  };
+  const applied = await renameSignal(from, to, pending.renameRevision, false, operationId);
+  if (applied.kind === 'ok' && applied.result?.status !== 'committed') {
+    throw new Error('Rename failed: CONNECT gave no commit answer.');
+  }
+  if (applied.kind === 'ok') {
+    const storeRevision = _renameStoreRevision(applied.result);
+    // A write core without the commit's revision cannot be given a safe base for step 2.
+    if (!storeRevision && _opsSupport !== false) {
+      await fetchInterfaces();
+      return { kind: 'committed', progress: { ...pending, committed: true, storeRevision: null } };
+    }
+    return { kind: 'committed', progress: { ...pending, committed: true, storeRevision } };
+  }
+  if (applied.kind === 'failed-after-persist') {
+    // Persisted; only the live hand-over in the gateway did not finish. Renamed, but without the
+    // commit's revision: step 2 is left to the user (Retry on the reloaded configuration).
+    await fetchInterfaces();
+    return { kind: 'committed', progress: { ...pending, committed: true, storeRevision: null } };
+  }
+  if (applied.kind === 'error') {
+    // The answer got lost: get the result back by operation id, never by reading the current state.
+    const recovered = await _recoverRename(pending);
+    if (recovered.kind === 'rerun') throw new Error(`Rename failed: ${applied.message}`);
+    return recovered;
+  }
+  throw new Error(_renameRefusal(applied, to));
+}
+
+function _renameRefusal(outcome: ConnectSignalRenameOutcome, to: string): string {
+  switch (outcome.kind) {
+    case 'name-collision': return `Cannot rename: a signal named '${to}' already exists${outcome.detail ? ` (${outcome.detail})` : ''}.`;
+    case 'validation': return `Cannot rename: ${outcome.detail}`;
+    case 'revision-mismatch': return 'Cannot rename: the configuration changed meanwhile — try again.';
+    case 'error': return `Rename failed: ${outcome.message}`;
+    default: return 'Rename failed.';
+  }
+}
+
+/**
+ * Save the signal dialog (plan-2025 F10): add, edit, or rename-and-edit. Throws on an outright
+ * failure (nothing saved); returns `renamed-not-saved` / `rename-unconfirmed` for the two resumable
+ * in-between states and `rename-unverified` when the rename's result cannot be recovered.
+ */
+export async function saveSignalFromDialog(request: SignalDialogSaveRequest): Promise<SignalDialogSaveOutcome> {
+  const { interfaceId, topic, originalName, signal, resume } = request;
+  if (originalName === null) {
+    await addSignal(interfaceId, signal, topic);
+    return { kind: 'saved' };
+  }
+  if (originalName === signal.name && !resume) {
+    await updateSignal(interfaceId, originalName, signal, topic);
+    return { kind: 'saved' };
+  }
+
+  const from = resume?.from ?? originalName;
+  const to = signal.name;
+  let progress: SignalRenameProgress;
+  // A Retry after a failed step 2 (committed, no store revision): the user's own decision on the
+  // configuration they now see — the one case where the shown revision is the base.
+  let userRetry = false;
+  if (resume?.committed && resume.to === to) {
+    progress = resume;
+    userRetry = true;
+  } else {
+    const step = await _renameStep(from, to, resume?.to === to ? resume : null);
+    if (step.kind === 'unsupported') {
+      // A CONNECT without the rename route: the pre-rename behaviour (the entry is replaced).
+      await _updateSignalLegacy(_ifaceOrThrow(interfaceId), from, signal, topic);
+      return { kind: 'saved' };
+    }
+    if (step.kind === 'unconfirmed') {
+      return {
+        kind: 'rename-unconfirmed', progress: step.progress,
+        message: `CONNECT has not confirmed the rename to '${to}' yet. Your input is kept — press Retry.`,
+      };
+    }
+    if (step.kind === 'unverified') {
+      try { await fetchInterfaces(); } catch { /* the message still applies */ }
+      return {
+        kind: 'rename-unverified', progress: null,
+        message: `CONNECT can no longer tell what became of the rename to '${to}', so your other changes were NOT saved. `
+          + 'The configuration has been reloaded — check whether the signal is renamed, then save again.',
+      };
+    }
+    progress = step.progress;
+  }
+
+  if (!userRetry && !progress.storeRevision && _opsSupport !== false) {
+    // Renamed, but CONNECT did not say on which revision: no automatic step 2 (it could overwrite a
+    // write that came after the rename). The draft stays; Retry is on the reloaded configuration.
+    return {
+      kind: 'renamed-not-saved', progress,
+      message: `Renamed to '${to}' — other changes not saved: CONNECT did not report the revision of the rename. `
+        + 'The configuration has been reloaded — check it and press Retry.',
+    };
+  }
+
+  // Step 2: the other fields, under the new name.
+  try {
+    const op = signalUpsertOp(interfaceId, signal, topic);
+    const commit = await _runConfigOps([op], progress.storeRevision ? { explicit: progress.storeRevision } : 'interfaces');
+    if (!commit) await _updateSignalLegacy(_ifaceOrThrow(interfaceId), to, signal, topic);
+    return { kind: 'saved' };
+  } catch (err) {
+    // The conflict path reloaded the interfaces; a Retry is based on what is shown now.
+    const next: SignalRenameProgress = { ...progress, storeRevision: null };
+    return {
+      kind: 'renamed-not-saved', progress: next,
+      message: `Renamed to '${to}' — other changes not saved: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
+// ── Address sources (plan-2025 F11 / F12) ────────────────────────────────
+
+/**
+ * What a fill / import preview was computed on (plan-2025 P7 review fix 3): the interface-list
+ * revision and instance, and the gateway (address + connection epoch). Apply sends exactly this
+ * revision; a plan whose base is no longer the shown one is refused before anything is sent.
+ */
+export interface ConnectConfigPlanBase {
+  revision: ConnectConfigRevision | null;
+  baseUrl: string;
+  epoch: number;
+}
+
+/** The base a preview computed now would have. */
+export function getConnectConfigPlanBase(): ConnectConfigPlanBase {
+  const target = _configTarget();
+  return { revision: _interfacesRevision, baseUrl: target.baseUrl, epoch: target.epoch };
+}
+
+/** Is a preview's base still the shown configuration of the connected gateway? */
+export function isConnectConfigPlanCurrent(base: ConnectConfigPlanBase | null | undefined): boolean {
+  if (!base || !base.revision) return false;
+  const now = getConnectConfigPlanBase();
+  return now.baseUrl === base.baseUrl && now.epoch === base.epoch && !!now.revision
+    && now.revision.revision === base.revision.revision && now.revision.instance === base.revision.instance;
+}
+
+/**
+ * Send a preview's batch on the preview's own base. Throws {@link ConnectConfigPlanStaleError} (nothing
+ * sent) when the base is not current, {@link ConnectConfigLimitError} over CONNECT's limits, and
+ * {@link CONNECT_OPS_REQUIRED_MESSAGE} on a gateway without the write core.
+ */
+async function _applyPlanOps(base: ConnectConfigPlanBase | undefined, ops: ConnectConfigOp[]): Promise<ConnectConfigOpsCommit> {
+  if (!isConnectConfigPlanCurrent(base)) throw new ConnectConfigPlanStaleError();
+  if (ops.length === 0) {
+    return { outcome: 'unchanged', revision: base!.revision!.revision, instance: base!.revision!.instance, results: [], warnings: [] };
+  }
+  const commit = await _runConfigOps(ops, { explicit: base!.revision });
+  if (!commit) throw new Error(CONNECT_OPS_REQUIRED_MESSAGE);
+  return commit;
+}
+
+/** Run a controller browse for "Fill addresses from controller" and plan the fill (writes nothing). */
+export async function planFillAddressesFromController(
+  interfaceId: string,
+  model: readonly ModelPlcSignal[],
+): Promise<FillAddressPlan> {
+  const iface = _ifaceOrThrow(interfaceId);
+  // Gateway and epoch are held before the browse: the plan is never built on another gateway's answer.
+  const before = _configTarget();
+  const run = await _discoverBound(interfaceId);
+  if (run.stale || !_isConfigTarget(before)) throw new ConnectConfigPlanStaleError();
+  const discovered = _store.getSnapshot().discoveredSignals;
+  if (discovered.length > 0 && discovered.every(d => d.contract !== 'current')) {
+    throw new Error('This CONNECT does not report symbol keys for browsed signals — update CONNECT to fill addresses from the controller.');
+  }
+  // The interface list and its revision are read together: the plan is based on exactly this state.
+  const base = getConnectConfigPlanBase();
+  const snap = _store.getSnapshot();
+  const plan = planFillAddresses({
+    iface: snap.interfaces.find(i => i.id === interfaceId) ?? iface,
+    model,
+    discovered,
+    otherInterfaces: snap.interfaces.filter(i => i.id !== interfaceId),
+    schema: getSignalSchema(iface.type),
+  });
+  return { ...plan, base, limitError: configOpsLimitError(fillAddressOps(plan)) };
+}
+
+/** Write a fill plan: ONE batch of `signal.upsert{fillEmpty}`, on the revision the plan was computed on. */
+export async function applyFillAddresses(plan: FillAddressPlan): Promise<ConnectConfigOpsCommit> {
+  return _applyPlanOps(plan.base, fillAddressOps(plan));
+}
+
+/** Validation concurrency of the table import's per-row address check. */
+const ADDRESS_VALIDATE_CONCURRENCY = 6;
+
+/**
+ * Plan an address table import (writes nothing): parse result + interface + options → per-row
+ * verdicts, with the gateway's own address parser run on every row it can check. A table that
+ * absurdly large (see `CONNECT_IMPORT_MAX_RAW_ROWS`) is refused BEFORE the per-row check ({@link ConnectConfigLimitError}); CONNECT's batch limits apply to the batch built from the writing rows (`limitError`).
+ */
+export async function planAddressTableImportFor(
+  interfaceId: string,
+  table: ParsedAddressTable,
+  options: AddressImportOptions,
+  model: readonly ModelPlcSignal[] = [],
+): Promise<AddressImportPlan> {
+  // Input protection only: raw rows are NOT a batch measure (unchanged / kept / rejected rows write
+  // nothing). The real CONNECT limits are checked on the batch that is actually built, before sending.
+  const rowLimit = rawRowLimitError(table.rows.length);
+  if (rowLimit) throw new ConnectConfigLimitError(rowLimit);
+  // The interface list and its revision are read together, before the (async) per-row check.
+  const base = getConnectConfigPlanBase();
+  const snap = _store.getSnapshot();
+  const iface = _ifaceOrThrow(interfaceId);
+  const otherInterfaces = snap.interfaces.filter(i => i.id !== interfaceId);
+  const schema = getSignalSchema(iface.type);
+  const pending = rowsToValidate(table, iface, schema, options);
+  const validation = new Map<number, SignalValidationResult | null>();
+  for (let i = 0; i < pending.length; i += ADDRESS_VALIDATE_CONCURRENCY) {
+    const chunk = pending.slice(i, i + ADDRESS_VALIDATE_CONCURRENCY);
+    const results = await Promise.all(chunk.map(r => validateSignalAddress(iface.type, r.address, r.dataType)));
+    chunk.forEach((r, k) => validation.set(r.line, results[k]));
+  }
+  const plan = planAddressTableImport({ table, iface, schema, options, model, validation, otherInterfaces });
+  return { ...plan, base, limitError: configOpsLimitError(addressImportOps(plan)) };
+}
+
+/** Write an import plan: ONE batch of `signal.upsert`, on the revision the plan was computed on. */
+export async function applyAddressTableImport(plan: AddressImportPlan): Promise<ConnectConfigOpsCommit> {
+  return _applyPlanOps(plan.base, addressImportOps(plan));
 }
 
 // ── Tag Table Import ─────────────────────────────────────────────────────
@@ -3261,6 +4287,11 @@ export async function importTagTable(params: ImportTagTableParams): Promise<void
     : undefined;
 
   if (existing) {
+    // plan-2025 F10 (matrix B6): one atomic batch — the broker setting and the topic as a whole.
+    const ops: ConnectConfigOp[] = [];
+    if (existing['brokerUrl'] !== brokerUrl) ops.push({ op: 'interface.patch', interfaceId: existing.id, patch: { brokerUrl } });
+    ops.push({ op: 'container.replace', interfaceId: existing.id, topicConfig: newTopic });
+    if (await _runConfigOps(ops, 'interfaces')) return;
     // Replace the same-named topic in place; keep all other topics untouched.
     const prevTopics = existing.topics ?? [];
     const topics = prevTopics.some(t => t.topic === topic)
@@ -3291,6 +4322,8 @@ export async function importTagTable(params: ImportTagTableParams): Promise<void
  */
 export async function importS7TagTable(interfaceId: string, tags: S7Tag[]): Promise<void> {
   const signals = _tagsToSignals(tags);
+  // plan-2025 F10 (matrix B6): replacing semantics stay, as the one container op of the write core.
+  if (await _runConfigOps([{ op: 'container.replace', interfaceId, signals }], 'interfaces')) return;
   await updateInterface(interfaceId, { signals });
 }
 
@@ -3309,15 +4342,27 @@ export function autoMapProtocolOf(type: string): AutoMapProtocol | null {
   return type === 'S7' || type === 'PlcSimAdvanced' ? type : null;
 }
 
+/**
+ * Where the UI offers "Adopt legacy addresses" (plan-2025 F10, R2-(d)): the S7 comment-prefix /
+ * Unity-Metadata migration and the PLCSIM tag-name seed. Deliberately its own question, separate
+ * from {@link autoMapProtocolOf} (the MCP auto-map tool) and from "Fill addresses from controller",
+ * which is offered by capability (`supportsDiscovery`) for every browsable type.
+ */
+export function legacyAdoptProtocolOf(type: string): AutoMapProtocol | null {
+  return type === 'S7' || type === 'PlcSimAdvanced' ? type : null;
+}
+
 function _autoMapError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
 /** Run a PLCSIM browse through the shared discovery action and keep the tags. */
 async function _discoverPlcTags(interfaceId: string): Promise<DiscoveredPlcTag[]> {
-  await startDiscovery(interfaceId);
+  const run = await _discoverBound(interfaceId);
+  if (run.stale) throw new ConnectConfigPlanStaleError();
   const tags: DiscoveredPlcTag[] = _store.getSnapshot().discoveredSignals.map(s => ({
-    tag: s.browsePath || s.protocolAddress,
+    // plan-2025 F8: the symbol key is the tag name the PLC spells; legacy gateways only had browsePath.
+    tag: s.symbolKey || s.browsePath || s.protocolAddress,
     direction: s.direction,
     dataType: s.dataType,
   }));
@@ -3383,45 +4428,98 @@ export async function applyAutoMap(
 ): Promise<AutoMapReport> {
   _store.set({ autoMapBusy: true });
   try {
-    let report = await _autoMapReport(interfaceId, model, true);
+    if (_opsSupport === false) return await _applyAutoMapLegacy(interfaceId, model);
+    const report = await _autoMapReport(interfaceId, model, true);
     const failed = (what: string, err: unknown): AutoMapReport => {
       report.hints = [`${what} failed: ${_autoMapError(err)}`, ...report.hints];
       _store.set({ autoMapReport: report });
       return report;
     };
+    const iface = _store.getSnapshot().interfaces.find(i => i.id === interfaceId);
 
+    // plan-2025 F10 (matrix B4/B5): ONE atomic batch — the PLCSIM data block filter (merged, never
+    // reduced) and a `signal.upsert{fillEmpty}` per adoptable signal. FillEmpty is the gateway's own
+    // merge-only rule, so an address another writer set meanwhile is kept, not overwritten.
+    const ops: ConnectConfigOp[] = [];
+    let filterAdded: string[] = [];
     if (report.protocol === 'PlcSimAdvanced' && report.dataBlockFilter.length > 0) {
-      const iface = _store.getSnapshot().interfaces.find(i => i.id === interfaceId);
       const settings: PlcSimAdvancedSettings = { ...PLCSIMADVANCED_SETTINGS_DEFAULTS, ...iface?.plcSimAdvanced };
       const merged = mergeDataBlockFilter(settings.dataBlockFilter, report.dataBlockFilter);
       if (merged !== settings.dataBlockFilter) {
-        try {
-          await updateInterface(interfaceId, { plcSimAdvanced: { ...settings, dataBlockFilter: merged } });
-        } catch (err) {
-          return failed('Setting the PLCSIM data block filter', err);
-        }
-        report = await _autoMapReport(interfaceId, model, true);
+        ops.push({ op: 'interface.patch', interfaceId, patch: { plcSimAdvanced: { dataBlockFilter: merged } } });
+        filterAdded = report.dataBlockFilter;
       }
     }
+    ops.push(...legacyAdoptOps(interfaceId, report, iface?.signals ?? []));
 
-    const current = _store.getSnapshot().interfaces.find(i => i.id === interfaceId)?.signals ?? [];
-    const signals = buildInterfaceSignals(report, current);
-    const written = report.counts.toApply;
-    if (!sameSignals(signals, current)) {
+    let written = 0;
+    if (ops.length > 0) {
+      let commit: ConnectConfigOpsCommit | null;
       try {
-        await updateInterface(interfaceId, { signals });
+        commit = await _runConfigOps(ops, 'interfaces');
       } catch (err) {
         return failed('Apply', err);
       }
+      if (!commit) return await _applyAutoMapLegacy(interfaceId, model);
+      written = commit.results.filter(r => r.op === 'signal.upsert' && (r.outcome === 'created' || r.outcome === 'updated')).length;
     }
 
-    const after = await _autoMapReport(interfaceId, model, false);
-    after.hints = [`Applied: ${written} signal(s) added or updated, nothing removed.`, ...after.hints];
+    // A widened data block filter makes more tags visible — but only to a NEW browse, after the
+    // worker restarted. They are reported, not written in a second commit behind the user's back.
+    const after = await _autoMapReport(interfaceId, model, filterAdded.length > 0);
+    const hints = [`Applied: ${written} signal(s) added or updated, nothing removed.`];
+    if (filterAdded.length > 0 && after.counts.toApply > 0) {
+      hints.push(`Data block filter extended (${filterAdded.join(', ')}): ${after.counts.toApply} newly visible tag(s) — run Adopt legacy addresses again to add them.`);
+    }
+    after.hints = [...hints, ...after.hints];
     _store.set({ autoMapReport: after });
     return after;
   } finally {
     _store.set({ autoMapBusy: false });
   }
+}
+
+/** Pre-ops route of {@link applyAutoMap} (older CONNECT): filter PUT, re-browse, signals PUT. */
+async function _applyAutoMapLegacy(
+  interfaceId: string,
+  model: readonly ModelPlcSignal[],
+): Promise<AutoMapReport> {
+  let report = await _autoMapReport(interfaceId, model, true);
+  const failed = (what: string, err: unknown): AutoMapReport => {
+    report.hints = [`${what} failed: ${_autoMapError(err)}`, ...report.hints];
+    _store.set({ autoMapReport: report });
+    return report;
+  };
+
+  if (report.protocol === 'PlcSimAdvanced' && report.dataBlockFilter.length > 0) {
+    const iface = _store.getSnapshot().interfaces.find(i => i.id === interfaceId);
+    const settings: PlcSimAdvancedSettings = { ...PLCSIMADVANCED_SETTINGS_DEFAULTS, ...iface?.plcSimAdvanced };
+    const merged = mergeDataBlockFilter(settings.dataBlockFilter, report.dataBlockFilter);
+    if (merged !== settings.dataBlockFilter) {
+      try {
+        await updateInterface(interfaceId, { plcSimAdvanced: { ...settings, dataBlockFilter: merged } });
+      } catch (err) {
+        return failed('Setting the PLCSIM data block filter', err);
+      }
+      report = await _autoMapReport(interfaceId, model, true);
+    }
+  }
+
+  const current = _store.getSnapshot().interfaces.find(i => i.id === interfaceId)?.signals ?? [];
+  const signals = buildInterfaceSignals(report, current);
+  const written = report.counts.toApply;
+  if (!sameSignals(signals, current)) {
+    try {
+      await updateInterface(interfaceId, { signals });
+    } catch (err) {
+      return failed('Apply', err);
+    }
+  }
+
+  const after = await _autoMapReport(interfaceId, model, false);
+  after.hints = [`Applied: ${written} signal(s) added or updated, nothing removed.`, ...after.hints];
+  _store.set({ autoMapReport: after });
+  return after;
 }
 
 /** Forget the auto-map report (e.g. after a model change). */
@@ -3531,6 +4629,61 @@ export async function importSewSymbolTable(params: ImportSewSymbolTableParams): 
   }
 }
 
+export interface ImportSewUdpSymbolTableParams {
+  signals: UdpImportSignal[];
+  targetInterfaceId: string | null;
+  /** Used only when creating a new interface; an existing write gate is preserved. */
+  allowWebToPlc: boolean;
+}
+
+/** Replace a UDP interface's signals, or create a disabled SEW-UDP preset interface. */
+export async function importSewUdpSymbolTable(params: ImportSewUdpSymbolTableParams): Promise<void> {
+  const { signals, targetInterfaceId, allowWebToPlc } = params;
+  const snapshot = _store.getSnapshot();
+  const existing = targetInterfaceId !== null
+    ? snapshot.interfaces.find(i => i.id === targetInterfaceId)
+    : undefined;
+  if (targetInterfaceId !== null) {
+    if (!existing) throw new Error(`Unknown interface "${targetInterfaceId}"`);
+    if (existing.type !== 'Udp') throw new Error(`Interface "${targetInterfaceId}" is not Udp`);
+  }
+  const body: ConnectInterface = existing ? { ...existing, signals } : {
+    id: nextInterfaceId('Udp', 'SEW-UDP'),
+    type: 'Udp',
+    enabled: false,
+    udp: { ...UDP_SETTINGS_DEFAULTS },
+    updateCycleMs: 20,
+    allowWebToPlc,
+    signals,
+  };
+  const path = existing ? `/config/interfaces/${encodeURIComponent(existing.id)}` : '/config/interfaces';
+  const resp = await connectRestFetch(`${snapshot.serverUrl}${path}`, {
+    method: existing ? 'PUT' : 'POST',
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    // This import promises the gateway text, including limit codes and plain-text
+    // responses, rather than the generic client's translated error copy.
+    const raw = await resp.text();
+    let message = raw || `HTTP ${resp.status}: ${resp.statusText}`;
+    try {
+      const error = JSON.parse(raw) as ConnectErrorBody;
+      const details = (error.collisions ?? [])
+        .map(c => `'${c.signal}' (already bound to interface '${c.existingInterfaceId}')`)
+        .concat(error.details ?? []);
+      message = [error.error ?? error.message ?? message, ...details].join(': ');
+    } catch { /* Plain-text gateway response: keep it verbatim. */ }
+    throw new Error(message);
+  }
+  if (existing) {
+    await fetchInterfaces();
+  } else {
+    const created = normalizeConnectInterface(await _readGatewayJson<ConnectInterface>(resp, snapshot.serverUrl));
+    _store.set(prev => ({ ...prev, interfaces: [...prev.interfaces, created] }));
+    _markInterfacesWritten();
+  }
+}
+
 /**
  * Patch one MQTT topic's transport settings (mode / encoding / publish interval /
  * QoS / retain) on an existing interface and PUT the whole config back.
@@ -3563,19 +4716,53 @@ function _topicSignalsToConfig(topic: ParsedTopic): ConnectInterfaceSignal[] {
 }
 
 /**
- * Push a Multi-Tab Excel import (one MQTT topic per tab) to CONNECT as a single
- * `InterfaceConfig` whose `Topics` array carries every parsed topic.
+ * The ONE atomic batch of a Multi-Tab import (plan-2025 P7 review fix 5), with the same replacing
+ * semantics as the old whole-interface PUT: afterwards the interface is MQTT on `brokerUrl` and its
+ * topics are EXACTLY the imported ones, in import order (a topic no longer in the workbook is gone,
+ * nothing accumulates); every other interface field stays as CONNECT has it.
  *
- * Idempotent and REPLACING (F10): the complete `Topics` array is sent via
- * `PUT /config/interfaces/{id}` and replaces whatever the interface had before —
- * topics removed in this import disappear, nothing accumulates. CONNECT's PUT
- * replaces the whole interface, so a stable `interfaceId` keeps re-imports from
- * duplicating. Push failures surface as a thrown error (F16), never a silent
- * no-op. The caller should `fetchInterfaces()` afterwards to refresh the UI.
+ * - no such interface → `interface.add` (empty topics) + one `container.replace` per topic;
+ * - existing interface → `interface.patch` of `type` / `brokerUrl` where they differ, `topics: []`
+ *   when the existing topic list is not already the imported names in order, then one
+ *   `container.replace` per topic (replace by name, or add).
  *
- * Precondition: the interface list should already be loaded (`fetchInterfaces()`)
- * so any existing interface's `enabled` flag and protocol settings are preserved
- * in the replaced config.
+ * One topic per operation keeps every operation under CONNECT's per-op signal limit.
+ */
+export function multiTabImportOps(
+  existing: ConnectInterface | undefined,
+  interfaceId: string,
+  brokerUrl: string,
+  topics: readonly ConnectMqttTopic[],
+): ConnectConfigOp[] {
+  const ops: ConnectConfigOp[] = [];
+  if (!existing) {
+    ops.push({ op: 'interface.add', interface: { id: interfaceId, type: 'MQTT', enabled: true, brokerUrl, topics: [] } });
+  } else {
+    const patch: Record<string, unknown> = {};
+    if (existing.type !== 'MQTT') patch.type = 'MQTT';
+    if (existing['brokerUrl'] !== brokerUrl) patch.brokerUrl = brokerUrl;
+    const before = (existing.topics ?? []).map(t => t.topic);
+    const after = topics.map(t => t.topic);
+    const sameOrder = before.length === after.length && before.every((t, i) => t === after[i]);
+    if (!sameOrder && before.length > 0) patch.topics = [];
+    if (Object.keys(patch).length > 0) ops.push({ op: 'interface.patch', interfaceId, patch });
+  }
+  for (const topicConfig of topics) ops.push({ op: 'container.replace', interfaceId, topicConfig });
+  return ops;
+}
+
+/**
+ * Push a Multi-Tab Excel import (one MQTT topic per tab) to CONNECT: the interface's `Topics` become
+ * exactly the parsed topics.
+ *
+ * Idempotent and REPLACING (F10): topics removed in this import disappear, nothing accumulates. With
+ * the write core this is ONE atomic batch ({@link multiTabImportOps}) on the revision of the interface
+ * list the import was read against — a concurrent change elsewhere answers 409 instead of being
+ * overwritten. Only an older CONNECT (no `/config/ops`) still gets the whole-interface PUT.
+ * Push failures surface as a thrown error (F16), never a silent no-op. The caller should
+ * `fetchInterfaces()` afterwards to refresh the UI.
+ *
+ * Precondition: the interface list should already be loaded (`fetchInterfaces()`).
  */
 export async function importMultiTabTagTable(
   topics: ParsedTopic[],
@@ -3591,9 +4778,13 @@ export async function importMultiTabTagTable(
     signals: _topicSignalsToConfig(t),
   }));
 
+  // The interface and the revision it was read with, held together: the batch is based on exactly this.
   const existing = _store.getSnapshot().interfaces.find(i => i.id === interfaceId);
+  const base = _interfacesRevision;
+  const ops = multiTabImportOps(existing, interfaceId, brokerUrl, mqttTopics);
+  if (await _runConfigOps(ops, { explicit: base })) return;
 
-  // Build the complete InterfaceConfig; the whole Topics array replaces the old one.
+  // Older CONNECT without the write core: the complete InterfaceConfig, the whole Topics array replaces the old one.
   const body: Record<string, unknown> = {
     ...(existing ?? {}),
     id: interfaceId,
@@ -3621,6 +4812,8 @@ export async function importMultiTabTagTable(
  * the signal name is kept identical (protocol converter semantics).
  */
 export interface ConnectMirrorRule {
+  /** Stable rule id (plan-2025 F7, `mr-` + 8 hex). Absent for a rule not saved yet — the gateway assigns it. */
+  id?: string;
   enabled: boolean;
   sourceInterfaceId: string;
   targetInterfaceId: string;
@@ -3639,17 +4832,64 @@ export interface ConnectSignalMapping {
   coercion?: 'Strict' | 'Coerce';
 }
 
+/**
+ * The mirror.* ops that turn `current` (the shown list) into `next` (plan-2025 F7/F10). Rules are
+ * addressed by id; a rule without one is new. Null when `current` is unknown or a shown rule has no
+ * id (an older gateway) — then only the whole-list PUT can say what is meant.
+ */
+export function mirrorOpsFor(
+  current: readonly ConnectMirrorRule[] | null,
+  next: readonly ConnectMirrorRule[],
+): ConnectConfigOp[] | null {
+  if (!current || current.some(m => !m.id)) return null;
+  const nextIds = new Set(next.map(m => m.id).filter((id): id is string => !!id));
+  const byId = new Map(current.map(m => [m.id!, m]));
+  const ops: ConnectConfigOp[] = [];
+  for (const m of current) if (!nextIds.has(m.id!)) ops.push({ op: 'mirror.remove', id: m.id });
+  for (const m of next) {
+    if (m.id && !byId.has(m.id)) return null; // an id this tab never saw: not a diff it can make
+    const before = m.id ? byId.get(m.id) : undefined;
+    if (before && JSON.stringify(before) === JSON.stringify(m)) continue;
+    ops.push({ op: 'mirror.upsert', mirror: { ...m, id: m.id ?? '' } });
+  }
+  return ops;
+}
+
+/** The mapping.* ops that turn `current` into `next`, keyed by (sourceSignal, destSignal). Null when `current` is unknown. */
+export function mappingOpsFor(
+  current: readonly ConnectSignalMapping[] | null,
+  next: readonly ConnectSignalMapping[],
+): ConnectConfigOp[] | null {
+  if (!current) return null;
+  const key = (m: ConnectSignalMapping) => `${m.sourceSignal}\u0000${m.destSignal}`;
+  const before = new Map(current.map(m => [key(m), m]));
+  const nextKeys = new Set(next.map(key));
+  const ops: ConnectConfigOp[] = [];
+  for (const m of current) {
+    if (!nextKeys.has(key(m))) ops.push({ op: 'mapping.remove', sourceSignal: m.sourceSignal, destSignal: m.destSignal });
+  }
+  for (const m of next) {
+    const prev = before.get(key(m));
+    if (prev && JSON.stringify(prev) === JSON.stringify(m)) continue;
+    ops.push({ op: 'mapping.upsert', mapping: { ...m } });
+  }
+  return ops;
+}
+
 export async function fetchMirrors(): Promise<ConnectMirrorRule[]> {
   return _fetchJson<ConnectMirrorRule[]>('/config/mirrors');
 }
 
 /** Replace ALL mirror rules. The gateway validates (sink types, patterns) and returns 400 with details on invalid rules. */
 export async function putMirrors(mirrors: ConnectMirrorRule[]): Promise<void> {
+  // plan-2025 F10 (matrix B7): the difference to the shown list as mirror.* ops, addressed by rule id.
+  const ops = mirrorOpsFor(_bridges.mirrors, mirrors);
+  if (ops && (ops.length === 0 || await _runConfigOps(ops, 'bridges'))) return;
   await _fetchJson<{ success: boolean }>('/config/mirrors', {
     method: 'PUT',
     body: JSON.stringify(mirrors),
   });
-  _setBridges({ mirrors: [...mirrors] });
+  _setBridgesLocal({ mirrors: [...mirrors] });
 }
 
 export async function fetchMappings(): Promise<ConnectSignalMapping[]> {
@@ -3658,11 +4898,14 @@ export async function fetchMappings(): Promise<ConnectSignalMapping[]> {
 
 /** Replace ALL signal mappings (validated by the gateway). */
 export async function putMappings(mappings: ConnectSignalMapping[]): Promise<void> {
+  // plan-2025 F10 (matrix B7): the difference to the shown list as mapping.* ops, keyed by (source, dest).
+  const ops = mappingOpsFor(_bridges.mappings, mappings);
+  if (ops && (ops.length === 0 || await _runConfigOps(ops, 'bridges'))) return;
   await _fetchJson<{ success: boolean }>('/config/mappings', {
     method: 'PUT',
     body: JSON.stringify(mappings),
   });
-  _setBridges({ mappings: [...mappings] });
+  _setBridgesLocal({ mappings: [...mappings] });
 }
 
 // -- Bridge cache (plan-566 R2-1) ---------------------------------------------
@@ -3718,15 +4961,21 @@ export function subscribeConnectBridges(cb: () => void): () => void {
 export function reloadConnectBridges(): Promise<void> {
   if (_bridgesInFlight) return _bridgesInFlight;
   const generation = _bridgesGeneration;
-  const request = Promise.all([fetchMirrors(), fetchMappings()])
-    .then(([mirrors, mappings]) => {
-      if (generation !== _bridgesGeneration) return;
-      _setBridges({ mirrors, mappings, supported: true, loaded: true });
+  // Shared writer sequence (plan-2024): an answer older than the last bridge write lands as a no-op.
+  const seq = ++_configSeq;
+  const target = _configTarget();
+  const current = (): boolean => generation === _bridgesGeneration && _isConfigTarget(target);
+  const request = fetchBridgesResult()
+    .then((res) => {
+      if (res.kind !== 'ok') throw new Error(res.kind);
+      if (!current()) return;
+      // plan-2025 F1: the revision travels with the bridges — the base of the next bridge write.
+      _commitBridges(seq, { mirrors: res.value.mirrors, mappings: res.value.mappings, supported: true }, res.revision ?? null);
     })
     .catch(() => {
       // Older gateway without the endpoints - the bridges UI hides itself.
-      if (generation !== _bridgesGeneration) return;
-      _setBridges({ mirrors: null, mappings: null, supported: false, loaded: true });
+      if (!current()) return;
+      _commitBridges(seq, { mirrors: null, mappings: null, supported: false });
     })
     .finally(() => { if (_bridgesInFlight === request) _bridgesInFlight = null; });
   _bridgesInFlight = request;
@@ -3743,6 +4992,426 @@ export function clearConnectBridges(): void {
 /** Ask the CONNECT panel to show one bridge row (`mapping:<i>` / `mirror:<i>`); `null` clears the request. */
 export function requestConnectBridgeReveal(key: string | null): void {
   if (_bridges.revealKey !== key) _setBridges({ revealKey: key });
+}
+
+// -- Live config push (plan-2024 P1) -------------------------------------------
+//
+// CONNECT pushes `{type:'config', instance, revision}` to every viewer tab after ANY configuration
+// change (REST, tray, profile switch, rename). The push is only an invalidation: this tab re-reads
+// interfaces, mirrors and mappings through the normal REST endpoints. One refresh runs at a time;
+// pushes that arrive meanwhile are merged into exactly one follow-up. The applied revision moves only
+// after a successful load, a transient failure keeps the last valid cache and retries (1/2/5 s).
+//
+// Write coordination (review follow-up): the interface cache and the bridge cache have more than one
+// writer - the push refresh, the explicit loaders `fetchInterfaces()` / `reloadConnectBridges()` and
+// the local mutations (POST / PUT). Every writer draws a sequence number from ONE counter when it
+// STARTS; a part is written only when its number is newer than the last one written for that part,
+// so an answer that started earlier can never overwrite one that started later. A target change
+// (`setServerUrl`, disconnect, reset) bumps `_configEpoch`: everything still in flight for the old
+// target writes nothing, the running refresh is aborted and its retry timer cleared.
+
+/** Outcome of one config load. `unsupported` is reserved for a 404 of the endpoint. */
+export type ConfigLoadResult<T> =
+  | { kind: 'ok'; value: T; revision?: ConnectConfigRevision }
+  | { kind: 'unsupported' }
+  | { kind: 'transient-error'; message: string };
+
+/** Options of the result loaders: an abort signal and the gateway to ask (default: the current one). */
+export interface ConfigLoadOptions { signal?: AbortSignal; baseUrl?: string }
+
+async function _loadJsonResult<T>(path: string, opts?: ConfigLoadOptions): Promise<ConfigLoadResult<T>> {
+  const baseUrl = opts?.baseUrl ?? _store.getSnapshot().serverUrl;
+  try {
+    const resp = await connectRestFetch(`${baseUrl}${path}`, opts?.signal ? { signal: opts.signal } : undefined);
+    if (resp.status === 404) return { kind: 'unsupported' };
+    if (!resp.ok) return { kind: 'transient-error', message: await _errorMessage(resp) };
+    const value = await _readGatewayJson<T>(resp, baseUrl);
+    const revision = readConfigRevision(resp);
+    return revision ? { kind: 'ok', value, revision } : { kind: 'ok', value };
+  } catch (err) {
+    return { kind: 'transient-error', message: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** Interfaces with a result instead of a swallowed error; writes nothing to the store (plan-2024 F2a). */
+export async function fetchInterfacesResult(opts?: ConfigLoadOptions): Promise<ConfigLoadResult<ConnectInterface[]>> {
+  const res = await _loadJsonResult<ConnectInterface[]>('/config/interfaces', opts);
+  if (res.kind !== 'ok') return res;
+  const value = Array.isArray(res.value) ? res.value.map(normalizeConnectInterface) : [];
+  return res.revision ? { kind: 'ok', value, revision: res.revision } : { kind: 'ok', value };
+}
+
+/** Mirrors + mappings with a result; `unsupported` only when an endpoint answers 404. Writes nothing. */
+export async function fetchBridgesResult(opts?: ConfigLoadOptions): Promise<
+  ConfigLoadResult<{ mirrors: ConnectMirrorRule[]; mappings: ConnectSignalMapping[] }>
+> {
+  const [mirrors, mappings] = await Promise.all([
+    _loadJsonResult<ConnectMirrorRule[]>('/config/mirrors', opts),
+    _loadJsonResult<ConnectSignalMapping[]>('/config/mappings', opts),
+  ]);
+  if (mirrors.kind === 'transient-error') return mirrors;
+  if (mappings.kind === 'transient-error') return mappings;
+  if (mirrors.kind === 'unsupported' || mappings.kind === 'unsupported') return { kind: 'unsupported' };
+  const value = { mirrors: mirrors.value, mappings: mappings.value };
+  // The OLDER of the two reads is the base: a bridge write must not claim a state it did not see.
+  const revision = _olderRevision(mirrors.revision, mappings.revision);
+  return revision ? { kind: 'ok', value, revision } : { kind: 'ok', value };
+}
+
+/** A viewer-side config demand: the newest push not yet applied. */
+interface ConfigDemand { instance: string; revision: number }
+
+/** The bridge part of a load as it would land in the cache (`supported: false` = endpoints 404). */
+interface BridgesPart { mirrors: ConnectMirrorRule[] | null; mappings: ConnectSignalMapping[] | null; supported: boolean }
+
+/** One loaded snapshot. A `null` part was not loaded (interfaces endpoint 404) or is superseded. */
+interface LoadedConfig {
+  /** Sequence number drawn when the load started. */
+  seq: number;
+  interfaces: ConnectInterface[] | null;
+  bridges: BridgesPart | null;
+  /** plan-2025 F1: store revision of each part (absent on an older gateway). */
+  interfacesRevision?: ConnectConfigRevision | null;
+  bridgesRevision?: ConnectConfigRevision | null;
+}
+
+const CONFIG_RETRY_DELAYS_MS: readonly number[] = [1000, 2000, 5000];
+let _configRetryDelays: readonly number[] = CONFIG_RETRY_DELAYS_MS;
+let _configInstance: string | null = null;
+let _configApplied = -1;
+let _configWanted: ConfigDemand | null = null;
+let _configForce = false;
+/** Target generation: bumped on reset, disconnect and every gateway URL change. */
+let _configEpoch = 0;
+/** Epoch of the refresh loop that is running, -1 when none; a loop of an older epoch never blocks. */
+let _configRunningEpoch = -1;
+let _configAbort: AbortController | null = null;
+let _configRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let _configRetryWake: (() => void) | null = null;
+let _configRefreshCount = 0;
+/** Writer sequence shared by every writer of the interface and bridge caches. */
+let _configSeq = 0;
+let _interfacesWrittenSeq = 0;
+let _bridgesWrittenSeq = 0;
+
+/** The older of two revisions of the same instance; null when either is missing or they differ in instance. */
+function _olderRevision(a: ConnectConfigRevision | undefined, b: ConnectConfigRevision | undefined): ConnectConfigRevision | null {
+  if (!a || !b || a.instance !== b.instance) return null;
+  return a.revision <= b.revision ? a : b;
+}
+
+function _mergeDemand(a: ConfigDemand | null, b: ConfigDemand | null): ConfigDemand | null {
+  if (!a) return b;
+  if (!b) return a;
+  if (a.instance !== b.instance) return b;
+  return a.revision >= b.revision ? a : b;
+}
+
+/** Number of refresh rounds that ended in a successful apply (observable for tests and diagnosis). */
+export function getConnectConfigRefreshCount(): number { return _configRefreshCount; }
+/** Last revision applied from a push (-1 when none). */
+export function getConnectConfigAppliedRevision(): number { return _configApplied; }
+
+/**
+ * Handle a `config` push frame. Returns whether it opened a refresh; same-or-older revisions of the
+ * known instance, malformed frames and pushes while not connected are ignored.
+ */
+export function handleConnectConfigPush(msg: { instance?: unknown; revision?: unknown }): boolean {
+  if (typeof msg.instance !== 'string' || typeof msg.revision !== 'number' || !Number.isFinite(msg.revision)) return false;
+  if (msg.instance === _configInstance && msg.revision <= _configApplied) return false;
+  if (_store.getSnapshot().state !== 'connected') return false;
+  _configWanted = _mergeDemand(_configWanted, { instance: msg.instance, revision: msg.revision });
+  _kickConfigRefresh();
+  return true;
+}
+
+/** Reload interfaces + bridges once, regardless of revisions (used after a bridge channel reconnect). */
+export function requestConnectConfigRefresh(): void {
+  if (_store.getSnapshot().state !== 'connected') return;
+  _configForce = true;
+  _kickConfigRefresh();
+}
+
+function _kickConfigRefresh(): void {
+  // The loop of THIS target re-checks the demand when its round ends; a loop of an older target
+  // (aborted by a reset) never blocks a new one.
+  if (_configRunningEpoch === _configEpoch) return;
+  void _runConfigRefresh();
+}
+
+/** One round: interfaces + bridges, all-or-nothing. */
+async function _loadConfigRound(seq: number, opts: ConfigLoadOptions): Promise<LoadedConfig | null> {
+  const [ifaces, bridges] = await Promise.all([fetchInterfacesResult(opts), fetchBridgesResult(opts)]);
+  if (ifaces.kind === 'transient-error' || bridges.kind === 'transient-error') return null;
+  return {
+    seq,
+    interfaces: ifaces.kind === 'ok' ? ifaces.value : null,
+    interfacesRevision: ifaces.kind === 'ok' ? ifaces.revision ?? null : null,
+    bridgesRevision: bridges.kind === 'ok' ? bridges.revision ?? null : null,
+    bridges: bridges.kind === 'ok'
+      ? { mirrors: bridges.value.mirrors, mappings: bridges.value.mappings, supported: true }
+      : { mirrors: null, mappings: null, supported: false },
+  };
+}
+
+/** Wait `ms`, cancellable by a reset (which resolves the wait at once). */
+function _configRetryWait(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    _configRetryWake = resolve;
+    _configRetryTimer = setTimeout(() => {
+      _configRetryTimer = null;
+      _configRetryWake = null;
+      resolve();
+    }, ms);
+  });
+}
+
+async function _runConfigRefresh(): Promise<void> {
+  const epoch = _configEpoch;
+  const owns = (): boolean => epoch === _configEpoch;
+  _configRunningEpoch = epoch;
+  let gaveUp = false;
+  try {
+    let attempt = 0;
+    while (owns() && (_configWanted || _configForce)) {
+      if (_store.getSnapshot().state !== 'connected') { _configWanted = null; _configForce = false; break; }
+      const baseUrl = _store.getSnapshot().serverUrl;
+      const demand = _configWanted;
+      const forced = _configForce;
+      _configWanted = null;
+      _configForce = false;
+
+      const seq = ++_configSeq;
+      const abort = new AbortController();
+      _configAbort = abort;
+      const loaded = await _loadConfigRound(seq, { signal: abort.signal, baseUrl });
+      if (_configAbort === abort) _configAbort = null;
+      // Reset, disconnect or a different gateway meanwhile: nothing may be written, the loop ends.
+      if (!owns() || _store.getSnapshot().serverUrl !== baseUrl) break;
+
+      if (loaded) {
+        attempt = 0;
+        if (!_offerLoadedConfig(loaded)) {
+          // A writer that started later already wrote a part: this answer is older than the cache.
+          // Load once more, so the demand is settled by an answer at least as new as every write.
+          _configWanted = _mergeDemand(demand, _configWanted);
+          _configForce = _configForce || forced;
+          continue;
+        }
+        _configRefreshCount++;
+        if (demand) {
+          _configInstance = demand.instance;
+          _configApplied = demand.revision;
+        }
+        continue;
+      }
+
+      // Transient failure: the last valid cache stays and the demand stays open.
+      _configWanted = _mergeDemand(demand, _configWanted);
+      _configForce = _configForce || forced;
+      if (attempt >= _configRetryDelays.length) {
+        console.warn('[connect-store] config refresh failed; waiting for the next push');
+        gaveUp = true;
+        break;
+      }
+      await _configRetryWait(_configRetryDelays[attempt++]);
+    }
+  } finally {
+    if (_configRunningEpoch === epoch) _configRunningEpoch = -1;
+  }
+  // A demand that arrived between the last loop check and the flag reset must not be lost.
+  if (owns() && !gaveUp && (_configWanted || _configForce)) _kickConfigRefresh();
+}
+
+/**
+ * Offer one loaded snapshot to the caches. Parts a later-started writer already wrote are dropped;
+ * returns false when that happened (the snapshot is older than the cache). While an edit is open the
+ * snapshot is held instead of written (F3) - always the NEWEST one, and a snapshot equal to the
+ * cache drops a held one together with its notice.
+ */
+function _offerLoadedConfig(config: LoadedConfig): boolean {
+  const fresh: LoadedConfig = {
+    seq: config.seq,
+    interfaces: config.interfaces && config.seq > _interfacesWrittenSeq ? config.interfaces : null,
+    bridges: config.bridges && config.seq > _bridgesWrittenSeq ? config.bridges : null,
+    interfacesRevision: config.interfacesRevision ?? null,
+    bridgesRevision: config.bridgesRevision ?? null,
+  };
+  const complete = (fresh.interfaces !== null) === (config.interfaces !== null)
+    && (fresh.bridges !== null) === (config.bridges !== null);
+  if (_configEditHolds > 0) {
+    if (_configChangesCurrent(fresh)) {
+      _configHeld = fresh;
+      if (!_configNotice.pending) _setConfigNotice({ pending: true });
+    } else {
+      _clearHeldConfig();
+    }
+    return complete;
+  }
+  _writeLoadedConfig(fresh);
+  return complete;
+}
+
+/** Write the parts of a snapshot that are still newer than the cache; unchanged parts publish nothing. */
+function _writeLoadedConfig(config: LoadedConfig): void {
+  if (config.interfaces) _commitInterfaces(config.seq, config.interfaces, config.interfacesRevision ?? null);
+  if (config.bridges) _commitBridges(config.seq, config.bridges, config.bridgesRevision ?? null);
+}
+
+function _sameJson(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/** Interfaces written by a load that started at `seq`; ignored when a later-started writer was faster. */
+function _commitInterfaces(seq: number, interfaces: ConnectInterface[], revision: ConnectConfigRevision | null = null): boolean {
+  if (seq <= _interfacesWrittenSeq) return false;
+  _interfacesWrittenSeq = seq;
+  _interfacesRevision = revision;
+  if (!_sameJson(interfaces, _store.getSnapshot().interfaces)) _store.set({ interfaces });
+  _reconcileHeldConfig();
+  return true;
+}
+
+/** Bridges written by a load that started at `seq`; ignored when a later-started writer was faster. */
+function _commitBridges(seq: number, part: BridgesPart, revision: ConnectConfigRevision | null = null): boolean {
+  if (seq <= _bridgesWrittenSeq) return false;
+  _bridgesWrittenSeq = seq;
+  _bridgesRevision = revision;
+  if (!_bridgesEqual(part)) _setBridges({ ...part, loaded: true });
+  _reconcileHeldConfig();
+  return true;
+}
+
+/** A local mutation of the interface cache: newer than every load that started before it. */
+function _markInterfacesWritten(): void {
+  _interfacesWrittenSeq = ++_configSeq;
+  // The cache now holds a state no GET has stamped: the next write goes unconditional until a load.
+  _interfacesRevision = null;
+}
+
+/** A local mutation of the bridge cache (PUT): newer than every load that started before it. */
+function _setBridgesLocal(patch: Partial<ConnectBridgesState>): void {
+  _bridgesWrittenSeq = ++_configSeq;
+  _bridgesRevision = null;
+  _setBridges(patch);
+  _reconcileHeldConfig();
+}
+
+function _bridgesEqual(part: BridgesPart): boolean {
+  return _bridges.loaded
+    && _bridges.supported === part.supported
+    && _sameJson(part.mirrors, _bridges.mirrors)
+    && _sameJson(part.mappings, _bridges.mappings);
+}
+
+/** Would writing this snapshot change what the user sees? Support/loaded state counts (404 = change). */
+function _configChangesCurrent(config: LoadedConfig): boolean {
+  if (config.interfaces && !_sameJson(config.interfaces, _store.getSnapshot().interfaces)) return true;
+  if (config.bridges && !_bridgesEqual(config.bridges)) return true;
+  return false;
+}
+
+/** After any write: drop held parts a newer write has overtaken, and the hold itself once it changes nothing. */
+function _reconcileHeldConfig(): void {
+  const held = _configHeld;
+  if (!held) return;
+  const next: LoadedConfig = {
+    seq: held.seq,
+    interfaces: held.interfaces && held.seq > _interfacesWrittenSeq ? held.interfaces : null,
+    bridges: held.bridges && held.seq > _bridgesWrittenSeq ? held.bridges : null,
+    interfacesRevision: held.interfacesRevision ?? null,
+    bridgesRevision: held.bridgesRevision ?? null,
+  };
+  if (!_configChangesCurrent(next)) { _clearHeldConfig(); return; }
+  _configHeld = next;
+}
+
+function _clearHeldConfig(): void {
+  _configHeld = null;
+  if (_configNotice.pending) _setConfigNotice({ pending: false });
+}
+
+/** Forget every push/refresh state (disconnect, reset, new gateway): nothing in flight writes afterwards. */
+function _resetConfigRefresh(): void {
+  _configEpoch++;
+  // A shared bridge load of the old target must not be handed to a caller of the new one.
+  _bridgesInFlight = null;
+  if (_configAbort) { _configAbort.abort(); _configAbort = null; }
+  if (_configRetryTimer !== null) { clearTimeout(_configRetryTimer); _configRetryTimer = null; }
+  const wake = _configRetryWake;
+  _configRetryWake = null;
+  wake?.();
+  _configRefreshCount = 0;
+  // plan-2025 F10: revisions and the write-core probe belong to ONE gateway target.
+  _interfacesRevision = null;
+  _bridgesRevision = null;
+  _opsSupport = null;
+  _configInstance = null;
+  _configApplied = -1;
+  _configWanted = null;
+  _configForce = false;
+  _clearHeldConfig();
+}
+
+/** Current target generation of the config caches (explicit loaders compare it before writing). */
+function _configTarget(): { epoch: number; baseUrl: string } {
+  return { epoch: _configEpoch, baseUrl: _store.getSnapshot().serverUrl };
+}
+
+function _isConfigTarget(target: { epoch: number; baseUrl: string }): boolean {
+  return target.epoch === _configEpoch && target.baseUrl === _store.getSnapshot().serverUrl;
+}
+
+// Open edits (plan-2024 F3): while a dialog or form is open, a push does not replace what the user
+// sees under their hands. The loaded config is held; the panel shows "Configuration changed outside"
+// with a Reload button, and the hold applies by itself when the last edit closes. Explicit loads
+// (`fetchInterfaces()` / `reloadConnectBridges()`) are requested by the caller - often by the open
+// dialog itself, which needs the fresh list - so they still write at once; a held part they overtake
+// is dropped.
+let _configEditHolds = 0;
+let _configHeld: LoadedConfig | null = null;
+
+/** State of the "changed outside" notice. */
+export interface ConnectConfigNotice { pending: boolean }
+let _configNotice: ConnectConfigNotice = { pending: false };
+const _configNoticeListeners = new Set<() => void>();
+
+function _setConfigNotice(next: ConnectConfigNotice): void {
+  _configNotice = next;
+  for (const cb of [..._configNoticeListeners]) {
+    try { cb(); } catch (e) { console.warn('[connect-store] notice listener failed:', e); }
+  }
+}
+
+export function getConnectConfigNotice(): ConnectConfigNotice { return _configNotice; }
+export function subscribeConnectConfigNotice(cb: () => void): () => void {
+  _configNoticeListeners.add(cb);
+  return () => { _configNoticeListeners.delete(cb); };
+}
+
+/** Register an open edit; returns the release. Releasing the last hold applies a held config. */
+export function holdConnectConfigEditing(): () => void {
+  _configEditHolds++;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    _configEditHolds = Math.max(0, _configEditHolds - 1);
+    if (_configEditHolds === 0) applyHeldConnectConfig();
+  };
+}
+
+/** Apply the config that arrived while an edit was open (the notice's Reload button). */
+export function applyHeldConnectConfig(): void {
+  const held = _configHeld;
+  _configHeld = null;
+  if (held) _writeLoadedConfig(held);
+  if (_configNotice.pending) _setConfigNotice({ pending: false });
+}
+
+/** @internal Shorter retry delays for tests. */
+export function _setConfigRetryDelaysForTest(delays: readonly number[] | null): void {
+  _configRetryDelays = delays ?? CONFIG_RETRY_DELAYS_MS;
 }
 
 // ── Signal-config profiles (plan-258) ────────────────────────────────────
@@ -4296,6 +5965,7 @@ export function _resetConnectStore(): void {
   hasFetchedConnectThisSession = false;
   connectNewsFetchInFlight = false;
   clearConnectBridges();
+  _resetConfigRefresh();
   _store.set({
     serverUrl: defaultGatewayUrl(),
     state: 'disconnected',

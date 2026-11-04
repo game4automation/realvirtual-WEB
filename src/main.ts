@@ -13,16 +13,21 @@
  */
 
 import { RVViewer, type RendererKind } from './core/rv-viewer';
+import { installRecordingSeam } from './core/engine/rv-recording-targets';
 import { LoadAbortedError } from './core/engine/rv-scene-loader';
 import type { RVExtrasOverlay } from './core/engine/rv-extras-overlay-store';
 import { debug, logInfo } from './core/engine/rv-debug';
 import { initTestRunner } from './rv-test-runner';
 import { runLegacyCleanup } from './core/project/rv-project-legacy-cleanup';
 import { fetchAppConfig, setAppConfig, initAnalytics, lockedModeOf, trackAnalyticsEvent } from './core/rv-app-config';
+import { RV_SERVE_INFO } from './core/rv-serve-info';
+import { applyBootViewProfile } from './core/rv-view-profile';
 import { initFragmentSecret, requireHostedPassword } from './core/hmi/password-gate';
 import { isLoopbackOrigin } from './core/hmi/connect-store';
-import { decryptServedBytes } from './core/persistence/rv-served-bytes';
+import { decryptServedBytes, decryptingStatusFor } from './core/persistence/rv-served-bytes';
 import { requireAnalyticsConsent } from './core/hmi/consent-gate';
+// Never-throwing storage access for the boot and model-load path (plan-2209 SOL #1).
+import { readLocalStorage, writeLocalStorage, removeLocalStorage } from './core/hmi/rv-storage-keys';
 import { loadVisualSettings, hasStoredVisualSettings } from './core/hmi/visual-settings-store';
 import { applyUIBlurScale } from './core/hmi/rv-ui-blur';
 import { loadPublishedPresets, seedInitialVisualPreset } from './core/hmi/visual-presets';
@@ -32,7 +37,6 @@ import {
 } from './core/hmi/auto-quality';
 import { isMobileDevice } from './hooks/use-mobile-layout';
 import { activateContext, registerUIElement, setContext } from './core/hmi/ui-context-store';
-import { isSupported as isFsApiSupported, listSubfolderFiles, readFileAsUrl } from './core/engine/rv-local-filesystem';
 import {
   canonicalModelUrl, modelFetchUrl, modelFileName, setModelRevision,
 } from './core/rv-model-catalog';
@@ -46,22 +50,46 @@ import {
   reportModelLoadEnd, reportModelLoadPreparing, reportModelLoadProgress,
   reportModelLoadStart,
 } from './core/hmi/model-load-progress-store';
-import { setBrandedSplashVisible } from './core/hmi/scene-transition-store';
+import {
+  setBrandedSplashVisible,
+  showNowAndPaint as showSceneTransition,
+  showDelayed as showSceneTransitionDelayed,
+  hide as hideSceneTransition,
+  type SceneTransitionToken,
+} from './core/hmi/scene-transition-store';
+import {
+  getRuntimeWarmupSnapshot, subscribeRuntimeWarmup,
+} from './core/hmi/runtime-warmup-store';
 import { createSplashRobot } from './core/hmi/rv-splash-robot';
 import { onLoadPhase } from './core/engine/rv-load-profiler';
 
 // Private content (resolves to stubs when private folder is absent)
 import { initHMI } from '@rv-private/custom/hmi-entry';
 import { registerPrivatePlugins } from '@rv-private/private-plugins';
+import { loadFeatureChunks, registerFeatureRetryCommand, installPreloadErrorHandler } from './core/rv-feature-loader';
+import { scheduleIdlePrefetch } from './core/rv-feature-prefetch';
+import { resolveBootMode } from './core/rv-boot-mode';
+import { commandRegistry } from './core/hmi/rv-command-registry';
 import { smoothMotionRegistry } from './core/engine/rv-smooth-motion-port';
+import { installDiagnosticsCollector } from './core/diagnostics/rv-diagnostics-collector';
+import { setOnRootSaveDiagnostics } from './core/hmi/RootErrorBoundary';
+import { ensureDiagnosticsExportCommandRegistered } from './core/diagnostics/rv-diagnostics-command';
 
-// Hide AGPL watermark only for explicitly commercial builds (RV_COMMERCIAL=1).
-// Presence of the private folder alone no longer hides it, so the AGPL
-// watermark stays visible in normal dev/private builds as well.
-if (__RV_COMMERCIAL__) {
-  const wm = document.getElementById('rv-watermark');
-  if (wm) wm.style.display = 'none';
-} else {
+// Always capture boot diagnostics, including production failures before plugin initialization.
+// Only the collector sits in the entry chunk; the CONNECT streamer and the export load on demand
+// (the collector buffers everything until the streamer attaches).
+installDiagnosticsCollector();
+const diagnosticsStreamer = import('./core/diagnostics/rv-diagnostics-streamer');
+void diagnosticsStreamer.then(m => m.installDiagnosticsStreamer());
+setOnRootSaveDiagnostics(() => {
+  void import('./core/diagnostics/rv-diagnostics-export').then(m => m.exportDiagnostics({ minutes: 15 }));
+});
+ensureDiagnosticsExportCommandRegistered(commandRegistry);
+
+// The AGPL watermark is no longer hidden at runtime (plan-679 Phase 9): a build that must not show
+// it does not contain it — vite.config.ts removes it from index.html unless this is a pure AGPL
+// build (__RV_AGPL_ATTRIBUTION__). RV_COMMERCIAL only decides installability.
+if (!__RV_COMMERCIAL__) {
   // Public/community builds are not installable as an app (the manifest link is
   // stripped at build time); this also suppresses any remaining install prompt.
   window.addEventListener('beforeinstallprompt', (e) => e.preventDefault());
@@ -71,10 +99,13 @@ if (__RV_COMMERCIAL__) {
 import { SensorMonitorPlugin } from './plugins/sensor-monitor-plugin';
 import { TransportStatsPlugin } from './plugins/transport-stats-plugin';
 import { CameraEventsPlugin } from './plugins/camera-events-plugin';
+import { SoundSystemPlugin } from './plugins/sound-system-plugin';
 import { DriveOrderPlugin } from './plugins/drive-order-plugin';
 import { IKPathVisualizerPlugin } from './plugins/ik-path-visualizer-plugin';
 import { PathVisualizerPlugin } from './plugins/path-visualizer-plugin';
+import { PathNetworkUiPlugin } from './plugins/path-network/path-network-ui-plugin';
 import { AgvScannerFieldPlugin } from './plugins/agv-scanner-field-plugin';
+import { PathTracePlugin } from './plugins/path-trace-plugin';
 import { IKTargetEditPlugin } from './plugins/ik-target-edit-plugin';
 import { DriveAxisGizmoPlugin } from './plugins/drive-axis-gizmo-plugin';
 import { MuInteractionPlugin } from './plugins/mu-interaction-plugin';
@@ -87,6 +118,9 @@ import { ClippingPlugin } from './plugins/rv-clipping-plugin';
 import { OrientationGizmoPlugin } from './plugins/rv-orientation-gizmo-plugin';
 import { WebErrorPlugin } from './plugins/web-error-plugin';
 import { CollisionAlertPlugin } from './plugins/collision-alert-plugin';
+import { DropAlertPlugin } from './plugins/drop-alert-plugin';
+import { AasLinkPlugin } from './plugins/aas-link-plugin';
+import { OrderManagerPlugin } from './plugins/order-manager-plugin';
 import { installAasResolution } from './plugins/aas-resolution';
 import {
   registerModelOptionModules,
@@ -94,27 +128,38 @@ import {
   type ModelOptionsModule,
 } from './plugins/models/model-option-plugin';
 import { CustomRuntimeInstructionPlugin } from './plugins/custom-runtime-instruction-plugin';
+import { MaintenancePlugin } from './plugins/demo/maintenance-plugin';
 import { WebComponentPlugin } from './plugins/web-component-plugin';
 import { ConnectionSystemPlugin } from './plugins/connection-system-plugin';
 import { ConnectionGizmoPlugin } from './plugins/connection-gizmo-plugin';
+import { UsdLiveLinkPlugin } from './plugins/usd-live-link/usd-live-link-plugin';
 
 // Extras editor plugin (hierarchy browser + property editor)
 import { RvExtrasEditorPlugin } from './core/hmi/rv-extras-editor';
 
-// Layout Planner (public — private extensions can attach via setExtension())
-import { LayoutPlannerPlugin } from './plugins/layout-planner';
+// Snap tools (the Layout Planner chunk is loaded before viewer creation in init()).
 import { SnapPointPlugin } from './plugins/snap-point';
 import { SnapFlipIconOverlay } from './plugins/snap-point/snap-flip-icon-overlay';
 
 // SimController: Play/Pause-Toggle + Reset (TopBar toolbar widget).
 import { SimControllerPlugin } from './plugins/sim-controller';
 
+// plan-630: owner of the planning registry. The window itself is imported
+// dynamically, the first time a model declares a planning parameter.
+import { PlanningParametersPlugin } from './plugins/planning-parameters';
+import { VariantsPlugin } from './plugins/variants';
+
 // DES workspace shell (plan-198) — UI surface for the DES mode.
 import { DESWorkspacePlugin } from './plugins/des/des-workspace-plugin';
+// plan-680: the on-demand DES feature is core code (declared here, body lazy).
+import { registerDesFeature } from './features/des.register';
+import { StatsHubPlugin } from './core/stats/stats-hub-plugin';
+import { registerPerformanceStats } from './core/planning/rv-planning-kpis';
 
 // Scene window: multi-scene browser + layout registry
 import { initSceneStore } from './core/hmi/scene/scene-store-singleton';
 import { installSignalRenameWiring } from './core/hmi/signal-rename-wiring';
+import { installEditRefusalWiring } from './core/hmi/edit-refusal-wiring';
 import { migrateLegacyAutosave } from './core/hmi/scene/layout-registry';
 import { resolvePublishedSceneParam } from './core/hmi/scene/rv-published-scenes';
 import { readActiveId, listMetas } from './core/hmi/scene/rv-scene-storage';
@@ -126,9 +171,10 @@ import { arrayBufferOf } from './core/project/rv-scene-record';
 import { getProjectStore } from './core/project/project-store';
 import { createDocument } from './core/project/rv-document-ops';
 import { newDocumentFolderFor, newDocumentNameFor } from './core/hmi/projects/dashboard-documents';
-import { setPendingAssetOpen } from '@rv-private/plugins/asset-editor/pending-open-store';
+import { setPendingAssetOpen } from '@rv-private/plugins/asset-editor/shared/pending-open-store';
 import { scriptRefForModelUrl } from './core/project/rv-project-refs';
 import { requestProjectCodeConsent } from './core/project/rv-project-code-consent';
+import { readTrackedBody } from './core/engine/rv-script-trust';
 
 import {
   clearAllOverrides as clearAllPluginOverrides,
@@ -141,8 +187,11 @@ import {
 import { resolveSceneRoute, sceneUrlToDocumentUrl } from './core/project/rv-doc-alias';
 import { documentsOf, findStartDocument } from './core/project/rv-project-documents';
 import {
-  diagnoseKioskBoot, projectStartDocument, resolveResumeTarget, resolveHostedBoot, resolveServedProjectUrl,
+  diagnoseKioskBoot, projectStartDocument, resolveResumeTarget, resolveHostedBoot, resolveDeepLinkBoot, resolveServedProjectUrl,
 } from './core/project/rv-project-open';
+import { readProjectStart } from './core/project/rv-project-types';
+import { attachModeOwnedPanelReconciler } from './core/hmi/mode-owned-panels';
+import { reportProblem } from './core/hmi/problems-store';
 import { forgetRememberedSession, readRememberedSession } from './core/project/rv-project-resume-store';
 import { reportMissingDocument } from './core/hmi/scene/rv-scene-live-sync';
 import { openProjectsDashboard } from './core/hmi/projects/projects-dashboard-store';
@@ -150,7 +199,11 @@ import { DEMO_PROJECT_FOLDER, DEMO_BASE_PATH } from './core/project/backends/bun
 import { getLibraryStore } from './core/library/library-store-singleton';
 import { installProjectLibraryProvider } from './core/library/project-library-provider';
 import { installGlobalLibraryProvider } from './core/library/global-library-provider';
-import { readProjectLibraries } from './core/library/project-libraries';
+import { libraryRefsSignature, readProjectLibraries } from './core/library/project-libraries';
+import { withBundledCatalogAsLibraryProject } from './core/library/library-origin';
+import { createAppLibraryProjectLoader } from './core/library/library-project-backends';
+import { setLibraryProjectLoader } from './core/library/library-project-loader';
+import { installLibraryProjectsProvider } from './core/library/library-projects-provider';
 import { getCadGlbCacheSize, clearCadGlbCache } from './core/import/rv-cad-glb-cache';
 
 // CONNECT gateway plugin (NavButton + LeftPanel for interface management)
@@ -198,7 +251,7 @@ const LS_KEY_RENDERER = 'rv-webviewer-renderer';
 // Mobile/touch devices always use WebGL — WebGPU is desktop-only unless explicitly overridden.
 const params = new URLSearchParams(window.location.search);
 const isTouchDevice = isMobileDevice();
-const rendererParam = params.get('renderer') ?? localStorage.getItem(LS_KEY_RENDERER);
+const rendererParam = params.get('renderer') ?? readLocalStorage(LS_KEY_RENDERER);
 const rendererKind: RendererKind =
   !isTouchDevice && (rendererParam === 'webgpu' || rendererParam === 'webgpu-gl')
     ? rendererParam
@@ -209,9 +262,8 @@ const loadingOverlay = document.getElementById('loading-overlay')!;
 const loadingStatus = document.getElementById('loading-status')!;
 const loadingLabel = document.getElementById('loading-label')!;
 const loadingModelName = document.getElementById('loading-model-name')!;
-const loadingProgressBar = document.getElementById('loading-progress-bar')!;
 const loadingProgressPct = document.getElementById('loading-progress-pct')!;
-const loadingProgressWrap = loadingProgressBar.parentElement?.parentElement ?? null;
+const loadingProgressWrap = loadingProgressPct.parentElement;
 const loadingError = document.getElementById('loading-error')!;
 const loadingErrorDetail = document.getElementById('loading-error-detail')!;
 const loadingRetryBtn = document.getElementById('loading-retry-btn') as HTMLButtonElement;
@@ -240,8 +292,6 @@ let loadingFraction = 0;
 function setLoadingStep(fraction: number, step: number, text: string) {
   if (fraction < loadingFraction) return;
   loadingFraction = fraction;
-  loadingProgressBar.classList.remove('indeterminate');
-  loadingProgressBar.style.transform = `scaleX(${fraction})`;
   loadingProgressPct.textContent = text;
   splashRobot.setStep(step);
 }
@@ -252,11 +302,28 @@ onLoadPhase((label, phase) => {
   if (step) setLoadingStep(step[0], step[1], step[2]);
 });
 
+// The robot splash is the BOOT experience: it runs for the first model of a
+// page session (a browser reload starts a new one). Switching scenes later
+// keeps the HMI on screen and masks the swap with the small scene-transition
+// overlay instead. A retry from the splash's error card stays on the splash.
+let splashLoadDone = false;
+let switchTransitionToken: SceneTransitionToken | null = null;
+
+async function showModelLoadIndicator(modelName: string) {
+  if (!splashLoadDone || !loadingOverlay.classList.contains('hidden')) {
+    showLoadingOverlay(modelName);
+    return;
+  }
+  hideInfoOverlay();
+  reportModelLoadStart(modelName);
+  const token = await showSceneTransition(`Loading ${modelName}…`);
+  if (switchTransitionToken !== null) hideSceneTransition(switchTransitionToken);
+  switchTransitionToken = token;
+}
+
 function showLoadingOverlay(modelName: string) {
   loadingLabel.textContent = 'Loading ';
   loadingModelName.textContent = modelName;
-  loadingProgressBar.classList.add('indeterminate');
-  loadingProgressBar.style.transform = '';
   loadingProgressPct.textContent = '';
   hideLoadingError();
   splashRobot.reset();
@@ -282,6 +349,10 @@ function showLoadingError(detail: string) {
   // The store goes idle — whoever was showing progress (the hero) stops; the
   // splash's own error card with Retry is the one error surface.
   reportModelLoadEnd();
+  if (switchTransitionToken !== null) {
+    hideSceneTransition(switchTransitionToken);
+    switchTransitionToken = null;
+  }
   splashRobot.fault(true);
   if (loadingProgressWrap) loadingProgressWrap.style.display = 'none';
   loadingStatus.style.display = 'none';
@@ -302,15 +373,13 @@ function hideLoadingError() {
 function setLoadingRetrying(attempt: number, total: number) {
   loadingLabel.textContent = `Connection problem — retrying (${attempt}/${total})…`;
   loadingModelName.textContent = '';
-  loadingProgressBar.classList.add('indeterminate');
-  loadingProgressBar.style.transform = '';
   loadingProgressPct.textContent = '';
 }
 
 function setLoadingProgress(loaded: number, total: number) {
   // Download finished — what's left is GLB parse + scene construction, which
-  // report no byte progress. Hand off to the indeterminate "preparing" state so
-  // the bar doesn't sit deceptively full while seconds of work remain.
+  // report no byte progress. Hand off to the "preparing" state so
+  // the splash does not claim "done" while seconds of work remain.
   if (total > 0 && loaded >= total) {
     setLoadingPreparing();
     return;
@@ -330,6 +399,11 @@ function setLoadingPreparing() {
 
 function hideLoadingOverlay() {
   reportModelLoadEnd();
+  if (switchTransitionToken !== null) {
+    hideSceneTransition(switchTransitionToken);
+    switchTransitionToken = null;
+  }
+  if (loadingOverlay.classList.contains('hidden')) return;
   // The belt fills at once, so the fade shows the finished cell without
   // delaying the scene by a frame.
   splashRobot.finish();
@@ -344,6 +418,38 @@ function hideLoadingOverlay() {
     loadingOverlay.classList.remove('fade-out');
   }, 600);
 }
+
+// ── Runtime warm-up, as the STANDARD loading overlay (plan-673) ─────────────
+//
+// Thomas: *"for loading info use standard overlay window like in loading if
+// needed"* — so no HUD of its own and no second text. A lazy feature's runtime
+// (the walker's 8.2 MB of MuJoCo + ONNX WASM, measured 8-17 s cold) reports a
+// FACT into `runtime-warmup-store`, and this — the one place that owns loading
+// presentation — turns it into the ordinary scene-transition overlay.
+//
+// Why that overlay and not the branded splash: the model is already complete
+// and on screen, so the wait is non-destructive. `showDelayed` is built for
+// exactly that case and brings the two properties Thomas asked for with it: a
+// 200 ms on-delay, so a WARM cache shows nothing at all instead of flashing,
+// and a 400 ms minimum once it is up. It also stays suppressed while the splash
+// is still visible, so the two indicators are sequential, never stacked.
+//
+// It is held only as long as needed: the owner of the runtime ends its warm-up
+// the moment it is running (or has failed), and the token is released here.
+let runtimeWarmupToken: SceneTransitionToken | null = null;
+
+function syncRuntimeWarmupOverlay() {
+  const { active, label } = getRuntimeWarmupSnapshot();
+  if (active && runtimeWarmupToken === null) {
+    runtimeWarmupToken = showSceneTransitionDelayed(`Starting ${label}…`);
+  } else if (!active && runtimeWarmupToken !== null) {
+    hideSceneTransition(runtimeWarmupToken);
+    runtimeWarmupToken = null;
+  }
+}
+
+subscribeRuntimeWarmup(syncRuntimeWarmupOverlay);
+syncRuntimeWarmupOverlay();
 
 /**
  * Escape hatch for the "a huge scene locks me out on every reload" trap. When
@@ -457,45 +563,10 @@ async function downloadGlb(
     try {
       const resp = await fetch(url, { signal: controller.signal });
       if (!resp.ok) throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
-      const len = parseInt(resp.headers.get('content-length') || '0', 10);
-
-      // Streamed path: single pre-sized buffer + byte-accurate progress.
-      if (resp.body && len > 0) {
-        const buf = new Uint8Array(len);
-        const reader = resp.body.getReader();
-        let offset = 0;
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (offset + value.byteLength > len) {
-            // Actual bytes exceed content-length (compressed transfer-encoding) —
-            // switch to a growable collector seeded with what we already have.
-            const parts: Uint8Array[] = [buf.slice(0, offset), value];
-            let extraLen = offset + value.byteLength;
-            for (;;) {
-              const r = await reader.read();
-              if (r.done) break;
-              parts.push(r.value);
-              extraLen += r.value.byteLength;
-            }
-            clearTimeout(timer);
-            const out = new Uint8Array(extraLen);
-            let o = 0;
-            for (const c of parts) { out.set(c, o); o += c.byteLength; }
-            return out.buffer;
-          }
-          buf.set(value, offset);
-          offset += value.byteLength;
-          setLoadingProgress(offset, len);
-        }
-        clearTimeout(timer);
-        if (offset === len) return buf.buffer;
-        throw new Error(`incomplete download (${offset}/${len} bytes)`);
-      }
-
-      // No content-length / no readable stream → single buffer, indeterminate bar.
-      setLoadingPreparing();
-      const data = await resp.arrayBuffer();
+      // Streamed into one buffer with byte progress (no content-length → no
+      // progress). `readTrackedBody` also records the script-trust provenance of
+      // exactly this buffer (rv-script-trust.ts): final URL, never a redirect.
+      const data = await readTrackedBody(resp, { onProgress: setLoadingProgress, onNoProgress: setLoadingPreparing });
       clearTimeout(timer);
       return data;
     } catch (e) {
@@ -517,6 +588,9 @@ async function init() {
   // bar as the very first thing, before any network request or the Teams block
   // below reads window.location.hash.
   initFragmentSecret();
+  const plannerModule = import('./plugins/layout-planner');
+  // Handle early failures during boot gates; keep the original rejection for await below.
+  void plannerModule.catch(() => {});
 
   // --- Microsoft Teams integration ---
   // When running inside a Teams tab (?teams=1), dynamically import the Teams JS SDK
@@ -548,7 +622,13 @@ async function init() {
   }
 
   // --- Load App Config (MUST complete before React mount — no flicker) ---
-  const appConfig = await fetchAppConfig();
+  // Dev server only (plan-615 F3): the dev toolbar's view switch decides
+  // whether the delivery's view keys (mode.lock, lockSettings, lockedTabs, ui)
+  // are applied. Without an explicit choice the loaded config is returned
+  // unchanged. `RV_SERVE_INFO` is the literal null in every build, so this
+  // branch and the module behind it are dropped there.
+  const loadedConfig = await fetchAppConfig();
+  const appConfig = RV_SERVE_INFO !== null ? applyBootViewProfile(loadedConfig) : loadedConfig;
 
   // URL param override for lockSettings (highest priority)
   if (params.has('lockSettings')) {
@@ -635,6 +715,19 @@ async function init() {
     }
   }
 
+  // --- Terms gate (plan-2209) ---
+  // Public demo build: blocking, versioned clickwrap for the demo terms (EULA
+  // Part B §13.8(5)); commercial customer workspace on the dev server: one-time
+  // licence acknowledgement for the developer. Runs BEFORE the analytics gate
+  // (two separate decisions, never one click) and before the viewer exists.
+  // The mode is the build define alone — no runtime exclusion — and every other
+  // build drops this branch together with the dynamic chunk. The gate never
+  // touches the URL, so `?doc=` / `?mode=` / the hash survive the dialog.
+  if (__RV_TERMS_GATE__ !== 'off') {
+    const { requireTermsConsent } = await import('./core/hmi/terms-gate');
+    await requireTermsConsent();
+  }
+
   // --- Analytics consent gate ---
   // When a tracker is configured (settings.json analytics.googleAnalyticsId), GA
   // may not load without prior opt-in (GDPR / §25 TDDDG). Block boot until the
@@ -701,15 +794,26 @@ async function init() {
   applyUIBlurScale(initialSettings.uiBlurScale);
 
   // --- Create Viewer ---
+  let loadedPlanner: Awaited<typeof plannerModule>;
+  try {
+    loadedPlanner = await plannerModule;
+  } catch (error) {
+    loadingRetryBtn.onclick = () => window.location.reload();
+    loadingReloadBtn.onclick = () => window.location.reload();
+    showLoadingError(`Could not load the layout planner: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  const { LayoutPlannerPlugin } = loadedPlanner;
   const viewer = await RVViewer.create(container, { renderer: rendererKind, antialias: wantAntialias, plannerSignalLinking: true });
+  void diagnosticsStreamer.then(m => m.attachDiagnosticsViewer(viewer));
 
   // Apply persisted DPR cap (runtime-changeable, no reload needed)
   viewer.maxDpr = initialSettings.maxDpr;
 
-  // AAS resolvability is decided centrally and marked on the nodes. Installed on
-  // the viewer (not only in AasLinkPlugin) because that plugin is not loaded in
-  // every mode — the layout planner would otherwise leave links unclassified,
-  // and unclassified means invisible (plan-373 F1/F2b).
+  // AAS resolvability is decided centrally and marked on the nodes, on the
+  // viewer and not in AasLinkPlugin: it must run in every mode and before the
+  // plugin's deferred model work (its `model-loaded` listener is registered
+  // here, before any plugin, so it runs first — plan-373 F1/F2b, plan-682 §2.1).
   installAasResolution(viewer);
 
   // Apply persisted visual settings NOW — before any model load. This kicks
@@ -728,6 +832,7 @@ async function init() {
 
   // Expose viewer globally for console debugging
   (window as unknown as { viewer: RVViewer }).viewer = viewer;
+  await installRecordingSeam(viewer);
 
   // --- Analytics: distinguish what the visitor views (no-op unless GA configured + consented) ---
   // Standard demo (model_view: DemoRealvirtualWeb) vs. Planner demo (workspace_mode: planner), etc.
@@ -805,6 +910,7 @@ async function init() {
     .use(new SensorMonitorPlugin(), 'core')
     .use(new TransportStatsPlugin(), 'core')
     .use(new CameraEventsPlugin(), 'core')
+    .use(new SoundSystemPlugin(), 'core')
     .use(new CameraStartPosPlugin(), 'core')
     .use(new CameraFollowPlugin(), 'core')
     // plan-740: the AI agent's camera body. Core because every mode's
@@ -816,7 +922,21 @@ async function init() {
     .use(new ClippingPlugin(), 'core')
     .use(new WebErrorPlugin(), 'core')
     .use(new CollisionAlertPlugin(), 'core')
+    // plan-2022: the unsupported-part cards sit right under the collision ones
+    // and share their whole module subtree (TileCard, severity-pulse, MUI Box
+    // and Button), so this adds no module to the main chunk that is not in it
+    // already — eager for symmetry with its sibling, and it renders nothing
+    // while no part is reported.
+    .use(new DropAlertPlugin(), 'core')
+    // plan-682: AAS (button, AAS mode, index metadata, datasheet hover) and the
+    // Order Cart exist in EVERY delivery with AAS links — the hosted project
+    // ones without a plugin package included. Both gate their own UI on a
+    // resolvable AAS link; model packs must not register them again.
+    .use(new AasLinkPlugin(), 'core')
+    .use(new OrderManagerPlugin(), 'core')
     .use(new CustomRuntimeInstructionPlugin(), 'core')
+    // plan-522 Phase 6: guided maintenance on every model (tiles in the message panel).
+    .use(new MaintenancePlugin(), 'core')
     .use(new RvExtrasEditorPlugin(), 'core')
     .use(new ConnectPlugin(), 'core')
     // plan-498 Phase 3: runs `Fmu` instances in CONNECT (upload, consent dialog,
@@ -841,10 +961,18 @@ async function init() {
     .use(new SnapPointPlugin(), 'core')
     .use(new SnapFlipIconOverlay(), 'core')
     .use(new SimControllerPlugin(), 'core')
+    // plan-630: the planning registry. Costs nothing on a document without
+    // planning parameters — no window is mounted and its module stays unloaded.
+    .use(new PlanningParametersPlugin(), 'core')
+    .use(new VariantsPlugin(), 'core')
     .use(new IKPathVisualizerPlugin(), 'core')
     .use(new PathVisualizerPlugin(), 'core')
+    // plan-628 Phase 5: path-network planner UI (catalog, ghost, block gizmo) — after the visualizer.
+    .use(new PathNetworkUiPlugin(), 'core')
     // plan-558: AGV scanner fields on the floor (overlay category 'safety-fields', default off).
     .use(new AgvScannerFieldPlugin(), 'core')
+    // plan-629: congestion trace bands along the path network (overlay categories 'trace-blocked' / 'trace-utilization', default off).
+    .use(new PathTracePlugin(), 'core')
     .use(new IKTargetEditPlugin(), 'core')
     .use(new DriveAxisGizmoPlugin(), 'core')
     // plan-567: Commissioning — remove (Delete / context menu) and drag workpiece carriers.
@@ -857,7 +985,12 @@ async function init() {
     // Typed connections (plan-259): rv-ODT Connections block lifecycle,
     // StopOnExit dispatch + cable visualization (overlay category 'connections').
     .use(new ConnectionSystemPlugin(), 'core')
-    .use(new ConnectionGizmoPlugin(), 'core');
+    .use(new ConnectionGizmoPlugin(), 'core')
+    // plan-637: USD button (Export / Import / Sync) + one-way live link into
+    // Isaac Sim. Core so the button exists in every workspace (its own
+    // visibility rule keeps it in the editor and planner); it never connects
+    // before the user switches Sync on.
+    .use(new UsdLiveLinkPlugin(), 'core');
 
   // --- Lazy Plugins (code-split, loaded on demand) ---
   viewer.registerLazy('gaussian-splat', () =>
@@ -932,11 +1065,42 @@ async function init() {
   const { UnifiedImportPlugin } = await import('./plugins/unified-import');
   viewer.use(new UnifiedImportPlugin(), 'core');
 
+  // --- SpaceMouse navigation (plan-2215 Phase 8 core release, Thomas 2026-11-04).
+  // AGPL core plugin: WebHID 3D mouse plus the shared SixDofNavInput that the
+  // private flystick bridge feeds. The dynamic import keeps the HID/nav code off
+  // the eager startup graph (plan-779 ratchet); awaited so the plugin exists
+  // before the private plugins look it up. Registered only here — the private
+  // internal adapter that carried it during the preview is gone.
+  const { SpaceMousePlugin } = await import('./plugins/spacemouse-plugin');
+  viewer.use(new SpaceMousePlugin(), 'core');
+
   // --- Register Private Plugins (no-op in public build) ---
   // Awaited: internal-tier features load via a __RV_INTERNAL__-gated dynamic
   // import and must finish registering (modes, components) before the mode
   // registration below and the mode-boot block later in this function.
+  // plan-652: the build's feature chunk table (bytes per feature for the [feature] lines and
+  // DevTools). Fire-and-forget, no await — the boot order stays untouched; a dev server has none.
+  void loadFeatureChunks();
+  // plan-652 §2.4.6: once the first model is on screen, prefetch (download only, no parse) the
+  // chunks of every declared, inactive feature when the browser is idle — gated to fine pointers,
+  // no Save-Data, no slow connection. Never before the first model (plan-598 boot lesson).
+  let idlePrefetchScheduled = false;
+  viewer.on('model-loaded', () => {
+    if (idlePrefetchScheduled) return;
+    idlePrefetchScheduled = true;
+    void loadFeatureChunks().then(() => scheduleIdlePrefetch(viewer.features));
+  });
+  registerFeatureRetryCommand(commandRegistry);
+  installPreloadErrorHandler();
+  viewer.use(new StatsHubPlugin(), 'core');
+  registerPerformanceStats(viewer);
+  // plan-680: DES is declared by the core (lazy body), before the private features.
+  registerDesFeature(viewer);
   await registerPrivatePlugins(viewer);
+  // plan-762 F3: a persisted / URL render mode that needs a backend registered
+  // by the private plugins (raytraced) was left pending by applyVisualSettings —
+  // enter it now if its backend is registered, else fall back and fix the store.
+  viewer.resolvePendingRenderMode();
 
   // --- Smooth-motion provider gate (plan-281 Finding #14) ---
   // The jerk-limited drive core must be decided BEFORE the first model loads:
@@ -978,11 +1142,22 @@ async function init() {
   // which runs inside registerPrivatePlugins above. A community build has no
   // editor, so the dropdown must not offer a mode that would open an empty shell.
   if (connectEmbedEnabled) attachConnectEmbedModeManager(viewer.modes);
+  // A mode-owned docked panel (planner library, editor kinematics/materials) is
+  // open only while an owning mode is active. The boot restore below
+  // (`leftPanelManager.restore()`) reopens whatever this ORIGIN last persisted,
+  // and a boot straight into HMI never runs the owner's `onModeDeactivate` —
+  // without this the right slot kept 340 px reserved for a panel nothing renders
+  // (customer hosted link, plan-640 follow-up). See core/hmi/mode-owned-panels.ts.
+  attachModeOwnedPanelReconciler({
+    leftPanelManager: viewer.leftPanelManager,
+    modes: viewer.modes,
+    on: (event, cb) => viewer.on(event, () => cb()),
+  });
 
   // ── The generic kiosk lock (plan-721 F5) ──────────────────────────────
   //
   // `settings.mode.lock` is the declared form of what CONNECT-embed and the
-  // Mauser/Toray plugins do in code. It is applied HERE, immediately after the
+  // the large CAD line/a CAD-import showcase model plugins do in code. It is applied HERE, immediately after the
   // modes are registered, and that placement is the whole contract:
   // `resolveResumeTarget` below reads `viewer.modes.lockedMode`, so a lock
   // applied later — in the model-plugin hook the project plugins use, which
@@ -1054,7 +1229,7 @@ async function init() {
         for (const pm of privateModels) {
           // `project` is carried through: every private project's models come
           // down this one endpoint, and a model belongs to exactly one of them.
-          // Dropping the tag here is what used to put Toray's and Mauser's GLBs
+          // Dropping the tag here is what used to put a CAD-import showcase model's and the large CAD line's GLBs
           // into the DemoRealvirtual project's Models list.
           entries.push({ filename: pm.filename, url: pm.url, project: pm.project });
         }
@@ -1116,17 +1291,6 @@ async function init() {
       }
     }
   } catch { /* no demo folder on this deploy — nothing to add */ }
-
-  // Discover local working folder models (File System Access API, Chrome/Edge only)
-  if (isFsApiSupported()) {
-    try {
-      const localFiles = await listSubfolderFiles('models', ['.glb']);
-      for (const f of localFiles) {
-        const blobUrl = await readFileAsUrl(f.handle);
-        entries.push({ filename: f.name, url: blobUrl });
-      }
-    } catch { /* permission denied or handle expired — skip silently */ }
-  }
 
   // Models published to a running CONNECT gateway (plan-365 §2.1). Laid over the
   // catalogue resolved above, never replacing it: `models.json` stays authoritative
@@ -1234,6 +1398,7 @@ async function init() {
   // nowhere else — re-deriving them later would mean a second fetch and a
   // second chance to disagree with what was actually resolved.
   let servedProjectUrl: string | null = null;
+  let servedFromQuery = false; // plan-2018: the served project came from ?projectUrl=
   let servedProjectManifestOk = false;
 
   // The workspace root is retired (plan-743). Its keys are dropped BEFORE the
@@ -1273,6 +1438,7 @@ async function init() {
       document.baseURI,
     );
     servedProjectUrl = urlProjectRoot;
+    servedFromQuery = (urlParams.get('projectUrl') ?? '').trim() !== '';
     await getProjectStore().resolveActiveProject({
       bundledBackend: bundled,
       ...(urlProject ? { projectId: urlProject } : {}),
@@ -1306,9 +1472,11 @@ async function init() {
   getProjectStore().attachToSceneStore(sceneStore);
 
   // plan-590: the signal-rename coordinator intercepts undo / redo of its tagged entries in the
-  // scene document and in every asset document the editor opens — from the moment they open, so a
+  // planner's document and in every document the editor opens — from the moment they open, so a
   // tagged entry from a reloaded session is refused instead of being undone model-only.
   installSignalRenameWiring(viewer);
+  // plan-614 F1: an editor edit refused AFTER it started (rolled back) is toasted, not swallowed.
+  installEditRefusalWiring(viewer);
 
   // ── User plugin overrides: restore what the user switched off (plan-435) ──
   // Placed after the last `viewer.use()` and after project resolution, but
@@ -1323,7 +1491,7 @@ async function init() {
       getProjectStore().getProject()?.id ?? null,
       // No model is loaded yet, so the last-model key is the best stand-in for
       // "which model is about to open" when no project is active.
-      (() => { try { return localStorage.getItem('rv-webviewer-last-model'); } catch { return null; } })(),
+      readLocalStorage(LS_KEY_MODEL),
     );
     if (scope !== null) {
       viewer.applyPersistedPluginOverrides(loadPluginOverrides(scope));
@@ -1382,7 +1550,13 @@ async function init() {
 
   async function loadModel(
     url: string,
-    options?: { overlay?: RVExtrasOverlay; identityUrl?: string; data?: ArrayBuffer },
+    options?: {
+      overlay?: RVExtrasOverlay; identityUrl?: string; data?: ArrayBuffer;
+      /** The scene carries edits (forwarded to `viewer.loadModel`; script trust input). */
+      editedScene?: boolean;
+      /** plan-769 Phase 7 — forwarded to `viewer.loadModel` (see there). */
+      baselinePlacements?: NonNullable<Parameters<RVViewer['loadModel']>[1]>['baselinePlacements'];
+    },
   ) {
     // `url` is where the bytes come from; `identityUrl` (set by loadScene when a
     // workspace resumed from a stored body) is which model they ARE. They differ
@@ -1397,8 +1571,8 @@ async function init() {
       ?? (identityUrl.split('/').pop() ?? identityUrl).split('?')[0].replace(/\.glb$/i, '');
     lastLoadRequest = { url, options };
     if (!connectEmbedEnabled) {
-      showLoadingOverlay(modelName);
-      localStorage.setItem(LS_KEY_MODEL, identityUrl);
+      writeLocalStorage(LS_KEY_MODEL, identityUrl);
+      await showModelLoadIndicator(modelName);
     }
 
     try {
@@ -1428,6 +1602,13 @@ async function init() {
       // has verified the key before anything is fetched; here the bytes only
       // need to be passed through the one decrypt seam. Without a key this
       // throws `EncryptedWithoutKeyError` — never ciphertext into the parser.
+      const decryptingLabel = decryptingStatusFor(data);
+      if (decryptingLabel) {
+        // Honest security cue: the user sees the file is protected. Yield one
+        // task so the line paints before the (synchronous-feeling) decrypt.
+        setLoadingStep(DOWNLOAD_SHARE, READ_STEP, decryptingLabel);
+        await new Promise<void>((r) => setTimeout(r, 0));
+      }
       data = await decryptServedBytes(data, url);
 
       const sizeMB = (data.byteLength / (1024 * 1024)).toFixed(1) + ' MB';
@@ -1454,6 +1635,7 @@ async function init() {
       const loadTime = ((performance.now() - loadStart) / 1000).toFixed(1) + 's';
       viewer.lastLoadInfo = { glbSize: sizeMB, loadTime };
       logInfo(`Model loaded: ${sizeMB}, ${loadTime}, ${result.drives.length} drives`);
+      splashLoadDone = true;
       hideLoadingOverlay();
       if (getConnectEmbedSnapshot().state === 'loading') completeConnectEmbedDemoLoad();
       return { ok: true } as const;
@@ -1598,6 +1780,12 @@ async function init() {
   // come from the `scenes/index.json` catalogue that plan abolished.
   let publishedBootMode: string | null = null;
 
+  // The mode the hosted start document asks for (plan-640, `project.json` →
+  // `settings.start.mode`). Set only when the hosted branch below opened that
+  // document; applied in the mode-boot chain after `?mode=`, before
+  // `publishedBootMode`.
+  let hostedStartMode: string | null = null;
+
   // The mode half of the resumed session (plan-703 decision 24) — set by the
   // resume block below and applied in the same mode-boot chain. The mode
   // follows the SESSION, and the session is per project, so this beats the
@@ -1622,6 +1810,44 @@ async function init() {
   // Assets tab able to show the project's own library and nothing else.
   installGlobalLibraryProvider(getLibraryStore());
 
+  // Library PROJECTS (plan-778): every project the open project names by id in
+  // `libraries[]` — and, transitively, what those name — as one read-only
+  // source each, plus the built-in realvirtual library (resolvable everywhere,
+  // Decision C). Installed here for the same reason as the two above: every
+  // boot path, before any await. The loader follows the project store through
+  // `syncProjectLibraries` below; with no project it holds the built-in only.
+  const libraryProjectLoader = createAppLibraryProjectLoader();
+  setLibraryProjectLoader(libraryProjectLoader);
+  installLibraryProjectsProvider(libraryProjectLoader);
+  libraryProjectLoader.setProject(withBundledCatalogAsLibraryProject(getProjectStore().getProject()));
+  // plan-778 Phase 2/3: a library that is locked / unknown / broken becomes a
+  // quiet Problems row with its repair (Grant / Locate folder…) and one summary
+  // line per project open; a customer project's realvirtual catalog URL is
+  // never rewritten on its own (Decision B) — a quiet Problems row offers
+  // Update (`library.migrate`). None of that is needed before the first frame
+  // and none of it takes part in RESOLUTION — the loader and the provider above
+  // stay eager, so a placement still sees its library source as pending — so
+  // the whole repair layer (commands, availability rows, reference update, and
+  // attach/detach + the folder picker behind them) is one lazy chunk
+  // (eager-source ratchet, plan-779). The order inside it is kept: the repairs
+  // are registry commands, so they exist before the first row is reported.
+  // Both installers sync once on install, so a library that failed before the
+  // chunk landed is still reported. The dashboard, the planner panel and the
+  // MCP bridge register the commands on their own (lazy) paths as before.
+  void Promise.all([
+    import('./core/library/library-commands'),
+    import('./core/library/library-availability'),
+    import('./core/library/library-reference-update'),
+  ]).then(([commands, availability, referenceUpdate]) => {
+    commands.ensureLibraryCommandsRegistered();
+    availability.installLibraryAvailability(libraryProjectLoader, {
+      getProjectId: () => getProjectStore().getProject()?.id ?? null,
+    });
+    referenceUpdate.installLibraryReferenceUpdate();
+  }).catch((e: unknown) => {
+    console.warn('[main] library repair layer failed to load:', e);
+  });
+
   // … and the user's own subscriptions come BACK here, not in the Layout
   // Planner. `restoreFromStorage` had exactly one caller: the planner plugin's
   // activation. Since the Add-Library verb moved to the Projects dashboard
@@ -1645,16 +1871,25 @@ async function init() {
   // ADDS libraries to the open project. Subscribing here rather than in the
   // dashboard covers every route into a project switch, not just that screen.
   //
-  // Keyed on the URL list itself, not the project id: re-applying the same
-  // list is not free (it re-reads the manifest rows and re-notifies), and an
-  // add made through the dashboard already applied its own change.
+  // Keyed on EVERY ref (projectId + url + hint, plan-778) and the project id,
+  // not on the URL list alone: re-applying the same list is not free (it
+  // re-reads the manifest rows and re-notifies), and an add made through the
+  // dashboard already applied its own change — but a `{projectId}` entry must
+  // re-sync the library loader, and two projects with the same refs differ in
+  // which ref is a self-reference. URL refs go to the catalog store, projectId
+  // refs to the loader, in the SAME step.
   let appliedLibraries = '';
+  const librarySignatureOf = (project: ReturnType<ReturnType<typeof getProjectStore>['getProject']>): string =>
+    JSON.stringify([project?.id ?? null, libraryRefsSignature(project)]);
   const syncProjectLibraries = (): void => {
-    const urls = readProjectLibraries(getProjectStore().getProject());
-    const signature = JSON.stringify(urls);
+    const project = getProjectStore().getProject();
+    const signature = librarySignatureOf(project);
     if (signature === appliedLibraries) return;
     appliedLibraries = signature;
-    void getLibraryStore().applyProjectLibraries(urls);
+    // plan-778 Phase 4: a still-listed bundled catalog URL reads as the library project.
+    const view = withBundledCatalogAsLibraryProject(project);
+    void getLibraryStore().applyProjectLibraries(readProjectLibraries(view));
+    libraryProjectLoader.setProject(view);
   };
   getProjectStore().subscribe(syncProjectLibraries);
 
@@ -1706,9 +1941,11 @@ async function init() {
       // Awaited here, and kept in sync from here on by the subscription above:
       // `subscribe` does not fire on subscribe, so the first project still
       // needs this call. The signature guard makes the pair idempotent.
-      const bootLibraries = readProjectLibraries(projectStore.getProject());
-      appliedLibraries = JSON.stringify(bootLibraries);
-      await getLibraryStore().applyProjectLibraries(bootLibraries);
+      const bootProject = projectStore.getProject();
+      appliedLibraries = librarySignatureOf(bootProject);
+      const bootView = withBundledCatalogAsLibraryProject(bootProject);
+      libraryProjectLoader.setProject(bootView);
+      await getLibraryStore().applyProjectLibraries(readProjectLibraries(bootView));
 
       // The plan-397 phase-7 op-log→GLB conversion used to run here. It is gone
       // with the rest of the JSON scene reader (plan-413 phase 6): a stored
@@ -1717,6 +1954,43 @@ async function init() {
     } catch (e) {
       console.warn('[main] Project restore skipped:', e);
     }
+
+    // ── Hosted start document (plan-640) — ONE switch for every place ──
+    //
+    // Computed HERE, right after `hydrateProjectScenes()` (only that fills the
+    // project — `resolveActiveProject()` merely resolves it) and before the
+    // implicit `?mode=planner` empty route below. `project.json` →
+    // `settings.start` applies only to a REAL hosted deploy: a served project,
+    // no kiosk lock (`lockedMode` is set from `mode.lock` far above), and the
+    // deploy's own `settings.json` marker `hostedDeploy: true`. A `?projectUrl=`
+    // boot anywhere else never carries the marker. This one value gates the
+    // implicit empty route, the active-scene restore and the hosted branch.
+    const hostedStart = servedProjectUrl && viewer.modes.lockedMode === null && appConfig.hostedDeploy === true
+      ? readProjectStart(getProjectStore().getProject())
+      : null;
+    // plan-2018: a `?projectUrl=` deep link without the deploy marker (and no
+    // kiosk lock) opens the project's start document (`settings.start`, else
+    // `defaultModel`) — it must beat the implicit planner empty route and the
+    // saved-active-scene restore exactly like the hosted start does.
+    const deepLinkProject = getProjectStore().getProject();
+    const deepLinkStart = servedProjectUrl && servedFromQuery
+      && viewer.modes.lockedMode === null && appConfig.hostedDeploy !== true
+      ? readProjectStart(deepLinkProject)
+      : null;
+    // The whole unlocked query boot (document, dashboard AND error verdict)
+    // keeps the implicit planner empty route and the saved-scene restore away.
+    const deepLinkApplies = resolveDeepLinkBoot({
+      servedProjectUrl,
+      servedFromQuery,
+      modeLocked: viewer.modes.lockedMode !== null,
+      hasDeployedManifest: servedProjectManifestOk,
+      documentCount: documentsOf(deepLinkProject).length,
+      hostedDeploy: appConfig.hostedDeploy === true,
+      start: deepLinkStart,
+      defaultModel: projectStartDocument(deepLinkProject),
+      documents: documentsOf(deepLinkProject),
+    }).suppressImplicitRoutes;
+    const hostedStartApplies = hostedStart !== null || deepLinkApplies;
 
     // ── URL routing for the unified Scene model ───────────────────────
     // ?scene=<id>             → open a saved scene by id (highest priority)
@@ -1796,9 +2070,14 @@ async function init() {
     // 2026-08-31: `?doc=` joined the list for the identical reason — the
     // planner demo's own link is `?doc=…&mode=planner`, and the synthesised
     // empty scene silently outranked the document it pointed at.
+    //
+    // plan-640: on a hosted deploy with a start document the IMPLICIT empty
+    // route is suppressed — `/<code>/?mode=planner` opens the start document in
+    // the planner. Explicit `?scene=empty` and `?doc=new` keep working.
     const plannerMode = params.get('mode') === 'planner';
+    // `?scene=` / `?model=`: shared-link parameters — do not rename (plan-777 P1).
     const urlScene = params.get('scene')
-      ?? ((urlDocNew || (plannerMode && !params.get('model') && !urlGlb && !urlDoc)) ? 'empty' : null);
+      ?? ((urlDocNew || (plannerMode && !params.get('model') && !urlGlb && !urlDoc && !hostedStartApplies)) ? 'empty' : null);
     if (urlScene) {
       try {
         if (urlScene === 'empty') {
@@ -1987,7 +2266,7 @@ async function init() {
     // needs (F11).
     const configModel = projectStartDocument(getProjectStore().getProject())
       ?? appConfig.defaultModel;
-    const savedModel = localStorage.getItem(LS_KEY_MODEL);
+    const savedModel = readLocalStorage(LS_KEY_MODEL);
 
     // Resolve configModel: match against discovered entries, or build a URL from filename/path
     let resolvedConfigModel: string | null = null;
@@ -2018,7 +2297,7 @@ async function init() {
       : null;
     if (savedModel && !savedEntry) {
       debug('config', `Saved model "${savedModel}" not available in this deploy — falling back to settings.json defaultModel`);
-      localStorage.removeItem(LS_KEY_MODEL);
+      removeLocalStorage(LS_KEY_MODEL);
     }
 
     // ── `?model=` gets the same basename resolution as the others (plan-737) ──
@@ -2068,7 +2347,12 @@ async function init() {
     // also writes `?scene=`, but reload-after-save without URL refresh,
     // bookmarks predating the URL-write fix, or future code paths that
     // forget to update the URL still recover here.
-    if (!sceneRouted) {
+    //
+    // plan-640: skipped when a hosted start document applies — every visitor of
+    // the bare hosted link sees the same start document, not whatever this
+    // browser last had open. The kiosk is excluded from `hostedStartApplies`,
+    // so its restore runs exactly as before.
+    if (!sceneRouted && !hostedStartApplies) {
       try {
         const activeId = readActiveId();
         if (activeId && await guardHeavyRestore(activeId)) {
@@ -2158,17 +2442,70 @@ async function init() {
           // opens only through its own `?doc=`, which routed above and never
           // reaches this branch. `defaultModel` is not consulted — the kiosk
           // branch below keeps its own start-document contract untouched.
+          //
+          // plan-640: the one opt-in exception — `hostedStart` (computed once
+          // after hydration) lets the root open `settings.start.document`.
           const hostedBoot = resolveHostedBoot({
             servedProjectUrl,
             modeLocked,
             hasDeployedManifest: servedProjectManifestOk,
             documentCount: documentsOf(project).length,
+            hostedDeploy: appConfig.hostedDeploy === true,
+            start: hostedStart ?? deepLinkStart,
+            documents: documentsOf(project),
+            servedFromQuery,
+            defaultModel: projectStartDocument(project),
           });
-          if (hostedBoot.kind === 'error') {
+          // plan-2018 (SOL 4): the deep-link autostart asks like the resume does
+          // for heavy CAD; a refusal shows the dashboard, no further fallback.
+          if (hostedBoot.kind === 'document' && hostedBoot.deepLink
+              && !await guardHeavyRestore(hostedBoot.docId, hostedBoot.docName)) {
+            hideLoadingOverlay();
+            openProjectsDashboard();
+            sceneRouted = true;
+          } else
+          if (sceneRouted) {
+            // deep-link start refused above
+          } else if (hostedBoot.kind === 'error') {
             console.error(`[main] Hosted boot failed (${hostedBoot.reason}): ${hostedBoot.detail}`);
             showLoadingError(`${hostedBoot.detail}\n\nChecked at ${new Date().toISOString()}.`);
             sceneRouted = true;
+          } else if (hostedBoot.kind === 'document') {
+            // The caller decides the mode (`hostedStartMode` in the mode-boot
+            // chain), so the row's stored mode is neither applied nor persisted.
+            try {
+              await sceneStore.openDocument(hostedBoot.docId, { name: hostedBoot.docName, modeDecidedByCaller: true });
+              hostedStartMode = hostedBoot.mode;
+              hideLoadingOverlay();
+            } catch (e) {
+              const cause = e instanceof Error ? e.message : String(e);
+              console.error(`[main] Hosted start document "${hostedBoot.docName}" failed to open:`, e);
+              showLoadingError(
+                `The start document "${hostedBoot.docName}" could not be opened: ${cause}\n\nChecked at ${new Date().toISOString()}.`,
+              );
+              reportProblem({
+                id: `hosted-start-failed:${hostedBoot.docId}`,
+                severity: 'error',
+                code: 'hosted-start-failed',
+                title: 'The hosted start document could not be opened',
+                detail: `project.json settings.start.document → "${hostedBoot.docName}" (${hostedBoot.docId}): ${cause}`,
+              });
+            }
+            // Routed either way: the error card IS the answer — the legacy
+            // model fallback below must never show a different machine.
+            sceneRouted = true;
           } else if (hostedBoot.kind === 'dashboard') {
+            if (hostedBoot.warning) {
+              console.warn(`[main] ${hostedBoot.warning}`);
+              const dl = hostedBoot.deepLink === true;
+              reportProblem({
+                id: dl ? 'projecturl-start-unresolved' : 'hosted-start-unresolved',
+                severity: 'warning',
+                code: dl ? 'projecturl-start-unresolved' : 'hosted-start-unresolved',
+                title: dl ? 'The project start document was not found' : 'The hosted start document was not found',
+                detail: `Project "${project?.name ?? projectId}": ${hostedBoot.warning}`,
+              });
+            }
             hideLoadingOverlay();
             openProjectsDashboard();
             sceneRouted = true;
@@ -2364,7 +2701,8 @@ async function init() {
   }
 
   // Workspace mode boot (plan-198). Precedence: ?mode= URL param (if a
-  // registered mode) > opened published example's catalogue mode > the resumed
+  // registered mode) > the hosted start document's mode (plan-640) > opened
+  // published example's catalogue mode > the resumed
   // project session's mode > persisted localStorage > 'hmi'. Applied AFTER the
   // model/scene has loaded so mode plugins
   // (e.g. Planner) see live model state in their onModeActivate hook. The legacy
@@ -2372,24 +2710,52 @@ async function init() {
   // now runs through the mode system.
   if (!connectEmbedEnabled) {
     const urlMode = params.get('mode');
-    if (urlMode && viewer.modes.has(urlMode)) {
-      viewer.modes.setMode(urlMode);
-      // `?doc=new&mode=editor` means "I want to build something": the empty
-      // document is on screen, so put the CAD import dialog up right away
-      // instead of leaving an empty stage and an unlabelled cube button.
-      if (params.get('doc') === 'new' && urlMode === 'editor') {
-        const { requestUnifiedImportOpen } = await import('./plugins/unified-import');
-        requestUnifiedImportOpen();
+    // plan-652: resolve the target FIRST (same precedence as always; the resumed
+    // session's mode sits above `restore()` because that answer is global and the
+    // pair is per project, but below the three statements about THIS load), then
+    // wait here — the one existing await point of the boot — for the target
+    // mode's on-demand feature (the Editor). Consent, splash and HMI mount are
+    // untouched; the loading overlay is still up while this waits.
+    const bootTarget = resolveBootMode({
+      locked: viewer.modes.lockedMode,
+      url: urlMode,
+      hostedStart: hostedStartMode,
+      published: publishedBootMode,
+      resume: resumeBootMode,
+    }, viewer.modes);
+    let bootFeatureFailed = false;
+    try {
+      await viewer.features.ensureForMode(bootTarget.mode);
+    } catch (e) {
+      // The loader already put up the Problems entry with a retry. There is no
+      // "old mode" at boot, so the workspace boots into HMI instead; switching
+      // to HMI also persists it, so a reload does not run into the same failure.
+      bootFeatureFailed = true;
+      console.error(`[main] boot mode '${bootTarget.mode}' could not be loaded — booting into hmi`, e);
+    }
+    if (bootFeatureFailed) {
+      if (viewer.modes.lockedMode === null) {
+        if (viewer.modes.has('hmi')) viewer.modes.setMode('hmi');
+      } else {
+        // A kiosk lock stays a lock: enter the locked mode as soon as a retry
+        // of the Problems entry has loaded its feature.
+        const lockedTarget = viewer.modes.lockedMode;
+        const off = viewer.features.subscribe(() => {
+          if (!viewer.features.isModeReady(lockedTarget)) return;
+          off();
+          viewer.modes.setMode(lockedTarget);
+        });
       }
-    } else if (publishedBootMode && viewer.modes.has(publishedBootMode)) {
-      viewer.modes.setMode(publishedBootMode);
-    } else if (resumeBootMode && viewer.modes.has(resumeBootMode)) {
-      // The resumed session's own mode (decision 24). Above `restore()` because
-      // that answer is global, and the pair is per project — but below the two
-      // above, which are statements about THIS load.
-      viewer.modes.setMode(resumeBootMode);
     } else {
-      viewer.modes.restore('hmi');
+      viewer.modes.setMode(bootTarget.mode);
+    }
+    // `?doc=new&mode=editor` means "I want to build something": the empty
+    // document is on screen, so put the CAD import dialog up right away
+    // instead of leaving an empty stage and an unlabelled cube button.
+    // Order (plan-652): ensureForMode → setMode → import dialog.
+    if (urlMode === 'editor' && viewer.modes.has(urlMode) && params.get('doc') === 'new' && !bootFeatureFailed) {
+      const { requestUnifiedImportOpen } = await import('./plugins/unified-import');
+      requestUnifiedImportOpen();
     }
   }
 
@@ -2407,6 +2773,14 @@ async function init() {
   // --- Dev-only: test runner + debug endpoint ---
   if (import.meta.env.DEV) {
     initTestRunner();
+    // The React dev build's performance track fills the unbounded User-Timing buffer with one
+    // `performance.measure` (+ props diff) per re-rendered component; a long dev session with a
+    // busy panel grew the renderer by 0.2 GB/min (2026-11-03). Dev only: production has no track.
+    // `?rvKeepMeasures=1` keeps the buffer intact for a session that reads it (profiling).
+    if (!new URLSearchParams(location.search).has('rvKeepMeasures')) {
+      const { installUserTimingGuard } = await import('./core/engine/perf/rv-user-timing-guard');
+      installUserTimingGuard({ onClear: dropped => console.debug(`[rv-dev] cleared ${dropped} React performance measures (User-Timing buffer guard; ?rvKeepMeasures=1 keeps them)`) });
+    }
     // NOT under `?perf` (plan-465 fix 2026-09-06): DebugEndpointPlugin walks
     // every drive/sensor/surface/signal once a second, `serializeProps`-es the
     // lot and POSTs it to Vite. On the synthetic line (216 sensors + 216
@@ -2419,9 +2793,6 @@ async function init() {
       const { DebugEndpointPlugin } = await import('./plugins/debug-endpoint-plugin');
       viewer.use(new DebugEndpointPlugin(), 'core');
     }
-
-    // --- Dev-only: expose the viewer for Playwright E2E + manual QA ---
-    (window as unknown as { __rvViewer?: unknown }).__rvViewer = viewer;
 
     // --- Dev-only: expose window.__rvInstruction for Playwright E2E + manual QA ---
     const instrStore = await import('./core/hmi/instruction-store');
@@ -2517,6 +2888,21 @@ async function init() {
     const { installMuComputeBench } = await import('./core/engine/rv-mu-compute-bench');
     installMuComputeBench(viewer);
   }
+
+  // --- `window.__rvViewer`: a pure ALIAS of `window.viewer`, in EVERY build ---
+  //
+  // One viewer global, one gate. `window.viewer` (above) is the official handle
+  // and was always ungated; `__rvViewer` used to be set inside the DEV block
+  // right above, which made the OFFICIAL-sounding name the one that silently
+  // does not exist in a build. That trap cost a public demo: the MuJoCo walker
+  // reached the scene through `__rvViewer`, got `undefined` in production and
+  // pushed obstacles whose drawn meshes never moved (plan-673, 2026-10-25).
+  // So the gate is gone and this is an alias of the SAME object, kept here —
+  // after the plugins attach — because the E2E specs and perf scripts use its
+  // appearance as the "viewer is wired" marker. Product code must use neither
+  // global: it takes the viewer from the plugin context it is given
+  // (tests/dev-only-globals.node.test.ts, guard c).
+  (window as unknown as { __rvViewer?: unknown }).__rvViewer = viewer;
 
   // --- MCP bridge (AI integration) ---
   // Always registered so the Settings -> AI tab is available everywhere,

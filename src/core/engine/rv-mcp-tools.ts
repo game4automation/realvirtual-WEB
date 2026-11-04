@@ -42,6 +42,8 @@ export interface ToolEntry {
   destructive?: boolean;
   /** plan-499: the command(s) this tool is a view of (metadata only, not on the wire). */
   command?: ToolCommandBinding;
+  /** plan-626 F1: explicit tool class (metadata only, never announced — CONNECT reads the allowlist). */
+  toolClass?: McpToolClassName;
 }
 
 export interface ParamEntry {
@@ -83,11 +85,19 @@ export interface ToolSchema {
     type: 'object';
     properties: Record<string, { type: string; description: string }>;
     required: string[];
+    additionalProperties?: boolean;
   };
   /** Standard MCP annotations; forwarded verbatim to `tools/list` by both bridges. */
   annotations?: McpToolAnnotations;
   /** Per-call timeout hint for the bridge; stripped before the MCP client sees the tool list. */
   timeoutMs?: number;
+  /**
+   * plan-641 Nachtrag 2026-10-21: `false` marks a command-bound alias — the bridges keep it
+   * callable but leave it out of `tools/list` (see `withAliasListing`). Absent = listed.
+   */
+  listed?: boolean;
+  /** Retired tool redirect: always hidden, including when aliases are listed. */
+  tombstone?: boolean;
 }
 
 // ── Metadata storage ──
@@ -167,7 +177,16 @@ export interface McpToolOptions {
    * result to the body as the trailing `McpCallContext` argument.
    */
   command?: ToolCommandBinding;
+  /**
+   * plan-626 F1: explicit tool class, only where the derivation in
+   * `rv-mcp-tool-class.ts` (readOnly → command prefix → domain) would be wrong.
+   * Metadata only — never announced; CONNECT reads the generated allowlist.
+   */
+  toolClass?: McpToolClassName;
 }
+
+/** plan-626 F1: the tool classes (`rv-mcp-tool-class.ts` derives and documents them). */
+export type McpToolClassName = 'read' | 'edit' | 'sim' | 'signal' | 'save' | 'destructive' | 'file';
 
 // ── Command bindings (plan-499) ──
 
@@ -263,6 +282,12 @@ export interface McpCallContext {
   readonly handle: DocumentHandle | null;
   /** Selection at call begin. */
   readonly selection: readonly string[];
+  /**
+   * plan-641 F2 — the meta arguments of the call (`_reason/_source/_confidence`),
+   * split off the wire centrally in the bridge before the binding resolved. Only
+   * the macro recorder reads them; the tool body never sees them.
+   */
+  readonly meta?: { readonly reason?: string; readonly source?: string; readonly confidence?: 'observed' | 'inferred' | 'unverified' } | null;
 }
 
 /**
@@ -296,6 +321,7 @@ export function McpTool(description: string, options?: McpToolOptions) {
       ...(options?.readOnly === undefined ? {} : { readOnly: options.readOnly }),
       ...(options?.destructive ? { destructive: true } : {}),
       ...(options?.command ? { command: options.command } : {}),
+      ...(options?.toolClass ? { toolClass: options.toolClass } : {}),
     });
   };
 }

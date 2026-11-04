@@ -97,7 +97,14 @@ export class UIPluginRegistry {
           copy.visibilityId = `mode-slot:${pluginId ?? 'unknown'}:${copy.slot}:${i}`;
         }
       }
-      this._slots.push({ entry: copy, seq: this._seqFor(copy.pluginId), index: i });
+      const seq = this._seqFor(copy.pluginId);
+      // plan-2010: a key that depends only on THIS declaration — not on where
+      // other plugins' entries sort in — so the rendered component is not
+      // remounted when e.g. the on-demand DES plugin registers lower orders.
+      copy.slotKey = copy.pluginId !== undefined
+        ? `${copy.pluginId}:${copy.slot}:${i}`
+        : `anon:${seq}:${i}`;
+      this._slots.push({ entry: copy, seq, index: i });
     });
     this._sort();
     this._notify();

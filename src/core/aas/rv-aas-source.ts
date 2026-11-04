@@ -221,6 +221,10 @@ export function invalidateAasSource(key: string): void {
 // ─── URL source ─────────────────────────────────────────────────────────
 
 const INDEX_TIMEOUT_MS = 10_000;
+/** Timeout of a retried index read: a cold first load may still saturate the line. */
+const INDEX_RETRY_TIMEOUT_MS = 30_000;
+/** Backoff before the one automatic retry after a failed index read. */
+export const INDEX_RETRY_DELAY_MS = 3_000;
 const PACKAGE_TIMEOUT_MS = 60_000;
 
 /** The `aasx/` directory under an assets root (the legacy `basePath`). */
@@ -234,22 +238,76 @@ function timeoutSignal(ms: number): AbortSignal | undefined {
     ? AbortSignal.timeout(ms) : undefined;
 }
 
-/** A deployed `aasx/` directory reached over HTTP. */
-export class UrlAasSource implements AasSource {
-  readonly key: string;
-  private _revision = 0;
-  private _index: Promise<AasIndexResult> | null = null;
-
-  constructor(readonly dir: string, readonly rangeReads = false) {
-    this.key = `url:${dir}`;
-  }
+/**
+ * Index caching shared by the URL and the project source: only a SUCCESSFUL
+ * read ('available' / 'missing') is cached. A failed read ('error': timeout,
+ * network, 5xx, broken JSON) is dropped, so the next `readIndex()` fetches
+ * again, and ONE automatic retry is scheduled after {@link INDEX_RETRY_DELAY_MS}:
+ * it bumps the revision and notifies, which re-runs the resolution pass (whose
+ * read then uses the longer {@link INDEX_RETRY_TIMEOUT_MS}). Without it a cold
+ * first load whose 10 s index timeout expired kept every AAS link on
+ * `index-error` for the whole session.
+ */
+abstract class CachedIndexSource {
+  abstract readonly key: string;
+  protected _revision = 0;
+  protected _index: Promise<AasIndexResult> | null = null;
+  private _failures = 0;
+  private _autoRetried = false;
+  private _retryTimer: ReturnType<typeof setTimeout> | null = null;
 
   get revision(): number { return this._revision; }
 
-  readIndex(): Promise<AasIndexResult> {
+  /** The cached index, or a fresh read via `load(timeoutMs)`, cached unless it failed. */
+  protected cachedIndex(load: (timeoutMs: number) => Promise<AasIndexResult>): Promise<AasIndexResult> {
     if (this._index) return this._index;
+    const p = load(this._failures > 0 ? INDEX_RETRY_TIMEOUT_MS : INDEX_TIMEOUT_MS);
+    this._index = p;
+    // Registered before any caller's continuation, so the cache is cleared first.
+    void p.then((r) => {
+      if (r.kind !== 'error') {
+        this._failures = 0;
+        this._autoRetried = false;
+        return;
+      }
+      if (this._index === p) this._index = null;
+      this._failures++;
+      if (this._autoRetried || this._retryTimer !== null) return;
+      this._autoRetried = true;
+      this._retryTimer = setTimeout(() => {
+        this._retryTimer = null;
+        // Already re-read meanwhile, or the source was replaced: nothing to do.
+        if (this._index !== null || _registry.get(this.key) !== (this as unknown)) return;
+        this._revision++;
+        notifySources();
+      }, INDEX_RETRY_DELAY_MS);
+    });
+    return p;
+  }
+
+  /** Cancel a scheduled automatic retry. */
+  protected cancelIndexRetry(): void {
+    if (this._retryTimer !== null) clearTimeout(this._retryTimer);
+    this._retryTimer = null;
+  }
+}
+
+/** A deployed `aasx/` directory reached over HTTP. */
+export class UrlAasSource extends CachedIndexSource implements AasSource {
+  readonly key: string;
+
+  constructor(readonly dir: string, readonly rangeReads = false) {
+    super();
+    this.key = `url:${dir}`;
+  }
+
+  readIndex(): Promise<AasIndexResult> {
+    return this.cachedIndex((timeoutMs) => this._fetchIndex(timeoutMs));
+  }
+
+  private _fetchIndex(timeoutMs: number): Promise<AasIndexResult> {
     const url = `${this.dir}index.json`;
-    this._index = fetch(url, { signal: timeoutSignal(INDEX_TIMEOUT_MS) })
+    return fetch(url, { signal: timeoutSignal(timeoutMs) })
       .then(async (r): Promise<AasIndexResult> => {
         if (r.status === 404) return { kind: 'missing' };
         if (!r.ok) return { kind: 'error', reason: `HTTP ${r.status}` };
@@ -265,7 +323,6 @@ export class UrlAasSource implements AasSource {
         }
       })
       .catch((e): AasIndexResult => ({ kind: 'error', reason: e instanceof Error ? e.message : String(e) }));
-    return this._index;
   }
 
   async openPackage(file: string): Promise<AasxPackage> {
@@ -286,6 +343,7 @@ export class UrlAasSource implements AasSource {
   }
 
   invalidate(): void {
+    this.cancelIndexRetry();
     this._index = null;
     this._revision++;
   }
@@ -322,25 +380,20 @@ async function backendBlob(backend: AasProjectBackend, path: string): Promise<{ 
 }
 
 /** The open project's `aasx/` folder, read through its backend. */
-export class ProjectAasSource implements AasSource {
+export class ProjectAasSource extends CachedIndexSource implements AasSource {
   readonly key: string;
-  private _revision = 0;
-  private _index: Promise<AasIndexResult> | null = null;
   private _file: AasProjectIndexFile | null = null;
 
   constructor(readonly backend: AasProjectBackend, readonly projectId: string) {
+    super();
     this.key = `project:${projectId}`;
   }
-
-  get revision(): number { return this._revision; }
 
   /** The project-format index as last read or scanned (null for the flat format / none). */
   get indexFile(): AasProjectIndexFile | null { return this._file; }
 
   readIndex(): Promise<AasIndexResult> {
-    if (this._index) return this._index;
-    this._index = this._readStoredIndex();
-    return this._index;
+    return this.cachedIndex((timeoutMs) => this._readStoredIndex(timeoutMs));
   }
 
   /**
@@ -348,12 +401,13 @@ export class ProjectAasSource implements AasSource {
    * whose index cannot be written). Bumps the revision; callers notify.
    */
   setScannedIndex(file: AasProjectIndexFile): void {
+    this.cancelIndexRetry();
     this._file = file;
     this._index = Promise.resolve({ kind: 'available', index: file.entries });
     this._revision++;
   }
 
-  private async _readStoredIndex(): Promise<AasIndexResult> {
+  private async _readStoredIndex(timeoutMs: number): Promise<AasIndexResult> {
     try {
       const got = await backendBlob(this.backend, PROJECT_AASX_INDEX);
       if (!got) return { kind: 'missing' };
@@ -362,7 +416,7 @@ export class ProjectAasSource implements AasSource {
         text = await got.blob.text();
       } else {
         try {
-          const r = await fetch(got.url, { signal: timeoutSignal(INDEX_TIMEOUT_MS) });
+          const r = await fetch(got.url, { signal: timeoutSignal(timeoutMs) });
           if (r.status === 404) return { kind: 'missing' };
           if (!r.ok) return { kind: 'error', reason: `HTTP ${r.status}` };
           if (/text\/html/i.test(r.headers?.get?.('content-type') ?? '')) return { kind: 'missing' };
@@ -408,6 +462,7 @@ export class ProjectAasSource implements AasSource {
   }
 
   invalidate(): void {
+    this.cancelIndexRetry();
     this._index = null;
     this._revision++;
   }
@@ -663,6 +718,7 @@ export function getAasPackageStats(): { open: number; keys: string[]; opening: n
 
 /** Reset every source, cache and listener — tests only. */
 export function resetAasSources(): void {
+  for (const s of _registry.values()) s.invalidate();
   releaseAasPackages();
   _registry.clear();
   _context = {};

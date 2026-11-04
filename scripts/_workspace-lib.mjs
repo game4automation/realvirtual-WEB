@@ -42,6 +42,8 @@ const SOURCE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 // can use them without importing this file back (plan-700 §2.9); there is
 // exactly one definition of each, here or there, never both.
 import { fixedPrefix, globRegex, patternsOverlap, readJson, toPosix, walk } from './_rv-fs-utils.mjs';
+// plan-778 F15: trimmed library projects beside every delivered project (one step, every channel).
+import { trimProjectLibraries } from './lib/rv-library-trim.mjs';
 // Secret patterns, denylists and size limits have exactly one definition, in
 // _rv-guards.mjs (plan-700 §2.9 / B10). Do not reintroduce a local array here —
 // tests/rv-guards.node.test.ts fails the build if one appears.
@@ -100,7 +102,11 @@ const DELIVERY_CONFIG_KEYS = new Set([
   // repository back, since bundle-rag embeds them into the delivered project-config.json anyway.
   'requestyApiKey', 'requestyBaseUrl',
 ]);
-const REGISTRATION_KEYS = new Set(['adapter', 'requires', 'status']);
+const REGISTRATION_KEYS = new Set(['adapter', 'requires', 'status', 'activation']);
+// When a feature's code is loaded (plan-652). Absent means `['startup']` — today's eager
+// registration. The prefixes name the trigger kinds the runtime FeatureLoader knows; anything
+// else is a manifest typo and must stop the delivery, not silently load at startup.
+const ACTIVATION_PATTERN = /^(startup|intent|idle|(mode|component|command):[A-Za-z0-9._-]+)$/;
 // Maturity of a delivered feature, independent of its tier. A feature can be fully entitled
 // and still be young; `beta` says so to the customer without withholding it. Absent means
 // `stable`, so every existing registration keeps its meaning unchanged.
@@ -138,7 +144,8 @@ const GENERATED_GIT_ATTRIBUTES = [
 const REQUIRED_NODE_MAJOR = 22;
 const CORE_FILES = [
   'index.html', 'package.json', 'package-lock.json', 'tsconfig.json', 'vite.config.ts',
-  'vitest.config.ts', 'vitest.node.config.ts', 'LICENSE', 'README.md', 'webviewer.mcp.md',
+  'vitest.config.ts', 'vitest.node.config.ts', 'LICENSE', 'NOTICE.md', 'CONTENT-LICENSE.md', 'CONTENT-MANIFEST.md',
+  'README.md', 'webviewer.mcp.md',
 ];
 const ALWAYS_DELIVERED_DOCS = [
   'doc-webviewer.md', 'doc-extending-webviewer.md', 'doc-scripting.md', 'doc-behaviors.md',
@@ -149,6 +156,11 @@ const ALWAYS_DELIVERED_DOCS = [
   // leaving it out turns those into broken links and strands the customer exactly when a
   // reference resolves to nothing (plan-381).
   'doc-node-paths.md',
+  // Linked from doc-node-paths.md, doc-scripting.md and doc-webviewer.md, all of which ship (plan-2059).
+  'doc-des-snapshot.md',
+  // Linked from doc-persistence.md and doc-path-fleet-control.md, both of which ship (plan-2061).
+  'doc-des-randomness.md',
+  'doc-des-scripting.md',
   // Same case: doc-extending-webviewer.md tells the reader to consult it BEFORE gating a slot by
   // mode, so omitting it strands them at exactly the moment they were sent looking.
   'doc-ui-visibility.md',
@@ -160,7 +172,16 @@ const ALWAYS_DELIVERED_DOCS = [
   // rv-path.ts lives in src/core/engine and `Path` is a normative component in rv-odt.json — so
   // it ships unconditionally rather than behind an entitlement.
   'doc-path-fleet-control.md',
+  // And again: doc-extending-webviewer.md sends plugin authors here for objects moved by an
+  // external simulation; the entity stream and pool are core (src/core/engine).
+  'doc-entity-stream.md',
+  // Experiment manager documentation ships from the private repository with its commercial module.
   'doc-getting-started.md', 'doc-projects.md', 'doc-project-plugin-example.md',
+  // plan-604: the publish guide. Until now a delivered workspace had NO deployment
+  // documentation at all — doc-deploy.md is realvirtual's own pipeline and stays
+  // internal, so every link to it was degraded and the customer was left with a
+  // `deploy` script in package.json and nothing that said what to do with it.
+  'doc-publishing.md',
   'doc-embedding.md', 'doc-migration.md',
   // Unconditional since plan-739. Both used to sit in CONDITIONAL_DELIVERED_DOCS behind the
   // `layout-planner` / `multiuser` entitlements, which gated the DOCUMENT while the code shipped
@@ -183,7 +204,7 @@ export const CONDITIONAL_DELIVERED_DOCS = new Map([]);
 // (brand and strategy are not published on the public mirror), so this tree cannot deliver them;
 // the code itself — src/core/hmi/theme.ts and signal-colors.ts — is the authority a customer has.
 const NEVER_DELIVERED_DOCS = new Set([
-  'doc-deploy.md', 'doc-plc-programming.md', 'doc-render-picking.md', 'PRODUCT.md',
+  'doc-deploy.md', 'doc-plc-programming.md', 'contract-bake-picking.md', 'PRODUCT.md',
 ]);
 const DELIVERY_DOC_LINK_REDIRECTS = new Map([
   ['src/plugins/sim-controller/DESExperimentsPanel.tsx', 'src/plugins/sim-controller/DESExperimentMatrixPanel.tsx'],
@@ -228,14 +249,35 @@ const SIBLING_CHECKOUT_LINK = /^\.\.\/[^/]+~\//;
 const DEMO_PROJECT_FOLDER = 'demo-realvirtual';
 // Curated bundled-library categories under `public/library/`. Anything else there is scratch
 // or CAD-import material. Set this to [] to deliver a workspace without the bundled library.
-const DELIVERED_LIBRARY_CATEGORIES = ['PalletHandling'];
+const DELIVERED_LIBRARY_CATEGORIES = ['PalletHandling', 'MobileRobots'];
 const LIBRARY_ROOT = 'library';
-const LIBRARY_CATALOG = `${LIBRARY_ROOT}/catalog.json`;
+// plan-778: the realvirtual library as a project — the file the viewer's built-in location reads.
+// (Its catalog.json is gone with plan-778 Phase 4; the project manifest is the one curated file.)
+const LIBRARY_PROJECT = `${LIBRARY_ROOT}/project.json`;
 // The bundled library is only useful together with the layout planner. The planner lives in
 // the AGPL core and is statically imported by src/main.ts, so it is part of every delivery
 // today; keying off its presence keeps the coupling honest if that ever changes.
 const LIBRARY_CONSUMER_DIR = 'src/plugins/layout-planner';
 const CORE_SCRIPT_FILES = [
+  // plan-604: the delivered publish path. `publish-project.mjs` is the CLI a customer or
+  // partner runs to put his own project on his own Bunny zone; the rest is its transitive
+  // closure. It deliberately does NOT include `bunny-deploy.mjs`: that module carries the
+  // customer register, the demo allowlist, the publish lock and the smoke runner, i.e. the
+  // operation of web.realvirtual.io, which is none of a customer's business. The staged-
+  // scripts test in tests/bunny-deploy.node.test.ts walks these imports and fails on a gap.
+  'publish-project.mjs', 'publish-project.d.mts',
+  '_bunny-lib.mjs', '_bunny-lib.d.mts',
+  '_rv-manifest.mjs', '_rv-manifest.d.mts',
+  '_rv-guards.mjs', '_rv-guards.d.mts',
+  '_rv-fs-utils.mjs',
+  'rv-sign-glb.mjs', 'rv-sign-glb.d.mts',
+  'lib/rv-crypto.mjs',
+  'lib/rv-dotenv.mjs', 'lib/rv-dotenv.d.mts',
+  'lib/rv-glb.mjs', 'lib/rv-glb.d.mts',
+  'lib/rv-hash.d.mts',
+  // plan-778 F15: `_bunny-lib.mjs` ships a project's library projects trimmed (its core is
+  // `src/core/project/rv-library-trim-core.mjs`, delivered with src/).
+  'lib/rv-library-trim.mjs', 'lib/rv-library-trim.d.mts',
   'compile-project-scripts.mjs', 'compile-project-scripts.d.mts',
   'install-private-dependencies.mjs', 'patch-occt-memory.mjs',
   'build-local-library-catalog.mjs', 'inject-ga-settings.mjs',
@@ -243,6 +285,10 @@ const CORE_SCRIPT_FILES = [
   '_rv-private-assets.mjs', '_rv-private-assets.d.mts',
   // vite.config.ts imports this at config-load time too (plan-553 F8: the cinematic loose assets).
   '_rv-cinematic-assets.mjs', '_rv-cinematic-assets.d.mts',
+  // vite.config.ts imports this at config-load time too (plan-637 Phase 6: the Isaac Sim
+  // extension download). Without `integrations/omniverse-kit` in the staged tree it only
+  // defines __RV_LIVESYNC_EXT__ = null.
+  '_rv-livesync-extension.mjs', '_rv-livesync-extension.d.mts',
   // build-local-library-catalog.mjs imports this (plan-508). Every helper a staged script
   // reaches by a relative import must be listed here — tests/bunny-deploy.node.test.ts
   // walks those imports and fails on a missing one before a deploy does.
@@ -255,7 +301,27 @@ const CORE_SCRIPT_FILES = [
   // Bunny, customer workspace, CONNECT webui — emits THIRD-PARTY-NOTICES.txt through it.
   'vite-plugin-third-party-notices.mjs', 'vite-plugin-third-party-notices.d.mts',
   'lib/rv-third-party-notices.mjs', 'lib/rv-third-party-notices.d.mts',
+  // vite.config.ts imports this at config-load time (plan-679 Phase 9: the AGPL notice per build
+  // stage). Every staged build — customer workspace, Bunny, hosted — runs it. No relative imports.
+  'lib/rv-agpl-attribution.mjs', 'lib/rv-agpl-attribution.d.mts',
+  // vite.config.ts and vitest.node.config.ts import testLockProgressPlugin() at config-load
+  // time — the staged build fails without it. A no-op outside vitest; no relative imports.
+  'test-progress-reporter.mjs', 'test-progress-reporter.d.mts',
+  // vite.config.ts imports this at config-load time (plan-646 Phase 2: dist/features.json).
+  'vite-plugin-features-json.mjs', 'vite-plugin-features-json.d.mts',
+  // vite.config.ts imports this at config-load time (plan-615 F4: the dev-server-only
+  // `POST /__api/dev/golden` of the dev toolbar). No relative imports.
+  'lib/rv-dev-golden.mjs', 'lib/rv-dev-golden.d.mts',
+  // vite.config.ts imports this at config-load time (plan-652: dist/feature-chunks.json).
+  // No relative imports.
+  'gen-feature-chunks.mjs', 'gen-feature-chunks.d.mts',
+  // `npm run gen:odt-split` (package.json ships): regenerates schema/v1/rv-odt.{structure,descriptions}.json. No relative imports.
+  'gen-odt-split.mjs', 'gen-odt-split.d.mts',
 ];
+//! Generated build inputs copied as-is when present (plan-646 F3b): the staged tree never
+//! regenerates them, its manifest is the reduced one. Only the --demo staging carries them
+//! (`includeGeneratedFiles`), the one path that regenerates them first; elsewhere they may be stale.
+export const CORE_GENERATED_FILES = ['generated/features.json'];
 // Directories outside src/ and public/ that staged source imports (schema/v1/rv-odt.json
 // via src/core/engine/rv-component-registry.ts) — the build fails without them.
 // The MCP help guides used to be listed here too; they now live under
@@ -263,6 +329,17 @@ const CORE_SCRIPT_FILES = [
 // `third-party` holds the licence policy, the manual component list and the canonical licence
 // texts the notices plugin reads at build time (plan-544) — the staged build needs them.
 const CORE_DIRS = ['schema', 'examples', 'third-party'];
+// The Isaac Sim extension (plan-637 Phase 6): build input of `scripts/_rv-livesync-extension.mjs`,
+// which packs it into `dist/downloads/realvirtual-livesync-<version>.zip` and defines
+// __RV_LIVESYNC_EXT__ — without it a staged build has no download. Staged without its pytest
+// suite and Python bytecode (none of which reaches the zip either).
+const LIVESYNC_KIT_DIR = 'integrations/omniverse-kit';
+//! True for the parts of the Kit integration a staged build needs (no tests/, no bytecode).
+function livesyncStagingFilter(rel, entry) {
+  if (rel === 'tests' || rel.startsWith('tests/')) return false;
+  if (entry?.isDirectory() && (entry.name === '__pycache__' || entry.name === '.pytest_cache')) return false;
+  return !/\.py[co]$/.test(rel);
+}
 // The customer's own licence-policy file (plan-544 F3). Never shipped by us — a dev checkout that
 // happens to carry one must not leak it into a delivery — and never overwritten by a delivery
 // (applySnapshot keeps the customer's copy).
@@ -275,35 +352,154 @@ const STATIC_CORE_RECIPES = ['kinematize-cad-import.md'];
 // Public no-op stubs for `@rv-private/*` modules; used as per-file fallback when a
 // delivery tier excludes the real private module (see stagePrivateStubFallbacks).
 const PRIVATE_STUB_ROOT = 'src/private-stubs';
-// Curated AGPL-core capabilities included in every delivery, independent of tier or
-// project. Kept honest and stable; it is the SSOT for the "Core (AGPL)" block in the
-// generated FEATURES.md and README.
+// The AGPL-core capabilities included in every delivery, independent of tier or project, are
+// the `edition: "community"` rows of the public feature catalog (plan-646). The catalog is the
+// SSOT for the "Core (AGPL)" block in the generated FEATURES.md and README, for the editions
+// block of the public README and for `generated/features.json`; it replaced the hand-kept
+// `CORE_FEATURES` list that used to live here.
 //
-// The layout planner used to be left out here as "a restricted feature". That was only ever
-// true of its DOCUMENT: `layout-planner` is a tier registration so `doc-layout-planner.md` can
-// be gated (CONDITIONAL_DELIVERED_DOCS), while the planner code itself sits in the AGPL core
-// and is statically imported by `src/main.ts` — see LIBRARY_CONSUMER_DIR above. Every customer
-// therefore receives it, and the core list now says so.
-const CORE_FEATURES = Object.freeze([
-  'Drives (linear and rotational motion)',
-  'Sensors',
-  'Transport surfaces (conveyors)',
-  'Sources and sinks (MU spawning and consumption)',
-  'Grippers and pick-and-place',
-  'Signals and PLC connectivity (rv WebSocket Realtime v2)',
-  'HMI panels and overlays',
-  'Camera presets and views',
-  'PDF document linking',
-  // `src/plugins/layout-planner/` lives in the AGPL core and is registered from
-  // `src/main.ts`, so it ships with EVERY delivery. Leaving it out understated what a
-  // core delivery contains.
-  //
-  // The ASSET EDITOR is deliberately NOT listed here. It ships from the core tree today,
-  // but it is a commercial feature as of this decision and its future versions move into
-  // the private repository — so promising it as part of the AGPL core would be a promise
-  // the next release does not keep.
-  'Layout planner',
-]);
+// The layout planner is a community row: `src/plugins/layout-planner/` sits in the AGPL core
+// and is statically imported by `src/main.ts` — see LIBRARY_CONSUMER_DIR above — so every
+// customer receives it. Its tier registration only ever gated its DOCUMENT.
+//
+// The ASSET EDITOR is deliberately NOT a community row. It ships from the core tree today,
+// but it is a commercial feature as of that decision and its future versions move into the
+// private repository — so promising it as part of the AGPL core would be a promise the next
+// release does not keep. It is the commercial catalog row `editor` (id `asset-editor`).
+//
+// The catalog is read from THIS checkout (SOURCE_ROOT), never from a staging root: the file
+// is not staged, and a fixture core in a test is not where the product's catalog lives.
+export const FEATURE_CATALOG_FILE = 'features.catalog.json';
+const CATALOG_GROUPS = new Set(['visualize', 'simulate', 'build', 'connect', 'interfaces', 'integrate']);
+const CATALOG_GROUP_KEYS = new Set(['id', 'label', 'note']);
+const CATALOG_ROW_KEYS = new Set(['id', 'label', 'group', 'summary', 'edition', 'status', 'ids', 'docs', 'demo', 'public', 'cells']);
+// A `cells` row states its three column texts itself (e.g. the CONNECT interfaces, licensed by
+// signal count rather than by edition). It is no WEB edition claim: no `edition`, no `ids`.
+const CATALOG_CELL_KEYS = ['community', 'commercial', 'demo'];
+const CATALOG_KEY_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+const catalogCache = new Map();
+
+//! Loads and schema-validates the public feature catalog (plan-646 §2.3). It checks only
+//! what the catalog can know on its own; the manifest-dependent rules (tier of every id,
+//! coverage of every commercial registration, demo documents) are checked by
+//! scripts/gen-features-json.mjs. Throws with a message naming the offending row.
+export function loadFeatureCatalog(catalogPath = join(SOURCE_ROOT, FEATURE_CATALOG_FILE)) {
+  const absolute = resolve(catalogPath);
+  if (catalogCache.has(absolute)) return catalogCache.get(absolute);
+  const catalog = validateFeatureCatalog(readJson(absolute, FEATURE_CATALOG_FILE));
+  catalogCache.set(absolute, catalog);
+  return catalog;
+}
+
+//! Validates an already parsed catalog object and returns it.
+export function validateFeatureCatalog(catalog) {
+  const fail = (message) => { throw new Error(`${FEATURE_CATALOG_FILE}: ${message}`); };
+  assertObject(catalog, FEATURE_CATALOG_FILE);
+  assertKnownKeys(catalog, new Set(['$comment', 'version', 'editions', 'groups', 'rows']), FEATURE_CATALOG_FILE);
+  if (catalog.version !== 1) fail('version must be 1.');
+  assertObject(catalog.editions, `${FEATURE_CATALOG_FILE} editions`);
+  assertKnownKeys(catalog.editions, new Set(['community', 'commercial', 'demo']), `${FEATURE_CATALOG_FILE} editions`);
+  for (const key of ['community', 'commercial', 'demo']) {
+    if (typeof catalog.editions[key] !== 'string' || !catalog.editions[key]) fail(`editions.${key} must be a non-empty string.`);
+  }
+  if (!Array.isArray(catalog.groups) || !catalog.groups.length) fail('groups must be a non-empty array.');
+  const groupIds = new Set();
+  for (const group of catalog.groups) {
+    if (!CATALOG_GROUPS.has(group?.id)) fail(`unknown group "${group?.id}".`);
+    assertKnownKeys(group, CATALOG_GROUP_KEYS, `${FEATURE_CATALOG_FILE} group "${group.id}"`);
+    if (groupIds.has(group.id)) fail(`group "${group.id}" is declared twice.`);
+    if (typeof group.label !== 'string' || !group.label) fail(`group "${group.id}" needs a label.`);
+    if (group.note !== undefined && (typeof group.note !== 'string' || !group.note.trim())) {
+      fail(`group "${group.id}": note must be a non-empty string.`);
+    }
+    groupIds.add(group.id);
+  }
+  if (!Array.isArray(catalog.rows) || !catalog.rows.length) fail('rows must be a non-empty array.');
+  const rowIds = new Set();
+  const registrationIds = new Set();
+  for (const row of catalog.rows) {
+    const where = `row "${row?.id}"`;
+    assertObject(row, `${FEATURE_CATALOG_FILE} ${where}`);
+    assertKnownKeys(row, CATALOG_ROW_KEYS, `${FEATURE_CATALOG_FILE} ${where}`);
+    if (!CATALOG_KEY_PATTERN.test(row.id ?? '')) fail(`${where}: id must match ${CATALOG_KEY_PATTERN}.`);
+    if (rowIds.has(row.id)) fail(`${where} is declared twice.`);
+    rowIds.add(row.id);
+    for (const key of ['label', 'summary']) {
+      if (typeof row[key] !== 'string' || !row[key].trim()) fail(`${where}: ${key} must be a non-empty string.`);
+    }
+    if (!groupIds.has(row.group)) fail(`${where}: group "${row.group}" is not declared in groups.`);
+    if (row.public !== undefined && typeof row.public !== 'boolean') fail(`${where}: public must be a boolean.`);
+    if (row.edition !== undefined && row.edition !== 'community') {
+      // A commercial edition is DERIVED from the manifest, never stated here (plan-646 F1):
+      // the catalog must not become a second tier truth.
+      fail(`${where}: edition may only be "community"; a commercial row is derived from its ids.`);
+    }
+    if (row.cells !== undefined) {
+      assertObject(row.cells, `${FEATURE_CATALOG_FILE} ${where}.cells`);
+      assertKnownKeys(row.cells, new Set(CATALOG_CELL_KEYS), `${FEATURE_CATALOG_FILE} ${where}.cells`);
+      for (const key of CATALOG_CELL_KEYS) {
+        if (typeof row.cells[key] !== 'string' || !row.cells[key].trim()) fail(`${where}: cells.${key} must be a non-empty string.`);
+      }
+      // The cell texts ARE the row's statement; an edition, a manifest id, a status or a demo
+      // link next to them would be a second, contradicting one.
+      for (const key of ['edition', 'ids', 'status', 'demo']) {
+        if (row[key] !== undefined) fail(`${where}: a cells row carries no ${key}.`);
+      }
+    } else if (row.edition === 'community') {
+      if (row.ids !== undefined) fail(`${where}: a community row carries no manifest ids.`);
+      if (row.public === false) fail(`${where}: a community row cannot be hidden.`);
+      if (row.status !== undefined && row.status !== 'beta') fail(`${where}: status may only be "beta".`);
+    } else {
+      if (row.status !== undefined) fail(`${where}: the status of a commercial row comes from the manifest, not the catalog.`);
+      if (!Array.isArray(row.ids) || !row.ids.length) fail(`${where}: a commercial row needs a non-empty ids array.`);
+      for (const id of row.ids) {
+        if (typeof id !== 'string' || !CATALOG_KEY_PATTERN.test(id)) fail(`${where}: invalid manifest id "${id}".`);
+        if (registrationIds.has(id)) fail(`manifest id "${id}" is assigned to more than one row.`);
+        registrationIds.add(id);
+      }
+    }
+    if (row.docs !== undefined && (typeof row.docs !== 'string' || !/^[a-z0-9][a-z0-9/-]*\/(#[a-z0-9-]+)?$/.test(row.docs))) {
+      fail(`${where}: docs must be a relative path under /doc/web/ ending in "/", optionally with an anchor (e.g. "components/physics/", "connect/interfaces/protocols/#siemens-s7").`);
+    }
+    if (row.demo !== undefined) {
+      assertObject(row.demo, `${FEATURE_CATALOG_FILE} ${where}.demo`);
+      assertKnownKeys(row.demo, new Set(['doc', 'mode']), `${FEATURE_CATALOG_FILE} ${where}.demo`);
+      if (typeof row.demo.doc !== 'string' || !row.demo.doc) fail(`${where}: demo.doc must be a document id.`);
+      if (row.demo.mode !== undefined && (typeof row.demo.mode !== 'string' || !/^[a-z]+$/.test(row.demo.mode))) {
+        fail(`${where}: demo.mode must be a lower-case mode name.`);
+      }
+    }
+  }
+  return catalog;
+}
+
+//! The community rows of the catalog, in catalog order, as the "Core (AGPL)" list.
+export function coreCapabilities(catalog = loadFeatureCatalog()) {
+  return catalog.rows
+    .filter((row) => row.edition === 'community')
+    .map((row) => (row.status === 'beta' ? `${row.label} (Beta)` : row.label));
+}
+
+//! Short prose form of the community rows for a running sentence: the parenthesised detail
+//! is dropped and an ordinary capitalised first word is lower-cased ("Collision detection" →
+//! "collision detection"), while names such as "WebXR", "USD" or "3D" keep their spelling.
+export function coreCapabilityProse(catalog = loadFeatureCatalog()) {
+  const names = catalog.rows
+    .filter((row) => row.edition === 'community')
+    .map((row) => {
+      const short = row.label.replace(/\s*\(.*\)\s*$/, '');
+      const [first, ...rest] = short.split(' ');
+      return [/^[A-Z][a-z]+$/.test(first) ? first.toLowerCase() : first, ...rest].join(' ');
+    });
+  return names.length > 1 ? `${names.slice(0, -1).join(', ')}, and ${names.at(-1)}` : names.join('');
+}
+
+//! Catalog label per manifest registration id (`step-import` → "CAD import (…)").
+export function catalogLabelsByRegistration(catalog = loadFeatureCatalog()) {
+  const labels = new Map();
+  for (const row of catalog.rows) for (const id of row.ids ?? []) labels.set(id, row.label);
+  return labels;
+}
 
 // The neutral identity of the ONE shared commercial repository (plan-434 §2.7).
 //
@@ -437,7 +633,12 @@ export function loadTierManifest(manifestPathOrPrivateRoot) {
     if (!REGISTRATION_STATUSES.includes(status)) {
       throw new Error(`${feature}.status must be one of ${REGISTRATION_STATUSES.join(', ')}.`);
     }
-    registrations[feature] = { adapter: registration.adapter, requires: [...requires], status };
+    const activation = registration.activation ?? ['startup'];
+    if (!Array.isArray(activation) || activation.length === 0
+      || activation.some((item) => typeof item !== 'string' || !ACTIVATION_PATTERN.test(item))) {
+      throw new Error(`${feature}.activation must be a non-empty array of triggers (startup, intent, idle, mode:<id>, component:<type>, command:<id>).`);
+    }
+    registrations[feature] = { adapter: registration.adapter, requires: [...requires], status, activation: [...activation] };
   }
 
   const rules = manifest.rules.map((rule, index) => {
@@ -630,6 +831,9 @@ function deliveryConfigFromCustomer(privateRoot, customer, manifest) {
     // travels with it so a log line, a report or a generated file can name the
     // relationship instead of inferring it from a length.
     kind: customer.kind,
+    // plan-679 Phase 2: `support` decides whether the delivery carries the diagnosis package
+    // (`deliversDiagnosis`). Carried so deliver.mjs can ask without re-reading the register.
+    support: customer.support,
     tier: customer.delivery.tier,
     restrictedFeatures: [...customer.delivery.restrictedFeatures],
     remote: customerRemoteUrl(customer, hubBaseUrl()),
@@ -866,7 +1070,8 @@ function assertDeliveryFields(config, manifest, extra) {
   return { ...config, ...extra };
 }
 
-function featureTier(manifest, feature) {
+//! Tier of one manifest registration, resolved from its adapter file.
+export function featureTier(manifest, feature) {
   const adapter = manifest.registrations[feature].adapter.replace(/^\.\//, '') + '.ts';
   return resolveTier(manifest, `src/${adapter}`).tier;
 }
@@ -908,17 +1113,49 @@ function selectedDocumentation(manifest, profile) {
 }
 
 //! Generates the customer-specific private plugin entry point without any internal import.
+//! Every adapter is a DYNAMIC import behind the same `useFeature` contract as the checked-in
+//! `private-plugins.ts` (plan-652 Phase 1): same order, same isolation per feature, and each
+//! adapter becomes its own chunk instead of being welded into the entry.
 export function generateCustomerPrivatePlugins(manifest, profile) {
   const features = selectedFeatures(manifest, profile);
-  const imports = features.map((feature, index) =>
-    `import { register as registerFeature${index} } from '${manifest.registrations[feature].adapter}';`);
-  const calls = features.map((_feature, index) => `  await registerFeature${index}(viewer);`);
+  // All adapter chunks are REQUESTED at once (they were one entry chunk before), then
+  // registered one by one in manifest order: a serial await per import would turn the
+  // former single download into a waterfall of round trips at boot (measured +17 %
+  // model-loaded locally, plan-652 Phase 1, 2026-10-21).
+  const fetches = features.map((feature, index) =>
+    `  const adapter${index} = early(import('${manifest.registrations[feature].adapter}'));`);
+  const calls = features.map((feature, index) =>
+    `  await useFeature(viewer, '${feature}', () => adapter${index});`);
   return [
     `import type { RVViewer } from '../../realvirtual-web/src/core/rv-viewer';`,
-    ...imports,
+    '',
+    '//! Runs one feature adapter, isolated: a throwing adapter is logged and skipped.',
+    '//! Reports the registration to the FeatureLoader when the core has one (plan-652).',
+    'async function useFeature(',
+    '  viewer: RVViewer,',
+    '  feature: string,',
+    '  load: () => Promise<{ register: (viewer: RVViewer) => Promise<void> }>,',
+    '): Promise<void> {',
+    '  const features = (viewer as { features?: { recordStartup?: (id: string, run: () => Promise<void>) => Promise<void> } }).features;',
+    '  const run = async (): Promise<void> => { const { register } = await load(); await register(viewer); };',
+    '  try {',
+    "    if (typeof features?.recordStartup === 'function') await features.recordStartup(feature, run);",
+    '    else await run();',
+    '  } catch (error) {',
+    '    console.error(`[private-plugins] feature "${feature}" failed to register:`, error);',
+    '  }',
+    '}',
+    '',
+    '//! Marks an early-started import as handled; its rejection still reaches useFeature().',
+    'function early<T>(promise: Promise<T>): Promise<T> {',
+    '  promise.catch(() => { /* reported by useFeature */ });',
+    '  return promise;',
+    '}',
     '',
     'export async function registerPrivatePlugins(viewer: RVViewer): Promise<void> {',
+    ...fetches,
     ...(calls.length ? calls : ['  void viewer;']),
+    '  (viewer as { features?: { logBootSummary?: () => void } }).features?.logBootSummary?.();',
     '}',
     '',
   ].join('\n');
@@ -961,14 +1198,20 @@ export function renderFeatureMatrix(manifest, deliveries, customerProjectKey = n
 
   lines.push('## Core (AGPL) - always included', '');
   lines.push('Included in every delivery (AGPL core).', '');
-  for (const capability of CORE_FEATURES) lines.push(`- ${capability}`);
+  for (const capability of coreCapabilities()) lines.push(`- ${capability}`);
   lines.push('');
 
   lines.push('## Licensed features', '');
   lines.push('Tier-gated commercial and restricted features; enabled per your licence.', '');
   // The column head names the delivery. In the shared repository that must not be the
   // display name of one customer, because every other one reads the same file (§2.7).
-  const headers = ['Feature', 'Tier', 'Status', ...configs.map((delivery) => deliveryDisplayName(delivery))];
+  // The trailing "Label" column names the public catalog row a registration belongs to
+  // (plan-646), so `step-import` reads as "CAD import (…)". It is appended rather than put
+  // next to the id so the leading `| id | tier | status |` cells keep their stable shape;
+  // a registration without a catalog row (a restricted one) shows "-" (the workspace
+  // documents are ASCII-only, see the customer-workspace test).
+  const labels = catalogLabelsByRegistration();
+  const headers = ['Feature', 'Tier', 'Status', ...configs.map((delivery) => deliveryDisplayName(delivery)), 'Label'];
   lines.push(`| ${headers.join(' | ')} |`);
   lines.push(`| ${headers.map(() => '---').join(' | ')} |`);
   // A customer must not read about features they were never given. For a single customer the
@@ -987,9 +1230,19 @@ export function renderFeatureMatrix(manifest, deliveries, customerProjectKey = n
         : tier === 'restricted' && delivery.restrictedFeatures.includes(feature);
       return enabled ? 'yes' : 'no';
     });
-    lines.push(`| ${feature} | ${tier} | ${status} | ${cells.join(' | ')} |`);
+    lines.push(`| ${feature} | ${tier} | ${status} | ${[...cells, labels.get(feature) ?? '-'].join(' | ')} |`);
   }
   lines.push('');
+  // plan-652: features whose manifest `activation` is not just `startup` are delivered but
+  // load on first use (mode, component type or command) - say so under the table instead of
+  // a new column, so the table keeps its stable shape.
+  const onDemand = rows.filter((feature) => {
+    const activation = manifest.registrations[feature]?.activation;
+    return Array.isArray(activation) && activation.some((trigger) => trigger !== 'startup');
+  });
+  if (onDemand.length > 0) {
+    lines.push(`On demand (delivered, loaded on first use): ${onDemand.join(', ')}.`, '');
+  }
 
   if (customerProjectKey) {
     lines.push('## Your project', '');
@@ -1179,6 +1432,23 @@ export function assertNoUnfetchedLfsObjects(privateRoot, key, files) {
   }
 }
 
+//! The delivery guards of the project's OWN files, applied to a library source folder that lives in the
+//! private tree's `projects/` (plan-778 D3): a clean tree (the Git index is what ships) and no unfetched
+//! LFS pointer. A library folder elsewhere (`--library`) is not a Git project of this tree and is left to
+//! the LFS-pointer check of the trim itself.
+export function libraryGitGuard(privateRoot) {
+  const projectsRoot = resolve(privateRoot, 'projects');
+  return (folder) => {
+    const rel = relative(projectsRoot, resolve(folder));
+    if (!rel || rel.startsWith('..') || isAbsolute(rel)) return;
+    const key = rel.split(sep)[0];
+    const tracked = gitTrackedProjectFiles(privateRoot, key);
+    if (!tracked) return;
+    assertProjectTreeClean(privateRoot, key);
+    assertNoUnfetchedLfsObjects(privateRoot, key, tracked);
+  };
+}
+
 //! Aborts when the project folder carries anything Git does not track.
 //!
 //! Modelled on `assertCleanTree` (deliver.mjs), narrowed to one project folder and widened to
@@ -1227,22 +1497,25 @@ function copyLibraryIntoCore(coreRoot, coreOutput) {
       if (file.isFile()) delivered.add(`${LIBRARY_ROOT}/${category}/${file.name}`);
     }
   }
-  writeDeliveredLibraryCatalog(projectDir, join(coreOutput, 'public'), delivered);
+  writeDeliveredLibraryProject(projectDir, join(coreOutput, 'public'), delivered);
 }
 
-//! Writes a bundled-library catalog reduced to the delivered GLBs. The project catalog also
-//! lists internal and customer-specific assets; delivering it verbatim would 404 in the
-//! workspace and expose those asset names in the planner library UI.
-function writeDeliveredLibraryCatalog(projectDir, publicOutput, delivered) {
-  const source = join(projectDir, 'library', 'catalog.json');
+//! Writes the realvirtual library's `project.json` reduced to the delivered GLBs
+//! (plan-778): the library is a PROJECT now (`prj_realvirtual_library`), and the
+//! viewer finds it at the app-level `library/project.json` of every build. The
+//! source manifest also lists internal and scratch categories; a row whose file is
+//! not delivered would 404 and expose an internal asset name in the planner. Every other field (id, name, aliases, hashes,
+//! thumbnails) is kept; the library itself is never trimmed per project (N2).
+function writeDeliveredLibraryProject(projectDir, publicOutput, delivered) {
+  const source = join(projectDir, LIBRARY_PROJECT);
   if (!existsSync(source)) return;
-  const catalog = readJson(source);
-  const entries = (catalog.entries ?? [])
-    .filter((entry) => delivered.has(`${LIBRARY_ROOT}/${toPosix(String(entry?.glbUrl ?? ''))}`));
-  if (entries.length === 0) return;
-  const destination = join(publicOutput, LIBRARY_CATALOG);
+  const project = readJson(source);
+  const documents = (Array.isArray(project.documents) ? project.documents : [])
+    .filter((row) => delivered.has(`${LIBRARY_ROOT}/${toPosix(String(row?.path ?? ''))}`));
+  if (documents.length === 0) return;
+  const destination = join(publicOutput, LIBRARY_PROJECT);
   mkdirSync(dirname(destination), { recursive: true });
-  writeFileSync(destination, JSON.stringify({ ...catalog, entries }, null, 2) + '\n');
+  writeFileSync(destination, JSON.stringify({ ...project, documents }, null, 2) + '\n');
 }
 
 // ─── The reference model is GONE (plan-737, was plan-735 Phase 1) ───────────
@@ -1419,10 +1692,16 @@ function copyCore(coreRoot, outputRoot, deliveredDocs, publicModels = new Set(),
   // includePublicDemoContent: the PUBLIC demo deploy ships realvirtual's own curated
   // scenes/ (Examples incl. DemoPlanner) and aasx/ (AAS supplier demos: Festo, SEW,
   // Bosch). Customer deliveries never get them — they are demo content, not product.
-  const { includePublicDemoContent = false } = opts;
+  const { includePublicDemoContent = false, includeGeneratedFiles = false } = opts;
   for (const name of CORE_FILES) {
     const source = join(coreRoot, name);
     if (existsSync(source)) copyFileSync(source, join(outputRoot, name));
+  }
+  for (const name of includeGeneratedFiles ? CORE_GENERATED_FILES : []) {
+    const source = join(coreRoot, name);
+    if (!existsSync(source)) continue;
+    mkdirSync(dirname(join(outputRoot, name)), { recursive: true });
+    copyFileSync(source, join(outputRoot, name));
   }
   for (const name of deliveredDocs) {
     const source = join(coreRoot, name);
@@ -1474,9 +1753,9 @@ function copyCore(coreRoot, outputRoot, deliveredDocs, publicModels = new Set(),
       // bytes twice in the workspace (here and under `projects/`), accepted by
       // user decision 2026-09-12 in exchange for a demo that opens.
     }
-    // The bundled component library is delivered by copyDemoAssetsIntoCore, which filters it
-    // to DELIVERED_LIBRARY_CATEGORIES and writes a matching reduced catalog. Copying the tree
-    // wholesale here would ship every category plus the full catalog.json and silently defeat
+    // The bundled component library is delivered by copyLibraryIntoCore, which filters it
+    // to DELIVERED_LIBRARY_CATEGORIES and writes a matching reduced project.json. Copying the tree
+    // wholesale here would ship every category plus the full library project.json and silently defeat
     // that curation.
     if (normalized === 'library' || normalized.startsWith('library/')) return false;
     if (normalized !== 'models' && !normalized.startsWith('models/')) return true;
@@ -1488,6 +1767,8 @@ function copyCore(coreRoot, outputRoot, deliveredDocs, publicModels = new Set(),
       copyTree(source, join(outputRoot, name), (rel) => `${name}/${rel}` !== CUSTOMER_POLICY_FILE);
     }
   }
+  const livesyncKit = join(coreRoot, LIVESYNC_KIT_DIR);
+  if (existsSync(livesyncKit)) copyTree(livesyncKit, join(outputRoot, LIVESYNC_KIT_DIR), livesyncStagingFilter);
   mkdirSync(join(outputRoot, 'scripts'), { recursive: true });
   for (const name of CORE_SCRIPT_FILES) {
     const source = join(coreRoot, 'scripts', name);
@@ -1613,11 +1894,23 @@ function pruneLegacyLockTree(tree) {
     }));
 }
 
-function writePrunedPrivatePackage(privateRoot, destination) {
-  const manifest = readJson(join(privateRoot, 'package.json'));
+/**
+ * The private package.json as a customer workspace receives it — every dependency field pruned of
+ * what a customer cannot install (plan-679 Phase 3: exported as a pure function so the static
+ * notices test judges a delivery tier by exactly the manifest the staging writes).
+ *
+ * The pruning is tier-independent today: no delivery tier carries the pruned scope.
+ */
+export function prunedPrivateManifest(manifest) {
+  const pruned = { ...manifest };
   for (const field of LOCK_DEPENDENCY_FIELDS) {
-    if (manifest[field]) manifest[field] = prunedDependencyMap(manifest[field]);
+    if (pruned[field]) pruned[field] = prunedDependencyMap(pruned[field]);
   }
+  return pruned;
+}
+
+function writePrunedPrivatePackage(privateRoot, destination) {
+  const manifest = prunedPrivateManifest(readJson(join(privateRoot, 'package.json')));
   writeFileSync(join(destination, 'package.json'), JSON.stringify(manifest, null, 2) + '\n');
   const lockPath = join(privateRoot, 'package-lock.json');
   if (!existsSync(lockPath)) {
@@ -1826,7 +2119,7 @@ function generateReadme(delivery, projectKey, model, features, projectPlugins = 
     `\`projects/demo-realvirtual/\` is the realvirtual demo project. It arrives once, with your first delivery, and after that it is treated exactly like any other folder under \`projects/\`: yours to open, edit and break, and never overwritten by an update.\n\n` +
     `## Reference\n\n` +
     `### Features\n\n` +
-    `Every delivery includes the AGPL core (${CORE_FEATURES.length} capabilities: drives, sensors, transport surfaces, sources and sinks, grippers, signals and PLC connectivity, HMI panels, camera presets, PDF document linking, and the layout planner). The categories below add to that core; they do not replace it.\n\n` +
+    `Every delivery includes the AGPL core (${coreCapabilities().length} capabilities: ${coreCapabilityProse()}). The categories below add to that core; they do not replace it.\n\n` +
     `**Licensed features** - tier-gated commercial and restricted features, enabled per your licence:\n\n` +
     `${licensedBlock}\n\n` +
     (projectless
@@ -2001,6 +2294,7 @@ function writeWorkspaceRecipes(root, projectKey, model, coreRoot) {
       `## Further reading\n\n- [InfluxDB OSS v2 installation](https://docs.influxdata.com/influxdb/v2/install/)\n- [InfluxDB v2 HTTP API](https://docs.influxdata.com/influxdb/v2/api/)\n- [Troubleshoot the runtime](troubleshoot-runtime.md)\n`,
 
     'deploy-production-web.md': `# Deploy the production web app\n\n` +
+      `## Two ways, and the short one first\n\nIf the target is a CDN zone (the one realvirtual provisioned for you, or one in your own Bunny account) you do not need the rest of this recipe. From \`realvirtual-web/\`, with the zone credentials in a gitignored \`.env\`:\n\n\`\`\`bash\nnpm run publish:project -- --list\nnpm run publish:project -- --project "<name>" --dry-run\nnpm run publish:project -- --project "<name>"\n\`\`\`\n\nThat builds, stages the project under \`<code>/p/\`, uploads only what changed, removes what the publish no longer contains, purges the cache and prints the URL. [Publishing a project](../realvirtual-web/doc-publishing.md) is the full guide.\n\nEverything below is the other case: hosting the build yourself on customer infrastructure, typically beside CONNECT and behind a reverse proxy.\n\n` +
       `## Goal and outcome\n\nBuild and host the customer-managed static realvirtual WEB application at its real production URL with secure CONNECT communication and predictable caching.\n\n` +
       `## When to use\n\nUse this recipe when customer IT deploys the Viewer to an intranet, DMZ, private cloud, or approved public web host.\n\n` +
       `## Prerequisites\n\n- A tested model and workspace.\n- A customer-owned HTTPS host or reverse proxy configuration.\n- An approved network path from each user's browser to CONNECT.\n- Customer IT/OT approval for authentication, firewall, VPN/DMZ, retention, and monitoring.\n\n` +
@@ -2420,6 +2714,7 @@ function writeCustomerCommands(root) {
   writeFileSync(join(commands, 'kinematize.md'), `# Kinematize a CAD import\n\nThis command is an adapter; [recipes/kinematize-cad-import.md](../../recipes/kinematize-cad-import.md) is canonical. Use the \`kinematize\` subagent for this work, because the perception phase consumes a lot of context and belongs in its own window. The recipe starts from an asset editor that is already open on an imported assembly - confirm that with \`web_editor_status\` first. It does not import and does not save.\n`);
   writeFileSync(join(commands, 'dev.md'), `# Start development\n\nThis command is an adapter; the [workspace recipes](../../recipes/README.md) are canonical. From the workspace root, run \`powershell -NoProfile -ExecutionPolicy Bypass -File .\\start.ps1\` (Linux: \`./start.sh\`). realvirtual CONNECT starts the development server itself and serves the Viewer at http://localhost:5100. After a \`git pull\` that changed the dependencies, run \`setup.ps1\` once. For model replacement or live signals, follow the linked recipe. Do not stop unrelated Node processes; if a port is occupied, pass \`-ConnectPort\` and \`-WebPort\` explicitly.\n`);
   writeFileSync(join(commands, 'build.md'), `# Verify and build\n\nThis command is an adapter; follow [Create a custom plugin](../../recipes/create-custom-plugin.md) for development checks and [Deploy the production web app](../../recipes/deploy-production-web.md) for deployment. From the workspace root, run \`cd realvirtual-web\`, then \`npx tsc --noEmit\`, then \`npm run build\`. Report either failure without changing unrelated files.\n`);
+  writeFileSync(join(commands, 'publish.md'), `# Publish a project\n\nThis command is an adapter; [Publishing a project](../../realvirtual-web/doc-publishing.md) is canonical, and [Deploy the production web app](../../recipes/deploy-production-web.md) covers self-hosting on customer infrastructure instead.\n\nFrom \`realvirtual-web/\`, run \`npm run publish:project -- --list\` to see the projects of this workspace, then \`npm run publish:project -- --project "<name>" --dry-run\` and read the printed plan back to the user BEFORE publishing for real.\n\nPublishing needs \`BUNNY_STORAGE_ZONE\` and \`BUNNY_STORAGE_KEY\` in a gitignored \`.env\`. Never put either value on a command line, into a commit, or into a chat message. A publish REPLACES what is on that project URL, so confirm the project name with the user first.\n`);
   writeFileSync(join(commands, 'debug.md'), `# Read-only diagnosis\n\nThis command is an adapter; follow [Troubleshoot the runtime](../../recipes/troubleshoot-runtime.md) as the canonical runbook. Start with read-only inspection. Read \`http://127.0.0.1:5100/__api/debug\` or use the read-only \`web_*\` MCP tools documented in \`realvirtual-web/webviewer.mcp.md\`. Do not change signals, scene state, files, or processes unless the user explicitly requests a mutation.\n`);
 }
 
@@ -2545,7 +2840,8 @@ function stubFallbackContent(stubSource, stubRel) {
 //! Stages public no-op stubs for `@rv-private` modules the delivery does not include.
 //! With realvirtual-web-pro present, Vite aliases `@rv-private` hard to the pro tree
 //! (no per-file fallback to src/private-stubs), so tier-excluded modules that core
-//! imports (e.g. plugins/des/*) must exist there as their public stubs.
+//! imports (e.g. plugins/asset-editor/shared/*) must exist there as their public stubs.
+//! (DES needs none since plan-680 — it is core code.)
 function stagePrivateStubFallbacks(coreRoot, privateOutput) {
   walk(join(coreRoot, PRIVATE_STUB_ROOT), (absolute, rel, entry) => {
     if (!entry.isFile() || rel === 'private-plugins.ts') return;
@@ -2727,6 +3023,8 @@ function stageFilteredSourceTreeAt(options, destinationRoot) {
     ?? (profile.tier === 'core' && !projectKey);
   copyCore(coreRoot, coreOutput, deliveredDocs, deliveredPublicModels(coreRoot), {
     includePublicDemoContent,
+    // plan-646: only the --demo deploy, which regenerates them just before staging.
+    includeGeneratedFiles: options.includeGeneratedFiles === true,
   });
   copyLibraryIntoCore(coreRoot, coreOutput);
   // The demo as a PROJECT, for the customer channels only (plan-737 F4/F5). The
@@ -2889,6 +3187,20 @@ function stageFilteredSourceTreeAt(options, destinationRoot) {
       // the bundled backend would outrank their workspace, and the delivery
       // would boot the reference model instead of the customer's machine.
       writeFileSync(join(projectOutput, 'project.json'), JSON.stringify(customerProjectConfig, null, 2) + '\n');
+      // plan-778 F15: the library projects it uses travel with it, trimmed, under
+      // `projects/<key>/libraries/<projectId>/` (hints rewritten in this copy only).
+      // Sources: `options.librarySources` (`--projects-dir` / `--library`), else the
+      // private tree's own `projects/`. An unresolvable library stops the delivery here,
+      // before anything reaches a customer repository.
+      trimProjectLibraries(projectOutput, {
+        projectsDir: options.librarySources?.projectsDir ?? join(privateRoot, 'projects'),
+        libraries: options.librarySources?.libraries ?? {},
+        realvirtualLibraryDir: existsSync(join(coreOutput, 'public', LIBRARY_PROJECT))
+          ? join(coreOutput, 'public', LIBRARY_ROOT)
+          : null,
+        label: `projects/${key}`,
+        verifySourceFolder: libraryGitGuard(privateRoot),
+      }, { log: (line) => console.log(line) });
     }
     // hasDiagnosis:false (a --no-rag delivery) ships no connect/ payload, so the generated README
     // and start.ps1 must not promise or hash a diagnosis package that is not there. It defaults to
@@ -2950,32 +3262,76 @@ export function assertWorkspaceGuards(workspaceRoot, options = {}) {
   const own = new Set((options.projectKeys ?? (options.projectKey ? [options.projectKey] : []))
     .map((value) => value.toLowerCase()));
   const foreign = (options.knownProjectKeys ?? []).map((value) => value.toLowerCase()).filter((value) => !own.has(value));
+  // Collect mode (plan-679 Phase 4): with `options.collect` (an array) every violation is pushed
+  // as `{ guard, kind, message }` instead of thrown, so a release check reports all of them in one
+  // run. Two kinds, with fixed semantics:
+  //  - structure guards (link, nested .git, secret-bearing name) report and do NOT enter the
+  //    subtree / read the file — a forbidden directory is never read further;
+  //  - content guards (size, foreign name, secret content, doc links, LFS) report and go on.
+  const collect = Array.isArray(options.collect) ? options.collect : null;
+  const report = (guard, kind, message) => {
+    if (!collect) throw new Error(message);
+    collect.push({ guard, kind, message });
+  };
   walk(root, (absolute, rel, entry) => {
     if (isNonDeliveredBuildDir(entry)) return false;
-    assertNotLink(absolute);
+    try {
+      assertNotLink(absolute);
+    } catch (error) {
+      report('link', 'structure', error.message);
+      return false;
+    }
     const segments = rel.split('/');
     if (segments[0].toLowerCase() === '.git') return false;
-    if (segments.some((segment) => segment.toLowerCase() === '.git')) throw new Error(`Nested .git is forbidden: ${rel}`);
-    if (entry.isDirectory()) return;
+    if (segments.some((segment) => segment.toLowerCase() === '.git')) {
+      report('nested-git', 'structure', `Nested .git is forbidden: ${rel}`);
+      return false;
+    }
+    if (entry.isDirectory()) {
+      // A directory named like a secret (`.env.d/`) is a structure finding in collect mode; the
+      // throwing mode keeps reporting it on the first file inside, exactly as before.
+      if (collect && isSecretPath(rel)) {
+        report('secret-name', 'structure', `Secret-bearing file is forbidden: ${rel}`);
+        return false;
+      }
+      return;
+    }
     const lower = rel.toLowerCase();
-    if (isSecretPath(rel)) throw new Error(`Secret-bearing file is forbidden: ${rel}`);
+    if (isSecretPath(rel)) {
+      report('secret-name', 'structure', `Secret-bearing file is forbidden: ${rel}`);
+      return;
+    }
     const size = statSync(absolute).size;
     if (size > MAX_DELIVERY_FILE_BYTES
       && (!options.lfsRepoRoot || !hasLfsFilter(options.lfsRepoRoot, rel))) {
-      throw new Error(`Oversized delivery file: ${rel}`);
+      report('size', 'content', `Oversized delivery file: ${rel}`);
     }
     const inSource = SOURCE_TREE_PREFIXES.some((prefix) => lower.startsWith(prefix))
       || (segments[0].toLowerCase() === 'projects' && own.has((segments[1] ?? '').toLowerCase()));
     if (foreign.some((name) => lower.includes(name) && !(inSource && PRODUCT_NAME_PROJECT_KEYS.has(name)))) {
-      throw new Error(`Foreign customer name found in ${rel}.`);
+      report('foreign-name', 'content', `Foreign customer name found in ${rel}.`);
     }
     const ext = lower.slice(lower.lastIndexOf('.'));
     if (!SECRET_SCAN_EXTENSIONS.has(ext)) return;
-    const violation = secretContentViolation(lower, ext, readFileSync(absolute, 'utf8'));
-    if (violation) throw new Error(violation);
+    // requireParser (plan-679 Phase 1): on the delivery path a missing TypeScript parser is a
+    // hard error. Falling back silently would bring the comment false positive straight back.
+    // Not a finding in collect mode either: without the parser no result of the scan is valid.
+    const violation = secretContentViolation(lower, ext, readFileSync(absolute, 'utf8'),
+      { requireParser: true, loadTypeScript: options.loadTypeScript });
+    if (violation) report('secret-content', 'content', violation);
   });
-  assertNoBrokenDocLinks(root);
-  if (options.lfsRepoRoot) assertLfsPointer(options.lfsRepoRoot);
+  try {
+    assertNoBrokenDocLinks(root);
+  } catch (error) {
+    report('doc-links', 'content', error.message);
+  }
+  if (options.lfsRepoRoot) {
+    try {
+      assertLfsPointer(options.lfsRepoRoot);
+    } catch (error) {
+      report('lfs', 'content', error.message);
+    }
+  }
 }
 
 function hasLfsFilter(repoRoot, path) {
@@ -3298,6 +3654,67 @@ function discardBrokenBuildCacheProfile(cacheBase, profileKey, ownLease) {
   removeBuildCacheTrash([outcome.value.trash]);
 }
 
+//! Where a profile keeps the private package's own `node_modules` (`realvirtual-web-pro/node_modules`,
+//! the result of `install-private-dependencies.mjs`). Same profile, because the profile key
+//! already hashes the staged private lockfile — the one `npm ci` of that step installs from.
+const PRIVATE_CACHE_DIR = 'private';
+
+//! Restores the private package's dependencies from a profile by COPY, never by junction: the
+//! staged layout (`<ws>/realvirtual-web-pro/node_modules`) must stay exactly what `npm ci` makes,
+//! because module resolution walks up from the real path and a junction into the cache would
+//! change which `node_modules` the private packages' own imports find. Returns true on success.
+function restoreCachedPrivateDependencies(profileRoot, workspaceRoot) {
+  const cached = join(profileRoot, PRIVATE_CACHE_DIR, 'node_modules');
+  const proRoot = join(workspaceRoot, 'realvirtual-web-pro');
+  if (!existsSync(cached) || !existsSync(join(proRoot, 'package.json'))) return false;
+  const target = join(proRoot, 'node_modules');
+  try {
+    rmSync(target, { recursive: true, force: true });
+    cpSync(cached, target, { recursive: true, force: true });
+    return true;
+  } catch (error) {
+    rmSync(target, { recursive: true, force: true });
+    console.warn(`[build-cache] Private dependency restore failed; installing them: ${error?.message ?? error}`);
+    return false;
+  }
+}
+
+//! Adds the private package's freshly installed `node_modules` to an existing profile. Like
+//! populateBuildCache: copy into a private temp folder outside the lock, swap in under it. A
+//! failure never fails the build. Returns true when the profile now holds them.
+function populatePrivateDependencyCache(cacheBase, profileKey, workspaceRoot) {
+  const profileRoot = join(cacheBase, profileKey);
+  const source = join(workspaceRoot, 'realvirtual-web-pro', 'node_modules');
+  const finalDir = join(profileRoot, PRIVATE_CACHE_DIR);
+  if (!existsSync(source) || !existsSync(join(profileRoot, 'node_modules'))) return false;
+  if (existsSync(join(finalDir, 'node_modules'))) return true;
+  const temporary = mkdtempSync(join(cacheBase, '.rv-build-profile-'));
+  try {
+    cpSync(source, join(temporary, 'node_modules'), { recursive: true, force: true });
+  } catch (error) {
+    removeBuildCacheTrash([temporary]);
+    console.warn(`[build-cache] Private dependency cache population failed; this build remains valid: ${error?.message ?? error}`);
+    return false;
+  }
+  const outcome = withBuildCacheWriteLock(cacheBase, () => {
+    if (existsSync(join(finalDir, 'node_modules'))) return { installed: true, trash: [temporary] };
+    if (!existsSync(join(profileRoot, 'node_modules'))) return { installed: false, trash: [temporary] };
+    const trash = existsSync(finalDir) ? [detachBuildCacheEntry(profileRoot, PRIVATE_CACHE_DIR)] : [];
+    try {
+      renameSync(temporary, finalDir);
+      return { installed: true, trash };
+    } catch {
+      return { installed: false, trash: [...trash, temporary] };
+    }
+  });
+  if (!outcome.acquired) {
+    removeBuildCacheTrash([temporary]);
+    return false;
+  }
+  removeBuildCacheTrash(outcome.value.trash);
+  return outcome.value.installed;
+}
+
 function restoreCachedNodeModules(cacheNodeModules, targetNodeModules) {
   rmSync(targetNodeModules, { recursive: true, force: true });
   try {
@@ -3407,6 +3824,24 @@ export function buildMetadataEnv(sourceRoot = SOURCE_ROOT, now = new Date()) {
   return env;
 }
 
+//! plan-680 §2.3 3b — null when `distDir` carries the DES feature chunk, else the reason.
+//! DES is core code since plan-680, so every built delivery (any tier, any profile) must
+//! ship it; `feature-chunks.json` is written by every production build (rvFeatureChunksPlugin).
+export function desFeatureChunkProblem(distDir) {
+  const table = join(distDir, 'feature-chunks.json');
+  if (!existsSync(table)) return `DES chunk check: ${table} is missing — not a production build of this core?`;
+  let rows;
+  try { rows = JSON.parse(readFileSync(table, 'utf8')); } catch (error) { return `DES chunk check: ${table} is unreadable (${error.message})`; }
+  const des = rows?.des;
+  if (!des || !Array.isArray(des.files) || des.files.length === 0) {
+    return 'incompatible core: plan-680 needs DES in the core — the built dist has no des feature chunk '
+      + `(${table}). Update both repos together (realvirtual-WebViewer~ and realvirtual-WebViewer-Private~).`;
+  }
+  const missing = des.files.filter((file) => !existsSync(join(distDir, file)));
+  if (missing.length > 0) return `DES chunk check: feature-chunks.json names files the dist does not have: ${missing.join(', ')}`;
+  return null;
+}
+
 //! Runs npm ci and the production build from the filtered workspace core.
 //!
 //! `fast: true` reuses a cached node_modules for an unchanged lockfile/runtime profile and
@@ -3414,6 +3849,14 @@ export function buildMetadataEnv(sourceRoot = SOURCE_ROOT, now = new Date()) {
 //! Test seams: `npmRunner`, `cacheRestore` (replaces the junction/copy restore),
 //! `runtimeIdentity` (replaces buildRuntimeIdentity()) and `sourceRoot` (the repository the
 //! build metadata is read from).
+//!
+//! `fast: true` also keeps the private package's own dependencies in the profile (a COPY, see
+//! restoreCachedPrivateDependencies): a hit whose profile already holds them skips the private
+//! `npm ci` (~1 min on the dev PC), a hit without them installs and then adds them.
+//! `devFast: true` (the /dev watcher only, `bunny-deploy --dev-fast`) sets `RV_DEV_FAST_BUILD=1`
+//! for the Vite build - the lighter build profile vite.config.ts reads. Never inherited: every
+//! other build has the variable removed. `onTiming(step, ms)` receives the duration of each step
+//! (`deps`, `private-deps`, `vite-build`, `provenance`); it must not throw.
 export function runBuild(workspaceRoot, options = {}) {
   const candidate = resolve(workspaceRoot);
   const coreRoot = existsSync(join(candidate, 'realvirtual-web', 'package.json')) ? join(candidate, 'realvirtual-web') : candidate;
@@ -3433,16 +3876,42 @@ export function runBuild(workspaceRoot, options = {}) {
     // maps — a `.map` next to these chunks IS the private TypeScript source.
     delete env.RV_INTERNAL;
     delete env.RV_SOURCEMAP;
+    // RV_COMMERCIAL makes the demo installable. The AGPL watermark no longer depends on it
+    // (plan-679 Phase 9): every build with the private tree drops it at build time — see
+    // scripts/lib/rv-agpl-attribution.mjs. ADR-047 holds unchanged:
     // The demo IS the commercial product (ADR-047); an AGPL watermark on a build that
     // contains code absent from the public repo would be a false licensing statement.
     env.RV_COMMERCIAL = '1';
   }
   else { delete env.VITE_PUBLIC_BUILD; env.VITE_PRIVATE_BUILD = '1'; }
+  // plan-679 Phase 3: the notices tier of a customer workspace is its DELIVERY tier, so the
+  // licence check judges the private policy against what this tier actually carries. Never
+  // inherited: a public, demo or full private build must not pick it up from the shell.
+  delete env.RV_NOTICES_TIER;
+  if (options.noticesTier !== undefined && options.mode !== 'public' && options.mode !== 'demo') {
+    if (!DELIVERY_TIERS.includes(options.noticesTier)) {
+      throw new Error(`runBuild: noticesTier "${options.noticesTier}" is not a delivery tier (${DELIVERY_TIERS.join(', ')}).`);
+    }
+    env.RV_NOTICES_TIER = options.noticesTier;
+  }
   if (options.base) env.VITE_BASE = options.base;
+  // plan-646 F14: the public-demo welcome window (`__RV_DEMO_WELCOME__`). Set explicitly to
+  // '1' or '0' for EVERY build — whatever the operator's shell or .env says is overwritten, so
+  // only bunny-deploy's `--demo --path demo` decision (demoWelcomeForTarget) can switch it on.
+  // The shared build cache holds node_modules only (keyed by lockfiles + runtime); `npm run
+  // build` always runs afresh below with this env, so a cache hit cannot carry the other value.
+  env.RV_DEMO_WELCOME = options.mode === 'demo' && options.demoWelcome === true ? '1' : '0';
+  // The "realvirtual public demo for evaluation" notice (#rv-demo-notice, scripts/lib/
+  // rv-agpl-attribution.mjs): ONLY the public demo (demo mode AND demoWelcome, i.e. target path `demo`) switches it on; set explicitly for every
+  // build, so a customer workspace / private deploy can never inherit it from the shell.
+  env.RV_DEMO_NOTICE = options.mode === 'demo' && options.demoWelcome === true ? '1' : '0';
   // Marks this as OUR staged release build for the third-party notices (plan-544 F11): without
   // RV_NOTICES_MODE the plugin uses the release default (warn until Phase 6, then enforce),
   // while a customer's own `npm run build` — which never passes through here — stays warn.
   env.RV_NOTICES_RELEASE_BUILD = '1';
+  // The lighter /dev build profile: only on an explicit request, never from the shell.
+  delete env.RV_DEV_FAST_BUILD;
+  if (options.devFast === true) env.RV_DEV_FAST_BUILD = '1';
   // The version line the built bundle shows. Additive: an operator who already set one of
   // these in the environment keeps their value, and a checkout without git contributes only
   // the build time.
@@ -3459,7 +3928,15 @@ export function runBuild(workspaceRoot, options = {}) {
   let populateCache = false;
   let cacheBase = null;
   let lease = null;
+  let privateCached = false;
+  const timed = (step, action) => {
+    const started = Date.now();
+    try { return action(); } finally {
+      try { options.onTiming?.(step, Date.now() - started); } catch { /* timing is diagnostics only */ }
+    }
+  };
   try {
+    const depsStarted = Date.now();
     if (options.fast) {
       profileKey = buildProfileKey(candidate, coreRoot, options.runtimeIdentity ?? buildRuntimeIdentity());
       if (profileKey) {
@@ -3491,7 +3968,15 @@ export function runBuild(workspaceRoot, options = {}) {
               // `npm ci`. Run that step explicitly, so a hit builds exactly what a miss builds
               // (/dev failed on every hit from 2026-10-04 to 2026-10-09). Idempotent: it installs
               // only what is missing and does nothing without a private package.
-              (options.privateDepsRunner ?? runPrivateDependencyInstall)(candidate, coreRoot, env);
+              // The profile may hold them already (keyed by the same private lockfile): then the
+              // copy replaces the install. The install script cannot be asked instead - it
+              // compares the installed version against the manifest RANGE (`^0.20.0`) and so
+              // reinstalls on every run.
+              privateCached = timed('private-deps', () => {
+                if (restoreCachedPrivateDependencies(profileRoot, candidate)) return true;
+                (options.privateDepsRunner ?? runPrivateDependencyInstall)(candidate, coreRoot, env);
+                return false;
+              });
             } else {
               discardBrokenBuildCacheProfile(cacheBase, profileKey, lease);
             }
@@ -3506,15 +3991,24 @@ export function runBuild(workspaceRoot, options = {}) {
       npmRunner(['ci'], { cwd: coreRoot, env, stdio: 'inherit' });
       populateCache = Boolean(options.fast && profileKey && cacheBase);
     }
-    npmRunner(['run', 'build'], { cwd: coreRoot, env, stdio: 'inherit' });
+    try { options.onTiming?.('deps', Date.now() - depsStarted); } catch { /* diagnostics only */ }
+    timed('vite-build', () => npmRunner(['run', 'build'], { cwd: coreRoot, env, stdio: 'inherit' }));
+    // plan-680 §2.3 3b: DES is core code — a built delivery without its lazy body chunk
+    // came from an incompatible tree pair and must not ship. Only after a real build (a
+    // test that replaces the runner produces no dist).
+    if (!options.npmRunner) {
+      const problem = desFeatureChunkProblem(join(coreRoot, 'dist'));
+      if (problem) throw new Error(problem);
+    }
     if (populateCache) populateBuildCache(cacheBase, profileKey, targetNodeModules, lease);
+    if (options.fast && profileKey && cacheBase && !privateCached) populatePrivateDependencyCache(cacheBase, profileKey, candidate);
     const distDir = join(coreRoot, 'dist');
-    writeFileSync(join(distDir, '.rv-build-provenance.json'), JSON.stringify({
+    timed('provenance', () => writeFileSync(join(distDir, '.rv-build-provenance.json'), JSON.stringify({
       sourceTreeSha256: hashTree(candidate, ['realvirtual-web/dist/**', '**/node_modules/**']),
       mode: options.mode ?? 'private',
       project: options.projectKey ?? null,
       fast: Boolean(options.fast),
-    }, null, 2) + '\n');
+    }, null, 2) + '\n'));
     return { coreRoot, distDir, dryRun: false, cacheStatus, cacheMethod, profileKey };
   } finally {
     releaseBuildCacheLease(lease);
@@ -3735,6 +4229,75 @@ function removeVendorSidecars(projectsRoot) {
  * gate (`readBaselineSourceInventory`): the manifest's own tag when it is really
  * there, and otherwise the most recent delivery tag that is.
  */
+/**
+ * The baseline tag of a customer repository, from the delivery tags that really exist
+ * (newest first) and the tag its HEAD manifest names: the named one when it exists, otherwise
+ * the newest. Pure, so the full clone ({@link detectDeliveryBaseline}) and the bare release-check
+ * read ({@link readRemoteBaselineInventory}) cannot disagree (plan-679 Phase 4).
+ */
+export function selectBaselineTag(tags, namedTag) {
+  return namedTag && tags.includes(namedTag) ? namedTag : (tags[0] ?? null);
+}
+
+/**
+ * Reads the private-source inventory of a customer repository's delivery baseline WITHOUT a
+ * full clone and without writing anything to the remote (plan-679 Phase 4, reused by plan-480
+ * Phase 3).
+ *
+ * A bare, blob-filtered clone into a temp directory: refs and trees only, then exactly the blobs
+ * `git show` needs — the HEAD manifest (which names the baseline tag) and the baseline tag's
+ * manifest. Everything is removed again in `finally`, also on a timeout.
+ *
+ * Returns `{ remoteEmpty, untagged, baselineTag, inventory, damage }`:
+ *  - empty remote or no delivery tag -> `inventory: null` (not gated, like the push path);
+ *  - a baseline tag without a readable manifest -> `damage` set (the release check treats it as
+ *    fatal: without a baseline the approval list cannot be right).
+ * A failing or hanging remote throws (timeout `timeoutMs`).
+ */
+export function readRemoteBaselineInventory(remote, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 180_000;
+  const tmpBase = resolve(options.tmpBase ?? process.env.RV_DELIVER_TMP ?? tmpdir());
+  mkdirSync(tmpBase, { recursive: true });
+  const dir = mkdtempSync(join(tmpBase, 'rv-baseline-'));
+  const run = (args, { allowFailure = false } = {}) => {
+    try {
+      return execFileSync('git', args, {
+        cwd: dir, encoding: 'utf8', timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      });
+    } catch (error) {
+      if (error?.code === 'ETIMEDOUT' || error?.signal === 'SIGTERM') {
+        throw new Error(`Reading the delivery baseline of ${remote} timed out after ${Math.round(timeoutMs / 1000)} s.`);
+      }
+      if (allowFailure) return null;
+      const detail = String(error?.stderr ?? error?.message ?? error).trim().split(/\r?\n/).slice(-3).join(' | ');
+      throw new Error(`Reading the delivery baseline of ${remote} failed: ${detail}`);
+    }
+  };
+  try {
+    run(['clone', '--bare', '--filter=blob:none', '--no-checkout', '--quiet', remote, '.']);
+    const remoteEmpty = run(['rev-parse', '--verify', 'HEAD'], { allowFailure: true }) === null;
+    if (remoteEmpty) return { remoteEmpty: true, untagged: false, baselineTag: null, inventory: null, damage: null };
+    const listed = run(['tag', '-l', 'delivery/*', '--sort=-refname', '--sort=-creatordate'], { allowFailure: true });
+    const tags = (listed ?? '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    let named = null;
+    const headManifest = run(['show', 'HEAD:delivery-manifest.json'], { allowFailure: true });
+    if (headManifest !== null) {
+      try { named = readDeliveryManifest(JSON.parse(headManifest)).baselineTag; } catch { named = null; }
+    }
+    const baselineTag = selectBaselineTag(tags, named);
+    if (!baselineTag) return { remoteEmpty: false, untagged: true, baselineTag: null, inventory: null, damage: null };
+    const text = run(['show', `${baselineTag}:delivery-manifest.json`], { allowFailure: true });
+    if (text === null) {
+      return { remoteEmpty: false, untagged: false, baselineTag, inventory: parseBaselineSourceInventory(''),
+        damage: `the baseline tag ${baselineTag} carries no delivery-manifest.json` };
+    }
+    return { remoteEmpty: false, untagged: false, baselineTag, inventory: parseBaselineSourceInventory(text), damage: null };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 export function detectDeliveryBaseline(clone) {
   const remoteEmpty = gitIn(clone, ['rev-parse', '--verify', 'HEAD'], { allowFailure: true }) === null;
   // Two sort keys: the later option is the primary one, so this is "newest
@@ -3743,7 +4306,7 @@ export function detectDeliveryBaseline(clone) {
     : gitIn(clone, ['tag', '-l', 'delivery/*', '--sort=-refname', '--sort=-creatordate'], { allowFailure: true });
   const tags = (listed ?? '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   const named = readCloneDeliveryManifest(clone).baselineTag;
-  const baselineTag = named && tags.includes(named) ? named : (tags[0] ?? null);
+  const baselineTag = selectBaselineTag(tags, named);
   // `firstDelivery` means SEED EVERYTHING, so it is tied to an empty remote and
   // to nothing else. A repository that has content but carries no delivery tag is
   // a different animal — see `untagged` — and used to be folded in here, which is
@@ -4010,6 +4573,124 @@ export function applySnapshot(stagedRoot, cloneRoot, options = {}) {
   };
 }
 
+// ─── CHANGELOG.md — the approved release notes (plan-679 Phase 5/6) ──────
+//
+// The format is guaranteed by the /release-web gate (and validated again by
+// Documentation/web/scripts/validate-changelog.mjs in the docs repo, which is not imported from
+// here): `## Unreleased`, then one `## X.Y.Z — YYYY-MM-DD` section per release, newest first,
+// each with bold block headings (`**New**`, `**Improved**`, `**Fixed**`, `**Internal**`).
+
+const CHANGELOG_SECTION = /^## (?:(Unreleased)|(\d+\.\d+\.\d+)(?:\s+[—-]\s+(\S+))?)\s*$/;
+
+function compareVersions(a, b) {
+  const pa = String(a).split('.').map(Number);
+  const pb = String(b).split('.').map(Number);
+  for (let i = 0; i < 3; i++) if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pa[i] ?? 0) - (pb[i] ?? 0);
+  return 0;
+}
+
+/**
+ * Splits a CHANGELOG into its preamble and `##` sections, keeping every byte: `heading` is the
+ * heading line, `body` everything up to the next `##` line (both with their line endings), so
+ * `preamble + sections.map(s => s.heading + s.body).join('')` is the input again.
+ */
+export function parseChangelogSections(text) {
+  const normalized = String(text ?? '').replace(/\r\n/g, '\n');
+  const lines = normalized.split('\n');
+  const sections = [];
+  let preamble = '';
+  let current = null;
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    const newline = index < lines.length - 1 ? '\n' : '';
+    const match = CHANGELOG_SECTION.exec(line);
+    if (match) {
+      current = { unreleased: Boolean(match[1]), version: match[2] ?? null, date: match[3] ?? null, heading: line + newline, body: '' };
+      sections.push(current);
+    } else if (current) current.body += line + newline;
+    else preamble += line + newline;
+  }
+  return { preamble, sections };
+}
+
+//! Removes the `**Internal**` block of one section body (up to the next bold block heading).
+export function stripInternalBlock(body) {
+  const out = [];
+  let internal = false;
+  for (const line of String(body).split('\n')) {
+    if (/^\*\*[^*]+\*\*\s*$/.test(line)) internal = /^\*\*Internal\*\*\s*$/.test(line);
+    if (!internal) out.push(line);
+  }
+  return out.join('\n');
+}
+
+//! Whitespace-normalised form of a release-notes text, for the approval comparison.
+export function normalizeReleaseNotes(text) {
+  return String(text ?? '').replace(/\r\n/g, '\n').split('\n').map((line) => line.replace(/\s+$/, ''))
+    .join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/**
+ * The customer-facing release notes of every release in `(fromVersion, toVersion]`, newest first,
+ * without the `**Internal**` blocks — what the delivery commit body carries (plan-679 F7 / A6).
+ *
+ * `fromVersion` null (first delivery, v1 manifest) or equal to `toVersion` (a corrected re-delivery
+ * of the same version): only the `toVersion` section. Returns '' when the CHANGELOG has no section
+ * in the range; the caller decides whether that is an error (release path) or a fallback.
+ */
+export function releaseNotesFromChangelog(text, fromVersion, toVersion) {
+  const { sections } = parseChangelogSections(text);
+  const only = !fromVersion || compareVersions(fromVersion, toVersion) >= 0;
+  const picked = sections.filter((section) => section.version
+    && compareVersions(section.version, toVersion) <= 0
+    && (only ? compareVersions(section.version, toVersion) === 0 : compareVersions(section.version, fromVersion) > 0));
+  return picked.map((section) => {
+    const body = normalizeReleaseNotes(stripInternalBlock(section.body));
+    return body ? `${section.heading.trim()}\n\n${body}` : '';
+  }).filter(Boolean).join('\n\n');
+}
+
+//! {@link releaseNotesFromChangelog} on the core checkout's CHANGELOG.md ('' when there is none).
+export function releaseNotesBetween(coreRoot, fromVersion, toVersion) {
+  const path = join(resolve(coreRoot), 'CHANGELOG.md');
+  if (!existsSync(path)) return '';
+  return releaseNotesFromChangelog(readFileSync(path, 'utf8'), fromVersion, toVersion);
+}
+
+//! The version a baseline tag `delivery/<version>` names, or null.
+export function versionOfBaselineTag(tag) {
+  const match = /^delivery\/(\d+\.\d+\.\d+)$/.exec(String(tag ?? ''));
+  return match ? match[1] : null;
+}
+
+/**
+ * True-or-reason check that a release commit promoted `## Unreleased` into exactly the APPROVED
+ * section and changed nothing else of the CHANGELOG (plan-679 Gate R2 finding 1): `## Unreleased`
+ * empty afterwards, one new `## <version> — <date>` section directly below it whose text equals the
+ * approved text (whitespace-normalised), every older section byte-identical. Returns `null` when
+ * the promotion is exactly that, else the reason.
+ */
+export function changelogPromotionProblem(before, after, version, approvedText) {
+  const old = parseChangelogSections(before);
+  const next = parseChangelogSections(after);
+  if (old.preamble !== next.preamble) return 'the CHANGELOG preamble changed';
+  const [unreleased, added, ...rest] = next.sections;
+  if (!unreleased?.unreleased) return 'the CHANGELOG does not start with "## Unreleased"';
+  if (normalizeReleaseNotes(unreleased.body) !== '') return '"## Unreleased" is not empty after the release commit';
+  if (!added || added.version !== version || !added.date) return `the section directly below "## Unreleased" is not "## ${version} — <date>"`;
+  if (normalizeReleaseNotes(added.body) !== normalizeReleaseNotes(approvedText)) {
+    return `the ${version} section differs from the approved release notes`;
+  }
+  const olderBefore = old.sections.filter((section) => !section.unreleased);
+  if (rest.length !== olderBefore.length) return 'older CHANGELOG sections were added or removed';
+  for (let index = 0; index < rest.length; index++) {
+    if (rest[index].heading + rest[index].body !== olderBefore[index].heading + olderBefore[index].body) {
+      return `the older section "${olderBefore[index].heading.trim()}" changed`;
+    }
+  }
+  return null;
+}
+
 //! Renders the customer-facing change summary between the previously delivered core commit
 //! and HEAD. Only feat/fix subjects are listed — wip/chore/merge/test noise stays internal,
 //! and the conventional-commit type and scope are stripped so the customer reads plain text.
@@ -4162,8 +4843,24 @@ export function diffPrivateSourceInventory(baseline, current) {
  * disappearing paths are reported and never block — dropping a file is always the
  * safe direction. Returns the diff so the caller can log the removals.
  */
-export function assertPrivateSourceInventory(baseline, current, { acceptNew = false } = {}) {
+export function assertPrivateSourceInventory(baseline, current, { acceptNew = false, approved = null } = {}) {
   const diff = diffPrivateSourceInventory(baseline, current);
+  // plan-679 Phase 4: the release path passes the APPROVED list (from the release-notes
+  // approval) instead of the blanket flag. Every added path must be on it; an approved path
+  // that no longer arrives is information only.
+  if (Array.isArray(approved)) {
+    const allowed = new Set(approved);
+    const notApproved = diff.gated ? diff.added.filter((path) => !allowed.has(path)) : [];
+    const arriving = new Set(diff.added);
+    diff.approvedUnused = approved.filter((path) => !arriving.has(path)).sort();
+    if (!notApproved.length) return diff;
+    throw new Error([
+      `${notApproved.length} private source file(s) would reach this customer for the first time `
+        + 'and are NOT on the approved list:',
+      ...notApproved.map((path) => `  + ${path}`),
+      'A new release dry-run lists them for approval; nothing else may add to the list.',
+    ].join('\n'));
+  }
   if (!diff.gated || !diff.added.length || acceptNew) return diff;
   throw new Error([
     `${diff.added.length} private source file(s) would reach this customer for the first time`

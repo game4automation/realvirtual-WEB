@@ -61,7 +61,7 @@ async function makeProvider(): Promise<RapierPhysicsProvider | null> {
     if (REQUIRE_WASM) {
       throw new Error(
         '[plan-467 F15] RV_PHYSICS_REQUIRE_WASM=1 but @dimforge/rapier3d-compat is not usable — ' +
-        'install it out-of-band (npm i --no-save @dimforge/rapier3d-compat@0.19.3) instead of skipping',
+        'run `npm install` in Assets/realvirtual-WebViewer-Private~ instead of skipping',
       );
     }
     console.warn('[physics-467] @dimforge/rapier3d-compat not installed (out-of-band) — skipping');
@@ -227,6 +227,32 @@ describe('kinematic moving parts move real MUs (real Rapier WASM, plan-467 9.5)'
       const plateStroke = 0.5 * DT * 5;
       console.log(`[physics-467 9.5] wake: MU rose ${(dy * 1000).toFixed(3)} mm for a ${(plateStroke * 1000).toFixed(3)} mm stroke`);
       expect(dy).toBeGreaterThan(plateStroke * 0.9);
+    } finally {
+      provider.dispose();
+    }
+  }, 60000);
+
+  it('a plate moved while NO dynamic body exists does not fling the first MU that arrives (accumulated travel must not become velocity)', async () => {
+    // step() skips world.step() with an empty MU map, so Rapier keeps the plate at its old pose while
+    // the poses accumulate; the provider resyncs the parts before the first MU (Codex review). Measured on
+    // 0.20: the unsynced variant is ALSO harmless for this scene - this pins the behaviour, not a regression.
+    const provider = await makeProvider();
+    if (!provider) return;
+    try {
+      provider.addStaticBox('floor', { x: 0, y: -0.1, z: 0 }, { x: 10, y: 0.1, z: 10 }, Q_IDENT);
+      provider.addKinematicBody(
+        'kin:fast',
+        { kind: 'cuboid', halfExtents: { x: 0.05, y: 0.15, z: 0.5 }, localOffset: V0 },
+        pose(-1, 0.15, 0),
+        false,
+      );
+      run(provider, 'kin:fast', { x: -1, y: 0.15, z: 0 }, { x: 2, y: 0, z: 0 }, 60); // no MU yet
+      provider.addDynamicMU('mu', pose(1, 0.3251, 0), { x: 0.025, y: 0.025, z: 0.25 }, V0, 1); // resting ON the plate's final pose
+      const hold = pose(1, 0.15, 0);
+      for (let t = 0; t < 30; t++) { provider.setKinematicPose('kin:fast', hold); provider.step(DT); }
+      const mu = muPos(provider, 'mu');
+      console.log(`[physics-467 9.5] empty-world transition: MU x=${mu.x.toFixed(3)}`);
+      expect(Math.abs(mu.x - 1)).toBeLessThan(0.05); // rides on the plate, was not flung by 2 m of accumulated travel
     } finally {
       provider.dispose();
     }

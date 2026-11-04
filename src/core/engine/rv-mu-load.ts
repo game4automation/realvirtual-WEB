@@ -30,6 +30,7 @@
 
 import type { RVMovingUnit, InstancedMovingUnit } from './rv-mu';
 import { MM_TO_METERS } from './rv-constants';
+import { isPhysicsOwned } from './rv-mu-owner';
 
 /** Vertical gap (mm) between a load's collider bottom and its carrier's top that still counts as resting. */
 export const LOAD_TOLERANCE_MM = 5;
@@ -79,7 +80,7 @@ export function isInLoadTree(root: RVMovingUnit, mu: RVMovingUnit): boolean {
  */
 export function loadMu(load: RVMovingUnit, carrier: RVMovingUnit, host?: MULoadHost | null): boolean {
   if (load === carrier || load.isInstanced || carrier.isInstanced) return false;
-  if (load.physicsOwned || load.isGripped) return false;
+  if (isPhysicsOwned(load) || load.isGripped) return false;
   if (isInLoadTree(load, carrier)) return false; // carrier rests on load → cycle
   if (load.loadedOn === carrier) return true;
   if (load.loadedOn) unlink(load);
@@ -176,7 +177,7 @@ export function findCarrierByCollider(mu: RVMovingUnit, actives: readonly (AnyMU
   for (const a of actives) {
     if (a.isInstanced) continue;
     const c = a as RVMovingUnit;
-    if (c === mu || c.markedForRemoval || c.isGripped || c.physicsOwned) continue;
+    if (c === mu || c.markedForRemoval || c.isGripped || isPhysicsOwned(c)) continue;
     visit(c);
   }
   return best;
@@ -319,7 +320,7 @@ function considerForPlacement(part: RVMovingUnit, moving: readonly RVMovingUnit[
   let candidate: RVMovingUnit | null = null;
   if (!f.isInstanced) {
     const c = f as RVMovingUnit;
-    if (!c.markedForRemoval && !c.isGripped && !c.physicsOwned && restsOn(part, c)) candidate = c;
+    if (!c.markedForRemoval && !c.isGripped && !isPhysicsOwned(c) && restsOn(part, c)) candidate = c;
   }
   for (let i = 0; i < moving.length; i++) {
     if (!boxesOverlap(moving[i], f)) continue;

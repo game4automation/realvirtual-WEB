@@ -84,3 +84,27 @@ describe('RVHighlightPolicy', () => {
     expect(ctx.isSubscribed()).toBe(false);
   });
 });
+
+describe('HighlightProfile.edges (plan-766 F6)', () => {
+  it('the editor profile is fill-only; every other shipped profile keeps its edges', () => {
+    expect(MODE_HIGHLIGHT_PROFILES.editor.edges).toBe(false);
+    for (const [mode, profile] of Object.entries(MODE_HIGHLIGHT_PROFILES)) {
+      if (mode === 'editor') continue;
+      // Unset = default true — HMI / DES / planner render unchanged.
+      expect(profile.edges !== false, mode).toBe(true);
+    }
+    expect(DEFAULT_HIGHLIGHT_PROFILE.edges !== false).toBe(true);
+  });
+
+  it('the policy installs the edge flag together with the editor profile', () => {
+    const ctx = makeHost();
+    const policy = new RVHighlightPolicy(ctx.host)
+      .register('hmi', MODE_HIGHLIGHT_PROFILES.hmi)
+      .register('editor', MODE_HIGHLIGHT_PROFILES.editor);
+    ctx.fireModeChanged('editor');
+    expect(ctx.highlighter.getProfile().edges).toBe(false);
+    ctx.fireModeChanged('hmi');
+    expect(ctx.highlighter.getProfile().edges !== false).toBe(true);
+    policy.dispose();
+  });
+});

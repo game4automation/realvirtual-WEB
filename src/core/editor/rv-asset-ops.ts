@@ -33,6 +33,8 @@ import { freshOpId } from '../ops/rv-op-utils';
 // this module imports the origin-filtered VIEW of the union back. One
 // vocabulary, described where each half belongs.
 import type { RvAssetOp, RvAssetPrimitiveOp } from '../ops/rv-unified-ops';
+import type { CadConverter } from '../import/rv-cad-glb-cache';
+import type { NodeIdMap } from '../engine/rv-subtree-instantiate';
 
 // ─── CADLink ────────────────────────────────────────────────────────────
 
@@ -57,8 +59,54 @@ export interface CADLinkExtras {
    * Converter that produced the geometry (plan-561). Absent = 'browser' (every import before
    * plan-561). Browser and CONNECT produce different trees, so the GLB cache keys on it and
    * re-import / re-tessellation stay with the original converter. Web-only field.
+   * `'solidcraft'` (plan-621): geometry written by a live CAD link, one body per GLB.
    */
-  Converter?: 'connect' | 'browser';
+  Converter?: CadConverter;
+  /**
+   * Live-link identity of a node mirrored from a SolidCraft design (plan-621, optional,
+   * additive — readers that do not know it ignore it). Matching uses these ids only,
+   * never node names or paths.
+   */
+  SolidCraft?: CADLinkSolidCraft;
+  /**
+   * Variant identity of a parametric family's `_Generated` subtree (plan-650, optional,
+   * additive). With `Converter: 'parametric'` the cache key is `(InputHash, 'param-v2')`; a
+   * cache miss during draft replay regenerates the variant from these fields.
+   */
+  Parametric?: CADLinkParametric;
+}
+
+/** Which family variant an `importCad` of converter `'parametric'` holds (plan-650 Phase 4). */
+export interface CADLinkParametric {
+  /** Path of the family node relative to the model root (`''` = the model root itself). */
+  FamilyPath: string;
+  /** Normalized parameter values of the variant. */
+  Values: Record<string, number | boolean | string>;
+}
+
+/**
+ * Which part of a SolidCraft design a node mirrors (plan-621 §2.3). Since plan-649 only the sync ROOT
+ * carries it as `CADLink.SolidCraft`; occurrence, body and joint nodes carry the same fields in the hidden
+ * `userData.realvirtual.SolidCraftLink` block (documents of the old format are migrated on connect).
+ */
+export interface CADLinkSolidCraft {
+  /** `root` = sync root, `occurrence` = placed component, `body` = one body mesh, `joint` = pivot. */
+  Role: 'root' | 'occurrence' | 'body' | 'joint';
+  /**
+   * Root: path of the `.solidcraft` file. Absent for an unsaved design — such a root is found again only
+   * within the same sync session (plan-649: never by its name).
+   */
+  DesignPath?: string;
+  /** Root: design name. */
+  DesignName?: string;
+  /** Occurrence and body: SolidCraft occurrence id (0 = the root component). */
+  OccurrenceId?: number;
+  /** Body: identity key (the body's stable SolidCraft feature id, as a string). */
+  BodyKey?: string;
+  /** Body: display name, used to detect a rename. */
+  BodyName?: string;
+  /** Joint: SolidCraft joint id. */
+  JointId?: number;
 }
 
 // ─── Op taxonomy ────────────────────────────────────────────────────────
@@ -89,6 +137,45 @@ export interface ImportCadOp extends AssetOpBase {
   cadlink: CADLinkExtras;
   /** Local transform of the CAD root at import (identity unless placed). */
   transform: NodeTransform;
+  /**
+   * plan-769 Phase 2 (F10/F11): the ids the imported nodes got, keyed by the decoded
+   * CAD node's seeded id (`@<preorder index>` without one); a CADLink re-import
+   * pre-fills it with the ids of the matched old nodes. Minted on the FIRST apply and
+   * written back here, so redo, draft replay and a remote peer give the same nodes the
+   * same ids. Runtime ids only (never persisted, F17); ops recorded before plan-769
+   * lack it and mint afresh.
+   */
+  idMap?: NodeIdMap;
+}
+
+/**
+ * Swap the GEOMETRY of one mesh node for the single mesh of a cached GLB
+ * (plan-621). The node itself — name, transform, material, children, rv_extras
+ * components — is untouched; only `mesh.geometry` changes.
+ *
+ * Geometry by hash, like {@link ImportCadOp}: both directions are addressed in
+ * the CAD-GLB cache under `(sha, quality, converter)`, so redo, draft replay
+ * AND undo after a save (the trash is flushed, the old geometry object is gone)
+ * re-materialise from the cache. That is why `prevSha256` is mandatory: an op
+ * whose previous geometry has no key could never be undone across a save.
+ *
+ * Only the vertices of the GLB's one mesh are used, in that mesh's LOCAL frame;
+ * node transforms inside the GLB are ignored.
+ */
+export interface ReplaceNodeGeometryOp extends AssetOpBase {
+  kind: 'replaceNodeGeometry';
+  /** A mesh node, or a node whose subtree holds exactly one mesh. */
+  nodePath: string;
+  /** Other users of the SAME source geometry; one decoded instance for all (plan-663). */
+  sharedNodePaths?: string[];
+  /** Cache key of the new geometry — SHA-256 of the GLB bytes stored under it. */
+  sha256: string;
+  /** Cache quality token of BOTH keys (e.g. `'source'`). */
+  quality: string;
+  /** Cache converter of BOTH keys (e.g. `'solidcraft'`). */
+  converter: CadConverter;
+  /** Cache key of the geometry the node carried before — the undo payload. */
+  prevSha256: string;
 }
 
 /** Set a node's local TRS. */
@@ -105,6 +192,14 @@ export interface RenameNodeOp extends AssetOpBase {
   nodePath: string;
   name: string;
   prevName: string;
+  /**
+   * The authored name (`userData._rvOrigName`) the node carried before the
+   * rename; ABSENT — never `undefined` — when it carried none (plan-765 F2).
+   * Forward deletes the stamp (the user's name is what a save writes now);
+   * undo writes this back. Ops recorded before plan-765 lack it: they replay
+   * forward correctly and only lose the stamp restore on undo.
+   */
+  prevOrigName?: string;
 }
 
 /** Detach a subtree (undo re-attaches — executor keeps it in a hidden trash). */
@@ -134,6 +229,34 @@ export interface CreateNodeOp extends AssetOpBase {
   transform: NodeTransform;
   /** Sibling insert position under the parent (append when omitted). */
   index?: number;
+  /** plan-769 Phase 2: the created node's id under key `node` — see {@link ImportCadOp.idMap}. */
+  idMap?: NodeIdMap;
+}
+
+/**
+ * Deep-copy a live subtree (plan-641 Phase 3, `editor.clone`): nodes, local
+ * transforms, `userData` (rv_extras components included), own geometry and
+ * material copies. The copy lands under `parentPath` with the leaf name of
+ * `nodePath`, deduped at op CREATION, so draft replay is deterministic. Forward
+ * copies the source AS IT STANDS when the op applies — the ops before it in the
+ * log have already put it there. Undo detaches the copy to the trash
+ * (`clone:<opId>`); redo re-attaches it. Stored references inside the copy that
+ * pointed INTO the copied subtree follow the copy; all others keep pointing where
+ * the source's did (plan-769 D9 — Unity Ctrl+D).
+ */
+export interface CloneNodeOp extends AssetOpBase {
+  kind: 'cloneNode';
+  /** Path of the subtree that is copied. */
+  sourcePath: string;
+  /** Full path of the copy: `<parentPath>/<dedupedName>` ('' parent = the asset root). */
+  nodePath: string;
+  /** Sibling insert position under the parent (append when omitted). */
+  index?: number;
+  /**
+   * plan-769 Phase 2 (D9): the copy's ids, keyed by the SOURCE node's identity id
+   * (`@<preorder index>` without one) — see {@link ImportCadOp.idMap}.
+   */
+  idMap?: NodeIdMap;
 }
 
 /** Move a subtree under a new parent, preserving its world transform. The
@@ -217,8 +340,32 @@ export interface MaterialValue {
   /** Emissive color `#rrggbb`. Omitted = black (non-emissive). */
   emissive?: string;
   emissiveIntensity?: number;
-  /** Embedded PNG color map (data URL); existing mesh UV coordinates are used. */
+  /** Embedded PNG color map (data URL, sRGB); existing mesh UV coordinates are used. */
   texture?: string;
+  /**
+   * plan-675: embedded ORM map (data URL, LINEAR): G = roughness, B = metalness —
+   * the glTF metallicRoughness layout, so the exporter writes it as one texture.
+   * The scalar `roughness` / `metalness` multiply it, as in glTF.
+   */
+  ormTexture?: string;
+  /** plan-675: embedded tangent-space normal map (data URL, LINEAR). */
+  normalTexture?: string;
+  /**
+   * plan-675: the preset this value came from. Persisted in the material's glTF
+   * `extras` (`rvMaterialPreset`) so a reloaded GLB rehydrates the preset's maps
+   * from its id — texture identities do not survive glTF.
+   */
+  presetId?: string;
+  /**
+   * plan-675: texture scale along U. Planar/box UVs (metres): metres per tile.
+   * A roller mantle preset (cylindrical UVs, u = revolutions): tiles per revolution.
+   * Omitted = 1.
+   */
+  textureScaleU?: number;
+  /** plan-675: texture scale along V — always metres per tile. Omitted = 1. */
+  textureScaleV?: number;
+  /** plan-675: animated roller mantle — the runtime spins its maps with the conveyor (Phase 3). */
+  spin?: 'roller';
 }
 
 /**
@@ -227,7 +374,7 @@ export interface MaterialValue {
  * Editor mode loads with `preserveHierarchy: true` — no uber bake, no
  * BatchTable — so every node keeps its own real material and a plain
  * `mesh.material = …` assignment both renders immediately AND survives the GLB
- * export (GLTFExporter serializes the live graph). See doc-render-picking.md
+ * export (GLTFExporter serializes the live graph). See contract-bake-picking.md
  * §1.1; this op MUST NOT be reachable from batched modes.
  */
 export interface SetMaterialOp extends AssetOpBase {
@@ -276,6 +423,11 @@ export interface SeparateMeshOp extends AssetOpBase {
    * a diagnostic), never a silent rename.
    */
   childNames: string[];
+  /**
+   * plan-769 Phase 2: the generated parts' ids under keys `part:<i>` (the Group keeps
+   * the source mesh's id) — see {@link ImportCadOp.idMap}.
+   */
+  idMap?: NodeIdMap;
 }
 
 /**
@@ -348,6 +500,11 @@ export interface MergeMeshOp extends AssetOpBase {
   outputs: MergeOutputSpec[];
   /** Surviving nodes, in PRE-ORDER so an anchor is re-homed before anything under it. */
   kept: MergeKeptNodeSpec[];
+  /**
+   * plan-769 Phase 2: the non-root outputs' ids under keys `output:<i>` (the root
+   * output keeps the root's id) — see {@link ImportCadOp.idMap}.
+   */
+  idMap?: NodeIdMap;
 }
 
 // The composite (transaction) op and the union over these payloads live in
@@ -393,6 +550,7 @@ export function assetOpTouchesHierarchy(op: RvAssetOp): boolean {
     || op.kind === 'setNodeVisible' // eye-icon state lives on the live node
     || op.kind === 'renameNode'
     || op.kind === 'createNode'
+    || op.kind === 'cloneNode'
     || op.kind === 'reparentNode'
     || op.kind === 'addComponent'
     || op.kind === 'removeComponent'
@@ -453,6 +611,9 @@ function collectRaycastImpact(op: RvAssetOp, into: AssetOpRaycastImpact): void {
     // Same from the other direction: N meshes leave, few enter, and every
     // FaceRange.objectPath under the merged root is replaced.
     case 'mergeMesh':
+    // The mesh set stays, but its triangles are new — merged pick geometry
+    // baked from the old ones would hit faces that no longer exist.
+    case 'replaceNodeGeometry':
       into.rebuild = true;
       return;
     default:

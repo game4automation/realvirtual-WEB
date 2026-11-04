@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * rv-component-section.tsx — Collapsible component section for the Property Inspector.
  *
@@ -45,7 +47,9 @@ import {
 } from './rv-inspector-helpers';
 import { flattenObjectFields } from './rv-field-editors';
 import { FieldRow } from './rv-field-row';
+import type { FieldEditState } from './rv-extras-editor';
 import { ReferencePickerRow } from './ReferencePickerRow';
+import { MaintenanceViewRow, MAINTENANCE_STEP_TYPE_FOR_VIEW } from './MaintenanceViewRow';
 import { pickableReferenceFields } from './rv-reference-field';
 import { getActiveAssetContext, getActiveAssetVersion, subscribeActiveAsset } from '../editor/active-asset-store';
 import { InspectorRow } from './rv-inspector-row';
@@ -72,7 +76,7 @@ function loadSet(storageKey: string, cacheRef: 'other' | 'section'): Set<string>
   if (cacheRef === 'section' && _sectionCollapsedCache) return _sectionCollapsedCache;
   let set: Set<string>;
   try {
-    const raw = localStorage.getItem(storageKey);
+    const raw = readLocalStorage(storageKey);
     set = raw ? new Set(JSON.parse(raw) as string[]) : new Set();
   } catch {
     set = new Set();
@@ -83,7 +87,7 @@ function loadSet(storageKey: string, cacheRef: 'other' | 'section'): Set<string>
 }
 
 function persistSet(storageKey: string, set: Set<string>): void {
-  localStorage.setItem(storageKey, JSON.stringify([...set]));
+  writeLocalStorage(storageKey, JSON.stringify([...set]));
 }
 
 function loadCollapsedSet(): Set<string> {
@@ -233,6 +237,12 @@ export interface ComponentSectionProps {
   /** Optional extra content rendered inside the expanded card, below the field rows (e.g. BehaviorLiveStateSections). */
   extraContent?: React.ReactNode;
   /**
+   * Optional per-field visibility (field rows AND signal-slot rows). A component
+   * whose fields depend on a mode shows only the active ones (plan-2227: the
+   * SignalConnector's Mode). Absent → every field, as before.
+   */
+  isFieldVisible?: (fieldName: string) => boolean;
+  /**
    * Read-only live mode: render ALL `data` fields as visible read-only rows
    * under the normal collapsible header — no editors, no overlay, no
    * consumed/other split, no "N more fields" collapse, no signal short-circuit.
@@ -245,9 +255,13 @@ export interface ComponentSectionProps {
   onResetComponent: () => void;
   viewer: RVViewer | null;
   signalStore: SignalStore | null;
+  getFieldEditState?: (fieldName: string) => FieldEditState | undefined;
+  onConfirmFieldEdit?: (fieldName: string) => void;
+  onCancelFieldEdit?: (fieldName: string) => void;
+  baseResetDisabled?: boolean;
 }
 
-export function ComponentSection({ nodePath, componentType, data, overriddenFields, consumedOnly, signalValue, headerAction, extraContent, readOnlyLive, onFieldEdit, onFieldReset, onResetComponent, viewer, signalStore }: ComponentSectionProps) {
+export function ComponentSection({ nodePath, componentType, data, overriddenFields, consumedOnly, signalValue, headerAction, extraContent, isFieldVisible, readOnlyLive, onFieldEdit, onFieldReset, onResetComponent, viewer, signalStore, getFieldEditState, onConfirmFieldEdit, onCancelFieldEdit, baseResetDisabled = false }: ComponentSectionProps) {
   // A PLCInput/PLCOutput section header is a pure TYPE badge — it names the
   // direction while no value is in play, so the hue stays but the intensity is
   // always `weak` (plan-341 §2.8 b). Every other component keeps its type colour.
@@ -296,7 +310,7 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
   }, []);
 
   // Structural references an author can pick in the editor (a step's sensor,
-  // drive or signal). Only while an asset document is being edited: there a
+  // drive or signal). Only while a document is being edited in the editor: there a
   // field edit is an undoable document op. Elsewhere they keep their read-only
   // ReferenceDisplay row.
   const assetVersion = useSyncExternalStore(subscribeActiveAsset, getActiveAssetVersion);
@@ -314,9 +328,13 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
     const consumedRaw: [string, unknown][] = [];
     const otherRaw: [string, unknown][] = [];
 
-    for (const [key, value] of Object.entries(withSeededDefaults(base, data))) {
+    const fields = { ...withSeededDefaults(base, data) };
+    // An omitted budget field is editable inheritance, not an absent property.
+    if (base === 'BlockageBudget') for (const key of consumed) if (!(key in fields)) fields[key] = null;
+    for (const [key, value] of Object.entries(fields)) {
       if (key.startsWith('_')) continue;
       if (isFieldHidden(base, key)) continue;
+      if (isFieldVisible && !isFieldVisible(key)) continue;
       // Rendering-precedence contract (plan-325 S3/S4): signal-slot keys are
       // removed from the generic FieldRow pipeline ENTIRELY — SignalSlotRow is
       // their only render path (also for value === null/undefined, where
@@ -344,9 +362,9 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
     // Consumed entries keep objects as-is (editable ObjectEditor handles them)
     // Other entries flatten objects into sub-field rows
     return { consumedEntries: consumedRaw, otherEntries: flattenEntries(otherRaw) };
-  }, [base, data, flattenEntries, pickableNames]);
+  }, [base, data, flattenEntries, pickableNames, isFieldVisible]);
 
-  // An MCP field write (web_editor_set_field / web_component_set) asks for its
+  // An MCP field write (web_editor_set_field / web_execute("component.setFields", …)) asks for its
   // row to be visible before the AI "clicks" it: open this section — and the
   // "more fields" block when the field lives there — without persisting, so the
   // user's own collapse preference survives the next selection.
@@ -643,22 +661,23 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
           </Box>
         )}
         {overriddenFields.size > 0 && (
-          <Tooltip title="Click to reset all overrides for this component" placement="top">
+          <Tooltip title={baseResetDisabled ? 'Switch to Base to reset base values' : 'Click to reset all overrides for this component'} placement="top">
             <Typography
-              onClick={(e) => { e.stopPropagation(); onResetComponent(); }}
+              onClick={baseResetDisabled ? undefined : (e) => { e.stopPropagation(); onResetComponent(); }}
               role="button"
-              tabIndex={0}
+              tabIndex={baseResetDisabled ? -1 : 0}
+              aria-disabled={baseResetDisabled || undefined}
               aria-label={`Reset ${overriddenFields.size} override${overriddenFields.size !== 1 ? 's' : ''} for ${componentType}`}
-              onKeyDown={activateOnKey(onResetComponent)}
+              onKeyDown={baseResetDisabled ? undefined : activateOnKey(onResetComponent)}
               sx={{
                 display: 'flex',
                 alignItems: 'center',
                 minHeight: HIT_MIN,
                 fontSize: FS.label,
-                color: ACCENT,
+                color: baseResetDisabled ? INK_LOW : ACCENT,
                 ml: 'auto',
-                cursor: 'pointer',
-                '&:hover': { color: INK_HIGH, textDecoration: 'underline' },
+                cursor: baseResetDisabled ? 'default' : 'pointer',
+                '&:hover': baseResetDisabled ? undefined : { color: INK_HIGH, textDecoration: 'underline' },
                 '&:focus-visible': { outline: `1px solid ${ACCENT}`, outlineOffset: 1, borderRadius: 0.5 },
               }}
             >
@@ -675,7 +694,8 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
       {/* Consumed (editable) fields */}
       {consumedEntries.map(([fieldName, value]) => {
         // Check for a custom field renderer plugin
-        const CustomRenderer = fieldRendererRegistry.getRenderer(componentType, fieldName);
+        const CustomRenderer = fieldRendererRegistry.getRenderer(componentType, fieldName)
+          ?? fieldRendererRegistry.getRenderer(base, fieldName);
         if (CustomRenderer) {
           // The custom renderer spans the full section-body width and aligns its
           // own title/rows to the inspector's label/value columns internally.
@@ -688,6 +708,7 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
               nodePath={nodePath}
               viewer={viewer}
               signalStore={signalStore}
+              onEdit={(v) => onFieldEdit(fieldName, v)}
             />
           );
         }
@@ -707,6 +728,11 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
             nodePath={nodePath}
             derived={unitBadges.get(fieldName)}
             aiKey={aiKeyOf(fieldName)}
+            componentType={componentType}
+            editState={getFieldEditState?.(fieldName)}
+            onConfirmEdit={() => onConfirmFieldEdit?.(fieldName)}
+            onCancelEdit={() => onCancelFieldEdit?.(fieldName)}
+            resetDisabled={baseResetDisabled}
           />
         );
       })}
@@ -715,17 +741,23 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
           field renders as a SignalSlotRow — also when the GLB has no value.
           The keys were removed from the FieldRow pipeline above; binding runs
           through SignalBindingManager + persistence, never onFieldEdit. */}
-      {pickable.map(({ field, target }) => (
+      {pickable.map(({ field, target, array }) => (
         <ReferencePickerRow
           key={`ref:${field}`}
           fieldName={field}
           value={data[field]}
           target={target}
+          array={array}
           viewer={viewer}
           nodePath={nodePath}
           onEdit={(v) => onFieldEdit(field, v)}
         />
       ))}
+
+      {/* plan-522: "Save current view" on a maintenance step — editor only (captureView). */}
+      {base === MAINTENANCE_STEP_TYPE_FOR_VIEW && getActiveAssetContext() !== null && (
+        <MaintenanceViewRow onEdit={(f, v) => onFieldEdit(f, v)} />
+      )}
 
       {getSignalSlotFields(base).length > 0 && (
         <ComponentSignalSlots
@@ -734,6 +766,7 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
           nodePath={nodePath}
           componentType={componentType}
           data={data}
+          isFieldVisible={isFieldVisible}
         />
       )}
 
@@ -838,6 +871,10 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
               unit={getFieldUnit(base, fieldName, data)}
               nodePath={nodePath}
               aiKey={aiKeyOf(fieldName)}
+              editState={getFieldEditState?.(fieldName)}
+              onConfirmEdit={() => onConfirmFieldEdit?.(fieldName)}
+              onCancelEdit={() => onCancelFieldEdit?.(fieldName)}
+              resetDisabled={baseResetDisabled}
             />
           ))}
         </>

@@ -12,8 +12,11 @@
  * - Steps 2 … SLOTS come from main.ts (reading the model, then the scene
  *   loader's phase marks); finish() earns the last step, which the robot puts
  *   down on the place point of the full belt.
- * - Behind the earned steps the cell runs faster (up to MAX_RATE); with
- *   nothing to deliver it swings empty-handed and slowly (class `idle`).
+ * - Behind the earned steps the cell runs faster (up to MAX_RATE). Ahead of
+ *   the load it still never swings empty: it keeps carrying boxes at
+ *   AHEAD_RATE: the unearned box joins the tail while the queue moves on one
+ *   pitch and its lead box rides off the belt end, so the number of boxes on
+ *   the belt stays the number of earned steps.
  * - The load is never delayed: the overlay fades on schedule, the robot just
  *   races through whatever is left during the fade.
  * - fault() stops the cell where it is (E-stop) until the next load.
@@ -28,8 +31,10 @@ const SLOT_PITCH = 30;
 const SLAT_PITCH = 12;
 /** Playback rate of the cell when several steps are waiting to be delivered. */
 const MAX_RATE = 5;
-/** Playback rate of an empty-handed swing (nothing earned to deliver). */
-const IDLE_RATE = 0.5;
+/** Extra travel of the lead box beyond the queue shift, enough to leave the belt. */
+const LEAD_EXIT = 50;
+/** Playback rate while the cell is ahead of the load (the lead box rides out). */
+const AHEAD_RATE = 0.8;
 const QUIP_INTERVAL_MS = 1800;
 const QUIP_FADE_MS = 250;
 
@@ -46,6 +51,13 @@ const QUIPS = [
   'Waiting for the forklift…',
   'Teaching the robot new tricks…',
   'Torquing to spec…',
+  'Packing the things…',
+  'Taping boxes shut…',
+  'Labelling parcels…',
+  'Stacking pallets…',
+  'Wrapping it in bubble foil…',
+  'Counting boxes twice…',
+  'Finding the box for the box…',
 ];
 
 export interface SplashRobot {
@@ -76,12 +88,19 @@ export function createSplashRobot(overlay: HTMLElement, detail: HTMLElement | nu
   let delivered = 0;
   let earned = 0;
   let rate = Number.NaN;
+  /** Whether the running cycle's box is earned (adds to the queue) or pushes the lead box off. */
+  let carrying = false;
   let quipTimer = 0;
   let quipIndex = 0;
 
+  /** Ride target of the running cycle's box; an unearned one lands on the last
+   *  queue position while the queue moves on one pitch. */
   const setTail = () => {
     const queued = Math.min(delivered, slots.length);
-    const to = queued >= slots.length ? 0 : TAIL_EMPTY - SLOT_PITCH * queued;
+    const to = !carrying ? TAIL_EMPTY - SLOT_PITCH * (queued - 1)
+      : queued >= slots.length ? 0 : TAIL_EMPTY - SLOT_PITCH * queued;
+    cell.style.setProperty('--rv-q-shift', carrying ? '0px' : `${SLOT_PITCH}px`);
+    cell.style.setProperty('--rv-q-exit', carrying ? '0px' : `${LEAD_EXIT}px`);
     cell.style.setProperty('--rv-out-to', `${to}px`);
     cell.style.setProperty('--rv-belt-to', `${Math.round(to / SLAT_PITCH) * SLAT_PITCH}px`);
   };
@@ -90,24 +109,28 @@ export function createSplashRobot(overlay: HTMLElement, detail: HTMLElement | nu
     rate = next;
     for (const a of cell.getAnimations({ subtree: true })) a.updatePlaybackRate(next);
   };
-  /** Speed for the current backlog; the idle class only flips at a cycle end. */
+  /** Speed for the current backlog. */
   const applyRate = () => {
     const backlog = earned - delivered;
-    setRate(backlog > 0 ? Math.min(MAX_RATE, 1 + 1.5 * (backlog - 1)) : IDLE_RATE);
+    setRate(backlog > 0 ? Math.min(MAX_RATE, 1 + 1.5 * (backlog - 1)) : AHEAD_RATE);
+  };
+  /** Decides at a cycle start whether its box is earned or pushes the lead box off.
+   *  With an empty belt there is nothing to push, so that box always counts. */
+  const startCycle = () => {
+    carrying = earned > delivered || delivered >= steps || delivered === 0;
+    setTail();
+    applyRate();
   };
 
-  // A cycle ended. If it carried a box, that box is now delivered: it stays at
-  // the tail as a queue box (or, on a full belt, on the place point). Then
-  // decide whether the next cycle carries a box or swings empty.
+  // A cycle ended. If its box was earned, it is now delivered: it stays at the
+  // tail as a queue box (or, on a full belt, on the place point).
   cell.querySelector('.out-box')?.addEventListener('animationiteration', () => {
     if (overlay.classList.contains('rv-fault')) return;
-    if (!cell.classList.contains('idle') && delivered < steps) {
+    if (carrying && delivered < earned) {
       if (delivered < slots.length) slots[delivered].classList.add('on');
       delivered++;
-      setTail();
     }
-    cell.classList.toggle('idle', earned <= delivered);
-    applyRate();
+    startCycle();
   });
 
   const setQuip = (text: string) => {
@@ -137,9 +160,7 @@ export function createSplashRobot(overlay: HTMLElement, detail: HTMLElement | nu
       bootDelivered = 0;
       earned = Math.max(1, delivered);
       slots.forEach((s, i) => s.classList.toggle('on', i < delivered));
-      setTail();
-      cell.classList.toggle('idle', earned <= delivered);
-      applyRate();
+      startCycle();
       this.fault(false);
       startQuips();
     },

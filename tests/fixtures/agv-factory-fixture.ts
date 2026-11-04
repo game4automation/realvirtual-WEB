@@ -5,7 +5,7 @@
  * Headless AGVFactory topology + work plan (plan-558 acceptance fixture).
  *
  * Geometry ported 1:1 from the private generator
- * `projects/DiscreteEventSimulation/tools/agv-factory-paths.mjs` (PATHS,
+ * `tools/des-examples/agv-factory-paths.mjs` (PATHS,
  * SUCCESSORS, ≤2.5 m splitting, MERGES zones, DRIVE_ORDER placement) and the
  * work plan from `plugins/agv-factory.ts` (Load → WS1/WS2 → WS3). No GLB.
  */

@@ -196,7 +196,136 @@ enforce it. Details: `doc-extending-webviewer.md` §5b.
 npm test              # Run all tests once (CI mode)
 npm run test:node     # Node-environment tests only (*.node.test.ts) — seconds, no browser
 npm run test:watch    # Watch mode for development
+npm run test:all      # node suite + browser suite, under ONE lock
 ```
+
+### Machine-wide test lock (plan-606)
+
+Test runs coordinate across the canonical checkout, every worktree and community clones.
+`RV_TEST_CAPACITY=single|budget` selects capacity (default budget at >=24 threads): single keeps
+one heavy run on H0; budget allows heavy on H0 plus light on base+3..+22, while exclusive holds
+all slots. Budget mode alone sets `VITEST_MAX_WORKERS` (light 4, heavy floor(0.75 × threads / 2),
+12 at 32 threads). `RV_TEST_LOCK_CLASS` / `--class=` overrides classification in budget mode;
+`status` shows all holders. Direct `npx vitest` stays heavy on H0 without a budget. See
+`doc-web-debugging.md` for classification and overrides. A suite under foreign load is useless as a measurement
+(2026-10-14: two parallel suites → 34 reds in 14 files, every file green alone).
+
+- **Mechanism:** the lock is a listening socket on `127.0.0.1:47177`. The wrapper
+  `scripts/with-test-lock.mjs` binds it, then starts the runner as its child (no shell, args
+  unchanged, inherited TTY) and releases it only after the child's process has exited — so it
+  brackets Playwright's `webServer` and every teardown. The OS frees the port whenever the
+  holder dies, and there is no lock file — but an orphaned or HUNG holder that does not die keeps
+  the port (2026-10-27: a hung bare `npx vitest run`, PID 7388, held it six hours and blocked five
+  agents). `node scripts/test-lock.mjs break` is the sanctioned way to free it (see below).
+- **Supported (protected) entry points:** `npm test`, `npm run test:node`, `npm run test:watch`
+  (lock held for the whole watch session), `npm run test:all` (one lock around both suites; the
+  inner `npm run …` re-enter via `RV_TEST_LOCK_HELD`), `npm run e2e`, `npm run e2e:headed`,
+  `npm run perf`, `perf:matrix`, `perf:soak`, `perf:load`. Extra args pass through:
+  `npm test -- tests/foo.test.ts -t "a b|c"`.
+- **Direct `npx vitest run`** is covered by the root `globalSetup` `tests/global-lock-guard.ts`
+  (both vitest configs): it takes the lock itself for the vitest process (weaker — released at
+  global teardown, before vitest has closed everything). It enforces `RV_TEST_MAX_RUNTIME_MINUTES`
+  itself (same default 90, exit 124, the vitest process ends and frees the port); the startup and
+  stall limits exist only under the wrapper — prefer the npm scripts.
+- **NOT protected:** a direct `npx playwright test` (incl. `--ui`), `vitest --ui` started directly,
+  and anything else that bypasses the npm scripts. Use the npm scripts.
+- **A second run waits** and prints `[test-lock] waiting for <argv> (PID …, since …) — N s left`
+  (at most every 30 s); after `RV_TEST_LOCK_TIMEOUT_SECONDS` (default 1800; exclusive: 3600 via
+  `RV_TEST_LOCK_EXCLUSIVE_TIMEOUT_SECONDS`) it refuses, naming the
+  holder. Who holds it: `node scripts/test-lock.mjs status` (exit 0 free, 1 held, 2 unknown process).
+- **A hung holder is freed with `node scripts/test-lock.mjs break`** (`[--dry-run]`, `[--port N]`,
+  `[--min-age-minutes 30]` (floor 10), `[--idle-seconds 60]` (floor 10)) — not by killing PIDs by hand.
+  It takes the PID listening on the port (netstat) and refuses (exit 2, printing why) unless the
+  holder's command line is a test process (vitest / with-test-lock / run-all-tests), it is older than
+  the minimum age, AND its tree is idle (< 1 s CPU between two samples, no process added or gone).
+  Then it kills the topmost ancestor still belonging to the same test invocation (npx vitest,
+  `cmd /c vitest`, Git Bash's `npx` shim, wrapper, run-all-tests) with `taskkill /T /F` — never a
+  Claude Code shell, claude.exe, npm, `timeout`, another node, Unity or CONNECT — re-checks the port and
+  prints what it ended. Exit 0 free/freed (also when a waiting run took the port at once), 1 the
+  kill did not free it, 2 refused. Windows only. A busy or young run is not hung: wait for it.
+- **Env switches:** `RV_TEST_LOCK=off` (no lock), `RV_TEST_LOCK_PORT` (other port, e.g. when a
+  foreign program uses 47177), `RV_TEST_LOCK_TIMEOUT_SECONDS`, `RV_TEST_LOCK_POLL_SECONDS`
+  (default 2). `RV_TEST_LOCK_DIR` (the old file lock, still written by `rv-worktree` into
+  `.env.local`) is **ignored** — one lock per machine is intended. `RV_TEST_MAX_RUNTIME_MINUTES`
+  (default 90, `0` = off): the lock-holding wrapper kills a run still going after that, releases, exits 124.
+  `RV_TEST_STARTUP_TIMEOUT_SECONDS` (default 300, `0` = off): same kill, exit **125**
+  (`no test file started within …`), when a vitest run has not started its first test FILE by then
+  (progress via `scripts/test-progress-reporter.mjs` in both vitest configs; a direct `npx vitest` is not
+  covered — only the maximum run time applies to it, see above —, watch reruns and non-vitest runners never limited). Since plan-617 the window closes at the
+  first `module-start` (a file's `suite-prepare`, or its import error), not at the first test: vitest's
+  100 ms update throttle delivers `test-prepare` only after a synchronous first test or a long `beforeAll`
+  has finished, so a legitimate first test longer than the limit used to be killed (2026-10-17, the large CAD line).
+  The limit guards against "no module event received" (#172: rpc dead, nothing reported); a run that
+  hangs AFTER a file started is covered by the stall limit.
+  `RV_TEST_STALL_MINUTES` (default 10, fractions allowed, `0` disables) catches silence after the
+  first module/file start: every record refreshes the window, including every file start/end and final
+  test result. On expiry the holder names unfinished files, counts expected files not started, kills
+  the tree and exits **123**. All reporting runs ending disarms it; watch idle and reruns are exempt.
+  Ten minutes leaves margin over the longest measured browser test (82 s) and the slowest file
+  (laserwelding-station-flow, 280 s with a result at least every 82 s). Every limit kill (123/124/125)
+  prints `[test-lock] FAILED (exit <code>): <cause>` last, after lock release, regardless of child status.
+  300 s stands (measured 2026-10-16 with the `[test-progress]` line): cold fresh worktree under foreign
+  load first test after 72.2 s (75.2 s since wrapper start, plan-764 gate run), warm 19.2 s / 3.6 s, node 0.8 s.
+- **Failures at once (`[test-fail]`, stderr, plan-617):** vitest's default reporter prints assertion and
+  stack only in its final summary, so a run ended by 124 / 125 or by hand lost every cause. The same
+  reporter prints each failure the moment it reaches the main process:
+  `[test-fail] <file> :: <full test name> — <first message, one line, ≤ 300 chars> @ <first stack line | no stack>`;
+  `:: (suite <name>)` for a `beforeAll` / `afterAll` error of a describe, `:: (module)` for an import or
+  file-level hook error. Only the final result of a retried test counts (green on retry → no line), each
+  cause once. 50 lines per run; the 51st prints `[test-fail] limit of 50 reached — further failures only in
+  the vitest summary` at once, a regular run end the remaining count. A failure still in the worker's
+  update buffer when the run is killed is lost — only what already arrived is kept.
+- **Progress + skip lines (stderr):** at its first test file and at its first test every vitest process
+  prints once `[test-progress] first test file started after X s (…)` and
+  `[test-progress] first test after X s (run start …, config …) / Y s since wrapper start`; every run
+  ends with `[test-skips] N skipped: <count> <note>, <count> no reason given: <file>, …` (top 5) —
+  `[test-skips] 0 skipped` when none (absence would be ambiguous). Tests vitest skipped because a
+  `beforeAll` of their file threw (the file is red as well) group as `file failed in setup: <file>`.
+  `--reporter=json` stdout stays clean.
+  WebGPU suites skip with the note `no WebGPU adapter (main suite runs without GPU — covered by npm run
+  test:gpu)` (`tests/helpers/webgpu-adapter-skip.ts`; `describe.skipIf` carries no note). The cause is
+  config, not hardware: the main suite deliberately runs headless Chromium on SwiftShader (every baseline
+  was measured that way), and vitest 4.0.18 does not forward per-instance `launchOptions`.
+- **GPU group (`npm run test:gpu`, 2026-10-17):** a separate, serial vitest run of the WebGPU files
+  (`tests/gpu-tests.json`: public `real-webgpu-smoke`, `mu-compute-transforms`; private
+  `cinematic-capability-probe`, `-motion`, `-render-smoke` when the sibling exists) WITH the real GPU.
+  `vitest.gpu.config.ts` spreads the resolved `vite.config.ts` (plugins, aliases, define,
+  optimizeDeps, exclude, lock guard identical) and overrides only: the Playwright PROVIDER gets
+  `launchOptions.args` = `--use-angle=d3d11 --enable-gpu --ignore-gpu-blocklist` (headless stays on) and
+  `launchOptions.channel: 'chromium'` (`GPU_BROWSER_CHANNEL`) — the FULL Chromium in new headless instead of
+  `chrome-headless-shell`, which ships no `dxil.dll` / `dxcompiler.dll`, so Dawn D3D12 could not create a
+  device and three fell back to WebGL2 silently (measured 2026-10-17),
+  `fileParallelism: false` / `maxWorkers: 1` (one GPU), its own `cacheDir` `node_modules/.vite-gpu`
+  (never touches the main suite's optimizer cache), `optimizeDeps.entries` = the main suite's test files
+  (vitest browser mode scans the project's include, not the CLI filter — with only five files the first run
+  re-optimized 37 deps mid-run), the include list, a setup file and a reporter.
+  **A missing adapter is an ERROR there, not a skip**: `tests/helpers/gpu-run-setup.ts` prints
+  `[gpu-backend] webgl=… webgpu=adapter(…)|none device=ok|<error>` and throws `GPU group without a WebGPU
+  adapter — flags not applied or driver/blocklist`, or — adapter present, `requestDevice()` failed —
+  `GPU group: WebGPU adapter present but requestDevice failed: <message>`; `skipEachWithoutAdapter` throws the same instead of skipping. Run end
+  (stderr, `scripts/test-gpu-run.mjs`): `[gpu-run]` verdict, then `[gpu-quarantine] inside the baseline
+  (N): … known failure reproduced, … now pass (remove from the list), … failed for another cause, …` and
+  `[gpu-quarantine] outside the baseline: … passed, … failed` — inside = an id of
+  `tests/webgpu-quarantine.json` (empty since 2026-10-17 — every GPU failure is red), where a PASS means the known failure reproduced. Not part of `npm test`
+  / `test:all`, never staged into a delivery; it needs the GPU, so run it in a load window. Never split
+  the main suite into projects for this (plan-602 part B, reverted 77111c0d: cold cache per project,
+  mid-run re-optimization, double wall time). Guard: `tests/test-gpu-run.node.test.ts`.
+- **Strict optimizeDeps (`[test-deps]`, stderr):** a dependency Vite's optimizer discovers **after the
+  run's first test** re-optimizes mid-run and usually reloads the page ("Vite unexpectedly reloaded a
+  test") — that run is unusable but used to report green. The same reporter watches the optimizer
+  (`registerMissingImport` + its `full-reload`) and prints `[test-deps] undeclared dependency discovered
+  mid-run: <dep> — add it to optimizeDeps.include in vite.config.ts (the reload made this run unusable)`;
+  every run ends with `[test-deps] 0 mid-run re-optimizations` or the list. **Before** the first test
+  (cold cache, "Re-optimizing dependencies because vite config has changed") nothing ever counts.
+  `RV_TEST_STRICT_DEPS` = `fail` (a hit ends the run non-zero although every test passed) / `warn` (lines
+  only) / `off` (nothing). Default **`fail`** (`DEFAULT_STRICT_DEPS_MODE`) since the discovery run of
+  2026-10-16 completed the include list (full suite, fresh worktree, 0 mid-run re-optimizations);
+  `RV_TEST_STRICT_DEPS=warn` downgrades a local run. The fix for a hit is always the include entry.
+  The watcher is a no-op without `process.env.VITEST` (vitest sets it): the Playwright `webServer` (a
+  plain vite dev server), `npm run dev` and builds are never affected — `fail` applies to vitest runs only.
+- **e2e port:** Playwright's dev server defaults to **5187** now (`RV_E2E_PORT` overrides), so it no
+  longer equals the vitest browser API port 5177.
+- Details and troubleshooting: `doc-web-debugging.md` § 4 *Machine-wide test lock*.
 
 ### Test Patterns
 ```typescript
@@ -251,9 +380,10 @@ from the `@McpTool` decorators into `<!-- BEGIN GENERATED: … -->` fences and c
 `tests/rv-mcp-docs-drift.test.ts` fails in BOTH directions — a tool change without a
 regeneration run, and a hand-edited block — so `npm test` will tell you if you forget.
 Everything outside the fences is prose: edit it freely, the generator never touches it.
-Adding a tool also means adding its delegate instance to `tests/helpers/mcp-schemas.ts`
-(the ONE list that must mirror `_sendDiscover`) and bumping the count assertion in
-`tests/rv-mcp-tool-conventions.test.ts`.
+Adding a tool class also means adding its delegate instance to `src/plugins/mcp-bridge/rv-mcp-instances.ts`
+(plan-713: the ONE list, production code; `McpBridgePlugin._sendDiscover` and
+`tests/helpers/mcp-schemas.ts` both READ it - the helper is no longer hand-maintained) and bumping the
+count assertion in `tests/rv-mcp-tool-conventions.test.ts`.
 
 ## Debug API
 
@@ -272,9 +402,11 @@ When the dev server is running (`npm run dev`), debug endpoints are available:
 
 realvirtual WEB includes a built-in MCP bridge (`src/plugins/mcp-bridge-plugin.ts`) that exposes the running Three.js scene to AI assistants. The MCP tools documentation is in `webviewer.mcp.md`.
 
-**The default MCP server is realvirtual CONNECT** (`http://localhost:5100/mcp`). It hosts the MCP endpoint itself, so nothing extra is installed: register it as `"realvirtual-CONNECT": { "type": "http", "url": "http://localhost:5100/mcp" }` in `.mcp.json`, enable it via the CONNECT tray icon (*MCP server ▸ Enabled*) and restart CONNECT. The browser reaches it over the same WebSocket contract at `:5100/webviewer` — that is the AI Bridge panel's default port, including under the Vite dev server on 5173 (`?mcpPort=5100` pins it explicitly). A **hosted** page that CONNECT did not serve (the demo on `web.realvirtual.io`, a customer site) targets `ws://localhost:<port>/webviewer` on its own — no URL parameter — and its https origin is paired once in the CONNECT tray instead of being added to `AllowedOrigins` (plan-541; the AI Bridge panel names the cause when it does not connect). Claude Code and Claude Code Desktop speak HTTP natively; classic Claude Desktop needs the `npx -y mcp-remote http://localhost:5100/mcp --allow-http` stdio shim.
+**The default MCP server is realvirtual CONNECT** (`http://localhost:5100/mcp`). It hosts the MCP endpoint itself, so nothing extra is installed: register it as `"realvirtual-CONNECT": { "type": "http", "url": "http://localhost:5100/mcp" }` in `.mcp.json`, enable it via the CONNECT tray icon (*MCP server ▸ Enabled*) and restart CONNECT. The browser reaches it over the same WebSocket contract at `:5100/webviewer` — that is the AI Bridge panel's default port, including under the Vite dev server on 5173 (`?mcpPort=5100` pins it explicitly). A **hosted** page that CONNECT did not serve (the demo on `web.realvirtual.io`, a customer site) targets `ws://localhost:<port>/webviewer` when AI control or a user connection action needs it — no URL parameter — and its https origin is paired once in the CONNECT tray instead of being added to `AllowedOrigins` (plan-541; the AI Bridge panel names the cause when it does not connect). Claude Code and Claude Code Desktop speak HTTP natively; classic Claude Desktop needs the `npx -y mcp-remote http://localhost:5100/mcp --allow-http` stdio shim.
 
 The local **Node bridge** in `mcp-bridge/` (a stdio MCP server hosting its own WebSocket server on `:18714`/`:18715`) is **not deprecated** — it remains the documented emergency fallback. In `.mcp.json` it is parked under the top-level `_disabledMcpServers` key, which Claude Code never launches; move that block into `mcpServers`, run `npm run setup` inside `mcp-bridge/` once, and point the browser at its port to fall back. Moving it back is the way home.
+
+When CONNECT serves the page (marker cookie or same-origin `/health` signature, including the dev proxy), the `/webviewer` channel stays connected with AI on or off for SolidCraft, log relay and ownership status. **AI control** in *Settings ▸ AI* gates the tab's AI/MCP catalog and calls: off announces no tools and refuses non-internal calls with `AI_DISABLED:`; CONNECT enforces the same gate, including for local clients.
 
 Tool ownership is strict: CONNECT owns the `web_*` browser tools, the Unity Python MCP server owns the 80+ Unity Editor tools. The Python server's historic `web_*` proxy on `:18712` still exists (arming `--no-webviewer` everywhere is follow-up plan 348) — ignore it and call `web_*` through CONNECT. Full reference: `doc-ai-integration.md`.
 
@@ -285,7 +417,8 @@ Tool ownership is strict: CONNECT owns the `web_*` browser tools, the Unity Pyth
 | `doc-webviewer.md` | Full architecture, component reference, configuration |
 | `doc-deploy.md` | Local test build vs. publishing to public; `npm run deploy`/`deploy:private`, credentials, CI |
 | `doc-lifecycle.md` | Runtime lifecycle: model load, fixed-step loop, pause, reset, dispose, events |
-| `../realvirtual-WebViewer-Private~/doc-render-picking.md` | **Batched render pipeline (motion blobs) + picking/highlight system — architecture AND hard do-not-touch contracts. Read BEFORE changing rv-batched-render/rv-batch-*/rv-raycast-*/rv-highlight-* files.** Lives in the private sibling (not published on the public mirror). |
+| `../realvirtual-WebViewer-Private~/.contracts/contract-bake-picking.md` | **Contract (golden rules + rejected alternatives) of the bake render pipeline, picking and highlight. Read BEFORE changing anything that draws, hides, picks or highlights.** Details and section numbers cited in code: `../realvirtual-WebViewer-Private~/doc-bake-picking-internals.md`. Private sibling, not on the public mirror. |
+| `../realvirtual-WebViewer-Private~/.contracts/contract-node-identity.md` | **Contract of node identity (NodeId) and stored references (addresses). Read BEFORE changing anything that stores, migrates or resolves a reference.** Mechanics: `doc-node-paths.md` § 0. |
 | `doc-node-paths.md` | **Node paths: how component/signal references are written by the exporter and resolved by NodeRegistry. The three naming layers (Unity / glTF / Three.js after sanitization + file-global dedup), alias mechanics, resolution order, known pitfalls. Read BEFORE changing anything that stores or resolves a path.** |
 | `doc-ui-visibility.md` | **UI visibility: the two independent axes — plugin runtime participation (`modes`/`core` → `pluginParticipatesInMode`) vs. element presentation (`visibilityRule`/`useUIVisible`), the bridge in `UIPluginRegistry.register`, the `shownOnlyInAny` overwrite, deploy overrides. Read BEFORE changing plugin `modes`/`core`, UI slots or anything gated by `useUIVisible`.** |
 | `doc-extending-webviewer.md` | Plugin system, custom components, UI slots, hooks |
@@ -310,17 +443,37 @@ Plastic checkin.
   pushed deliberately and only via `/gitweb`)
 - **Branch:** `main`
 
-Commit here, not in the parent repo:
+Commit here, not in the parent repo. **Add path by path, never `git add -A`** - in a
+shared checkout the tree regularly carries other sessions' uncommitted work, and `-A`
+would sweep it into your commit (plus stray files like redirected test logs, which are
+not gitignored):
 ```bash
-git add -A
+git add -- src/thing.ts tests/thing.test.ts   # the paths YOU changed
 git commit -m "feat(webviewer): description"
 git push origin main
 ```
 
-Work canonically on `main` or in a worktree (`/worktree-web <plan>`) — the worktree is a tool
-against parallel sessions, not an obligation. A handful of paths that git ignores (for example
-`.env.production` and the NDA models under `public/models/library/Custom/`) stay under Plastic
-control; they are listed file by file in `<WS>\ignore.conf`.
+### Check-in authorization
+
+Commit and push to the internal `origin` remote of this repo and of its private sibling
+need no individual approval: finished, green work gets committed and pushed, then
+reported, instead of being parked uncommitted while someone waits for a word. The
+authoritative wording, including which remotes and targets are excluded, lives outside
+this mirrored file: see the repository CLAUDE.md of the parent Unity project, section
+"Standing authorization for web-repo check-ins".
+
+Two conditions hold absolutely:
+- **Your own changes only, added path by path** (see above). Foreign uncommitted work in
+  the tree is reported, never carried along. If you cannot tell whose a change is, read
+  its diff instead of guessing from the path.
+- **Never rewrite what is not yours.** No `rebase`, `reset --hard` or force-push while
+  foreign commits or foreign working-tree changes are present. Setting your commit onto
+  `origin/main` freshly (`read-tree` / `commit-tree`), or pushing via a temporary
+  `git worktree`, is how to do that without touching the shared tree.
+
+Pushing to the public mirror, publishing into external repositories, deployments and
+releases are **never** covered by this and always need an explicit word from Thomas or
+Vincent, given in their own session.
 
 ## Private/Commercial Extensions
 
@@ -329,6 +482,8 @@ Private extensions live in the sibling folder `../realvirtual-WebViewer-Private~
 Private content is NOT AGPL — do not add AGPL headers to private files.
 
 **Two private tiers** (see `doc-deploy.md` → "Build tiers & feature gating"): `private-plugins.ts` = customer tier (ships in customer deploys), `internal-plugins.ts` = internal/dev-only tier, loaded ONLY behind the `__RV_INTERNAL__` build flag (dev server/vitest always on; production builds only with `RV_INTERNAL=1`; customer deploys never set it — Rollup drops the gated dynamic import and its chunks). NEVER import internal feature modules statically — their side-effect registrations would leak back into every private build. Guard: `tests/private-internal-gate.node.test.ts`. New in-development features register in `internal-plugins.ts`, not `private-plugins.ts`.
+
+**On-demand features (plan-652):** the Editor (`asset-editor`) and DES (`des`) are declared at startup and load on first use (manifest `activation`, stub `features/<id>.register.ts` + body `features/<id>.body.ts`, `viewer.features`). NEVER value-import a `*.body.ts`, `plugins/asset-editor/**` (except `asset-editor/shared/`) or `plugins/des/**` from entry/startup code — one static import pulls the body back into the boot set. Call `viewer.features.ensure(...)` / `ensureFeatureIfDeclared(...)` before `getPlugin('asset-editor' | 'des-hmi')`. Guards: `tests/feature-manifest-consistency.node.test.ts`, `npm run test:bundle-guard`. Details: `doc-extending-webviewer.md` → *On-demand features*.
 
 ## Design Context
 

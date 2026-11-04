@@ -36,7 +36,7 @@ vi.mock('../src/core/project/project-store', () => ({
 
 import { DocumentCard } from '../src/core/hmi/scene/DocumentCard';
 import { editorDocumentView } from '@rv-private/plugins/asset-editor/editor-document-view';
-import { sceneDocumentView } from '../src/core/hmi/scene/scene-document-view';
+import { plannerDocumentView } from '../src/core/hmi/scene/scene-document-view';
 import {
   resetActiveDocumentViewForTests,
   setActiveDocumentView,
@@ -202,16 +202,17 @@ describe('AssetActiveCard parity — the card', () => {
   });
 
   /**
-   * Changed on purpose (2026-09-07): one doorway to the verbs, on the hero.
-   *
-   * The kebab used to sit in BOTH cards, and the compact one competed with the
-   * document's own name for a row barely wide enough for the name. The hero on
-   * the projects dashboard is where document-level actions live.
+   * Both cards carry the same menu (2026-10-25). The compact one was dropped
+   * on 2026-09-07 and came back so "Discard changes" is reachable from the
+   * hierarchy header, where the user works.
    */
-  it('renders every old verb in the hero overflow menu, and offers none in compact', () => {
+  it('renders every old verb in the overflow menu of both cards', () => {
     setActiveDocumentView(editorDocumentView(stubAssetContext()));
     const compact = render(<DocumentCard variant="compact" activeMode="editor" />);
-    expect(screen.queryByLabelText('More actions')).toBeNull();
+    fireEvent.click(screen.getByLabelText('More actions'));
+    for (const id of ['save-as', 'rename', 'download', 'discard', 'share']) {
+      expect(screen.getByTestId(`document-card-verb-${id}`)).toBeTruthy();
+    }
     compact.unmount();
 
     setActiveDocumentView(editorDocumentView(stubAssetContext()));
@@ -248,7 +249,7 @@ describe('the card and the exit guard read ONE dirty bit', () => {
   it('the view’s dirty IS the snapshot’s dirty, both ways', () => {
     for (const dirty of [true, false]) {
       const snap = stubSceneSnapshot({ dirty });
-      const view = sceneDocumentView(stubSceneStore, { ...(snap as object), dirty } as never, backend);
+      const view = plannerDocumentView(stubSceneStore, { ...(snap as object), dirty } as never, backend);
       // `trySwitch` in ProjectsDashboardHost gates on exactly `snap.dirty`, so
       // a card built from the same field cannot show "saved" while the guard
       // still asks — there is no second bit to disagree with.
@@ -258,12 +259,12 @@ describe('the card and the exit guard read ONE dirty bit', () => {
   });
 
   it('gives a scene exactly one breadcrumb chip', () => {
-    const view = sceneDocumentView(stubSceneStore, stubSceneSnapshot(), backend);
+    const view = plannerDocumentView(stubSceneStore, stubSceneSnapshot(), backend);
     expect(view?.crumbs.map(c => c.label)).toEqual(['MyPlant']);
   });
 
   it('hangs saveSettingsIntoModel back on the card’s menu', () => {
-    const view = sceneDocumentView(stubSceneStore, stubSceneSnapshot(), backend);
+    const view = plannerDocumentView(stubSceneStore, stubSceneSnapshot(), backend);
     const verb = view?.actions.menu?.find(v => v.id === 'save-into-model');
     expect(verb).toBeTruthy();
     expect(verb?.secondary).toBe('Settings travel with the file');
@@ -271,7 +272,7 @@ describe('the card and the exit guard read ONE dirty bit', () => {
 
   it('refuses to save a read-only project, and says why', () => {
     const readOnly = { id: 'b2', kind: 'bundled', writable: false } as never;
-    const view = sceneDocumentView(stubSceneStore, stubSceneSnapshot(), readOnly);
+    const view = plannerDocumentView(stubSceneStore, stubSceneSnapshot(), readOnly);
     expect(view?.saveVerb).toBe('blocked');
     expect(view?.saveReason).toContain('ships with the application');
   });
@@ -288,35 +289,35 @@ describe('the location crumb names the file, never a section', () => {
     ({ ...(stubSceneStore as object), documentIdentity: () => identity }) as never;
 
   it('a document in the project root shows no folder at all', () => {
-    const view = sceneDocumentView(
+    const view = plannerDocumentView(
       storeWithIdentity(documentBase('doc_1', 'MyPlant', 'MyPlant.glb')),
       stubSceneSnapshot(), backend);
     expect(view?.location).toEqual([]);
   });
 
   it('a document in a folder shows that folder', () => {
-    const view = sceneDocumentView(
+    const view = plannerDocumentView(
       storeWithIdentity(documentBase('doc_1', 'Press', 'machines/Press.glb')),
       stubSceneSnapshot(), backend);
     expect(view?.location).toEqual(['machines']);
   });
 
   it('a library document shows the Library crumbs, same as the editor', () => {
-    const view = sceneDocumentView(
+    const view = plannerDocumentView(
       storeWithIdentity(documentBase('doc_1', 'Belt', 'library/Custom/Belt.glb')),
       stubSceneSnapshot(), backend);
     expect(view?.location).toEqual(['Library', 'Custom']);
   });
 
   it('only a DRAFT — a document that exists nowhere yet — says Unsaved', () => {
-    const view = sceneDocumentView(
+    const view = plannerDocumentView(
       storeWithIdentity(null),
       stubSceneSnapshot({ saved: null, isDraft: true }), backend);
     expect(view?.location).toEqual(['Unsaved']);
   });
 
   it('"Scenes" never appears — not even for a legacy path-less identity', () => {
-    const view = sceneDocumentView(
+    const view = plannerDocumentView(
       storeWithIdentity(documentBase('doc_1', 'Old')),   // path: '' (slot form)
       stubSceneSnapshot(), backend);
     expect(view?.location).toEqual([]);

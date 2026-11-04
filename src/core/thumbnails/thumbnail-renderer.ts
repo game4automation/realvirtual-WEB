@@ -2,23 +2,31 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * ThumbnailRenderer — Generates preview images for library catalog entries
- * using an offscreen WebGL render target.
+ * ThumbnailRenderer — renders the preview image a SAVE writes beside a
+ * document (plan-776). Nothing renders a thumbnail on view any more: the
+ * dashboard and the library read the sidecar the save wrote, so this class is
+ * reached only from the save path (`rv-thumbnail-write.ts`, loaded on demand).
  *
- * Reuses the viewer's existing WebGLRenderer (no second GL context) and the
- * main scene's image-based environment (HDRI IBL), but renders with a **frozen
+ * Reuses the viewer's existing renderer (no second GL context) and the main
+ * scene's image-based environment (HDRI IBL), but renders with a **frozen
  * look** rather than the user's live visual settings (plan-712): the lighting of
  * the 'default' (Shaded) render mode — environment plus one directional key
  * light, no ambient fill — with GTAO ambient occlusion, no tone mapping and no
- * bloom. Two users with different render modes must get byte-comparable
- * previews for the same asset — a card picture is cached, shared and long-lived,
- * so it cannot depend on whatever the viewport happened to be set to when it
- * was generated.
+ * bloom. Two users with different render modes get comparable previews for
+ * the same document. That includes the 'raytraced' mode (plan-762 F17): it is
+ * treated exactly like 'default' — no trace, no history, the frozen Shaded look.
  *
- * The image is rendered at 2x the requested edge length and downscaled in one
- * halving step (supersampling AA — the composer chain makes MSAA useless, see
- * three.js #23300), on a transparent background with a soft baked contact
- * shadow underneath, so the asset sits on the card instead of floating.
+ * ONE source, ONE look, for every document (plan-716: asset = document =
+ * model): the capture clone of the document's content roots
+ * (`thumbnail-content.ts` — authored content AND materialised placements, each
+ * at its world transform) in a private studio scene, with GTAO and a baked
+ * contact shadow underneath, a transparent background and the FIXED 3/4 camera
+ * (front-right, slightly above) fitted to the bounding sphere of the complete
+ * capture. Rendered at 2× and downscaled once (supersampling AA — the composer
+ * chain makes MSAA useless, three.js #23300). The clone shares geometry and
+ * materials with the live scene; the first save of a document compiles the
+ * studio light variant of its materials once (three caches it per material),
+ * the live view switches back to its cached programs without a recompile.
  */
 
 import {
@@ -27,31 +35,45 @@ import {
   Scene,
   DirectionalLight,
   Box3,
+  Sphere,
   Vector3,
   SRGBColorSpace,
   UnsignedByteType,
   NoToneMapping,
+  MathUtils,
 } from 'three';
 import type { Object3D, WebGLRenderer } from 'three';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
-import { computeSubtreeAABB, disposeSubtree } from '../engine/rv-traverse-utils';
 import { OffscreenCapture } from '../engine/rv-offscreen-capture';
 import { bakeContactShadow } from './thumbnail-contact-shadow';
+import { captureDocument } from './thumbnail-content';
 
-const _box = new Box3();
-const _center = new Vector3();
-const _size = new Vector3();
+/** What {@link ThumbnailRenderer.render} draws: one content root or several. */
+export type ThumbnailContent = Object3D | readonly Object3D[];
+
+function rootsOf(content: ThumbnailContent): readonly Object3D[] {
+  return Array.isArray(content) ? content : [content as Object3D];
+}
+
+const _sphere = new Sphere();
+const _dir = new Vector3();
+
+/** The fixed thumbnail view direction (camera offset from the target): front-right, slightly above. */
+export const THUMBNAIL_VIEW_DIRECTION: readonly [number, number, number] = [1, 0.75, 1];
+/** Breathing room around the bounding sphere (1 = the sphere touches the frame). */
+const FRAME_MARGIN = 1.15;
+/** Vertical field of view of the thumbnail camera, degrees. */
+const CAMERA_FOV = 35;
 
 /**
  * Frozen snapshot of the "Default" visual preset (`public/presets/Default.preset.json`)
  * as far as thumbnails are concerned. Deliberately NOT read from the (editable)
  * preset file at runtime — thumbnails must be deterministic and identical for
- * every user (Entscheidungs-Log plan-712). If the look is ever meant to change,
- * change these constants AND bump the cache bucket in `thumbnail-cache.ts`
- * together, otherwise old and new previews mix in one library.
+ * every user (Entscheidungs-Log plan-712). A changed look only reaches a
+ * document's picture with its next save (plan-776: there is no cache to bump).
  */
 const THUMBNAIL_LOOK = {
   toneMapping: NoToneMapping,                    // modeSettings.default.toneMapping: "none"
@@ -75,8 +97,34 @@ const THUMBNAIL_LOOK = {
   // main scene (the HDRI is a scene asset, not a preset value).
 } as const;
 
-/** One-time warning flag for the WebGPURenderer skip (plan-271). */
-let _warnedWebGPUSkip = false;
+/**
+ * Point `camera` at the bounding sphere of `box` from the fixed 3/4 direction,
+ * far enough that the whole sphere fits the (square) frame. View-independent:
+ * `r / sin(fov/2) × margin` frames the same object the same way whatever its
+ * orientation.
+ */
+function fitCamera(camera: PerspectiveCamera, box: Box3): void {
+  box.getBoundingSphere(_sphere);
+  const radius = Math.max(_sphere.radius, 1e-4);
+  const halfFov = MathUtils.degToRad(CAMERA_FOV) / 2;
+  const distance = (radius / Math.sin(halfFov)) * FRAME_MARGIN;
+  _dir.set(...THUMBNAIL_VIEW_DIRECTION).normalize();
+  camera.fov = CAMERA_FOV;
+  camera.aspect = 1;
+  camera.near = Math.max(distance - radius * 2, radius / 500, 1e-4);
+  camera.far = distance + radius * 2;
+  camera.position.copy(_sphere.center).addScaledVector(_dir, distance);
+  camera.lookAt(_sphere.center);
+  camera.updateProjectionMatrix();
+  camera.updateMatrixWorld(true);
+}
+
+/** True when `box` is a finite, non-empty volume — the framing is meaningful. */
+export function isRenderableBounds(box: Box3): boolean {
+  if (box.isEmpty()) return false;
+  const values = [box.min.x, box.min.y, box.min.z, box.max.x, box.max.y, box.max.z];
+  return values.every(Number.isFinite);
+}
 
 export class ThumbnailRenderer {
   private _renderer: WebGLRenderer;
@@ -90,10 +138,8 @@ export class ThumbnailRenderer {
   private _composer: EffectComposer | null = null;
   /** Edge length of the supersampled buffers the composer is currently sized to. */
   private _composerSize = 0;
-  /** Private camera for {@link renderLive} — never the viewport camera. */
-  private _liveCamera: PerspectiveCamera | null = null;
-  /** Private render target for {@link renderLive} (no composer on that path). */
-  private _liveCapture: OffscreenCapture | null = null;
+  /** Private render target for the WebGPU path (no composer there). */
+  private _capture: OffscreenCapture | null = null;
   /** Full-resolution scratch canvas for the y-flip (supersampled size). */
   private _ssCanvas: HTMLCanvasElement | null = null;
   /** Output canvas at the requested size (downscale destination). */
@@ -111,7 +157,7 @@ export class ThumbnailRenderer {
     this._dir = new DirectionalLight(THUMBNAIL_LOOK.dirLight.color, THUMBNAIL_LOOK.dirLight.intensity);
     this._scene.add(this._dir);
 
-    this._camera = new PerspectiveCamera(35, 1, 0.01, 100);
+    this._camera = new PerspectiveCamera(CAMERA_FOV, 1, 0.01, 100);
   }
 
   /**
@@ -124,13 +170,18 @@ export class ThumbnailRenderer {
     // on the same WebGL renderer) + matching intensity.
     this._scene.environment = this._mainScene.environment;
     this._scene.environmentIntensity = this._mainScene.environmentIntensity;
+    this._aimKeyLight(new Vector3(0, 0, 0));
+  }
 
+  /** Key light from the fixed studio direction, aimed at `target`. */
+  private _aimKeyLight(target: Vector3): void {
     const [dx, dy, dz] = THUMBNAIL_LOOK.dirLight.direction;
     this._dir.color.setHex(THUMBNAIL_LOOK.dirLight.color);
     this._dir.intensity = THUMBNAIL_LOOK.dirLight.intensity;
-    // DirectionalLight.target sits at the origin, so the position *is* the
-    // direction; the asset's own position is irrelevant (no shadow map).
-    this._dir.position.set(dx, dy, dz);
+    this._dir.target.position.copy(target);
+    this._dir.position.set(target.x + dx, target.y + dy, target.z + dz);
+    this._dir.updateMatrixWorld(true);
+    this._dir.target.updateMatrixWorld(true);
   }
 
   /**
@@ -184,22 +235,23 @@ export class ThumbnailRenderer {
   }
 
   /**
-   * Render a model to a PNG data URL (transparent background, 512px default).
-   * The model is cloned internally — the original is not modified.
+   * Render a DOCUMENT to a `size`×`size` canvas (transparent background, 512 px
+   * default, rendered at 2×). `content` is the document's content root(s); the
+   * capture clone (`captureDocument`) is drawn — the live scene is not touched.
    *
-   * Returns `null` when the viewer runs on a WebGPURenderer (either backend,
-   * i.e. `viewer.isWebGPU` — plan-271 semantics): this class is hard-wired to
-   * the classic WebGLRenderer (WebGLRenderTarget + synchronous
-   * readRenderTargetPixels, which does not exist under WebGPURenderer).
-   * Callers must treat `null` as "no thumbnail" — never as an error.
+   * The composer render runs synchronously, before the first `await`, so the
+   * renderer's global state is restored by the time this call returns its
+   * promise. Under a WebGPURenderer the composer chain (GTAO) and the baked
+   * contact shadow are WebGL-only, so the image is the plain lit model there —
+   * the documented reduced look. `null` = nothing renderable (empty bounds) —
+   * callers treat it as "no thumbnail", never as an error.
+   *
+   * The returned canvas is owned by this renderer: encode it before
+   * {@link dispose} or the next render.
    */
-  render(model: Object3D, size = 512): string | null {
+  async render(content: ThumbnailContent, size = 512): Promise<HTMLCanvasElement | null> {
     if ((this._renderer as unknown as { isWebGPURenderer?: boolean }).isWebGPURenderer) {
-      if (!_warnedWebGPUSkip) {
-        _warnedWebGPUSkip = true;
-        console.warn('[ThumbnailRenderer] Skipping thumbnail generation — requires the classic WebGLRenderer (viewer is running a WebGPURenderer).');
-      }
-      return null;
+      return this._renderPlainClone(content, size);
     }
 
     // Render at 2x and downscale — supersampling AA for the whole pipeline
@@ -210,33 +262,18 @@ export class ThumbnailRenderer {
 
     this._applyLook();
 
-    // Add clone to thumbnail scene
-    const clone = model.clone();
-    this._scene.add(clone);
-
-    // Compute bounds and fit camera
-    _box.setFromObject(clone);
-    if (!_box.isEmpty()) {
-      _box.getCenter(_center);
-      _box.getSize(_size);
-
-      const maxDim = Math.max(_size.x, _size.y, _size.z);
-      const distance = maxDim * 2.0;
-
-      // 3/4 overhead angle
-      this._camera.position.set(
-        _center.x + distance * 0.6,
-        _center.y + distance * 0.7,
-        _center.z + distance * 0.6,
-      );
-      this._camera.lookAt(_center);
-      this._camera.updateProjectionMatrix();
+    // The bounds come from the FINISHED capture — every placement included.
+    const capture = captureDocument(rootsOf(content));
+    if (!isRenderableBounds(capture.bounds)) {
+      capture.dispose();
+      return null;
     }
+    this._scene.add(capture.root);
+    fitCamera(this._camera, capture.bounds);
 
-    // Contact shadow AFTER the camera fit: the plane is a sibling of the clone,
-    // so `Box3.setFromObject(clone)` above never saw it and the framing stays
-    // about the asset (Box3 has no exclude option — ordering is the guard).
-    const shadow = _box.isEmpty() ? null : bakeContactShadow(this._renderer, clone, _box);
+    // The contact shadow is a sibling of the capture, built after the bounds,
+    // so the framing stays about the document.
+    const shadow = bakeContactShadow(this._renderer, capture.root, capture.bounds);
     if (shadow) this._scene.add(shadow.plane);
 
     // `toneMapping` / `outputColorSpace` are renderer-global and read live by
@@ -244,8 +281,6 @@ export class ThumbnailRenderer {
     // live grading and leave its own behind on the main scene.
     const prevTarget = this._renderer.getRenderTarget();
     const prevClearAlpha = this._renderer.getClearAlpha();
-    // Types come from three's own d.ts (`outputColorSpace` is typed `string`
-    // there) — inferred, so a three upgrade cannot break this line.
     const prevToneMapping = this._renderer.toneMapping;
     const prevColorSpace = this._renderer.outputColorSpace;
     try {
@@ -254,124 +289,58 @@ export class ThumbnailRenderer {
       // RenderPass clears with the renderer's clear colour/alpha — alpha 0 is
       // what keeps the background transparent through the whole chain.
       this._composer!.render();
+      // Read back from the composer's READ buffer: after the last swap that is
+      // the buffer holding the OutputPass result.
+      this._renderer.readRenderTargetPixels(this._composer!.readBuffer, 0, 0, ss, ss, this._pixels!);
     } finally {
       this._renderer.toneMapping = prevToneMapping;
       this._renderer.outputColorSpace = prevColorSpace;
       this._renderer.setClearAlpha(prevClearAlpha);
       this._renderer.setRenderTarget(prevTarget);
+      if (shadow) {
+        this._scene.remove(shadow.plane);
+        shadow.dispose();
+      }
+      capture.dispose();
     }
 
-    // Read back from the composer's READ buffer: after the last swap that is
-    // the buffer holding the OutputPass result. The render target handed to the
-    // constructor is only one half of the ping-pong pair and is not guaranteed
-    // to be the one carrying the final image.
-    const finalTarget = this._composer!.readBuffer;
-    this._renderer.readRenderTargetPixels(finalTarget, 0, 0, ss, ss, this._pixels!);
-
-    const dataUrl = this._encodeReadback(ss, size);
-
-    // Clean up clone + shadow from scene
-    if (shadow) {
-      this._scene.remove(shadow.plane);
-      shadow.dispose();
-    }
-    this._scene.remove(clone);
-    disposeSubtree(clone);
-
-    return dataUrl;
+    return this._downscale(this._pixels!, ss, size, true);
   }
 
   /**
-   * Render the LIVE scene — the open model as it currently stands — to a PNG
-   * data URL. Nothing is cloned and nothing is disposed.
-   *
-   * This exists because {@link render} is O(model) on the live model root:
-   * `model.clone()` duplicates every BatchedMesh arena (three's
-   * `BatchedMesh.copy()` clones the full merged geometry + matrices textures),
-   * and `disposeSubtree(clone)` then destroys geometries/materials the clone
-   * SHARES with the live scene (`Mesh.clone()` shares both), forcing a full
-   * re-upload + shader recompile on the next viewport frame. On a large model
-   * that froze the projects dashboard for ~20 s per open/switch. Here the live
-   * scene is rendered in place with a private camera into a private render
-   * target (the `web_eye` "beauty" pattern) — the live model's resources
-   * are never touched.
-   *
-   * Look trade-off, accepted: the picture is the live look (current lighting,
-   * no frozen studio grade, no GTAO, no contact shadow) on a transparent
-   * background — a snapshot of "what is open right now", not a cached library
-   * thumbnail. The private camera keeps the default layer mask (layer 0), so
-   * overlay layers (isolate/highlight/measurement) and NO_AO in-scene UI stay
-   * out of the shot.
-   *
-   * Returns `null` under a WebGPURenderer (same contract as {@link render}).
-   * A subtree without mesh content yields a transparent picture, not `null` —
-   * the same as {@link render}, and the card treats both as "no preview".
+   * WebGPURenderer path of {@link render}: the same capture in the private
+   * studio scene, lit by the studio lights, plain forward render into the
+   * private offscreen target, async readback. No GTAO, no contact shadow (both
+   * are WebGL post/shader chains).
    */
-  renderLive(root: Object3D, size = 512): string | null {
-    if ((this._renderer as unknown as { isWebGPURenderer?: boolean }).isWebGPURenderer) {
-      if (!_warnedWebGPUSkip) {
-        _warnedWebGPUSkip = true;
-        console.warn('[ThumbnailRenderer] Skipping thumbnail generation — requires the classic WebGLRenderer (viewer is running a WebGPURenderer).');
-      }
-      return null;
-    }
-
+  private async _renderPlainClone(content: ThumbnailContent, size: number): Promise<HTMLCanvasElement | null> {
     const ss = size * 2;
-    // Canvases/pixel buffer are shared with render() — both paths are
-    // synchronous on the one renderer, so they can never interleave.
     this._ensureReadbackSurfaces(ss, size);
-
-    // Never empty: the util falls back to a minimal box at the node position,
-    // and clamps each size component to ≥ 0.001 — the framing below holds.
-    const bounds = computeSubtreeAABB(root, _box);
-    const maxDim = Math.max(bounds.size.x, bounds.size.y, bounds.size.z);
-
-    // Same ¾ overhead framing as render(), but near/far derived from the model
-    // radius — the live root can be a whole plant, not a library asset.
-    const radius = bounds.size.length() * 0.5;
-    if (!this._liveCamera) this._liveCamera = new PerspectiveCamera(35, 1, 0.01, 100);
-    const camera = this._liveCamera;
-    camera.near = Math.max(radius / 500, 0.01);
-    camera.far = Math.max(radius * 40, 10);
-    const distance = maxDim * 2.0;
-    camera.position.set(
-      bounds.center.x + distance * 0.6,
-      bounds.center.y + distance * 0.7,
-      bounds.center.z + distance * 0.6,
-    );
-    camera.lookAt(bounds.center);
-    camera.updateProjectionMatrix();
-    camera.updateMatrixWorld(true);
-
-    // One shared offscreen path since plan-740 P2.1: the target lifecycle and
-    // the save/restore live in OffscreenCapture, and this call states its
-    // contract as parameters — layer 0 only (so overlay layers, isolate and
-    // measurement UI stay out of a card thumbnail), transparent clear, live
-    // scene background detached. Tone mapping is deliberately NOT in the pass:
-    // rendering into a target skips it anyway (three applies it only on the
-    // default framebuffer / via OutputPass), and the sRGB conversion follows
-    // the target texture's colorSpace.
-    this._liveCapture ??= new OffscreenCapture(() => this._renderer);
-    this._liveCapture.withPass(
-      {
-        width: ss, height: ss, supersample: 1,
-        layerMask: 1 << 0,
-        clearAlpha: 0,
-        background: null,
-        colorSpace: SRGBColorSpace,
-        scene: this._mainScene,
-        camera,
-      },
-      ({ target }) => {
-        this._renderer.render(this._mainScene, camera);
-        // Read BOTTOM-UP into the shared buffer: `_encodeReadback` owns the
-        // flip, and going through the capture's flipping readback here would
-        // flip twice and turn every thumbnail upside down.
-        this._renderer.readRenderTargetPixels(target, 0, 0, ss, ss, this._pixels!);
-      },
-    );
-
-    return this._encodeReadback(ss, size);
+    this._applyLook();
+    const capture = captureDocument(rootsOf(content));
+    try {
+      if (!isRenderableBounds(capture.bounds)) return null;
+      this._scene.add(capture.root);
+      fitCamera(this._camera, capture.bounds);
+      this._capture ??= new OffscreenCapture(() => this._renderer);
+      const read = this._capture.withPass(
+        {
+          width: ss, height: ss, supersample: 1,
+          clearAlpha: 0, background: null, colorSpace: SRGBColorSpace,
+          toneMapping: THUMBNAIL_LOOK.toneMapping,
+          scene: this._scene, camera: this._camera,
+        },
+        ({ target }) => {
+          this._renderer.render(this._scene, this._camera);
+          return this._capture!.readPixels(target, ss, ss);
+        },
+      );
+      const pixels = await read;
+      if (!this._canvas) return null; // disposed while the readback was in flight
+      return this._downscale(pixels, ss, size, false);
+    } finally {
+      capture.dispose();
+    }
   }
 
   /** Size the shared scratch canvases + pixel buffer for one readback. */
@@ -389,29 +358,30 @@ export class ThumbnailRenderer {
     }
   }
 
-  /** Y-flip `_pixels` into the scratch canvas, downscale 2×, return a PNG. */
-  private _encodeReadback(ss: number, size: number): string {
-    const pixels = this._pixels!;
+  /** Copy `pixels` into the scratch canvas (Y-flipped when they are in GL
+   *  order) and downscale 2× in ONE `drawImage` step into the output canvas. */
+  private _downscale(pixels: Uint8Array, ss: number, size: number, flip: boolean): HTMLCanvasElement {
     const ssCtx = this._ssCanvas!.getContext('2d')!;
     const imageData = ssCtx.createImageData(ss, ss);
-    // WebGL pixels are bottom-to-top, flip vertically
-    for (let y = 0; y < ss; y++) {
-      const srcRow = (ss - 1 - y) * ss * 4;
-      const dstRow = y * ss * 4;
-      for (let x = 0; x < ss * 4; x++) {
-        imageData.data[dstRow + x] = pixels[srcRow + x];
+    if (flip) {
+      // WebGL pixels are bottom-to-top, flip vertically
+      const row = ss * 4;
+      for (let y = 0; y < ss; y++) {
+        imageData.data.set(pixels.subarray((ss - 1 - y) * row, (ss - y) * row), y * row);
       }
+    } else {
+      imageData.data.set(pixels.subarray(0, ss * ss * 4));
     }
     ssCtx.putImageData(imageData, 0, 0);
 
-    // Downscale 2x in a single halving step (one halving needs no mip chain).
+    // One halving needs no mip chain; the canvas filters premultiplied, which
+    // is what keeps the silhouette free of dark fringes.
     const ctx = this._canvas!.getContext('2d')!;
     ctx.clearRect(0, 0, size, size);
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(this._ssCanvas!, 0, 0, ss, ss, 0, 0, size, size);
-
-    return this._canvas!.toDataURL('image/png');
+    return this._canvas!;
   }
 
   dispose(): void {
@@ -427,9 +397,8 @@ export class ThumbnailRenderer {
       this._composer = null;
     }
     this._composerSize = 0;
-    this._liveCapture?.dispose();
-    this._liveCapture = null;
-    this._liveCamera = null;
+    this._capture?.dispose();
+    this._capture = null;
     // Detach the shared environment reference (we never owned it).
     this._scene.environment = null;
     this._ssCanvas = null;

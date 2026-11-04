@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /** Persists visual settings and camera bookmarks to localStorage. */
 
 import { useSyncExternalStore } from 'react';
@@ -105,8 +107,8 @@ export interface VisualSettings {
   fpvSensitivity: number;
   /** FPV eye height above ground in meters. */
   fpvEyeHeight: number;
-  /** Ambient-occlusion backend: 'off' | 'gtao' | 'n8ao'. WebGL only; on WebGPU
-   *  this is effectively ignored (AO is a no-op). Supersedes the legacy
+  /** Ambient-occlusion backend: 'off' | 'gtao' | 'n8ao'. WebGL: composer passes; on WebGPU
+   *  the TSL GTAO node (any non-off mode). Supersedes the legacy
    *  `ssaoEnabled` boolean — the boolean is derived from this for back-compat. */
   aoMode: AOMode;
   /** AO blend intensity (0 = invisible, 1 = full). Shared between backends. */
@@ -140,7 +142,7 @@ export interface VisualSettings {
   toonOutlineColor: string;
   /** Toon: tint the dark bands slightly cool (blue) instead of just darker. */
   toonCoolShadows: boolean;
-  /** Whether bloom (glow on bright areas) is enabled. WebGL only. */
+  /** Whether bloom (glow on bright areas) is enabled — both renderers (plan-763). */
   bloomEnabled: boolean;
   /** Bloom glow intensity (0–2). */
   bloomIntensity: number;
@@ -159,7 +161,7 @@ export interface VisualSettings {
   backgroundBrightness: number;
   /** Floor checker pattern contrast multiplier (0 = flat midgray, 1 = default, 2 = doubled). */
   checkerContrast: number;
-  /** Whether the optional floor reflection is enabled (WebGL only). */
+  /** Whether the optional floor reflection is enabled — both renderers since plan-763. */
   reflectionEnabled: boolean;
   /** Floor reflection strength (0 = none, 1 = full mirror). */
   reflectionStrength: number;
@@ -244,15 +246,29 @@ const MODE_DEFAULTS: Record<RenderMode, LightingModeSettings> = {
     dirLightEnabled: true, dirLightColor: '#ffffff', dirLightIntensity: 2.0,
     shadowEnabled: false, shadowIntensity: 0.5, shadowQuality: 'medium',
   },
+  raytraced: {
+    // plan-762: Shaded's lighting (HDRI environment + key light + tone mapping),
+    // but the shadow map is off — shadows and AO come from the traced bounce.
+    lightIntensity: 0.5, toneMapping: 'neutral', toneMappingExposure: 1.0,
+    ambientColor: '#404040', ambientIntensity: 0.75,
+    dirLightEnabled: true, dirLightColor: '#ffffff', dirLightIntensity: 1.5,
+    shadowEnabled: false, shadowIntensity: 0, shadowQuality: 'medium',
+  },
 };
+
+/**
+ * A fresh copy of {@link MODE_DEFAULTS} — one entry per id of RENDER_MODE_IDS,
+ * so a new render mode never needs a hand-written object literal here.
+ */
+function freshModeSettings(): Record<RenderMode, LightingModeSettings> {
+  const out = {} as Record<RenderMode, LightingModeSettings>;
+  for (const mode of RENDER_MODE_IDS) out[mode] = { ...MODE_DEFAULTS[mode] };
+  return out;
+}
 
 const DEFAULTS: VisualSettings = {
   renderMode: DEFAULT_RENDER_MODE,
-  modeSettings: {
-    simple:  { ...MODE_DEFAULTS.simple },
-    default: { ...MODE_DEFAULTS.default },
-    toon:    { ...MODE_DEFAULTS.toon },
-  },
+  modeSettings: freshModeSettings(),
   projection: 'perspective' as ProjectionType,
   fov: 45,
   cameras: [null, null, null],
@@ -315,11 +331,7 @@ function migrateToneMapping(raw: unknown, mode: RenderMode): ToneMappingType {
 }
 
 function parseModeSettings(raw: unknown): Record<RenderMode, LightingModeSettings> {
-  const result: Record<RenderMode, LightingModeSettings> = {
-    simple:  { ...MODE_DEFAULTS.simple },
-    default: { ...MODE_DEFAULTS.default },
-    toon:    { ...MODE_DEFAULTS.toon },
-  };
+  const result = freshModeSettings();
   if (typeof raw !== 'object' || raw === null) return result;
   const obj = raw as Record<string, Partial<LightingModeSettings> & { toneMapping?: unknown }>;
   for (const mode of RENDER_MODE_IDS) {
@@ -426,8 +438,8 @@ export function loadVisualSettings(): VisualSettings {
 
 function loadFromLocalStorage(): VisualSettings {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { ...DEFAULTS, modeSettings: { simple: { ...MODE_DEFAULTS.simple }, default: { ...MODE_DEFAULTS.default }, toon: { ...MODE_DEFAULTS.toon } }, cameras: [...DEFAULTS.cameras] };
+    const raw = readLocalStorage(STORAGE_KEY);
+    if (!raw) return { ...DEFAULTS, modeSettings: freshModeSettings(), cameras: [...DEFAULTS.cameras] };
     const parsed = JSON.parse(raw) as Partial<VisualSettings> & { lightIntensity?: number; qualityPreset?: string; lightingMode?: string };
     // Back-compat: the field was renamed `lightingMode` → `renderMode`.
     const rawMode = parsed.renderMode ?? parsed.lightingMode;
@@ -656,7 +668,7 @@ function loadFromLocalStorage(): VisualSettings {
       navigateAroundCursorPoint,
     };
   } catch {
-    return { ...DEFAULTS, modeSettings: { simple: { ...MODE_DEFAULTS.simple }, default: { ...MODE_DEFAULTS.default }, toon: { ...MODE_DEFAULTS.toon } }, cameras: [...DEFAULTS.cameras] };
+    return { ...DEFAULTS, modeSettings: freshModeSettings(), cameras: [...DEFAULTS.cameras] };
   }
 }
 
@@ -705,11 +717,7 @@ export function saveVisualSettings(settings: VisualSettings): void {
 /** True when the user already has persisted visual settings (i.e. NOT a fresh
  *  install). Used to decide whether to seed an initial visual preset at boot. */
 export function hasStoredVisualSettings(): boolean {
-  try {
-    return localStorage.getItem(STORAGE_KEY) !== null;
-  } catch {
-    return false;
-  }
+  return readLocalStorage(STORAGE_KEY) !== null;
 }
 
 /** Fresh deep clone of the built-in default visual settings (no localStorage /
@@ -717,11 +725,7 @@ export function hasStoredVisualSettings(): boolean {
 export function getDefaultVisualSettings(): VisualSettings {
   return {
     ...DEFAULTS,
-    modeSettings: {
-      simple:  { ...MODE_DEFAULTS.simple },
-      default: { ...MODE_DEFAULTS.default },
-      toon:    { ...MODE_DEFAULTS.toon },
-    },
+    modeSettings: freshModeSettings(),
     cameras: [...DEFAULTS.cameras],
   };
 }
@@ -772,7 +776,7 @@ interface PersistedBoolStore {
 function createPersistedBoolStore(key: string, defaultValue: boolean): PersistedBoolStore {
   const load = (): boolean => {
     try {
-      const raw = localStorage.getItem(key);
+      const raw = readLocalStorage(key);
       if (raw === null) return defaultValue;
       return raw === 'true';
     } catch {
@@ -786,11 +790,7 @@ function createPersistedBoolStore(key: string, defaultValue: boolean): Persisted
     set(next: boolean): void {
       if (value === next) return;
       value = next;
-      try {
-        localStorage.setItem(key, next ? 'true' : 'false');
-      } catch {
-        /* quota exceeded or storage disabled — ignore */
-      }
+      writeLocalStorage(key, next ? 'true' : 'false');
       for (const l of listeners) l();
     },
     subscribe(cb: () => void): () => void {
@@ -877,11 +877,7 @@ export function getPhysicsWholeScene(): boolean { return _physicsWholeScene; }
 export function setPhysicsWholeScene(enabled: boolean): void {
   if (_physicsWholeScene === enabled) return;
   _physicsWholeScene = enabled;
-  try {
-    localStorage.setItem(PHYSICS_FLAG_KEY, enabled ? 'on' : 'off');
-  } catch {
-    /* quota exceeded or storage disabled — ignore */
-  }
+  writeLocalStorage(PHYSICS_FLAG_KEY, enabled ? 'on' : 'off');
   // Keep the load-time gate coherent for the NEXT model load (the settings.json
   // kill-switch still wins — same inputs as the boot block in main.ts). The
   // derived full gate (F17) depends on `enabled`, so it is re-evaluated too.
@@ -924,11 +920,7 @@ export function getPhysicsFull(): boolean { return _physicsFull; }
 export function setPhysicsFull(enabled: boolean): void {
   if (_physicsFull === enabled) return;
   _physicsFull = enabled;
-  try {
-    localStorage.setItem(PHYSICS_FULL_FLAG_KEY, enabled ? 'on' : 'off');
-  } catch {
-    /* quota exceeded or storage disabled — ignore */
-  }
+  writeLocalStorage(PHYSICS_FULL_FLAG_KEY, enabled ? 'on' : 'off');
   physicsInputs.deployAllowed = getAppConfig().simulation?.physicsEnabled !== false;
   physicsInputs.userPref = _physicsWholeScene;
   physicsInputs.userFullPref = enabled;

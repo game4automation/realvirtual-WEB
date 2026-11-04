@@ -311,9 +311,14 @@ describe('scene-ready contract (plan-753)', () => {
     const readyAt = bind.indexOf('await viewer.whenSceneReady?.();');
     expect(readyAt).toBeGreaterThan(-1);
     expect(readyAt, 'BEFORE the registry is asked').toBeLessThan(bind.indexOf('findOrphanedBindingCarriers(overlay, registry)'));
-    // DES re-binds once the references exist; model-loaded stays what it was.
+    // DES re-binds once the references exist; model-loaded stays what it was. Since
+    // plan-612 CP1d-b (2026-10-20) the hook calls `rebindScene()` (tears down the
+    // scene-discovered instances and rediscovers) instead of `reset()`, which never
+    // rediscovered once the runner held instances (direct DES start bound nothing).
     const viewerSrc = (await import('../src/core/rv-viewer.ts?raw')).default as string;
-    expect(viewerSrc).toContain("info.materialized > 0 && this._kernel?.mode === 'des') this._kernel.reset();");
+    // plan-645 L4: still on placements-materialized, now skipping a served scene generation.
+    expect(viewerSrc).toContain("if (info.aborted || info.materialized <= 0) return;");
+    expect(viewerSrc).toContain("if (served !== null && served === this._sceneGeneration) return;");
     expect(viewerSrc).toContain("this.emit('model-loaded', { result });\n".replace('\n', ''));
     expect(viewerSrc.indexOf('this.placements.sealLoad();')).toBeGreaterThan(viewerSrc.indexOf("this.emit('model-loaded', { result });"));
   });

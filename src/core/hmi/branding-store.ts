@@ -21,7 +21,7 @@ export interface CustomBranding {
   /** URL to the custom activity-bar logo (the top-left mark). Optional: when
    *  omitted the activity bar keeps the default realvirtual logo, so a project
    *  can apply title-bar/colour branding while leaving the platform mark in
-   *  place (e.g. Mauser). Set it to let a customer swap in their own mark. */
+   *  place (e.g. the large CAD line). Set it to let a customer swap in their own mark. */
   logoUrl?: string;
   /** Company/project name shown next to logo (optional, logo-only if omitted). */
   name?: string;

@@ -26,6 +26,7 @@
 import { Component, Suspense, type ErrorInfo, type ReactNode } from 'react';
 import { Box, Typography } from '@mui/material';
 import { WarningAmber } from '@mui/icons-material';
+import { captureChunkError } from '../diagnostics/rv-diagnostics-collector';
 
 /** System Warning Amber (DESIGN.md) — a failed chunk is a warning, not a machine fault. */
 const WARNING_AMBER = '#ffa726';
@@ -33,6 +34,7 @@ const WARNING_AMBER = '#ffa726';
 interface ChunkErrorBoundaryProps {
   /** Panel name for the operator-facing notice and the console log. */
   label: string;
+  visible: boolean;
   children: ReactNode;
 }
 
@@ -48,11 +50,13 @@ class ChunkErrorBoundary extends Component<ChunkErrorBoundaryProps, ChunkErrorBo
   }
 
   componentDidCatch(error: Error, info: ErrorInfo): void {
+    captureChunkError(error, info.componentStack ?? '');
     console.error(`[LazyPanelBoundary] '${this.props.label}' failed to load:`, error, info.componentStack);
   }
 
   render(): ReactNode {
     if (!this.state.failed) return this.props.children;
+    if (!this.props.visible) return null;
     return (
       <Box
         data-testid="lazy-panel-error"
@@ -67,11 +71,16 @@ class ChunkErrorBoundary extends Component<ChunkErrorBoundaryProps, ChunkErrorBo
   }
 }
 
-/** Suspense + chunk-error containment for one lazily loaded panel. */
-export function LazyPanelBoundary({ label, children }: { label: string; children: ReactNode }) {
+/**
+ * Suspense + chunk-error containment for one lazily loaded panel.
+ * `visible` defaults to true; false hides loading and error UI, while loaded
+ * children render normally and errors are still logged. The failed state is
+ * preserved across visibility changes; callers reset it with a new `key`.
+ */
+export function LazyPanelBoundary({ label, children, visible = true }: { label: string; children: ReactNode; visible?: boolean }) {
   return (
-    <ChunkErrorBoundary label={label}>
-      <Suspense fallback={<Box data-testid="lazy-panel-loading" />}>{children}</Suspense>
+    <ChunkErrorBoundary label={label} visible={visible}>
+      <Suspense fallback={visible ? <Box data-testid="lazy-panel-loading" /> : null}>{children}</Suspense>
     </ChunkErrorBoundary>
   );
 }

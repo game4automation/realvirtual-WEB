@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import type { DesSnapshotBlockers } from '../material-flow/des-snapshot-blockers';
+
 /**
  * CoreSubsystems — the per-tick core subsystem pipeline, extracted VERBATIM
  * from `RVViewer.fixedUpdate` so the SimulationExecutors (ContinuousRunner /
@@ -40,6 +42,9 @@ export interface PlaybackLike {
 
 /** Slice of RVLogicEngine the pipeline drives. */
 export interface LogicEngineLike {
+  snapshotBlockerReason?(): string | null;
+  /** Names of the root containers that exist and are active for the current connection state (DES batch guard). */
+  batchPresence?(): string[];
   readonly activeOnly: ActiveOnly;
   /** plan-538: per-root `Active` transitions for the connection state. Optional
    *  so plain test fakes can omit it. Runs even while `activeOnly` is closed. */
@@ -49,11 +54,14 @@ export interface LogicEngineLike {
 
 /** Slice of RVIKPath the pipeline drives. */
 export interface IKPathLike {
+  readonly PathIsActive?: boolean;
+  readonly node?: { readonly name: string };
   fixedUpdate(dt: number): void;
 }
 
 /** Slice of RVReplayRecording the pipeline drives. */
 export interface ReplayRecordingLike {
+  readonly isActive?: boolean;
   readonly activeOnly: ActiveOnly;
   fixedUpdate(dt: number): void;
 }
@@ -128,12 +136,26 @@ export interface CoreSubsystemsHost {
    *  (the embed viewer, unit-test fakes) simply omit it. Making it required
    *  would force every host to carry a `null` for a subsystem it cannot use. */
   readonly machiningManager?: { update(dt: number): boolean } | null;
+  /**
+   * Following-error / overload diagnostics of the dynamic axes and the grip
+   * loads (plan-673 Phase 4). Runs at the END of the drive stage: the drive
+   * loop is what applies the position the physics reported and fires the
+   * feedback bindings, so running earlier would publish last tick's numbers.
+   * A true return means a published value changed — render dirty (a readout
+   * moved), never shadows (nothing moved).
+   *
+   * OPTIONAL like `machiningManager`: a host without dynamic axes (the embed
+   * runtime, unit-test fakes) simply omits it.
+   */
+  readonly axisDiagnostics?: { update(dt: number): boolean } | null;
   /** Collision check (plan-394). Runs LAST in the visuals stage so it sees the
    *  poses of this tick. A true return means a NEW collision was reported (new
    *  highlight) — render dirty, no shadow change (nothing moved). */
   readonly collisionManager: { update(dt: number): boolean } | null;
   markRenderDirty(): void;
   markShadowsDirty(): void;
+  /** The viewer's own blocker registry; without one the subsystems cannot block a DES snapshot. */
+  readonly snapshotBlockers?: DesSnapshotBlockers;
 }
 
 export class CoreSubsystems {
@@ -141,8 +163,24 @@ export class CoreSubsystems {
   /** Last-seen MU count for the spawn/despawn dirty diff (was RVViewer._prevMuCount). */
   private _prevMuCount = 0;
 
+  private readonly offSnapshotBlocker: (() => void) | null;
+  dispose(): void { this.offSnapshotBlocker?.(); }
+
   constructor(host: CoreSubsystemsHost) {
     this.host = host;
+    this.offSnapshotBlocker = host.snapshotBlockers?.register('core', () => {
+      const h = this.host;
+      const reasons = [h.logicEngine?.snapshotBlockerReason?.(),
+        h.ikPaths.some(p => p.PathIsActive) ? 'active IK path' : null,
+        h.playback?.isPlaying ? 'playback playing' : null,
+        h.replayRecordings.some(r => r.isActive) ? 'active replay recording' : null].filter(Boolean);
+      return reasons.length ? reasons.join('; ') : null;
+    }, () => {
+      // Presence, not activity: the batch pauses the viewer, so logic that merely exists would stand still (plan-2062).
+      const h = this.host;
+      return [{ system: 'LogicStep', nodes: h.logicEngine?.batchPresence?.() ?? [] },
+        { system: 'IK path', nodes: h.ikPaths.map(p => p.node?.name ?? 'IKPath') }];
+    }) ?? null;
   }
 
   /**
@@ -227,6 +265,10 @@ export class CoreSubsystems {
       h.markRenderDirty();
     }
     this._prevMuCount = muCount;
+
+    // plan-673 Phase 4 — net following error, torque, saturation, part slip.
+    // Last in the stage, for the ordering reason documented on the host field.
+    if (h.axisDiagnostics?.update(dt)) h.markRenderDirty();
   }
 
   /**

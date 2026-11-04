@@ -325,6 +325,30 @@ describe('ui blur token — source invariant', () => {
     // antialias reload hint (plan-591, `reload-hint-store.tsx`, 8px). It is a
     // small glass card of its own because the shared info overlay has a single
     // state slot and dims the whole viewport, which an open-ended hint must not.
+    //
+    // 13.10.2026: 44. A REMOVAL — the AGV maze HUD (maze-hud.tsx, 16px) left
+    // src/ with the maze for the private Development project.
+    //
+    // 22.10.2026: 43. A REMOVAL — plan-615 (90474739) deleted ServeSessionBadge.tsx
+    // (8px), its dev-server banner replaced by the dev toolbar. PathNetworkToolbar.tsx
+    // (plan-628, 8px) arrived NAKED and was converted to `uiBlur(8)`, so like
+    // DocumentStackBar it is scaled but not part of this INLINE inventory.
+    //
+    // 26.10.2026, plan-680: 44. The bottom DES control bar (8px) arrived
+    // NAKED with the move of DES into the core and was converted to the scaled
+    // form, as this invariant demands (same as the maze HUD on 07.10.).
+    // Plan-2006: removing the obsolete bottom control bar removes one surface.
+    //
+    // 31.10.2026, plan-2050: 44. One surface — the offline activation dialog
+    // (OfflineActivationDialog.tsx, 16px), the request-code / token import route
+    // for a machine with no internet. It arrived ALREADY in the scaled form
+    // (`naked` above is empty, which is the assertion that proves it), so this is
+    // a count raise only, not a conversion.
+    //
+    // 02.11.2026, plan-2209: 45. The Terms-Gate full-screen scrim
+    // (terms-gate.tsx, 12px) blocks consent in the Public Demo or Commercial
+    // customer workspace. It arrived ALREADY scaled (`naked` is empty),
+    // so this is a count raise only, not a conversion.
     expect(scaled.length).toBe(45);
   });
 

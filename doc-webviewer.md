@@ -289,7 +289,7 @@ the parent with its op log intact (§2.1b there).
 |---|---|---|
 | **Viewer** | Just look at the machine. The asset, the running kinematics, and nothing else to operate — for shared links, embedded showcases and "show the machine" deliveries, where an engineering IDE would only confuse. | Nothing. It *removes*: no authoring, no signals, no panels, no Play/Pause — the one mode where even override ops are off. What remains is Settings, the camera / view controls and the grouping overlay. Kinematics run exactly as in HMI (`runtime: 'simulation'`). |
 | **HMI** (default) | Operate and monitor a running asset — the delivery / 3D-HMI view. | Live PLC signals (WebSocket / MQTT / REST), KPI overlays, message panel, drive & sensor tooltips, camera presets, measurement. |
-| **DES** | Discrete-event material-flow simulation for throughput and utilization analysis — fast, event-driven rather than per-frame. | DES workspace surface, material-flow statistics, and the **Experiments window**: ONE tree — Project → Experiment → Run → Checkpoint — over full-state snapshots stored chunked in IndexedDB with NDJSON.gz export/import (see [doc-persistence.md](doc-persistence.md) §7.5). Snapshots capture the complete sim state — event queue, components, MUs, RNG streams and script-component state — so any stored point loads back with correct statistics and continues deterministically (script authors persist closure state via the `onSnapshot`/`onRestore` hooks, see [doc-scripting.md](doc-scripting.md)). **Simulation runs** are tracked automatically: every run gets a run id + master seed (fixed or auto-rolled per reset) and is archived with its statistics on reset / sim end under its experiment; **projects** are the comparison boundary. The Experiments window (opened from the DES clock settings or the DES side-tool button) shows all experiments of the active project at once — per-run status/seed/sim-time, expandable checkpoints with load-and-continue, snapshot/export/import/rename/delete on the experiment rows — and run checkboxes across the whole tree feed the project-internal multi-run compare view with mean ± 95% CI (see [doc-persistence.md](doc-persistence.md) §7.5.1). |
+| **DES** | Discrete-event material-flow simulation for throughput and utilization analysis: event-driven runs, FastForward, live statistics, snapshot files and per-run KPI recording (KPI definitions in `src/plugins/sim-controller/des-kpi-defs.ts`; the run identity `src/plugins/des/rv-des-run-identity.ts` records the published sources with `KpiTracker` from `src/plugins/des/des-kpi-track.ts` and returns them with `kpiTrack()`; `registerKpiSourceProvider` lets a module supply a model's sources). See the [DES snapshot developer contract](doc-des-snapshot.md) and [DES randomness](doc-des-randomness.md). The experiment manager (matrix, replications with confidence intervals, batch, comparison and export/import) is a commercial module (realvirtual Commercial); without it the **Experiments** button opens a short notice (`CommercialFeatureNotice`) with links to the public demo and the editions page. It is documented in the private repository / at [des/experiments](https://doc.realvirtual.io/web/des/experiments/). |
 | **Planner** | The composition verbs: place other assets inside the open one (conveyors, robots, fixtures) on a grid, snap and position them with gizmos. Authoring, not operation — and it works on *any* asset, not only on a "layout". | Library panel, grid + snap toolbar, translate / rotate gizmos, snap-point connections. See [doc-layout-planner.md](doc-layout-planner.md). |
 | **Commissioning** | Put a machine into operation — usually one that arrived through a shared link. The lean surface of the Viewer, *minus* the operator HMI and *plus* the integrator's instruments. Override ops are on here, content and composition are not. | Property Inspector, Hierarchy, the CONNECT panel and its opener, the AI-bridge entry (MCP), and the tools: Signal Link mode, Test Axes, Measure, Section/Clip. It *removes* the operator chrome: KPI cards, message stack, views slot, AI activity overlay. Kinematics run (`runtime: 'simulation'`). |
 | **Editor** *(commercial)* | The content verbs on the open asset's own substance: import CAD, restructure the hierarchy, split and merge meshes, assign materials, add components. The only mode registered with `runtime: 'detached'` — the `SimulationRuntime` performs **no** time integration here, because this is authoring, not simulation. | Op log with undo, Materials window, Mesh Separator / Mesh Merge, unified CAD import, `preserveHierarchy` loading (no uber bake, every node keeps its own material). |
@@ -375,6 +375,36 @@ Each of these transitions reloads the scene, which is why a short *"Preparing
 test run…"* / *"Leaving editor…"* overlay appears instead of a blank viewport.
 Big assets take a moment on both edges of a test run — that is the export and
 re-import that guarantee the test behaves like the saved asset.
+
+### Editor display — batched arenas and the transform tool
+
+The Editor keeps every CAD part as its own node (it never bakes), but it no
+longer asks the GPU to draw them one by one (plan-766). When a document opens,
+the parts are gathered into a few **BatchedMesh arenas** — one for all plain
+materials, whose colour, roughness and metalness are stored per part, plus one
+per textured material that is used 16 times or more — and the tree's own meshes
+are only masked out of the renderer. Transparent parts, `keep` components and
+multi-material meshes are drawn on their own as before. Measured on the
+acceptance CAD-import showcase model FA-11 (Chrome, 2026-10-19): 12 730 → 70 draw calls and
+94–142 → 5–6 ms render time per frame; on the large CAD line stress model ~140 000 →
+~250 calls and 830–930 → 75–141 ms. Building the arenas takes 0.1 s (a CAD-import showcase model) and
+0.6–0.7 s (the large CAD line) when a document opens.
+
+Nothing about authoring changes: hover, selection, the hierarchy eye, groups,
+Undo, Save and the exported GLB all work on the tree exactly as before (the
+arenas live outside the document and are never saved). Moving, hiding, deleting
+and re-colouring a part update its arena instance in the same frame; the
+**▶ Test** run, a document switch and leaving the Editor take the arenas down
+and build them again when the authoring tree comes back. The **Stats** window
+shows both views — the authored figures and an *Editor display* block with
+arenas, instances, standalone meshes and the real draw-call count.
+
+**The transform gizmo is a tool you switch on.** Selecting a part no longer
+attaches the move/rotate gizmo by itself: the **Move** button in the editor
+toolbar (or **T**, or `web_editor_shortcut "T"`) turns the transform tool on and
+off. It starts OFF every time you enter the Editor and is not persisted;
+selection, hover and the hierarchy behave the same either way. Hover and
+selection are a yellow fill without crease edges.
 
 ### Recent documents
 
@@ -602,8 +632,35 @@ re-reads the new bytes.
 
 ### Public material-flow kernel contracts
 
+DES uses one engine: `DESRunner` with material-flow behaviours. `DESPlugin` and the
+native `DESSource`, `DESSink`, `DESStation`, `DESStorage`, `DESConveyor` and
+`DESDowntime` components are removed. When a loaded file carries one of these
+types, binding in DES mode reports Problems code `des-legacy-component` with the
+node path and replacement type: `Source`, `Sink`, `Station`, `Storage`,
+`Conveyor` or `Downtime`, respectively. Replace the component; there is no import alias.
+
+`Storage` with `AutoRelease=false` releases as soon as its successor can accept.
+With `AutoRelease=true`, `AutoReleaseDelay` is a minimum dwell time per MU.
+Warmup resets statistics at the exact configured simulation time, before model
+events at that time. An explicit batch/API seed takes precedence over the scene's
+`MasterSeed`. Batch Cancel interrupts the current replication; only completed
+replications contribute to batch KPI aggregates. How the seed feeds per-component
+RNGs, stochastic `Downtime` and the stochastic fleet takt: see
+[Seeded RNG and stochastic timing](doc-path-fleet-control.md#seeded-rng-and-stochastic-timing-plan-2051-plan-2060).
+
+**AGV mid-run fault (plan-2053).** `Downtime` can also target an `Agv` instance mid-run — point
+`TargetComponentPath` at the vehicle's DES path, same as targeting any other material-flow
+component. No new signal or component is needed: the existing `DESComponent.setFailure()` /
+`Agv.des.onFreeze` / `onResume` contract already freezes the vehicle with a real deceleration
+profile (no teleport stop) and resumes the same task at the same traveler position, including its
+remaining service time, when the repair ends. The vehicle keeps every zone it already held across
+the fault — there is no automatic release of lookahead reservations while frozen (that extension is
+a separate, later follow-up). Covered by `tests/des/agv-downtime-fault.node.test.ts` (freeze/resume
+timing + zone-holding) and `tests/des/pallet-yard-fault-determinism.node.test.ts` (seed determinism
+on a real PalletYard scene, opt-in via `RV_FAULT_DETERMINISM=1`).
+
 The public material-flow API describes event-safe state without importing the
-private DES engine. `MaterialFlowSelf` exposes the MUs currently held by a
+Community DES core plugin (`src/plugins/des/`). `MaterialFlowSelf` exposes the MUs currently held by a
 component through `self.mus`, together with `currentLoad`, `reservedLoad`,
 `downstreamFreeCapacity()`, `reserveDownstream()`, and `reservation()`. A
 `ReservationRecord` is JSON data for one active capacity promise; it identifies
@@ -614,7 +671,7 @@ record back.
 `FrozenDescriptor` is the JSON-only representation of scheduled work paused by
 a component failure. It stores the named action, optional MU reference, payload,
 remaining time, and position/path tween data. No live event or tween handle is
-part of this contract, so the private runner can resolve actions and paths again
+part of this contract, so the DES runner can resolve actions and paths again
 after snapshot restore.
 
 `self.pathTween()` creates a data-only path tween for a duration event. Persisted
@@ -846,6 +903,7 @@ src/
 │   │   ├── rv-source.ts                 # MU spawner
 │   │   ├── rv-sink.ts                   # MU consumer
 │   │   ├── rv-sensor.ts                 # AABB sensor
+│   │   ├── rv-sound.ts                  # Sound (Sound.cs) — procedural drive sound, eager part
 │   │   ├── rv-sensor-recorder.ts        # Sensor history sampler
 │   │   ├── rv-transport-surface.ts      # Conveyor surface
 │   │   ├── rv-transport-manager.ts      # Sources → surfaces → sensors → sinks
@@ -899,6 +957,11 @@ src/
 │   │   ├── rv-component-event-dispatcher.ts # Per-component onHover/onClick/onSelect routing
 │   │   ├── rv-auto-filter-registry.ts   # Type-based auto filter registration
 │   │   └── rv-extras-validator.ts       # Dev-mode GLB extras parity checker
+│   ├── audio/                           # Drive sounds — LAZY, loaded on first activation (plan-2019)
+│   │   ├── rv-audio-engine.ts           # Page AudioContext (refcount), master per viewer, voice pool, panners
+│   │   ├── rv-sound-sampler.ts          # Render-frame sampler: visible speed, edges, sim-time envelopes
+│   │   ├── rv-synth-motor.ts            # Electric motor parameters (Large / Medium / Small)
+│   │   └── rv-synth-pneumatic.ts        # Cylinder / hydraulic parameters + one-shots
 │   └── hmi/                             # React HMI layout components (MUI-based)
 │       ├── rv-app-config.ts             # DEPRECATED re-export barrel → import from core/rv-app-config.ts
 │       ├── ui-context-store.ts          # Context-aware UI visibility (activateContext, useUIVisible)
@@ -966,6 +1029,7 @@ src/
 │   │  # Core (`core: true` — always loaded, survive model switches) ───
 │   ├── sensor-monitor-plugin.ts         # Event-based sensor monitoring
 │   ├── transport-stats-plugin.ts        # 10 Hz RingBuffer transport stats
+│   ├── sound-system-plugin.ts           # Drive sounds of one viewer (Sound list, settings, lazy engine)
 │   ├── camera-events-plugin.ts          # Camera animation done events
 │   ├── drive-order-plugin.ts            # Topological CAM/Gear drive sort
 │   ├── camera-startpos-plugin.tsx       # Per-model camera start position
@@ -1019,7 +1083,8 @@ Unity GLB Export (UnityGLTF + GLBComponentSerializer)
   → GLB with node.extras.realvirtual.{Drive, TransportSurface, Sensor, Source, Sink, ...}
   → Three.js GLTFLoader → node.userData.realvirtual.*
   → rv-scene-loader.ts: Two-phase construction (register nodes, then build typed instances)
-  → LoadResult { drives[], transportManager, signalStore, registry, logicEngine, playback }
+  → LoadResult { drives[], transportManager, signalStore, registry, playback }
+  → viewer: LogicSteps built once the scene is complete (placements materialised) → viewer.logicEngine
   → viewer.use(plugin) — Register plugins
   → SimulationLoop (60Hz fixedUpdate):
       1. LogicEngine         — LogicStep sequencing
@@ -1125,9 +1190,9 @@ Plugins with `slots` automatically register React components into HMI layout pos
 
 | Tier | Loaded when | Can be removed | Examples |
 |------|------------|----------------|----------|
-| **Core** (`core: true`) | Always — survive model switches | No (`removePlugin()` blocked); `disablePlugin()` works on any plugin | `drive-order`, `sensor-monitor`, `transport-stats`, `camera-events`, `camera-startpos`, `rv-extras-editor`, `signal-bind`, `connection-system`, `kiosk`, `interface-manager` |
-| **Global Private** | Always when private folder present | Yes | `layout-planner`, `des-plugin`, `des-hmi` |
-| **Model-Specific** | Only when matching GLB is loaded | Yes (auto-removed on model switch) | `kpi-demo`, `demo-hmi`, `webxr`, `multiuser`, `fpv`, `annotations`, `aas-link`, `docs-browser`, `blueprint`, `drive-recorder`, `sensor-recorder`, `order-manager`, `machine-control`, `maintenance` |
+| **Core** (`core: true`) | Always — survive model switches | No (`removePlugin()` blocked); `disablePlugin()` works on any plugin | `drive-order`, `sensor-monitor`, `transport-stats`, `camera-events`, `camera-startpos`, `rv-extras-editor`, `signal-bind`, `connection-system`, `kiosk`, `interface-manager`, `maintenance` (guided maintenance, plan-522 Phase 6), DES (`src/plugins/des/`), `layout-planner` |
+| **Global Private** | Always when private folder present | Yes | `asset-editor` |
+| **Model-Specific** | Only when matching GLB is loaded | Yes (auto-removed on model switch) | `kpi-demo`, `demo-hmi`, `webxr`, `multiuser`, `fpv`, `annotations`, `aas-link`, `docs-browser`, `blueprint`, `drive-recorder`, `sensor-recorder`, `order-manager`, `machine-control` |
 
 `debug-endpoint` and `mcp-bridge` are registered unconditionally in dev builds but are **not**
 `core: true` — a project may remove them.
@@ -1139,12 +1204,14 @@ See **[doc-extending-webviewer.md](doc-extending-webviewer.md)** for detailed pl
 ## Simulation Features
 
 ### Transport
+
+**Surface settle.** Kinematic clone and instanced MUs captured within `surfaceVerticalReach` descend onto horizontal linear transport surfaces with `RVTransportManager.settleGravity = 9.81` m/s². A gap above `settleMinGap = 0.0005` m starts the descent; each tick integrates downward velocity and clamps travel to the remaining gap. Landing, changing/leaving the surface, holding (including Zone Hold), loading or physics ownership resets the velocity. `settleEnabled = false` (default `true`) restores the previous floating transport for A/B comparisons. Tilted local XZ planes, non-horizontal transport directions, CAD Z-up surfaces, radial surfaces and custom transport paths (including `TransportGuided`) are conservatively excluded: their bounding-box maximum is not a reliable local support height.
 Non-physics AABB-based transport. Sources spawn MUs, transport surfaces move them, sensors detect overlap, sinks consume.
 
 #### MU accumulation (gap clamp)
 MUs on conveyors do not penetrate each other: each moving MU clamps its per-tick advance to the free distance up to the next MU in its actual (signed) move direction — a jam builds up behind a stopped part and releases automatically when the leader moves on. This is a pure 1D projection along the transport direction over the existing spatial grid (no physics engine, no continuous collision detection), so it also works with forced signals, reversed belts, rotated conveyors and across surface seams. Pre-existing overlaps are ignored (only new penetration is prevented), gripped MUs never block, and Sources hold a spawn while the spawn spot is occupied. Radial (turntable) surfaces are excluded.
 
-Configuration: per TransportSurface via **Accumulate** (boolean, default `true`) and **MinGap** (mm, default `0`) in the GLB/scene extras; deployment-wide off-switch via settings.json `simulation.accumulateDefault: false`. Diagnostics: `mu.blocked` per MU and `blockedMuCount` in the `web_transport_status` MCP tool.
+Configuration: per TransportSurface via **Accumulate** (boolean, default `true`) and **MinGap** (mm, default `0`) in the GLB/scene extras; deployment-wide off-switch via settings.json `simulation.accumulateDefault: false`. Diagnostics: `mu.blocked` per MU and `blockedMuCount` in the `web_query("transport.status", {})` MCP tool.
 
 #### Pre-placed MUs and loads (plan-516)
 An MU authored in the scene is **live**, exactly as in Unity — it no longer has to come out of a Source. The classification is implicit (no schema field, no export change): an MU node is a **Source template** when a Source references it — as the Source node itself, as its resolved `ThisObjectAsMU` template, or through an ancestor of either — and **pre-placed** otherwise. Templates stay hidden as before; pre-placed MUs stay visible.
@@ -1167,14 +1234,14 @@ A `Zone` (`rv-zone.ts`, spec §7a.66) is a box (`Center`/`Size`, local mm) on an
 - **Activation** — `Always`; `Signal` (bool, `InvertSignal`); `Axis`: the `ActivationDrive` stands still (not running, not jogging, no behaviour motion, position unchanged since the last tick) inside `AxisFrom`..`AxisTo`. A moving box with `Always` blocks as soon as it crosses the path.
 - **Tick** — in the transport manager: box, activation and Hold release/acquire *before* the MU loop (an MU contained at the switch-on cannot ride out first), Block inside it, Detect after the MU AABB/grid update. MUs that arrived since the last tick are indexed first, so a zone sees them in their arrival tick. 100 zones × 500 MUs cost about 0.07 ms per tick in the measurement of `zone-core.test.ts`.
 - **Authority** — DES never runs the transport manager; a multiuser follower sets `zone.isOwner = false` (box and gizmo only, held MUs let go in place) and back when the session is left.
-- **Gizmo / handles** — box edges plus translucent faces in the effect colour (Hold violet > Block orange > Detect green), faint while inactive, denser faces while occupied; visible in the editor and the test run, never exported. In the asset editor a selected zone gets six face handles (resize, opposite face fixed) and a centre handle (move); one drag is one undo step, Escape cancels, Shift snaps to 5 mm. `web_transport_status` lists every zone with its state.
+- **Gizmo / handles** — box edges plus translucent faces in the effect colour (Hold violet > Block orange > Detect green), faint while inactive, denser faces while occupied; visible in the editor and the test run, never exported. In the asset editor a selected zone gets six face handles (resize, opposite face fixed) and a centre handle (move); one drag is one undo step, Escape cancels, Shift snaps to 5 mm. `web_query("transport.status", {})` lists every zone with its state.
 
 #### Source markers (floor ring + label)
 Every Source carries an always-visible **floor marker** — a thin semi-transparent ring on the ground plus a camera-oriented label sprite showing the source's node name. The marker is visible in **Play, Pause, AR and Layout-Planner modes** so spawn locations stay identifiable even before the first MU appears. Each source's ring/label color is derived deterministically from its name (golden-ratio hue hash), giving consistent visual separation across sessions.
 
 Markers are children of the source node, so they follow Layout-Planner drags automatically. They are excluded from raycast hits via the central `RaycastManager.excludeFilters` (the same filter also catches the pause-ghost overlay), so clicking through the marker selects the underlying layout object instead.
 
-Toggle globally via **Settings → Visual → Show source markers** (default ON) or programmatically via `viewer.setSourceMarkersVisible(false)` / the MCP tool `web_view_source_markers`. The choice persists to `localStorage['rv-source-markers-visible']`.
+Toggle globally via **Settings → Visual → Show source markers** (default ON) or programmatically via `viewer.setSourceMarkersVisible(false)` / the MCP tool `web_execute("view.sourceMarkers", {visible:true})`. The choice persists to `localStorage['rv-source-markers-visible']`.
 
 ### Physics Zones (optional)
 
@@ -1191,7 +1258,7 @@ Opt-in rigid-body physics for free 3D material behavior — MUs falling off conv
 
   The Browser preference is Settings → Simulation → **Physics (whole scene)** (default OFF, `localStorage['rv.physics']`). It is only a preference: while a zone model is loaded, switching it off keeps that model's physics on; the preference applies after the next model switch. When a model switched physics on by itself, Settings → Simulation says so ("Physics enabled by this model"). Without explicit physics zones in the model, the preference treats the whole scene as one zone with default parameters (friction 0.8, restitution 0) — the plugin's synthetic zone never counts as a model zone, and a model that carries zone extras (even only disabled or broken ones) never gets the synthetic whole-scene zone.
 - **Full physics (Beta)**: a second switch, **Full physics — all conveyors** (`localStorage['rv.physics.full']`, only effective while the main switch is on — a zone model never switches it on by itself, and an authored `SceneSettings` flag switches it off). Every non-radial transport surface then runs as a physical belt and MUs become dynamic bodies the moment they enter a surface — accumulation pressure is computed by the physics engine instead of the gap clamp. Radial (turntable) surfaces stay kinematic (v1 exclusion).
-- **`WebPhysicsZone` extras contract**: zones are box volumes authored as `WebPhysicsZone` rv_extras in the GLB (schema `schema/v1/rv-odt.json`, spec section 7a): `ZoneEnabled`, `WholeScene`, `Friction`, `Restitution`, `RemoveBelowY`, `ShowGizmo`, `StaticColliders` (node paths of additional fixed collision geometry). The volume is the `BoxCollider` (center/size) of the SAME node — since plan-525 that box wins over the node's mesh bounds. Overlapping zones: the first registered zone wins, configs are never mixed.
+- **`WebPhysicsZone` extras contract**: zones are box volumes authored as `WebPhysicsZone` rv_extras in the GLB (schema `schema/v1/rv-odt.json`, spec section 7a): `ZoneEnabled`, `WholeScene`, `Friction`, `Restitution`, `SoftCcdPrediction`, `RemoveBelowY`, `ShowGizmo`, `StaticColliders` (node paths of additional fixed collision geometry). The volume is the `BoxCollider` (center/size) of the SAME node — since plan-525 that box wins over the node's mesh bounds. Overlapping zones: the first registered zone wins, configs are never mixed.
 - **Authoring in the asset editor (plan-525)**: Quick Edit → Components → **Box Collider** / **Physics Zone**, the inspector's Add Component menu and `web_editor_add_component` share one rule path:
   - a node carries **one** box collider (a "collider node"); a second one is refused. Several boxes = several collider nodes;
   - "Add Box Collider" on a node that draws geometry creates an empty child **`Collider`** (identity transform) and puts the box there, in one undo step — only an empty collider node survives the destructive bake on its own;
@@ -1207,12 +1274,29 @@ Opt-in rigid-body physics for free 3D material behavior — MUs falling off conv
   [physics-zone] implicit static box "Turbine-cut" (38.2×38.5×16.0 m) spans the scene — skipped (broken collider scale?)
   ```
   Scenes with empty or planar bounds have fewer than two comparable axes; there the guard deliberately fails open. Collision geometry that is meant to be invisible (invisible walls) must be authored explicitly through the zone's `StaticColliders` node paths — those are registered regardless of visibility.
+- **Tunnelling guard for dynamic MUs (plan-2219)**: every MU that becomes a dynamic body gets Rapier soft CCD with the zone's `SoftCcdPrediction` look-ahead (metres, default **0.03**, inspector range 0 to 0.2, `0` = off; the synthetic WholeScene zone uses the default). Rapier 0.20 does not sweep a small, slow-falling part against a fixed thin floor: a 26 mm part dropped at ~1.1 m/s onto a 15 mm floor tunnelled in 20 of 300 drops without it, 0 of 300 with 0.03. The value is set once when the body is created (no per-step cost); hard CCD on the MU (plan-467) and the per-tick soft CCD of moving machine parts are unchanged. A Unity export without the field gets the default.
 - **Automatic floor plate**: the synthetic WholeScene zone (the convenience default when the toggle is on and the model has no authored zone) gets an invisible static plate `floor:synthetic`, so MUs that fall stay visible instead of dropping into the `RemoveBelowY` guard. Its top face is flush with `boundingBox.min.y` and it spans the scene footprint plus a margin. Note the fallback semantics: `boundingBox.min.y` is the underside of *all* render geometry, not necessarily the visible hall floor — with pits or basements in the model the plate sits under that geometry (it is never placed above `min.y`, so it can never cut visible geometry). For an exact floor height author an explicit zone with `StaticColliders`. Authored zones never get a plate.
 - **Kill switches**: settings.json `simulation.physicsEnabled: false` disables physics deployment-wide (wins over the user toggle AND over authored zones); `simulation.physicsSurfaceDefault: false` keeps every surface kinematic (wins over `PhysicsMode` and full physics).
 - **Exclusions**: physics runs only in the continuous simulation kernel — switching to DES tears the physics world down; an active multiuser/live connection (Unity is the pose authority) disables physics entirely.
-- **Diagnostics**: read-only line in Settings → Simulation ("N zones / M bodies (K kinematic) / X ms step" — the parenthesis appears only while moving machine parts are registered) and `physicsOwnedCount` / `physicsBodies` / `physicsKinematicBodies` in the `web_transport_status` MCP tool.
+- **Diagnostics**: read-only line in Settings → Simulation ("N zones / M bodies (K kinematic) / X ms step" — the parenthesis appears only while moving machine parts are registered) and `physicsOwnedCount` / `physicsBodies` / `physicsKinematicBodies` in the `web_query("transport.status", {})` MCP tool.
 
 The physics engine itself is a **private provider** (Rapier, Rust → WASM) behind the public `PhysicsProvider` registry — open-source builds without a registered provider are a strict no-op and load zero physics bytes. See [doc-extending-webviewer.md](doc-extending-webviewer.md) for the provider contract.
+
+#### 2D interaction zones (WebPhysicsZone2D)
+
+`WebPhysicsZone2D` adds four kinds of conveyor interaction: `Jam`, `BufferTable`, `Diverter` and `Merge`. Its box volume comes from the node's `BoxCollider`. Box2D v3 simulates footprints and yaw in a top-down plane at fixed height; Rapier remains the 3D engine for falling, sliding and tipping. Touching zones share one world per contact region, normally in a Web Worker. `Surface` identifies the discharge surface, `Guides` supplies static guide boxes, and `KinematicDrives` supplies moving bodies. `Damping`, `SleepThreshold`, `ForceReturnAfter` and `ShowGizmo` complete the authored settings. Diverters and merges follow local belt directions and moving platforms; routing decisions stay in behaviors.
+
+Each MU has one pose owner: `transport`, `rapier` or `box2d`. Entry through `zone2dHook` either claims the MU or makes it wait for space, backing up the kinematic infeed. Rapier/Box2D handover creates or queues the destination body, confirms ownership, then removes the source body; a refused transfer rolls back the destination. Rapier entry requires a settled, upright MU. Holding remains separate (`heldBy`) and takes precedence.
+
+TODO-SCREENSHOT: diagram transport -> Box2D -> transport handover
+
+Normal exit is downstream only, with a footprint-sized hysteresis margin before returning to transport or handing over to Rapier. A jam tail pushed across the entry stays in Box2D; straight worlds also return bodies that escape beyond the 0.5 m end bands. `ForceReturnAfter` (default 0, disabled) corrects a persistent faulty pose near a straight-zone exit, never a legitimate standing jam; junctions do not use this forced-return rule. Jam pressure is bounded by relaxing stopped bodies, freezing them into a static plug and releasing them from the front.
+
+WASM/worker failure after boot fallback is exhausted, or a runtime failure/watchdog timeout, fails off: every MU returns to transport at its last known pose, the affected world stops and a `physics2d-fail-off` Problem is recorded. DES mode and an active multiuser connection tear worlds down; returning to continuous, disconnected operation rebuilds them.
+
+The acceptance envelope is **10,000 bottles total, at most 7,000 awake**; Phase 6 performance measurements are pending, so this is not a measured production guarantee. The current default capacity is **8,192 body slots per world**, configurable by the plugin. `compat` (no SIMD or threads) is the default WASM flavour. Optional `deluxe` combines SIMD and pthreads and requires `crossOriginIsolated`; the loader selects the flavour explicitly and falls back to compat. Worker boot can fall back to the same simulation inline.
+
+**Status:** `Physics2DZonePlugin` is registered through Private `internal-plugins.ts`, order **21** (after Rapier at 20). Commercial/beta promotion is pending. Public builds carry the component and provider contract only; without a provider, transport stays kinematic. See [doc-extending-webviewer.md](doc-extending-webviewer.md#21b-physics-provider-registry-optional-physics-zones) for extension points.
 
 #### Moving machine parts and payload feedback (plan-467)
 
@@ -1304,7 +1388,7 @@ Two library components ride this substrate (in `src/behaviors/`, built with `def
 
 **Routing is project logic, not built in.** Vehicles follow `successors[0]` by default; junction decisions, arrival tracking, and dispatch come from id-based hooks (`selectNextPath(candidateIds, ctx) → id`, `onArrive(pathId, travelerId)`, `requestDispatch(travelerId)`) that a project script (JS-in-GLB) fills via its `routing.*` handlers — see [doc-scripting.md](doc-scripting.md). Only plain JSON crosses the script boundary; the path graph is queryable by id via `self.paths`.
 
-**Both kernels run the same planner (plan-558).** In the event kernel a vehicle schedules ONE leg event per PLAN (not per path piece); the `path` tween samples the profile position over time (accelerating / braking vehicles render exactly), re-plans happen only at triggers (leg end, task / service, a changed leader plan, a zone release, a horizon extension at its braking point, a scanner field transition) and are coalesced into one deterministic flush per sim instant (leaders first, then vehicle id; at most four per vehicle and instant, then an immediately *safe* hold plan). **Routing is decided at planning time** and kept by later re-plans until the task changes; with a project router installed every piece end is announced (`router.onArrive`) at its exact arrival time — without one, `traveler.path` / `Agv.Position` are synced lazily at the vehicle's own events. The continuous kernel evaluates the SAME plan `x(t)` per tick and runs the plan events on its own exact-time clock, so conflict-free trajectories are identical in both kernels (≤ 1 mm, several piece ends per tick included), and contended runs keep the same order and end state. DES snapshots of scenes with AGVs are an explicit non-goal: taking one warns, restoring refuses cleanly.
+**Both kernels run the same planner (plan-558).** In the event kernel a vehicle schedules ONE leg event per PLAN (not per path piece); the `path` tween samples the profile position over time (accelerating / braking vehicles render exactly), re-plans happen only at triggers (leg end, task / service, a changed leader plan, a zone release, a horizon extension at its braking point, a scanner field transition) and are coalesced into one deterministic flush per sim instant (leaders first, then vehicle id; at most four per vehicle and instant, then an immediately *safe* hold plan). **Routing is decided at planning time** and kept by later re-plans until the task changes; with a project router installed every piece end is announced (`router.onArrive`) at its exact arrival time — without one, `traveler.path` / `Agv.Position` are synced lazily at the vehicle's own events. The continuous kernel evaluates the SAME plan `x(t)` per tick and runs the plan events on its own exact-time clock, so conflict-free trajectories are identical in both kernels (≤ 1 mm, several piece ends per tick included), and contended runs keep the same order and end state. DES snapshots of scenes with AGVs are an explicit non-goal: taking one throws (the checkpoint autosave catches and logs it, plan-2058), restoring refuses cleanly.
 
 ### LogicStep Engine
 Port of Unity's LogicStep sequencing — roughly 25 step types are built in `rv-logic-engine.ts`:
@@ -1566,6 +1650,18 @@ still depends on the renderer's active post-processing path and luminance
 threshold. The asset editor includes red, amber, green, blue, and white
 **Lamp / Signal** presets, with stronger blue and white emission to compensate
 for luminance-based bloom.
+
+### Sound (procedural drive sounds, plan-2019)
+
+`Sound` (`src/core/engine/rv-sound.ts`) is the browser counterpart of Unity's `Sound.cs`. Attached to a node that carries a `Drive`, it makes that drive audible. It has three properties: **Kind** (`Auto` / `Drive` / `Cylinder` / `Hydraulic`), **Variant** (shown as **Type**: `Large` / `Medium` / `Small` for a motor, `Hard` / `Cushioned` for a cylinder, `Auto` only for hydraulics) and **Volume** (0..1). `Auto` resolves to `Cylinder` when the node carries a `Drive_Cylinder`, else to `Drive`; `Hydraulic` is only used when set. Speed, stroke times and end positions come from the Drive / Drive_Cylinder. The Unity fields `SoundType` / `Mode` are read only when the GLB carries neither `Kind` nor `Variant` (`Robot1/2` → Drive/Medium, `SmallElectric1/2` → Drive/Small, `AirPressure` → Cylinder/Cushioned). A variant that does not fit its kind plays as `Auto` and is listed in Problems (`sound-variant-mismatch`); a Sound without a Drive stays silent (`sound-without-drive`). The component claims nothing in the bake (`bake: 'merge'` — the Drive is the boundary) and is authorable, so it is added in the asset editor or with `web_editor_add_component` and edited with the generic component commands.
+
+**What it sounds like.** A motor hums with a fundamental and inverter whine that follow the drive's visible speed relative to its configured `TargetSpeed` (clamped at 2×). A pneumatic cylinder ticks its valve when it starts, slides quietly and hits its end position once (Hard: with bounces; Cushioned: a throttled exhaust before the end, no bounce); a stop mid-stroke is silent. A hydraulic axis sounds only while it moves or relieves pressure (the pump does not idle at standstill), with a valve "tock" at start and stop, flow noise that follows the speed and — when it stops in an end position (cylinder) or at its positioning target (plain Drive) — the hiss of the pressure-relief valve for 2.4 s. A plain Drive (no `Drive_Cylinder`) as a pneumatic axis slides while it moves and knocks once when the move ends at its positioning target; a motor gets a subtle start and brake transient. The continuous voices are trimmed in favour of these events, and every Sound carries a fixed small spread (pitch ±7 %, level ±10 %, seeded from the node id) so identical axes do not sound identical. A simulation reset suppresses edges until each drive has come to rest, and a seek or teleport is recognised as a jump (no sound, no clack).
+
+**Speed and pause.** Everything follows the simulation speed (`rv-speed-override.ts`): pitch from the visible speed, the long envelopes (slide, relief hold) advanced in simulation time, short one-shots compressed but not pitched up. A pause or speed 0 fades all voices out in 80 ms and freezes the envelopes; above 4× at most 10 one-shots per second sound.
+
+**Audio engine** (`src/core/audio/`, loaded only on the first activation). One `AudioContext` per page (reference-counted over the viewers, closed with the last one) and one master gain per viewer (`rv-audio-engine.ts`). Six continuous voices (constructor argument `voiceCount`) are built once and re-assigned four times a second to the sources nearest to the listener (score = Volume / distance squared); nothing is re-created while running. Every voice and one-shot goes through an HRTF `PannerNode` (fallback equalpower, inverse distance, 2 m reference, rolloff factor 2) at the drive node's world position; the listener follows the active camera, in an XR session the headset pose (`renderer.xr.getCamera()`). The render-frame sampler (`rv-sound-sampler.ts`) reads only `currentPosition`, so live, playback and follower drives sound the same; synthesis parameters are in `rv-synth-motor.ts` and `rv-synth-pneumatic.ts`.
+
+**Switching it on.** Sound is off by default. When the scene contains a `Sound`, the view cluster bottom right shows a speaker segment: click toggles it (command `view.sound`), the icon button is the only on / off toggle; hovering opens a volume slider (`view.soundVolume`, no separate switch); both persist in the browser (`rv-sound-enabled`, `rv-sound-volume`). The `SoundSystem` plugin (`src/plugins/sound-system-plugin.ts`) owns this per viewer. Before the first activation no audio code is loaded and no context exists; switched off afterwards, the context is suspended and the voice pool kept. Browsers start audio only after a user gesture, so an "on" set by MCP or restored from the last session starts sounding with the next click or key press. The inspector's **Preview** button plays one run-up or stroke even with sound switched off.
 
 ### Scene buttons (PushButton3D, EmergencyButton3D, HandleSwitch3D)
 
@@ -2075,7 +2171,7 @@ link's mass record with the parallel-axis theorem). The sample frame is the
 `KinematicMechanism` node's world pose (position + rotation, never its scale).
 A CSV (`time;X;Y;Z`, `;` / `,` / Tab, decimal point or comma, s or ms; velocity
 and acceleration columns are ignored) fills it from the panel or
-`web_editor_mechanism_trajectory_import`. One validator
+`web_execute("mechanism.trajectoryImport", {path, relPath, mechanismPath, targetLinkPath})`. One validator
 (`validateTrajectoryConfig`) judges EVERY input path — import, GLB load,
 `setField`, run, playback: 2…20000 finite triples, positive raster, output
 raster a whole multiple of it.
@@ -2092,7 +2188,7 @@ torque is the kernel's `driveForce` (N·m at the joint = gearbox output). A samp
 counts only when every stage reports OK; the preroll tolerates only "history
 short". One run per mechanism at a time; a model switch aborts it. The result
 carries a `configRevision`, and **Export axes** (panel) /
-`web_editor_mechanism_trajectory_export` (MCP) refuse a run that is stale,
+`web_query("mechanism.trajectoryExport", {path})` (MCP) refuse a run that is stale,
 incomplete, aborted or failed. The export is one SERVOsoft text per driven axis
 (`<Name>_<Joint>.txt`: Tab, CRLF, decimal comma, C `%.20e` with round-half-even,
 columns Time / Velocity / Acceleration / Payload / Thrust / Torque, Payload and
@@ -2307,7 +2403,7 @@ feature:
   pipeline (gated hit → triangle refinement → candidates → ranking → world lift)
   behind a canvas coordinate. `mechanism-pick.ts` is now only the modal
   interaction and takes the `recommended` candidate from the same call, so a
-  click and `web_editor_mechanism_snap_list` cannot answer differently at the
+  click and `web_query("mechanism.snapList", {x:0.5, y:0.5})` cannot answer differently at the
   same bore. The tool is `readOnly` and still requires editor mode: the gate is
   the PICK PATH, which is invalid wherever a `BatchTable` exists.
 - **Recording follows the session, not the panel.** The
@@ -2374,6 +2470,83 @@ dropdown and nothing else — no group names, no exclusion matrix:
   immediately: there is deliberately no baseline, so set floors, frames and
   supports to `None`.
 
+### Unsupported-part detection (DropDetection)
+
+A part that nothing holds and that has nothing beneath it does **not** fall: the
+kinematic engine has no gravity, so it stands where the transport let it go and
+the model builder never learns that the handover missed. **Drop detection is on
+by default**, even without a component, using the defaults in `rv-odt.json`.
+Such a part becomes a visible finding instead. Disable it immediately in
+**Settings > Simulation > Unsupported-part detection**. This browser preference
+persists in localStorage (`rv-drop-detection-settings`) across model changes
+and reloads; unavailable storage falls back to on.
+
+An optional **DropDetection** component on any one node (conventionally the
+scene root) tunes the scene-wide parameters and signal slots. `Enabled=false`
+on that component disables detection for the scene. Options off always wins,
+even with `Enabled=true`. Without a component, or after removing it, schema
+defaults apply. Disabling stops detection and optional deletion; existing cards
+and their signals remain latched until acknowledged or reset.
+
+It is a diagnostic and plausibility tool for the model builder, not a safety
+mechanism — **the simulation never stops**. The component is optional; its parameters travel with the model.
+
+- **What is checked, stage 1 (every tick, free).** A part is a *candidate* while
+  nothing holds it (`heldBy`: grip, typed connection, Hold zone, commissioning
+  drag), no transport surface *plausibly* carries it, it seats on no GripTarget
+  and it rests on no carrier part. "Plausibly" is the point: asking whether a
+  surface is merely *assigned* is not enough — a part can carry a stale surface
+  reference pointing at a conveyor half a metre below itself. The check uses the
+  same two comparisons and the same tolerance the transport itself uses to
+  decide whether a surface may take a part over (`surfaceVerticalReach`): if the
+  transport would not pick that surface up for this part, the part is not
+  supported by it.
+- **What is checked, stage 2 (event-driven, not per tick).** A candidate that
+  outlasts **Grace Time** gets one ray cast straight down, from just below its
+  own collider. Any hit within **Support Probe Distance** counts as support —
+  *including* opaque geometry that carries no component at all, which is exactly
+  the table, chute or shelf-plate case. In doubt everything supports: a false
+  alarm costs more than a missed case. Only when there is demonstrably nothing
+  below is the part reported. The ray runs at most every **Support Recheck
+  Interval** per part and at most eight times per tick in the whole scene.
+  **Support Mode: StateOnly** switches the ray off entirely (then a part lying
+  on anything that is not a transport surface *is* reported).
+- **What is never reported.** A part owned by a physics engine
+  (`WebPhysicsZone`, Rapier or Box2D) — there falling is the wanted behaviour
+  and `RemoveBelowY` already cleans up. Likewise a part mid end-of-line vanish
+  (it is already recognised as the end of the line) and a part marked for
+  removal.
+- **What happens on a finding.** The part gets the pulsing severity outline (the
+  same OutlinePass status silhouette as a collision, in the same warning orange
+  — the two are unioned, not traded) and one card appears in the right-side
+  messages panel, directly below the collision cards. Card and outline
+  **latch**: they stay after the part is supported again, because the finding is
+  the point. Clicking a card frames the camera on the part and flashes it. **OK**
+  acknowledges exactly this part (still unsupported, it returns next tick);
+  **Ignore `<Source>`** mutes every part of that source for the rest of the run.
+- **Signals.** `DropActive` (bool) and `DropCount` (int) mirror the latched state
+  for the PLC; a rising edge on `ResetDrops` clears every card and silhouette
+  (still-unsupported parts are reported again on the next tick).
+- **Optional deletion.** **Delete Unsupported** is **off** by default on
+  purpose: deleting the part destroys exactly the evidence the report is about.
+  Switch it on for long runs in which the part count would otherwise grow
+  without bound — the card stays and names the deleted part together with the
+  position it stood at.
+- **Testing it on purpose.** `diag.unsupportPart` (web_execute / web_commands)
+  releases a named part from its support so the detection, the card and the
+  silhouette can be exercised without waiting for a real defect. It does not
+  fake a report: it only changes hold and carry state, so what appears is the
+  real detector answering. `diag.dropStatus` reads the configuration and the
+  current findings, `diag.dropReset` clears them.
+- **Known limits.** An **instanced** part has no node of its own (its slot lives
+  in a pooled `InstancedMesh`), so it gets a card but **no silhouette** and the
+  card has no click target — the same limit the collision cards have. A **clone
+  part used as a carrier** without `loadedOn` set is not a raycast target, so
+  the ray passes through it and the part on top is reported: set `heldBy` /
+  `loadedOn` correctly (the load path does). The OutlinePass status channel has
+  no mirror on the WebGPU/TSL pipeline, so there the card appears without the
+  silhouette — inherited from the collision feature, not new here.
+
 ### Sensor isolation (toolbar button)
 A single **Isolate Sensors** toolbar button (in the `button-group` slot, registered via `web-sensor-plugin.tsx`) toggles sensor isolation mode. When active, non-sensor meshes are dimmed (opacity `0.55`) and desaturated so only the sensors stand out, and sensor labels are shown for identification. Click the button again to restore the normal view.
 
@@ -2410,7 +2583,7 @@ Everything is **config-gated via `settings.json`**: `diagnostics.diagnoseUrl` en
 
 Unified raycast pipeline (`rv-raycast-manager.ts`) consolidates hover, scene click, and XR controller raycasting into a single Three.js `Raycaster`. Hover is throttled at 50 ms.
 
-**Pick geometry = the bake** (plan-753/756). The loaded model and every planner placement are `BakedAsset` instances of the viewer's `BakeRegistry` (`rv-bake-pipeline.ts`, `rv-bake-registry.ts`): a few chunk meshes (one static, one per textured material, one per mover, each split by group partition), and each chunk carries realvirtual's own CPU **pick structure** — *segments* (one triangle run per surviving node, with the node that a click on it selects), Morton-sorted *clusters* with one box each, and a binned-SAH tree over those boxes (`rv-pick-structure.ts`). The `PickBackend` (`rv-pick-backend.ts`) raycasts those chunk meshes and resolves the hit triangle through its segment to the owner node in O(1) — no binary search, no ancestor walk-up at runtime. An unowned segment of an **opaque** chunk blocks the ray (nothing is selected, and nothing behind it either); a transparent chunk lets the ray pass, and hidden nodes are skipped during the traversal. A plain `THREE.Raycaster` gets the same structure through an instance `.raycast` override that returns an ordinary `Intersection`. Authoring loads (`preserveHierarchy`) and loads that did not bake (static batching switched off) pick real meshes through the `InstancePickIndex` backend instead. `InstancedMesh` MU pools and aux targets (gizmos, energy-chain hulls) are the manager's own targets on every load.
+**Pick geometry = the bake** (plan-753/756). The loaded model and every planner placement are `BakedAsset` instances of the viewer's `BakeRegistry` (`rv-bake-pipeline.ts`, `rv-bake-registry.ts`): a few chunk meshes (one static, one per textured material, one per mover, each split by group partition), and each chunk carries realvirtual's own CPU **pick structure** — *segments* (one triangle run per surviving node, with the node that a click on it selects), Morton-sorted *clusters* with one box each, and a binned-SAH tree over those boxes (`rv-pick-structure.ts`). The `PickBackend` (`rv-pick-backend.ts`) raycasts those chunk meshes and resolves the hit triangle through its segment to the owner node in O(1) — no binary search, no ancestor walk-up at runtime. An unowned segment of an **opaque** chunk blocks the ray (nothing is selected, and nothing behind it either); a transparent chunk lets the ray pass, and hidden nodes are skipped during the traversal. A plain `THREE.Raycaster` gets the same structure through an instance `.raycast` override that returns an ordinary `Intersection`. Authoring loads (`preserveHierarchy`) and documents that draw nothing (they never run the bake recipe) pick real meshes through the `InstancePickIndex` backend instead. `InstancedMesh` MU pools and aux targets (gizmos, energy-chain hulls) are the manager's own targets on every load.
 
 **Raycast readiness:** a baked chunk is never raycast without its structure — `bake()` builds it in a worker pool and resolves only when every chunk has it, so the first hover after scene entry is as fast as the thousandth. The remaining pick surfaces (collision, transport, instance pick) use per-mesh three-mesh-bvh trees built asynchronously after `model-loaded` by one reused background worker, with a time-sliced inline fallback where no `Worker` exists; until such a tree lands, those raycasts use the native three.js fallback. The `'raycast-ready'` viewer event signals full completion.
 
@@ -2433,6 +2606,8 @@ Unified raycast pipeline (`rv-raycast-manager.ts`) consolidates hover, scene cli
 - Two modes: static snapshot (brief hover) and tracked (overlays follow moving meshes)
 
 **Architecture + hard invariants** (bake chunks, pick geometry, layer/AO contracts, do-not-touch rules) are documented in the internal render/picking design note, which is not part of this repository. The canonical source is `src/core/engine/rv-bake-pipeline.ts`, `rv-bake-registry.ts`, `rv-pick-backend.ts` and `rv-pick-structure.ts`.
+
+`object-hover` fires when the hovered node changes, even with a stationary pointer: the hover ray resolves one frame after `pointermove`. Otherwise it fires only after more than 4 px of pointer movement.
 
 **Events emitted:**
 - `object-hover` — `{ node, nodeType, nodePath, pointer, hitPoint, mesh }`
@@ -2638,7 +2813,7 @@ everything moved into a dropdown, behind a condition, or behind `⋯`:
 | Group | Contents | Rule |
 |-------|----------|------|
 | Follow / Sit-On | follow and ride-along camera | rendered **only** while a followable part is selected — the `CameraFollowPlugin` leaves the mode itself on deselection. Sits at the strip's **outer (left) end**: the strip is right-anchored, so their arrival moves nothing else; they fade in (120 ms) |
-| Render mode | **one** segment showing the active mode's icon, opening Unlit / Shaded / Toon (+ Wireframe in the Editor workspace), then the two quality rows **Max Quality** / **Fast** (plan-591) | absent when the Visual settings are locked (`lockSettings` / `lockedTabs: ['visual']`) — the quality rows included. The trigger icon keeps showing the MODE: quality is a second axis and is deliberately not represented there |
+| Render mode | **one** segment showing the active mode's icon, opening Unlit / Shaded / Toon (+ Ray traced where its backend gate is open, see *Render modes*; + Wireframe in the Editor workspace), then the two quality rows **Max Quality** / **Fast** (plan-591) | absent when the Visual settings are locked (`lockSettings` / `lockedTabs: ['visual']`) — the quality rows included. The trigger icon keeps showing the MODE: quality is a second axis and is deliberately not represented there |
 | Camera | only the **occupied** bookmark slots (as numbers), then one `+` segment that saves the current view into the first free slot | the `+` disappears when all three slots are taken. Click / Enter restores, long-press / Shift+Enter overwrites (green flash). Global **1 / 2 / 3** restore, **Shift+1/2/3** save — not while typing, not in the asset editor (`cameraBookmarkKey`) |
 | View | the eye (toggle HMI, **H**), the Display panel (only with groups or overlay categories), the overflow `⋯` | `⋯` holds VR / AR, First-Person View (**F**) and every row a plugin contributes through the **`view-overflow`** slot — Record video lives there. `⋯` disappears only when it has nothing at all to offer |
 
@@ -2723,7 +2898,7 @@ Keyboard shortcuts (enabled by default, suppressed inside text inputs):
 
 #### Pause is a multi-reason set
 
-Pause is reference-counted by `string` reason. Multiple subsystems can hold it simultaneously, and the simulation only resumes after every holder releases its reason:
+Pause is a **set** of `string` reasons (not a counter): adding the same reason twice is one entry, and one release removes it. Multiple subsystems can hold different reasons simultaneously, and the simulation only resumes once the set is empty:
 
 | Reason          | Holder                                       |
 |-----------------|----------------------------------------------|
@@ -2864,7 +3039,7 @@ Drop targets:
 
 Every signal can say where it is used. `viewer.signalUsage` (`src/core/engine/rv-signal-usage-index.ts`) indexes six kinds of usage, grouped in this order: **Components** (a schema signal slot, a reference field whose rv-ODT target is a signal, a `ComponentReference` whose wire type names a PLC signal, or the fixed string fields `WebSensor.SignalBool` / `SignalInt` and `ConnectSignal`), **Logic steps**, **PLC** (ST program lines with `declaration` / `read` / `write` / `read-write`, read from the current `PLCProgram.Code` of every program through the public `PlcRuntime.getSignalUsages()` seam), **Operator panel** (each element of a `WebOperatorPanel` config), **Bindings** (the binding inventory, orphaned links included) and **CONNECT bridges** (1:1 mappings by source and destination, mirror rules by pattern). References resolve in the scope of the node that carries them, exactly like the runtime (`NodeRegistry.resolveSignalReference`), so placements never see each other's signals; an unresolved reference stays in the list, marked.
 
-Where it shows: a **Used by (N)** block in the Property Inspector of a selected signal node; a small count chip on every signal row of the Hierarchy and of the CONNECT signal list that opens the same list in a popover (also for process-image signals without a scene node); a "Used by N" line in the signal chip's tooltip; and the MCP tool `web_signal_usage`. A click jumps to the place: the node (hierarchy + inspector), the PLC editor at the line (only while the PLC plugin registers its `PlcNavigation`), or the CONNECT panel at the bridge row. A name two signal nodes share is flagged and grouped by signal path.
+Where it shows: a **Used by (N)** block in the Property Inspector of a selected signal node; a small count chip on every signal row of the Hierarchy and of the CONNECT signal list that opens the same list in a popover (also for process-image signals without a scene node); a "Used by N" line in the signal chip's tooltip; and the MCP tool `web_query("signal.usage", {name})`. A click jumps to the place: the node (hierarchy + inspector), the PLC editor at the line (only while the PLC plugin registers its `PlcNavigation`), or the CONNECT panel at the bridge row. A name two signal nodes share is flagged and grouped by signal path.
 
 The index is built lazily by the first reader and only invalidated — never rebuilt — by model load / clear, placements, editor structure and field changes, every committed SceneStore op (undo / redo included), binding changes, operator panels, CONNECT bridge changes and the PLC editor's dirty flag; nothing runs per frame.
 
@@ -2875,7 +3050,8 @@ In the **Commissioning** workspace a carrier (MU) can be taken off the line or s
 - **Remove** — select a carrier and press **Delete**, or right-click it › **Remove workpiece carrier**. The carrier goes together with every part riding on it (a click on a part addresses its carrier); several selected carriers ask for a confirmation. Connection holds (StopOnExit, belt-stop refcount included) are released, script-station ledgers forget the carrier, and sensors and zones are re-evaluated at once — a paused line shows the freed sensor and writes its signal immediately (`RVTransportManager.refreshDetection()`). There is no undo: an authored (pre-placed) carrier comes back on the next simulation reset, workspace switch or model reload.
 - **Move** — drag a carrier: it follows the pointer over the tops of the transport surfaces, the outline is green where it can be dropped and red where the spot is occupied or there is no surface; release drops it (collider bottom on the surface top, rotation kept), **Esc** cancels and restores pose, parent, surface state and a GripTarget it sat on. While dragged the carrier is held with owner `'user'`.
 - **Not available** for pooled (instanced) carriers, physics-owned carriers, carriers held by a gripper, a zone or a station (move only), in the DES kernel and in a multiuser client session — the context menu and the drag hint name the reason.
-- **MCP**: `web_mu_delete(id)` and `web_mu_move(id, x, y, z, surface?)` are views of the same commands (`mu.delete` / `mu.move`); the ids come from `web_transport_status` (`mus[].id`).
+- **MCP**: `web_mu_delete(id)` and `web_mu_move(id, x, y, z, surface?)` are views of the same commands (`mu.delete` / `mu.move`); the ids come from `web_query("transport.status", {})` (`mus[].id`).
+- **Ray drag** (plan-2215 Phase 7): `startDragFromRay(mu, origin, direction)` / `updateDragFromRay(origin, direction)` take the carrier with a world-space ray (the flystick bridge); `finishDrag()` / `abortDrag()` end it. The pointer variants turn the screen position into a ray and run the same drag step, so both inputs behave identically. Only one drag runs at a time; pointer events never end a ray drag.
 
 ## Operator Panel Config Editor (plan-555)
 
@@ -2925,14 +3101,30 @@ Runtime pieces:
 
 Editing: the Property Inspector's **Connections** section lists in/out edges as chips (click navigates to the other end), offers typed per-edge config fields, an add form, a drag handle (drag onto another node in the 3D scene to connect) and the connection-type editor. All edits are ops (`addConnection` / `removeConnection` / `setConnectionType`) — undoable and draft-autosaved. GLBs without a `Connections` block load unchanged.
 
+## USD Button and Live Link to Isaac Sim (plan-637)
+
+The **USD** button in the left tool bar (also in the editor and the planner) groups
+*Export USD…*, *Import USD…* (both need the commercial USD providers of plan-764 and are
+disabled without them) and **Sync to Isaac Sim**: the running simulation is transferred
+into NVIDIA Isaac Sim with one click, after which every axis and every workpiece moves
+there live (default 30 Hz, 10–60 Hz adjustable). Display happens only in Isaac Sim; nothing
+streams back. The viewer connects directly to the Kit extension `realvirtual.livesync` on
+`ws://127.0.0.1:8775` (default since extension 0.2.1; was 8765. Same PC, token from the extension's panel) — no CONNECT, no Nucleus.
+Another program on the port is detected (plain-HTTP probe `GET /realvirtual-livesync`) and stops the retries with a clear message;
+change the port on both sides (USD ▸ ⚙ and `/exts/realvirtual.livesync/port`).
+A pill next to the simulation controls shows the state and the effective rate. Setup:
+`integrations/omniverse-kit/README.md`; architecture and protocol:
+`doc-extending-webviewer.md` § *USD live link to Isaac Sim*.
+
 ## Unified CAD Import
 
-All geometry sources are imported through one entry point: the **Import** button (left tool toolbar, available in every workspace mode) opens the Unified Import Dialog. The deep link `?doc=new&mode=editor` opens the same dialog automatically on top of a freshly minted asset document (see *Workspace modes* above). Its tabs come dynamically from the import provider registry (`viewer.importProviders`):
+All geometry sources are imported through one entry point: the **Import** button (left tool toolbar, available in every workspace mode) opens the Unified Import Dialog. The deep link `?doc=new&mode=editor` opens the same dialog automatically on top of a freshly minted document (see *Workspace modes* above). Its tabs come dynamically from the import provider registry (`viewer.importProviders`):
 
 | Provider | Source | Build |
 |----------|--------|-------|
 | GLB File | local `.glb` file(s) | core (public) |
 | STEP | local `.step`/`.stp` via occt WASM (browser-local, no upload) | private |
+| DXF | local `.dxf` (ASCII, R12–R2018) — AutoCAD drawings, clean-room parser | private |
 | Asset Manager | Unity Cloud Asset Manager (shared connections with the Library panel) | private |
 | Onshape | Onshape cloud (registry entry point reserved) | private |
 | AutomationML | local `.aml` **folder** (or a single `.amlx`) — CAEX topology + referenced COLLADA | private, **internal only** |
@@ -2943,6 +3135,61 @@ The dialog makes the target explicit ("Import as"):
 - **Open as new scene** — replace: loads the result as a new model (clears the current scene), identical to opening a model from the selector.
 
 Providers report availability reactively (`ready` / `needs-setup` / `connecting`); a provider that needs a login or credentials shows a setup hint instead of its form. Errors and partial results (e.g. 3 of 5 files converted) are listed in the dialog — nothing fails silently. See `doc-extending-webviewer.md` §21 for writing your own provider.
+
+### DXF (plan-741)
+
+The DXF tab exists for one job above all others: putting a **factory hall floor plan** on the
+planner floor as a locked reference to build a layout on top of. Extruding closed contours into
+rough walls and importing a 3D DXF as a mesh asset are by-products of the same pipeline.
+
+Everything runs in the browser with a clean-room ASCII parser — no npm parser, no upload, no
+CONNECT. Binary DXF and DWG are **not** supported and are refused with a message that says so;
+re-save as ASCII DXF in the CAD tool.
+
+**What arrives.** LINE, LWPOLYLINE, POLYLINE, CIRCLE, ARC, ELLIPSE, SPLINE, INSERT (nested
+blocks, rotation, mirroring, rectangular arrays), HATCH boundaries, 3DFACE/SOLID, and — as an
+option — TEXT/MTEXT. Lines become flat **ribbon meshes**, not `THREE.Line`: picking, the batched
+renderer and five gates in the scene loader are all mesh-only, so line primitives would be
+invisible to selection, isolate and thumbnails, and WebGL draws them one pixel wide regardless.
+One mesh per DXF **layer**, colours from the ACI palette as vertex colours.
+
+**Options** (`DxfImportOptions`):
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| Units | Auto | `$INSUNITS`, sanity-checked against the real extent — see below |
+| Line width | 20 mm | Drawn ribbon width in world millimetres |
+| Include frozen / off layers | off | Also import hidden layers and `Defpoints` |
+| Extrude closed contours | off | Closed outlines become `ExtrudeGeometry` walls of the given height; their ribbons are dropped |
+| Render text | off | TEXT/MTEXT as canvas sprites (a hall plan carries thousands) |
+| Place as locked reference | on | Planner sink only — see `doc-layout-planner.md` §6.10 |
+
+**Units are the trap.** `$INSUNITS` is very often 0 ("unitless") or simply wrong, and a hall read
+as metres instead of millimetres arrives 1000× too large. The pre-import summary therefore checks
+the declared unit against the extent of the actual geometry (a building is between 1 m and 2 km
+across), recommends a better one when it does not fit, and the tab lets you override it outright.
+The extent comes from the entities, never from `$EXTMIN`/`$EXTMAX` — those carry AutoCAD's ±1e20
+placeholder in any drawing that was never zoomed.
+
+**The root is pivot-correct by construction.** The planner's reload path re-pivots every placement
+unconditionally, so the drawing is centred on its own AABB and the Z-up→Y-up rotation sits on an
+inner `DxfContent` wrapper rather than the root. `pivotToFloorCenter` is then a genuine no-op and
+a placed plan does not drift on reload. The drawing floats 0.5 mm above the floor to avoid
+z-fighting with the grid.
+
+**Performance.** A synthetic 100 000-entity drawing (7 MB, 2.4 M triangles) measures ~1.10 s of
+parse + geometry + ribbon, so drawings over 1 MB run in a Web Worker
+(`dxf-import-worker.ts`), with an automatic inline fallback if a worker cannot be created.
+Before the GLB is encoded, a triangle guard refuses above 2 M and warns above 1 M — `objectToGlb`
+materialises the binary chunk twice and dies well below any glTF limit.
+
+**Not in v1:** binary DXF, DWG, DIMENSION geometry, line types (everything is solid), hatch
+pattern fills, paper space, XREFs, block instancing in the GLB, DXF export.
+
+Modules: `../realvirtual-WebViewer-Private~/src/plugins/dxf-import/` (`dxf-parse`,
+`dxf-analyze`, `dxf-geometry`, `dxf-ribbon`, `dxf-colors`, `dxf-to-three`,
+`dxf-import-worker`) plus the tab in `import-providers/dxf-import-provider.tsx`. Everything up to
+and including `dxf-ribbon` is Three.js-free on purpose — that is what makes the worker a shell.
 
 ### AutomationML (plan-420, internal preview)
 
@@ -3076,12 +3323,31 @@ emits `editor-structure-changed` (which costs the hierarchy panel a full
 `scene.traverse`) plus one grouped-BVH classification. So an API that emits one op
 per node makes both of those scale with the node count.
 
-- `reparentNodes(paths, target)` — one top-level op **per node**. Use it for
-  interactive moves (drag & drop, a handful of nodes).
-- `reparentNodesBatch(paths, target)` — the whole block resolved **before** the
-  first mutation and applied as **one composite**: one structure event, one BVH
+- `reparentNodes(paths, target)` — interactive moves (drag & drop, a handful of
+  nodes). Since plan-610 it, too, is planned before the first mutation and applied
+  as **one composite** (one undo step), but it keeps sequential semantics: node *i*
+  moves after node *i-1*, so its collision name, `prevIndex` and source path see
+  the earlier moves.
+- `reparentNodesBatch(paths, target)` — the whole block resolved against **one**
+  pre-move state and applied as **one composite**: one structure event, one BVH
   classification, one world-matrix flush, one undo step. Use it for anything bulk
   (`groupIntoEmpty`, the PLMXML kinematics import).
+
+Both — and `renameNode` — are **reference-safe** (plan-610): a reference stored as an
+ADDRESS (every web save, plan-769) needs no rewrite at all; for the PATH-form ones a file
+still carries, the composite also carries the `setField` steps that rewrite every stored path into the renamed or
+moved subtrees (ComponentReferences at any depth, the declared path fields, unique
+name fields), in the spelling they were written in; a collision auto-rename is
+followed by the rewrite onto the final name. The `…Detailed` forms
+(`renameNodeAwaited`, `reparentNodesDetailed`, `reparentNodesBatchDetailed`)
+return `referencesRewritten`, `nameFieldsRewritten` and `warnings[]`
+(`auto-renamed`, references left unchanged, ambiguous name fields), and reject with
+`RenameRefusedError` — nothing mutated — for a `/` in a name, the model root,
+referenced content, or a signal node whose signal name follows its node name. The
+MCP tools `web_editor_rename` / `web_editor_reparent` pass those fields through
+(plus a `note` that only the open document was searched) and turn a refusal into
+an error naming the way out (`web_editor_signal_rename` for a signal node). Rules,
+limits and the load audit: [doc-node-paths.md](doc-node-paths.md) § 10.
 
 Measured on a synthetic 4493-node assembly moving 434 nodes with the hierarchy
 panel open: **178 ms → 21 ms**, structure events 773 → 8, forced
@@ -3098,7 +3364,8 @@ into a list that grows back one node at a time — snapshotting raw indices
 scrambles sibling order on undo.
 
 The matrix batching that goes with it is applied **only** to a composite made
-purely of moves and renames (`isPureMoveComposite`): those apply a transform
+of moves and renames, optionally followed by the reference rewrite's
+`setField` / `unsetField` steps (`isPureMoveComposite`): those apply a transform
 resolved before the batch opened, so nothing inside reads `matrixWorld`. A
 composite that also constructs components keeps the eager per-op refresh, and the
 flush itself is unconditional — the editor pick backend reads `matrixWorld` raw.
@@ -3353,7 +3620,8 @@ was never a question. The Layout Planner's placement init calls likewise stay
 ungated.
 
 The only entry that does NOT bake is therefore the **asset editor** (it authors
-the tree). There is **no runtime rollback of the bake** (plan-757 Phase 3,
+the tree; it draws that tree through BatchedMesh arenas instead — see *Editor
+display* above and `contract-bake-picking.md` §2.5). There is **no runtime rollback of the bake** (plan-757 Phase 3,
 2026-09-22): the Visual-tab switch went with commit A, the localStorage override
 `rv-webviewer-static-merge` and its module `rv-static-merge-flag.ts` were
 deleted with commit B (a stored value is ignored), and the only rollback is a
@@ -3361,7 +3629,7 @@ deploy revert. A bake that FAILS is a load error: `loadGLB` rejects with
 `BakeFailedError` and the Problems panel carries a `bake-failed` entry; no
 unbaked tree is loaded in its place. The pick structure has a rollback of its
 own inside `PickBackend` (dev flag `rv-webviewer-pick-structure` = `0`, the
-linear segment walk — `doc-render-picking.md` §1.1).
+linear segment walk — `contract-bake-picking.md` §1.1).
 
 Guarded by `tests/rv-authoring-hierarchy-invariant.test.ts` (a baked runtime
 load moves the members into the axis' chunk; every non-baking load, flag or no
@@ -3397,18 +3665,178 @@ are correct.
 ## Renderer Support
 
 - **WebGL** (default): Stable, all browsers
-- **WebGPU**: Three.js r185 `WebGPURenderer` with WebGL2 fallback
+- **WebGPU**: Three.js r185 `WebGPURenderer` with WebGL2 fallback. Opt-in with feature parity
+  since plan-763: ambient occlusion, bloom, selection / hover / status outlines (pulse included),
+  toon edge lines and the floor reflection run as TSL nodes of one `RenderPipeline`
+  (`rv-post-processing-tsl.ts`, `rv-ground-reflector-tsl.ts`); every capture tool, library
+  thumbnails and the per-pass frame stats work on both renderers. Known differences on WebGPU:
+  the agent-eye `beauty` channel and saved document thumbnails render without AO and contact shadow,
+  toon edges also trace gizmos / ghosts and glass, MSAA gives way to FXAA on the tone-mapped frame while edges or AO are on (both read the scene depth, which WGSL cannot sample multisampled), the
+  `shadow` stats bucket stays empty, video recording still needs WebGL, and WebXR, Gaussian
+  splats and the private virtual camera stay WebGL-only.
+  **The one rule** behind all of it: on WebGPU nothing may call `renderer.render()` or
+  `clear()` to the canvas after `RenderPipeline.render()` — three routes such a call through
+  its frame-buffer target and blits that over the finished frame (the grey screen of
+  2026-10-13). Helper renders are graph nodes (`updateBefore`) or render into a target.
 
 Selection persists via URL parameter (`?renderer=webgpu`) or localStorage.
 
+### Render strategy seam (plan-2215)
+
+`viewer.setRenderStrategy(strategy | null)` lets ONE owner replace the main scene pass with
+N views into canvas rectangles (`engine/rv-render-strategy.ts`: `RenderStrategy`,
+`RenderStrategyContext`, `ViewportRect` in CSS pixels, WebGL origin bottom left). The commercial
+stereo plugin (SBS for 3D TVs, Private) and display wall plugin use this seam. Rules:
+
+- **No strategy = the unchanged mono path** — the branch is not entered, the render calls are
+  identical. A second owner is refused (`setRenderStrategy` returns `false`).
+- `viewer.camera` stays the only navigation camera (controls, picking, capture, multiuser, MCP).
+  A strategy derives its view cameras from it every rendered frame and never writes back.
+- `ctx.renderViewport(rect, camera)` = scissored scene pass + overlay-layer pass with that camera
+  (`_renderOverlayLayers(camera)`). The shadow map updates with the first view only; scissor and
+  viewport are reset after the frame. Isolate, EffectComposer and TSL post are skipped.
+- Render on demand stays: whoever changes a view parameter calls `markRenderDirty()`.
+- A throw from `renderFrame` removes the strategy, restores the render target bound at entry,
+  renders the frame mono, then `onFailed(err)` runs exactly once — also when the mono fallback
+  throws (that throw reaches the render recovery). XR presenting always wins;
+  `renderFrameForCapture` and video capture stay mono.
+- While a strategy draws, `viewer.pointerPickBlocked` is true. It is the ONE question every
+  pointer handler that raycasts with `viewer.camera` from client coordinates asks: clicks,
+  double-clicks, context menu, long press, hover (`RaycastManager.pickBlocked`), the pointer pick
+  APIs (`raycastForRVNodeDetailed`, `pickDetailed`) and the plugin gizmos / tools find nothing, and
+  a running drag is aborted or ended. Navigation keeps working. Per-view picking is a later phase.
+- `viewer.strategyFrame` says whether the back buffer holds a strategy frame. Plugins that draw
+  over the back buffer in `onRender` skip their pass exactly then — today only `gaussian-splat`
+  (splats are not visible in stereo; mono screenshots and video captures keep them).
+- `web_status` carries a `stereo` block when the stereo plugin is registered.
+- The optional wall strategy reports `web_status.wall` and `wall.status` / `wall.viewports` queries;
+  `wall.start` / `wall.stop` execute through the command registry. Its view cameras share one
+  navigation rig snapshot per frame. Tracking is polled before the render decision, also while paused.
+- `viewer.clickFromHit(hit, { shiftKey?, clientX?, clientY? })` is the click logic of the canvas
+  `pointerup` (chart filter, `pick:'action'`, select / shift-toggle, empty space clears) with an
+  already resolved hit. The mouse calls it with the `raycastForRVNodeDetailed` hit, the private
+  flystick bridge with `raycastManager.raycastRay` from the wall's rig snapshot (`applyPointer(rig)`,
+  registered through `WallRenderStrategy.addRigConsumer`); a ray click has no screen position, so
+  no WebLabel framing.
+- `npm run gen:mcp-docs -- --node` regenerates the same marked documentation and CONNECT class
+  allowlists through Node tests when a browser cannot be started.
+
+### Render modes
+
+The render mode is the master rendering preset (`viewer.renderMode`, the pill segment, the Visual
+tab, `view.renderMode`, MCP `web_view_render_mode`). The registry `src/core/rv-render-modes.ts` is
+the single source of truth: each mode is a descriptor whose capability flags gate both the Visual-tab
+controls and the pipeline features.
+
+| Mode (label) | Id | Look | Available |
+|---|---|---|---|
+| Unlit | `simple` | flat ambient light, no environment, no tone mapping, no post-processing | always |
+| Shaded | `default` | HDRI environment + key light, shadow map, AO, bloom, floor reflection | always |
+| Toon | `toon` | cel bands + edge lines, flat ambient fill | always |
+| Ray traced (WebGPU, internal) | `raytraced` | Shaded's primary hit (raster), but the lighting is traced per pixel in compute passes and accumulated over frames: diffuse (environment, 1–3 bounces, emissive) and GGX specular reflections, lit by the HDRI environment only (no key light); transparent materials attenuate the rays; no shadow map, no AO pass | real WebGPU backend **and** a registered backend (internal builds only) |
+
+**Backend gate (plan-762).** `raytraced` declares `requires: 'compute'`. Whether it is offered is
+decided only by `availableRenderModes(ctx)` / `resolveRenderMode(id, ctx)` with
+`ctx = viewer.renderModeContext` (`{ hasCompute, backendRegistered }`, read live). On `webgl`, on
+`webgpu-gl` (no compute) and in every build without a registered backend (community, customer,
+public demo) the mode is not listed anywhere, `web_view_render_mode raytraced` answers
+`{ ok: false, reason }`, and a persisted / app-config `renderMode: 'raytraced'` falls back to
+`default` at load (and the stored value is corrected). On a WebGPU viewer whose backend registers
+only after boot (private plugins register after `RVViewer.create`), the persisted mode stays
+pending — the viewer renders Shaded — until `main.ts` calls `viewer.resolvePendingRenderMode()`.
+The backend registers through the hook `src/core/engine/rv-raytraced-hook.ts`
+(`registerRaytracedBackend` / `getRaytracedBackend`); its lifecycle (epoch token, scene wait,
+fatal fallback to `default`) lives in `src/core/engine/rv-raytraced-host.ts`. Internal builds also
+request the adapter's storage-buffer limits when creating the WebGPU device (one retry without
+them, then the usual WebGL fallback).
+
+**How the mode renders (hybrid).** The raster still draws the primary hit: the TSL scene pass
+writes a single-sampled G-buffer (MRT: lit colour, diffuse albedo `baseColor × (1 − metalness)`,
+world normal, a specular attachment, depth) and records the pass camera. The backend traces a
+separate **copy** of the scene — never the baked chunks themselves — in two compute dispatches per
+frame:
+
+- **Trace** (the budget rows only, default 1/4 of the rows per frame): per pixel one sample of the
+  **diffuse irradiance** — environment (importance-sampled), 1–3 diffuse bounces with emissive —
+  and one **GGX specular** sample (VNDF-sampled reflection ray). The reflected ray is shaded at its
+  hit with emission, one environment sample and an environment reflection; a miss returns the
+  environment. The mode has **no key light**: the directional light leaves the scene while it is
+  active (capability `directionalLight: false`, like Unlit), so the trace is lit by the HDRI and
+  emissive surfaces only and the raster fallback of pixels without history matches it. The specular
+  sample is stored divided by the analytic environment BRDF of the pixel (F0, roughness, N·V), so
+  its history stays smooth; the composite multiplies the same term back.
+- **Resolve** (every pixel): reprojects the per-pixel histories (diffuse and specular, each with its
+  own history length N) from the previous frame's G-buffer with the camera matrices — the same
+  pixel at rest, four validated bilinear taps under motion (plane distance + normal test; a failed
+  test is a disocclusion and restarts that pixel only) — and blends the new samples in.
+
+**Transparency.** Transparent materials (`transparent` with `opacity < 1`, or `transmission > 0`)
+are attenuating occluders in the trace: a shadow, bounce or reflection ray that hits one multiplies
+its throughput by `t × material colour` (`t = transmission`, else `1 − opacity`) and continues
+(up to four transparent hits, then the hit counts as opaque). Glass guards therefore tint and
+attenuate the shadow and light behind them instead of casting a black shadow or none. The glass
+pixel itself is drawn by the raster and blended with the traced result by its opacity.
+
+**Sliding window instead of restarts.** Only mode entry, resize, model change and environment
+edits reset the history. A camera move keeps it (reprojection) and shortens the window
+globally — diffuse to `capCameraMotionFrames` (default 32 frames), specular to
+`capSpecularMotionFrames` (default 8; view-dependent); with the optional **dirty
+regions** (`dirtyRegions`, **off by default** since 2026-10-20 — **Shift+D** toggles them, stored in
+localStorage `rv-raytraced-dirty-regions`), parts moved by the simulation shorten it **locally**:
+their world boxes (plus `dirtyMargin` 0.1 m) become up to 32 dirty regions, inside which the window
+is `capMotionFrames` (16 frames) for the diffuse and twice that for the specular history; everything
+else stays uncapped. Without them only the reprojection test reacts to moving parts (it restarts
+the pixels of the part itself); the light a moving part takes from or adds to its static
+surroundings then blends in with the progressive mean. A YCoCg variance clip against the freshly traced neighbours limits ghosting
+where something moves (diffuse: in dirty regions only; specular: also under camera motion).
+Windows are counted in frames, so at a pixel budget of 1/4 a 16-frame window holds 4 samples.
+Render-on-demand stops when `samplesSinceMotion` (dispatches since the last motion × budget)
+reaches `targetSamples` (default 256). A running simulation neither repacks the trace scene
+(spawned parts bind to hidden spare copies) nor resets the history; transforms are refitted after
+every render in which something moved (a few ms on the 2.3-million-triangle station).
+
+**Diagnostics.** `web_status.raytraced` reports phase, `bvhBuildMs`, `lastUpdateMs`, `kernelMs`,
+triangles, `historyFrames`, `samplesSinceMotion`, `targetSamples`, `pixelBudget`, `bounces`, `cap`,
+`refitMs` / `refitMsMax`, `stallMsMax`, the newest `events` (reset / repack / refit / stall /
+kernel rebuild / TLAS rebuild) with `counters`, and free-form `diagnostics` (temporal windows and dirty regions,
+traced specular on / active, disocclusions, trace-scene counts incl. transparent meshes, repack
+reasons). The `rv:raytraced-bvh|update|kernel|refit` performance measures appear in the layout
+timings. An on-screen HUD (frame-time graph, window, motion state, last events) toggles with
+**Shift+R** (stored in localStorage `rv-raytraced-hud`); it shows the dirty-region switch (**Shift+D**). Backend options (settable on the backend
+instance, reflected in `diagnostics`): `bounces`, `pixelBudget`, `targetSamples`, `tracedSpecular`
+(default on; off = raster specular), `capCameraMotionFrames`, `capSpecularMotionFrames`,
+`capMotionFrames`, `dirtyRegions`, `dirtyMargin`, `clipGamma`, `specularClipGamma`, `fireflyK`,
+`topologyDebounceMs`, `hud`, `tlasRebuild` (default on), `tlasRebuildRatio` (default 1.25), `tlasStrategy`.
+
+**Trace structure under a running simulation (plan-767 run 4).** Moving parts are refitted in place,
+which slowly loosens the top level of the trace structure (on the station the trace cost grew ×5
+within a minute). When the measured kernel time exceeds `tlasRebuildRatio` × its value right after
+the last build, the top level is rebuilt in a Web Worker over the existing clusters and swapped in
+between two frames (a few ms on the main thread); nothing is repacked and the history is kept.
+`diagnostics.tlas` reports the baseline, rebuild count and timings.
+
+Known limits: building the ray tracing structure blocks the main thread once on entry (about 8 s
+for the 2.3-million-triangle station); under camera motion the image is visibly grainier (a few
+samples per pixel) and re-converges within ~17 s at rest; specular reflections of moving parts and
+very smooth mirrors smear briefly under motion (reprojection follows the surface, not the
+reflection); refraction is not simulated (glass attenuates, it does not bend light); gizmos are
+shaded like scene geometry; between two TLAS rebuilds the trace cost of a running simulation
+drifts up by up to the rebuild ratio. Leaving the mode restores Shaded / Toon shadows unchanged: on
+WebGPU shadows are switched by `renderer.shadowMap.enabled` alone (the Shaded / Toon key light
+keeps `castShadow`; Ray traced takes it out of the scene and Shaded puts it back), the shadow map type stays PCF (Toon's hard edge = shadow radius 0) and a shadow map
+resize re-creates the cached render objects. Visual acceptance runs in real Chrome via the private bench script
+`scripts/raytraced-bench.mjs`.
+
 ### Automatic Quality Selection
 
-Weak devices automatically get the published **"Fast"** visual preset (Unlit render mode, no shadows, no antialias, lower DPR cap) instead of "Default" (`src/core/hmi/auto-quality.ts`):
+Weak devices automatically get the published **"Fast"** visual preset (Unlit render mode, no shadows, no antialias, no bloom, DPR capped at 1.0 — since 2026-10-19; it was 1.5, which on a 1.5× display rendered 2.25× the pixels the preset was meant to save) instead of "Default" (`src/core/hmi/auto-quality.ts`):
 
 - **Boot seed** — on a fresh install (no persisted visual settings), a standalone WebGL probe classifies the GPU tier; mobile devices and integrated/software GPUs seed "Fast", everything else "Default".
 - **FPS watchdog** — after each model load (5 s grace period), `viewer.currentFps` is sampled (15 valid samples, hidden-tab samples skipped); a median below 20 fps switches to "Fast" at runtime.
 
 Both stages show a one-time modal ("Performance mode enabled", dismissed with OK) and act **at most once per device** — the localStorage flag `rv-auto-quality-applied` guarantees a manual preset choice is never overridden afterwards.
+
+**Memory budget (`memory-budget` problem).** Quality presets cannot save a load that does not fit into the renderer process: a 242 MB CAD line (the large CAD line, 7.5 M triangles) peaks at 1.7–1.8 GB of JavaScript heap during the bake and keeps 1.4 GB, and a browser that cannot give that dies mid-bake (`RangeError: Array buffer allocation failed`, then "Aw, Snap") without a word. Since 2026-10-19 the loader asks first (`src/core/engine/rv-load-memory-budget.ts`): for a GLB of 100 MB or more the estimated peak (7.5× the file size) is compared with `performance.memory.jsHeapSizeLimit` and `navigator.deviceMemory` (both Chromium-only; absent → silent), and a shortfall is filed as ONE Problems warning naming the file, the numbers and the three things that help — a 64-bit browser (on Windows on ARM the installed Chrome may be the 32-bit x86 build running under emulation, with a 1.1 GB heap limit; the ARM64 build or Edge gives 4 GB), fewer 3D tabs, a reduced export. Under WebGL the loader also no longer zero-fills a `uv` attribute into chunks that have none (92 MiB on the same model); that fill is WebGPU-only.
 
 The preset can be changed anytime under **Settings → Visual → Preset** — and since plan-591
 straight from the viewport: the render-mode menu in the bottom-right cluster ends in two
@@ -3425,40 +3853,151 @@ antialias there regardless of the stored preset, so a reload could not resolve t
 
 ## Library Thumbnails
 
-Card previews for library assets, projects and documents are rendered in the browser by
-`src/core/thumbnails/` — `ThumbnailService` (queue, concurrency 1, pull-based) →
-`ThumbnailRenderer` (offscreen render) → `ThumbnailCache` (Cache API). On a WebGPU viewer the
-service reports unavailable and every request resolves to `null`; cards fall back to their icon.
+**Thumbnails are written when a document is saved, and only read everywhere else (plan-776).**
+Nothing renders a card picture on view: the project dashboard, the detail pane and the planner
+library window read the pointer a save wrote, and a document without one shows its type
+placeholder ("No preview" tile). Nothing ever loads a GLB to draw a card.
 
-**Output**: 512×512 transparent PNG, rendered internally at 1024² and downscaled in one halving
-step. Supersampling rather than MSAA, because MSAA is resolved away by the first composer
+```
+SAVE (the only writer)                              READ (never renders)
+editor save ─┐                                      project.json row.thumbnail ─┐
+planner save─┼─► renderThumbnailImage ─► sidecar     catalog.json entry.thumbnail ┼─► resolveThumbnailUrl
+mcp replace ─┘   (512 px, webp|png)      .thumbnails/<id>.<hash8>.<ext>         │   (backend.readDocumentUrl)
+                        └─► ProjectStore.setDocumentThumbnail (merging write)    ▼
+                            + delete the previous sidecar                   URL store ─► <img lazy> | type tile
+copy / duplicate ─► copy the sidecar bytes        delete / retire ─► delete the sidecar
+```
+
+**Where it lives.** A sidecar file next to the documents:
+`.thumbnails/<encodeThumbnailId(id)>.<hash8>.<webp|png>` at the project root; a library catalog
+keeps its own per category folder (`library/<Category>/.thumbnails/…`), because a delivery copies
+whole category folders. The document row (`documents[].thumbnail`) holds the exact relative file
+name; a catalog entry holds it as `thumbnail`, relative to the catalog, and the catalog reader turns
+it into `thumbnailUrl`. `hash8` is the first 8 hex characters of the image's SHA-256
+(`revisionOfBytes`): a changed picture is a changed file name, so every cache on the way — browser,
+Bunny CDN (which ignores query strings) — sees a new key, and the pointer alone is the cache key.
+`.thumbnails/` is a dot folder, so every project listing and the dashboard tree hide it.
+
+**Which writes render** (`src/core/thumbnails/rv-thumbnail-write.ts`, the one writer, loaded on
+demand so the renderer stays out of the startup chunk):
+
+| Write | Thumbnail |
+|---|---|
+| Editor save (`saveDocument`) | rendered (the one document render, see below) |
+| Planner save — in place, first save, *Save as*, *Save settings into model* (`SceneStore`) | rendered — the same render |
+| MCP `document replace` of the loaded document | rendered again; of a document that is not loaded: pointer removed, sidecar deleted |
+| Duplicate, cross-source copy / move | sidecar bytes copied under the new id; a failed copy leaves the row without a pointer |
+| Delete / retire | sidecar deleted after the row |
+| Rename, move | nothing — the sidecar is keyed by the id |
+| Classification / info / planning / variants | nothing — the row keeps its pointer |
+| Imports (STEP, Onshape, SimReady, GLB) | nothing — placeholder until the first save |
+| **Regenerate thumbnails** (project row ⋮, plan-776 #20) | every document of the project rendered again — the one explicit exception, see below |
+
+The save order: the GLB is written first (the only step that can fail the save), then the image is
+rendered, written, and the row pointed at it with `await ProjectStore.setDocumentThumbnail(id, path)`
+— one merging manifest write (CAS on a folder project, the stored manifest on a browser project),
+awaited before the save's `rescanDocuments()`. Then the row's previous sidecar and a legacy
+hash-less `<id>.png` of the same id are deleted. **Any failure after the GLB removes the pointer**
+— the card shows the placeholder, never a stale picture — and the save still reports success. A
+read-only backend or a document without a manifest row writes nothing.
+
+**Validity check.** No image is written for empty or non-finite bounds, a lost WebGL context, or an
+image without a single visible pixel.
+
+**Delete safety.** Every delete goes through `deleteThumbnailSidecar`, which removes only a
+project-root sidecar of exactly that document id (`.thumbnails/<enc(id)>.<hash8>.<ext>` or the legacy
+`<enc(id)>.png`) in the backend that owns the document. A pointer a manifest names by hand — a URL,
+an absolute path, `../models/x.glb`, another id's file — is never deleted.
+
+**Output**: 512×512, rendered internally at 1024² and downscaled in one `drawImage` step,
+transparent background. WebP at quality 0.85 with alpha; where the browser cannot encode WebP
+(Safari) the encoder's actual result decides and a PNG is written under `.png` — never PNG bytes under
+`.webp`. Supersampling rather than MSAA, because MSAA is resolved away by the first composer
 intermediate (three.js #23300).
 
-**Look is frozen, not live**: previews are rendered with a hard-coded snapshot of the "Default"
-visual preset (`THUMBNAIL_LOOK` in `thumbnail-renderer.ts`) — GTAO ambient occlusion (intensity 1,
-radius 0.1), fixed ambient/directional light values, no tone mapping, **no bloom**
-(`UnrealBloomPass` clamps alpha to 1 and would fill the transparent background, three.js #14104).
-Only the environment (HDRI IBL) is mirrored from the live scene. A cached picture is shared and
-long-lived, so it must not depend on the render mode the viewport happened to be in. Changing the
-look means changing those constants **and** bumping the cache bucket together.
+**Camera**: one fixed 3/4 view (front-right, slightly above, direction `(1, 0.75, 1)`) fitted to the
+bounding sphere of the complete content (`r / sin(fov/2) × 1.15`). There is no per-document camera.
+
+**One rule for every document** (plan-716: asset = document = model). Whoever saves — the editor,
+the planner, an MCP replace — the same function renders the same thing: the viewer's document
+content (`documentContentRoots`: the model root plus the planner's layout root), cloned by
+`captureDocument` (`src/core/thumbnails/thumbnail-content.ts`) into the renderer's private studio
+scene, each content root at its live world transform. The live scene is never rendered and never
+changed; the clone shares geometry and materials with it and frees only what it owns.
+
+**What is in the picture**: what the file contains, under ONE predicate
+(`isThumbnailExcludedNode`). A **placed reference is file content**: the PlacementInstancer
+materialises it as `_rvBakeChunk` meshes and keep meshes under the reference node, and the capture
+keeps them — although the GLB export drops chunks (the file stores the reference node; the load
+rebuilds the chunks). Left out, with their subtrees: spawned MUs, gizmos, ghosts, highlight
+overlays, raycast BVH helpers, the planner floor and guides (`_layoutFloor`, `_floorGizmo*`,
+`_layoutSnapGuide`, `_layoutNeighborGuide`, `_layoutNeighborDistance`, `_layoutSelectionPivot`),
+three.js helpers (grid), every other runtime helper of the export table (`isRuntimeHelperNode`), and
+the editor's BatchedMesh arenas — the clone is taken in arena capture mode, so their source meshes
+are cloned instead and an arena would draw them twice. Nodes hidden only in the view are shown;
+`rv.Hidden` and authored-inactive nodes stay out with everything below them. Drives stay where they
+are. Only layer-0 drawables count for the framing and reach the picture, so overlay layers never do.
+The save waits (at most 5 s, `SCENE_READY_WAIT_MS`) for `viewer.whenSceneReady()` — every placement
+materialised — so the framing is computed over the complete content.
+
+**Look**: one hard-coded snapshot of the "Default" visual preset for every document
+(`THUMBNAIL_LOOK` in `thumbnail-renderer.ts`) — GTAO ambient occlusion (intensity 1, radius 0.1), one
+fixed directional key light, no ambient fill, no tone mapping, **no bloom** (`UnrealBloomPass` clamps
+alpha to 1 and would fill the transparent background, three.js #14104) — plus a contact shadow. Only
+the environment (HDRI IBL) is mirrored from the live scene. The first save of a document compiles
+the studio-light variant of its materials once (three caches programs per material, so the live
+view switches back without a recompile). On a WebGPU viewer the picture is the plain lit model
+without GTAO and contact shadow (plan-763).
 
 **Contact shadow**: `thumbnail-contact-shadow.ts` bakes a silhouette-true soft shadow — an
-orthographic camera on the floor renders the asset with a modified `MeshDepthMaterial` into an
+orthographic camera on the floor renders the document capture with a modified `MeshDepthMaterial` into an
 alpha mask, blurred in two passes and mapped onto a plane placed just below `bounds.min.y`. The
-plane is always a **sibling** of the asset (the camera fit uses `Box3.setFromObject`, which cannot
-exclude it) and is baked **after** the fit. Assets without meshes bake an empty mask and simply get
-no shadow.
+plane is always a **sibling** of the capture and is baked **after** the framing bounds are taken, so
+the framing stays about the document.
 
-**Cache invalidation** runs through the bucket name only — the key
-(`projectId:providerId:sourceId:assetId[:version]`) deliberately does not include the size. The
-current bucket is `rv-thumbnails-v4`; `rv-thumbnails-v3` (short-lived plan-712 previews with a
-too-bright ambient fill), `rv-thumbnails-v2` (256px previews) and `rv-planner-thumbnails`
-(pre-plan-372 glbUrl keys) are deleted once per browser session. Previews regenerate lazily, for
-visible cards first.
+**Reading.** `resolveThumbnailUrl(backend, pointer)` (`src/core/library/resolve-document-thumbnail.ts`)
+passes a pointer with a URL scheme or a leading `/` through unchanged (a value a delivered manifest
+or another provider states), reads a relative pointer that names a `.thumbnails/` file
+(`.thumbnails/x` or `<Category>/.thumbnails/x`, no `..`) through `backend.readDocumentUrl` — a blob
+URL for a folder or browser project, a plain or (encrypted deploy) decrypted blob URL for a bundled
+one — and answers `null` for anything else or on a read/decrypt error. It never probes a
+conventional path. At most 4 reads run at once. The session URL store
+(`rv-thumbnail-url-store.ts`) shares one URL per `backend + pointer` between all cards, refcounts it,
+releases idle entries oldest first past 500, and releases everything on a project switch and on
+viewer dispose. Cards render `<img loading="lazy" decoding="async" width height>`; a missing pointer
+or a load error shows the type tile.
 
-Persisted thumbnail **files** are a separate store and are not touched by the bucket bump:
-`library/.thumbnails/Custom/*.png` (written by `rv-asset-library-save.ts`) and the planner's
-`public/` thumbnails keep their old picture until the asset is saved or regenerated.
+**Regenerate thumbnails (plan-776 #20).** The one explicit exception to "only a save renders": the
+project row's ⋮ menu on the dashboard's project list offers *Regenerate thumbnails*, which re-renders
+the thumbnail of EVERY document of that project. It is ONE registry command,
+`project.regenerateThumbnails` (`{ projectId }`; MCP: `web_execute`, runs as a job), and it renders
+through exactly the save path: each document is opened in the viewer through the open funnel
+(`SceneStore.openDocument(id, { background: true })` — no recents entry, URL or resume pair), the run
+waits for `whenSceneReady()` (every placed reference materialised, at most 120 s per document), and
+`writeDocumentThumbnail` renders, validates, writes the hashed sidecar, cleans up the old one and
+points the row. **Not offscreen**, deliberately: a document's nested placements are materialised by
+the viewer's `PlacementInstancer` into the viewer's `NodeRegistry` and scene-ready gate, so a private
+`ModelCache` bake would render the document without its placed references. At the end the previous
+document (or bundled model / empty workspace) and the mode are opened again; the editor is parked in
+the first non-editor mode during the run. The rule (`regenerateThumbnailsEnabled` — the menu item's
+tooltip and the tool's refusal): disabled for a read-only project (bundled, hosted,
+`!backend.writable`), while there is unsaved work, and while a run is in progress. A linked folder
+that is not open is opened first, like *Open* does (a lapsed grant is asked for again; refused access
+aborts the run with a message). A dialog shows `3 / 12` and the current document; *Cancel* stops
+after the current document (written thumbnails stay); the result names every failure by document
+(open failed, recovered autosave draft — not rendered, or nothing renderable). Modules:
+`rv-thumbnail-regenerate-commands.ts` (descriptor, rule, project-open step — light, the dashboard
+imports it), `rv-thumbnail-regenerate.ts` (the loop, loaded lazily on the first run; guard 9.5 forbids
+it on the read side), `rv-thumbnail-regenerate-progress.ts` (the progress + Cancel store the
+dashboard's `RegenerateThumbnailsDialog` reads). Browsing still never loads a GLB.
+
+**Not migrated.** Existing projects, Unity exports and fresh imports show placeholders until a
+document is saved (or, in a writable project, *Regenerate thumbnails* is run); the old hash-less `.thumbnails/<id>.png` files are ignored by the reader and
+deleted by the next save of that id. The Cache API buckets of the former render-on-view cache
+(`rv-thumbnails-v4/v3/v2`, `rv-planner-thumbnails`) are deleted once per page by the URL store.
+Built-in library assets have no save-in-place yet: their catalog carries the `thumbnail` field and
+the reader, and they show placeholders until a sidecar exists in their category folder
+(`build-local-library-catalog.mjs` derives the field from it on every build).
 
 ## Deployment Configuration (settings.json)
 
@@ -3592,7 +4131,10 @@ A deployment without an AASX payload (the CONNECT embed strips the whole `aasx/`
 shows no AAS UI at all instead of a red error on every motor hover. A *broken* index keeps its
 visible error on purpose — hiding it would mask a broken deployment.
 
-Links attached at runtime (`attachDriveDatasheets`, layout-planner placements) are marked
+AAS links come **only from authored data** — an `AASLink` in the GLB's rv_extras, an rv-extras
+overlay, or a model plugin that remaps an authored link (`remapAasLink`). A node's name never
+attaches one: the former name rule (`/motor|antrieb/i`, `/^drive/i` → the SEW KA47 demo shell)
+was removed because it put the demo datasheet on customer motors. Every authored link is marked
 `pending` synchronously and classified by `resolveAasSubtree()`, which is driven from the viewer's
 `model-loaded` and `layout-content-added` events so it also runs in modes where `AasLinkPlugin`
 is not loaded. Every change of a source's index (scan, import, project switch) re-classifies the
@@ -3612,7 +4154,7 @@ viewer, order manager, layout planner, resolution pass — reads `getActiveAasSo
 |--------|-------|-------|
 | `ProjectAasSource` | the open project's `aasx/` through its `ProjectBackend` | folder: lazy `File`, ranged reads; bundled: decrypted by the backend; browser: OPFS |
 | `UrlAasSource` | a deployed `aasx/` directory (`public/aasx`, or the model's explicit `pluginConfig['aas-link'].assetsBasePath` + `aasx/`) | through the decrypt seam; HTTP range reads on unencrypted deploys |
-| `MergedAasSource` | project over deploy | **the project wins per AAS id**; the deploy-wide index stays the fallback (the SEW demo motors keep working inside a customer project) |
+| `MergedAasSource` | project over deploy | **the project wins per AAS id**; the deploy-wide index stays the fallback for ids a project does not ship |
 
 `lookupAas(source, id)` returns the entry **with the source that listed it**, and the archive is
 opened from exactly that source — a file name present in both never mixes up two archives.
@@ -3664,6 +4206,36 @@ the inspector's undoable `setField` op.
 
 Hosted and password-protected deploys carry `aasx/` like any other project content; see
 `doc-deploy.md` § *Password protection* for the encryption of AASX files.
+
+### Mirrored external AAS documents
+
+A type AAS often links its manuals on the manufacturer's site (a File value `https://…`) instead
+of shipping them. Such sites send no CORS headers, so the overlay reader cannot fetch them and the
+link opens in a **new browser tab** — the default, unchanged.
+
+To open them **inline** instead, mirror them into the project (opt-in, per project):
+
+```bash
+node scripts/mirror-aas-documents.mjs --project <project dir>
+#   [--max-total-mb 500] [--max-file-mb 100] [--exclude-manufacturer <regex>] [--refresh] [--dry-run]
+```
+
+The tool reads every `aasx/**/*.aasx` of the project, downloads each external PDF once into
+`docs/aas/<url-hash>-<file>.pdf` and writes `docs/aas/mirror.json`
+(`documents: { url → { path, sha256, size, fetchedAt, etag?, lastModified?, sources } }`).
+Identical bytes behind several addresses (one per language) are stored once. A re-run revalidates
+with ETag / Last-Modified and skips unchanged files; failures (not a PDF, too large, HTTP errors)
+are listed, never fatal (exit code 1 when any failed).
+
+**The presence of `docs/aas/mirror.json` is the opt-in** — there is no project.json flag. When the
+open project has one (`src/core/aas/rv-aas-document-mirror.ts`, loaded on model load and before a
+maintenance document button is enabled), `openPdfViewer()` resolves a `{ type: 'external' }`
+source it lists to the project copy, read through the project backend (same-origin on a hosted
+deploy, decrypted on an encrypted one), and opens it in the overlay — `#page=N` of the address
+becomes the initial page, so a maintenance step's *"Betriebsanleitung, S. 18"* lands on page 18.
+An address the mapping does not list, or a project without the file, still opens a new tab.
+Entries whose path is not a plain relative path under `docs/` are ignored. In a customer repo the
+PDFs belong in Git LFS (`*.pdf`).
 
 ### Settings Priority
 
@@ -3768,7 +4340,7 @@ function KpiBar() {
 | `?lockSettings=false` | Explicitly unlocks |
 | `?model=models/demo.glb` | Load specific model |
 | `?mode=<id>` | Boot into a workspace mode (`viewer`, `hmi`, `des`, `planner`, `commissioning`, `editor`) |
-| `?doc=new&mode=editor` | Editor entry: mint a new asset document, open the editor and the CAD import dialog |
+| `?doc=new&mode=editor` | Editor entry: mint a new document, open the editor and the CAD import dialog |
 | `?renderer=webgpu` | Use WebGPU renderer |
 | `?option=<id>` | Load a **model variant** (see below) |
 
@@ -4152,8 +4724,9 @@ not there. Desktop measures are unchanged (tree 280, detail 260, search 200).
 listings — manifest documents, `docs-index.json` targets, `*.connect.json`,
 `*.knowledge.md` — and a file in none of them was simply not there, which is why
 people could not find their own drawings, scripts and notes. Now one backend
-walk lists everything except viewer machinery (dot-paths, `project.json`,
-`docs-index.json`, the `thumbnails/` cache), and the old distinction shows up as
+walk lists everything except viewer machinery (dot-paths — the saved previews in
+`.thumbnails/` among them —, `project.json`, `docs-index.json`, an old undotted
+`thumbnails/` cache), and the old distinction shows up as
 **verbs** instead of as presence: a file with no reference model behind it
 renders as an *inert* row — visible, selectable, no context menu, no F2, no
 drag, and refused as a move/rename source by the tree rules themselves, so the
@@ -4225,7 +4798,7 @@ on it reveals the file in the tree, the **×** clears the binding — and each i
 without a mouse through the card's *Bind CONNECT configuration… / Bind plugin… / Bind knowledge
 file…* menu entries, which open a keyboard-driven picker listing only the project's valid
 candidates. A drop the slot cannot accept says why, in the card's own notice box, instead of failing
-quietly. `project.json` is never edited by hand for any of this, and `web_document_bind` is the same
+quietly. `project.json` is never edited by hand for any of this, and `web_execute("document.bind", {document, field, ref})` is the same
 write over MCP.
 
 The PLUGIN slot has one thing the other two do not: a **runtime state**. Its chip reports not only
@@ -4244,9 +4817,13 @@ Details: [`doc-persistence.md`](doc-persistence.md) §2.0-0, §3.6a, §3.6b, §3
 A saved scene used to be a base-GLB URL plus an operation log in localStorage.
 Since plan-397 it is **a GLB file**, and GLBs may reference each other. Since
 plan-716 there is no second kind of owned content at all: **one document model**,
-one list (`documents[]`), one identity (`documentId`). "Scene" is a ROLE a
-document plays — the one you have open — not a storage concept. (The word keeps
-its ordinary meaning for the Three.js scene in the viewport.)
+one list (`documents[]`), one identity (`documentId`). What is saved and opened
+is a **document**, in every mode (plan-777): "scene" means the 3D scene graph
+only (the Three.js scene in the viewport, glTF `scenes[]`), "asset" a library
+catalog entry only. `SceneStore` and `AssetDocument` keep their historical class
+names; they are the planner's and the editor's **session** on a document, not two
+document kinds. Every save — planner or editor — ends in the same post-save step
+(thumbnail → `document-saved` → background rescan, `doc-persistence.md` §2.0a-3).
 
 **Storage.** Bodies are files in the project: `scenes/<name>.glb` in a folder
 project, the same path over OPFS in the implicit browser project *My Workspace*.
@@ -4282,8 +4859,32 @@ placement, recursively for references inside placed assets — nothing is grafte
 at runtime, the main model is the placement at the origin that is not cloned.
 History: until plan-757 composition used to resolve and graft references into the
 tree right after the parse, which kept every referencing document on the unbaked
-path. The asset editor (an authoring load) still composes and grafts, because it
-edits and saves the composed tree. The referencing file carries an
+path, and until plan-774 the asset editor still grafted. **Since plan-774 the
+editor follows the nested-prefab model:** the open document's own content stays
+unbaked and authorable, its references are the same baked placements the HMI
+shows:
+
+```
+editor open / undo-by-recompose / Back / test-run stop
+  loadAuthoringModel(viewer, url, { identity, keepBaked, holdKept })
+    viewer.loadModel(preserveHierarchy + preserveAuthoringHierarchy)
+      clearModel: release instances, KEEP baked assets for this load
+      loadGLB: own content unbaked; every non-embedded reference node
+               left EMPTY + deferred (legacy stored children detached)
+      placements.materializeDeferred → ModelCache (bake once, share) → instances
+    join: whenSceneReady() raced against 60 s → identity check
+      superseded        → nothing replayed
+      ready             → arena.rebuild (owned meshes only), replay ops
+      budget expired    → Problems placements-still-loading; ops on placed
+                          content wait for the late settle (draft tail kept)
+    settle: retireKept() — kept assets nobody claimed are retired
+```
+
+Inside placed content only component values are editable: the edit is an
+instance override in `AssetOverrides.byAddress` of the outermost reference
+(written by the op itself, undoable, Revert = back to the asset's value);
+structure, transforms and mechanisms are authored by descending into the asset,
+which opens it unbaked. Details and problem codes: `doc-node-paths.md` §9. The referencing file carries an
 `AssetOverrides` layer; the referenced file is never modified. Trust is per
 subtree and per chain: a signed root does not lend its signature to unsigned
 content, and a containing asset's weaker verdict gates the assets inside it.
@@ -4305,7 +4906,9 @@ Details: [`doc-persistence.md`](doc-persistence.md) §2–§3,
 Tests run in real Chromium via Vitest + Playwright:
 
 ```bash
-npm test              # All tests, headless
+npm test              # Browser suite (Vitest + Playwright), headless — NOT the node tests
+npm run test:node     # Node suite (*.node.test.ts, vitest.node.config.ts)
+npm run test:all      # All suites in sequence (scripts/run-all-tests.mjs)
 npm run test:watch    # Watch mode
 npm run typecheck     # Full type check (tsconfig.full.json — includes private-dependent tests)
 npx tsc --noEmit      # Community type check — the public tsconfig, excludes private-dependent tests
@@ -4321,6 +4924,8 @@ that loads one must pair it with the skip probe - see *Testing Plugins* in
 Test files live in [tests/](tests/) (Vitest, browser-mode) and [e2e/](e2e/) (Playwright). Run `ls tests/*.test.*` for the current inventory — counts move every release, so no totals are kept here.
 
 ## Debug Logging
+
+- [Blockage checker](doc-web-debugging.md#blockage-checker): deadlocks, missing expected progress, coverage and legitimate-wait budgets.
 
 Category-based structured logging via `rv-debug.ts`. Zero overhead in production.
 
@@ -4623,3 +5228,26 @@ See **[doc-extending-webviewer.md](doc-extending-webviewer.md)** for:
 - Existing plugins reference
 
 Plugins can read deployment config via `getAppConfig()` from `rv-app-config.ts` to adjust behavior based on `settings.json` values. Custom tooltips can be added via `tooltipRegistry.register()` — see [Tooltip System](#tooltip-system) above.
+
+
+### SpaceMousePlugin (plan-2215 P1, core since Phase 8)
+
+The AGPL `SpaceMousePlugin` (`spacemouse`) is a core plugin, registered in
+`src/main.ts` (dynamic import, `core: true`) for every build, community included. `/?spacemouse` opens Settings > SpaceMouse. Chrome/Edge
+WebHID connects a permitted 3Dconnexion device after clicking **Connect SpaceMouse**;
+already permitted devices reconnect automatically. The connection status is
+`not-connected | connecting | connected | unavailable | failed`; if opening fails,
+another application such as 3DxWare may hold the device.
+Orbit uses the navigation pivot and never rolls; Fly supports horizon locking (roll
+only with Lock Horizon off) and optional Walk ground snapping. Settings include per-axis inversion, dead zone, smoothing,
+sensitivity, dominant axis, eye height in mm and two configurable station buttons.
+Preferences use `SPACEMOUSE_SETTINGS_KEY` (`rv-spacemouse-settings`).
+
+`SpaceMousePluginAPI` exposes connection status, device name, last axes and
+`navInput: SixDofNavInput`. Feed normalized `SixDofSample` axes (`tx,ty,tz,rx,ry,rz`)
+with `feed(sample, 'spacemouse' | 'external')`; samples remain held until replaced,
+so external producers must feed zero when released. Sources smooth independently
+and their sum is clamped. `mode` selects `Orbit` or `Fly`. Input runs in
+`onBeforeFrame`, including paused simulation and an empty viewer, and calls
+`markRenderDirty()` on movement. Capture, FPV/XR ownership, focus loss, disconnect
+and deactivation discard input and smoothing to prevent delayed movement.

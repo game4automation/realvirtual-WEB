@@ -116,9 +116,11 @@ describe('LayoutLibraryPanel source contract', () => {
 
   test('the panel keeps exactly one management route', () => {
     expect(panelSource).toContain('handleManageLibraries');
-    expect(panelSource.match(/globalLibraries/g) ?? []).toHaveLength(1);
+    // plan-655 F2: the one route opens the dashboard WITH the Add-library
+    // dialog (`openAddLibraryDialog`, which aims at `globalLibraries` itself).
     // Count the CALL, not the label: the empty state names "Manage libraries…"
     // in prose to point the user at it, which is a mention, not a second route.
-    expect(panelSource.match(/openProjectsDashboard\(/g) ?? []).toHaveLength(1);
+    expect(panelSource.match(/openAddLibraryDialog\(/g) ?? []).toHaveLength(1);
+    expect(panelSource.match(/openProjectsDashboard\(/g) ?? []).toHaveLength(0);
   });
 });

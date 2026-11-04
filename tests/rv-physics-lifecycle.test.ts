@@ -103,6 +103,8 @@ class FakeBody implements RapierRigidBody {
   isSleeping(): boolean { return false; }
   setNextKinematicTranslation(t: RapierVec3): void { this.pos = { ...t }; }
   setNextKinematicRotation(r: RapierQuat): void { this.rot = { ...r }; }
+  setSoftCcdPrediction(_distance: number): void { /* not under test here */ }
+  setRotation(_r: RapierQuat, _wake: boolean): void { /* not under test here */ }
 }
 
 class FakeDesc implements RapierRigidBodyDesc {
@@ -116,6 +118,9 @@ class FakeDesc implements RapierRigidBodyDesc {
   /** plan-467 F16: CCD on the dynamic MU (recorded, not simulated). */
   ccd = false;
   setCcdEnabled(e: boolean): FakeDesc { this.ccd = e; return this; }
+  /** plan-2219: soft-CCD look-ahead of the dynamic MU (recorded, not simulated). */
+  softCcd = 0;
+  setSoftCcdPrediction(d: number): FakeDesc { this.softCcd = d; return this; }
 }
 
 class FakeColliderDesc implements RapierColliderDesc {
@@ -240,7 +245,7 @@ describe('RapierPhysicsProvider lifecycle (mocked RapierLibLoader — no WASM)',
   });
 
   afterEach(() => {
-    setRapierLibLoader(null); // restore default URL loader + clear cache
+    setRapierLibLoader(null); // restore default loader + clear cache
     vi.restoreAllMocks();
   });
 
@@ -431,7 +436,7 @@ describe('RapierPhysicsProvider lifecycle (mocked RapierLibLoader — no WASM)',
 // ─── Integration against REAL Rapier WASM (out-of-band, graceful skip) ──────
 
 describe('RapierPhysicsProvider × real Rapier WASM (out-of-band)', () => {
-  beforeEach(() => setRapierLibLoader(null)); // default URL-import loader
+  beforeEach(() => setRapierLibLoader(null)); // default loader
   afterEach(() => setRapierLibLoader(null));
 
   async function initRealProvider(): Promise<RapierPhysicsProvider | null> {
@@ -444,6 +449,8 @@ describe('RapierPhysicsProvider × real Rapier WASM (out-of-band)', () => {
     try {
       await provider.init();
     } catch {
+      // A missing/unloadable Rapier is a FAILURE whenever the private tree is present (vite define).
+      if (typeof __RV_PHYSICS_REQUIRE_WASM__ !== 'undefined' && __RV_PHYSICS_REQUIRE_WASM__) throw new Error('@dimforge/rapier3d-compat is not usable');
       console.warn('[physics] @dimforge/rapier3d-compat not installed (out-of-band) — skipping');
       return null;
     }

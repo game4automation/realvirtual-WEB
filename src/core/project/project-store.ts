@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, removeLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * project-store — the bridge between a project folder and the browser cache.
  *
@@ -117,7 +119,6 @@ import { discoverDeclaredScriptRefs } from '../rv-model-plugin-manager';
 import {
   adoptDiscoveredDocuments as adoptScan,
   applyAdoptDelta,
-  isModelCataloguePath,
   isSidecarMigrated,
   mintReferencedAssets,
   mintableReferences,
@@ -144,8 +145,8 @@ import {
 import { isSelfContainedGlb, type ProjectAssetSource } from './rv-project-asset-source';
 import { arrayBufferOf, revisionOfBytes } from './rv-scene-record';
 import {
-  hiddenIdsOf, mergeAssetTiers, mergeDocumentTiers,
-  type TieredAssetEntry, type TieredDocumentEntry,
+  hiddenIdsOf, mergeDocumentTiers,
+  type TieredDocumentEntry,
 } from './rv-project-tiers';
 import {
   classificationEquals,
@@ -154,6 +155,8 @@ import {
 import { writeDocumentClassification } from './rv-document-classify';
 import { documentInfoCacheEquals, type DocumentInfo } from './rv-document-info';
 import { writeDocumentInfo } from './rv-document-info-write';
+import { writeDocumentPlanning } from './rv-document-planning-write';
+import type { PlanningScenarioBlock } from '../planning/rv-planning-scenario';
 import {
   documentKeyOf,
   documentOfEntry,
@@ -188,9 +191,8 @@ import {
   newProject,
   type RvDocumentEntry,
   type RvProject,
-  type RvProjectAssetEntry,
-  type RvProjectSceneEntry,
 } from './rv-project-types';
+import { beginProjectOpStep } from './project-op-progress';
 
 /** localStorage pointer to the project to restore on next boot. */
 export const LS_KEY_LAST_PROJECT = 'rv-project/last';
@@ -238,21 +240,15 @@ export interface ProjectSnapshot {
   /** Where the open project's bytes live. Null when nothing is open. */
   backendKind: 'bundled' | 'browser' | 'folder' | null;
   /**
-   * The project's own base models, tier-tagged (§2.3).
-   *
-   * Manifest-driven, exactly like the scene list — which is what keeps another
-   * project's models out of this one. The deploy-wide `viewer.availableModels`
-   * is a different thing entirely (every GLB the dev server can reach) and must
-   * never be shown as if it belonged to whichever project happens to be open.
-   */
-  models: TieredAssetEntry[];
-  /**
    * **The one list** (plan-413 §2.4) — every scene, model and library asset of
    * the open project, tier-tagged.
    *
    * It was published beside a `scenes` mirror and a `sceneIds` set while the UI
-   * was moved over; both are gone with the scene catalogue (plan-716 Phase 6),
-   * and this is now the only artefact list the snapshot carries.
+   * was moved over; both are gone with the scene catalogue (plan-716 Phase 6).
+   * The `models` view — a `models/**` place filter over this same list — went
+   * with plan-777 (P3), so this is the only artefact list the snapshot carries.
+   * `tests/document-vocabulary-guard.node.test.ts` pins that no `models` or
+   * `scenes` member comes back.
    */
   documents: TieredDocumentEntry[];
   /**
@@ -343,20 +339,15 @@ export interface ResolveProjectOptions {
 export interface ResolvedActiveProject {
   project: RvProject | null;
   backend: ProjectBackend;
-  /** Feeds `viewer.availableModels`. */
-  models: RvProjectAssetEntry[];
   /**
-   * Every document of the resolved project, typed as the scene entries this
-   * field's consumers used to speak.
+   * Every document of the resolved project — exactly what `documentsOf(project)`
+   * returns, untiered (plan-777 F4).
    *
-   * It used to feed `viewer.availablePublishedScenes` — the second identity
-   * space plan-731 removed — and it used to be the SCENE-section subset. Both
-   * are gone: it has no production consumer left, and the subset was wrong
-   * anyway. A browser document's path is its bare id, so once nothing stamped
-   * `section` the scene projection answered "none" for exactly the projects
-   * that have scenes (plan-744 F3).
+   * It replaced a `models` view (a `models/**` place filter) and a `scenes`
+   * view (the same list typed as legacy scene entries). Neither had a production
+   * reader: boot discards the result and hydrates through `adoptResolved()`.
    */
-  scenes: RvProjectSceneEntry[];
+  documents: RvDocumentEntry[];
   kind: 'bundled' | 'browser' | 'folder';
 }
 
@@ -607,11 +598,12 @@ export class ProjectStore {
   private _resolved: { backend: ProjectBackend; project: RvProject } | null = null;
   /** Folder handle of a resolved-but-not-yet-hydrated project. */
   private _pendingDir: FileSystemDirectoryHandle | null = null;
-  private _bundledModels: RvProjectAssetEntry[] = [];
-  private _userModels: RvProjectAssetEntry[] = [];
-  /** Backend document listing of the open project, split by tier like the models. */
+  /** Backend document listing of the open project, split by tier. */
   private _bundledDocuments: RvDocumentEntry[] = [];
   private _userDocuments: RvDocumentEntry[] = [];
+  /** The scan {@link rescanDocuments} is running, and the one follow-up it may queue (P7). */
+  private _rescanRunning: Promise<void> | null = null;
+  private _rescanFollowUp: Promise<void> | null = null;
   private _sceneStore: SceneStoreLike | null = null;
   private _warnings: string[] = [];
   private _unloadHandler: (() => void) | null = null;
@@ -623,6 +615,8 @@ export class ProjectStore {
   private _lastConflicts: SceneConflictPromptItem[] = [];
   /** The single adopt run in flight, or null (plan-717 §2.2, R1-A2). */
   private _adoptRun: Promise<AdoptRunSummary> | null = null;
+  /** Tail of the {@link applyManifestDelta} queue — one delta at a time. */
+  private _deltaQueue: Promise<void> = Promise.resolve();
   /** Test seams for the adopt verb — clock, quarantine window, audit sink. */
   private _adoptOptions: AdoptStoreOptions = {};
 
@@ -714,7 +708,7 @@ export class ProjectStore {
   private async _commitManifest(
     reason: string,
     apply: (current: RvProject | null) => RvProject | Promise<RvProject>,
-    opts: { notify: boolean },
+    opts: { notify: boolean; libraryMigration?: boolean },
   ): Promise<{ project: RvProject; changed: boolean } | null> {
     const dir = this._dir;
     if (!dir) return null;
@@ -723,13 +717,41 @@ export class ProjectStore {
     // project stays a read - so this is the door the `extrasScan` marker and the
     // `documentInfo` cache reach the disk through.
     const written = await updateManifestCas(
-      dir, async current => this._foldScanCache(await apply(current)));
+      dir, async current => this._foldScanCache(await apply(
+        opts.libraryMigration === false ? current : await this._foldLibraryMigration(current))));
     const changed = written.revision !== written.previousRevision;
     if (opts.notify && changed) this._notifyConnectAsync();
     if (!changed) {
       console.debug(`[project-store] ${reason}: manifest unchanged, nothing announced.`);
     }
     return { project: written.project, changed };
+  }
+
+  /**
+   * The realvirtual library reference migration (plan-778 F14), folded into the
+   * FIRST manifest-writing save of a writable project.
+   *
+   * It runs BEFORE the verb's own change, on what is on disk, so the verb sees
+   * the migrated manifest: a user who removes the library in that very save
+   * removes the converted entry and the marker (already set) keeps it removed.
+   * The marker rides in the same write as the converted entries — there is no
+   * second write. A project that is read-only, already migrated or of kind
+   * `customer` (Decision B: only on request, `library.migrate`) is returned
+   * as it is. Best-effort: a migration that throws must not cost the save.
+   *
+   * The migration module is imported on demand (eager-source ratchet): only a
+   * write needs it, never the boot path, and every caller is already async.
+   */
+  private async _foldLibraryMigration(project: RvProject | null): Promise<RvProject | null> {
+    if (!project || !this._backend?.writable) return project;
+    try {
+      const { migrateLibraryProject } = await import('./rv-project-library-migration');
+      const result = migrateLibraryProject(project);
+      return result.outcome === 'migrated' ? result.project : project;
+    } catch (e) {
+      console.warn('[project-store] library reference migration skipped:', e);
+      return project;
+    }
   }
 
   /**
@@ -754,7 +776,7 @@ export class ProjectStore {
     const documents = rows.map(entry => {
       if (!entry || typeof entry.path !== 'string') return entry;
       const row = entry as unknown as RvDocumentEntry;
-      const known = captured.get(documentKeyOf(documentOfEntry(entry as unknown as RvProjectSceneEntry)));
+      const known = captured.get(documentKeyOf(documentOfEntry(entry)));
       if (!known) return entry;
       // The same evidence the pre-filter accepts: an equal digest, or an equal
       // size AND an equal (present) mtime.
@@ -1069,6 +1091,7 @@ export class ProjectStore {
       // main-thread block, so a message that has not painted yet would only
       // appear once the thing it describes is already over.
       say: async (message: string) => {
+        beginProjectOpStep(message);
         overlay.showInfoOverlay(message);
         await new Promise<void>(resolve => requestAnimationFrame(
           () => requestAnimationFrame(() => resolve())));
@@ -1167,7 +1190,7 @@ export class ProjectStore {
       await this._adoptProject(backend, project);
       // A deliberate open answers the boot-restore failure (plan-702 Punkt 3).
       this._restoreFailure = null;
-      try { localStorage.setItem(LS_KEY_LAST_PROJECT, project.id); } catch { /* private mode */ }
+      writeLocalStorage(LS_KEY_LAST_PROJECT, project.id);
       try { await putHandle(dir, projectHandleKey(project.id)); } catch { /* non-fatal */ }
       // The link is recorded AFTER the handle is stored: a display row without a
       // reopenable handle would be a dashboard entry that does nothing (§4.5).
@@ -1214,21 +1237,14 @@ export class ProjectStore {
     // out-of-date classification cache is a display detail, and letting it take
     // a project open down would be the worst possible trade.
     //
-    // ONE call, reused (plan-744 §8): the models projection below used to be a
-    // second `listModels()` against the same backend, which on a folder project
-    // meant a second directory walk per open for a list that is a filter of the
-    // one already in hand.
+    // ONE call (plan-744 §8): a second `listModels()` against the same backend
+    // used to feed a models view, which on a folder project meant a second
+    // directory walk per open. That view is gone too (plan-777 P3).
+    beginProjectOpStep('Listing documents');
     const documents = await backend.listDocuments().catch(() => []);
+    beginProjectOpStep(`Reading document headers (${documents.length})`);
     const scanned = await this._scanSceneExtras(backend, documents);
 
-    // `_bundledModels`/`_userModels` feed the `?model=` selector catalogue,
-    // which is still a `models/` notion and out of plan-744's scope. What
-    // changed is where the answer comes from: a PLACE filter over the one list
-    // rather than a listing of its own (see `isModelCataloguePath`).
-    const backendModels = scanned
-      .filter(d => isModelCataloguePath(d.path)) as unknown as RvProjectAssetEntry[];
-    this._bundledModels = isBundledBackend ? backendModels : [];
-    this._userModels = isBundledBackend ? [] : backendModels;
     this._bundledDocuments = isBundledBackend ? scanned : [];
     this._userDocuments = isBundledBackend ? [] : scanned;
 
@@ -1253,10 +1269,14 @@ export class ProjectStore {
     const unscoped = backend.kind === 'bundled' || isWorkspaceDefaultBackend(backend);
     setDraftScope(unscoped ? null : project.id);
 
+    beginProjectOpStep('Reconciling cached scenes');
     await this._reconcileScenes(project);
+    beginProjectOpStep('Loading the active scene');
     await this._seedSceneMetas(project);
+    beginProjectOpStep('Applying project settings');
     await this._applySettings(project);
 
+    beginProjectOpStep('Activating the project');
     await backend.activate();
     // The one write that "creates" My Workspace, and the first legal moment for
     // it: `writeManifest()` refuses on an inactive backend. Idempotent on the
@@ -1270,10 +1290,12 @@ export class ProjectStore {
     // works on `this._project`, which the steps above may have replaced. Every
     // caller of this method publishes right after it, so the run defers its own
     // publish and the whole open stays at one (R1-A3b).
+    beginProjectOpStep('Registering new and changed files');
     await this._adoptQuietly();
     // plan-718 §2.7 — AFTER adopt, and it has to be: the migration binds
     // document ROWS, and on a folder project the rows for `models/**` do not
     // exist until the adopt run has created them.
+    beginProjectOpStep('Migrating project bindings');
     await this._migrateScriptRefsQuietly();
     await this._adoptConnectHandoffQuietly();
   }
@@ -1314,7 +1336,7 @@ export class ProjectStore {
    */
   async restoreLastProject(): Promise<boolean> {
     let lastId: string | null = null;
-    try { lastId = localStorage.getItem(LS_KEY_LAST_PROJECT); } catch { return false; }
+    try { lastId = readLocalStorage(LS_KEY_LAST_PROJECT); } catch { return false; }
     if (!lastId) return false;
     const handle = await getFolderHandle(projectHandleKey(lastId), {
       mode: 'readwrite',
@@ -1643,26 +1665,13 @@ export class ProjectStore {
     this._resolved = project ? { backend, project } : null;
     this._pendingDir = dir;
 
-    // The manifest first, the folder scan second — same order the pre-413 code
-    // had. A discovered folder whose files have not been scanned yet still has
-    // to show what its manifest declares.
-    //
-    // Both halves are PLACE filters over the one list now (plan-744 F1/F3), and
-    // the `scenes` half deliberately is not one: `sceneDocumentsOf()` filtered
-    // on a path heuristic that answers `'library'` for every browser document,
-    // so a boot resolve of a browser project reported no scenes at all. What
-    // the caller wants here is "what can be opened", which is every document.
-    const declaredModels = documentsOf(project).filter(d => isModelCataloguePath(d.path));
-    const models = (declaredModels.length > 0
-      ? declaredModels
-      : (await backend.listDocuments().catch(() => [])).filter(d => isModelCataloguePath(d.path))
-    ) as unknown as RvProjectAssetEntry[];
-    const scenes = documentsOf(project) as unknown as RvProjectSceneEntry[];
+    // Every document the manifest declares (plan-777 F4) — "what can be
+    // opened". The `models`/`scenes` views this used to return were a place
+    // filter and a re-typing of this same list, and nothing read either.
     return {
       project,
       backend,
-      models,
-      scenes,
+      documents: documentsOf(project),
       kind: backend.kind,
     };
   }
@@ -1785,7 +1794,7 @@ export class ProjectStore {
     if (resolved.backend.kind === 'folder' && this._dir) {
       const dir = this._dir;
       const project = resolved.project;
-      try { localStorage.setItem(LS_KEY_LAST_PROJECT, project.id); } catch { /* private mode */ }
+      writeLocalStorage(LS_KEY_LAST_PROJECT, project.id);
       recordLinkedProject({
         id: project.id,
         name: project.name,
@@ -1843,12 +1852,12 @@ export class ProjectStore {
     // projection it used to ask answered nothing at all for a browser project,
     // whose paths are bare ids. A document with no cached body falls out one
     // line down, so widening the input costs a map lookup per row.
-    const entries = documentsOf(project) as unknown as RvProjectSceneEntry[];
+    const entries = documentsOf(project);
     if (entries.length === 0) return;
 
     const conflicts: Array<{
       item: SceneConflictPromptItem;
-      entry: RvProjectSceneEntry;
+      entry: RvDocumentEntry;
       body: { scene: RvScene; revision: string } | null;
     }> = [];
 
@@ -1985,7 +1994,7 @@ export class ProjectStore {
    * than handed back here as something to convert.
    */
   private async _readSceneBody(
-    entry: RvProjectSceneEntry,
+    entry: RvDocumentEntry,
   ): Promise<{ scene: RvScene; revision: string } | null> {
     if (!this._provider || typeof entry.path !== 'string') return null;
     let record: DocumentRecord | null;
@@ -2116,13 +2125,12 @@ export class ProjectStore {
     return true;
   }
 
-  private _sceneEntry(id: string): RvProjectSceneEntry | undefined {
+  private _sceneEntry(id: string): RvDocumentEntry | undefined {
     // By ID over the one list (plan-744 F3). An id is unique across the
     // manifest, so filtering to a section first could only ever LOSE the row —
     // which is what happened to every browser document, whose bare-id path the
     // section heuristic reads as `library`.
-    return documentsOf(this._project).find(e => e.id === id) as
-      unknown as RvProjectSceneEntry | undefined;
+    return documentsOf(this._project).find(e => e.id === id);
   }
 
   // ─── Settings ─────────────────────────────────────────────────────────
@@ -2231,7 +2239,7 @@ export class ProjectStore {
    * The last term is plan-710 F7 and closes the same asymmetry one level down:
    * an open document's DRAFT TIMER is unpersisted work by exactly the argument
    * that made the scene's timer count, and until now only the scene's did. It
-   * is asked in every mode, so an asset document left mid-write behind the
+   * is asked in every mode, so an editor's document left mid-write behind the
    * planner or the HMI is covered too.
    */
   hasUnpersistedWork(): boolean {
@@ -2285,6 +2293,9 @@ export class ProjectStore {
     if (!this.hasUnsavedWork()) return 'proceed';
     const snap = this._sceneStore?.getSnapshot?.();
     const status = this._writerStatus();
+    // Named, because this step waits on the USER: shown in the dashboard's
+    // operation dialog, it is what tells "slow" apart from "a question is open".
+    beginProjectOpStep('Waiting for your answer — unsaved changes', { waitingForUser: true });
     try {
       return await this._dirtyGuard({
         reason,
@@ -2313,6 +2324,7 @@ export class ProjectStore {
     // §2.2.1b — deactivation flushes and unsubscribes. It is the only way the
     // writer is torn down, so no path can leave a bus listener behind that
     // would write the next project's saves into this project's folder.
+    beginProjectOpStep(`Closing ${this._project?.name ?? 'project'} — writing pending changes`);
     try {
       await this._backend?.deactivate();
     } catch { /* status already carries the failure */ }
@@ -2340,7 +2352,7 @@ export class ProjectStore {
     // closing the always-present bundled project would erase the user's
     // last-opened folder — which is not open only because its grant lapsed.
     if (wasFolder) {
-      try { localStorage.removeItem(LS_KEY_LAST_PROJECT); } catch { /* ignore */ }
+      removeLocalStorage(LS_KEY_LAST_PROJECT);
     }
     this._publish();
   }
@@ -2371,27 +2383,6 @@ export class ProjectStore {
   }
 
   /**
-   * The model list, merged from the two tiers once per publish.
-   *
-   * Identity discipline: an unchanged list must come back as the *previous*
-   * array, or `useSyncExternalStore` sees a change every writer-status tick.
-   */
-  private _mergeModelTiers(): TieredAssetEntry[] {
-    const user = this._userModels;
-    if (this._bundledModels.length === 0 && user.length === 0) return NO_MODELS;
-    const merged = mergeAssetTiers(this._bundledModels, user, hiddenIdsOf(this._project));
-    const prev = this._snapshot.models;
-    return sameAssets(prev, merged.entries) ? prev : merged.entries;
-  }
-
-  /**
-   * The document list, merged the same way the scenes and the models are.
-   *
-   * Same identity discipline for the same `useSyncExternalStore` reason: an
-   * unchanged list has to come back as the *previous* array, or every writer
-   * status tick reads as a change.
-   */
-  /**
    * Re-run the open backend's document scan and republish.
    *
    * `listDocuments()` deliberately runs once at open — a folder scan must not
@@ -2405,23 +2396,65 @@ export class ProjectStore {
    * listing. The scan itself still writes nothing — see
    * {@link ProjectStore.adoptDiscoveredDocuments} and rv-asset-identity rule 1.
    * Both halves publish once, together, at the end.
+   *
+   * ## Single-flight with a dirty re-run (plan-777 P7)
+   *
+   * Every save ends in a rescan (`finishDocumentSave`), so two quick saves
+   * overlap — and two parallel scans used to overwrite `_userDocuments`
+   * last-writer-wins, the older listing possibly landing last. Now at most ONE
+   * scan runs and at most ONE is queued: a call that arrives while a scan runs
+   * marks the store dirty and resolves with the FOLLOW-UP scan, never with the
+   * one already running — that one may have listed the folder before the
+   * caller's file existed, and the thumbnail writer and
+   * `SceneStore._documentRowOrAdopt` both rely on finding their new row once
+   * the awaited rescan resolves. Every further call while a follow-up is queued
+   * joins that follow-up.
    */
-  async rescanDocuments(): Promise<void> {
-    const backend = this._backend;
-    if (!backend || backend.kind === 'bundled') return;
-    const t0 = performance.now();   // TEMP verb-timing
-    const documents = await backend.listDocuments().catch(() => null);
-    if (!documents) return;
-    const t1 = performance.now();
-    this._userDocuments = await this._scanSceneExtras(backend, documents);
-    const t2 = performance.now();
-    await this._adoptQuietly();
-    const t3 = performance.now();
-    this._publish();
-    console.warn(`[verb-timing] rescan: list ${Math.round(t1 - t0)} ms, classify ${Math.round(t2 - t1)} ms, `
-      + `adopt ${Math.round(t3 - t2)} ms, publish ${Math.round(performance.now() - t3)} ms`);
+  rescanDocuments(): Promise<void> {
+    if (this._rescanFollowUp) return this._rescanFollowUp;
+    const running = this._rescanRunning;
+    if (running) {
+      const followUp = running.catch(() => {}).then(() => {
+        // From here on a new call queues the NEXT follow-up, not this one.
+        this._rescanFollowUp = null;
+        return this._startRescan();
+      });
+      this._rescanFollowUp = followUp;
+      return followUp;
+    }
+    return this._startRescan();
   }
 
+  private _startRescan(): Promise<void> {
+    const run = this._rescanOnce().finally(() => {
+      if (this._rescanRunning === run) this._rescanRunning = null;
+    });
+    this._rescanRunning = run;
+    return run;
+  }
+
+  private async _rescanOnce(): Promise<void> {
+    const backend = this._backend;
+    if (!backend || backend.kind === 'bundled') return;
+    // A project switch during any await makes this listing stale: never write the
+    // old project's rows into the new one's snapshot (plan-777 review).
+    const documents = await backend.listDocuments().catch(() => null);
+    if (!documents || this._backend !== backend) return;
+    const scanned = await this._scanSceneExtras(backend, documents);
+    if (this._backend !== backend) return;
+    this._userDocuments = scanned;
+    await this._adoptQuietly();
+    if (this._backend !== backend) return;
+    this._publish();
+  }
+
+  /**
+   * The document list, merged from the two tiers once per publish.
+   *
+   * Identity discipline for the `useSyncExternalStore` reason: an unchanged
+   * list has to come back as the *previous* array, or every writer status tick
+   * reads as a change.
+   */
   private _mergeDocumentTiers(): TieredDocumentEntry[] {
     const user = this._liveUserDocuments();
     if (this._bundledDocuments.length === 0 && user.length === 0) return NO_DOCUMENTS;
@@ -2503,7 +2536,7 @@ export class ProjectStore {
     // That belief stopped being true when every document became savable, and
     // the split was doing real harm in the meantime: a captured row the manifest
     // ALSO listed appeared twice whenever the path heuristic and the stored
-    // section disagreed about it, and a manifest row for a non-scene document
+    // section disagreed about it, and a manifest row for a document outside `scenes/`
     // was dropped entirely. Walking the manifest once, with the cache as an
     // overlay, is both the simpler rule and the one that was intended: the
     // manifest says which documents there are, the cache says what was learnt
@@ -2513,7 +2546,7 @@ export class ProjectStore {
     const seen = new Set<string>();
     for (const entry of documentsOf(this._project)) {
       if (!entry || typeof entry.path !== 'string') continue;
-      const doc = documentOfEntry(entry as unknown as RvProjectSceneEntry);
+      const doc = documentOfEntry(entry);
       const key = documentKeyOf(doc);
       seen.add(key);
       const known = cached.get(key);
@@ -2710,6 +2743,66 @@ export class ProjectStore {
   }
 
   /**
+   * Point a document's row at its saved thumbnail, or take the pointer away
+   * (plan-776 F4). The ONLY writer of `thumbnail` is the save path
+   * (`rv-thumbnail-write.ts`); metadata rewrites spread the row and keep it.
+   *
+   * In-memory first so the card swaps its picture at once, then ONE merging
+   * manifest write through {@link applyManifestDelta}: a folder project goes
+   * through the CAS wrapper (so it merges with a concurrent adopt `stat` delta
+   * instead of overwriting it), a browser project — whose rows live in its
+   * stored manifest since plan-716 Phase 6 — through `writeManifest`. Callers
+   * await it BEFORE `rescanDocuments()`, so the next listing already carries it.
+   *
+   * A read-only project, or an id the project does not know, is a no-op.
+   */
+  async setDocumentThumbnail(documentId: string, pointer: string | null): Promise<void> {
+    const backend = this._backend;
+    if (!backend?.writable || typeof documentId !== 'string' || documentId === '') return;
+    const next = typeof pointer === 'string' && pointer.trim() !== '' ? pointer : null;
+    const patch = <T extends { id?: unknown; thumbnail?: unknown }>(entry: T): T => {
+      if (!entry || entry.id !== documentId) return entry;
+      if (next === null) {
+        if (!('thumbnail' in entry)) return entry;
+        const copy = { ...entry };
+        delete copy.thumbnail;
+        return copy;
+      }
+      return entry.thumbnail === next ? entry : { ...entry, thumbnail: next };
+    };
+    this._userDocuments = this._userDocuments.map(patch);
+    this._publish();
+    await this.applyManifestDelta(current => ({
+      ...current,
+      documents: (current.documents ?? []).map(patch),
+    }));
+  }
+
+  /**
+   * Declare the experiment archive a document ships (`experiments` on its row).
+   *
+   * Written by the experiment save path once `experiments/<id>.rvexp.ndjson`
+   * exists, so a deploy of this folder lets a read-only viewer load it without
+   * probing every document for a file that is usually not there. Same write
+   * order as {@link setDocumentThumbnail}; a row that already declares this
+   * path is left alone (no manifest write), a read-only project is a no-op.
+   */
+  async setDocumentExperiments(documentId: string, pointer: string): Promise<void> {
+    const backend = this._backend;
+    if (!backend?.writable || typeof documentId !== 'string' || documentId === '') return;
+    if (typeof pointer !== 'string' || pointer.trim() === '') return;
+    if (this._userDocuments.find(e => e.id === documentId)?.experiments === pointer) return;
+    const patch = <T extends { id?: unknown; experiments?: unknown }>(entry: T): T =>
+      !entry || entry.id !== documentId || entry.experiments === pointer ? entry : { ...entry, experiments: pointer };
+    this._userDocuments = this._userDocuments.map(patch);
+    this._publish();
+    await this.applyManifestDelta(current => ({
+      ...current,
+      documents: (current.documents ?? []).map(patch),
+    }));
+  }
+
+  /**
    * Change what a document says about itself — its summary and Markdown
    * description (plan-506 F2/F9/F14).
    *
@@ -2775,6 +2868,86 @@ export class ProjectStore {
       return { ...base, documents };
     }, { notify: false });
     return result.documentInfo;
+  }
+
+  /**
+   * Store a document's planning scenarios in its GLB (plan-630 §2.8) — the explicit Save of
+   * the planning window (and later `web_scenario_save`).
+   *
+   * The same order and the same guards as {@link setDocumentInfo}: bundled refused, project
+   * identity checked before and after, bytes first (`writeDocumentPlanning`, compare-and-swap),
+   * then the row's scan marker in memory and in the manifest. The manifest carries no copy of
+   * the block — the GLB is its only home.
+   *
+   * @returns the block the file now carries, or null when it was removed.
+   */
+  async setDocumentPlanning(
+    documentId: string,
+    block: PlanningScenarioBlock | null,
+    opts: { expectProjectId?: string } = {},
+  ): Promise<PlanningScenarioBlock | null> {
+    const backend = this._backend;
+    const projectId = this._project?.id ?? null;
+    if (opts.expectProjectId !== undefined && projectId !== opts.expectProjectId) {
+      throw new ProjectChangedError(opts.expectProjectId, projectId);
+    }
+    if (!backend) throw new Error('No project is open.');
+    if (!backend.writable) throw new Error('This project is read-only.');
+    const doc = this._snapshot.documents.find(d => d.id === documentId);
+    if (!doc) throw new Error('That document is no longer part of this project.');
+    if (doc.tier === 'bundled') {
+      throw new Error(`"${doc.name}" is read-only — duplicate it into this project first.`);
+    }
+
+    const result = await writeDocumentPlanning(backend, doc, block);
+    if (this._backend !== backend || (this._project?.id ?? null) !== projectId) {
+      throw new ProjectChangedError(opts.expectProjectId ?? projectId ?? '', this._project?.id ?? null);
+    }
+    if (doc.extrasScan !== EXTRAS_SCAN_GENERATION) {
+      const key = documentKeyOf(doc);
+      const patch = (e: RvDocumentEntry): RvDocumentEntry => ({ ...e, extrasScan: EXTRAS_SCAN_GENERATION });
+      const apply = (list: RvDocumentEntry[]) => list.map(e => documentKeyOf(e) === key ? patch(e) : e);
+      this._userDocuments = apply(this._userDocuments);
+      this._bundledDocuments = apply(this._bundledDocuments);
+      this._publish();
+      // `notify: false`: scenarios are planning values, not gateway configuration.
+      await this._commitManifest('setDocumentPlanning', current => {
+        const base = current ?? this._project;
+        if (!base) throw new Error('This project has no manifest to update.');
+        const documents = (base.documents ?? []).map(
+          e => documentKeyOf(e) === key ? patch(e as unknown as RvDocumentEntry) as unknown as typeof e : e);
+        return { ...base, documents };
+      }, { notify: false });
+    }
+    return result.planningScenarios;
+  }
+
+  /**
+   * plan-2013 §2.8 — write the open document's `Variants` block (the serialised block;
+   * `null` removes it) into its own bytes, CAS on the revision read. The writer is loaded
+   * with `import()`: variants are opt-in and stay off the startup path.
+   */
+  async setDocumentVariants(
+    documentId: string,
+    payload: Record<string, unknown> | null,
+    opts: { expectProjectId?: string } = {},
+  ): Promise<Record<string, unknown> | null> {
+    const backend = this._backend;
+    const projectId = this._project?.id ?? null;
+    if (opts.expectProjectId !== undefined && projectId !== opts.expectProjectId) {
+      throw new ProjectChangedError(opts.expectProjectId, projectId);
+    }
+    if (!backend) throw new Error('No project is open.');
+    if (!backend.writable) throw new Error('This project is read-only.');
+    const doc = this._snapshot.documents.find(d => d.id === documentId);
+    if (!doc) throw new Error('That document is no longer part of this project.');
+    if (doc.tier === 'bundled') throw new Error(`"${doc.name}" is read-only — duplicate it into this project first.`);
+    const { writeDocumentVariants } = await import('./rv-document-variants-write');
+    const result = await writeDocumentVariants(backend, doc, payload);
+    if (this._backend !== backend || (this._project?.id ?? null) !== projectId) {
+      throw new ProjectChangedError(opts.expectProjectId ?? projectId ?? '', this._project?.id ?? null);
+    }
+    return result.variants;
   }
 
   /**
@@ -2888,7 +3061,9 @@ export class ProjectStore {
     // name or folder must stop being written back to where it no longer is. It
     // is also the reason the no-op rule is a content compare (plan-462 B2) —
     // a caller that re-states an unchanged manifest states no news.
-    const committed = await this._commitManifest('replaceManifest', () => next, { notify: true });
+    // `libraryMigration: false`: the constant `() => next` is the caller's whole truth, a
+    // migration folded in before it would be discarded by it. The next delta migrates.
+    const committed = await this._commitManifest('replaceManifest', () => next, { notify: true, libraryMigration: false });
     // No directory, no revision to compare: announce it, as before plan-462 B2.
     if (!committed) this._notifyConnectAsync();
   }
@@ -2922,6 +3097,20 @@ export class ProjectStore {
     apply: (current: RvProject) => RvProject,
     opts: { publish?: boolean } = {},
   ): Promise<RvProject | null> {
+    // One delta at a time (plan-776 R-05). A folder project merges through the
+    // CAS wrapper anyway; a browser project writes its stored manifest with a
+    // plain read-modify-write, where two interleaved deltas (an adopt `stat`
+    // delta and a thumbnail pointer) would lose one. Queued, each reads what
+    // the previous one wrote. `apply` is pure — it never re-enters this queue.
+    const run = this._deltaQueue.then(() => this._applyManifestDelta(apply, opts));
+    this._deltaQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private async _applyManifestDelta(
+    apply: (current: RvProject) => RvProject,
+    opts: { publish?: boolean },
+  ): Promise<RvProject | null> {
     const backend = this._backend;
     const base = this._project;
     if (!base || !backend?.writable) return null;
@@ -2935,7 +3124,7 @@ export class ProjectStore {
       const writing = backend as ProjectBackend & Partial<ManifestWritingBackend>;
       if (typeof writing.writeManifest !== 'function') return null;
       const current = await backend.readManifest().catch(() => null);
-      next = apply(current ?? base);
+      next = apply((await this._foldLibraryMigration(current ?? base)) ?? base);
       await writing.writeManifest(next);
       // A backend that writes its own manifest reports no revision, so there is
       // no no-op signal on this path: it announces every write, exactly as it
@@ -2959,9 +3148,11 @@ export class ProjectStore {
    * Turn what the scan found into authored rows — the write half of §2.2.
    *
    * Runs after `_adoptProject()` and after every `rescanDocuments()`, on a
-   * WRITABLE backend and nowhere else. Single-flight: the save cascade fires
-   * `void rescanDocuments()` twice a second, and an overlapping call joins the
-   * run already going rather than starting a second one (R1-A2).
+   * WRITABLE backend and nowhere else. Single-flight on its own: an overlapping
+   * call joins the run already going rather than starting a second one (R1-A2).
+   * The scan in front of it is single-flighted separately, with a dirty re-run
+   * ({@link rescanDocuments}, plan-777 P7) — the adopt alone being joined is
+   * what used to let two parallel scans overwrite each other's listing.
    *
    * An empty delta means no commit at all — not a commit of an unchanged
    * manifest (R1-I1). That is what keeps a customer's `project.json` untouched
@@ -2994,12 +3185,17 @@ export class ProjectStore {
 
     const sidecar = await this._readSidecarForIngestion(backend, project);
 
+    let hashCount = 0;
     const scan = await adoptScan(project, {
       stats,
       now: this._adoptOptions.now,
       quarantineMs: this._adoptOptions.quarantineMs,
       sidecar: sidecar.ingestion ?? undefined,
       hashOf: async path => {
+        hashCount += 1;
+        const size = stats.find(st => st.path === path)?.size;
+        const mb = typeof size === 'number' ? ` (${(size / 1048576).toFixed(1)} MB)` : '';
+        beginProjectOpStep(`Hashing file ${hashCount} — ${path}${mb}`);
         const bytes = await backend.readDocument(path).catch(() => null).then(r => r?.bytes ?? null);
         return bytes ? await revisionOfBytes(bytes) : null;
       },
@@ -3277,7 +3473,6 @@ export class ProjectStore {
 
   private _publish(): void {
     const status = this._writerStatus();
-    const models = this._mergeModelTiers();
     const documents = this._mergeDocumentTiers();
     this._snapshot = {
       documents,
@@ -3288,7 +3483,6 @@ export class ProjectStore {
       diskPending: status?.pending ?? false,
       warnings: [...this._warnings],
       backendKind: this._backend?.kind ?? null,
-      models,
       restoreFailure: this._restoreFailure,
     };
     for (const l of [...this._listeners]) {
@@ -3319,7 +3513,6 @@ function projectNameOf(projectId: string): string | undefined {
  * A fresh instance per publish is a fresh identity, and a fresh identity is a
  * change signal `useSyncExternalStore` never stops reacting to.
  */
-const NO_MODELS: TieredAssetEntry[] = [];
 const NO_DOCUMENTS: TieredDocumentEntry[] = [];
 
 /**
@@ -3350,6 +3543,12 @@ export function sameDocuments(
       || x.connectRef !== y.connectRef
       || x.scriptRef !== y.scriptRef
       || x.knowledgeRef !== y.knowledgeRef
+      // plan-776: the saved-thumbnail pointer is row state too — without it a
+      // save's new picture never reached the cards until an unrelated change.
+      || x.thumbnail !== y.thumbnail
+      // The experiment-archive declaration is read from the snapshot when a
+      // document opens; a declaration the snapshot never saw is never read.
+      || x.experiments !== y.experiments
       || !classificationEquals(x.classification, y.classification)
       // plan-506 F15: WITH the stamps — a scan that found a newer `updatedAt`
       // or a removed block is a change the snapshot must carry.
@@ -3358,22 +3557,10 @@ export function sameDocuments(
   return true;
 }
 
-/** Same shallow comparison for the asset list, keyed on `path`. */
-function sameAssets(a: readonly TieredAssetEntry[], b: readonly TieredAssetEntry[]): boolean {
-  if (a === b) return true;
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    const x = a[i]!;
-    const y = b[i]!;
-    if (x.path !== y.path || x.label !== y.label || x.tier !== y.tier) return false;
-  }
-  return true;
-}
-
 /** The project recorded for the next boot, or null. */
 function readLastProjectId(): string | null {
   try {
-    return localStorage.getItem(LS_KEY_LAST_PROJECT);
+    return readLocalStorage(LS_KEY_LAST_PROJECT);
   } catch {
     return null;   // private mode
   }
@@ -3388,7 +3575,6 @@ function emptySnapshot(): ProjectSnapshot {
     diskPending: false,
     warnings: [],
     backendKind: null,
-    models: NO_MODELS,
     documents: NO_DOCUMENTS,
     restoreFailure: null,
   };

@@ -14,7 +14,7 @@
  *
  * Keys are the canonical absolute url ({@link cacheKeyFor} without a hash) AND
  * the BASE_URL-relative form (`rebaseLocalLibraryUrl`), so `/library/x.glb`,
- * `http://host/library/x.glb` and a scene saved on another deploy
+ * `http://host/library/x.glb` and a document saved on another deploy
  * (`/demo/library/x.glb`) all find the same entry. A registry-resolved asset
  * (a project document, `resolved:<provider>:<source>:<entry>`) is registered
  * under that key verbatim.

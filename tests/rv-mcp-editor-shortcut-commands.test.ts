@@ -2,20 +2,15 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * plan-499 §9.4 — `web_editor_shortcut` is a view of commands (F6).
- *
- * Every key combo is a branch of SHORTCUT_BINDING and dispatches the command
- * the real key triggers — exactly once, with the call's selection as the
- * implicit target (`null` args). Aliases normalise (Backspace, Ctrl+Shift+Z,
- * K>NAME, any case/spacing); an unknown combo answers the table and dispatches
- * nothing; K without a name answers the reason plus the existing names and
- * dispatches nothing. Chromium: the tool class imports viewer modules.
+ * Phase 6A: every former shortcut case runs its command through web_execute.
+ * The old shortcut name is a tombstone listing all branch targets.
  */
 
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { RVViewer } from '../src/core/rv-viewer';
-import { createMcpDelegates } from '../src/plugins/mcp-bridge/rv-mcp-instances';
-import type { McpEditorTools } from '../src/plugins/mcp-bridge/rv-mcp-editor-tools';
+import { McpCommandTools } from '../src/plugins/mcp-bridge/rv-mcp-command-tools';
+import { movedToolOf, movedToolAnswer } from '../src/plugins/mcp-bridge/rv-mcp-moved-tools';
+import { SHORTCUT_BRANCHES } from '../src/core/hmi/editor-command-descriptors';
 import { commandRegistry } from '../src/core/hmi/rv-command-registry';
 import { ensureEditorCommandsRegistered } from '../src/core/hmi/editor-command-descriptors';
 import { setActiveAssetContext, type ActiveAssetContext } from '../src/core/editor/active-asset-store';
@@ -27,11 +22,11 @@ const viewer = {
   currentModelRoot: null,
 } as unknown as RVViewer;
 
-let tools: McpEditorTools;
+let tools: McpCommandTools;
 
 beforeAll(() => {
   ensureEditorCommandsRegistered();
-  tools = createMcpDelegates(() => viewer)['McpEditorTools'] as McpEditorTools;
+  tools = new McpCommandTools(() => viewer);
 });
 
 afterEach(() => {
@@ -63,43 +58,37 @@ const CASES: ReadonlyArray<{ keys: string; arg?: string; id: string; args: unkno
   // Wireframe view: the bare key flips (on: null), arg sets it explicitly.
   { keys: 'Shift+Z', id: 'editor.wireframe', args: { on: null }, value: { wireframe: true }, result: { shortcut: 'Shift+Z', wireframe: true } },
   { keys: 'Shift+Z', arg: 'off', id: 'editor.wireframe', args: { on: false }, value: { wireframe: false }, result: { shortcut: 'Shift+Z', wireframe: false } },
+  // plan-766 F3 — transform tool: same flip / explicit-arg shape as Shift+Z.
+  { keys: 'T', id: 'editor.toggleTransformTool', args: { on: null }, value: { transformTool: true }, result: { shortcut: 'T', transformTool: true } },
+  { keys: 't', arg: 'off', id: 'editor.toggleTransformTool', args: { on: false }, value: { transformTool: false }, result: { shortcut: 'T', transformTool: false } },
 ];
 
 describe('web_editor_shortcut over commands', () => {
   it('every branch dispatches its command exactly once, with the selection as the implicit target', async () => {
     for (const c of CASES) {
       const spy = vi.spyOn(commandRegistry, 'execute').mockResolvedValue({ ok: true, value: c.value });
-      const res = JSON.parse(await tools.webEditorShortcut(c.keys, c.arg as string)) as Record<string, unknown>;
+      const res = JSON.parse(await tools.webExecute(c.id, JSON.stringify(c.args))) as Record<string, unknown>;
       expect(spy, c.keys).toHaveBeenCalledTimes(1);
       expect(spy.mock.calls[0][0], c.keys).toBe(c.id);
       expect(spy.mock.calls[0][1], c.keys).toEqual(c.args);
       // The early-captured selection travels with the dispatch.
       expect(spy.mock.calls[0][2], c.keys).toMatchObject({ origin: 'mcp', context: { selection: ['A'] } });
-      expect(res, c.keys).toMatchObject(c.result);
+      expect(res, c.keys).toMatchObject({ ok: true, value: c.value });
       spy.mockRestore();
     }
   }, 30_000);
 
   it('a refused command answers its reason', async () => {
     vi.spyOn(commandRegistry, 'execute').mockResolvedValue({ ok: false, kind: 'disabled', reason: 'Nothing selected — select first (web_select)' });
-    expect(JSON.parse(await tools.webEditorShortcut('H', undefined as unknown as string)))
-      .toEqual({ error: 'Nothing selected — select first (web_select)' });
+    expect(JSON.parse(await tools.webExecute('editor.hide', JSON.stringify({ paths: null }))))
+      .toMatchObject({ error: 'Nothing selected — select first (web_select)' });
   });
 
-  it('an unknown combo answers the table and dispatches nothing', async () => {
-    setActiveAssetContext({ viewer, doc: { id: 'd' } as unknown as ActiveAssetContext['doc'] });
+  it('the retired shortcut answers MOVED with all branches and never dispatches', () => {
     const spy = vi.spyOn(commandRegistry, 'execute');
-    const res = JSON.parse(await tools.webEditorShortcut('Q>Z', undefined as unknown as string)) as Record<string, unknown>;
+    expect(JSON.parse(movedToolAnswer(movedToolOf('web_editor_shortcut')!))).toMatchObject({
+      error: 'MOVED', movedTo: SHORTCUT_BRANCHES.map((b) => b.id),
+    });
     expect(spy).not.toHaveBeenCalled();
-    expect(res['error']).toBe('Unknown shortcut "Q>Z"');
-    expect(Object.keys(res['shortcuts'] as object)).toContain('S>I');
-  });
-
-  it('K without a name answers the reason (with the existing names) and dispatches nothing', async () => {
-    const spy = vi.spyOn(commandRegistry, 'execute');
-    const res = JSON.parse(await tools.webEditorShortcut('K', '')) as Record<string, unknown>;
-    expect(spy).not.toHaveBeenCalled();
-    expect(res['error']).toBe('K needs arg = kinematic/group name');
-    expect(Array.isArray(res['existing'])).toBe(true);
   });
 });

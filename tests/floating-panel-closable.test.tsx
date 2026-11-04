@@ -12,7 +12,7 @@
  * `expanded` maximize), and geometry persistence at the end of a drag.
  */
 
-import { useState } from 'react';
+import { StrictMode, useState } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, act, waitFor } from '@testing-library/react';
 import { ThemeProvider } from '@mui/material/styles';
@@ -475,5 +475,122 @@ describe('A4 — first mount geometry', () => {
     expect(left).toBeLessThanOrEqual(window.innerWidth);
     expect(top).toBeGreaterThanOrEqual(0);
     expect(top).toBeLessThanOrEqual(window.innerHeight);
+  });
+});
+
+// ─── Close and unmount save the same normal rectangle ───────────────────
+
+describe('geometry persistence on unmount', () => {
+  type HostProps = Partial<React.ComponentProps<typeof FloatingPanel>>;
+
+  /** A host that unmounts the panel (like the AI prompt window) or closes it via `open`. */
+  function Host(props: HostProps) {
+    const [mounted, setMounted] = useState(true);
+    const [open, setOpen] = useState(true);
+    return (
+      <Wrapper>
+        <button type="button" onClick={() => setMounted(m => !m)}>mount</button>
+        <button type="button" onClick={() => setOpen(o => !o)}>open</button>
+        {mounted && (
+          <FloatingPanel open={open} onClose={() => setOpen(false)} title="T" panelId="test-panel" {...SMALL} {...props}>
+            <div data-testid="panel-content" />
+          </FloatingPanel>
+        )}
+      </Wrapper>
+    );
+  }
+
+  const saved = () => JSON.parse(localStorage.getItem(geoKey())!);
+
+  function resizeBy(dw: number, dh: number) {
+    const handle = document.querySelector('[data-resize-handle]') as HTMLElement;
+    fireEvent.pointerDown(handle, { pointerId: 2, clientX: 300, clientY: 300 });
+    fireEvent.pointerMove(window, { pointerId: 2, clientX: 300 + dw, clientY: 300 + dh });
+    fireEvent.pointerUp(window, { pointerId: 2, clientX: 300 + dw, clientY: 300 + dh });
+  }
+
+  it('restores a moved and resized panel after unmount and remount', () => {
+    render(<Host />);
+    dragBy(40, 30);
+    resizeBy(30, 70);
+
+    fireEvent.click(screen.getByText('mount'));
+    expect(saved()).toEqual({ x: 140, y: 130, w: 230, h: 220 });
+
+    fireEvent.click(screen.getByText('mount'));
+    expect(geo()).toMatchObject({ left: 140, top: 130, width: 230, height: 220 });
+  });
+
+  it('saves the latest normal rectangle, not the maximized one, when unmounted while maximized', async () => {
+    render(<Host />);
+    dragBy(40, 30);
+    fireEvent.click(screen.getByLabelText('Expand window'));
+    await waitFor(() => expect(geo().width).toBeGreaterThan(200));
+
+    fireEvent.click(screen.getByText('mount'));
+    expect(saved()).toEqual({ x: 140, y: 130, w: 200, h: 150 });
+  });
+
+  it('close via open={false} saves the same normal rectangle as unmount, even while maximized', async () => {
+    render(<Host />);
+    dragBy(40, 30);
+    fireEvent.click(screen.getByLabelText('Expand window'));
+    await waitFor(() => expect(geo().width).toBeGreaterThan(200));
+
+    fireEvent.click(screen.getByText('open'));
+    expect(saved()).toEqual({ x: 140, y: 130, w: 200, h: 150 });
+  });
+
+  it('ignores a move while collapsed and keeps the collapsed preference', () => {
+    render(<Host collapsible persistCollapsed />);
+    dragBy(40, 30);
+    fireEvent.click(screen.getByLabelText('Collapse panel'));
+    dragBy(20, 20);
+
+    fireEvent.click(screen.getByText('mount'));
+    expect(saved()).toEqual({ x: 140, y: 130, w: 200, h: 150 });
+    expect(localStorage.getItem(collapsedKey())).toBe('1');
+  });
+
+  it('writes nothing for a panel only ever used in the mobile layout', () => {
+    layout.mobile = true;
+    render(<Host />);
+    dragBy(10, 10);
+    fireEvent.click(screen.getByText('mount'));
+    expect(localStorage.getItem(geoKey())).toBeNull();
+  });
+
+  it('keeps the desktop rectangle through a breakpoint change to mobile', () => {
+    const { rerender } = render(<Host />);
+    dragBy(40, 30);
+    layout.mobile = true;
+    rerender(<Host />);
+    dragBy(10, 10);
+    // The breakpoint change itself is not an unmount and writes nothing.
+    expect(localStorage.getItem(geoKey())).toBeNull();
+
+    fireEvent.click(screen.getByText('mount'));
+    expect(saved()).toEqual({ x: 140, y: 130, w: 200, h: 150 });
+  });
+
+  it('saves the current rectangle after a breakpoint change from mobile to desktop, without a drag', () => {
+    layout.mobile = true;
+    const { rerender } = render(<Host />);
+    layout.mobile = false;
+    rerender(<Host />);
+    const { left, top, width, height } = geo();
+
+    fireEvent.click(screen.getByText('mount'));
+    expect(saved()).toEqual({ x: left, y: top, w: width, h: height });
+  });
+
+  it('does not overwrite seeded geometry with defaults under StrictMode', () => {
+    const seeded = { x: 120, y: 110, w: 210, h: 230 };
+    localStorage.setItem(geoKey(), JSON.stringify(seeded));
+    const { unmount } = render(<StrictMode><Host /></StrictMode>);
+    expect(geo()).toMatchObject({ left: 120, top: 110, width: 210, height: 230 });
+
+    unmount();
+    expect(saved()).toEqual(seeded);
   });
 });

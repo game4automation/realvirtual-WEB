@@ -32,10 +32,10 @@ export function injectNewsIntoSettings(
   dryRun?: boolean,
 ): boolean;
 
-export type BuildMode = 'public' | 'private';
+export type BuildMode = 'public' | 'private' | 'demo';
 export function buildEnvForMode(
   mode: BuildMode,
-  opts?: { base?: string | null },
+  opts?: { base?: string | null; demoWelcome?: boolean },
 ): Record<string, string | undefined>;
 
 export function sanitizeDemoName(name: string | null | undefined): string;
@@ -142,6 +142,10 @@ export interface HostedStageReport {
   oversized: string[];
   /** Only set by `stageHostedProject`. */
   encrypted: string[];
+  /** Only set by `stageHostedProject`: library projects shipped trimmed under `p/libraries/` (plan-778). */
+  libraries?: string[];
+  /** Only set by `stageHostedProject`: the app-level realvirtual library was published (plan-778). */
+  realvirtualLibrary?: boolean;
 }
 
 /** Copies a project folder byte-for-byte minus the hosted deny list; symlinks are skipped. */
@@ -149,7 +153,7 @@ export function copyProjectVerbatim(
   projectDir: string,
   destDir: string,
   opts?: { ignoreRules?: unknown[] | null },
-): Omit<HostedStageReport, 'encrypted'>;
+): Omit<HostedStageReport, 'encrypted' | 'libraries' | 'realvirtualLibrary'>;
 
 /** True for a `p/`-relative path a password deploy encrypts: `.glb`, `aasx/*.aasx`, `aasx/index.json` (plan-596). */
 export function isEncryptablePath(rel: string): boolean;
@@ -179,6 +183,9 @@ export function stageHostedProject(opts: {
   encryption?: PrivateEncryptionOptions | null;
   signing?: PrivateSigningOptions | null;
   onReport?: ((report: HostedStageReport) => void) | null;
+  /** Library sources for the trim (plan-778): `--projects-dir` / `--library <id>=<folder>`. */
+  librarySources?: { projectsDir?: string | null; libraries?: Record<string, string> } | null;
+  onLog?: ((line: string) => void) | null;
 }): Promise<string>;
 
 export const PUBLIC_MODEL_PREFIX: string;
@@ -277,9 +284,12 @@ export function existsOnDiskExactly(rootDir: string, relPath: string): boolean;
 /** Every `catalog.json` under `rootDir` (forward-slash rels). */
 export function findCatalogFiles(rootDir: string): string[];
 /** Deploy-relative path of an entry's `glbUrl` / `splatUrl`, or null for non-relative urls. */
-export function catalogEntryBinaryRel(catalogRel: string, entry: { glbUrl?: string; splatUrl?: string }): string | null;
+export function catalogEntryBinaryRel(catalogRel: string, entry: { glbUrl?: string; splatUrl?: string; path?: string }): string | null;
 /** Re-stamp `sha256` + `sizeBytes` into every catalog under `rootDir` from the bytes there now. */
-export function stampCatalogHashes(rootDir: string, opts?: { dryRun?: boolean }): { catalogs: number; stamped: number };
+export function stampCatalogHashes(rootDir: string, opts?: { dryRun?: boolean }): { catalogs: number; stamped: number; libraryProjects: number; projectRows: number };
+/** Every realvirtual library `project.json` (id prj_realvirtual_library) under `rootDir` (forward-slash rels). */
+export function findLibraryProjectFiles(rootDir: string): string[];
+export const REALVIRTUAL_LIBRARY_PROJECT_ID: string;
 /** Catalogued binaries whose hash differs from the remote catalog (null = none published: all). */
 export function catalogChangedBinaries(localDir: string, catalogRel: string, remoteText: string | Buffer | null): string[];
 export interface ProbeResult { ok: boolean; findings: string[]; checks: string[]; }
@@ -292,3 +302,18 @@ export function probePublishedAssets(opts: {
   catalogRel?: string;
   now?: () => number;
 }): Promise<ProbeResult>;
+
+/** Registers the delivery-config lookup (plan-604). Internal tooling calls this; the
+ *  delivered publish path does not, so a project there simply carries no `delivery`. */
+export function setDeliveryLookup(
+  lookup: ((privateRoot: string, folderName: string) => unknown) | null,
+): void;
+
+/** Is `rel` a library catalog? The default `deferUntilLast` predicate. */
+export function isCatalogFile(rel: string): boolean;
+/** What a hosted publish leaves on the CDN: exactly the staging listing. */
+export function expectedHostedSnapshot(stagingDir: string): Set<string>;
+/** Deletes every remote file absent from the local snapshot; returns the count. */
+export function reconcileRemoteSnapshot(
+  client: any, remotePrefix: string, expectedPaths: Set<string>,
+): Promise<number>;

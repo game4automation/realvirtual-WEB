@@ -111,6 +111,8 @@ export class CanvasInteractionManager {
     const onDirectPointerDown = (e: PointerEvent) => {
       if (!this.deps.isActive() || e.button !== 0) return;
       if (this.deps.getPlacementEntry()) return;
+      // plan-2215: no screen pick (and no marquee) while a render strategy draws other cameras.
+      if (viewer.pointerPickBlocked) return;
 
       // The FloorGizmo registers its own `pointerdown` listener on the same
       // canvas BEFORE this manager wires up (planner constructs the gizmo
@@ -183,6 +185,11 @@ export class CanvasInteractionManager {
 
     const onDirectPointerMove = (e: PointerEvent) => {
       if (!this._dragCandidate || this._dragCandidate.started) return;
+      if (viewer.pointerPickBlocked) {
+        viewer.controls.enabled = true;
+        this._dragCandidate = null;
+        return;
+      }
       const dx = e.clientX - this._dragCandidate.startX;
       const dy = e.clientY - this._dragCandidate.startY;
       if (dx * dx + dy * dy < DIRECT_DRAG_THRESHOLD_SQ) return;
@@ -219,6 +226,7 @@ export class CanvasInteractionManager {
 
       const placementEntry = this.deps.getPlacementEntry();
       if (!placementEntry) return;
+      if (viewer.pointerPickBlocked) return;
 
       pointerToNDC(e.clientX, e.clientY, canvas, this._mouse);
       this._raycaster.setFromCamera(this._mouse, viewer.camera);
@@ -246,6 +254,7 @@ export class CanvasInteractionManager {
         if (!this.deps.getDragEntry()) this.deps.cancelDraft();
         return;
       }
+      if (viewer.pointerPickBlocked) return;
 
       this.deps.startDraft(placementEntry);
 

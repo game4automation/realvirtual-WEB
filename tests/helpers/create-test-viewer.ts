@@ -40,6 +40,13 @@ export interface CreateTestViewerOptions extends Omit<RVViewerOptions, 'renderer
   /** Container size in px. Default 640×480. */
   width?: number;
   height?: number;
+  /**
+   * plan-652 Phase 3: register the DES runner factory up front, as the viewer did before
+   * DES became an on-demand feature (the app now hands it over when DES activates).
+   * Default true, so kernel tests keep switching to DES directly; `false` tests the lazy
+   * path. A no-op in the community build (the stub exports `null`).
+   */
+  desRunner?: boolean;
 }
 
 const DEFAULT_INIT_TIMEOUT_MS = 15_000;
@@ -54,7 +61,7 @@ export async function createTestViewer(
   kind: RendererKind = 'webgl',
   options: CreateTestViewerOptions = {},
 ): Promise<TestViewerHandle> {
-  const { initTimeoutMs, width, height, ...viewerOptions } = options;
+  const { initTimeoutMs, width, height, desRunner, ...viewerOptions } = options;
 
   const container = document.createElement('div');
   container.style.cssText =
@@ -83,6 +90,8 @@ export async function createTestViewer(
       }),
       timeout,
     ]);
+
+    if (desRunner !== false) await viewer.loadDesRunnerFactory();
 
     let disposed = false;
     return {

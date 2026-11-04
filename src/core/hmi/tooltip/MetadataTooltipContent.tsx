@@ -37,6 +37,7 @@ import type { TooltipContentProps } from './tooltip-registry';
 import { tooltipRegistry } from './tooltip-registry';
 import type { TooltipData } from './tooltip-store';
 import type { OrderManagerConfig, OrderManagerPluginAPI } from '../../types/plugin-types';
+import { useCartAvailable } from '../cart-gate';
 /** Data shape for metadata tooltips. */
 export interface MetadataTooltipData extends TooltipData {
   type: 'metadata';
@@ -290,6 +291,8 @@ export function MetadataTooltipContent({ data, viewer, isPinned }: TooltipConten
     | (OrderManagerPluginAPI & { config?: OrderManagerConfig })
     | undefined;
   const orderConfig = orderPlugin?.config;
+  // plan-682 §2.7: the cart action reads the same gate as the cart panel.
+  const cartAvailable = useCartAvailable();
   const articleInfo = useMemo(() => {
     return findValueByLabels(tags, orderConfig?.metadataArticleLabels ?? DEFAULT_ARTICLE_LABELS) || null;
   }, [tags, orderConfig]);
@@ -415,7 +418,7 @@ export function MetadataTooltipContent({ data, viewer, isPinned }: TooltipConten
       })}
 
       {/* Add to Cart button — only in pinned mode (same style as AAS tooltips) */}
-      {isPinned && articleInfo && orderPlugin && (
+      {isPinned && cartAvailable && articleInfo && orderPlugin && (
         <Button
           variant="outlined"
           size="small"

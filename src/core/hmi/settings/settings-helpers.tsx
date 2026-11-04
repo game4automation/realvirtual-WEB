@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../../rv-safe-storage';
+
 import { useState, type ReactNode } from 'react';
 import { Typography, Box, Collapse, Slider } from '@mui/material';
 import { ExpandMore } from '@mui/icons-material';
@@ -21,7 +23,7 @@ const SECTION_COLLAPSE_KEY = 'rv-settings-section-collapsed';
 
 function loadCollapsedSections(): Set<string> {
   try {
-    const raw = localStorage.getItem(SECTION_COLLAPSE_KEY);
+    const raw = readLocalStorage(SECTION_COLLAPSE_KEY);
     return raw ? new Set(JSON.parse(raw) as string[]) : new Set();
   } catch {
     return new Set();
@@ -32,7 +34,7 @@ function persistCollapsedSection(id: string, collapsed: boolean): void {
   const set = loadCollapsedSections();
   if (collapsed) set.add(id); else set.delete(id);
   try {
-    localStorage.setItem(SECTION_COLLAPSE_KEY, JSON.stringify([...set]));
+    writeLocalStorage(SECTION_COLLAPSE_KEY, JSON.stringify([...set]));
   } catch {
     /* quota exceeded or storage disabled — ignore */
   }

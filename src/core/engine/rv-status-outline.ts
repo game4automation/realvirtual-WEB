@@ -4,12 +4,12 @@
 /**
  * rv-status-outline — the shared BLINKING OUTLINE for status/severity
  * highlighting, rendered by the OutlinePass status channel
- * (RVOutlineManager). This is the same visual as the Toray motor-alarm
+ * (RVOutlineManager). This is the same visual as the CAD-import showcase model motor-alarm
  * pulse: a GPU silhouette with `pulsePeriod` breathing.
  *
  * Why proxies: the OutlinePass can only outline meshes the camera actually
  * renders. Statically batched source meshes keep `visible = true` with
- * `layers.mask = 0` (doc-render-picking.md §1.2) — the camera never draws
+ * `layers.mask = 0` (contract-bake-picking.md §1.2) — the camera never draws
  * them, so passing them to the OutlinePass shows nothing. For such nodes
  * this module builds invisible proxy meshes (shared geometry, colorWrite
  * and depthWrite off, on NO_AO_LAYER so they live inside the composer but
@@ -17,10 +17,13 @@
  * selection mask. The base render pipeline is untouched: proxies draw no
  * pixels, write no depth, cast no shadows, and are excluded from picking.
  *
- * Ownership: there is ONE status outline at a time (the OutlinePass channel
- * has a single style/color). `showStatusOutline` supports a persistent
- * owner (runtime-instruction step highlight) plus a transient interrupt
- * (severity pulse) that restores the persistent outline when it ends.
+ * Ownership: the OutlinePass channel has a single style/color, but it may be
+ * CLAIMED by several persistent owners at once (runtime-instruction step
+ * highlight, collision, drop detection). Claims asking for the same style are
+ * UNIONED; a claim asking for a different style is hidden by the youngest one
+ * and says so once (plan-2022 Phase 0 — before that register, a second owner
+ * silently erased the first). On top sits a transient interrupt (severity
+ * pulse) which restores the claim union when it ends.
  */
 
 import { Mesh, MeshBasicMaterial, Group } from 'three';
@@ -146,12 +149,27 @@ interface OutlineRequest {
   disposeProxies: (() => void) | null;
 }
 
-/** The persistent outline (runtime-instruction step highlight). */
-let _persistent: OutlineRequest | null = null;
+/**
+ * The CLAIM REGISTER of the persistent status channel (plan-2022 Phase 0).
+ *
+ * Before this there was a single `_persistent` slot, and a second persistent
+ * caller silently THREW AWAY the first one: a runtime-instruction step
+ * highlight erased a standing collision outline, and vice versa. Both of them
+ * ask for the very same thing — "look here, something is wrong" — so the fix is
+ * a register whose entries are UNIONED when they want the same style.
+ *
+ * Insertion order is age (a `Map.set` on an existing key keeps its position, so
+ * a re-show by the same owner does not make it the youngest — a collision that
+ * re-publishes its root set every tick must not keep stealing the style).
+ */
+const _claims = new Map<string, OutlineRequest>();
 /** A transient interrupt (severity pulse) shown on top of / instead of the
- *  persistent outline; the persistent one is re-applied when it clears. */
+ *  claims; the claims are re-applied when it clears. */
 let _transient: OutlineRequest | null = null;
+/** Warn-once keys (`loser>winner`) for the style-conflict message. */
+const _warnedConflicts = new Set<string>();
 
+/** Apply ONE request alone (the transient pulse). */
 function apply(host: StatusOutlineHost, req: OutlineRequest): void {
   req.disposeProxies?.();
   const { targets, dispose } = resolveOutlineTargets(host.scene, req.nodes);
@@ -161,11 +179,55 @@ function apply(host: StatusOutlineHost, req: OutlineRequest): void {
 }
 
 /**
+ * Apply the claim register: the youngest claim defines the style, and every
+ * claim with the SAME `(color, pulsePeriod)` contributes its nodes to one
+ * union. A claim with a different style loses — the OutlinePass status channel
+ * has exactly one style (`rv-outline-manager.ts`), so there is nothing to mix —
+ * but it loses LOUDLY: one `console.warn` per pairing instead of the silent
+ * eviction this register replaces. Its proxies are dropped while it is out and
+ * rebuilt if it becomes the youngest later.
+ */
+function applyClaims(host: StatusOutlineHost): void {
+  if (_claims.size === 0) {
+    host.outlineManager.clearStatus();
+    return;
+  }
+  const list = [..._claims.values()];
+  const style = list[list.length - 1];
+  const union: Object3D[] = [];
+  for (const claim of list) {
+    if (claim !== style && (claim.color !== style.color || claim.pulsePeriod !== style.pulsePeriod)) {
+      const key = `${claim.ownerKey}>${style.ownerKey}`;
+      if (!_warnedConflicts.has(key)) {
+        _warnedConflicts.add(key);
+        console.warn(
+          `[status-outline] claim "${claim.ownerKey}" is hidden by "${style.ownerKey}": the status channel `
+          + 'carries one style and these two ask for different ones '
+          + `(0x${claim.color.toString(16)}/${claim.pulsePeriod}s vs 0x${style.color.toString(16)}/${style.pulsePeriod}s).`,
+        );
+      }
+      claim.disposeProxies?.();
+      claim.disposeProxies = null;
+      continue;
+    }
+    claim.disposeProxies?.();
+    const { targets, dispose } = resolveOutlineTargets(host.scene, claim.nodes);
+    claim.disposeProxies = dispose;
+    for (const t of targets) if (!union.includes(t)) union.push(t);
+  }
+  host.outlineManager.setStatusStyle(makeStatusOutlineStyle(style.color, style.pulsePeriod));
+  host.outlineManager.setStatusOutlined(union);
+}
+
+/**
  * Show the status outline (OutlinePass status channel) on `nodes` in `color`.
- * `pulsePeriod` seconds per blink cycle (0 = static). Re-invoking with the
- * same ownerKey replaces the outline; a different persistent owner takes the
- * channel over. `transient: true` marks a short-lived interrupt (severity
- * pulse) — the previous persistent outline is restored by hideStatusOutline.
+ * `pulsePeriod` seconds per blink cycle (0 = static).
+ *
+ * Re-invoking with the same ownerKey replaces that owner's claim. SEVERAL
+ * persistent owners may hold the channel at once: claims asking for the same
+ * style are unioned, a claim asking for a different style is hidden by the
+ * youngest one (with a warning). `transient: true` marks a short-lived
+ * interrupt (severity pulse) — the claim union is restored by hideStatusOutline.
  */
 export function showStatusOutline(
   host: StatusOutlineHost,
@@ -184,44 +246,48 @@ export function showStatusOutline(
   if (opts.transient) {
     _transient?.disposeProxies?.();
     _transient = req;
-  } else {
-    if (_persistent && _persistent.ownerKey !== req.ownerKey) _persistent.disposeProxies?.();
-    else _persistent?.disposeProxies?.();
-    _persistent = req;
-    if (_transient) return; // transient pulse stays on top; applied on its hide
+    apply(host, req);
+    return;
   }
-  apply(host, req);
+  // Hand the previous claim's proxies over: the new request rebuilds them.
+  _claims.get(req.ownerKey)?.disposeProxies?.();
+  _claims.set(req.ownerKey, req);
+  if (_transient) return; // transient pulse stays on top; applied on its hide
+  applyClaims(host);
 }
 
 /**
- * Hide the status outline owned by `ownerKey`. When a transient pulse ends
- * and a persistent outline is still registered, the persistent outline is
- * re-applied (fresh proxies — node transforms may have changed). Unknown
- * owners are a no-op, so stale timeouts can't clear a newer outline.
+ * Hide the status outline owned by `ownerKey`. When a transient pulse ends the
+ * remaining claims are re-applied (fresh proxies — node transforms may have
+ * changed); taking one claim out of three disposes exactly that claim's proxies
+ * and leaves the others standing. Unknown owners are a no-op, so stale timeouts
+ * can't clear a newer outline.
  */
 export function hideStatusOutline(host: StatusOutlineHost, ownerKey: string): void {
   if (_transient?.ownerKey === ownerKey) {
     _transient.disposeProxies?.();
     _transient = null;
-    if (_persistent) {
-      apply(host, _persistent);
-    } else {
-      host.outlineManager.clearStatus();
-    }
+    applyClaims(host);
     return;
   }
-  if (_persistent?.ownerKey === ownerKey) {
-    _persistent.disposeProxies?.();
-    _persistent = null;
-    if (!_transient) host.outlineManager.clearStatus();
-  }
+  const claim = _claims.get(ownerKey);
+  if (!claim) return;
+  claim.disposeProxies?.();
+  _claims.delete(ownerKey);
+  if (!_transient) applyClaims(host);
 }
 
-/** Full reset (model unload) — drops both outlines and all proxies. */
+/** Owner keys currently holding a persistent claim, oldest first (diagnostics/tests). */
+export function statusOutlineClaimOwners(): readonly string[] {
+  return [..._claims.keys()];
+}
+
+/** Full reset (model unload) — drops every claim, the pulse and all proxies. */
 export function clearAllStatusOutlines(host: StatusOutlineHost): void {
   _transient?.disposeProxies?.();
   _transient = null;
-  _persistent?.disposeProxies?.();
-  _persistent = null;
+  for (const claim of _claims.values()) claim.disposeProxies?.();
+  _claims.clear();
+  _warnedConflicts.clear();
   host.outlineManager.clearStatus();
 }

@@ -1,0 +1,132 @@
+<!doctype html>
+<!-- plan-659 spike: offscreen preview page for rv-duck.glb. Driven by render-duck.mjs. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>rv-duck preview</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; }
+  body {
+    background:
+      radial-gradient(ellipse 120% 90% at 50% 38%, #ffffff 0%, #eef0f3 48%, #dfe3e9 100%);
+  }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<!-- the examples/jsm modules import the bare specifier "three" -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "/node_modules/three/build/three.module.js",
+    "three/": "/node_modules/three/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+
+const W = window.innerWidth, H = window.innerHeight;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+renderer.setSize(W, H);
+renderer.setPixelRatio(1);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+// Neutral (KHR PBR neutral) instead of ACES: it holds the RV brand pink instead of
+// bleaching it towards magenta.
+renderer.toneMapping = THREE.NeutralToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+
+// soft indoor environment so the dark actuator surfaces read as real material
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.55;
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0xd8dde4, 0.55));
+
+const key = new THREE.DirectionalLight(0xffffff, 2.1);
+key.position.set(0.42, 0.75, 0.34);
+key.castShadow = true;
+key.shadow.mapSize.set(2048, 2048);
+const sc = key.shadow.camera;
+sc.left = -0.3; sc.right = 0.3; sc.top = 0.3; sc.bottom = -0.3; sc.near = 0.01; sc.far = 2.2;
+key.shadow.bias = -0.0004;
+key.shadow.normalBias = 0.004;
+scene.add(key);
+
+const fill = new THREE.DirectionalLight(0xdce6f5, 0.75);
+fill.position.set(-0.6, 0.35, -0.55);
+scene.add(fill);
+
+const rim = new THREE.DirectionalLight(0xffffff, 1.05);
+rim.position.set(-0.45, 0.5, 0.8);
+scene.add(rim);
+
+// shadow catcher
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(4, 4),
+  new THREE.ShadowMaterial({ color: 0x2a3340, opacity: 0.22 }));
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = 0;
+ground.receiveShadow = true;
+scene.add(ground);
+
+const camera = new THREE.PerspectiveCamera(26, W / H, 0.01, 20);
+scene.add(camera);
+
+const VIEWS = {
+  // After the GLB root rotation the duck faces +X, up is +Y, its left is -Z.
+  threequarter: { dir: [0.80, 0.30, 0.52], pad: 1.16, lift: 0.00 },
+  side:         { dir: [0.03, 0.09, 1.00], pad: 1.30, lift: 0.00 },
+  // close-up so the lens and the ToF window are readable; framed on the head subtree
+  // from the duck's LEFT, because that is the side the real ToF site sits on
+  head:         { dir: [0.80, 0.24, -0.55], pad: 1.30, lift: 0.00, focus: 'jaw_soft' },
+};
+
+new GLTFLoader().load('/spikes/659/duck/rv-duck.glb', (gltf) => {
+  const model = gltf.scene;
+  model.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+  scene.add(model);
+
+  const box = new THREE.Box3().setFromObject(model);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  window.__rvBounds = { min: box.min.toArray(), max: box.max.toArray(), size: size.toArray() };
+
+  window.__rvSetView = (name) => {
+    const v = VIEWS[name];
+    let b = box, sz = size;
+    if (v.focus) {
+      const sub = model.getObjectByName(v.focus);
+      if (sub) { b = new THREE.Box3().setFromObject(sub); sz = b.getSize(new THREE.Vector3()); }
+    }
+    const target = b.getCenter(new THREE.Vector3());
+    target.y += v.lift;
+    // fit height and width separately instead of the loose bounding-sphere estimate
+    const fovY = camera.fov * Math.PI / 180;
+    const fovX = 2 * Math.atan(Math.tan(fovY / 2) * camera.aspect);
+    const fitY = (sz.y / 2) / Math.tan(fovY / 2);
+    const fitX = (Math.max(sz.x, sz.z) / 2) / Math.tan(fovX / 2);
+    const dist = Math.max(fitY, fitX) * v.pad;
+    const dir = new THREE.Vector3(v.dir[0], v.dir[1], v.dir[2]).normalize();
+    camera.position.copy(target).add(dir.multiplyScalar(dist));
+    camera.lookAt(target);
+    camera.updateProjectionMatrix();
+    key.target.position.copy(target);
+    key.target.updateMatrixWorld();
+    renderer.render(scene, camera);
+    return true;
+  };
+  window.__rvSetView('threequarter');
+  window.__rvReady = true;
+}, undefined, (err) => { window.__rvError = String(err); });
+</script>
+</body>
+</html>

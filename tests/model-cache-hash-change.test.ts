@@ -279,12 +279,16 @@ describe('ModelCache expected hash', () => {
   });
 });
 
-describe('real bytes: the bundled catalog and a library GLB', () => {
-  it('normalizing the catalog registers the hash; the real GLB verifies and decodes', async () => {
-    const catalogUrl = new URL('/library/catalog.json', location.href).href;
-    const catalog = await (await fetch(catalogUrl)).json() as { entries: Array<{ glbUrl: string; sha256?: string }> };
-    const base = catalogUrl.slice(0, catalogUrl.lastIndexOf('/') + 1);
-    const raw = catalog.entries.find((e) => /CartonBox\.glb$/.test(e.glbUrl)) ?? catalog.entries[0];
+describe('real bytes: the bundled library project and a library GLB', () => {
+  // plan-778 Phase 4: the bundled catalog.json is gone — the real hash comes from the
+  // library PROJECT row now. It is fed through the same catalog normaliser a URL catalog
+  // still uses, so the registration + verification path under test is unchanged.
+  it('normalizing a library row registers the hash; the real GLB verifies and decodes', async () => {
+    const projectUrl = new URL('/library/project.json', location.href).href;
+    const project = await (await fetch(projectUrl)).json() as { documents: Array<{ id: string; name: string; path: string; sha256?: string }> };
+    const base = projectUrl.slice(0, projectUrl.lastIndexOf('/') + 1);
+    const row = project.documents.find((d) => /CartonBox\.glb$/.test(d.path)) ?? project.documents[0];
+    const raw = { id: row.id, name: row.name, glbUrl: row.path, sha256: row.sha256 };
     expect(raw.sha256).toMatch(/^[0-9a-f]{64}$/);
     const entry = normalizeCatalogEntry(raw, base);
     expect(hashForUrl(entry.glbUrl!)?.sha256).toBe(raw.sha256);

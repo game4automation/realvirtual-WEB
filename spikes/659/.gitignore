@@ -1,0 +1,4 @@
+# Mess- und Nachweis-Artefakte: reproduzierbar per browser-smoke.mjs bzw. render-duck.mjs.
+# Dieses Repo hat ein public-Remote (ungefilterter GitHub-Mirror) - Screenshots gehoeren
+# nicht hinein. Die zugehoerigen *.json-Reports BLEIBEN versioniert, sie sind die Messwerte.
+*.png

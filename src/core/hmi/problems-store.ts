@@ -63,6 +63,12 @@ export interface ProblemEntry {
    * it as a button and dispatches it; no entry is obliged to carry one.
    */
   action?: { label: string; commandId: string; args: unknown };
+  /**
+   * Not news (plan-628 8.11g): the panel does not open by itself for this entry;
+   * it is listed and counted as usual. For live findings whose marker already
+   * sits in the 3D view (path-network info / warning).
+   */
+  quiet?: boolean;
   /** When it was reported (ms epoch), so the panel can order stably. */
   at: number;
 }
@@ -107,6 +113,7 @@ export function reportProblem(input: ProblemInput): ProblemEntry {
     && previous.title === entry.title
     && previous.detail === entry.detail
     && previous.nodePath === entry.nodePath
+    && previous.quiet === entry.quiet
     // The action is part of the content: same headline, different argument list (the names a
     // repair would act on) is a changed entry, and the button must follow it.
     && sameAction(previous.action, entry.action)) {
@@ -115,6 +122,11 @@ export function reportProblem(input: ProblemInput): ProblemEntry {
   }
   notify();
   return entry;
+}
+
+/** The current entry of one problem id, `undefined` when none is reported. */
+export function getProblem(id: string): ProblemEntry | undefined {
+  return _entries.get(id);
 }
 
 /** Drop one problem by id. No-op when unknown. */
@@ -158,6 +170,80 @@ export function getProblems(): ProblemEntry[] {
 export function subscribeProblems(listener: () => void): () => void {
   _listeners.add(listener);
   return () => { _listeners.delete(listener); };
+}
+
+// ─── Summary line (plan-778 §2.7) ───────────────────────────────────────
+// One short line ("2 libraries unavailable — Show") for problems that are
+// `quiet` on purpose: the panel must not pop open over a project that just
+// opened, but the user should still learn, once, that something is missing.
+// One announcement at a time; the panel renders it and "Show" opens the panel
+// filtered to the announcement's `code`.
+
+/** A one-line summary of quiet problems, with the code the panel filters to on "Show". */
+export interface ProblemsAnnouncement {
+  /** Identity — re-announcing the same key with the same text is a no-op. */
+  key: string;
+  message: string;
+  /** The problem `code` "Show" filters the panel to. */
+  code: string;
+  /** Per announcement; dismissals key on it. */
+  readonly seq?: number;
+}
+
+let _announcement: ProblemsAnnouncement | null = null;
+let _announcementSeq = 0;
+const _announcementListeners = new Set<() => void>();
+
+function notifyAnnouncement(): void {
+  for (const l of _announcementListeners) {
+    try { l(); } catch { /* a subscriber must never break the reporter */ }
+  }
+}
+
+/** Put up (or replace) the summary line. */
+export function announceProblems(a: ProblemsAnnouncement): void {
+  if (_announcement && _announcement.key === a.key && _announcement.message === a.message && _announcement.code === a.code) return;
+  _announcement = { ...a, seq: ++_announcementSeq };
+  notifyAnnouncement();
+}
+
+/** Take the summary line down — only when it is still the one with `key` (null = any). */
+export function withdrawProblemsAnnouncement(key: string | null = null): void {
+  if (!_announcement) return;
+  if (key !== null && _announcement.key !== key) return;
+  _announcement = null;
+  notifyAnnouncement();
+}
+
+/** Stable snapshot for `useSyncExternalStore`. */
+export function getProblemsAnnouncement(): ProblemsAnnouncement | null { return _announcement; }
+
+export function subscribeProblemsAnnouncement(listener: () => void): () => void {
+  _announcementListeners.add(listener);
+  return () => { _announcementListeners.delete(listener); };
+}
+
+// ─── Open document ──────────────────────────────────────────────────────
+// Which document the list is about. Set by the viewer when a load STARTS, so it
+// is already current while that load reports. The panel keys the user's "close"
+// on it: closed for one model stays closed for that model, not for the next one.
+
+let _documentKey: string | null = null;
+const _documentListeners = new Set<() => void>();
+
+export function setProblemsDocument(key: string | null): void {
+  if (_documentKey === key) return;
+  _documentKey = key;
+  for (const l of _documentListeners) {
+    try { l(); } catch { /* a subscriber must never break the loader */ }
+  }
+}
+
+export function getProblemsDocument(): string | null { return _documentKey; }
+
+export function subscribeProblemsDocument(listener: () => void): () => void {
+  _documentListeners.add(listener);
+  return () => { _documentListeners.delete(listener); };
 }
 
 // ─── Missing references ─────────────────────────────────────────────────
@@ -312,20 +398,22 @@ export interface OverrideOrphanedReport {
   label: string;
   assetId: string;
   /** How the override addressed its target (`OrphanedOverride.addressing`). */
-  addressing: 'nodeId' | 'path' | 'trs';
-  /** The NodeId or asset-relative path that did not resolve. */
+  addressing: 'address' | 'path';
+  /** The address (`#<id>`) or the legacy relative path that did not resolve. */
   key: string;
-  /** Component types the override would have touched (empty for a transform). */
+  /** Component types the override would have touched. */
   componentTypes: readonly string[];
   /**
-   * plan-757 Phase 2b: WHY a path override orphaned when the reason is known.
-   * `'nested-reference'` = the path leads into a reference node INSIDE the
-   * placed asset (a nested placement): an override on the outer reference node
-   * does not reach into the referenced asset's own references (F6, no byPath
-   * routing for depth ≥ 2). `nestedReferencePath` names that node.
+   * WHY the override orphaned when it is more than "no such node" (plan-769 4b):
+   * `'ambiguous'` — the id names two nodes of the asset, none is guessed;
+   * `'missing'` — it is aimed into a nested placement that never materialised
+   * (the verdict falls once no placement is pending);
+   * `'placement-missing'` / `'placement-cap'` / `'placement-refused'` — that
+   * nested placement failed to load, was cut by the per-load cap, or was refused
+   * (cycle / depth). Overrides into nested placements are routed since 4b; the
+   * plan-757 `'nested-reference'` refusal is gone.
    */
-  reason?: 'nested-reference';
-  nestedReferencePath?: string;
+  reason?: 'ambiguous' | 'missing' | 'placement-missing' | 'placement-cap' | 'placement-refused';
 }
 
 /** The problem id of an orphaned override — one per (node, addressing, key), so a re-apply replaces. */
@@ -335,17 +423,24 @@ export function overrideOrphanedProblemId(nodePath: string, addressing: string, 
 
 /** Report ONE orphaned override. Re-reporting the same triple replaces. */
 export function reportOverrideOrphaned(m: OverrideOrphanedReport): void {
-  const what = m.addressing === 'trs'
-    ? `The moved part (NodeId "${m.key}")`
-    : m.addressing === 'path'
-      ? `The override target "${m.key}" (path relative to the asset)`
-      : `The override target with NodeId "${m.key}"`;
+  const what = m.addressing === 'path'
+    ? `The override target "${m.key}" (path relative to the asset)`
+    : `The override target "${m.key}" (address in the asset)`;
   const fields = m.componentTypes.length > 0 ? ` for ${m.componentTypes.join(', ')}` : '';
-  const detail = m.reason === 'nested-reference'
-    ? `${what}${fields} leads into "${m.nestedReferencePath ?? '?'}", a reference INSIDE the placed asset "${m.assetId}" `
-      + '— a nested placement. An override on this reference node does not reach into a referenced asset\'s own '
-      + 'references (plan-757: no byPath routing below the first level), so it is not applied. Open the referenced '
-      + 'asset and change the value there, or place the inner asset directly.'
+  const why: Record<NonNullable<OverrideOrphanedReport['reason']>, string> = {
+    ambiguous: `${what}${fields} names more than one node in "${m.assetId}" — none is guessed, the override is not `
+      + 'applied. Make the ids in the asset unique, or revert the override.',
+    missing: `${what}${fields} is aimed into a nested placement of "${m.assetId}" that never appeared — the nested `
+      + 'reference was removed or renamed in the asset. The override is not applied; revert it on the reference node.',
+    'placement-missing': `${what}${fields} is aimed into a nested placement of "${m.assetId}" whose asset could not `
+      + 'be loaded. It applies again once that asset is available.',
+    'placement-cap': `${what}${fields} is aimed into a nested placement of "${m.assetId}" that was not built because `
+      + 'the per-load placement cap was reached.',
+    'placement-refused': `${what}${fields} is aimed into a nested placement of "${m.assetId}" that was refused `
+      + '(reference cycle or nesting too deep).',
+  };
+  const detail = m.reason
+    ? why[m.reason]
     : `${what}${fields} does not exist in the baked asset "${m.assetId}" — the part was merged into a chunk, `
       + 'renamed, or removed from the file. The override is not applied. Give the part a component or a `BakeRole` '
       + 'in the asset, or revert the override on the reference node.';
@@ -353,8 +448,8 @@ export function reportOverrideOrphaned(m: OverrideOrphanedReport): void {
     id: overrideOrphanedProblemId(m.nodePath, m.addressing, m.key),
     severity: 'warning',
     code: 'override-orphaned',
-    title: m.reason === 'nested-reference'
-      ? `Override targets a nested reference in ${m.label}`
+    title: m.reason === 'ambiguous'
+      ? `Override target is ambiguous in ${m.label}`
       : `Override has no target in ${m.label}`,
     detail,
     nodePath: m.nodePath,
@@ -364,7 +459,649 @@ export function reportOverrideOrphaned(m: OverrideOrphanedReport): void {
 /** Drop every orphaned-override problem — the document changed. */
 export function clearOverrideOrphanedProblems(): void {
   clearProblemsOfCode('override-orphaned');
+  clearProblemsOfCode(OVERRIDE_TRANSFORMS_DROPPED_CODE);
+  clearNestedTransformRefusedProblems();
+  clearPlacementTransformOrphanedProblems();
 }
+
+// ─── Removed part moves (plan-769 F14) ───────────────────────────────────
+
+/** Problem code: an old file's reference node carried `trsByNodeId` part moves, which are no longer applied. */
+export const OVERRIDE_TRANSFORMS_DROPPED_CODE = 'override-transforms-dropped';
+
+/**
+ * Report that a reference node of an old file carried `count` part moves
+ * (`trsByNodeId`). They are not applied (plan-769 F14 — a part inside a placement
+ * keeps the position its asset gives it) and the next save does not write them
+ * back. One problem per reference node; a re-apply replaces.
+ */
+export function reportOverrideTransformsDropped(m: {
+  nodePath: string; label: string; assetId: string; count: number;
+}): void {
+  reportProblem({
+    id: `${OVERRIDE_TRANSFORMS_DROPPED_CODE}:${m.nodePath}`,
+    severity: 'warning',
+    code: OVERRIDE_TRANSFORMS_DROPPED_CODE,
+    title: `${m.count} moved part${m.count === 1 ? '' : 's'} in ${m.label} no longer applied`,
+    detail: `This file moved ${m.count} part${m.count === 1 ? '' : 's'} inside the placed asset "${m.assetId}" `
+      + '(trsByNodeId). Moving a part inside a placement is no longer supported: the parts stay where the asset '
+      + 'puts them, and saving the document drops the old moves. Move the part in the asset itself, or place it '
+      + 'as its own asset.',
+    nodePath: m.nodePath,
+  });
+}
+
+/** Drop every `nested-transform-refused` problem — a new save attempt, or the document changed. */
+export function clearNestedTransformRefusedProblems(): void {
+  clearProblemsOfCode(NESTED_TRANSFORM_REFUSED_CODE);
+}
+
+/** Problem code: a transform edit on a node inside a placement was refused (plan-769 D11). */
+export const NESTED_TRANSFORM_REFUSED_CODE = 'nested-transform-refused';
+
+// ─── Moves of placements the file no longer holds (plan-769 Phase 7) ─────
+
+/** Problem code: a move of a placement the saved file held could not be written — its node is gone. */
+export const PLACEMENT_TRANSFORM_ORPHANED_CODE = 'placement-transform-orphaned';
+
+/**
+ * Report that a save could not write the move of placement `placementId`: the
+ * file being written holds no placement node with that id any more (plan-769
+ * D23). One problem per placement; the next save attempt replaces the set.
+ */
+export function reportPlacementTransformOrphaned(m: { placementId: string }): void {
+  reportProblem({
+    id: `${PLACEMENT_TRANSFORM_ORPHANED_CODE}:${m.placementId}`,
+    severity: 'warning',
+    code: PLACEMENT_TRANSFORM_ORPHANED_CODE,
+    title: 'A moved placement could not be saved',
+    detail: `The placement ${m.placementId} was moved, but the document file no longer contains it, so the move `
+      + 'was not written. Reopen the document and place the asset again if it is still needed.',
+  });
+}
+
+/** Drop every `placement-transform-orphaned` problem — a new save attempt, or the document changed. */
+export function clearPlacementTransformOrphanedProblems(): void {
+  clearProblemsOfCode(PLACEMENT_TRANSFORM_ORPHANED_CODE);
+}
+
+/**
+ * Report a refused part move inside a placement (plan-769 D11/F14). Only component
+ * values may be overridden inside placed content; a transform has no vocabulary
+ * there. One problem per refused node; the next refusal of the same node replaces.
+ */
+export function reportNestedTransformRefused(m: { nodePath: string; placementPath: string }): void {
+  reportProblem({
+    id: `${NESTED_TRANSFORM_REFUSED_CODE}:${m.nodePath}`,
+    severity: 'warning',
+    code: NESTED_TRANSFORM_REFUSED_CODE,
+    title: 'A part inside a placement cannot be moved',
+    detail: `"${m.nodePath}" belongs to the placement "${m.placementPath}". Inside placed content only component `
+      + 'values can be changed; move the whole placement, or move the part in its asset.',
+    nodePath: m.nodePath,
+  });
+}
+
+// ─── Stored node references (plan-610 F9) ───────────────────────────────
+
+/** Problem codes of the reference audit (`engine/rv-reference-audit.ts`). */
+export const REFERENCE_PROBLEM_CODES = Object.freeze({
+  /** No node answers the stored path — error. */
+  unresolved: 'reference-unresolved',
+  /** A node answers only through a fallback lookup (suffix, sanitized, name) — warning. */
+  rescued: 'reference-rescued',
+} as const);
+
+/**
+ * Most entries per code; the rest is ONE summary entry. A badly broken document must
+ * not bury every other problem under thousands of rows.
+ */
+export const REFERENCE_PROBLEM_CAP = 200;
+
+/** Where a stored reference sits — the subset of an audit finding the store needs. */
+export interface ReferenceProblemLocation {
+  /** Registry path of the node carrying the reference (the entry's `nodePath`). */
+  referrerPath: string;
+  /** rv extras key of the component (`Drive_Cylinder`). */
+  componentType: string;
+  /** Top-level field key. */
+  field: string;
+  /** Element position of an array field. */
+  index?: number | undefined;
+  /** Location below `field[index]` (`targetObjects[1]`). */
+  subPath?: string | undefined;
+  /** The path as stored. */
+  writtenPath: string;
+  /** The reference's own target component type, when it carries one. */
+  targetComponentType?: string | undefined;
+}
+
+/** A reference no node answers. */
+export interface ReferenceUnresolvedReport extends ReferenceProblemLocation {
+  /**
+   * plan-765 F6: a node exists under the written path with a Three.js dedup
+   * suffix (`_1` … `_3`) — the mark of a file saved by an editor before
+   * plan-765. Adds {@link DEDUP_SUFFIX_HINT} to the detail; nothing else changes.
+   */
+  dedupSuffixExists?: boolean | undefined;
+}
+
+/** The F6 sentence, verbatim — one wording for the panel and the tests. */
+export const DEDUP_SUFFIX_HINT = 'A node exists under this path with a `_N` suffix: the file was saved by an editor '
+  + 'before plan-765 and should be re-exported from its source.';
+
+/** A reference that resolved only through a fallback lookup. */
+export interface ReferenceRescuedReport extends ReferenceProblemLocation {
+  /** Canonical path of the node it landed on. */
+  resolvedPath: string;
+  /** The fallback stage that hit (`suffix`, `sanitized`, `name-in-scope`). */
+  stage: string;
+}
+
+function referenceLocationKey(componentType: string, field: string, index?: number, subPath?: string): string {
+  let s = `${componentType}.${field}`;
+  if (index !== undefined) s += `[${index}]`;
+  if (subPath) s += subPath.startsWith('[') ? subPath : `.${subPath}`;
+  return s;
+}
+
+/** The problem id of an unresolved reference — one per (referrer, component, field, element). */
+export function referenceUnresolvedProblemId(
+  referrerPath: string, componentType: string, field: string, index?: number, subPath?: string,
+): string {
+  return `${REFERENCE_PROBLEM_CODES.unresolved}:${referrerPath}:${referenceLocationKey(componentType, field, index, subPath)}`;
+}
+
+/** The problem id of a rescued reference — one per (referrer, component, field, element). */
+export function referenceRescuedProblemId(
+  referrerPath: string, componentType: string, field: string, index?: number, subPath?: string,
+): string {
+  return `${REFERENCE_PROBLEM_CODES.rescued}:${referrerPath}:${referenceLocationKey(componentType, field, index, subPath)}`;
+}
+
+/** Report ONE unresolved reference (error). Re-reporting the same location replaces. */
+export function reportReferenceUnresolved(m: ReferenceUnresolvedReport): void {
+  const where = referenceLocationKey(m.componentType, m.field, m.index, m.subPath);
+  const target = m.targetComponentType ? ` (${m.targetComponentType})` : '';
+  reportProblem({
+    id: referenceUnresolvedProblemId(m.referrerPath, m.componentType, m.field, m.index, m.subPath),
+    severity: 'error',
+    code: REFERENCE_PROBLEM_CODES.unresolved,
+    title: `Reference not found: ${m.writtenPath}`,
+    detail: `${where} on "${m.referrerPath}" points at "${m.writtenPath}"${target} — no node with this path exists `
+      + 'in its asset or in the scene. The reference stays unbound. Fix the path, or restore the node it named.'
+      + (m.dedupSuffixExists === true ? ` ${DEDUP_SUFFIX_HINT}` : ''),
+    nodePath: m.referrerPath,
+  });
+}
+
+/** Report ONE reference found only by a fallback lookup (warning). Re-reporting replaces. */
+export function reportReferenceRescued(m: ReferenceRescuedReport): void {
+  const where = referenceLocationKey(m.componentType, m.field, m.index, m.subPath);
+  reportProblem({
+    id: referenceRescuedProblemId(m.referrerPath, m.componentType, m.field, m.index, m.subPath),
+    severity: 'warning',
+    code: REFERENCE_PROBLEM_CODES.rescued,
+    title: `Reference found by name only: ${m.writtenPath} → ${m.resolvedPath}`,
+    detail: `${where} on "${m.referrerPath}": "${m.writtenPath}" does not exist as written; a ${m.stage} lookup `
+      + `bound it to "${m.resolvedPath}". It works now but may bind a different node once the scene changes — `
+      + `change the path to "${m.resolvedPath}".`,
+    nodePath: m.referrerPath,
+  });
+}
+
+/** One summary entry for the findings beyond {@link REFERENCE_PROBLEM_CAP}. */
+function reportReferenceOverflow(code: string, severity: ProblemSeverity, more: number): void {
+  reportProblem({
+    id: `${code}:+more`,
+    severity,
+    code,
+    title: code === REFERENCE_PROBLEM_CODES.unresolved
+      ? `${more} more references not found`
+      : `${more} more references found by name only`,
+    detail: `The list shows the first ${REFERENCE_PROBLEM_CAP}; ${more} further references of this kind were found `
+      + 'and are not listed one by one.',
+  });
+}
+
+/** One audit finding as {@link reportReferenceAudit} takes it (an engine `ReferenceAuditFinding` fits). */
+export interface ReferenceAuditProblemInput extends ReferenceProblemLocation {
+  kind: 'unresolved' | 'rescued';
+  resolvedPath?: string | undefined;
+  stage?: string | undefined;
+  /** `unresolved` only — see {@link ReferenceUnresolvedReport.dedupSuffixExists}. */
+  dedupSuffixExists?: boolean | undefined;
+  /**
+   * `unresolved` only, plan-774 F7: the target lies inside this PLACED reference
+   * (registry path) and its bake did not keep it — reported as
+   * {@link REFERENCE_TARGET_BAKED_AWAY_CODE} instead of `reference-unresolved`.
+   */
+  bakedAwayIn?: string | undefined;
+  /** With {@link bakedAwayIn}: the stored target address, when there is one. */
+  targetAddress?: string | undefined;
+}
+
+/**
+ * Replace the reference problems with exactly what this audit found
+ * (retire-then-report, like {@link reportMissingReferences}: an unchanged document
+ * re-audited after every edit must not wake the panel).
+ */
+export function reportReferenceAudit(findings: readonly ReferenceAuditProblemInput[]): void {
+  const wanted = new Set<string>();
+  const unresolved: ReferenceUnresolvedReport[] = [];
+  const rescued: ReferenceRescuedReport[] = [];
+  const bakedAway: ReferenceTargetBakedAwayReport[] = [];
+  for (const f of findings) {
+    if (f.kind === 'unresolved' && typeof f.bakedAwayIn === 'string') {
+      bakedAway.push({ ...f, placementPath: f.bakedAwayIn, targetAddress: f.targetAddress });
+    } else if (f.kind === 'unresolved') unresolved.push(f);
+    else if (typeof f.resolvedPath === 'string' && typeof f.stage === 'string') {
+      rescued.push({ ...f, resolvedPath: f.resolvedPath, stage: f.stage });
+    }
+  }
+  const uShown = unresolved.slice(0, REFERENCE_PROBLEM_CAP);
+  const rShown = rescued.slice(0, REFERENCE_PROBLEM_CAP);
+  for (const m of uShown) wanted.add(referenceUnresolvedProblemId(m.referrerPath, m.componentType, m.field, m.index, m.subPath));
+  for (const m of rShown) wanted.add(referenceRescuedProblemId(m.referrerPath, m.componentType, m.field, m.index, m.subPath));
+  if (unresolved.length > REFERENCE_PROBLEM_CAP) wanted.add(`${REFERENCE_PROBLEM_CODES.unresolved}:+more`);
+  if (rescued.length > REFERENCE_PROBLEM_CAP) wanted.add(`${REFERENCE_PROBLEM_CODES.rescued}:+more`);
+
+  let removed = false;
+  for (const [id, entry] of [..._entries]) {
+    if (entry.code !== REFERENCE_PROBLEM_CODES.unresolved && entry.code !== REFERENCE_PROBLEM_CODES.rescued) continue;
+    if (wanted.has(id)) continue;
+    _entries.delete(id);
+    removed = true;
+  }
+  if (removed) notify();
+  for (const m of uShown) reportReferenceUnresolved(m);
+  for (const m of rShown) reportReferenceRescued(m);
+  if (unresolved.length > REFERENCE_PROBLEM_CAP) {
+    reportReferenceOverflow(REFERENCE_PROBLEM_CODES.unresolved, 'error', unresolved.length - REFERENCE_PROBLEM_CAP);
+  }
+  if (rescued.length > REFERENCE_PROBLEM_CAP) {
+    reportReferenceOverflow(REFERENCE_PROBLEM_CODES.rescued, 'warning', rescued.length - REFERENCE_PROBLEM_CAP);
+  }
+  reportReferenceTargetsBakedAway(bakedAway);
+}
+
+// ─── Honest references into placed content (plan-774 F7) ────────────────
+
+/**
+ * Problem code (F7): a reference of the OPEN document (a `ComponentReference`,
+ * a path field, a mechanism body / anchor) points at a node inside a placed
+ * reference that the referenced asset's bake did not keep — a plain part merged
+ * into a chunk. Same as at runtime: the reference stays unbound until the part
+ * carries a component in its own asset.
+ */
+export const REFERENCE_TARGET_BAKED_AWAY_CODE = 'reference-target-baked-away';
+
+/** One reference whose target was baked away inside a placed asset. */
+export interface ReferenceTargetBakedAwayReport extends ReferenceProblemLocation {
+  /** Registry path of the placed reference node the target lies in. */
+  placementPath: string;
+  /** The stored target address (`<p>#<id>`), when the reference is stored as one. */
+  targetAddress?: string | undefined;
+}
+
+/** One entry per (referrer, component, field, element) — like `reference-unresolved`. */
+export function referenceTargetBakedAwayProblemId(
+  referrerPath: string, componentType: string, field: string, index?: number, subPath?: string,
+): string {
+  return `${REFERENCE_TARGET_BAKED_AWAY_CODE}:${referrerPath}:${referenceLocationKey(componentType, field, index, subPath)}`;
+}
+
+/**
+ * Replace the `reference-target-baked-away` entries with exactly `list`
+ * (retire-then-report; the audit re-runs per materialisation and per edit).
+ */
+export function reportReferenceTargetsBakedAway(list: readonly ReferenceTargetBakedAwayReport[]): void {
+  const shown = list.slice(0, REFERENCE_PROBLEM_CAP);
+  const wanted = new Set(shown.map((m) => referenceTargetBakedAwayProblemId(m.referrerPath, m.componentType, m.field, m.index, m.subPath)));
+  let removed = false;
+  for (const [id, entry] of [..._entries]) {
+    if (entry.code !== REFERENCE_TARGET_BAKED_AWAY_CODE || wanted.has(id)) continue;
+    _entries.delete(id);
+    removed = true;
+  }
+  if (removed) notify();
+  for (const m of shown) {
+    const where = referenceLocationKey(m.componentType, m.field, m.index, m.subPath);
+    const target = m.targetAddress ?? m.writtenPath;
+    const placed = lastSegmentOf(m.placementPath);
+    reportProblem({
+      id: referenceTargetBakedAwayProblemId(m.referrerPath, m.componentType, m.field, m.index, m.subPath),
+      severity: 'error',
+      code: REFERENCE_TARGET_BAKED_AWAY_CODE,
+      title: `Reference into placed asset ${placed} has no target: ${target}`,
+      detail: `${where} on "${m.referrerPath}" points at "${target}" inside the placed asset "${m.placementPath}". `
+        + 'That node is a plain part, which the asset\'s bake merges away — only nodes with a component stay '
+        + 'addressable inside a placed asset. Open that asset (double-click the reference), give the part a '
+        + 'component there and save it, or point the reference at a node that has one.',
+      nodePath: m.referrerPath,
+    });
+  }
+}
+
+/**
+ * Problem code (F7): a `Kinematic` of the open document integrates a group
+ * (`IntegrateGroupEnable`) that has members inside a placed reference. A
+ * placed asset is baked on its own; its parts are never re-parented under the
+ * open document's kinematic axis, so they do not move with it.
+ */
+export const KINEMATIC_MEMBER_IN_PLACED_CONTENT_CODE = 'kinematic-member-in-placed-content';
+
+/** One kinematic node whose group reaches into placed content. */
+export interface KinematicMemberInPlacedContentReport {
+  /** Registry path of the node carrying the `Kinematic`. */
+  kinematicPath: string;
+  /** Resolved group name. */
+  groupName: string;
+  /** How many members of the group lie inside placed content. */
+  memberCount: number;
+  /** Registry paths (or names) of the placed reference nodes they lie in. */
+  placementPaths: string[];
+}
+
+/** One entry per (kinematic node, group). */
+export function kinematicMemberInPlacedContentProblemId(kinematicPath: string, groupName: string): string {
+  return `${KINEMATIC_MEMBER_IN_PLACED_CONTENT_CODE}:${kinematicPath}:${groupName}`;
+}
+
+/** Replace the `kinematic-member-in-placed-content` entries with exactly `list`. */
+export function reportKinematicMembersInPlacedContent(list: readonly KinematicMemberInPlacedContentReport[]): void {
+  const wanted = new Set(list.map((m) => kinematicMemberInPlacedContentProblemId(m.kinematicPath, m.groupName)));
+  let removed = false;
+  for (const [id, entry] of [..._entries]) {
+    if (entry.code !== KINEMATIC_MEMBER_IN_PLACED_CONTENT_CODE || wanted.has(id)) continue;
+    _entries.delete(id);
+    removed = true;
+  }
+  if (removed) notify();
+  for (const m of list) {
+    const assets = m.placementPaths.map((p) => `"${p}"`).join(', ');
+    reportProblem({
+      id: kinematicMemberInPlacedContentProblemId(m.kinematicPath, m.groupName),
+      severity: 'warning',
+      code: KINEMATIC_MEMBER_IN_PLACED_CONTENT_CODE,
+      title: `Kinematic group ${m.groupName} reaches into a placed asset`,
+      detail: `The Kinematic on "${m.kinematicPath}" integrates group "${m.groupName}", and ${m.memberCount} of its `
+        + `member${m.memberCount === 1 ? '' : 's'} lie inside the placed asset${m.placementPaths.length === 1 ? '' : 's'} ${assets}. `
+        + 'A placed asset is baked on its own, so those parts do not move with this axis. Move the group into the '
+        + 'asset (open it with a double-click on the reference) or take the group off the placed parts.',
+      nodePath: m.kinematicPath,
+    });
+  }
+}
+
+/** Last path segment — the display name of a placement path. */
+function lastSegmentOf(path: string): string {
+  const i = path.lastIndexOf('/');
+  return i >= 0 ? path.slice(i + 1) : path;
+}
+
+/** Drop every unresolved-reference problem. */
+export function clearReferenceUnresolvedProblems(): void {
+  clearProblemsOfCode(REFERENCE_PROBLEM_CODES.unresolved);
+}
+
+/** Drop every rescued-reference problem. */
+export function clearReferenceRescuedProblems(): void {
+  clearProblemsOfCode(REFERENCE_PROBLEM_CODES.rescued);
+}
+
+/** Drop every reference-audit code — the document changed (plan-774: incl. the placed-content findings). */
+export function clearReferenceAuditProblems(): void {
+  clearReferenceUnresolvedProblems();
+  clearReferenceRescuedProblems();
+  clearProblemsOfCode(REFERENCE_TARGET_BAKED_AWAY_CODE);
+  clearProblemsOfCode(KINEMATIC_MEMBER_IN_PLACED_CONTENT_CODE);
+}
+
+// ─── Reference migration on load (plan-769 Phase 1a, F4) ────────────────
+
+/**
+ * Problem codes of the migration on load (`rv-decode-identity.ts`): what the
+ * file's authored index says about a stored path that the path audit cannot see.
+ * A MISSING target stays the audit's `reference-unresolved` — since plan-769 Phase 1b
+ * never `reference-rescued`: a reference the file carries is not read by a guessing
+ * stage any more.
+ */
+export const REFERENCE_MIGRATION_PROBLEM_CODES = Object.freeze({
+  /** The written path names more than one node of its file — kept, never guessed. */
+  ambiguous: 'reference-ambiguous',
+  /** The written path exists only in the loader's (Three.js) spelling, not in the authored names. */
+  legacySpelling: 'reference-legacy-spelling',
+  /** The written path names a node the bake created (a partition / chunk), not one of the file. */
+  syntheticTarget: 'reference-target-synthetic',
+} as const);
+
+/** One finding of the migration on load, located in the live scene. */
+export interface ReferenceMigrationProblem {
+  kind: keyof typeof REFERENCE_MIGRATION_PROBLEM_CODES;
+  /** Registry path of the node carrying the reference. */
+  referrerPath: string;
+  /** rv extras key of the component. */
+  componentType: string;
+  /** Location label (`steps[0].targetObjects[1]`). */
+  field: string;
+  /** The path as stored. */
+  writtenPath: string;
+}
+
+/** The problem id of a migration finding — one per (code, referrer, component, field). */
+export function referenceMigrationProblemId(m: ReferenceMigrationProblem): string {
+  return `${REFERENCE_MIGRATION_PROBLEM_CODES[m.kind]}:${m.referrerPath}:${m.componentType}.${m.field}`;
+}
+
+const MIGRATION_DETAIL: Readonly<Record<ReferenceMigrationProblem['kind'], string>> = {
+  ambiguous: 'matches more than one node of its file (two parts share this path). The reference is kept as written '
+    + 'and not bound by guessing; make the names unique in the source and re-export.',
+  legacySpelling: 'exists only in the loader\'s renamed spelling (a `_N` / sanitized name), not in the names the '
+    + 'file authored. It binds, but a re-export or rename can break it; write the authored path in the source.',
+  syntheticTarget: 'names a node the viewer created while optimising the model (a merged chunk or group '
+    + 'partition), not a part of the file. Such nodes have no identity; point the reference at a real part.',
+};
+
+/**
+ * Report migration findings (add / replace by id). Capped per code at
+ * {@link REFERENCE_PROBLEM_CAP}; the rest is one summary entry per code. Dropped by
+ * {@link clearReferenceMigrationProblems} in `clearModel()`.
+ */
+export function reportReferenceMigrationProblems(list: readonly ReferenceMigrationProblem[]): void {
+  if (list.length === 0) return;
+  const shown = new Map<string, number>();
+  for (const e of _entries.values()) {
+    if (Object.values(REFERENCE_MIGRATION_PROBLEM_CODES).includes(e.code as never) && !e.id.endsWith(':+more')) {
+      shown.set(e.code, (shown.get(e.code) ?? 0) + 1);
+    }
+  }
+  const more = new Map<string, number>();
+  for (const m of list) {
+    const id = referenceMigrationProblemId(m);
+    const code = REFERENCE_MIGRATION_PROBLEM_CODES[m.kind];
+    if (!_entries.has(id) && (shown.get(code) ?? 0) >= REFERENCE_PROBLEM_CAP) {
+      more.set(code, (more.get(code) ?? 0) + 1);
+      continue;
+    }
+    if (!_entries.has(id)) shown.set(code, (shown.get(code) ?? 0) + 1);
+    reportProblem({
+      id,
+      severity: m.kind === 'legacySpelling' ? 'warning' : 'error',
+      code: REFERENCE_MIGRATION_PROBLEM_CODES[m.kind],
+      title: m.kind === 'ambiguous'
+        ? `Reference is ambiguous (kept): ${m.writtenPath}`
+        : m.kind === 'legacySpelling'
+          ? `Reference uses a renamed spelling: ${m.writtenPath}`
+          : `Reference targets a generated node: ${m.writtenPath}`,
+      detail: `${m.componentType}.${m.field} on "${m.referrerPath}": "${m.writtenPath}" ${MIGRATION_DETAIL[m.kind]}`,
+      nodePath: m.referrerPath,
+    });
+  }
+  for (const [code, n] of more) {
+    const id = `${code}:+more`;
+    const prev = Number(/^(\d+)/.exec(_entries.get(id)?.title ?? '')?.[1] ?? 0);
+    reportProblem({
+      id,
+      severity: 'warning',
+      code,
+      title: `${prev + n} more references (${code})`,
+      detail: `The list shows the first ${REFERENCE_PROBLEM_CAP}; further references of this kind were found and `
+        + 'are not listed one by one.',
+    });
+  }
+}
+
+/** Drop every migration finding — the document changed. */
+export function clearReferenceMigrationProblems(): void {
+  for (const code of Object.values(REFERENCE_MIGRATION_PROBLEM_CODES)) clearProblemsOfCode(code);
+  for (const code of Object.values(ID_VERSION_PROBLEM_CODES)) clearProblemsOfCode(code);
+  for (const code of Object.values(USER_PATH_PROBLEM_CODES)) clearProblemsOfCode(code);
+  for (const code of Object.values(SAVE_IDENTITY_PROBLEM_CODES)) clearProblemsOfCode(code);
+}
+
+// ─── Id format of a document (plan-769 Phase 1b, 9.19) ─────────────────
+
+/** Problem codes of a document's `idVersion` (`scenes[0].extras.realvirtual.idVersion`). */
+export const ID_VERSION_PROBLEM_CODES = Object.freeze({
+  /** The file was written by a NEWER viewer: its references are read as they are, not migrated. */
+  newer: 'id-version-newer',
+} as const);
+
+/**
+ * Report a document whose id format is newer than this viewer's (9.19): a warning,
+ * its references stay as stored. One entry per file. Cleared with the model.
+ */
+export function reportIdVersionNewer(m: { file: string; idVersion: number; supported: number; nodePath?: string }): void {
+  reportProblem({
+    id: `${ID_VERSION_PROBLEM_CODES.newer}:${m.file}`,
+    severity: 'warning',
+    code: ID_VERSION_PROBLEM_CODES.newer,
+    title: `Document written by a newer viewer (id format ${m.idVersion})`,
+    detail: `"${m.file}" stores node ids in format ${m.idVersion}; this viewer reads format ${m.supported}. `
+      + 'Its references are read as stored (not migrated) — what this viewer does not understand stays '
+      + 'unresolved. Open the document with a current viewer.',
+    ...(m.nodePath ? { nodePath: m.nodePath } : {}),
+  });
+}
+
+// ─── Paths typed by plugins / users (plan-769 F9) ───────────────────────
+
+/**
+ * Problem codes of a PATH INPUT (`NodeRegistry.findNodeForUser`) that a plugin or a
+ * load script resolves: nothing answers, or only a guessing stage does (until
+ * plan-770). Never a stored reference — those are `reference-*`.
+ */
+export const USER_PATH_PROBLEM_CODES = Object.freeze({
+  notFound: 'plugin-path-not-found',
+  guessed: 'plugin-path-guessed',
+} as const);
+
+/**
+ * Report a plugin's path input that missed or only bound through a guess (F9). A
+ * guessed hit is still used for the input — the entry makes it visible before it
+ * could ever be stored. One entry per (plugin, path). Cleared with the model.
+ */
+export function reportPluginPathProblem(m: {
+  plugin: string;
+  path: string;
+  kind: keyof typeof USER_PATH_PROBLEM_CODES;
+  /** Registry path of the node a guess landed on. */
+  matchedPath?: string;
+  /** What the plugin wanted the node for. */
+  purpose?: string;
+}): void {
+  const code = USER_PATH_PROBLEM_CODES[m.kind];
+  const what = m.purpose ? ` (${m.purpose})` : '';
+  reportProblem({
+    id: `${code}:${m.plugin}:${m.path}`,
+    severity: 'warning',
+    code,
+    title: m.kind === 'notFound'
+      ? `Plugin path not found: ${m.path}`
+      : `Plugin path matched only by guessing: ${m.path}`,
+    detail: m.kind === 'notFound'
+      ? `Plugin "${m.plugin}" looks for "${m.path}"${what}, but no node of the loaded model has this path — `
+        + 'neither as shown in the hierarchy nor as authored in the file. The plugin feature does nothing; '
+        + 'update the path in the plugin.'
+      : `Plugin "${m.plugin}" looks for "${m.path}"${what}; only a fallback lookup matched `
+        + `"${m.matchedPath ?? '?'}". It is used for now, but may be the wrong part — write the exact path in the plugin.`,
+    ...(m.matchedPath ? { nodePath: m.matchedPath } : {}),
+  });
+}
+
+// ─── Ids and references written by a save (plan-769 Phase 3) ──────────
+
+/** Problem codes of the id / reference writer of a save (`rv-reference-writer.ts`). */
+export const SAVE_IDENTITY_PROBLEM_CODES = Object.freeze({
+  /** Two exported nodes carried one NodeId; the later one was given a new id. */
+  duplicateReminted: 'node-id-duplicate-reminted',
+  /** A reference written this session reached its target only through a guessing stage (F9). */
+  savedFromGuess: 'reference-saved-from-guess',
+  /** F21: a reference into another document names an id that document has not saved yet. */
+  targetUnsaved: 'reference-target-unsaved',
+} as const);
+
+/**
+ * plan-769 F21 — warn that a reference was written to a node whose id exists only in this
+ * session, inside another document: save that document first, or the reference is an
+ * orphan after the next reload. One entry per (referrer, address). Cleared with the model.
+ */
+export function reportReferenceTargetUnsaved(m: { referrerPath: string; address: string; targetPath: string; documentName: string }): void {
+  reportProblem({
+    id: `${SAVE_IDENTITY_PROBLEM_CODES.targetUnsaved}:${m.referrerPath}:${m.address}`,
+    severity: 'warning',
+    code: SAVE_IDENTITY_PROBLEM_CODES.targetUnsaved,
+    title: `Save document "${m.documentName}" first`,
+    detail: `"${m.referrerPath}" now references "${m.targetPath}" in "${m.documentName}", whose id was created in this `
+      + `session and is not in that document's file yet. Save "${m.documentName}" before this document, or the reference `
+      + 'is lost on the next load.',
+    nodePath: m.referrerPath,
+  });
+}
+
+/**
+ * Report what the save's writer had to decide on its own: re-minted duplicate ids, and
+ * references stored as the address of a GUESSED target (F9 — written, but visible,
+ * because the guess is now permanent). One entry per id / per (referrer, field, path).
+ * Cleared with the model ({@link clearReferenceMigrationProblems}).
+ */
+export function reportSaveIdentityProblems(m: {
+  reminted: ReadonlyArray<{ id: string; reminted: string; nodePath: string }>;
+  guessed: ReadonlyArray<{
+    referrerPath: string; componentType: string; field: string; writtenPath: string; targetPath: string; stage?: string;
+  }>;
+}): void {
+  for (const d of m.reminted.slice(0, REFERENCE_PROBLEM_CAP)) {
+    reportProblem({
+      id: `${SAVE_IDENTITY_PROBLEM_CODES.duplicateReminted}:${d.id}:${d.nodePath}`,
+      severity: 'warning',
+      code: SAVE_IDENTITY_PROBLEM_CODES.duplicateReminted,
+      title: `Duplicate node id re-minted: ${d.nodePath}`,
+      detail: `"${d.nodePath}" carried the id ${d.id}, which another node of the document also carries. `
+        + `It was saved with the new id ${d.reminted}; references to ${d.id} keep naming the other node.`,
+      nodePath: d.nodePath,
+    });
+  }
+  for (const g of m.guessed.slice(0, REFERENCE_PROBLEM_CAP)) {
+    reportProblem({
+      id: `${SAVE_IDENTITY_PROBLEM_CODES.savedFromGuess}:${g.referrerPath}:${g.componentType}.${g.field}:${g.writtenPath}`,
+      severity: 'warning',
+      code: SAVE_IDENTITY_PROBLEM_CODES.savedFromGuess,
+      title: `Reference saved from a guess: ${g.writtenPath}`,
+      detail: `${g.componentType}.${g.field} on "${g.referrerPath}": "${g.writtenPath}" matched "${g.targetPath}" `
+        + `only through the "${g.stage ?? 'fallback'}" lookup stage. It is now stored as that node's id — `
+        + 'check it is the intended part, or set the reference again.',
+      nodePath: g.referrerPath,
+    });
+  }
+}
+
+/** Drop every plugin path finding. Also part of {@link clearReferenceMigrationProblems}. */
+export function clearPluginPathProblems(): void {
+  for (const code of Object.values(USER_PATH_PROBLEM_CODES)) clearProblemsOfCode(code);
+}
+
 
 // ─── Signal name collisions (plan-589) ──────────────────────────────────
 
@@ -407,6 +1144,114 @@ export function reportSignalNameCollision(
 export function clearSignalNameCollisionProblems(): void {
   clearProblemsOfCode('signal-name-collision');
 }
+
+// ─── Instruction targets (CustomRuntimeInstruction, plan-769 Phase 0a) ──
+
+/** Problem code: a CustomRuntimeInstruction step names a target node the loaded model does not have. */
+export const UNRESOLVED_INSTRUCTION_TARGET_CODE = 'unresolved-instruction-target';
+
+/**
+ * Drop every unresolved-instruction-target problem — the document changed.
+ * The instruction reports its targets at init; without this clear an entry of
+ * the previous model stayed in the panel after a model switch (plan-769 F16).
+ */
+export function clearUnresolvedInstructionTargetProblems(): void {
+  clearProblemsOfCode(UNRESOLVED_INSTRUCTION_TARGET_CODE);
+}
+
+// ─── Instance collisions (plan-559 Phase 2a) ────────────────────────────
+//
+// Two warnings about copies of the same asset that are NOT placements (embedded
+// in the document): they report, they never change behaviour (decision D7/A1 —
+// warn, don't auto-instance, don't forbid). Both are per-document: they are
+// dropped when another document starts loading (below), and a path component
+// drops its own entry when it leaves the scene.
+
+/** Problem code: one scoped signal name is claimed by several component nodes outside a placement. */
+export const INSTANCE_SIGNAL_COLLISION_CODE = 'instance-signal-collision';
+
+/** Problem code: several path nodes register the same (global) path id. */
+export const PATH_ID_COLLISION_CODE = 'path-id-collision';
+
+/** The problem id of a colliding instance signal name — ONE entry per name. */
+export function instanceSignalCollisionProblemId(name: string): string {
+  return `${INSTANCE_SIGNAL_COLLISION_CODE}:${name}`;
+}
+
+/**
+ * Report that several nodes OUTSIDE any placement claim the same PLC signal
+ * name — typically two embedded copies of one asset without an `InstanceScope`
+ * marker, whose generated signals (`Flow.Run`, …) then share one symbol. A
+ * warning: the model loads and runs, and the copies keep sharing the signal.
+ *
+ * ONE entry per name (re-reporting replaces), every claiming node path in
+ * `detail`, `nodePath` on the one that triggered the report.
+ */
+export function reportInstanceSignalCollision(
+  name: string, paths: readonly string[], nodePath?: string,
+): void {
+  const list = [...paths].sort();
+  reportProblem({
+    id: instanceSignalCollisionProblemId(name),
+    severity: 'warning',
+    code: INSTANCE_SIGNAL_COLLISION_CODE,
+    title: `Signal "${name}" is claimed by ${list.length} components`,
+    detail: `These nodes all register the PLC signal "${name}": ${list.join(', ')}. `
+      + 'They are not placements, so nothing separates their signals — they share ONE signal, and a '
+      + 'binding or a PLC interface drives all of them together. If they are copies of one asset that '
+      + 'should run independently, add an InstanceScope component to the root of each copy (its name, or '
+      + 'the name of its PrefixNode, becomes the signal prefix).',
+    ...(nodePath ? { nodePath } : {}),
+  });
+}
+
+/** Drop every instance-signal-collision problem. */
+export function clearInstanceSignalCollisionProblems(): void {
+  clearProblemsOfCode(INSTANCE_SIGNAL_COLLISION_CODE);
+}
+
+/** The problem id of a colliding path id — ONE entry per id. */
+export function pathIdCollisionProblemId(id: string): string {
+  return `${PATH_ID_COLLISION_CODE}:${id}`;
+}
+
+/**
+ * Report that several path nodes register the same path id. Path ids are
+ * global in the path network (the last registration wins the id), so routing
+ * follows only one of them. A warning; nothing about the routing changes.
+ */
+export function reportPathIdCollision(
+  id: string, paths: readonly string[], nodePath?: string,
+): void {
+  const list = [...new Set(paths)].sort();
+  reportProblem({
+    id: pathIdCollisionProblemId(id),
+    severity: 'warning',
+    code: PATH_ID_COLLISION_CODE,
+    title: `Path id "${id}" is used by ${list.length} paths`,
+    detail: `These path nodes all register the path id "${id}": ${list.join(', ')}. `
+      + 'Path ids are global: the path network keeps only the last one registered, so vehicles and '
+      + 'successor links reach only that path. Give each path a unique id.',
+    ...(nodePath ? { nodePath } : {}),
+  });
+}
+
+/** Drop the path-id-collision problem of one id. */
+export function clearPathIdCollisionProblem(id: string): void {
+  clearProblem(pathIdCollisionProblemId(id));
+}
+
+/** Drop every path-id-collision problem. */
+export function clearPathIdCollisionProblems(): void {
+  clearProblemsOfCode(PATH_ID_COLLISION_CODE);
+}
+
+// Per-document: a new document starts without the previous one's collisions.
+// (The viewer sets the document when a load STARTS, before anything reports.)
+subscribeProblemsDocument(() => {
+  clearInstanceSignalCollisionProblems();
+  clearPathIdCollisionProblems();
+});
 
 // ─── Signal reconcile (plan-589 F6) ─────────────────────────────────────
 
@@ -497,9 +1342,14 @@ export function reportSignalReconcileProblems(
   report: SignalReconcileSummary,
   creatable: readonly string[] = [],
 ): void {
+  // An interface the model couples to NOT ONE signal of (nothing mapped, no variant, no
+  // mismatch, no missing address) is unrelated to this model — e.g. another project's gateway
+  // config. "Your N model signals are not configured on it" is then noise, not a finding.
+  const coupled = report.entries.some((e) => e.category !== 'missing-in-plc' && e.category !== 'plc-only');
   const byCategory = new Map<string, string[]>();
   for (const entry of report.entries) {
     if (!(entry.category in RECONCILE_PROBLEM_KIND)) continue;
+    if (entry.category === 'missing-in-plc' && !coupled) continue;
     const list = byCategory.get(entry.category) ?? [];
     list.push(entry.name);
     byCategory.set(entry.category, list);
@@ -550,9 +1400,49 @@ export function clearSignalReconcileProblems(interfaceId?: string): void {
 export const NESTED_REFERENCE_PROBLEM_CODES = {
   cycle: 'reference-cycle',
   depth: 'reference-depth',
+  // plan-650 Phase 5b: the same refusals for nested child FAMILIES.
+  'parametric-cycle': 'parametric-cycle',
+  'parametric-depth': 'parametric-depth',
+  'parametric-budget': 'parametric-budget',
 } as const;
 
 export type NestedReferenceRefusalReason = keyof typeof NESTED_REFERENCE_PROBLEM_CODES;
+
+/** plan-650 Phase 5b: a nested child family is not available in the project. */
+export const PARAMETRIC_CHILD_MISSING_CODE = 'parametric-child-missing';
+
+/** Report a missing child family (plan-650 Phase 5b) - the parent variant stays standing. */
+export function reportParametricChildMissing(m: { family: string; nodePath: string; parentId: string }): void {
+  reportProblem({
+    id: `${PARAMETRIC_CHILD_MISSING_CODE}:${m.nodePath}`,
+    severity: 'error',
+    code: PARAMETRIC_CHILD_MISSING_CODE,
+    title: `Child family "${m.family}" is missing`,
+    detail: `The parametric placement "${m.parentId}" places the child family "${m.family}", which is not in this project. `
+      + 'The parent stands without the child - import the family bundle again or add the child family to the project library.',
+    nodePath: m.nodePath,
+  });
+}
+
+/**
+ * plan-650 Phase 5b: child families a share export could not bundle, or an
+ * import could not find - one entry per family, same code as at load time.
+ */
+export function reportParametricBundleMissing(m: { families: string[]; phase: 'export' | 'import'; document?: string }): void {
+  for (const family of m.families) {
+    reportProblem({
+      id: `${PARAMETRIC_CHILD_MISSING_CODE}:${m.phase}:${family}`,
+      severity: 'warning',
+      code: PARAMETRIC_CHILD_MISSING_CODE,
+      title: `Child family "${family}" is missing`,
+      detail: m.phase === 'export'
+        ? `The shared file${m.document ? ` "${m.document}"` : ''} declares the child family "${family}", but its exact document `
+          + '(the declared DocHash) is not in this project - the receiver will see the parent without it.'
+        : `The imported file${m.document ? ` "${m.document}"` : ''} declares the child family "${family}", which neither the bundle `
+          + 'nor this project contains - the parent stands without it.',
+    });
+  }
+}
 
 /** The ONE aggregated per-load entry of the placement cap (F9). */
 export const PLACEMENT_CAP_PROBLEM_CODE = 'placement-cap';
@@ -587,7 +1477,19 @@ export function reportNestedReferenceRefused(m: NestedReferenceRefusedReport): v
   const where = m.chain.length > 0 ? ` (nesting: ${[...m.chain, m.assetKey].join(' → ')})` : '';
   let title: string;
   let detail: string;
-  if (m.reason === 'cycle') {
+  if (m.reason === 'parametric-cycle') {
+    title = `Parametric family cycle at ${m.label}`;
+    detail = `Family "${m.assetKey}" places itself as a child through its nesting${where}. The child shows a placeholder - `
+      + 'remove the child from the family rules or use a different child family.';
+  } else if (m.reason === 'parametric-depth') {
+    title = `Parametric families nested too deep at ${m.label}`;
+    detail = `The child family "${m.assetKey}" would be nested deeper than 4 family levels${where}. The child shows a placeholder - `
+      + 'flatten the family hierarchy.';
+  } else if (m.reason === 'parametric-budget') {
+    title = `Parametric child budget exceeded at ${m.label}`;
+    detail = `The child family "${m.assetKey}" exceeds the combined budget of its placement (child placements or vertices over all levels)${where}. `
+      + 'The child shows a placeholder - reduce the number or size of child families.';
+  } else if (m.reason === 'cycle') {
     title = `Reference cycle at ${m.label}`;
     detail = `Asset "${m.assetKey}" references itself through its nesting${where}. The reference shows a placeholder — `
       + 'remove the reference from the asset, or reference a different asset.';
@@ -712,6 +1614,127 @@ export function clearNestedReferenceProblems(): void {
   for (const code of Object.values(NESTED_REFERENCE_PROBLEM_CODES)) clearProblemsOfCode(code);
   clearProblemsOfCode(PLACEMENT_CAP_PROBLEM_CODE);
   clearProblemsOfCode(PLACEMENT_REGISTER_FAILED_CODE);
+  // plan-774: per-document as well (F11 legacy content, F3 join budget).
+  clearProblemsOfCode(REFERENCE_CONTENT_DISCARDED_CODE);
+  clearProblemsOfCode(PLACEMENTS_STILL_LOADING_CODE);
+  clearProblemsOfCode(REPLAY_OP_SKIPPED_CODE);
+}
+
+// ─── Editor loads defer references (plan-774) ───────────────────────────
+
+/**
+ * Problem code (F11): a non-embedded reference node of the file already carried
+ * children. A reference is a placement — its content comes from the referenced
+ * asset — so the stored children (an old double-graft, a hand edit) were
+ * discarded at load instead of being shown twice.
+ */
+export const REFERENCE_CONTENT_DISCARDED_CODE = 'reference-content-discarded';
+
+/** One entry per reference node; a re-load replaces. */
+export function referenceContentDiscardedProblemId(nodePath: string): string {
+  return `${REFERENCE_CONTENT_DISCARDED_CODE}:${nodePath}`;
+}
+
+/** Report the stored children of one reference node that the load discarded. */
+export function reportReferenceContentDiscarded(m: { nodePath: string; label: string; count: number }): void {
+  reportProblem({
+    id: referenceContentDiscardedProblemId(m.nodePath),
+    severity: 'warning',
+    code: REFERENCE_CONTENT_DISCARDED_CODE,
+    title: `Stored content under reference ${m.label} was ignored`,
+    detail: `The reference node "${m.label}" carried ${m.count} child node${m.count === 1 ? '' : 's'} in the file. `
+      + 'A reference shows the content of the asset it points at, so the stored copy was not loaded — '
+      + 'otherwise it would appear twice. Saving the document writes the reference without it. To change '
+      + 'the referenced asset, open it (double-click the reference) and edit it there.',
+    nodePath: m.nodePath,
+  });
+}
+
+/**
+ * Problem code (F3): the editor's authoring join ran out of its time budget
+ * before every placed reference was materialised. The editor is usable; edits
+ * inside placed content wait until the references have arrived.
+ */
+export const PLACEMENTS_STILL_LOADING_CODE = 'placements-still-loading';
+
+/** Report that the placements of the open document are still loading. ONE entry per document. */
+export function reportPlacementsStillLoading(m: { label: string; pending: number; total: number }): void {
+  reportProblem({
+    id: PLACEMENTS_STILL_LOADING_CODE,
+    severity: 'warning',
+    code: PLACEMENTS_STILL_LOADING_CODE,
+    title: `${m.pending} of ${m.total} placed reference${m.total === 1 ? '' : 's'} still loading`,
+    detail: `"${m.label}" opened before all of its placed references were ready. They keep loading in the `
+      + 'background; changes inside them are applied once they have arrived. If this entry does not go away, '
+      + 'a referenced file could not be fetched — reopen the document.',
+  });
+}
+
+/** Drop the still-loading entry — the placements arrived, or the document changed. */
+export function clearPlacementsStillLoading(): void {
+  clearProblemsOfCode(PLACEMENTS_STILL_LOADING_CODE);
+}
+
+/**
+ * Problem code (F8): a replayed edit (recovered draft, undo-by-recompose,
+ * projection switch) targets a node INSIDE a placed reference that is not
+ * there — typically an old draft whose path pointed into grafted CAD parts
+ * that the placed asset's bake merges away. The edit was not applied.
+ */
+export const REPLAY_OP_SKIPPED_CODE = 'replay-op-skipped';
+
+/** One skipped op as the replay reports it. */
+export interface ReplayOpSkippedReport {
+  /** The op kind (`setField`, …). */
+  kind: string;
+  /** The target path the op carried. */
+  nodePath: string;
+  /**
+   * Why it did not land (plan-774 review fix E4): `baked-away` (default) — the
+   * placement is there, its bake merged the node away; `not-loaded` — the
+   * placement did not materialise (placeholder), the edit is kept; `still-loading`
+   * — the placement was still materialising when the wait ran out, the edit is kept.
+   */
+  reason?: 'baked-away' | 'not-loaded' | 'still-loading';
+}
+
+/** The problem id of a skipped replay op — one per (path, op kind). */
+export function replayOpSkippedProblemId(nodePath: string, kind: string): string {
+  return `${REPLAY_OP_SKIPPED_CODE}:${nodePath}:${kind}`;
+}
+
+/** Report the ops of one replay that were skipped under a reference — one entry per (path, kind). */
+export function reportReplayOpsSkipped(skips: readonly ReplayOpSkippedReport[], documentLabel: string): void {
+  const byId = new Map<string, { m: ReplayOpSkippedReport; count: number }>();
+  for (const m of skips) {
+    const id = replayOpSkippedProblemId(m.nodePath, m.kind);
+    const hit = byId.get(id);
+    if (hit) hit.count++;
+    else byId.set(id, { m, count: 1 });
+  }
+  for (const [id, { m, count }] of byId) {
+    const edits = `${count === 1 ? 'A recorded edit' : `${count} recorded edits`} (${m.kind}) of "${documentLabel}" target`;
+    const reason = m.reason ?? 'baked-away';
+    const detail = reason === 'baked-away'
+      ? `${edits} "${m.nodePath}", which lies inside a placed asset and does not exist there. A placed asset is baked: `
+        + 'only nodes with a component stay addressable. The edit was skipped. To make it, open that asset '
+        + '(double-click the reference) and change it there.'
+      : reason === 'not-loaded'
+        ? `${edits} "${m.nodePath}", inside a placed asset that is not loaded (its file could not be opened). `
+          + 'The edit was not applied, but it is kept: it applies as soon as the asset loads again.'
+        : `${edits} "${m.nodePath}", inside a placed asset that is still loading. `
+          + 'The edit was not applied yet, but it is kept: reopen the document once the asset has loaded.';
+    reportProblem({
+      id,
+      severity: 'warning',
+      code: REPLAY_OP_SKIPPED_CODE,
+      title: reason === 'baked-away'
+        ? `Edit not applied: ${m.kind} on ${m.nodePath}`
+        : `Edit not applied (placement ${reason === 'not-loaded' ? 'not loaded' : 'still loading'}): ${m.kind} on ${m.nodePath}`,
+      detail,
+      nodePath: m.nodePath,
+    });
+  }
 }
 
 // ─── Plugin bake claims on a placement (plan-757 §2.6 / D5) ─────────────
@@ -789,6 +1812,54 @@ export function reportBakeFailed(m: BakeFailedReport): void {
 /** Drop every failed-bake problem — the document changed. */
 export function clearBakeFailedProblems(): void {
   clearProblemsOfCode('bake-failed');
+}
+
+// ─── References lost by a save (plan-765 F5) ────────────────────────────
+
+/** Problem code of the save guard: the written file resolves fewer references than the document it came from. */
+export const SAVE_REFERENCE_LOSS_CODE = 'save-reference-loss';
+
+/** The problem id of a save's reference loss — one per document, so the next save replaces or clears it. */
+export function saveReferenceLossProblemId(documentId: string): string {
+  return `${SAVE_REFERENCE_LOSS_CODE}:${documentId}`;
+}
+
+/**
+ * Report that a save wrote a file in which `after - before` more references are
+ * unresolved than in the tree it was written from (warning). The file WAS
+ * written — the guard never blocks (plan-765 decision Q5); this entry is how
+ * the user learns the file lost something. `byField` is the per-field increase
+ * (`Component.field` → count). A non-positive delta clears instead.
+ *
+ * Not cleared on a model change (unlike the load-time codes): it describes a
+ * FILE that now exists, and the next save of the same document is what retires it.
+ */
+export function reportSaveReferenceLoss(
+  documentId: string,
+  before: number,
+  after: number,
+  byField: Readonly<Record<string, number>>,
+): void {
+  const delta = after - before;
+  if (delta <= 0) { clearSaveReferenceLoss(documentId); return; }
+  const fields = Object.entries(byField)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([k, n]) => `${k} ${n}`)
+    .join(' · ');
+  reportProblem({
+    id: saveReferenceLossProblemId(documentId),
+    severity: 'warning',
+    code: SAVE_REFERENCE_LOSS_CODE,
+    title: `Save left ${delta} reference(s) unresolved`,
+    detail: `The file written for "${documentId}" has ${after} unresolved reference(s), the document it was saved `
+      + `from had ${before}${fields ? ` — ${fields}` : ''}. The file was written; the lost references name nodes `
+      + 'under a spelling the file no longer contains. Keep the previous file, and report this together with it.',
+  });
+}
+
+/** Drop the reference-loss entry of one document — its latest save lost nothing. */
+export function clearSaveReferenceLoss(documentId: string): void {
+  clearProblem(saveReferenceLossProblemId(documentId));
 }
 
 // ─── Duplicate asset ids (plan-703 §2.5, Phase 5) ───────────────────────
@@ -1082,10 +2153,175 @@ export function clearSeatOccupiedProblems(): void {
   clearProblemsOfCode(SEAT_OCCUPIED_CODE);
 }
 
+// ─── Robot IK: the degradations that used to be silent ──────────────────
+
+/**
+ * Problem codes of the robot IK (`RobotIK`, `IKPath`, `IKTarget`).
+ *
+ * Every one of these was a `console.warn` at best and a bare `return null` at
+ * worst. A rig whose kinematic chain cannot be derived, whose TCP does not
+ * resolve, or whose OPW parameters are unusable keeps replaying its baked joint
+ * angles and therefore LOOKS like it works: there is no LIN motion, no
+ * interactive re-solve and no honest reachability colouring, and nothing said
+ * so. These entries are the saying-so — none of them changes what the IK
+ * computes.
+ *
+ * Severity follows one rule: an entry is an `error` when the IK cannot do its
+ * job for that robot (no chain, no tool pose, no analytic parameters, no axes),
+ * and a `warning` when the motion still runs but is quietly less than it looks
+ * (a wrist type guessed from the default, one waypoint without baked angles).
+ */
+export const IK_PROBLEM_CODES = Object.freeze({
+  /** error — `RobotIK.Axis` resolved to no drives at all: the robot cannot move. */
+  axesUnresolved: 'robot-ik-axes-unresolved',
+  /** error — the axes are there but no serial 6-revolute chain can be derived from them. */
+  chainUnresolved: 'robot-ik-chain-unresolved',
+  /** error — `RobotIK.TCP` is written in the file but resolves to no node. */
+  tcpUnresolved: 'robot-ik-tcp-unresolved',
+  /** error — no usable OPW parameters (no finite `a1`): no LIN, no reach colouring. */
+  opwUnusable: 'robot-ik-opw-unusable',
+  /** warning — no `WristType` in the file, so the `Spherical` default is assumed. */
+  wristTypeMissing: 'robot-ik-wrist-type-missing',
+  /** warning — an `IKTarget` carries no usable `AxisPos`; the waypoint moves nothing. */
+  targetNoAngles: 'robot-ik-target-no-angles',
+});
+
+/** Identity of one robot (or one IK path) in the Problems panel. */
+export interface RobotIkProblemSubject {
+  /** Node path of the reporting node — the id component, and what the user searches for. */
+  nodePath: string;
+  /** Node name shown in the title. */
+  label: string;
+}
+
+/** One entry per subject and code: a second load replaces, never appends. */
+function ikProblemId(code: string, nodePath: string): string {
+  return `${code}:${nodePath}`;
+}
+
+/** `RobotIK.Axis` named no resolvable drive — nothing can move this robot. */
+export function reportRobotIkAxesUnresolved(m: RobotIkProblemSubject & { declared: number }): void {
+  reportProblem({
+    id: ikProblemId(IK_PROBLEM_CODES.axesUnresolved, m.nodePath),
+    severity: 'error',
+    code: IK_PROBLEM_CODES.axesUnresolved,
+    title: `${m.label} — robot has no axis drives`,
+    detail: m.declared > 0
+      ? `RobotIK.Axis lists ${m.declared} entr${m.declared === 1 ? 'y' : 'ies'}, none of which resolves to a Drive component. `
+        + 'The robot cannot move at all: no replay, no LIN, no interactive solve. '
+        + 'Re-export the robot with its Axis references assigned, or repair them in the editor.'
+      : 'RobotIK.Axis is empty or missing in the file. The robot cannot move at all: no replay, no LIN, '
+        + 'no interactive solve. Assign Axis[0..5] on the RobotIK component and export again.',
+    nodePath: m.nodePath,
+  });
+}
+
+/**
+ * No serial 6-revolute chain could be derived from the axis drives.
+ *
+ * `reason` is not optional padding: without it the entry says "it broke" and
+ * leaves the user with the whole rig to search. The deriving code knows exactly
+ * which axis failed and why, so it says so.
+ */
+export function reportRobotIkChainUnresolved(m: RobotIkProblemSubject & { reason: string }): void {
+  reportProblem({
+    id: ikProblemId(IK_PROBLEM_CODES.chainUnresolved, m.nodePath),
+    severity: 'error',
+    code: IK_PROBLEM_CODES.chainUnresolved,
+    title: `${m.label} — kinematic chain cannot be derived`,
+    detail: `${m.reason} Without a chain the robot only replays its baked joint angles: no linear (LIN) motion, `
+      + 'no interactive re-solve, and reachability cannot be checked. The axis nodes must be nested inside one '
+      + 'another in axis order (each axis a descendant of the previous one, axis 0 a descendant of the robot).',
+    nodePath: m.nodePath,
+  });
+}
+
+/** `RobotIK.TCP` is written in the file but names no node in the loaded scene. */
+export function reportRobotIkTcpUnresolved(m: RobotIkProblemSubject & { written: string }): void {
+  reportProblem({
+    id: ikProblemId(IK_PROBLEM_CODES.tcpUnresolved, m.nodePath),
+    severity: 'error',
+    code: IK_PROBLEM_CODES.tcpUnresolved,
+    title: `${m.label} — TCP reference resolves to nothing`,
+    detail: `RobotIK.TCP is written as "${m.written}", which names no node in the loaded document. `
+      + 'The tool pose silently collapses onto the axis-6 flange, so every solved and every reported pose is '
+      + 'off by the whole tool length and orientation. Check that the TCP node exists and survives the load.',
+    nodePath: m.nodePath,
+  });
+}
+
+/** `getOpwParams()` is null — the analytic parameters are absent or not finite. */
+export function reportRobotIkOpwUnusable(m: RobotIkProblemSubject): void {
+  reportProblem({
+    id: ikProblemId(IK_PROBLEM_CODES.opwUnusable, m.nodePath),
+    severity: 'error',
+    code: IK_PROBLEM_CODES.opwUnusable,
+    title: `${m.label} — no usable OPW parameters`,
+    detail: 'The RobotIK extras carry no finite `a1`, so the analytic (OPW/Pieper) parameters are unusable. '
+      + 'Linear (LIN) segments fall back to joint-space replay and waypoint reachability cannot be decided — '
+      + 'its markers are shown as unknown rather than reachable. Re-export the robot from Unity with its '
+      + 'OPW parameters computed.',
+    nodePath: m.nodePath,
+  });
+}
+
+/** No `WristType` in the file: the default is `Spherical`, which may be the wrong model. */
+export function reportRobotIkWristTypeMissing(m: RobotIkProblemSubject & { assumed: string }): void {
+  reportProblem({
+    id: ikProblemId(IK_PROBLEM_CODES.wristTypeMissing, m.nodePath),
+    severity: 'warning',
+    code: IK_PROBLEM_CODES.wristTypeMissing,
+    title: `${m.label} — no WristType in the file, assuming ${m.assumed}`,
+    detail: `The RobotIK extras carry no WristType, so "${m.assumed}" is assumed. A cobot (non-spherical wrist) `
+      + 'exported before this field existed is then solved with the wrong kinematic model, which lands near the '
+      + 'target instead of on it. Set WristType on the RobotIK component and export again.',
+    nodePath: m.nodePath,
+  });
+}
+
+/** An `IKTarget` the replay has to skip because it carries no usable `AxisPos`. */
+export function reportIkTargetNoAngles(m: RobotIkProblemSubject & { pathLabel: string; axisCount: number }): void {
+  reportProblem({
+    id: ikProblemId(IK_PROBLEM_CODES.targetNoAngles, m.nodePath),
+    severity: 'warning',
+    code: IK_PROBLEM_CODES.targetNoAngles,
+    title: `${m.label} — waypoint without baked joint angles`,
+    detail: `IKPath "${m.pathLabel}" reaches this target with no usable AxisPos for its ${m.axisCount} axes `
+      + '(absent, too short, or all zero). The waypoint is skipped: the drives stay where they are and the path '
+      + 'continues to the next target, so the robot silently visits a different pose sequence. '
+      + 'Solve the path in Unity and export again.',
+    nodePath: m.nodePath,
+  });
+}
+
+/** Drop every IK problem of one subject (a fresh diagnosis replaces it). */
+export function clearRobotIkProblems(nodePath: string): void {
+  for (const code of Object.values(IK_PROBLEM_CODES)) clearProblem(ikProblemId(code, nodePath));
+}
+
+/** Drop every IK problem of the document (model switch). */
+export function clearIkProblems(): void {
+  for (const code of Object.values(IK_PROBLEM_CODES)) clearProblemsOfCode(code);
+}
+
 /** Test seam: restore the module to its initial state. */
 export function resetProblemsForTests(): void {
   _entries.clear();
   _listeners.clear();
   _snapshot = [];
   _dirty = true;
+  _announcement = null;
+}
+
+/** Stable subject key; independent of elapsed time and explanatory text. */
+export function blockageProblemId(cls: string, chainKey: string): string {
+  return `blockage-${cls}:${chainKey}`;
+}
+export const BLOCKAGE_PROBLEM_CODES = Object.freeze({
+  deadlock: 'blockage-deadlock', stall: 'blockage-stall', coverage: 'blockage-coverage-gap',
+});
+export function clearBlockageProblems(): void {
+  clearProblemsOfCode('blockage-deadlock');
+  clearProblemsOfCode('blockage-stall');
+  clearProblemsOfCode('blockage-coverage-gap');
 }

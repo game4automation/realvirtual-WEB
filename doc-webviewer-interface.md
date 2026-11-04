@@ -364,9 +364,19 @@ badge on the interface card, `connect-store.reconcileReports`, and Problems entr
 **Create model signals** for `plc-only` rows (the CONNECT name is taken verbatim, so the result is
 exactly `mapped`; a Text/String signal the model cannot register is shown as `unsupported type`),
 and **Adopt legacy addresses** as a merge-only proposal from a `Comment` prefix or the Unity
-`Metadata`, which never overwrites an existing CONNECT address.
+`Metadata`, which never overwrites an existing CONNECT address (S7 / PLCSIM only, on its own
+"Legacy migration" line).
 
-The same report is available read-only over MCP as `web_signal_reconcile`. Architecture and the
+Two address sources sit on the interface card next to it (plan-2025 F11 / F12): **Fill addresses from
+controller** (offered where the gateway reports `supportsDiscovery`) browses the controller and fills
+in the address of every model signal whose name is exactly a controller symbol, and **Import address
+table** reads a CSV / TSV `name;address[;dataType[;topic]]`. Both show a preview with one verdict per
+row and write ONE batch through CONNECT's write core (`POST /config/ops`) on the revision the user saw;
+existing addresses are kept unless the import is set to Overwrite. Every other configuration write of
+the CONNECT panel uses the same write core, with a fallback to the old routes on an older CONNECT —
+see [`doc-signal-architecture.md`](doc-signal-architecture.md) §6.w.
+
+The same report is available read-only over MCP as `web_query("signal.reconcile", {})`. Architecture and the
 naming rule behind it: [`doc-signal-architecture.md`](doc-signal-architecture.md) §2.4–2.5 and §6.5.
 
 ## Integration with Drives
@@ -438,7 +448,7 @@ Document lifecycle events on the same bus:
 
 | Event | Payload | When |
 |-------|---------|------|
-| `document-saved` | `{ documentId, relPath }` | After EVERY successful document write, whatever the path. `relPath` is project-relative, and the empty string for a slot-addressed document. Subscribe to drop anything cached against a document's bytes — this is the path-agnostic replacement for reaching into a plugin and matching `library/**` (plan-719 F8). |
+| `document-saved` | `{ documentId, relPath }` | After EVERY successful document write, whatever the path — editor saves, planner saves (in place, Save as…, settings into a model) and MCP replaces alike. `relPath` is project-relative, and the empty string for a slot-addressed document. Emitted from the one post-save step `finishDocumentSave()` in this order: thumbnail pointer set (awaited) → `document-saved` → background rescan (not awaited) — so a subscriber already sees the new thumbnail pointer and must not wait for the listing (plan-777, [doc-persistence.md](doc-persistence.md) §2.0a-3). Subscribe to drop anything cached against a document's bytes — this is the path-agnostic replacement for reaching into a plugin and matching `library/**` (plan-719 F8). |
 
 Use the `useInterfaceStatus` React hook for UI integration:
 
@@ -794,6 +804,39 @@ worker restart (a new `workerGeneration`), a sim reset (`simTime` jumping back),
 `Connected` or a gateway disconnect all start a fresh observation window, and a late-connecting
 second interface gets its own.
 
+## `window.viewer` — the console and automation handle
+
+`window.viewer` is the viewer handle for the browser console, Playwright specs,
+the perf and recording scripts, and integrator scripts on the page. It is set in
+every build — dev server, `vite preview`, the `/demo` deploy, a customer delivery
+— and it is the only name product code may NOT use: a plugin, a component or an
+HMI surface receives the viewer through the context it is given
+(`UISlotProps.viewer`, `CommandContext.viewer`, `RVBindContext.viewer`, the
+plugin's own `this.viewer`). `tests/dev-only-globals.node.test.ts` guard (c)
+enforces that: a read of `window.viewer` or `window.__rvViewer` under `src/`
+fails the suite unless the module is allow-listed with a reason.
+
+`window.__rvViewer` is a **pure alias** of the same object, kept for the dev
+tooling that grew around it (E2E specs, `scripts/perf-*.mjs`, `spikes/`). It used
+to be installed inside `main.ts`' `if (import.meta.env.DEV)` block while
+`window.viewer` was ungated, i.e. the more official-looking name was the one
+absent from every build — in October 2026 that cost a public demo, where a
+physics mirror bound through `__rvViewer` silently got `undefined` and pushed
+bodies whose drawn meshes never moved. Both names are ungated now. New code
+should use `window.viewer`.
+
+**The contract covers the documented methods only.** `window.viewer` is an
+`RVViewer` instance, so the console shows every field it happens to carry:
+managers, stores, caches, plugin internals. Binding to one of those is binding to
+an implementation detail — it may be renamed or disappear in any release without
+a note. What is promised across releases is what the viewer documentation
+describes: the APIs in `doc-webviewer.md`, the public interface sections of this
+file (its § SignalStore, and for example `viewer.raycastManager.raycastSurface`
+and `viewer.sceneScale.get()` below) and the plugin API in
+`doc-extending-webviewer.md`. For anything beyond them, prefer the embed facade
+(`RVEmbedViewer`, `doc-embedding.md`) or the MCP `web_*` tools, whose surfaces
+are versioned.
+
 ## Viewer surface picks and scene scale (plan-515)
 
 Two viewer-side APIs that HMI code and interfaces reading the 3D view can use
@@ -881,6 +924,33 @@ setter stays limited to mode plus lighting.
   impossible. It is **suppressed on touch devices** at both display paths (this host and the
   Visual tab's own "Reload required"), because `main.ts` vetoes antialias there on every boot
   and a reload could not resolve the mismatch — plan-592 removes that gate.
+
+## Auxiliary render passes and runtime visuals (plan-599)
+
+Two generic contracts for plugins that render something of their own into the scene.
+
+- `viewer.renderAuxiliaryPass(fn: (renderer, scene) => void): boolean` — run an extra
+  off-screen render OUTSIDE the main pass, typically from a plugin's `onRender` (which runs
+  every animation frame, after the main pass, also when the main pass was skipped). For the
+  duration of `fn`:
+  - the ground reflector is hidden (its `onBeforeRender` would re-render the whole scene),
+  - the global section clipping (`renderer.clippingPlanes`) and XR are off,
+  - `scene.matrixWorldAutoUpdate` is off — the world matrices are walked at most once per
+    frame (by the main pass, or by the first auxiliary pass of a frame without one).
+
+  Everything — reflector visibility, clipping planes, `localClippingEnabled`, `xr.enabled`,
+  the scene flag, `autoClear` and the active render target — is restored in a `finally`,
+  also when `fn` throws (the error propagates). The hook returns `false` WITHOUT running `fn`
+  while a video capture is running (the capture owns the frame; retry after it) and under a
+  WebGPURenderer (`fn` always receives a classic `WebGLRenderer`). Draw calls of the pass are
+  booked under `plugins` in the frame stats. Use your own persistent render target (e.g. one
+  `OffscreenCapture` per consumer, `rv-offscreen-capture.ts`) — never the composer — and a
+  layer mask without the overlay layers. The hook does NOT mark the viewport dirty: when the
+  result is shown in the scene, call `viewer.markRenderDirty()` once after a visible change.
+- `userData._rvRuntimeVisual = true` — a node built at load time from extras (a screen plane,
+  an overlay, a preview mesh) is pruned from every editor save together with its subtree
+  (`pruneRuntimeHelpers`, `rv-asset-glb-export.ts`). Only the exact value `true` counts. Without
+  it, each save → reload round trip would add one more copy of the runtime geometry to the file.
 
 ## Unity-Side Setup
 

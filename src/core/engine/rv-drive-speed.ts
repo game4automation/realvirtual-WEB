@@ -13,6 +13,11 @@ import {
 } from './rv-signal-store';
 import { debug } from './rv-debug';
 import { scaleFeedbackPosition } from './rv-signal-wiring';
+import { slotDeclare, slotUndeclare, slotWrite } from './rv-slot-io';
+
+/** PLCInput slots of Drive_Speed (drive → PLC). */
+const FEEDBACK_SLOTS = ['SignalCurrentSpeed', 'SignalCurrentPosition', 'SignalIsDriving'] as const;
+type FeedbackSlot = typeof FEEDBACK_SLOTS[number];
 
 /**
  * RVDriveSpeed — TypeScript port of Drive_Speed.cs
@@ -39,6 +44,10 @@ import { scaleFeedbackPosition } from './rv-signal-wiring';
  * the jog block integrates the motion the same tick); feedback is written inline
  * from the drive's previous-tick currentSpeed/isRunning, exactly as C# reads
  * Drive.CurrentSpeed inside its single CalcFixedUpdate.
+ *
+ * Unwired slots are bound directly through SlotIO (rv-slot-io.ts): a direct
+ * command sets TargetSpeed / Acceleration, neutralize restores the authored
+ * value; the feedback values are published after every drive update.
  */
 export class RVDriveSpeed implements IDriveBehavior, RVComponent {
   // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
@@ -67,40 +76,26 @@ export class RVDriveSpeed implements IDriveBehavior, RVComponent {
   private authoredTargetSpeed = 100;
   private authoredAcceleration = 100;
   private feedbackCb: ((drive: RVDrive) => void) | null = null;
-  private readonly feedbackListeners: (() => void)[] = [];
 
   constructor(node: Object3D) {
     this.node = node;
   }
 
-  commandSignalTargetSpeed(value: boolean | number): void { this.TargetSpeed = Number(value); }
-  commandSignalAcceleration(value: boolean | number): void { this.Acceleration = Number(value); }
-  neutralizeSignalTargetSpeed(): void { this.TargetSpeed = this.authoredTargetSpeed; }
-  neutralizeSignalAcceleration(): void { this.Acceleration = this.authoredAcceleration; }
-
-  addFeedbackListener(cb: () => void): void {
-    if (!this.feedbackListeners.includes(cb)) this.feedbackListeners.push(cb);
-  }
-
-  removeFeedbackListener(cb: () => void): void {
-    const index = this.feedbackListeners.indexOf(cb);
-    if (index >= 0) this.feedbackListeners.splice(index, 1);
-  }
-
-  readFeedbackSlot(slot: string): boolean | number {
-    const drive = this.drive;
-    if (!drive) return slot === 'SignalIsDriving' ? false : 0;
+  /** Current value of a feedback slot, from the drive's state. */
+  private feedbackValue(drive: RVDrive, slot: FeedbackSlot): boolean | number {
     if (slot === 'SignalCurrentSpeed') return drive.currentSpeed;
-    if (slot === 'SignalCurrentPosition') {
-      return scaleFeedbackPosition(
-        drive.currentPosition,
-        this.ScaleFeedbackPosition,
-        this.CurrentPositionScale,
-        this.CurrentPositionOffset,
-      );
-    }
     if (slot === 'SignalIsDriving') return drive.isRunning;
-    throw new Error(`[Drive_Speed] Unknown feedback slot "${slot}"`);
+    return scaleFeedbackPosition(
+      drive.currentPosition,
+      this.ScaleFeedbackPosition,
+      this.CurrentPositionScale,
+      this.CurrentPositionOffset,
+    );
+  }
+
+  /** Publish the feedback values to directly bound slots (SlotIO cache). */
+  private publishFeedback(drive: RVDrive): void {
+    for (const slot of FEEDBACK_SLOTS) slotWrite(this, slot, null, this.feedbackValue(drive, slot), null);
   }
 
   init(context: ComponentContext): void {
@@ -124,9 +119,21 @@ export class RVDriveSpeed implements IDriveBehavior, RVComponent {
 
     // Register self as a drive behavior so drive.update() calls our update().
     drive.driveBehaviors.push(this);
-    this.feedbackCb = () => {
-      for (let i = 0; i < this.feedbackListeners.length; i++) this.feedbackListeners[i]();
-    };
+    slotDeclare(this, 'SignalTargetSpeed', 'setter', {
+      apply: (value) => { this.TargetSpeed = Number(value); },
+      neutral: () => { this.TargetSpeed = this.authoredTargetSpeed; },
+      reapply: context.reapply,
+    });
+    slotDeclare(this, 'SignalAcceleration', 'setter', {
+      apply: (value) => { this.Acceleration = Number(value); },
+      neutral: () => { this.Acceleration = this.authoredAcceleration; },
+      reapply: context.reapply,
+    });
+    slotDeclare(this, 'SignalCurrentSpeed', 'feedback');
+    slotDeclare(this, 'SignalCurrentPosition', 'feedback');
+    slotDeclare(this, 'SignalIsDriving', 'feedback', { initial: false });
+    this.publishFeedback(drive);
+    this.feedbackCb = (d) => this.publishFeedback(d);
     drive.addAfterUpdate(this.feedbackCb);
 
     debug('loader',
@@ -161,12 +168,13 @@ export class RVDriveSpeed implements IDriveBehavior, RVComponent {
 
     // ── Feedback (drive → PLC) — from the drive's previous-tick state, exactly
     //    like C# reads Drive.CurrentSpeed inside CalcFixedUpdate. ──
-    if (this.SignalIsDriving) this.signalWriter!.setByPath(this.SignalIsDriving, this.readFeedbackSlot('SignalIsDriving'));
-    if (this.SignalCurrentSpeed) this.signalWriter!.setByPath(this.SignalCurrentSpeed, this.readFeedbackSlot('SignalCurrentSpeed'));
-    if (this.SignalCurrentPosition) this.signalWriter!.setByPath(this.SignalCurrentPosition, this.readFeedbackSlot('SignalCurrentPosition'));
+    if (this.SignalIsDriving) this.signalWriter!.setByPath(this.SignalIsDriving, this.feedbackValue(drive, 'SignalIsDriving'));
+    if (this.SignalCurrentSpeed) this.signalWriter!.setByPath(this.SignalCurrentSpeed, this.feedbackValue(drive, 'SignalCurrentSpeed'));
+    if (this.SignalCurrentPosition) this.signalWriter!.setByPath(this.SignalCurrentPosition, this.feedbackValue(drive, 'SignalCurrentPosition'));
   }
 
   dispose(): void {
+    slotUndeclare(this);
     if (this.drive) {
       const index = this.drive.driveBehaviors.indexOf(this);
       if (index >= 0) this.drive.driveBehaviors.splice(index, 1);
@@ -176,7 +184,6 @@ export class RVDriveSpeed implements IDriveBehavior, RVComponent {
     this.drive = null;
     this.signalStore = null;
     this.signalWriter = null;
-    this.feedbackListeners.length = 0;
   }
 }
 

@@ -17,18 +17,24 @@
 
 export { OperatorPanel, OperatorPanelPlugin, type OperatorPanelProps } from './OperatorPanel';
 export {
-  validateOperatorPanelConfig, validateOperatorPanelConfigIssues, operatorPanelSignals, resolveStatus, evaluateCondition,
+  validateOperatorPanelConfig, validateOperatorPanelConfigIssues, operatorPanelSignals,
+  operatorPanelAnalogSignals, resolveStatus, evaluateCondition,
   OperatorPanelController, OFFLINE_SNAPSHOT, STATUS_ICONS, STATUS_TONES,
   type OperatorPanelSnapshot, type OperatorPanelSource, type OperatorPanelHostViewer,
   type OperatorPanelConfig, type OperatorPanelValidation, type OperatorPanelIssue, type Condition, type SignalReader,
   type PanelButtonConfig, type PanelSelectorConfig, type PanelEstopConfig, type PanelLampConfig,
   type PanelTowerSegmentConfig, type PanelChipConfig, type PanelStatusRule, type PanelPositionConfig,
+  type PanelSliderConfig, type PanelReadoutConfig,
+  type PanelKeyLegendConfig, type PanelKeyLegendRowConfig,
   type StatusIcon, type StatusTone,
 } from './operator-panel-model';
 export { IlluminatedPushButton, type IlluminatedPushButtonProps } from './IlluminatedPushButton';
 export { SelectorSwitch, type SelectorSwitchProps, type SelectorPosition } from './SelectorSwitch';
 export { EmergencyStop, type EmergencyStopProps, RELEASE_HOLD_MS, ESTOP_PRESSED_WORD } from './EmergencyStop';
 export { StackLight, stackLightWords, type StackLightProps, type StackLightSegment } from './StackLight';
+export { SetpointSlider, type SetpointSliderProps } from './SetpointSlider';
+export { DigitalReadout, type DigitalReadoutProps } from './DigitalReadout';
+export { KeyLegend, type KeyLegendProps, type KeyLegendRow } from './KeyLegend';
 export {
   PilotLamp, type PilotLampProps, type LampState, type LampLook, lampLook, lampWords, lampGlow, NOT_DRIVEN_HINT,
   usePrefersReducedMotion,

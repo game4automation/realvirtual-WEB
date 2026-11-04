@@ -18,12 +18,15 @@
  * | `layout.remove`      | Planner toolbar Delete (id null = selection)   | `web_layout_remove`      |
  * | `layout.snapAttach`  | Snap picker popup entry (snap-point plugin)    | `web_layout_snap_attach` |
  * | `layout.undo/redo`   | Planner toolbar Undo / Redo                    | —                        |
+ * | `layout.setParams`   | Placement inspector parameter mask (plan-650)  | — (`web_execute`)        |
  *
  * The refusal texts are the ones the tools answered before the migration, so an
  * agent sees what it saw and a button shows the same text as its tooltip.
  */
 
-import { Box3, type Object3D } from 'three';
+import { activeHistoryStep } from '../../core/hmi/rv-edit-target';
+import { Box3, Vector3, type InstancedMesh, type Mesh, type Object3D } from 'three';
+import type { GizmoBasis, RadialSector } from '../../core/engine/rv-transport-gizmo-geometry';
 import {
   commandRegistry,
   CommandError,
@@ -35,7 +38,8 @@ import {
   type CommandRegistry,
 } from '../../core/hmi/rv-command-registry';
 import { getSceneStore } from '../../core/hmi/scene/scene-store-singleton';
-import { listLibrarySources } from '../../core/library/library-source-registry';
+import { getLibrarySource, listLibrarySources } from '../../core/library/library-source-registry';
+import { LIBRARY_PROJECTS_PROVIDER_ID } from '../../core/library/library-origin';
 import { computeSubtreeAABB } from '../../core/engine/rv-traverse-utils';
 import type { SnapPoint } from '../../core/engine/rv-snap-point-registry';
 import type { SnapPointPlugin } from '../snap-point';
@@ -47,11 +51,20 @@ import type { LibraryCatalogEntry } from './rv-layout-store';
 
 export interface PlaceArgs {
   readonly catalogId: string;
+  /**
+   * plan-778: the library PROJECT the entry comes from. The same document id
+   * may live in two libraries; with this the entry is looked up in that
+   * library only (and the placement is qualified with it). Absent = today's
+   * search (the planner's catalogs, then every placeable source).
+   */
+  readonly libraryProjectId?: string | null;
   readonly x: number;
   readonly y: number;
   readonly z: number;
   /** Placement id to rest the part ON (its transport-surface top); null/absent = x/y/z. */
   readonly onto?: string | null;
+  /** plan-675 D4: yaw in degrees; on a curve `onto` defaults it to the tangent there. */
+  readonly ry?: number | null;
 }
 export interface MoveArgs {
   readonly id: string;
@@ -60,31 +73,44 @@ export interface MoveArgs {
 }
 /** `id` null = "the current selection" (the toolbar Delete button). */
 export interface RemoveArgs { readonly id: string | null | undefined }
+/** plan-650 Phase 5: `values` = JSON object of parameter values; `family` = family path / NodeId (optional). */
+export interface SetParamsArgs {
+  readonly id: string;
+  readonly values: string;
+  readonly family?: string | null;
+}
 export interface SnapAttachArgs {
   readonly targetId: string;
   readonly catalogId: string;
+  /** plan-778: see {@link PlaceArgs.libraryProjectId}. */
+  readonly libraryProjectId?: string | null;
   readonly targetSnapName?: string | null;
   readonly flow?: string | null;
 }
 
 // ─── Reasons ────────────────────────────────────────────────────────────
 
-export const PLANNER_UNAVAILABLE = 'Layout planner not available — call web_mode_set("planner") first';
+export const PLANNER_UNAVAILABLE = 'Layout planner not available — call web_execute("workspace.setMode", {mode:"planner"}) first';
 export const NOTHING_TO_DELETE = 'Delete (select something first)';
 export const NOTHING_TO_UNDO = 'Nothing to undo';
 export const NOTHING_TO_REDO = 'Nothing to redo';
-export const noPlacement = (id: string): string => `No placement "${id}". Use web_layout_list.`;
-export const noPlacementOnto = (id: string): string => `No placement "${id}" to place onto. Use web_layout_list.`;
+export const noPlacement = (id: string): string => `No placement "${id}". Use web_query("layout.list", {}).`;
+export const noPlacementOnto = (id: string): string => `No placement "${id}" to place onto. Use web_query("layout.list", {}).`;
 export const noCatalogEntry = (id: string): string =>
-  `No catalog entry "${id}". Use web_catalog_list or web_document_list (id or "project:<path>").`;
-export const noPlannerCatalogEntry = (id: string): string => `No catalog entry "${id}". Use web_catalog_list.`;
+  `No catalog entry "${id}". Use web_query("library.catalogList", {}) or web_document_list (id or "project:<path>").`;
+export const noPlannerCatalogEntry = (id: string): string => `No catalog entry "${id}". Use web_query("library.catalogList", {}).`;
 const PLANNER_NOT_ATTACHED =
-  'Layout planner is not attached to the viewer (no model loaded and planner mode not entered yet) — call web_mode_set("planner") or web_document_open(<document>) first, then retry';
+  'Layout planner is not attached to the viewer (no model loaded and planner mode not entered yet) — call web_execute("workspace.setMode", {mode:"planner"}) or web_document_open(<document>) first, then retry';
 
 // ─── Button keys ────────────────────────────────────────────────────────
 
-/** The library entry of a catalog id — the view of `layout.place`. */
-export const libraryEntryKey = (catalogId: string): string => `layout.library:${catalogId}`;
+/**
+ * The library entry of a catalog id — the view of `layout.place`. With a
+ * library project (plan-778) the key names both, because two libraries may
+ * hold the same document id.
+ */
+export const libraryEntryKey = (catalogId: string, libraryProjectId?: string | null): string =>
+  libraryProjectId ? `layout.library:${libraryProjectId}/${catalogId}` : `layout.library:${catalogId}`;
 export const PLANNER_DELETE_KEY = 'layout.delete';
 export const PLANNER_UNDO_KEY = 'layout.undo';
 export const PLANNER_REDO_KEY = 'layout.redo';
@@ -102,10 +128,24 @@ export function plannerOf(ctx: Pick<CommandContext, 'viewer'>): LayoutPlannerPlu
  * sources (project documents, global library — `project:<path>` ids or the
  * manifest documentId), the same entries the library panel drags from.
  */
-export function resolvePlaceEntry(planner: LayoutPlannerPlugin, catalogId: string): LibraryCatalogEntry | undefined {
+export function resolvePlaceEntry(
+  planner: LayoutPlannerPlugin,
+  catalogId: string,
+  libraryProjectId?: string | null,
+): LibraryCatalogEntry | undefined {
+  // plan-778: a named library is asked alone — and only when it is placeable
+  // (a direct library of this project, Decision 4 / C).
+  if (libraryProjectId) {
+    const source = getLibrarySource(LIBRARY_PROJECTS_PROVIDER_ID, libraryProjectId);
+    if (!source || source.hidden === true) return undefined;
+    try { return source.getEntry(catalogId) ?? undefined; } catch { return undefined; }
+  }
   const own = findPlannerEntry(planner, catalogId);
   if (own) return own;
-  for (const { source } of listLibrarySources()) {
+  for (const { providerId, source } of listLibrarySources()) {
+    // A library project that is only resolvable (transitive, or the built-in
+    // realvirtual library the project does not list) is not placeable.
+    if (providerId === LIBRARY_PROJECTS_PROVIDER_ID && source.hidden === true) continue;
     let entries: LibraryCatalogEntry[];
     try { entries = source.listEntries(); } catch { continue; }
     const found = entries.find((e) => e.id === catalogId || e.documentId === catalogId);
@@ -129,25 +169,99 @@ export function findPlannerEntry(planner: LayoutPlannerPlugin, catalogId: string
  * frames and makes a pallet float), centred on the placement. Falls back to the
  * bounding-box top when the placement has no surface.
  */
-export function transportSurfaceTop(root: Object3D): { x: number; y: number; z: number; source: string } {
+/** What {@link transportSurfaceTop} needs from a radial TransportSurface (an `RVTransportSurface` satisfies it). */
+export interface RadialSurfaceLike {
+  readonly Radial: boolean;
+  getRadialSector(): (RadialSector & { basis: GizmoBasis; worldScale: number }) | null;
+}
+
+/**
+ * plan-675 D4 — the resting point on a CURVE: the mid radius at the middle of
+ * the arc, and the yaw that lines the part's +X up with the tangent there.
+ * Null when the node's sector cannot be measured.
+ */
+function radialRestPoint(node: Object3D, surface: RadialSurfaceLike): { x: number; z: number; ry: number } | null {
+  const sector = surface.getRadialSector();
+  if (!sector || sector.full) return null;
+  const { basis, worldScale } = sector;
+  const rMid = (sector.rMin + sector.rMax) / 2 / worldScale; // node-local units
+  const theta = sector.thetaStart + sector.thetaLength / 2;
+  // Canonical angle convention (rv-transport-gizmo-geometry): atan2(−cw, cu).
+  const cu = rMid * Math.cos(theta);
+  const cw = -rMid * Math.sin(theta);
+  const local = new Vector3().addScaledVector(basis.u, cu).addScaledVector(basis.w, cw);
+  const world = node.localToWorld(local.clone());
+  const tangentLocal = new Vector3().addScaledVector(basis.u, -Math.sin(theta)).addScaledVector(basis.w, -Math.cos(theta));
+  const tangent = tangentLocal.transformDirection(node.matrixWorld);
+  // Yaw about +Y that maps +X onto the horizontal tangent.
+  const ry = Math.atan2(-tangent.z, tangent.x) * 180 / Math.PI;
+  return { x: world.x, z: world.z, ry };
+}
+
+export function transportSurfaceTop(
+  root: Object3D,
+  surfaceOf?: (node: Object3D) => RadialSurfaceLike | null,
+): { x: number; y: number; z: number; source: string; ry?: number } {
   root.updateMatrixWorld(true);
   const all = computeSubtreeAABB(root, new Box3());
+  // plan-653 fix-up: the centre must not follow a selection overlay either.
+  const allGeom = geometryBoundsOf(root, new Box3());
+  if (!allGeom.isEmpty()) allGeom.getCenter(all.center);
   const surfaces = new Box3();
+  const surfaceNodes: Object3D[] = [];
   root.traverse((n) => {
     const rv = (n.userData as { realvirtual?: Record<string, unknown> } | undefined)?.realvirtual;
     if (!rv || rv.TransportSurface === undefined) return;
+    surfaceNodes.push(n);
     // Mesh-less surface nodes would answer with computeSubtreeAABB's 0.1 m
-    // placeholder box — not a surface height.
-    let hasMesh = false;
-    n.traverse((c) => { if ((c as { isMesh?: boolean }).isMesh) hasMesh = true; });
-    if (!hasMesh) return;
-    surfaces.union(computeSubtreeAABB(n, new Box3()).box);
+    // placeholder box — not a surface height. Overlay meshes (the selection
+    // arrow a selected surface parents under its node) are not geometry: on a
+    // SolidCraft body (local Z up, mm) that arrow stands upright and lifted the
+    // reported top by ~0.23 m (plan-653 fix-up).
+    surfaces.union(geometryBoundsOf(n, new Box3()));
   });
   const r3 = (v: number): number => +v.toFixed(4);
   if (!surfaces.isEmpty()) {
-    return { x: r3(all.center.x), y: r3(surfaces.max.y), z: r3(all.center.z), source: 'TransportSurface' };
+    // plan-675 D4: ONE curve → mid radius at the middle of the arc, tangential.
+    const radial = surfaceNodes
+      .map((n) => ({ n, s: surfaceOf?.(n) ?? null }))
+      .filter((e) => e.s?.Radial);
+    if (radial.length === 1) {
+      const p = radialRestPoint(radial[0].n, radial[0].s!);
+      if (p) return { x: r3(p.x), y: r3(surfaces.max.y), z: r3(p.z), source: 'TransportSurface radial', ry: +p.ry.toFixed(2) };
+    }
+    // Straight belt: the middle of the belt itself (its centre line), not of
+    // the whole placement — side frames / a drive box must not pull it off.
+    const c = surfaces.getCenter(new Vector3());
+    return { x: r3(c.x), y: r3(surfaces.max.y), z: r3(c.z), source: 'TransportSurface' };
   }
   return { x: r3(all.center.x), y: r3(all.box.isEmpty() ? 0 : all.box.max.y), z: r3(all.center.z), source: 'bounds-top' };
+}
+
+/** World bounds of the real meshes under `node`, skipping highlight/selection
+ *  overlays (`userData._highlightOverlay`) and everything below them. Empty when
+ *  the subtree has no such mesh. Matrices must be current (caller updates). */
+function geometryBoundsOf(node: Object3D, out: Box3): Box3 {
+  out.makeEmpty();
+  const tmp = new Box3();
+  const visit = (o: Object3D): void => {
+    if ((o.userData as { _highlightOverlay?: boolean } | undefined)?._highlightOverlay) return;
+    const mesh = o as Mesh;
+    if (mesh.isMesh && mesh.geometry) {
+      const inst = o as InstancedMesh;
+      if (inst.isInstancedMesh) {
+        if (inst.boundingBox === null) inst.computeBoundingBox();
+        tmp.copy(inst.boundingBox as Box3);
+      } else {
+        if (mesh.geometry.boundingBox === null) mesh.geometry.computeBoundingBox();
+        tmp.copy(mesh.geometry.boundingBox as Box3);
+      }
+      if (!tmp.isEmpty()) out.union(tmp.applyMatrix4(mesh.matrixWorld));
+    }
+    for (const c of o.children) visit(c);
+  };
+  visit(node);
+  return out;
 }
 
 /** Free, live snaps of a placed root (the UI's own "open ports" derivation). */
@@ -184,19 +298,26 @@ const place: CommandImpl<PlaceArgs, Record<string, unknown>> = {
   enabled: (ctx, a) => {
     const planner = plannerOf(ctx);
     if (!planner) return { reason: PLANNER_UNAVAILABLE };
-    if (!resolvePlaceEntry(planner, String(a?.catalogId ?? ''))) return { reason: noCatalogEntry(String(a?.catalogId ?? '')) };
+    if (!resolvePlaceEntry(planner, String(a?.catalogId ?? ''), a?.libraryProjectId)) return { reason: noCatalogEntry(String(a?.catalogId ?? '')) };
     if (a.onto && !planner.getPlacedRootById(a.onto)) return { reason: noPlacementOnto(a.onto) };
     return true;
   },
   run: async (ctx, a) => {
     const planner = plannerOf(ctx) as LayoutPlannerPlugin;
-    const entry = resolvePlaceEntry(planner, a.catalogId) as LibraryCatalogEntry;
+    const entry = resolvePlaceEntry(planner, a.catalogId, a.libraryProjectId) as LibraryCatalogEntry;
     let [x, y, z] = [Number(a.x ?? 0), Number(a.y ?? 0), Number(a.z ?? 0)];
-    let surface: { x: number; y: number; z: number; source: string } | null = null;
+    let surface: { x: number; y: number; z: number; source: string; ry?: number } | null = null;
     if (a.onto) {
-      surface = transportSurfaceTop(planner.getPlacedRootById(a.onto) as Object3D);
+      const surfaces = (ctx.viewer as { transportManager?: { surfaces: ReadonlyArray<RadialSurfaceLike & { node: Object3D }> } | null })
+        .transportManager?.surfaces ?? [];
+      surface = transportSurfaceTop(
+        planner.getPlacedRootById(a.onto) as Object3D,
+        (n) => surfaces.find((s) => s.node === n) ?? null,
+      );
       ({ x, y, z } = surface);
     }
+    // An explicit yaw wins over the curve tangent.
+    const ry = present(a.ry) ? Number(a.ry) : (surface?.ry ?? 0);
     const t0 = performance.now();
     // Add + (height) move are ONE undo step.
     const id = await asOneStep(`Place ${entry.name}`, async () => {
@@ -210,11 +331,13 @@ const place: CommandImpl<PlaceArgs, Record<string, unknown>> = {
       }
       // `placeComponent` floor-aligns the part (y = 0); a requested height is
       // a booked move on top, so it survives the save like a gizmo drag would.
-      if (y !== 0) await planner.moveById(placed, [x, y, z], [0, 0, 0]);
+      if (y !== 0 || ry !== 0) await planner.moveById(placed, [x, y, z], [0, ry, 0]);
       return placed;
     });
     return {
       id, catalogId: a.catalogId, position: [x, y, z], placeMs: Math.round(performance.now() - t0),
+      ...(entry.libraryOrigin ? { libraryProjectId: entry.libraryOrigin.sourceId } : {}),
+      ...(ry !== 0 ? { rotation: [0, ry, 0] } : {}),
       ...(surface ? { onto: a.onto, surfaceHeight: y, surfaceSource: surface.source } : {}),
     };
   },
@@ -282,7 +405,9 @@ const snapAttach: CommandImpl<SnapAttachArgs, Record<string, unknown>> = {
     if ('error' in picked) return { reason: picked.error, details: { available: picked.available } };
     const wantFlow = String(a.flow ?? '').trim().toLowerCase();
     if (wantFlow && wantFlow !== 'in' && wantFlow !== 'out') return { reason: 'flow must be "in" or "out"' };
-    if (!findPlannerEntry(planner, String(a.catalogId ?? ''))) return { reason: noPlannerCatalogEntry(String(a.catalogId ?? '')) };
+    // plan-655 F4: the same resolution as layout.place — catalog entries AND
+    // project parts (`project:<path>` or the documentId).
+    if (!resolvePlaceEntry(planner, String(a.catalogId ?? ''), a.libraryProjectId)) return { reason: noCatalogEntry(String(a.catalogId ?? '')) };
     return true;
   },
   run: async (ctx, a) => {
@@ -292,11 +417,13 @@ const snapAttach: CommandImpl<SnapAttachArgs, Record<string, unknown>> = {
     if ('error' in picked) throw new CommandError(picked.error, { available: picked.available });
     const target = picked.snap;
     const wantFlow = String(a.flow ?? '').trim().toLowerCase();
-    const entry = findPlannerEntry(planner, a.catalogId) as LibraryCatalogEntry;
+    const entry = resolvePlaceEntry(planner, a.catalogId, a.libraryProjectId) as LibraryCatalogEntry;
     // The asset snap index is heavy — loaded on first attach, never eagerly.
-    const { findCompatibleLibraryAssets, ensureAssetIndex } = await import('../snap-point/library-snap-index');
+    const { findCompatibleLibraryAssets, ensureEntryIndex } = await import('../snap-point/library-snap-index');
     const matches = await findCompatibleLibraryAssets([entry], target.typeId, oppositeDirection(target.dir), target.flow);
-    const chosen = matches.find((m) => m.entry.id === a.catalogId);
+    // Compared with the RESOLVED entry: a documentId argument names the same
+    // entry under its `project:<path>` id (SOL R1-1).
+    const chosen = matches.find((m) => m.entry.id === entry.id);
     if (!chosen) {
       throw new CommandError(`"${a.catalogId}" has no snap compatible with typeId=${target.typeId}, flow=${target.flow ?? 'bidi'}`);
     }
@@ -305,9 +432,9 @@ const snapAttach: CommandImpl<SnapAttachArgs, Record<string, unknown>> = {
     // the new part's own snap by ITS flow instead: feeding in = its output.
     let ownSnapName = chosen.ownSnapName;
     let ownFlow: string | undefined;
-    if (entry.glbUrl) {
-      let idx: Awaited<ReturnType<typeof ensureAssetIndex>> | null = null;
-      try { idx = await ensureAssetIndex(entry.id, entry.glbUrl); } catch { /* index unavailable — keep the natural match */ }
+    {
+      let idx: Awaited<ReturnType<typeof ensureEntryIndex>> | null = null;
+      try { idx = await ensureEntryIndex(entry); } catch { /* index unavailable — keep the natural match */ }
       if (idx) {
         const fits = idx.snaps.filter((sn) => sn.typeId === target.typeId && flowsCompatible(target.flow, sn.flow));
         if (wantFlow) {
@@ -328,12 +455,40 @@ const snapAttach: CommandImpl<SnapAttachArgs, Record<string, unknown>> = {
     if (!newId) throw new CommandError('Placement rejected (snap occupied, non-uniform scale, or own-snap not found)');
     return {
       id: newId,
-      catalogId: a.catalogId,
+      catalogId: entry.id,
       attachedTo: { placementId: a.targetId, snapName: target.object3D.name, typeId: target.typeId },
       ownSnapName,
       // What the NEW part does relative to the target.
       ...(ownFlow ? { flow: ownFlow === 'out' ? 'in' : ownFlow === 'in' ? 'out' : 'bidi' } : {}),
     };
+  },
+};
+
+const setParams: CommandImpl<SetParamsArgs, Record<string, unknown>> = {
+  enabled: (ctx, a) => {
+    const planner = plannerOf(ctx);
+    if (!planner) return { reason: PLANNER_UNAVAILABLE };
+    if (!planner.getPlacedRootById(String(a?.id ?? ''))) return { reason: noPlacement(String(a?.id ?? '')) };
+    return true;
+  },
+  run: async (ctx, a) => {
+    const planner = plannerOf(ctx) as LayoutPlannerPlugin;
+    let values: unknown;
+    try {
+      values = typeof a.values === 'string' ? JSON.parse(a.values) : a.values;
+    } catch {
+      throw new CommandError('values must be a JSON object, e.g. {"ML": 2160}');
+    }
+    if (!values || typeof values !== 'object' || Array.isArray(values)) {
+      throw new CommandError('values must be a JSON object, e.g. {"ML": 2160}');
+    }
+    // The variant machinery loads on first use only.
+    const { setPlacementParams } = await import('./planner-parametric');
+    try {
+      return { ...(await setPlacementParams(ctx.viewer, planner, a.id, values as Record<string, unknown>, a.family)) };
+    } catch (e) {
+      throw new CommandError(e instanceof Error ? e.message : String(e));
+    }
   },
 };
 
@@ -347,7 +502,8 @@ function history(kind: 'undo' | 'redo'): CommandImpl<Record<string, never>, { ca
     run: async () => {
       const store = getSceneStore();
       if (!store) throw new CommandError(kind === 'undo' ? NOTHING_TO_UNDO : NOTHING_TO_REDO);
-      await (kind === 'undo' ? store.undo() : store.redo());
+      const own = activeHistoryStep(kind);   // plan-2013: the variant in the scene has its own history
+      if (own) await own; else await (kind === 'undo' ? store.undo() : store.redo());
       return { canUndo: store.canUndo(), canRedo: store.canRedo() };
     },
   };
@@ -374,11 +530,11 @@ interface Spec {
 const SPECS: readonly Spec[] = [
   {
     id: 'layout.place', label: 'Place component', undoLabel: 'Place component',
-    argsSchema: { catalogId: 'string', x: 'number', y: 'number', z: 'number', onto: 'string' },
-    buttonKey: (a: PlaceArgs) => libraryEntryKey(String(a?.catalogId ?? '')),
+    argsSchema: { catalogId: 'string', x: 'number', y: 'number', z: 'number', onto: 'string', ry: 'number', libraryProjectId: 'string' },
+    buttonKey: (a: PlaceArgs) => libraryEntryKey(String(a?.catalogId ?? ''), a?.libraryProjectId),
     mcp: {
       tool: 'web_layout_place',
-      params: [req('catalogId'), req('x', 'number'), req('y', 'number'), req('z', 'number'), opt('onto')],
+      params: [req('catalogId'), req('x', 'number'), req('y', 'number'), req('z', 'number'), opt('onto'), opt('ry', 'number'), opt('libraryProjectId')],
     },
     impl: place as CommandImpl<never, unknown>,
   },
@@ -401,13 +557,19 @@ const SPECS: readonly Spec[] = [
   },
   {
     id: 'layout.snapAttach', label: 'Attach at snap', undoLabel: 'Attach at snap',
-    argsSchema: { targetId: 'string', catalogId: 'string', targetSnapName: 'string', flow: 'string' },
+    argsSchema: { targetId: 'string', catalogId: 'string', targetSnapName: 'string', flow: 'string', libraryProjectId: 'string' },
     buttonKey: () => SNAP_ATTACH_KEY,
     mcp: {
       tool: 'web_layout_snap_attach',
-      params: [req('targetId'), req('catalogId'), opt('targetSnapName'), opt('flow')],
+      params: [req('targetId'), req('catalogId'), opt('targetSnapName'), opt('flow'), opt('libraryProjectId')],
     },
     impl: snapAttach as CommandImpl<never, unknown>,
+  },
+  {
+    // plan-650 Phase 5 (F17): no MCP mirror by design — reached through web_execute.
+    id: 'layout.setParams', label: 'Set placement parameters', undoLabel: 'Set placement parameters',
+    argsSchema: { id: 'string', values: 'string', family: 'string' },
+    impl: setParams as CommandImpl<never, unknown>,
   },
   {
     id: 'layout.undo', label: 'Undo', argsSchema: {}, shortcut: 'Ctrl+Z',
@@ -422,11 +584,64 @@ const SPECS: readonly Spec[] = [
 ];
 
 /** Every planner command id (preload, tests). */
-export const PLANNER_COMMAND_IDS: readonly string[] = SPECS.map((s) => s.id);
+export const PLANNER_COMMAND_IDS: readonly string[] = [...SPECS.map((s) => s.id), 'layout.list', 'layout.export', 'layout.snapList', 'layout.snapSuggest'];
 
 /** Build the planner descriptors (testable seam: no registry side effect). */
 export function createPlannerCommandDescriptors(): CommandDescriptor<never, unknown>[] {
-  return SPECS.map((s): CommandDescriptor<never, unknown> => ({
+  return [
+    {
+      id: 'layout.list', label: 'layout.list', readOnly: true, scope: 'none',
+      available: true, unavailableReason: 'Not available',
+      argsSchema: {},
+      impl: async () => {
+        const { McpSceneTools } = await import('../mcp-bridge/rv-mcp-scene-tools');
+        const impl: CommandImpl<{}, unknown> = {
+          enabled: () => true,
+          run: async (ctx) => JSON.parse(await new McpSceneTools(() => ctx.viewer).queryLayoutList()),
+        };
+        return impl;
+      },
+    },
+    {
+      id: 'layout.export', label: 'layout.export', readOnly: true, scope: 'none',
+      available: true, unavailableReason: 'Not available',
+      argsSchema: {},
+      impl: async () => {
+        const { McpSceneTools } = await import('../mcp-bridge/rv-mcp-scene-tools');
+        const impl: CommandImpl<{}, unknown> = {
+          enabled: () => true,
+          run: async (ctx) => JSON.parse(await new McpSceneTools(() => ctx.viewer).queryLayoutExport()),
+        };
+        return impl;
+      },
+    },
+    {
+      id: 'layout.snapList', label: 'layout.snapList', readOnly: true, scope: 'none',
+      available: true, unavailableReason: 'Not available',
+      argsSchema: { id: 'string' },
+      impl: async () => {
+        const { McpSceneTools } = await import('../mcp-bridge/rv-mcp-scene-tools');
+        const impl: CommandImpl<{ id: string }, unknown> = {
+          enabled: () => true,
+          run: async (ctx, a) => JSON.parse(await new McpSceneTools(() => ctx.viewer).queryLayoutSnapList(a.id)),
+        };
+        return impl;
+      },
+    },
+    {
+      id: 'layout.snapSuggest', label: 'layout.snapSuggest', readOnly: true, scope: 'none',
+      available: true, unavailableReason: 'Not available',
+      argsSchema: { targetId: 'string', targetSnapName: 'string' },
+      impl: async () => {
+        const { McpSceneTools } = await import('../mcp-bridge/rv-mcp-scene-tools');
+        const impl: CommandImpl<{ targetId: string; targetSnapName?: string }, unknown> = {
+          enabled: () => true,
+          run: async (ctx, a) => JSON.parse(await new McpSceneTools(() => ctx.viewer).queryLayoutSnapSuggest(a.targetId, a?.targetSnapName)),
+        };
+        return impl;
+      },
+    },
+    ...SPECS.map((s): CommandDescriptor<never, unknown> => ({
     id: s.id,
     label: s.label,
     readOnly: false,
@@ -441,7 +656,8 @@ export function createPlannerCommandDescriptors(): CommandDescriptor<never, unkn
     argsSchema: s.argsSchema,
     eagerImpl: s.impl,
     impl: () => Promise.resolve(s.impl),
-  }));
+  })),
+  ] as CommandDescriptor<never, unknown>[];
 }
 
 const registered = new WeakSet<CommandRegistry>();

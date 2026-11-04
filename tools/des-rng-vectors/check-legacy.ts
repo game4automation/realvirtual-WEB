@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';
+import fixture from '../realvirtual-WebViewer~/tests/des/fixtures/rng-v2/legacy-sequences.json';
+import { legacySequences } from '../realvirtual-WebViewer~/tests/des/rng-v2-legacy-harness';
+import { SFC32, SFC32Legacy } from '../realvirtual-WebViewer~/src/core/rv-rng-distribution';
+assert.equal(SFC32, SFC32Legacy);
+assert.equal(fixture.takt.plantId, 'PlantA');
+assert.equal(fixture.takt.masterSeed, 7);
+const { provenance, ...expected } = fixture;
+assert.deepEqual(legacySequences(), expected);
+console.log('Legacy contract passed (Node loader): raw, downtime, production-derived takt and constructor alias');

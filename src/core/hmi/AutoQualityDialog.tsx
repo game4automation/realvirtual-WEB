@@ -12,6 +12,7 @@
  * until it is actually shown and dismissed.
  */
 
+import { FIELD_BORDER, PANEL_SURFACE } from './shared-sx';
 import { createPortal } from 'react-dom';
 import { Box, Paper, Typography, Button } from '@mui/material';
 import SpeedIcon from '@mui/icons-material/Speed';
@@ -56,11 +57,16 @@ export function AutoQualityDialog() {
       onClick={clearAutoQualityNotice}
     >
       <Paper
-        elevation={12}
+        elevation={0}
         sx={{
-          borderRadius: 2,
+          borderRadius: 1,
+          bgcolor: `${PANEL_SURFACE} !important`,
+          border: `1px solid ${FIELD_BORDER}`,
+          boxShadow: 'none',
           width: 420,
           maxWidth: '95vw',
+          maxHeight: 'calc(100dvh - 32px)',
+          overflowY: 'auto',
           p: { xs: 2.5, sm: 3 },
           display: 'flex',
           flexDirection: 'column',

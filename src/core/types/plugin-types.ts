@@ -73,6 +73,32 @@ export interface MaintenanceState {
   stepResults: StepResult[];
   /** Whether a camera animation is currently in progress. */
   isCameraAnimating: boolean;
+  /** plan-522: a live industrial interface is connected — no freeze, no machine actions. */
+  isLive: boolean;
+  /** plan-522: a guide with a maintenance runtime runs — render-mode changes are refused. */
+  renderModeLocked: boolean;
+}
+
+/** One maintenance tile of the message panel (plan-522 Phase 6). */
+export interface MaintenanceMessageEntry {
+  procedure: MaintenanceProcedure;
+  /** Due or overdue (`level >= 2`). */
+  due: boolean;
+  /** 0 ok, 1 upcoming, 2 due, 3 overdue (plan-522 Phase 7). */
+  level: 0 | 1 | 2 | 3;
+  levelName: 'ok' | 'upcoming' | 'due' | 'overdue';
+  /** Counter of the deciding trigger in `unit` (0 without counter). */
+  value: number;
+  /** Interval of the deciding trigger in `unit` (0 without counter). */
+  interval: number;
+  /** Unit of the deciding trigger's counter; '' = a count; null = no counter. */
+  unit: 'km' | 'h' | '' | null;
+  /** Name of the deciding trigger node; '' for the Phase-6 fields or none. */
+  triggerName: string;
+  /** Path of the deciding trigger's signal / drive ('' = none). */
+  sourcePath: string;
+  /** Live without a PLC counter: this browser counts only while it is open. */
+  liveBrowserCount: boolean;
 }
 
 /**
@@ -83,7 +109,12 @@ export interface MaintenancePluginAPI {
   readonly id: string;
   getState(): MaintenanceState;
   getProcedures(): MaintenanceProcedure[];
-  enterMaintenance(): void;
+  /** Re-read the procedures from the scene (procedure nodes added at runtime after the load). */
+  rescanProcedures(): void;
+  /** Open the mode dialog for the named procedure (default: the first). */
+  enterMaintenance(procedureName?: string): void;
+  /** Message-panel tiles (plan-522 Phase 6). */
+  getMessageEntries(): MaintenanceMessageEntry[];
   exitMaintenance(): void;
   startScenario(procedure: MaintenanceProcedure | null, mode: 'flythrough' | 'stepbystep'): void;
   goToStep(stepIndex: number): void;
@@ -91,6 +122,12 @@ export interface MaintenancePluginAPI {
   prevStep(): void;
   completeStep(stepIndex: number, result?: 'pass' | 'fail'): void;
   restoreProgress(stepResults: StepResult[]): void;
+  /**
+   * plan-522: clamp a target step to the safety barrier — the first
+   * `ConfirmWarning` step that is not confirmed (`'pass'`). Next, the stepper
+   * and resume never pass it; the flythrough preview is exempt.
+   */
+  clampToBarrier(target: number): number;
 }
 
 // ─── WebXR Types ────────────────────────────────────────────────────────
@@ -116,6 +153,10 @@ export interface WebXRPluginAPI {
 export interface FpvPluginAPI {
   readonly id: string;
   toggle(): void;
+  /** Whether FPV is active. */
+  readonly isActive?: boolean;
+  /** Leave FPV (no-op when inactive). */
+  exit?(): void;
 }
 
 // ─── Camera Follow / Sit-On Types ─────────────────────────────────────────
@@ -148,7 +189,14 @@ export interface CameraFollowPluginAPI {
 export interface McpBridgePluginAPI {
   readonly id: string;
   reconnect(port?: string): void;
+  /** plan-668: switch AI control on/off (the CONNECT channel is independent). */
   setEnabled(enabled: boolean): void;
+  /** plan-2220 E8: "AI may control SolidCraft" (default off). */
+  setAiSolidCraft?(enabled: boolean): void;
+  /** plan-668: a user action holds the CONNECT channel open (page without CONNECT). */
+  acquireChannel?(holder: string): void;
+  /** plan-668: release a holder taken with {@link acquireChannel}. */
+  releaseChannel?(holder: string): void;
   /** Set the target port without connecting (applied on next enable/reconnect). */
   setPort(port: string): void;
   /** Ask the bridge server to shut down (process exits; restart via the MCP host). */
@@ -318,4 +366,77 @@ export interface MeasurementPluginAPI {
   removeAll(): void;
   getMeasurements(): Measurement[];
   focusMeasurement(id: string): void;
+}
+
+import type { SixDofNavInput, SixDofSample } from '../engine/rv-spacemouse-nav';
+
+/** SpaceMouse connection state: `unavailable` = no WebHID, `failed` = the last open attempt threw. */
+export type SpaceMouseConnectionStatus = 'not-connected' | 'connecting' | 'connected' | 'unavailable' | 'failed';
+
+export interface SpaceMousePluginAPI {
+  readonly id: string;
+  readonly navInput: SixDofNavInput;
+  readonly status: SpaceMouseConnectionStatus;
+  readonly connected: boolean;
+  readonly deviceName: string;
+  readonly lastAxes: Readonly<SixDofSample>;
+  readonly message: string;
+  connect(): Promise<void>;
+}
+
+/** Stereo state (plan-2215): `requested` = layout chosen, waiting for fullscreen; `active` = rendering stereo. */
+export type StereoState = 'off' | 'requested' | 'active';
+
+/** `web_status.stereo` — the stereo plugin's state as the MCP status reports it. */
+export interface StereoStatus {
+  state: StereoState;
+  active: boolean;
+  layout: string;
+  eyeSepMm: number;
+  scaleMode: string;
+  zeroParallax: string;
+  /** Distance of the zero-parallax plane in metres (last rendered frame; 0 before the first). */
+  zeroParallaxM: number;
+  swapEyes: boolean;
+  /** Why stereo is not (or no longer) active, or null. */
+  refusedReason: string | null;
+  /** Plugins whose own back-buffer drawing is not visible in stereo (e.g. Gaussian splats). */
+  hiddenInStereo: string[];
+}
+
+/** Public contract of the commercial stereo plugin (id `stereo`); the core only reads it. */
+export interface StereoPluginAPI {
+  readonly id: string;
+  readonly status: StereoStatus;
+}
+
+/** Status contract of an optional display wall strategy owner (plan-2215 P5). */
+export interface WallStatus {
+  state: 'off' | 'requested' | 'active';
+  active: boolean;
+  refusedReason: string | null;
+  mode: 'wall' | 'wall-preview';
+  node: string | null;
+  canvasWidth: number;
+  canvasHeight: number;
+  configErrors: { path: string; message: string }[];
+  outputMismatch: {
+    expected: { width: number; height: number };
+    actual: { width: number; height: number };
+  } | null;
+  viewports: {
+    label: string;
+    headPosePrefix: string;
+    ageMs: number | null;
+    status: 'fresh' | 'sweet spot' | 'too close';
+    rect: { x: number; y: number; w: number; h: number };
+    eye: string;
+  }[];
+}
+
+export interface DisplayWallPluginAPI {
+  readonly id: string;
+  readonly status: WallStatus;
+  start(preview?: boolean, path?: string): Promise<void>;
+  deactivate(reason: string, next?: 'off' | 'requested'): void;
 }

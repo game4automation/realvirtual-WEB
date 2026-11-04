@@ -1,0 +1,25 @@
+# plan-659: fremde Binaer-Assets werden per Skript beschafft, NICHT eingecheckt.
+# Entscheidung Thomas, 2026-10-22.
+#
+# Grund: dieses Repo hat ein `public`-Remote, das ein ungefilterter GitHub-Mirror ist.
+# Die Microduck-STL-Meshes und `visual/microduck.glb` stehen laut
+# `microduck_rl/LICENSE-MODELS.md` unter CC BY-NC-SA 4.0 — NonCommercial UND ShareAlike,
+# und die Klausel erfasst ausdruecklich "decimated or converted meshes". Sie duerfen
+# deshalb nicht in ein kommerziell ausgeliefertes Repo wandern. Die ONNX-Gewichte sind
+# dagegen sauber Apache-2.0 (eigenes Model-Repo `pollen-robotics/microduck-policies`,
+# `license: apache-2.0`), werden aber aus demselben Manifest beschafft und deshalb
+# gleich mitbehandelt.
+#
+# Beschaffung:   python spikes/659/make-microduck-fixtures.py
+#                python spikes/659/make-g1-fixtures.py
+#
+# Versioniert bleibt der vollstaendige Nachweis, nicht die Nutzlast:
+#   asset-manifest.json / g1-asset-manifest.json   Revision + URL + SHA-256 je Datei
+#   SHA256SUMS.txt                                 Pruefsummen zum Abgleich
+#   NOTICE.md, licenses/                           Lizenztexte und Zuordnung
+#   mjcf/*.xml, rig/kinematics.json                Apache-2.0, Text, bleibt
+#   reference/*.json                               Paritaets-Fixtures, eigene Erzeugung
+*.stl
+*.glb
+*.onnx
+*.pt

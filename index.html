@@ -136,7 +136,7 @@
       display: block; width: min(504px, 100vw, calc((100vh - 300px) * 2.717)); height: auto;
       overflow: visible; pointer-events: none;
     }
-    .rv-cell { --rv-out-to: 156px; --rv-belt-to: 156px; }
+    .rv-cell { --rv-out-to: 156px; --rv-belt-to: 156px; --rv-q-shift: 0px; --rv-q-exit: 0px; }
     .rv-cell * { transform-origin: 0 0; }
     .rv-cell .a1      { transform: rotate(0deg);          animation: rv-a1 2s infinite; }
     .rv-cell .a2      {                                   animation: rv-a2 2s infinite; }
@@ -149,6 +149,8 @@
     .rv-cell .held    {                                   animation: rv-held 2s infinite step-end; }
     .rv-cell .in-box  {                                   animation: rv-in-box 2s infinite; }
     .rv-cell .out-box { transform: translate(var(--rv-out-to), 0);   animation: rv-out-box 2s infinite; }
+    .rv-cell .queue   {                                   animation: rv-queue 2s infinite; }
+    .rv-cell .slot.lead {                                 animation: rv-lead 2s infinite; }
     .rv-cell .in-belt {                                   animation: rv-in-belt 2s infinite; }
     .rv-cell .out-belt {                                  animation: rv-out-belt 2s infinite; }
 
@@ -205,6 +207,19 @@
       51%, 55%   { transform: translate(0, 0); opacity: 1; animation-timing-function: cubic-bezier(.5, 0, .7, 1); }
       90%, 100%  { transform: translate(var(--rv-out-to), 0); opacity: 1; }
     }
+    /* Ahead of the load the placed box joins the queue at the tail while the
+       whole queue moves on one pitch (--rv-q-shift) and the lead box at the
+       belt end rides off (--rv-q-exit): the box count stays the earned steps.
+       Both are 0 for an earned box. At the cycle end the shifted picture equals
+       the unshifted queue, so the reset is seamless. */
+    @keyframes rv-queue {
+      0%, 55%   { transform: translate(0, 0); animation-timing-function: cubic-bezier(.5, 0, .7, 1); }
+      90%, 100% { transform: translate(var(--rv-q-shift), 0); }
+    }
+    @keyframes rv-lead {
+      0%, 55%   { transform: translate(0, 0); animation-timing-function: cubic-bezier(.5, 0, .7, 1); }
+      90%, 100% { transform: translate(var(--rv-q-exit), 0); }
+    }
     /* Slats move with the box; 84 = 7 × 12 px pitch, so the reset is seamless. */
     @keyframes rv-in-belt {
       0%, 50%  { transform: translate(0, 0); animation-timing-function: cubic-bezier(.3, 0, .4, 1); }
@@ -220,8 +235,6 @@
        end of a carrying cycle the delivered box becomes a queue box in place. */
     .rv-cell .slot { opacity: 0; }
     .rv-cell .slot.on { opacity: 1; }
-    /* Nothing earned to deliver: the robot swings empty-handed (and slowly). */
-    .rv-cell.idle .held, .rv-cell.idle .out-box { visibility: hidden; }
     /* Load failed: the cell stops where it is, like an E-stop. */
     #loading-overlay.rv-fault .rv-cell * { animation-play-state: paused !important; }
 
@@ -292,37 +305,13 @@
       font-family: 'Consolas', 'Monaco', monospace;
     }
 
-    /* Progress bar */
+    /* Progress text: load step + quips under the robot cell */
     .loader-progress-wrap {
       margin-top: 18px;
       display: flex;
       flex-direction: column;
       align-items: center;
       gap: 8px;
-    }
-    .loader-progress-track {
-      width: min(220px, 60vw);
-      height: 4px;
-      background: #2a2a2a;
-      border-radius: 3px;
-      overflow: hidden;
-    }
-    /* Full-width bar scaled from the left edge: progress and the sweep are
-       transform-only (compositor), never width/margin (layout). main.ts sets
-       `style.transform = scaleX(fraction)` for determinate progress. */
-    .loader-progress-bar {
-      height: 100%;
-      width: 100%;
-      background: linear-gradient(90deg, #e94078, #ff6b9d);
-      border-radius: 3px;
-      transform-origin: left center;
-      transform: scaleX(0);
-      transition: transform 0.3s ease-out;
-    }
-    /* Indeterminate sweep when no real progress */
-    .loader-progress-bar.indeterminate {
-      transition: none;
-      animation: progress-sweep 1.8s ease-in-out infinite;
     }
     .loader-progress-pct {
       color: #555;
@@ -399,14 +388,6 @@
     }
     .loader-btn-primary:hover { filter: brightness(1.08); color: #fff; }
 
-    /* Same shape as the old width/margin-left sweep (0→60%→0 wide, sliding
-       0→20%→100%), expressed as translate + scale so it never touches layout.
-       translateX(%) is relative to the bar's own width, which is the track. */
-    @keyframes progress-sweep {
-      0% { transform: translateX(0%) scaleX(0); }
-      50% { transform: translateX(20%) scaleX(0.6); }
-      100% { transform: translateX(100%) scaleX(0); }
-    }
   </style>
 </head>
 <body>
@@ -462,11 +443,13 @@
           <rect x="-24" y="-23" width="214" height="46" rx="3" fill="#222" stroke="#333" />
           <g clip-path="url(#rv-clip-out)">
             <use class="out-belt" href="#rv-slats" />
-            <g transform="translate(156 0)"><g class="slot"><use href="#rv-box" /></g></g>
-            <g transform="translate(126 0)"><g class="slot"><use href="#rv-box" /></g></g>
-            <g transform="translate(96 0)"><g class="slot"><use href="#rv-box" /></g></g>
-            <g transform="translate(66 0)"><g class="slot"><use href="#rv-box" /></g></g>
-            <g transform="translate(36 0)"><g class="slot"><use href="#rv-box" /></g></g>
+            <g class="queue">
+              <g transform="translate(156 0)"><g class="slot lead"><use href="#rv-box" /></g></g>
+              <g transform="translate(126 0)"><g class="slot"><use href="#rv-box" /></g></g>
+              <g transform="translate(96 0)"><g class="slot"><use href="#rv-box" /></g></g>
+              <g transform="translate(66 0)"><g class="slot"><use href="#rv-box" /></g></g>
+              <g transform="translate(36 0)"><g class="slot"><use href="#rv-box" /></g></g>
+            </g>
             <g class="out-box"><use href="#rv-box" /></g>
           </g>
         </g>
@@ -531,7 +514,6 @@
     <div class="loader-slogan">Open. Light. Industrial. AI-native.</div>
     <div class="loader-status" id="loading-status"><span id="loading-label">Starting… </span><span class="model-name" id="loading-model-name"></span></div>
     <div class="loader-progress-wrap">
-      <div class="loader-progress-track"><div class="loader-progress-bar indeterminate" id="loading-progress-bar"></div></div>
       <div class="loader-progress-pct" id="loading-progress-pct"></div>
       <div class="loader-detail" id="loading-detail"></div>
     </div>
@@ -550,7 +532,8 @@
 
   <div id="react-root"></div>
 
-  <!-- AGPL Watermark — removal requires a commercial license -->
+  <!-- AGPL Watermark — removal requires a commercial license. Keeping it visible is an additional
+       term under AGPL-3.0 section 7(b), see NOTICE.md: do not remove, hide or cover it. -->
   <a id="rv-watermark" href="https://github.com/game4automation/realvirtual-WEB" target="_blank" rel="noopener noreferrer">
     Powered by <strong>realvirtual WEB</strong> · AGPL-3.0
   </a>
@@ -596,6 +579,62 @@
     }
   </style>
 
+  <!-- Demo notice - only in the public demo build (RV_DEMO_NOTICE=1 + private tree); removed from every other build by rv-agpl-attribution. Sits where the AGPL watermark sits; never both. -->
+  <a id="rv-demo-notice" href="https://realvirtual.io/en/editions/" target="_blank" rel="noopener noreferrer">
+    Evaluation demo · Non-commercial use only
+  </a>
+  <style>
+    /* Placement is aligned to the HMI chrome (measured, values from the components):
+       - right: 8px  = the right edge of the card column (MessagePanel right: 8), the bottom-right
+         toolbar and the top-right controls (App.tsx top: 8 / right: 8).
+       - bottom: 38px = 8px gap above the bottom-right toolbar, whose top edge sits 30px above the
+         viewport bottom (bottom: 8px + 22px bar height); 8px is also the gap between the cards.
+       Plain CSS cannot read the React constants, so keep these in step with them. */
+    #rv-demo-notice {
+      position: fixed;
+      bottom: 38px;
+      right: 8px;
+      z-index: 9999;
+      font-family: 'Segoe UI', sans-serif;
+      font-size: 13px;
+      color: rgba(255, 255, 255, 0.85);
+      text-decoration: none; /* a link by cursor + hover, not by a permanent underline */
+      cursor: pointer;
+      pointer-events: auto;
+      letter-spacing: 0.4px;
+      transition: color 0.2s, background 0.2s;
+      background: rgba(0, 0, 0, 0.65);
+      padding: 4px 10px;
+      border-radius: 4px;
+    }
+    #rv-demo-notice:hover,
+    #rv-demo-notice:focus-visible {
+      color: #fff;
+      background: rgba(0, 0, 0, 0.9);
+      text-decoration: none;
+    }
+    /* A toolbar tooltip (MUI Tooltip popper, z-index 1500) opens over the same corner and would
+       sit behind the notice (z-index 9999): step aside while one is shown. Open dropdowns
+       (z-index 10000) already draw above the notice by design and need no rule. */
+    body:has(.MuiTooltip-popper) #rv-demo-notice {
+      opacity: 0;
+      pointer-events: none;
+    }
+    /* Compact layout (phones): stacked directly above the floating search button (BottomBar:
+       right: 12px, bottom: 60px, rendered 44px box), same
+       right edge as the button, 8px above it. */
+    @media (max-width: 899px) {
+      #rv-demo-notice {
+        bottom: calc(60px + 44px + 8px + env(safe-area-inset-bottom, 0px));
+        right: 12px;
+        font-size: 11px;
+        line-height: 16px;
+        letter-spacing: 0;
+        padding: 2px 6px;
+      }
+    }
+  </style>
+
   <!-- On-screen DevTools console (opt-in via ?debug=1 URL param) -->
   <script>
     if (new URLSearchParams(location.search).has('debug')) {
@@ -607,9 +646,10 @@
   </script>
 
   <!-- Splash boot phase = load step 1 (virtual, before the app code runs):
-       the first robot turn delivers its box, then the cell swings empty and
-       slowly until rv-splash-robot.ts takes over (data-rv-load). Same tail
-       geometry and rates as the controller. -->
+       the first robot turn delivers its box, then the cell keeps carrying
+       boxes ahead of the load (each one pushes the lead box off the belt)
+       until rv-splash-robot.ts takes over (data-rv-load). Same tail geometry
+       and rates as the controller. -->
   <script>
     (function () {
       var cell = document.querySelector('#loading-overlay .rv-cell');
@@ -620,12 +660,13 @@
       box.addEventListener('animationiteration', function () {
         if (cell.closest('[data-rv-load]') || n >= 1) return;
         slots[n++].classList.add('on');
-        var to = 156 - 30 * n;
+        var to = 156 - 30 * (n - 1);
         cell.style.setProperty('--rv-out-to', to + 'px');
         cell.style.setProperty('--rv-belt-to', Math.round(to / 12) * 12 + 'px');
-        cell.classList.add('idle');
+        cell.style.setProperty('--rv-q-shift', '30px');
+        cell.style.setProperty('--rv-q-exit', '50px');
         if (cell.getAnimations) {
-          cell.getAnimations({ subtree: true }).forEach(function (a) { a.updatePlaybackRate(0.5); });
+          cell.getAnimations({ subtree: true }).forEach(function (a) { a.updatePlaybackRate(0.8); });
         }
       });
     })();

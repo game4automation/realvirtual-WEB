@@ -72,7 +72,8 @@ export type TslMaterialsModule =
   typeof import('./rv-mu-dissolve-tsl') &
   typeof import('./rv-pipe-flow-tsl') &
   typeof import('./rv-post-processing-tsl') &
-  typeof import('./rv-mu-compute-tsl');
+  typeof import('./rv-mu-compute-tsl') &
+  typeof import('./rv-ground-reflector-tsl');
 
 let _tslModule: TslMaterialsModule | null = null;
 let _tslPreload: Promise<void> | null = null;
@@ -95,9 +96,10 @@ export async function preloadTslMaterials(ctx: MaterialContext): Promise<void> {
       import('./rv-pipe-flow-tsl'),
       import('./rv-post-processing-tsl'),
       import('./rv-mu-compute-tsl'),
+      import('./rv-ground-reflector-tsl'),
     ])
-      .then(([uber, toon, dissolve, pipeFlow, post, muCompute]) => {
-        _tslModule = { ...uber, ...toon, ...dissolve, ...pipeFlow, ...post, ...muCompute };
+      .then(([uber, toon, dissolve, pipeFlow, post, muCompute, reflectorTsl]) => {
+        _tslModule = { ...uber, ...toon, ...dissolve, ...pipeFlow, ...post, ...muCompute, ...reflectorTsl };
       })
       .catch((err) => {
         _tslPreload = null; // allow a later retry

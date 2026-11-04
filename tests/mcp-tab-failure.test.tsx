@@ -8,9 +8,11 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { ThemeProvider } from '@mui/material/styles';
 import { McpTab } from '../src/core/hmi/settings/McpTab';
+import { ConnectChannelRow } from '../src/core/hmi/settings/ConnectChannelRow';
+import { grantAiBridgeConsent, revokeAiBridgeConsent } from '../src/core/hmi/ai-consent-store';
 import { rvDarkTheme } from '../src/core/hmi/theme';
 import { RVViewerProvider } from '../src/hooks/use-viewer';
 import type { McpBridgeFailure, McpBridgeSnapshot } from '../src/plugins/mcp-bridge-plugin';
@@ -31,24 +33,28 @@ function snapshot(over: Partial<McpBridgeSnapshot>): McpBridgeSnapshot {
   };
 }
 
-function renderTab(snap: McpBridgeSnapshot) {
-  const plugin = {
-    getSnapshot: () => snap, serverLog: [],
-    reconnect: vi.fn(), setEnabled: vi.fn(), setPort: vi.fn(),
-    shutdownServer: vi.fn(), pauseServer: vi.fn(), resumeServer: vi.fn(),
-  };
+function renderTab(snap: McpBridgeSnapshot, plugin = pluginDouble(snap)) {
   const viewer = {
     getPlugin: (id: string) => (id === 'mcp-bridge' ? plugin : null),
     on: () => () => undefined,
   };
+  // plan-668: the channel row (target, cause, retry) sits above the AI part, as in Settings ▸ AI.
   return render(
     <ThemeProvider theme={rvDarkTheme}>
-      <RVViewerProvider value={viewer as never}><McpTab /></RVViewerProvider>
+      <RVViewerProvider value={viewer as never}><ConnectChannelRow /><McpTab /></RVViewerProvider>
     </ThemeProvider>,
   );
 }
 
-afterEach(() => { cleanup(); });
+function pluginDouble(snap: McpBridgeSnapshot) {
+  return {
+    getSnapshot: () => snap, serverLog: [],
+    reconnect: vi.fn(), setEnabled: vi.fn(), setPort: vi.fn(),
+    shutdownServer: vi.fn(), pauseServer: vi.fn(), resumeServer: vi.fn(),
+  };
+}
+
+afterEach(() => { cleanup(); revokeAiBridgeConsent(); });
 
 /** plan-541 § 3.1, verbatim. */
 const TABLE: Array<[Exclude<McpBridgeFailure, 'none'>, string, string]> = [
@@ -120,14 +126,83 @@ describe('McpTab — target and failure cause (plan-541)', () => {
   });
 });
 
-describe('ActivityBar tooltip (plan-541)', () => {
+describe('ActivityBar tooltip (plan-541, plan-668)', () => {
   it('names an open approval prompt', () => {
     expect(aiBridgeTitle({ connected: false, enabled: true, toolCount: 0, failure: 'pairing-pending' }, null))
-      .toBe('AI Bridge — waiting for approval in the CONNECT tray');
+      .toBe('AI control — waiting for approval in the CONNECT tray');
   });
 
   it('stays "connecting…" for any other cause', () => {
     expect(aiBridgeTitle({ connected: false, enabled: true, toolCount: 0, failure: 'unreachable' }, null))
-      .toBe('AI Bridge — connecting…');
+      .toBe('AI control — connecting…');
   });
+
+  it('a connected channel with AI control off reads "off", not "connected"', () => {
+    expect(aiBridgeTitle({ connected: true, enabled: false, aiEnabled: false, toolCount: 0 }, null))
+      .toBe('AI control — off');
+  });
+});
+
+describe('Settings ▸ AI — channel and AI control are two rows (plan-668)', () => {
+  it('shows "CONNECT channel: Connected" and "AI control: Off" with 0 tools when AI is off', () => {
+    grantAiBridgeConsent();
+    renderTab(snapshot({
+      connected: true, enabled: false, aiEnabled: false, channelReason: 'connect-origin', reconnectAttempt: 0,
+    }));
+    expect(screen.getByTestId('connect-channel-row')).toHaveTextContent('Connected');
+    expect(screen.getByText('served by CONNECT')).toBeInTheDocument();
+    expect(screen.getByText('0 (AI off)')).toBeInTheDocument();
+    expect(screen.getByText('Off')).toBeInTheDocument();
+  });
+
+  it('switching AI on without consent opens the consent dialog first; "Not now" keeps AI off', () => {
+    revokeAiBridgeConsent();
+    const snap = snapshot({ connected: true, enabled: false, aiEnabled: false, channelReason: 'connect-origin' });
+    const plugin = pluginDouble(snap);
+    renderTab(snap, plugin);
+    fireEvent.click(screen.getByTestId('ai-control-switch').querySelector('input')!);
+    expect(screen.getByTestId('ai-consent-dialog')).toBeInTheDocument();
+    expect(plugin.setEnabled).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Not now' }));
+    expect(plugin.setEnabled).not.toHaveBeenCalled();
+    // The channel row stays, AI or not.
+    expect(screen.getByTestId('connect-channel-row')).toHaveTextContent('Connected');
+
+    fireEvent.click(screen.getByTestId('ai-control-switch').querySelector('input')!);
+    fireEvent.click(screen.getByRole('button', { name: 'Got it' }));
+    expect(plugin.setEnabled).toHaveBeenCalledWith(true);
+  });
+
+  it('with consent the switch goes straight through, both ways', () => {
+    grantAiBridgeConsent();
+    const snap = snapshot({ connected: true, enabled: false, aiEnabled: false, channelReason: 'connect-origin' });
+    const plugin = pluginDouble(snap);
+    renderTab(snap, plugin);
+    fireEvent.click(screen.getByTestId('ai-control-switch').querySelector('input')!);
+    expect(screen.queryByTestId('ai-consent-dialog')).not.toBeInTheDocument();
+    expect(plugin.setEnabled).toHaveBeenCalledWith(true);
+  });
+
+  it('no channel wanted: "Not connected" and the hint when it opens, no retry', () => {
+    renderTab(snapshot({ connected: false, enabled: false, channelReason: 'none', reconnectAttempt: 0 }));
+    expect(screen.getByTestId('connect-channel-row')).toHaveTextContent('Not connected');
+    expect(screen.queryByRole('button', { name: 'Retry Now' })).not.toBeInTheDocument();
+  });
+});
+
+
+it('Show AI clicks dispatches the command and reflects the new preference', async () => {
+  const { commandRegistry } = await import('../src/core/hmi/rv-command-registry');
+  const { ensureViewCommandsRegistered } = await import('../src/core/hmi/view-commands');
+  const { setAiClicks } = await import('../src/core/hmi/ai-click-choreography-store');
+  ensureViewCommandsRegistered();
+  setAiClicks(true);
+  const spy = vi.spyOn(commandRegistry, 'execute');
+  try {
+    renderTab(snapshot({}));
+    const toggle = screen.getByRole('switch', { name: 'Show AI clicks' });
+    fireEvent.click(toggle);
+    expect(spy).toHaveBeenCalledWith('view.aiClicks', { on: false }, expect.objectContaining({ origin: 'ui' }));
+    await waitFor(() => expect(toggle).not.toBeChecked());
+  } finally { cleanup(); setAiClicks(true); spy.mockRestore(); }
 });

@@ -42,13 +42,15 @@
  * one-line loader integration can follow later).
  */
 
+import { desComponentIdForNode } from '../material-flow/rv-des-identity';
 import type { Object3D } from 'three';
+import { ownExtrasOf, ownValue } from './rv-safe-keys';
 import type { RVScriptHost } from './rv-script-host';
 import type { SandboxError } from './rv-script-sandbox';
 import { createSdkComponent, type SdkComponent } from '../sdk/rv-component-sdk';
 import { RVScriptComponentAdapter } from '../sdk/rv-script-component-adapter';
 import type { SdkEnvironment, SdkScriptComponentAccess, SdkScriptComponentInfo } from '../sdk/rv-sdk-self';
-import { RV_MSG_HOOK, type SdkScheduler } from '../sdk/rv-script-hook';
+import { RV_MSG_HOOK, type ScriptHookDispatcher, type SdkScheduler } from '../sdk/rv-script-hook';
 
 // ─── §7 WebComponent parsing ────────────────────────────────────────────────
 
@@ -89,18 +91,24 @@ export function parseWebComponent(raw: unknown): ParsedWebComponent | null {
   const r = raw as Record<string, unknown>;
   const props: Record<string, number | string | boolean | null> = {};
   for (const [key, value] of Object.entries(r)) {
-    if (WEB_COMPONENT_FIELDS.has(key)) continue;
+    if (WEB_COMPONENT_FIELDS.has(key) || key === '__proto__') continue;
     if (value === null || typeof value === 'number' || typeof value === 'string' || typeof value === 'boolean') {
       props[key] = value;
     }
   }
+  // OWN fields only: an inherited `Code` must never become a script.
+  const active = ownValue(r, 'Active');
+  const apiVersion = ownValue(r, 'ApiVersion');
+  const language = ownValue(r, 'Language');
+  const typeId = ownValue(r, 'TypeId');
+  const code = ownValue(r, 'Code');
   return {
-    active: r.Active !== false,
-    apiVersion: typeof r.ApiVersion === 'number' && Number.isFinite(r.ApiVersion) ? r.ApiVersion : 1,
-    language: typeof r.Language === 'string' && r.Language.length > 0 ? r.Language : 'js',
-    desSafe: r.DesSafe === true,
-    typeId: typeof r.TypeId === 'string' ? r.TypeId : '',
-    code: typeof r.Code === 'string' ? r.Code : '',
+    active: active !== false,
+    apiVersion: typeof apiVersion === 'number' && Number.isFinite(apiVersion) ? apiVersion : 1,
+    language: typeof language === 'string' && language.length > 0 ? language : 'js',
+    desSafe: ownValue(r, 'DesSafe') === true,
+    typeId: typeof typeId === 'string' ? typeId : '',
+    code: typeof code === 'string' ? code : '',
     props,
   };
 }
@@ -131,6 +139,8 @@ export class WebComponentInstance {
 
   private readonly teardowns: Array<() => void> = [];
   private disposedFlag = false;
+  /** plan-2212 Phase 2: true once `mint` finished (setup() ran); see {@link lifecyclePhase}. */
+  setupDone = false;
   private disabledFlag = false;
   private disabledReasonValue: string | null = null;
 
@@ -158,6 +168,11 @@ export class WebComponentInstance {
 
   get isDisposed(): boolean {
     return this.disposedFlag;
+  }
+
+  /** `setup` while the VM is being built (setup() runs), `running` after, `disposed` once torn down. */
+  get lifecyclePhase(): 'setup' | 'running' | 'disposed' {
+    return this.disposedFlag ? 'disposed' : this.setupDone ? 'running' : 'setup';
   }
 
   get isDisabled(): boolean {
@@ -219,12 +234,88 @@ export interface WebComponentEnvArgs {
    * (event listeners, fan-out shims, …). Runs on instance dispose.
    */
   addTeardown(fn: () => void): void;
+  /**
+   * plan-2212 Phase 2: the active DES binding this instance is minted under
+   * (null = continuous). The factory resolves `self.sink(path)` through its
+   * `sinks` while it is set.
+   */
+  des?: WebComponentDesBinding | null;
+  /**
+   * plan-2212 Phase 2: the instance's lifecycle phase - `setup` while setup()
+   * runs, `running` afterwards, `disposed` during teardown. DES sink
+   * subscriptions are declared in setup() only.
+   */
+  phase?(): 'setup' | 'running' | 'disposed';
 }
 
 /** Builds the `SdkEnvironment` one instance runs against (viewer wiring). */
 export type WebComponentEnvFactory = (args: WebComponentEnvArgs) => SdkEnvironment;
 
+/**
+ * Problem code: a DES run started without its Model-Scripts (plan-2212 R2-3).
+ * Reported by the DES runner when the script wiring failed (QuickJS host load);
+ * retired by the `web-component` plugin on every model clear / load and on a
+ * successful wiring, and by the runner on the next bind. Lives here (public
+ * core) so the plugin can retire it without importing the DES plugin.
+ */
+export const DES_SCRIPTS_UNAVAILABLE_CODE = 'des-scripts-unavailable';
+
+/**
+ * DES binding context (plan-2212): handed in by the DES runner while a DES run
+ * is bound. Every instance minted while it is active - the rebuild of
+ * `bindDes()` AND every later one (QuickJS loaded late, a placement, a trust
+ * release, an editor reload) - runs on the DES event clock with the run seed.
+ * Structural and DES-free: core never imports the DES plugin.
+ */
+export interface WebComponentDesBinding {
+  /** The ScriptHook-backed scheduler for one instance; `dispatcher` is its adapter. */
+  makeScheduler(dispatcher: ScriptHookDispatcher): SdkScheduler;
+  /**
+   * The run RNG seed of one script (`env.seed`, fixed BEFORE `setup()` runs);
+   * null keeps the path seed (RNG v1). `desId` is the script's registered DES
+   * address (null when unaddressable).
+   */
+  seedFor(desId: string | null, path: string): number | null;
+  /** Notified for every instance minted in DES mode (snapshot participant / settle gating). */
+  onInstance?(info: { path: string; desId: string | null }): void;
+  /** Receives the DES lint warnings of non-`DesSafe` scripts (default: console.warn). */
+  onLintWarning?(path: string, code: string, message: string): void;
+  /**
+   * plan-2212 Phase 4: true while the DES run animates (not FastForward, not a
+   * batch). Only then do the scripts' frame hooks (`continuous.fixedUpdate` /
+   * `lateFixedUpdate`) run in DES mode — for display only, behind the
+   * adapter's write fence. Absent = frame hooks never run in DES mode.
+   */
+  displayFrames?(): boolean;
+  /**
+   * plan-2212 Phase 2: the DES sinks of the run, behind `self.sink(path).on` in
+   * DES mode. Absent = scripts keep the continuous sink targets.
+   */
+  sinks?: WebComponentDesSinks;
+}
+
+/** One DES sink a script can listen to (plan-2212 Phase 2). */
+export interface WebComponentDesSinkRef {
+  /** The scene node the DES sink is anchored to. */
+  readonly node: Object3D;
+  /**
+   * Called synchronously for every arrival, at the DES time of the arrival.
+   * `orderKey` (the script node path) fixes the delivery order among the
+   * listeners of one sink. Returns the idempotent unsubscribe.
+   */
+  subscribe(cb: (mu: { id: number }) => void, orderKey: string): () => void;
+}
+
+/** Resolves the DES sinks of the bound run (plan-2212 Phase 2). */
+export interface WebComponentDesSinks {
+  /** The DES sink on `node` (preferred) or at `path`; null when the run has none there. */
+  find(path: string, node: Object3D | null): WebComponentDesSinkRef | null;
+  /** Every DES sink of the run, in runner instance order. */
+  all(): WebComponentDesSinkRef[];
+}
+
 export interface WebComponentRegistryOptions {
+  getAddressForNode?(node: Object3D): string | null;
   /** The shared QuickJS host (one runtime, one context per instance). */
   host: RVScriptHost;
   /** Environment factory (live viewer wiring or test mocks). */
@@ -253,6 +344,8 @@ export class RVWebComponentRegistry {
   /** Reloads/disposals deferred by the swap guard (applied after the pass). */
   private readonly deferred: Array<() => void> = [];
   private disposed = false;
+  /** Active DES binding (plan-2212); null = continuous (frame clock). */
+  private desBinding: WebComponentDesBinding | null = null;
 
   constructor(opts: WebComponentRegistryOptions) {
     this.opts = opts;
@@ -270,6 +363,52 @@ export class RVWebComponentRegistry {
     return [...this.instances.values()];
   }
 
+  /** True while a DES binding is active (instances run on the DES clock). */
+  get desBound(): boolean {
+    return this.desBinding !== null;
+  }
+
+  /**
+   * plan-2212: bind every instance to a DES run. Rebuilds each VM in DES mode
+   * (`reMintAll`) - node, code and identity stay; closure state, persist, FSM
+   * and timers start fresh; the run seed is fixed before `setup()`. The binding
+   * stays active, so instances minted later are built the same way. Calling it
+   * again (the next replication) rebuilds again with the new seeds.
+   */
+  bindDes(binding: WebComponentDesBinding): void {
+    this.assertUsable('bindDes');
+    this.desBinding = binding;
+    this.reMintAll();
+  }
+
+  /**
+   * plan-2212: back to the frame clock. Rebuilds every instance continuous
+   * (fresh state, path seed). No-op when no DES binding is active.
+   */
+  unbindDes(): void {
+    if (this.disposed || !this.desBinding) return;
+    this.desBinding = null;
+    this.reMintAll();
+  }
+
+  /**
+   * Rebuild every instance under the current binding mode, keeping node, meta
+   * and path (and with them its identity / DES address). Deferred to the end
+   * of a running pass by the swap guard.
+   */
+  reMintAll(): void {
+    if (this.disposed) return;
+    if (this.inPass) {
+      this.deferred.push(() => this.reMintAll());
+      return;
+    }
+    for (const [nodePath, old] of [...this.instances]) {
+      const { node, meta } = old;
+      old.dispose();
+      this.instances.set(nodePath, this.mint(nodePath, node, meta));
+    }
+  }
+
   /**
    * Live script components with their kernel adapters (plan-261 B4). This is
    * the access path the (private) DES snapshot pipeline uses to capture and
@@ -278,11 +417,12 @@ export class RVWebComponentRegistry {
    * channel with no state introspection. Public + structural: only public
    * types cross the boundary. Inactive / disposed instances are skipped.
    */
-  listScriptComponents(): Array<{ path: string; adapter: RVScriptComponentAdapter }> {
-    const out: Array<{ path: string; adapter: RVScriptComponentAdapter }> = [];
+  listScriptComponents(): Array<{ path: string; node: Object3D; desId: string | null; source: string; adapter: RVScriptComponentAdapter }> {
+    const out: Array<{ path: string; node: Object3D; desId: string | null; source: string; adapter: RVScriptComponentAdapter }> = [];
     for (const inst of this.instances.values()) {
       if (inst.adapter && !inst.isDisposed) {
-        out.push({ path: inst.nodePath, adapter: inst.adapter });
+        out.push({ path: inst.nodePath, node: inst.node, desId: this.desIdOf(inst.node),
+          source: inst.meta.code, adapter: inst.adapter });
       }
     }
     return out;
@@ -451,14 +591,51 @@ export class RVWebComponentRegistry {
     }
   }
 
-  /** Builds one instance: adapter → env → sandboxed component → attach. */
+  /** Registered DES address of a script node (`desComponentIdForNode`), null when unaddressable. */
+  private desIdOf(node: Object3D): string | null {
+    return desComponentIdForNode(this.opts.getAddressForNode ? { getAddressForNode: this.opts.getAddressForNode } : null, node, 'WebComponent');
+  }
+
+  /**
+   * Builds one instance: adapter → env → sandboxed component → attach. With an
+   * active DES binding (plan-2212) the adapter runs in DES mode on the
+   * binding's ScriptHook scheduler and the run seed is fixed as `env.seed`
+   * before `setup()` runs.
+   */
   private mint(nodePath: string, node: Object3D, meta: ParsedWebComponent): WebComponentInstance {
     const inst = new WebComponentInstance(nodePath, node, meta);
+    try {
+      return this.mintInto(inst, nodePath, node, meta);
+    } finally {
+      inst.setupDone = true;
+    }
+  }
+
+  private mintInto(inst: WebComponentInstance, nodePath: string, node: Object3D, meta: ParsedWebComponent): WebComponentInstance {
     if (!meta.active || meta.code.trim().length === 0) {
       return inst;   // §7: empty code / inactive → no VM, no error.
     }
 
+    const des = this.desBinding;
+    const desId = des ? this.desIdOf(node) : null;
+    let runSeed: number | null = null;
+    if (des) {
+      try { runSeed = des.seedFor(desId, nodePath); } catch (err) {
+        console.warn(`[web-component:${nodePath}] DES run seed unavailable:`, err);
+      }
+    }
+
     const adapter = new RVScriptComponentAdapter({
+      ...(des ? {
+        mode: 'des' as const,
+        makeDesScheduler: (dispatcher: ScriptHookDispatcher) => des.makeScheduler(dispatcher),
+        lintPolicy: meta.desSafe ? 'strict' as const : 'warn' as const,
+        displayFrames: () => des.displayFrames?.() === true,
+        onLintWarning: (code: string, message: string) => {
+          if (des.onLintWarning) des.onLintWarning(nodePath, code, message);
+          else console.warn(`[web-component:${nodePath}] ${code}: ${message}`);
+        },
+      } : {}),
       onHandlerError: (path, message) => {
         // §4.4 failure isolation: an error in the FIRST tick disables the
         // instance; later handler errors only log (poison backoff decides
@@ -480,7 +657,10 @@ export class RVWebComponentRegistry {
       props: meta.props,
       scheduler: adapter.scheduler,
       addTeardown: (fn) => inst.addTeardown(fn),
+      des,
+      phase: () => inst.lifecyclePhase,
     });
+    if (runSeed !== null) env.seed = runSeed;
 
     // ── Registry defaults (phase 1b) — additive, factory overrides win ──
     // State tracking (script→script `component(path).state`): wrap the
@@ -515,13 +695,34 @@ export class RVWebComponentRegistry {
     const component = createSdkComponent(this.opts.host, env, meta.code, {
       callDeadlineMs: this.opts.callDeadlineMs,
     });
-    adapter.attach(component);
     inst.adapter = adapter;
     inst.component = component;
     // Auto-teardown register (LIFO): component first (bridge unsubscribes +
     // cancels pending timers while the heap is still alive), then adapter.
     inst.addTeardown(() => adapter.dispose());
     inst.addTeardown(() => component.dispose());
+    try {
+      adapter.attach(component);
+    } catch (err) {
+      // DES strict lint (a `DesSafe` script with undeclared state, plan-2212
+      // F7): the adapter already disabled the component - the instance stays
+      // registered, inactive, and the disable is surfaced.
+      const reason = err instanceof Error ? err.message : String(err);
+      inst.adapter = null;   // not a live script: DES snapshot and settle gating skip it
+      inst.disable(reason);
+      // plan-2212 Phase 3: `setup()` already ran and may have queued Script.Hook
+      // timers on the DES queue for this adapter. Cancel them with the VM - a
+      // queued hook of a dead dispatcher would make every snapshot refuse
+      // ('unknown script dispatcher') and could never be delivered anyway.
+      try { component.dispose(); } catch (e) {
+        console.warn(`[web-component:${nodePath}] dispose of the disabled script failed:`, e);
+      }
+      adapter.dispose();
+      this.opts.onInstanceDisabled?.(nodePath, reason);
+      return inst;
+    }
+    if (runSeed !== null && component.ok) adapter.markRunSeeded(runSeed);
+    if (des) des.onInstance?.({ path: nodePath, desId });
 
     if (!component.ok) {
       const reason = `setup failed: ${component.error?.message ?? 'unknown error'}`;
@@ -627,6 +828,8 @@ export interface WireWebComponentsOptions {
   allowScripts?: boolean;
   /** Node-path resolver override (default: hierarchy walk root→leaf). */
   pathOf?: (node: Object3D) => string;
+  /** Only nodes this returns true for are wired (others count as blocked). */
+  include?: (node: Object3D) => boolean;
 }
 
 export interface WireWebComponentsResult {
@@ -642,8 +845,8 @@ export interface WireWebComponentsResult {
 export function countWebComponents(root: Object3D): number {
   let n = 0;
   root.traverse((node) => {
-    const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
-    if (rv && rv.WebComponent !== undefined) n++;
+    // OWN properties only: an inherited `WebComponent` (a polluted prototype) is no entry.
+    if (ownValue(ownExtrasOf(node.userData), 'WebComponent') !== undefined) n++;
   });
   return n;
 }
@@ -664,14 +867,14 @@ export function wireWebComponents(
   const pathOf = opts.pathOf ?? computeWebComponentNodePath;
   const result: WireWebComponentsResult = { created: [], blocked: 0, malformed: 0 };
   root.traverse((node) => {
-    const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
-    if (!rv || rv.WebComponent === undefined) return;
-    const meta = parseWebComponent(rv.WebComponent);
+    const raw = ownValue(ownExtrasOf(node.userData), 'WebComponent');
+    if (raw === undefined) return;
+    const meta = parseWebComponent(raw);
     if (!meta) {
       result.malformed++;
       return;
     }
-    if (!allow) {
+    if (!allow || (opts.include && !opts.include(node))) {
       result.blocked++;
       return;
     }

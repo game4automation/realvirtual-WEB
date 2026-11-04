@@ -85,7 +85,7 @@ describe('NewsDialog rendering', () => {
 
   it('marks the current item seen and closes via the X button', async () => {
     const { onSeen } = renderNews({ id: 'x', title: 'T', body: '' });
-    fireEvent.click(screen.getByRole('button', { name: 'News schließen' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Close news' }));
     expect(onSeen).toHaveBeenCalledWith('x');
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
   });
@@ -114,12 +114,12 @@ describe('NewsDialog rendering', () => {
       { id: 'one', title: 'One', body: '' },
       { id: 'two', title: 'Two', body: '' },
     ]);
-    expect(screen.getByText('1 von 2')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Weiter' }));
+    expect(screen.getByText('1 of 2')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     expect(onSeen).toHaveBeenCalledWith('one');
     expect(screen.getByText('Two')).toBeTruthy();
-    expect(screen.getByText('2 von 2')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Schließen' }));
+    expect(screen.getByText('2 of 2')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
     expect(onSeen).toHaveBeenLastCalledWith('two');
   });
 
@@ -132,7 +132,7 @@ describe('NewsDialog rendering', () => {
 
   it('autofocuses the primary action inside the dialog', async () => {
     renderNews({ id: 'focus', title: 'Focus', body: '' });
-    const button = screen.getByRole('button', { name: 'Schließen' });
+    const button = screen.getByRole('button', { name: 'Close' });
     await waitFor(() => expect(document.activeElement).toBe(button));
     expect(screen.getByRole('dialog').contains(document.activeElement)).toBe(true);
   });
@@ -151,7 +151,7 @@ describe('NewsDialog rendering', () => {
 
     render(<NewsDialogHost includeWeb />);
     expect(screen.getByText('WEB item')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Schließen' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
     expect(await screen.findByText('CONNECT item')).toBeTruthy();
   });
 

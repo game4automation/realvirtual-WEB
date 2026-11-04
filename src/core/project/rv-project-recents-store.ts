@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * rv-project-recents-store — the persisted half of the recent-documents ring
  * (plan-478 Phase 1/2).
@@ -61,12 +63,12 @@ let snapshot: RecentDocumentEntry[] | null = null;
 const listeners = new Set<() => void>();
 
 function readStorage(): RecentDocumentEntry[] {
-  try { return parseRecents(localStorage.getItem(LS_KEY_RECENT_DOCUMENTS)); }
+  try { return parseRecents(readLocalStorage(LS_KEY_RECENT_DOCUMENTS)); }
   catch { return []; }
 }
 
 function writeStorage(items: readonly RecentDocumentEntry[]): void {
-  try { localStorage.setItem(LS_KEY_RECENT_DOCUMENTS, serialiseRecents(items)); }
+  try { writeLocalStorage(LS_KEY_RECENT_DOCUMENTS, serialiseRecents(items)); }
   catch { /* private mode / quota — the in-memory snapshot still stands */ }
 }
 

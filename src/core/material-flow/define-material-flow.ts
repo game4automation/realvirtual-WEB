@@ -1,6 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import type { Object3D } from 'three';
+import type { PersistableQueueEvent } from '../../plugins/des/rv-des-action-schema';
+
+/** Saved-world references available during the mutation-free participant preflight. */
+export interface BehaviourSnapshotContext {
+  componentId: string;
+  portCounts?: { inputs: number; outputs: number };
+  fsmState?: string;
+  prop?: Record<string, unknown>;
+  events: readonly PersistableQueueEvent[];
+  frozen: readonly { action: string; muRef: { id: number; gen: number } | null }[];
+  hasMU(id: number, gen: number): boolean;
+  /** Matches resolution against this component's restored self.mus. */
+  ownsMU(id: number, gen?: number): boolean;
+}
 /**
  * define-material-flow.ts — the public `defineMaterialFlow` API (Plan 194 §2.2).
  *
@@ -30,6 +45,7 @@ import {
   type MaterialFlowKind,
   type MU,
   type Port,
+  type AcceptContext,
   type FrozenDescriptor,
   type SignalShape,
 } from './material-flow-self';
@@ -97,12 +113,26 @@ export interface DesBlock<S extends MaterialFlowSelf<any> = MaterialFlowSelf> {
    * entirely in FastForward (pure conveyor/station lines pay zero cost).
    */
   samplesLiveGeometry?: boolean;
-  canAccept?(self: S, mu: MU, port?: Port): boolean;
-  onAccept?(self: S, mu: MU, port?: Port): boolean;
+  /**
+   * Declares that `canAccept` / `onAccept` honour `ctx.acceptPose` (plan-631):
+   * the MU is taken over where it was set down instead of at the entry. The
+   * runner refuses a pose hand-over to a type without this flag, and to an
+   * instance whose accept is deferred (a central Processing attachment at
+   * `accept`) — a pose is only valid on the synchronous accept path.
+   */
+  acceptsPose?: boolean;
+  /**
+   * `ctx` (plan-631 F2) is passed ONLY for an explicit pose hand-over; every
+   * other call keeps the three-argument form.
+   */
+  canAccept?(self: S, mu: MU, port?: Port, ctx?: AcceptContext): boolean;
+  onAccept?(self: S, mu: MU, port?: Port, ctx?: AcceptContext): boolean;
   onArrival?(self: S, mu: MU): void;
   onProcessComplete?(self: S, mu: MU, data?: unknown): void;
   onRotateComplete?(self: S, mu: MU): void;
   onGenerate?(self: S): void;
+  /** Exactly the nodes moved by simulation; no implicit descendants. */
+  movedNodes?(self: S): Object3D[];
   onAutoRelease?(self: S, mu: MU): void;
   onDownstreamReady?(self: S, from: unknown): void;
   onSignalChanged?(self: S, signal: string, value: boolean | number): void;
@@ -110,12 +140,17 @@ export interface DesBlock<S extends MaterialFlowSelf<any> = MaterialFlowSelf> {
   onFreeze?(self: S, frozen: FrozenDescriptor[]): void;
   /** Called after frozen work was rebound and scheduled with its remaining time. */
   onResume?(self: S, frozen: FrozenDescriptor[]): void;
-  /** Called after a full DES snapshot restore has rebuilt component and MU state. */
-  onRestore?(self: S): void;
+  /** Snapshot-safe local state. Store MU references by id + generation, never live objects. */
+  onSnapshot?(self: S): unknown;
+  /** Validate saved local state before any live-world mutation. Must be pure. */
+  validateSnapshot?(state: unknown, ctx: BehaviourSnapshotContext): void;
+  /** Called after component and MU state is rebuilt; state is the saved onSnapshot result. */
+  onRestore?(self: S, state?: unknown): void;
   /** Called when FastForward exits after final-only tweens have settled. */
   onFastForwardExit?(self: S): void;
   /** Adapter-private helpers (rotateTo/tryRelease/…) authored on the block.
-   *  `boolean` is included only for the `samplesLiveGeometry` capability flag. */
+   *  `boolean` is included only for the `samplesLiveGeometry` / `acceptsPose`
+   *  capability flags. */
   [name: string]: ((self: S, ...args: never[]) => unknown) | boolean | undefined;
 }
 
@@ -128,6 +163,11 @@ export interface MaterialFlowDefinition<
   /** Stable id: rv_extras key AND DES action namespace ('Conveyor' → 'Conveyor.Arrival'). */
   readonly type: string;
   readonly kind: MaterialFlowKind;
+  /**
+   * Display/statistics kind (stats filter chips, MCP `statistics().kind`). Falls back to `kind`.
+   * Never used for topology — `kind` stays load-bearing for connection resolution.
+   */
+  readonly statsKind?: string;
   /**
    * Short, human-facing one-liner — what this component IS and does. Shown as the
    * library hover tooltip and returned by the `web_catalog_list` MCP tool. Keep it

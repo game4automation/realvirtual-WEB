@@ -1,0 +1,69 @@
+{
+  "$schema": "rv-tutorial/1",
+  "id": "ai-kinematize",
+  "title": "realvirtual WEB - Import and kinematize a STEP model with AI",
+  "url": "/?doc=new&mode=editor",
+  "connect": "live",
+  "viewport": { "width": 1920, "height": 1080 },
+  "welcome": "dismiss",
+  "ready": "#rv-viewport",
+  "minStepSec": 2,
+  "setup": [
+    { "type": "waitFor", "selector": "[data-testid=\"unified-import-dialog\"]", "timeoutMs": 120000 },
+    { "type": "press", "key": "Escape" },
+    { "type": "waitFor", "selector": "[data-testid=\"unified-import-dialog\"]", "state": "hidden", "timeoutMs": 10000 },
+    { "type": "click", "target": { "selector": "button[aria-label^=\"AI control\"]" } },
+    { "type": "waitFor", "selector": "[data-rv-ai=\"panel\"]", "timeoutMs": 10000 },
+    { "type": "click", "target": { "selector": "[data-rv-ai=\"settings\"]" } },
+    { "type": "waitFor", "selector": "[data-testid=\"ai-consent-dialog\"]", "timeoutMs": 10000 },
+    { "type": "click", "target": { "selector": "[data-testid=\"ai-consent-dialog\"] button:has-text(\"Got it\")" } },
+    { "type": "waitFor", "selector": "[data-testid=\"ai-consent-dialog\"]", "state": "hidden", "timeoutMs": 10000 },
+    { "type": "press", "key": "Escape" },
+    { "type": "waitFor", "selector": "[data-rv-ai=\"panel\"]", "state": "hidden", "timeoutMs": 10000 },
+    { "type": "click", "target": { "selector": "button[aria-label=\"Settings\"]" } }
+  ],
+  "steps": [
+    {
+      "id": "open-ai-prompt",
+      "holdSec": 2,
+      "actions": [
+        { "type": "click", "target": { "selector": "button[aria-label^=\"AI control\"]" } },
+        { "type": "waitFor", "selector": "[data-rv-ai=\"panel\"]", "timeoutMs": 10000 }
+      ]
+    },
+    {
+      "id": "enter-kinematize-prompt",
+      "holdSec": 2,
+      "actions": [
+        {
+          "type": "type",
+          "target": { "selector": "[data-rv-ai=\"input\"]" },
+          "text": "Import the STEP file `tools/solidcraft/agv-stacker/agv-stacker.step` from CONNECT's configured Unity repository working directory with the MCP tool `web_editor_import_cad`. Then use `web_help` to read the `kinematize` help and kinematize the AGV stacker's lift and lift axis. Verify the motion and leave the result visible.",
+          "delayMs": 40
+        }
+      ]
+    },
+    {
+      "id": "send-prompt",
+      "holdSec": 2,
+      "actions": [
+        { "type": "click", "target": { "selector": "[data-rv-ai=\"send\"]" } },
+        { "type": "waitFor", "selector": "[data-rv-ai-state=\"running\"]", "timeoutMs": 10000 }
+      ]
+    },
+    {
+      "id": "wait-for-result",
+      "holdSec": 2,
+      "actions": [
+        { "type": "waitFor", "selector": "[data-rv-ai-state=\"idle\"]", "timeoutMs": 900000 }
+      ]
+    },
+    {
+      "id": "show-result",
+      "holdSec": 3,
+      "actions": [
+        { "type": "camera", "position": [4, 3, 4], "target": [0, 1, 0], "durationSec": 1.5 }
+      ]
+    }
+  ]
+}

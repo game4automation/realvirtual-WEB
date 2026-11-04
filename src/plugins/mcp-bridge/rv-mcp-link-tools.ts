@@ -46,7 +46,6 @@
  */
 
 import type { RVViewer } from '../../core/rv-viewer';
-import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
 import { parseGlbParam } from '../../core/share/rv-share-target';
 import { builtinSources } from '../../core/rv-model-catalog';
 import { modelSupportsOption, optionIdFromUrl } from '../models/model-option-plugin';
@@ -417,7 +416,7 @@ function applySnapshotIdentity(
   if (state.dirty) {
     warnings.push(
       'The open document has unsaved changes; they are not part of this link. Save first '
-      + '(web_editor_save / scene save) if the recipient should see them.',
+      + '(web_editor_save / web_document_save) if the recipient should see them.',
     );
   }
 
@@ -519,7 +518,7 @@ export function readLinkEnv(viewer: RVViewer | undefined): LinkEnv {
 
 // ─── Tool ───────────────────────────────────────────────────────────────
 
-export class McpLinkTools {
+export class LinkQueries {
   constructor(
     private readonly getViewer: () => RVViewer | undefined,
     /** Injected in tests; production always reads the real stores. */
@@ -531,31 +530,14 @@ export class McpLinkTools {
     return this.getViewer();
   }
 
-  @McpTool(
-    'Compose a canonical, shareable deep link into the viewer — the one thing MCP could not do: '
-    + 'open anything, then hand out a URL to it. Called with NO arguments it snapshots what is '
-    + 'open right now (document or model, active workspace mode, model option) into a link that '
-    + 'reproduces it. Called with model/glb/doc/scene/mode/option it validates each against the '
-    + 'live catalogues and composes the URL. Returns {url, params, warnings}: an unknown value is '
-    + 'a warning and still gets set, never a hard error. Read-only, mints no share, and copies '
-    + 'nothing from the current address bar — access keys and share tokens can never leak into a '
-    + 'composed link.',
-    { readOnly: true, timeoutMs: 30_000 },
-  )
-  async webLinkCompose(
-    @McpParam('model', 'Model URL, built-in label or document name from web_document_list (the ?model= URL param).', 'string', false)
+  /** Read-only command body; preserves the original JSON value contract. */
+  async queryLinkCompose(
     model: string,
-    @McpParam('glb', 'Absolute GLB URL, or an existing "s:<id>" share value. Never minted here.', 'string', false)
     glb: string,
-    @McpParam('doc', 'Document id of the open project (see web_document_list).', 'string', false)
     doc: string,
-    @McpParam('scene', 'empty | builtin:<file.glb> | published:<name> | a saved scene id.', 'string', false)
     scene: string,
-    @McpParam('mode', 'Workspace mode to boot into: hmi, planner, des, … Defaults to the ACTIVE mode.', 'string', false)
     mode: string,
-    @McpParam('option', 'Model variant id, validated against the model\'s declared options.', 'string', false)
     option: string,
-    @McpParam('base', 'Base URL override. Defaults to this page\'s origin + path.', 'string', false)
     base: string,
   ): Promise<string> {
     const v = this.viewer;

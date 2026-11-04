@@ -41,7 +41,9 @@ import {
 // SIGNAL_TYPES / isDuplicateSignalName additionally feed the raw PLC-signal
 // slot branch (plan-418).
 import { SIGNAL_TYPES, isDuplicateSignalName } from './rv-signal-construction';
+import { isComponentReference } from './rv-node-path-rewrite.mjs';
 import './rv-sensor';
+import { slotCommand, slotDeclared, slotFeedbackSource, slotNeutralize, slotRefusal } from './rv-slot-io';
 
 /**
  * Behavior types whose slots are synthetic (descriptor-driven, no schema
@@ -293,9 +295,29 @@ interface DriveDestinationMotorLike {
   liveControlled?: boolean;
 }
 
+/**
+ * The signal address a slot value names, or null — THE recognition rule the
+ * display shares with the runtime: a non-empty string, or a properly typed
+ * `ComponentReference` (`type: 'ComponentReference'`) in its path form, which
+ * `resolveComponentRefs` turns into exactly that string. Anything else — a bare
+ * `{ path }` without the type (an AI-written signal did, 2026-11-01), an address
+ * or unresolved form without owner context, a number — is "no signal": the
+ * runtime wiring ignores it, so the slot must not look linked, and the callers
+ * run during render, so a throw would take the whole interface down.
+ */
+export function signalRefAddress(value: unknown): string | null {
+  if (typeof value === 'string') return value.length > 0 ? value : null;
+  if (isComponentReference(value)) {
+    const path = (value as { path?: unknown }).path;
+    if (typeof path === 'string' && path.length > 0) return path;
+  }
+  return null;
+}
+
 /** Resolve a signal ADDRESS (path or name) to a registered store NAME, or null. */
-function addrToName(store: SignalStore, addr: string | null): string | null {
-  if (!addr) return null;
+function addrToName(store: SignalStore, value: unknown): string | null {
+  const addr = signalRefAddress(value);
+  if (addr === null) return null;
   if (store.get(addr) !== undefined) return addr;       // already a name
   const byPath = store.nameForPath(addr);
   return byPath ?? null;
@@ -502,7 +524,8 @@ export function resolveElementSlots(
   return out;
 }
 
-function relativeComponentPath(root: Object3D, node: Object3D, registry: NodeRegistry): string {
+/** `node`'s path relative to the bind target `root` (`'.'` = the root) — a slot's `componentPath`. */
+export function relativeComponentPath(root: Object3D, node: Object3D, registry: NodeRegistry): string {
   const rootPath = registry.getPathForNode(root) ?? NodeRegistry.computeNodePath(root);
   const nodePath = registry.getPathForNode(node) ?? NodeRegistry.computeNodePath(node);
   if (nodePath === rootPath) return '.';
@@ -633,10 +656,14 @@ export function resolveBindableSlots(
         if (directKeys.has(key)) continue;
         directKeys.add(key);
 
+        // Unwired slot: the instance's own contract first (its `command*` is the
+        // component logic itself), then a SlotIO declaration (`rv-slot-io.ts`).
         if (signal.startsWith('PLCOutput')) {
           const command = instance[`command${slot}`];
           const neutralize = instance[`neutralize${slot}`];
-          if (typeof command === 'function' && typeof neutralize === 'function') {
+          const own = typeof command === 'function' && typeof neutralize === 'function';
+          const access = own ? null : slotDeclared(instance, slot);
+          if (own || access === 'setter' || access === 'poll') {
             output.push({
               kind: 'direct-property',
               slot,
@@ -649,19 +676,31 @@ export function resolveBindableSlots(
               instance,
               drive,
               edgeTriggered: slot === 'StartDrive',
-              command: (value) => command.call(instance, value),
-              neutralize: () => neutralize.call(instance),
+              command: own
+                ? (value) => (command as (v: boolean | number) => void).call(instance, value)
+                : (value) => slotCommand(instance, slot, value),
+              neutralize: own
+                ? () => (neutralize as () => void).call(instance)
+                : () => slotNeutralize(instance, slot),
             });
           } else {
-            output.push({ kind: 'unavailable', slot, label, reason: `Missing command contract for ${componentType}.${slot}` });
+            output.push({
+              kind: 'unavailable',
+              slot,
+              label,
+              reason: slotRefusal(instance, slot) ?? `Missing command contract for ${componentType}.${slot}`,
+            });
           }
           continue;
         }
 
-        const source = instance as unknown as Partial<FeedbackSource>;
-        if (typeof source.addFeedbackListener === 'function'
-          && typeof source.removeFeedbackListener === 'function'
-          && typeof source.readFeedbackSlot === 'function') {
+        const ownSource = instance as unknown as Partial<FeedbackSource>;
+        const source = typeof ownSource.addFeedbackListener === 'function'
+          && typeof ownSource.removeFeedbackListener === 'function'
+          && typeof ownSource.readFeedbackSlot === 'function'
+          ? ownSource as FeedbackSource
+          : slotFeedbackSource(instance, slot);
+        if (source) {
           output.push({
             kind: 'direct-feedback',
             slot,
@@ -674,10 +713,15 @@ export function resolveBindableSlots(
             instance,
             drive,
             edgeTriggered: false,
-            source: source as FeedbackSource,
+            source,
           });
         } else {
-          output.push({ kind: 'unavailable', slot, label, reason: `Missing feedback contract for ${componentType}.${slot}` });
+          output.push({
+            kind: 'unavailable',
+            slot,
+            label,
+            reason: slotRefusal(instance, slot) ?? `Missing feedback contract for ${componentType}.${slot}`,
+          });
         }
       }
     }

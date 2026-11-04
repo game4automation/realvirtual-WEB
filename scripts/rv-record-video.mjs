@@ -25,6 +25,7 @@
  *   --target <node path>   orbit centre (default model bounds)
  *   --orbit-from-view      orbit around the current view's target at its distance and height (plan-551 F3)
  *   --radius-scale <n>  --sweep <deg>  --start <deg>  --orbit-height <m>  --easing none|inOut  --fov <deg>
+ *   --camera-pos x,y,z --camera-target x,y,z   fixed: explicit pose (world, m) instead of the loaded view
  *   --size WxH (1920x1080)  --fps 30|60 (60)  --seconds <s> (10)  --warmup <s> (3)
  *   --quality standard|high|max (high)  --jitter <n>  --bitrate <bit/s>  --codec avc|hevc|av1|vp9
  *   --out <file.mp4>       (default recordings/<model>-<timestamp>.mp4 under the cwd)
@@ -137,6 +138,13 @@ export function buildUrl(url, opts) {
   return u.toString();
 }
 
+/** `x,y,z` (world, m) → [x, y, z]; a usage error otherwise. */
+function vec3(v, name) {
+  const a = String(v).split(',').map(Number);
+  if (a.length !== 3 || !a.every(Number.isFinite)) usage(`${name} must be x,y,z (world, metres)`);
+  return a;
+}
+
 /** Map CLI options onto VideoRecordOptions (validated again in the browser). */
 export function recordOptions(opts) {
   const size = (opts.size ?? '1920x1080').toLowerCase().split('x').map(Number);
@@ -169,6 +177,12 @@ export function recordOptions(opts) {
   } else if (kind === 'fixed') {
     path = { kind: 'fixed' };
     if (opts['orbit-from-view'] === true) usage('--orbit-from-view needs --path orbit');
+    if ((opts['camera-pos'] === undefined) !== (opts['camera-target'] === undefined)) usage('--camera-pos and --camera-target go together');
+    if (opts['camera-pos'] !== undefined) {
+      path.position = vec3(opts['camera-pos'], '--camera-pos');
+      path.target = vec3(opts['camera-target'], '--camera-target');
+    }
+    if (opts.fov !== undefined) path.fov = num(opts.fov, '--fov');
   } else {
     usage(`unknown --path "${kind}"`);
   }
@@ -366,7 +380,10 @@ async function main() {
       viewport: outputViewport ? { width: options.width, height: options.height } : { width: 1280, height: 800 },
       ...(outputViewport ? { deviceScaleFactor: 1 } : {}),
     });
-    if (outputViewport) await context.addInitScript(bootCleanupInitScript);
+    // Always seed consent/welcome flags and close the dev banner: a fresh Playwright context has
+    // no localStorage, so without this a first-run modal can block scene init on ANY recording
+    // mode, not just HMI (outputViewport) ones.
+    await context.addInitScript(bootCleanupInitScript);
     page = await context.newPage();
     page.on('pageerror', (e) => console.error(`[page] ${e.message}`));
     console.log(`rv-record-video: opening ${url}`);

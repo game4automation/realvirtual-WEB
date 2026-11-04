@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * rv-project-linked — the flat list of project folders this browser knows
  * (plan-743).
@@ -73,7 +75,7 @@ function isEntry(value: unknown): value is LinkedProjectEntry {
 export function readLinkedProjects(): LinkedProjectEntry[] {
   let raw: string | null;
   try {
-    raw = localStorage.getItem(LS_KEY_LINKED_PROJECTS);
+    raw = readLocalStorage(LS_KEY_LINKED_PROJECTS);
   } catch {
     return [];
   }
@@ -101,7 +103,7 @@ export function readLinkedProjects(): LinkedProjectEntry[] {
 
 function writeLinkedProjects(entries: LinkedProjectEntry[]): void {
   try {
-    localStorage.setItem(LS_KEY_LINKED_PROJECTS, JSON.stringify(entries));
+    writeLocalStorage(LS_KEY_LINKED_PROJECTS, JSON.stringify(entries));
   } catch {
     // Private mode / quota — the list is a convenience, never a precondition
     // for opening a project the handle store still holds.
@@ -183,15 +185,15 @@ export function forgetLinkedRow(id: string): void {
  * behind — with no workspace to rediscover the folder, an orphaned handle would
  * simply reappear in {@link listLinkedProjects} under a fallback label, and
  * "Remove from list" would look broken. No file is touched.
+ *
+ * The handle goes FIRST: deleting a missing IndexedDB key succeeds, so a
+ * rejection here is a real storage failure — it propagates and the row stays,
+ * instead of leaving exactly that orphan behind.
  */
 export async function unlinkProject(id: string): Promise<void> {
   if (!id) return;
+  await deleteStoredHandle(projectHandleKey(id));
   forgetLinkedRow(id);
-  try {
-    await deleteStoredHandle(projectHandleKey(id));
-  } catch {
-    // A missing slot is already the desired end state.
-  }
 }
 
 /**

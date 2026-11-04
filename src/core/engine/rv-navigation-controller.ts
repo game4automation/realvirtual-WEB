@@ -99,7 +99,7 @@ import type { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import type { SurfaceHit } from './rv-raycast-manager';
 import {
   createNavScalarIO, cursorRayIO, dollyStepIO, maxBackoffInsideIO, nearFarForIO, orbitAboutPivotIO,
-  orthoNearFarForIO, panKeepPointIO, zoomOrthoAtCursorIO, MIN_ORBIT_POLAR,
+  orthoNearFarForIO, panKeepPointIO, zoomOrthoAtCursorIO, MIN_ORBIT_POLAR, MAX_FAR_NEAR_RATIO,
   type NavSceneScale, type NearFar,
 } from './rv-navigation-math';
 
@@ -140,6 +140,11 @@ export interface NavigationControllerOptions {
   markDirty: () => void;
   /** Called for every wheel event on the canvas — real user input (plan-520 idle clock). */
   onUserInput?: () => void;
+  /**
+   * Smallest perspective far plane needed for content outside the scene sphere
+   * (the floor disc). 0 = none. Near is raised to keep far/near <= 1e7.
+   */
+  getMinFar?: (cam: Vector3) => number;
 }
 
 /** Smallest camera-to-surface distance of a wheel / pinch dolly (plan F3: 0.5 mm). */
@@ -343,10 +348,13 @@ export class NavigationController {
   /** The current orbit pivot (world). A live view — do not mutate. */
   get pivot(): Readonly<Vector3> { return this._pivot; }
 
-  /** Reset the orbit pivot to `controls.target` and stop the inertia (explicit seam for callers). */
-  resetPivot(): void {
+  /**
+   * Reset the orbit pivot to `pivot` (default `controls.target`) and stop the inertia (explicit seam
+   * for callers). Records the current target as the controller's own, so the next tick keeps the pivot.
+   */
+  resetPivot(pivot: Readonly<Vector3> = this.opts.controls.target): void {
     this._stopInertia();
-    this._pivot.copy(this.opts.controls.target);
+    this._pivot.copy(pivot);
     this.stats.pivotResets++;
     this._recordOwn();
   }
@@ -1200,6 +1208,11 @@ export class NavigationController {
     io.focus = Math.sqrt(dx * dx + dy * dy + dz * dz);
     nearFarForIO(p, sc, io, this._nf);
     orthoNearFarForIO(p, sc, io, this._onf);
+    const minFar = this.opts.getMinFar ? this.opts.getMinFar(p) : 0;
+    if (minFar > this._nf.far) {
+      this._nf.far = minFar;
+      this._nf.near = Math.max(this._nf.near, minFar / MAX_FAR_NEAR_RATIO);
+    }
     if (this.opts.camera.applyClipping(this._nf, this._onf)) {
       this.stats.clippingUpdates++;
       this.opts.markDirty();

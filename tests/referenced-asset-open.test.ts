@@ -82,6 +82,19 @@ describe('planReferencedAssetOpen', () => {
     expect(plan).toEqual({ via: 'path', relPath: 'parts/Gripper.glb' });
   });
 
+  it('a project-library placement id (project:<path>) opens the document at that path', () => {
+    // Dragged in from the project library: the catalog id, and no `path`.
+    const plan = planReferencedAssetOpen(
+      { assetId: 'project:parts/G.glb' },
+      project([{ id: 'doc_g', path: 'parts/G.glb' }]),
+      'Owner.glb',
+    );
+    expect(plan).toEqual({ via: 'manifest', assetId: 'doc_g', relPath: 'parts/G.glb' });
+    // A project:<path> the manifest does not list is still unresolvable.
+    expect(planReferencedAssetOpen({ assetId: 'project:gone.glb' }, project([]), null))
+      .toEqual({ via: 'unresolvable', reason: 'unknown-asset' });
+  });
+
   it('an id with neither a row nor a path is unresolvable, not guessed at', () => {
     const plan = planReferencedAssetOpen({ assetId: 'ghost' }, project([]), 'a/Owner.glb');
     expect(plan).toEqual({ via: 'unresolvable', reason: 'unknown-asset' });

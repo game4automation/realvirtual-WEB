@@ -24,6 +24,8 @@ import { isPureSanitization } from './rv-three-names';
 import { unwrapGltfRoot } from './rv-gltf-unwrap';
 import { debug } from './rv-debug';
 import { parseGlbCollectingResources } from './rv-binary-resources';
+import { RV_ORIG_NAME_KEY } from './rv-authored-keys';
+import { getDecodeIdentity, linkDecodeIdentity, type FileIdentity } from './rv-decode-identity';
 
 // ─── Singleton loader ────────────────────────────────────────────────────
 
@@ -63,7 +65,7 @@ gltfLoader.setDRACOLoader(dracoLoader);
  * existing scene. Leading `_` is load-bearing: `sanitizeUserDataForExport`
  * strips exactly those keys, so the marker never reaches a saved GLB.
  */
-export const RV_ORIG_NAME_KEY = '_rvOrigName';
+export { RV_ORIG_NAME_KEY };
 
 /**
  * Rebuild the renamed-node map for an already-parsed subtree from the
@@ -268,6 +270,8 @@ export interface ParsedGlbSubtree {
   gltfNodeIndices: Map<Object3D, number>;
   /** THIS file's raw glTF node names, indexed like its `nodes[]`. */
   gltfNodeNames: (string | undefined)[];
+  /** plan-769: the file's identity record (seeded ids, authored index, migrated refs), or null. */
+  identity?: FileIdentity | null;
 }
 
 /**
@@ -295,5 +299,8 @@ export async function parseGlbSubtreeWithMeta(
   const renamedNodes = detectRenamedNodes(parser);
   const gltfNodeIndices = collectGltfNodeIndices(parser);
   const gltfNodeNames = collectGltfNodeNames(parser);
-  return { root: unwrapGltfRoot(gltf.scene as Group), renamedNodes, gltfNodeIndices, gltfNodeNames };
+  const identity = getDecodeIdentity(gltf.scene as Group);
+  const root = unwrapGltfRoot(gltf.scene as Group);
+  linkDecodeIdentity(root, identity);
+  return { root, renamedNodes, gltfNodeIndices, gltfNodeNames, identity };
 }

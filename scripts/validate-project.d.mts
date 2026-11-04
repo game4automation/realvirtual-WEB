@@ -15,5 +15,16 @@ export interface ProjectValidationResult {
   warnings: string[];
 }
 
-export function validateProject(root: string): ProjectValidationResult;
-export function assertValidProject(root: string, label?: string): ProjectValidationResult;
+/** Workspace mode ids a `documents[].modes` entry may name. */
+export const KNOWN_WORKSPACE_MODES: string[];
+/** plan-778: library resolution options (see validate-project.mjs). */
+export interface ProjectValidationOptions {
+  /** The folder is a delivered / packed copy: qualified references must resolve in its own libraries/. */
+  delivered?: boolean;
+  /** A source project's library sources: by id in a projects folder, or an explicit map. */
+  librarySources?: { projectsDir?: string | null; libraries?: Record<string, string> } | null;
+  /** The app-level realvirtual library folder, to check references into it. */
+  realvirtualLibraryDir?: string | null;
+}
+export function validateProject(root: string, opts?: ProjectValidationOptions): ProjectValidationResult;
+export function assertValidProject(root: string, label?: string, opts?: ProjectValidationOptions): ProjectValidationResult;

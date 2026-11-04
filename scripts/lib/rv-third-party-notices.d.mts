@@ -4,7 +4,14 @@
 /** Type declarations for rv-third-party-notices.mjs (plan-544). */
 
 export type NoticesMode = 'warn' | 'enforce';
-export type NoticesTier = 'public' | 'demo' | 'private';
+/** plan-679 Phase 3: a delivery tier of a customer workspace build (`RV_NOTICES_TIER`). */
+export type NoticesDeliveryTier = 'core' | 'commercial' | 'restricted' | 'internal';
+export type NoticesTier = 'public' | 'demo' | 'private' | NoticesDeliveryTier;
+/** What a policy entry's `tiers` may name: a delivery tier or `private` (the full build). */
+export type NoticesPolicyTier = NoticesDeliveryTier | 'private';
+export const NOTICE_DELIVERY_TIERS: readonly NoticesDeliveryTier[];
+export const NOTICE_POLICY_TIERS: readonly NoticesPolicyTier[];
+export function policyEntryAppliesToTier(entry: { tiers?: NoticesPolicyTier[] } | null | undefined, tier: NoticesTier): boolean;
 
 export interface ThirdPartyComponent {
   name: string;
@@ -34,8 +41,8 @@ export interface LicensePolicy {
   scope: 'public' | 'private' | 'customer';
   allowed: string[];
   dynamicOnly: string[];
-  exceptions: Array<{ name: string; version: string; license?: string; reason: string; decidedBy: string; date: string }>;
-  vendorTerms: Array<{ name: string; version: string; vendor: string; licenseRef: string; reason: string; decidedBy?: string; date?: string }>;
+  exceptions: Array<{ name: string; version: string; license?: string; reason: string; decidedBy: string; date: string; tiers?: NoticesPolicyTier[] }>;
+  vendorTerms: Array<{ name: string; version: string; vendor: string; licenseRef: string; reason: string; decidedBy?: string; date?: string; tiers?: NoticesPolicyTier[] }>;
 }
 
 export interface Violation { name: string; version: string; rule: string; message: string }
@@ -60,7 +67,12 @@ export function spdxIds(node: SpdxNode): string[];
 export function evaluateSpdx(expression: string | SpdxNode, policy: { allowed?: string[]; dynamicOnly?: string[] }): { ok: boolean; chosen: string; dynamicOnly: boolean; reason: string | null; rank: number };
 export function loadPolicy(path: string, options?: { scope: LicensePolicy['scope']; optional?: boolean }): LicensePolicy | null;
 export function mergePolicies(policies: Array<Pick<LicensePolicy, 'allowed' | 'dynamicOnly'>>): { allowed: string[]; dynamicOnly: string[] };
-export function applyPolicy(components: ThirdPartyComponent[], policies: LicensePolicy[], options?: { tier?: NoticesTier; declared?: Iterable<string> }): { violations: Violation[]; staleExceptions: Array<Record<string, unknown>> };
+export function applyPolicy(components: ThirdPartyComponent[], policies: LicensePolicy[], options?: { tier?: NoticesTier; declared?: Iterable<string> }): {
+  violations: Violation[];
+  staleExceptions: Array<Record<string, unknown>>;
+  /** plan-679: policy entries marked for other tiers than this build's — information, not a violation. */
+  notInTier: Array<{ name: string; version: string; kind: string; policy: string; tiers?: NoticesPolicyTier[] }>;
+};
 export function extractCopyright(text: string, options?: { licenseTextsDir?: string }): string[];
 export const IDENTIFIABLE_IDS: string[];
 export function identifyLicenseText(text: string, options?: { candidates?: string[]; licenseTextsDir?: string }): string | null;

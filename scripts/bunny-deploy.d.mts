@@ -17,7 +17,7 @@ export function uploadDirectory(
 ): Promise<{ uploaded: number; skipped: number; deleted: number }>;
 /** plan-759 F9: the remote snapshot of a hosted publish — exactly the staging listing, lower-cased. */
 export function expectedHostedSnapshot(stagingDir: string): Set<string>;
-/** Is `rel` a library catalog (`…/catalog.json`)? */
+/** Is `rel` a catalog or library manifest (`…/catalog.json`, `library/project.json`, `libraries/<id>/project.json`)? */
 export function isCatalogFile(rel: string): boolean;
 /** Catalogued binaries whose sha256 changed against the published catalogs under `remotePrefix`. */
 export function catalogHashDiff(
@@ -32,7 +32,30 @@ export function stageAndBuild(options: {
   projectDir?: string | null;
   base?: string | null;
   dryRun?: boolean;
-}): { workspaceRoot: string; coreRoot: string; distDir: string; dryRun: boolean; manifest: any };
+  fast?: boolean;
+  /** plan-646 F14: build the public-demo welcome window; honoured only for mode 'demo'. */
+  demoWelcome?: boolean;
+  /** /dev only: the lighter build profile (RV_DEV_FAST_BUILD=1). */
+  devFast?: boolean;
+  /** Receives the [timing] marks of staging and build. */
+  timings?: DeployTimings | null;
+}, deps?: Record<string, any>): { workspaceRoot: string; coreRoot: string; distDir: string; dryRun: boolean; manifest: any };
+/** plan-646 F14: the `--demo` staging profile (full commercial tier + `demo-welcome`). */
+export const DEMO_PROFILE: Readonly<{ tier: 'commercial'; restrictedFeatures: readonly string[] }>;
+/** `demo`, `/demo/`, `demo/`, `\demo` → `demo` (lower-cased, outer slashes stripped). */
+export function normalizeRemotePrefix(remotePrefix: string | null | undefined): string;
+/** plan-646 F14: true only for `--demo` with the effective target path `demo` (never with `--root`). */
+export function demoWelcomeForTarget(options?: {
+  demo?: boolean;
+  remotePrefix?: string | null;
+  root?: boolean;
+}): boolean;
+/** plan-646: writes generated/features.json before a --demo staging; throws (deploy aborts) on failure. */
+export function generateDemoFeatures(options?: {
+  generate?: () => { available: false; manifestPath: string } | { available: true; json: string };
+  write?: (path: string, data: string) => void;
+  out?: string;
+}): string;
 export function reconcileRemoteSnapshot(
   client: { listRecursive(path: string): Promise<any[]>; deleteFile(path: string): Promise<void> },
   remotePrefix: string,
@@ -60,3 +83,9 @@ export function reportDeployPhase(phase: DeployPhase, options?: {
     renameSync: (from: string, to: string) => void;
   };
 }): string | null;
+
+/** `[timing] <step> <seconds>s` lines; `time` measures a sync or async function. */
+export interface DeployTimings { mark(step: string, ms: number): void; time<T>(step: string, fn: () => T): T }
+export function createTimings(write?: (line: string) => void, now?: () => number): DeployTimings;
+/** Throws unless `--dev-fast` targets a public / --demo deploy to the prefix `dev`. */
+export function assertDevFastAllowed(options?: { devFast?: boolean; private?: boolean; root?: boolean; path?: string | null }): void;

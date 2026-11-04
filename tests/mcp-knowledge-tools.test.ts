@@ -23,7 +23,9 @@
  * the mock instead.
  */
 
+import { executeDelegateValue } from './helpers/execute-value';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { queryValue } from './helpers/query-value';
 import { Object3D } from 'three';
 import { McpKnowledgeTools } from '../src/plugins/mcp-bridge/rv-mcp-knowledge-tools';
 import { RvExtrasEditorPlugin } from '../src/core/hmi/rv-extras-editor';
@@ -88,6 +90,7 @@ function assetEditTarget() {
 // ─── Scene fixture ──────────────────────────────────────────────────────
 
 interface Fixture {
+  viewer: RVViewer;
   tools: McpKnowledgeTools;
   nodes: Record<string, Object3D>;
   editor: RvExtrasEditorPlugin;
@@ -130,12 +133,15 @@ function makeFixture(): Fixture {
     registry,
     currentModelRoot: root,
     scene: root,
+    // plan-641 Nachtrag: web_knowledge_set dispatches `knowledge.set` through the
+    // command registry, whose context capture reads the active mode.
+    modes: { activeMode: 'hmi' },
     getPlugin: <T>(id: string): T | undefined =>
       (id === 'rv-extras-editor' ? editor as unknown as T : undefined),
   } as unknown as RVViewer;
   (editor as unknown as { _viewer: RVViewer })._viewer = viewer;
 
-  return { tools: new McpKnowledgeTools(() => viewer), nodes: byPath, editor };
+  return { viewer, tools: new McpKnowledgeTools(() => viewer), nodes: byPath, editor };
 }
 
 const parse = (raw: string): Record<string, unknown> => JSON.parse(raw);
@@ -149,7 +155,7 @@ describe('web_knowledge_set', () => {
     const { target, ops } = recordingEditTarget();
     setActiveEditTarget(target);
 
-    const res = parse(await fx.tools.webKnowledgeSet('Cell/Axis1', '- backlash ~0.2deg'));
+    const res = parse(await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: '- backlash ~0.2deg' }));
     expect(res.error).toBeUndefined();
     expect(res.path).toBe('Cell/Axis1');
     expect(res.chars).toBe('- backlash ~0.2deg'.length);
@@ -175,7 +181,7 @@ describe('web_knowledge_set', () => {
     expect(target.available).toBe(true);
     setActiveEditTarget(target);
 
-    const res = parse(await fx.tools.webKnowledgeSet('Cell/Axis1', 'note'));
+    const res = parse(await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'note' }));
     expect(res.error).toBeUndefined();
     expect(res.persistedTo).toBe('none');
     expect(String(res.persistenceNote)).toContain('gone on reload');
@@ -185,14 +191,14 @@ describe('web_knowledge_set', () => {
 
   it('reports persistedTo "none" when no edit target is available', async () => {
     setActiveEditTarget(UNAVAILABLE);
-    const res = parse(await fx.tools.webKnowledgeSet('Cell/Axis1', 'note'));
+    const res = parse(await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'note' }));
     expect(res.persistedTo).toBe('none');
   });
 
   it('reports persistedTo "asset" inside the asset editor', async () => {
     const { target } = assetEditTarget();
     setActiveEditTarget(target);
-    const res = parse(await fx.tools.webKnowledgeSet('Cell/Axis1', 'note'));
+    const res = parse(await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'note' }));
     expect(res.persistedTo).toBe('asset');
     expect(String(res.persistenceNote)).toContain('web_editor_save');
   });
@@ -208,7 +214,7 @@ describe('web_knowledge_set', () => {
     delete withoutDeclaration.persistsTo;
     setActiveEditTarget(withoutDeclaration as unknown as EditTarget);
 
-    const res = parse(await fx.tools.webKnowledgeSet('Cell/Axis1', 'note'));
+    const res = parse(await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'note' }));
     expect(res.persistedTo).toBe('asset');
   });
 
@@ -216,7 +222,7 @@ describe('web_knowledge_set', () => {
     const { target, ops } = recordingEditTarget();
     setActiveEditTarget(target);
 
-    const res = parse(await fx.tools.webKnowledgeSet('Cell/NoSuchNode', 'note'));
+    const res = parse(await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/NoSuchNode', markdown: 'note' }));
     expect(String(res.error)).toContain('Node not found');
     expect(ops).toEqual([]);
   });
@@ -225,7 +231,7 @@ describe('web_knowledge_set', () => {
     const { target } = recordingEditTarget();
     setActiveEditTarget(target);
 
-    const res = parse(await fx.tools.webKnowledgeSet('Cell/Locked/Inner', 'note'));
+    const res = parse(await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Locked/Inner', markdown: 'note' }));
     expect(String(res.error)).toContain('refused');
     expect(res.persistedTo).toBe('none');
     expect(readNodeKnowledge(fx.nodes['Cell/Locked/Inner'])).toBeNull();
@@ -235,7 +241,7 @@ describe('web_knowledge_set', () => {
     const { target, ops } = recordingEditTarget();
     setActiveEditTarget(target);
 
-    const res = parse(await fx.tools.webKnowledgeSet('Cell/Axis1', 'x'.repeat(MAX_NOTE_CHARS + 1)));
+    const res = parse(await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'x'.repeat(MAX_NOTE_CHARS + 1) }));
     expect(String(res.error)).toContain(String(MAX_NOTE_CHARS));
     expect(res.chars).toBe(MAX_NOTE_CHARS + 1);
     expect(ops).toEqual([]);
@@ -244,7 +250,7 @@ describe('web_knowledge_set', () => {
 
   it('accepts a note of exactly MAX_NOTE_CHARS', async () => {
     setActiveEditTarget(recordingEditTarget().target);
-    const res = parse(await fx.tools.webKnowledgeSet('Cell/Axis1', 'x'.repeat(MAX_NOTE_CHARS)));
+    const res = parse(await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'x'.repeat(MAX_NOTE_CHARS) }));
     expect(res.error).toBeUndefined();
     expect(res.chars).toBe(MAX_NOTE_CHARS);
   });
@@ -255,24 +261,24 @@ describe('web_knowledge_set', () => {
     // the limit protects the GLB's JSON chunk, not a reading experience.
     const emoji = '\u{1F600}'.repeat(2001);
     expect(emoji.length).toBe(4002);
-    const res = parse(await fx.tools.webKnowledgeSet('Cell/Axis1', emoji));
+    const res = parse(await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: emoji }));
     expect(String(res.error)).toContain('4002');
   });
 
   it('overwrites rather than appending', async () => {
     setActiveEditTarget(recordingEditTarget().target);
-    await fx.tools.webKnowledgeSet('Cell/Axis1', 'first version');
-    await fx.tools.webKnowledgeSet('Cell/Axis1', 'second version');
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'first version' });
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'second version' });
     expect(readNodeKnowledge(fx.nodes['Cell/Axis1'])?.Note).toBe('second version');
   });
 
   it('records author and confidence when given, and narrows nonsense values', async () => {
     setActiveEditTarget(recordingEditTarget().target);
-    await fx.tools.webKnowledgeSet('Cell/Axis1', 'n', 'user', 'unverified');
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'n', author: 'user', confidence: 'unverified' });
     expect(readNodeKnowledge(fx.nodes['Cell/Axis1'])?.Author).toBe('user');
     expect(readNodeKnowledge(fx.nodes['Cell/Axis1'])?.Confidence).toBe('unverified');
 
-    await fx.tools.webKnowledgeSet('Cell/Axis2', 'n', 'ceo', 'certain');
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis2', markdown: 'n', author: 'ceo', confidence: 'certain' });
     expect(readNodeKnowledge(fx.nodes['Cell/Axis2'])?.Author).toBe('agent');
     expect(readNodeKnowledge(fx.nodes['Cell/Axis2'])?.Confidence).toBe('observed');
   });
@@ -299,7 +305,7 @@ describe('web_knowledge_set', () => {
     const { target, ops } = assetEditTarget();
     setActiveEditTarget(target);
 
-    const res = parse(await fx.tools.webKnowledgeSet('Cell/Axis1', '## still writable', 'user', 'inferred'));
+    const res = parse(await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: '## still writable', author: 'user', confidence: 'inferred' }));
 
     expect(res.error).toBeUndefined();
     expect(res.rejected).toBeUndefined();
@@ -317,7 +323,7 @@ describe('web_knowledge_set', () => {
   it('keeps multi-line Markdown intact', async () => {
     setActiveEditTarget(recordingEditTarget().target);
     const note = '## Axis 1\n- one\n- two';
-    await fx.tools.webKnowledgeSet('Cell/Axis1', note);
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: note });
     expect(readNodeKnowledge(fx.nodes['Cell/Axis1'])?.Note).toBe(note);
   });
 });
@@ -330,10 +336,10 @@ describe('web_knowledge_set — clearing (F7)', () => {
   it('treats a whitespace-only note as empty and removes the entry', async () => {
     const { target, ops } = recordingEditTarget();
     setActiveEditTarget(target);
-    await fx.tools.webKnowledgeSet('Cell/Axis1', 'to be removed');
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'to be removed' });
     ops.length = 0;
 
-    const res = parse(await fx.tools.webKnowledgeSet('Cell/Axis1', '   \n\t  '));
+    const res = parse(await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: '   \n\t  ' }));
     expect(res.removed).toBe(true);
     expect(res.chars).toBe(0);
     // No stub: the type hull is gone, not just the Note field. The scene store
@@ -352,9 +358,9 @@ describe('web_knowledge_set — clearing (F7)', () => {
   it('uses the removeComponent op when the target has one (asset editor)', async () => {
     const { target, removed } = assetEditTarget();
     setActiveEditTarget(target);
-    await fx.tools.webKnowledgeSet('Cell/Axis1', 'to be removed');
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'to be removed' });
 
-    const res = parse(await fx.tools.webKnowledgeSet('Cell/Axis1', ''));
+    const res = parse(await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: '' }));
     expect(res.removed).toBe(true);
     expect(removed).toEqual([{ nodePath: 'Cell/Axis1', componentType: NODE_KNOWLEDGE_TYPE }]);
     expect(readNodeKnowledge(fx.nodes['Cell/Axis1'])).toBeNull();
@@ -362,7 +368,7 @@ describe('web_knowledge_set — clearing (F7)', () => {
 
   it('says so plainly when there was nothing to remove', async () => {
     setActiveEditTarget(recordingEditTarget().target);
-    const res = parse(await fx.tools.webKnowledgeSet('Cell/Axis1', ''));
+    const res = parse(await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: '' }));
     expect(res.error).toBeUndefined();
     expect(res.removed).toBe(false);
   });
@@ -370,10 +376,10 @@ describe('web_knowledge_set — clearing (F7)', () => {
   it('refuses to claim a removal with no edit target', async () => {
     // Seed through a working target, then take the document away.
     setActiveEditTarget(recordingEditTarget().target);
-    await fx.tools.webKnowledgeSet('Cell/Axis1', 'note');
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'note' });
     setActiveEditTarget(UNAVAILABLE);
 
-    const res = parse(await fx.tools.webKnowledgeSet('Cell/Axis1', ''));
+    const res = parse(await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: '' }));
     expect(String(res.error)).toContain('cannot be removed');
     expect(readNodeKnowledge(fx.nodes['Cell/Axis1'])?.Note).toBe('note');
   });
@@ -386,9 +392,9 @@ describe('web_knowledge_get', () => {
 
   it('returns raw markdown, not a JSON-wrapped string (F2)', async () => {
     const note = '## Axis 1\n- backlash ~0.2deg\n- "quoted" & <angled>';
-    await fx.tools.webKnowledgeSet('Cell/Axis1', note);
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: note });
 
-    const res = parse(await fx.tools.webKnowledgeGet('Cell/Axis1'));
+    const res = parse(await queryValue(fx.viewer, 'knowledge.get', { path: 'Cell/Axis1' }));
     // Byte-identical, including the characters the PROMPT path neutralizes.
     // Sanitizing is a property of the prompt embedding, not of storage: a tool
     // handing an agent a mangled note would be handing it a wrong note.
@@ -403,17 +409,17 @@ describe('web_knowledge_get', () => {
     // Guards the raw-userData read path. Going through the component registry
     // would answer "no note" here: NodeKnowledge registers no factory, so no
     // instance is ever created for it — not at load, and not on write.
-    await fx.tools.webKnowledgeSet('Cell/Axis2', 'fresh in this session');
-    const res = parse(await fx.tools.webKnowledgeGet('Cell/Axis2'));
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis2', markdown: 'fresh in this session' });
+    const res = parse(await queryValue(fx.viewer, 'knowledge.get', { path: 'Cell/Axis2' }));
     expect(res.markdown).toBe('fresh in this session');
   });
 
   it('distinguishes "unknown path" from "node has no note" (F11)', async () => {
-    const unknown = parse(await fx.tools.webKnowledgeGet('Cell/NoSuchNode'));
+    const unknown = parse(await queryValue(fx.viewer, 'knowledge.get', { path: 'Cell/NoSuchNode' }));
     expect(String(unknown.error)).toContain('Node not found');
     expect(unknown.hasNote).toBeUndefined();
 
-    const noNote = parse(await fx.tools.webKnowledgeGet('Cell/Axis1'));
+    const noNote = parse(await queryValue(fx.viewer, 'knowledge.get', { path: 'Cell/Axis1' }));
     expect(String(noNote.error)).toContain('no knowledge note');
     expect(noNote.hasNote).toBe(false);
     // Two different next actions for the agent: fix the path vs. write the note.
@@ -421,13 +427,13 @@ describe('web_knowledge_get', () => {
   });
 
   it('rejects an empty path instead of guessing', async () => {
-    expect(String(parse(await fx.tools.webKnowledgeGet('')).error)).toContain('required');
+    expect(String(parse(await queryValue(fx.viewer, 'knowledge.get', { path: '' })).error)).toContain('required');
   });
 
   it('reports a NodeId mismatch when the node was renumbered', async () => {
-    await fx.tools.webKnowledgeSet('Cell/Axis1', 'note');
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'note' });
     setNodeId(fx.nodes['Cell/Axis1'], 'ffffffffffffffff');   // as a re-import would
-    const res = parse(await fx.tools.webKnowledgeGet('Cell/Axis1'));
+    const res = parse(await queryValue(fx.viewer, 'knowledge.get', { path: 'Cell/Axis1' }));
     expect(res.nodeIdMismatch).toBe(true);
     expect(res.nodeIdAtWrite).toBe('a1b2c3d4e5f60718');
     expect(res.nodeIdNow).toBe('ffffffffffffffff');
@@ -439,8 +445,8 @@ describe('web_knowledge_get', () => {
     // rv-node-id.ts forbids writing the occurrence chain into a file. So this
     // check is knowingly weak, and this test pins that weakness as INTENDED —
     // absence of a mismatch is not evidence of identity.
-    await fx.tools.webKnowledgeSet('Cell/Axis1', 'note about axis 1');
-    const res = parse(await fx.tools.webKnowledgeGet('Cell/Axis1'));
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'note about axis 1' });
+    const res = parse(await queryValue(fx.viewer, 'knowledge.get', { path: 'Cell/Axis1' }));
     expect(res.nodeIdMismatch).toBeUndefined();
 
     const foreign = readNodeKnowledge(fx.nodes['Cell/Axis1'])!;
@@ -456,16 +462,16 @@ describe('web_knowledge_list', () => {
   afterEach(() => { setActiveEditTarget(null); });
 
   it('lists nothing when no node carries a note', async () => {
-    const res = parse(await fx.tools.webKnowledgeList());
+    const res = parse(await queryValue(fx.viewer, 'knowledge.list', { }));
     expect(res.total).toBe(0);
     expect(res.results).toEqual([]);
   });
 
   it('lists every annotated node with provenance', async () => {
-    await fx.tools.webKnowledgeSet('Cell/Axis1', 'about axis one', 'agent', 'observed');
-    await fx.tools.webKnowledgeSet('Cell/Axis2', 'about axis two', 'user', 'inferred');
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'about axis one', author: 'agent', confidence: 'observed' });
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis2', markdown: 'about axis two', author: 'user', confidence: 'inferred' });
 
-    const res = parse(await fx.tools.webKnowledgeList());
+    const res = parse(await queryValue(fx.viewer, 'knowledge.list', { }));
     expect(res.total).toBe(2);
     const rows = res.results as Array<Record<string, unknown>>;
     expect(rows.map((r) => r.path).sort()).toEqual(['Cell/Axis1', 'Cell/Axis2']);
@@ -478,46 +484,46 @@ describe('web_knowledge_list', () => {
   });
 
   it('filters by query over note text AND node path', async () => {
-    await fx.tools.webKnowledgeSet('Cell/Axis1', 'hydraulic clamp, not a drive');
-    await fx.tools.webKnowledgeSet('Cell/Axis2', 'plain rotary axis');
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'hydraulic clamp, not a drive' });
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis2', markdown: 'plain rotary axis' });
 
-    const byText = parse(await fx.tools.webKnowledgeList('HYDRAULIC'));
+    const byText = parse(await queryValue(fx.viewer, 'knowledge.list', { query: 'HYDRAULIC' }));
     expect((byText.results as unknown[]).length).toBe(1);
     expect((byText.results as Array<{ path: string }>)[0].path).toBe('Cell/Axis1');
 
-    const byPath = parse(await fx.tools.webKnowledgeList('axis2'));
+    const byPath = parse(await queryValue(fx.viewer, 'knowledge.list', { query: 'axis2' }));
     expect((byPath.results as Array<{ path: string }>)[0].path).toBe('Cell/Axis2');
 
-    expect((parse(await fx.tools.webKnowledgeList('nothing matches')).results as unknown[]).length)
+    expect((parse(await queryValue(fx.viewer, 'knowledge.list', { query: 'nothing matches' })).results as unknown[]).length)
       .toBe(0);
   });
 
   it('caps with a truncated flag and keeps total honest', async () => {
-    await fx.tools.webKnowledgeSet('Cell/Axis1', 'one');
-    await fx.tools.webKnowledgeSet('Cell/Axis2', 'two');
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'one' });
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis2', markdown: 'two' });
 
-    const res = parse(await fx.tools.webKnowledgeList(undefined, 1));
+    const res = parse(await queryValue(fx.viewer, 'knowledge.list', { query: undefined, limit: 1 }));
     expect(res.total).toBe(2);           // what exists
     expect(res.truncated).toBe(true);    // said out loud
     expect((res.results as unknown[]).length).toBe(1);
   });
 
   it('marks a long note excerpt as truncated', async () => {
-    await fx.tools.webKnowledgeSet('Cell/Axis1', 'y'.repeat(400));
-    const row = (parse(await fx.tools.webKnowledgeList()).results as Array<Record<string, unknown>>)[0];
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'y'.repeat(400) });
+    const row = (parse(await queryValue(fx.viewer, 'knowledge.list', { })).results as Array<Record<string, unknown>>)[0];
     expect(row.truncated).toBe(true);
     expect((row.excerpt as string).length).toBeLessThan(400);
     expect(row.chars).toBe(400);         // the excerpt is short, the note is not
   });
 
   it('orders newest first', async () => {
-    await fx.tools.webKnowledgeSet('Cell/Axis1', 'older');
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'older' });
     // UpdatedAt is ISO with millisecond resolution; force a distinct stamp.
     const older = fx.nodes['Cell/Axis1'].userData.realvirtual as Record<string, Record<string, unknown>>;
     older[NODE_KNOWLEDGE_TYPE].UpdatedAt = '2020-01-01T00:00:00.000Z';
-    await fx.tools.webKnowledgeSet('Cell/Axis2', 'newer');
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis2', markdown: 'newer' });
 
-    const rows = parse(await fx.tools.webKnowledgeList()).results as Array<{ path: string }>;
+    const rows = parse(await queryValue(fx.viewer, 'knowledge.list', { })).results as Array<{ path: string }>;
     expect(rows[0].path).toBe('Cell/Axis2');
   });
 
@@ -525,7 +531,7 @@ describe('web_knowledge_list', () => {
     fx.nodes['Cell/Axis1'].userData.realvirtual = {
       [NODE_KNOWLEDGE_TYPE]: { Note: '   ', UpdatedAt: '2026-01-01T00:00:00.000Z' },
     };
-    expect(parse(await fx.tools.webKnowledgeList()).total).toBe(0);
+    expect(parse(await queryValue(fx.viewer, 'knowledge.list', { })).total).toBe(0);
   });
 
   it('traverses a large tree within a sane time budget', async () => {
@@ -538,10 +544,10 @@ describe('web_knowledge_list', () => {
       n.name = `Filler${i}`;
       root.add(n);
     }
-    await fx.tools.webKnowledgeSet('Cell/Axis1', 'the only note');
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'the only note' });
 
     const t0 = performance.now();
-    const res = parse(await fx.tools.webKnowledgeList());
+    const res = parse(await queryValue(fx.viewer, 'knowledge.list', { }));
     const elapsed = performance.now() - t0;
     expect(res.total).toBe(1);
     // Generous on purpose — this is a regression fence against an accidental

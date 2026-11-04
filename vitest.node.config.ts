@@ -14,6 +14,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { defaultExclude, defineConfig } from 'vitest/config';
+import { testLockProgressPlugin } from './scripts/test-progress-reporter.mjs';
 
 // Same @rv-private convention as vite.config.ts: resolve to the private repo
 // when present, otherwise to the public stubs (plan-237 — the onshape-url
@@ -33,9 +34,13 @@ const PRIVATE_DEPENDENT_TESTS: string[] = HAS_PRIVATE
   : JSON.parse(readFileSync(resolve(__dirname, 'tests/private-dependent-tests.json'), 'utf8'));
 
 export default defineConfig({
+  // Startup progress for the test lock wrapper + the [test-skips] line (scripts/test-progress-reporter.mjs),
+  // appended to whatever reporters config/CLI chose — same plugin as vite.config.ts.
+  plugins: [testLockProgressPlugin()],
   // Same build-time flag vite.config.ts defines for the app bundle: node tests
   // that (transitively) import rv-model-plugin-manager need it resolved too.
   define: {
+    __RV_TERMS_GATE__: JSON.stringify('off'),
     __RV_HAS_PRIVATE__: JSON.stringify(HAS_PRIVATE),
     __RV_EMBED__: 'false',
   },
@@ -55,5 +60,9 @@ export default defineConfig({
     include: ['tests/**/*.node.test.ts', '../realvirtual-WebViewer-Private~/tests/**/*.node.test.ts'],
     exclude: [...defaultExclude, ...PRIVATE_DEPENDENT_TESTS],
     pool: 'forks',
+    // plan-606: machine-wide test lock. Under `npm run test:node` the wrapper holds it and
+    // the guard only checks; a direct `npx vitest run --config vitest.node.config.ts`
+    // takes it here. ROOT ONLY — never in a project, never via `extends: true`.
+    globalSetup: ['./tests/global-lock-guard.ts'],
   },
 });

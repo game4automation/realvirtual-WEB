@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage } from '../rv-safe-storage';
+
 /**
  * rv-dev-load-flags.ts — developer kill-switches for model-load features
  * (Settings → Dev Tools, or the DevTools console). Read at load time only;
@@ -26,7 +28,7 @@ export function isMetadataLoadingEnabled(): boolean {
   // traverse; the flag needs a reload to change anyway).
   if (_metadataEnabled === null) {
     try {
-      _metadataEnabled = typeof localStorage === 'undefined' || localStorage.getItem(DISABLE_METADATA_LS_KEY) !== '1';
+      _metadataEnabled = readLocalStorage(DISABLE_METADATA_LS_KEY) !== '1';
     } catch {
       _metadataEnabled = true;
     }
@@ -48,7 +50,7 @@ export const PICK_STRUCTURE_LS_KEY = 'rv-webviewer-pick-structure';
 /** True unless the user switched the pick structure off (default true). */
 export function isPickStructureEnabled(): boolean {
   try {
-    return typeof localStorage === 'undefined' || localStorage.getItem(PICK_STRUCTURE_LS_KEY) !== '0';
+    return readLocalStorage(PICK_STRUCTURE_LS_KEY) !== '0';
   } catch {
     return true;
   }
@@ -65,7 +67,7 @@ export const JSON_EDITOR_LS_KEY = 'rv-webviewer-json-editor';
 /** True unless the user switched the Monaco JSON field editor off (default true). */
 export function isJsonEditorEnabled(): boolean {
   try {
-    return typeof localStorage === 'undefined' || localStorage.getItem(JSON_EDITOR_LS_KEY) !== '0';
+    return readLocalStorage(JSON_EDITOR_LS_KEY) !== '0';
   } catch {
     return true;
   }

@@ -18,6 +18,7 @@ import { applySchema, setComponentInstance, loadSchemaFromSpec } from './rv-comp
 import { validateExtras } from './rv-extras-validator';
 import { NodeRegistry } from './rv-node-registry';
 import { registerTooltipComponent } from './rv-tooltip-component';
+import { storedRefString } from './rv-stored-ref-label';
 
 /** Raw ComponentReference shape from GLB extras. */
 interface ComponentRefRaw {
@@ -56,8 +57,9 @@ export class RVPipe {
     // applySchema stores raw ComponentRef objects — extract paths
     const src = (this as unknown as { source?: ComponentRefRaw | null }).source;
     const dst = (this as unknown as { destination?: ComponentRefRaw | null }).destination;
-    this.sourcePath = src?.path ?? null;
-    this.destinationPath = dst?.path ?? null;
+    // plan-769 Phase 3: a path, or the label of an address (read back by readStoredRef).
+    this.sourcePath = storedRefString(node, src);
+    this.destinationPath = storedRefString(node, dst);
 
     setComponentInstance(node, this);
     node.userData._rvType = 'Pipe';

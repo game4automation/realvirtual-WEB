@@ -105,6 +105,14 @@ export class TooltipStore {
   /** Active hover-suppression tokens — while non-empty, hover tooltips are hidden. */
   private hoverSuppressors = new Set<string>();
 
+  /** Pinned bubbles the pointer is currently inside (reported by TooltipLayer). */
+  private pinnedPointerOwners = new Set<string>();
+  private pinnedPointerListeners = new Set<(inside: boolean) => void>();
+
+  /** Bumped by {@link requestPin}; GenericTooltipController re-pins on change. */
+  private pinRequestSeq = 0;
+  private pinRequestListeners = new Set<() => void>();
+
   // ── useSyncExternalStore interface ──
 
   private _listeners = new Set<() => void>();
@@ -190,6 +198,54 @@ export class TooltipStore {
     if (!this.hoverSuppressors.delete(token)) return;
     this.notify();
   }
+
+  // ── Pinned-bubble interaction ──
+
+  /**
+   * Report whether the pointer is inside the pinned bubble `owner` (its
+   * React key). While the pointer is inside ANY pinned bubble the pin
+   * auto-hide stands still — a tooltip never closes under the reading user.
+   * Listeners fire only when the overall inside/outside state flips.
+   */
+  setPointerInsidePinned(owner: string, inside: boolean): void {
+    const before = this.pinnedPointerOwners.size > 0;
+    if (inside) this.pinnedPointerOwners.add(owner);
+    else this.pinnedPointerOwners.delete(owner);
+    const after = this.pinnedPointerOwners.size > 0;
+    if (before !== after) for (const l of this.pinnedPointerListeners) l(after);
+  }
+
+  /** True while the pointer is inside any pinned bubble. */
+  get pointerInsidePinned(): boolean {
+    return this.pinnedPointerOwners.size > 0;
+  }
+
+  /** Listen for the pointer entering (true) / leaving (false) the pinned bubbles. */
+  subscribePinnedPointer = (listener: (inside: boolean) => void): (() => void) => {
+    this.pinnedPointerListeners.add(listener);
+    return () => { this.pinnedPointerListeners.delete(listener); };
+  };
+
+  /**
+   * Ask the selection-pin controller to (re-)pin the current 3D selection even
+   * though the selection itself did not change — e.g. a click on the part (or
+   * its AAS badge) that is already selected but whose pin was dismissed by the
+   * auto-hide, an orbit or a wheel zoom. `SelectionManager.select()` of the
+   * same path is a silent no-op, so without this the click did nothing.
+   */
+  requestPin(): void {
+    this.pinRequestSeq++;
+    for (const l of this.pinRequestListeners) l();
+  }
+
+  /** useSyncExternalStore subscribe for {@link requestPin}. */
+  subscribePinRequest = (listener: () => void): (() => void) => {
+    this.pinRequestListeners.add(listener);
+    return () => { this.pinRequestListeners.delete(listener); };
+  };
+
+  /** useSyncExternalStore snapshot for {@link requestPin}. */
+  getPinRequestSeq = (): number => this.pinRequestSeq;
 
   /**
    * Register a model-cleared handler on the viewer to auto-clear all tooltips.

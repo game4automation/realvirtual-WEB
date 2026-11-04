@@ -33,6 +33,7 @@
  * unused routing surface.
  */
 
+import { runLeaseBlocker } from './rv-run-lease';
 import { getSceneStore } from './scene/scene-store-singleton';
 import { freshOpId } from '../ops/rv-op-utils';
 
@@ -46,8 +47,11 @@ import { freshOpId } from '../ops/rv-op-utils';
  *             CANCELS the autosave rather than flushing it, so an edit made less
  *             than the debounce interval before a model switch is lost.
  *   'none'  — accepted and persisted nowhere.
+ *   'variant' — the variant in the scene (plan-2013 §2.6): the edit runs through the
+ *             parameter apply transaction (one reset) and lands in the variant store,
+ *             never in the scene op log; saved with the variants, not as a base value.
  */
-export type PersistenceTarget = 'asset' | 'scene' | 'none';
+export type PersistenceTarget = 'asset' | 'scene' | 'none' | 'variant';
 
 export interface EditTarget {
   /** True when the target can accept ops right now (SceneStore may be absent pre-boot). */
@@ -68,7 +72,12 @@ export interface EditTarget {
    * its adapter while the document stays). Undefined → key on the target.
    */
   readonly documentKey?: object;
-  setField(nodePath: string, componentType: string, fieldName: string, value: unknown, prev: unknown): void;
+  /**
+   * Fire-and-forget field edit. A target MAY return the op's promise so a
+   * caller can tell when it settled (plan-774: the editor's document does); it is
+   * already observed by the target — never required, never awaited for errors.
+   */
+  setField(nodePath: string, componentType: string, fieldName: string, value: unknown, prev: unknown): void | Promise<void>;
   /**
    * Awaitable `setField` (plan-512): resolves once the op has been applied,
    * rejects when it was not. Inside a transaction a rejection is what makes the
@@ -78,15 +87,33 @@ export interface EditTarget {
   setFieldAsync?(nodePath: string, componentType: string, fieldName: string, value: unknown, prev: unknown): Promise<void>;
   unsetField(nodePath: string, componentType: string, fieldName: string, prev: unknown): void;
   withTransaction(label: string, fn: () => Promise<void>): Promise<void>;
+  /**
+   * Synchronous pre-check of a field edit (plan-2013 §2.6, Gate R1 #5): admission and lock.
+   * Defined only by targets that can refuse; a refusal is returned to the caller (the
+   * inspector shows it, MCP reports it) and nothing is written — no optimistic overlay entry.
+   */
+  trySetField?(nodePath: string, componentType: string, fieldName: string, value: unknown): { ok: true } | { ok: false; reason: string; code?: 'shared-field' };
+  /** Target-own undo / redo (the variant target's tuple stack). Undefined ⇒ the scene op log's. */
+  undo?(): Promise<boolean>;
+  redo?(): Promise<boolean>;
   // Editor-only capabilities — undefined ⇒ the UI hides the affordance.
   addComponent?(nodePath: string, baseType: string, fields: Record<string, unknown>): string;
   removeComponent?(nodePath: string, componentType: string): void;
   setNodeVisible?(nodePath: string, visible: boolean): void;
+  /**
+   * Current camera as `{ position, target }` in viewer coordinates (plan-522
+   * "Save current view" on a maintenance step). Editor-only; undefined ⇒ the
+   * inspector shows no capture button.
+   */
+  captureView?(): { position: [number, number, number]; target: [number, number, number] };
 }
 
 /** SceneStore adapter — reproduces the exact op emission the inspector and
  *  scene-field-ops used before the seam existed. */
 const sceneStoreTarget: EditTarget = {
+  trySetField() {
+    return runLeaseBlocker() ? { ok: false, reason: 'experiment-running' } : { ok: true };
+  },
   get available(): boolean {
     return getSceneStore() !== null;
   },
@@ -141,7 +168,7 @@ export function setActiveEditTarget(target: EditTarget | null): void {
   for (const fn of _listeners) fn();
 }
 
-/** The currently active edit target (asset document in editor mode, else SceneStore). */
+/** The currently active edit target (the editor's document in editor mode, else SceneStore). */
 export function getActiveEditTarget(): EditTarget {
   return _override ?? sceneStoreTarget;
 }
@@ -167,6 +194,16 @@ export function getActivePersistenceTarget(): PersistenceTarget {
 // The asset-editor target installs ASYNCHRONOUSLY after mode activation (the
 // plugin awaits the base-model load first), so UI that gates on editor-only
 // capabilities needs a change signal — useSyncExternalStore-compatible pair.
+
+/**
+ * Undo / redo through the active target when it has its own history (plan-2013 §2.6: the
+ * variant in the scene). Returns `null` when the caller should use the scene op log.
+ */
+export function activeHistoryStep(kind: 'undo' | 'redo'): Promise<boolean> | null {
+  const t = getActiveEditTarget();
+  const step = kind === 'undo' ? t.undo : t.redo;
+  return step ? step.call(t) : null;
+}
 
 /** Subscribe to edit-target install/clear. Returns the unsubscribe. */
 export function subscribeEditTarget(fn: () => void): () => void {

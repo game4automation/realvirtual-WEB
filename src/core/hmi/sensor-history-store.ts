@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readSessionStorage, removeSessionStorage, writeSessionStorage } from '../rv-safe-storage';
+
 /**
  * sensor-history-store — Module-level store for the floating SensorHistoryPanel.
  *
@@ -87,7 +89,7 @@ function defaultBottomRightLayout(): SensorHistoryPanelLayout {
 
 function loadLayout(): SensorHistoryPanelLayout {
   try {
-    const raw = sessionStorage.getItem(STORAGE_KEY);
+    const raw = readSessionStorage(STORAGE_KEY);
     if (!raw) return defaultBottomRightLayout();
     const parsed = JSON.parse(raw) as Partial<SensorHistoryPanelLayout>;
     if (
@@ -104,7 +106,7 @@ function loadLayout(): SensorHistoryPanelLayout {
 
 function saveLayout(layout: SensorHistoryPanelLayout): void {
   try {
-    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(layout));
+    writeSessionStorage(STORAGE_KEY, JSON.stringify(layout));
   } catch {
     // Private-mode or quota — ignore.
   }
@@ -221,7 +223,7 @@ export function __resetSensorHistoryStore(): void {
     layout: defaultBottomRightLayout(),
   };
   _snapshot = _state;
-  try { sessionStorage.removeItem(STORAGE_KEY); } catch { /* ignore */ }
+  removeSessionStorage(STORAGE_KEY);
   for (const l of _listeners) l();
 }
 

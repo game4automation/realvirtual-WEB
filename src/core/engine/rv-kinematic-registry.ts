@@ -557,7 +557,7 @@ export interface MechanismUiBridge {
    * Start the sizing run of one trajectory; resolves when it ended. One run per mechanism at a
    * time — a second start answers with `run-in-progress`. TRANSIENT: no document op.
    */
-  runTrajectory?(trajectoryPath: string): Promise<MechanismTrajectoryView | { error: string }>;
+  runTrajectory?(trajectoryPath: string, signal?: AbortSignal): Promise<MechanismTrajectoryView | { error: string }>;
   /** Cancel a running sizing run. Returns false when none was running. */
   cancelTrajectoryRun?(trajectoryPath: string): boolean;
   /** Downsampled series of the last run (null when there is none). */

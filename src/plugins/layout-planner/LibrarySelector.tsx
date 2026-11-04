@@ -31,6 +31,7 @@ import {
   MenuItem,
   ListItemIcon,
   ListItemText,
+  ListSubheader,
   Divider,
   Typography,
   CircularProgress,
@@ -66,6 +67,18 @@ export interface LibraryItem {
   cloudStatus?: 'connected' | 'connecting' | 'error';
   /** Catalog failed to load (non-permission error). */
   error?: boolean;
+  /**
+   * plan-778: the state of a library PROJECT (`pending` / `ready` / `locked` /
+   * `unknown` / `error`). Rendered as a badge word; absent for catalogs.
+   */
+  state?: string;
+}
+
+/** plan-778: a "needed by <B>" group — transitive libraries, listed, never selectable. */
+export interface LibraryNeededByGroup {
+  neededById: string;
+  neededByLabel: string;
+  items: Array<{ projectId: string; label: string; state: string }>;
 }
 
 export interface LibrarySelectorProps {
@@ -74,6 +87,10 @@ export interface LibrarySelectorProps {
   onSelect: (id: string) => void;
   /** Open the Projects dashboard on its Assets tab — the only management route. */
   onManage: () => void;
+  /** plan-778: transitive libraries, grouped by the library that needs them. */
+  neededBy?: LibraryNeededByGroup[];
+  /** plan-778: badge word of a library-project state (the shared rule lives in core). */
+  stateText?: (state: string) => string;
   /** Compact mode (mobile): collapse the inline refresh button into a single
    *  "⋮" overflow menu and tighten padding, so the header row stays small.
    *  Default false keeps the desktop inline-actions layout. */
@@ -95,7 +112,18 @@ function kindIcon(kind: LibraryKind, status: LibraryItem['cloudStatus'], error?:
   }
 }
 
-export function LibrarySelector({ items, activeId, onSelect, onManage, compact = false }: LibrarySelectorProps) {
+/** Is a library-project state one that needs the user? (locked / unknown / error) */
+function needsAttention(state: string | undefined): boolean {
+  return state === 'locked' || state === 'unknown' || state === 'error';
+}
+
+export function LibrarySelector({
+  items, activeId, onSelect, onManage, compact = false, neededBy = [], stateText,
+}: LibrarySelectorProps) {
+  const secondaryOf = (item: LibraryItem): string | undefined => {
+    if (item.state && item.state !== 'ready') return stateText ? stateText(item.state) : item.state;
+    return item.error ? 'Failed to load' : undefined;
+  };
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   const close = () => setAnchor(null);
   // Compact-mode overflow ("⋮") menu anchor — separate from the library dropdown.
@@ -170,22 +198,26 @@ export function LibrarySelector({ items, activeId, onSelect, onManage, compact =
       >
         {items.map((item) => {
           const isActive = item.id === activeId;
+          const secondary = secondaryOf(item);
+          const alert = item.error || needsAttention(item.state);
           return (
             <MenuItem
               key={item.id}
               selected={isActive}
+              data-library-item={item.id}
+              data-library-state={item.state ?? undefined}
               onClick={() => { onSelect(item.id); close(); }}
               sx={{ fontSize: 12, py: 0.5, pr: 1 }}
             >
               <ListItemIcon sx={{ minWidth: 26 }}>
-                {isActive ? <Check sx={{ fontSize: 16, color: 'primary.main' }} /> : kindIcon(item.kind, item.cloudStatus, item.error)}
+                {isActive ? <Check sx={{ fontSize: 16, color: 'primary.main' }} /> : kindIcon(item.kind, item.cloudStatus, alert)}
               </ListItemIcon>
               <ListItemText
                 primary={item.label}
-                secondary={item.error ? 'Failed to load' : undefined}
+                secondary={secondary}
                 slotProps={{
                   primary: { sx: { fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
-                  secondary: { sx: { fontSize: 10, color: item.error ? '#ef5350' : 'text.disabled' } },
+                  secondary: { sx: { fontSize: 10, color: alert ? '#ef5350' : 'text.disabled' } },
                 }}
               />
               {item.kind === 'cloud' && item.cloudStatus === 'connecting' && (
@@ -194,6 +226,36 @@ export function LibrarySelector({ items, activeId, onSelect, onManage, compact =
             </MenuItem>
           );
         })}
+
+        {/* plan-778 Decision 4: transitive libraries resolve but are not
+            placeable — listed under the library that needs them, never selectable. */}
+        {neededBy.map((group) => [
+          <ListSubheader
+            key={`needed-by:${group.neededById}`}
+            data-needed-by={group.neededById}
+            sx={{ fontSize: 10, lineHeight: '24px', bgcolor: 'transparent', color: 'text.disabled' }}
+          >
+            Needed by {group.neededByLabel}
+          </ListSubheader>,
+          ...group.items.map((t) => (
+            <MenuItem
+              key={`needed-by:${group.neededById}:${t.projectId}`}
+              disabled
+              data-library-item={t.projectId}
+              data-library-state={t.state}
+              sx={{ fontSize: 12, py: 0.25, pl: 2 }}
+            >
+              <ListItemText
+                primary={t.label}
+                secondary={t.state !== 'ready' ? (stateText ? stateText(t.state) : t.state) : undefined}
+                slotProps={{
+                  primary: { sx: { fontSize: 11 } },
+                  secondary: { sx: { fontSize: 10 } },
+                }}
+              />
+            </MenuItem>
+          )),
+        ])}
 
         {items.length > 0 && <Divider />}
 

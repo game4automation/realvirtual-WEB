@@ -10,8 +10,10 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { Object3D, Vector3, Euler } from 'three';
+import { Object3D, Vector3, Euler, Quaternion } from 'three';
 import { makeTestCameraManager, makeFakeSource } from './helpers/camera-test-harness';
+import { resolveFollowSource } from '../src/core/engine/rv-follow-source';
+import type { ViewerHost } from '../src/core/engine/rv-viewer-host';
 
 describe('CameraManager — Follow mode', () => {
   it('keeps the relative offset and follows the target (delta-pattern)', () => {
@@ -35,6 +37,55 @@ describe('CameraManager — Follow mode', () => {
 });
 
 describe('CameraManager — Sit-On mode', () => {
+  it.each([
+    { label: 'path vehicle', metadata: { AgvBehavior: { Path: 'route' } }, forward: 1 },
+    { label: 'plain part', metadata: {}, forward: -1 },
+    { label: 'AGV without a resolved path', metadata: { AgvBehavior: {} }, forward: -1 },
+  ])('9.5: looks along the local forward axis of a $label', ({ metadata, forward }) => {
+    const cm = makeTestCameraManager();
+    const parent = new Object3D();
+    parent.rotation.set(0.2, 0.7, -0.1);
+    const part = new Object3D();
+    part.userData.realvirtual = metadata;
+    parent.add(part);
+    const viewer = { registry: { getNode: () => part } } as unknown as ViewerHost;
+    const source = resolveFollowSource(viewer, 'part')!;
+    expect(source.seatForward).toBe(forward === 1 ? 'posZ' : 'negZ');
+    cm.startSitOn(source);
+    for (const yaw of [0, Math.PI / 2]) {
+      part.rotation.set(0.1, yaw, 0.3);
+      cm.tickFollow(1 / 60);
+      const expected = new Vector3(0, 0, forward).applyQuaternion(part.getWorldQuaternion(new Quaternion()));
+      expect(cm.camera.getWorldDirection(new Vector3()).distanceTo(expected)).toBeLessThan(1e-6);
+    }
+  });
+
+  it('keeps the seat in the part frame and applies mouse-look after the +Z correction', () => {
+    const cm = makeTestCameraManager();
+    const part = new Object3D();
+    part.position.set(10, 2, 3);
+    part.rotation.set(0.2, 0.7, -0.1);
+    const seat = new Vector3(1, 4, 2);
+    cm.startSitOn(makeFakeSource(part, { seatForward: 'posZ', seatHeight: 0 }), seat);
+    cm.tickFollow(1 / 60);
+    const expectedPosition = new Vector3(1, 0, 2).applyQuaternion(part.quaternion).add(part.position);
+    expect(cm.camera.position.distanceTo(expectedPosition)).toBeLessThan(1e-6);
+    expect(seat.y).toBe(4);
+    const initial = cm.camera.quaternion.clone();
+    cm.applyLookDelta(0, 100);
+    cm.tickFollow(1 / 60);
+    const localLook = initial.clone().invert().multiply(cm.camera.quaternion);
+    expect(new Euler().setFromQuaternion(localLook, 'YXZ').x).toBeLessThan(0);
+    expect(cm.camera.position.distanceTo(expectedPosition)).toBeLessThan(1e-6);
+  });
+
+  it('uses the source seat height instead of the default bounding-box height', () => {
+    const cm = makeTestCameraManager();
+    cm.startSitOn(makeFakeSource(new Object3D(), { seatHeight: 2.5 }));
+    cm.tickFollow(1 / 60);
+    expect(cm.camera.position.y).toBe(2.5);
+  });
+
   it('attaches position and rotates the view with the part', () => {
     const cm = makeTestCameraManager();
     const part = new Object3D();

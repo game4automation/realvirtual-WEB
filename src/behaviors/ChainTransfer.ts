@@ -25,8 +25,11 @@
  * Full authoring guide: doc-behavior-modelling.md
  */
 
+import { captureChainTransfer, restoreChainTransfer, validateChainTransfer } from './_shared/chain-transfer-snapshot';
 import { Vector3 } from 'three';
 import type { Object3D } from 'three';
+import { physics2dRegistry } from '../core/engine/rv-physics2d-registry';
+import { behaviorWaitEdges } from '../core/diagnostics/rv-behavior-wait-sources';
 import { defineLibraryComponent, createTransitTimer, type RV, type TransitTimer } from './_shared/behavior-kit';
 import { classifyConnections, listOwnSnaps, type PortConnection } from './_shared/snap-graph-helpers';
 import { FLOW_OCCUPIED, flowOccupiedRootSignal } from './_shared/transport-links';
@@ -75,7 +78,7 @@ function chainCat(s: State): string {
 
 type Axis = 'X' | 'Z';
 
-interface ChainTransferLocal {
+export interface ChainTransferLocal {
   zNode: Object3D | null;
   xNode: Object3D | null;
   liftNode: Object3D | null;
@@ -114,7 +117,7 @@ interface ChainTransferLocal {
   _center: Vector3;
 }
 
-type ChainTransferSelf = RV.Self<ChainTransferLocal, typeof SIGNALS>;
+export type ChainTransferSelf = RV.Self<ChainTransferLocal, typeof SIGNALS>;
 
 interface ComponentRegistryShape {
   findInChildren<T = unknown>(node: Object3D, type: string): T | null;
@@ -408,6 +411,23 @@ const def = {
     if (!l.xNode)      return self.disable('no Transport-X node');
     if (!l.liftNode)   return self.disable('no Drive-Lin-Y (lift) node');
     if (!l.sensorNode) return self.disable('no Sensor node');
+    self.registerWaitSource({ id: `chain-transfer:${self.root.uuid}`, edges: () => {
+      if (self.disabled || !self.sig.Run.get()) return [];
+      if (self.mode === 'des') {
+        if (l.blockedMUs.length === 0) return [];
+        const outputs = self.outputs();
+        if (outputs.length === 0) return behaviorWaitEdges(self, null, `output:${self.root.uuid}`, 'chain-transfer');
+        return outputs.flatMap(out => behaviorWaitEdges(self, out.ownerRoot, out.id,
+          'chain-transfer', outputs.length > 1));
+      }
+      if (l.state !== 'holding') return [];
+      // The dispatch rule cannot send a part received on X back out on X.
+      const outputs = outputsList(l).filter(out => l.inAxis !== 'X' || !isX(l, out));
+      if (outputs.length === 0) return behaviorWaitEdges(self, null, `output:${self.root.uuid}`, 'chain-transfer');
+      if (outputs.some(out => !downstreamOccupied(self, out))) return [];
+      return outputs.flatMap(out => behaviorWaitEdges(self, out.ownerRoot, out.pairedSnap.id,
+        'chain-transfer', outputs.length > 1));
+    } });
 
     // Reset transient state (setup re-runs on Reset-on-Switch / DESRunner.start()).
     l.sensorOccupied = false;
@@ -445,6 +465,7 @@ const def = {
   continuous: {
     setup(self: ChainTransferSelf): void {
       const l = self.local;
+      physics2dRegistry.bindMotion(l.xNode!, l.liftNode!);
       l.zBelt = self.attachBelt(l.zNode!);
       l.lift = self.attachDrive(l.liftNode!);
       l.lift.moveTo(0); // start lowered (Z engaged)
@@ -549,6 +570,9 @@ const def = {
     // (transit-timing leadingEdge) — keep the per-event-time tween settle
     // active while a chain-transfer instance exists (plan-262 Phase 2).
     samplesLiveGeometry: true,
+    validateSnapshot: validateChainTransfer,
+    onSnapshot(self: ChainTransferSelf): unknown { return captureChainTransfer(self.local, self.mus); },
+    onRestore(self: ChainTransferSelf, state?: unknown): void { restoreChainTransfer(self, state); },
     onAccept(self: ChainTransferSelf, mu: RV.MU): boolean {
       const l = self.local;
       l.transitMUs.set(mu.id, self.in(l.timer!.transitTime, 'Arrival', mu, l.timer!.tween(mu)));

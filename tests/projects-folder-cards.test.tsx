@@ -274,6 +274,22 @@ describe('Lauf 13 — a card opens on double-click', () => {
     expect(onOpen).toHaveBeenCalledTimes(1);
     expect(onOpen.mock.calls[0][0].relPath).toBe('parts/Roll2m.glb');
   });
+
+  // User report 2026-10-20: the first click selects and re-renders the card,
+  // which can make Chromium drop the native dblclick. Two clicks must open on
+  // their own — and the dblclick that follows them must not open a second time.
+  it('opens on two clicks alone, and only once with the trailing dblclick', () => {
+    const onOpen = vi.fn();
+    render(<Screen onOpen={onOpen} />);
+    clickFolder('proj_myplant/parts');
+    const card = () => document.querySelector('[data-card-path$="Roll2m.glb"]')!.querySelector('*')!;
+    fireEvent.click(card(), { detail: 1 });
+    expect(onOpen).not.toHaveBeenCalled();
+    fireEvent.click(card(), { detail: 2 });
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    fireEvent.doubleClick(card());
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
 });
 
 // ─── 4. Card onto a folder moves ─────────────────────────────────────────

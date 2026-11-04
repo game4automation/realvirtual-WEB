@@ -161,7 +161,7 @@ describe('T8 — save verb matrix', () => {
 
   it('a named asset in a writable project saves in place', () => {
     const d = decideSaveVerb(
-      { lineage: 'asset', base: { kind: 'document', path: 'library/Custom/A.glb' } as never, name: 'A' },
+      { lineage: 'editor', base: { kind: 'document', path: 'library/Custom/A.glb' } as never, name: 'A' },
       writable,
     );
     expect(d.verb).toBe('save');
@@ -180,7 +180,7 @@ describe('T8 — save verb matrix', () => {
   it('a document created by source=new saves to its own path', () => {
     const d = decideSaveVerb(
       {
-        lineage: 'asset',
+        lineage: 'editor',
         base: { kind: 'document', documentId: 'doc_fresh', path: 'Fresh.glb', name: 'Fresh' },
         name: 'Fresh',
       },
@@ -196,7 +196,7 @@ describe('T8 — save verb matrix', () => {
     // The one case where the MCP result must not read as "saved in place":
     // the document's identity changes, which is exactly what F6 wants reported.
     const d = decideSaveVerb(
-      { lineage: 'asset', base: { kind: 'providerAsset', providerId: 'p' } as never, name: 'Belt' },
+      { lineage: 'editor', base: { kind: 'providerAsset', providerId: 'p' } as never, name: 'Belt' },
       writable,
     );
     expect(d.verb).toBe('save-into-project');
@@ -204,8 +204,8 @@ describe('T8 — save verb matrix', () => {
   });
 
   it('nothing open is blocked in both lineages, with the same sentence', () => {
-    const asset = decideSaveVerb({ lineage: 'asset', base: null, name: 'A' }, writable);
-    const scene = decideSaveVerb({ lineage: 'scene', open: false, transient: false }, writable);
+    const asset = decideSaveVerb({ lineage: 'editor', base: null, name: 'A' }, writable);
+    const scene = decideSaveVerb({ lineage: 'planner', open: false, transient: false }, writable);
     expect(asset.verb).toBe('blocked');
     expect(asset.reason).toBe(scene.reason);
   });
@@ -214,9 +214,9 @@ describe('T8 — save verb matrix', () => {
     // Both subjects must be OPEN, or the earlier "nothing is open" branch answers
     // first and the shared read-only wording is never reached.
     const asset = decideSaveVerb(
-      { lineage: 'asset', base: anyOpenDocument, name: 'A' }, readOnly,
+      { lineage: 'editor', base: anyOpenDocument, name: 'A' }, readOnly,
     );
-    const scene = decideSaveVerb({ lineage: 'scene', open: true, transient: false }, readOnly);
+    const scene = decideSaveVerb({ lineage: 'planner', open: true, transient: false }, readOnly);
     expect(asset.verb).toBe('blocked');
     expect(scene.verb).toBe('blocked');
     // plan-710 F5: one function, so the refusals cannot drift apart.
@@ -226,29 +226,29 @@ describe('T8 — save verb matrix', () => {
 
   it('no project at all is blocked in both lineages, identically', () => {
     const asset = decideSaveVerb(
-      { lineage: 'asset', base: anyOpenDocument, name: 'A' }, null,
+      { lineage: 'editor', base: anyOpenDocument, name: 'A' }, null,
     );
-    const scene = decideSaveVerb({ lineage: 'scene', open: true, transient: false }, null);
+    const scene = decideSaveVerb({ lineage: 'planner', open: true, transient: false }, null);
     expect(asset.verb).toBe('blocked');
     expect(asset.reason).toBe(scene.reason);
   });
 
   it('a scene with nothing open is blocked', () => {
-    expect(decideSaveVerb({ lineage: 'scene', open: false, transient: false }, writable).verb)
+    expect(decideSaveVerb({ lineage: 'planner', open: false, transient: false }, writable).verb)
       .toBe('blocked');
   });
 
   it('an open scene in a writable project is saveable', () => {
-    const d = decideSaveVerb({ lineage: 'scene', open: true, transient: false }, writable);
+    const d = decideSaveVerb({ lineage: 'planner', open: true, transient: false }, writable);
     expect(d.verb).not.toBe('blocked');
   });
 
   it('every verb is one of the three the type declares', () => {
     for (const d of [
-      decideSaveVerb({ lineage: 'asset', base: null, name: 'A' }, writable),
-      decideSaveVerb({ lineage: 'asset', base: null, name: 'A' }, null),
-      decideSaveVerb({ lineage: 'scene', open: true, transient: true }, writable),
-      decideSaveVerb({ lineage: 'scene', open: false, transient: false }, null),
+      decideSaveVerb({ lineage: 'editor', base: null, name: 'A' }, writable),
+      decideSaveVerb({ lineage: 'editor', base: null, name: 'A' }, null),
+      decideSaveVerb({ lineage: 'planner', open: true, transient: true }, writable),
+      decideSaveVerb({ lineage: 'planner', open: false, transient: false }, null),
     ]) {
       expect(['save', 'save-into-project', 'blocked']).toContain(d.verb);
       if (d.verb === 'blocked') expect(d.reason).toBeTruthy();

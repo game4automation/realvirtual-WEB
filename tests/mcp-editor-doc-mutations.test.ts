@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { executeValue } from './helpers/execute-value';
+import { queryValue } from './helpers/query-value';
+
 /**
  * plan-710 §9.8 — the MCP bridge's document surface, all 18 methods.
  *
@@ -28,18 +31,23 @@
  * is then pinned on the document method the tool calls.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
  import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Scene, Group, Mesh, BoxGeometry, MeshStandardMaterial, Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { AssetDocument } from '../src/core/editor/rv-asset-document';
 import { McpEditorTools } from '../src/plugins/mcp-bridge/rv-mcp-editor-tools';
+import { McpCommandTools, setGatewayCommandClassesState } from '../src/plugins/mcp-bridge/rv-mcp-command-tools';
+import { McpMacroTools } from '../src/plugins/mcp-bridge/rv-mcp-macro-tools';
+import { macroJobs } from '../src/plugins/mcp-bridge/rv-mcp-macro';
+import { ensureEditorCommandsRegistered } from '../src/core/hmi/editor-command-descriptors';
 import {
   sceneDocumentBase,
   setActiveAssetContext,
 } from '../src/core/editor/active-asset-store';
 import { __clearDraftStoresForTests } from '../src/core/ops/rv-document-drafts';
+import { installFakeDocumentProject, fakeGlb } from './helpers/fake-document-project';
 import { RvDocument } from '../src/core/ops/rv-document';
 import { RvUnifiedExecutor } from '../src/core/ops/rv-unified-executors';
 
@@ -74,6 +82,9 @@ function makeEnv(): Env {
   register();
 
   let activeMode = 'editor';
+  const modeDescriptors = [{ id: 'planner' }, { id: 'hmi' }, { id: 'editor' }];
+  // plan-900 §2.3 / F8: this inline stub is not covered by the shared-double
+  // surface invariant; if a third inline stub appears, the rule itself must grow.
   const viewer = {
     scene,
     registry,
@@ -84,7 +95,9 @@ function makeEnv(): Env {
       get activeMode() { return activeMode; },
       has: () => true,
       setMode: (m: string) => { activeMode = m; },
-      list: () => [{ id: 'planner' }, { id: 'hmi' }, { id: 'editor' }],
+      list: () => modeDescriptors,
+      restrictedFallback: () => null,
+      available: () => modeDescriptors,
       subscribe: () => () => {},
     },
     selectionManager: {
@@ -152,25 +165,25 @@ interface MutationRow {
 const MUTATIONS: MutationRow[] = [
   {
     method: 'addComponent',
-    run: async (e) => { ok(await e.tools.webEditorAddComponent(e.boxPath, 'Drive', '')); },
+    run: async (e) => { ok(await executeValue(e.viewer, 'editor.addComponent', { path: e.boxPath, type: 'Drive', propsJson: '' })); },
     effect: (e) => 'Drive' in rvOf(e.viewer, e.boxPath),
   },
   {
     method: 'removeComponent',
-    setup: async (e) => { ok(await e.tools.webEditorAddComponent(e.boxPath, 'Drive', '')); },
-    run: async (e) => { ok(await e.tools.webEditorRemoveComponent(e.boxPath, 'Drive')); },
+    setup: async (e) => { ok(await executeValue(e.viewer, 'editor.addComponent', { path: e.boxPath, type: 'Drive', propsJson: '' })); },
+    run: async (e) => { ok(await executeValue(e.viewer, 'editor.removeComponent', { path: e.boxPath, componentType: 'Drive' })); },
     effect: (e) => !('Drive' in rvOf(e.viewer, e.boxPath)),
   },
   {
     method: 'setField',
-    setup: async (e) => { ok(await e.tools.webEditorAddComponent(e.boxPath, 'Drive', '')); },
-    run: async (e) => { ok(await e.tools.webEditorSetField(e.boxPath, 'Drive', 'TargetSpeed', '777')); },
+    setup: async (e) => { ok(await executeValue(e.viewer, 'editor.addComponent', { path: e.boxPath, type: 'Drive', propsJson: '' })); },
+    run: async (e) => { ok(await executeValue(e.viewer, 'editor.setField', { path: e.boxPath, componentType: 'Drive', fieldName: 'TargetSpeed', valueJson: '777' })); },
     effect: (e) => driveField(e, 'TargetSpeed') === 777,
   },
   {
     method: 'unsetField',
     setup: async (e) => {
-      ok(await e.tools.webEditorAddComponent(e.boxPath, 'Drive', '{"TargetSpeed":123}'));
+      ok(await executeValue(e.viewer, 'editor.addComponent', { path: e.boxPath, type: 'Drive', propsJson: '{"TargetSpeed":123}' }));
     },
     run: async (e) => {
       // No dedicated tool: the bridge reaches `unsetField` through the mechanism
@@ -183,34 +196,34 @@ const MUTATIONS: MutationRow[] = [
   },
   {
     method: 'renameNode',
-    run: async (e) => { ok(await e.tools.webEditorRename(e.boxPath, 'Crate')); },
+    run: async (e) => { ok(await executeValue(e.viewer, 'editor.rename', { path: e.boxPath, name: 'Crate' })); },
     effect: (e) => !!e.root.children.find((c) => c.name === 'Crate'),
   },
   {
     method: 'transformNode',
-    run: async (e) => { ok(await e.tools.webEditorTransform(e.boxPath, 1, 2, 3, NaN, NaN, NaN, NaN, NaN, NaN)); },
+    run: async (e) => { ok(await executeValue(e.viewer, 'editor.transform', { path: e.boxPath, px: 1, py: 2, pz: 3, rx: NaN, ry: NaN, rz: NaN, sx: NaN, sy: NaN, sz: NaN })); },
     effect: (e) => node(e, e.boxPath)?.position.x === 1,
   },
   {
     method: 'setNodeVisible',
-    run: async (e) => { ok(await e.tools.webEditorSetVisible(e.boxPath, false)); },
+    run: async (e) => { ok(await executeValue(e.viewer, 'editor.setVisible', { paths: e.boxPath, visible: false })); },
     effect: (e) => node(e, e.boxPath)?.visible === false,
   },
   {
     method: 'deleteNodes',
-    run: async (e) => { ok(await e.tools.webEditorDelete(e.boxPath)); },
+    run: async (e) => { ok(await executeValue(e.viewer, 'editor.delete', { paths: e.boxPath })); },
     effect: (e) => !e.root.children.some((c) => c.name === 'Box'),
   },
   {
     method: 'createEmptyNode',
-    run: async (e) => { ok(await e.tools.webEditorCreateEmpty('', 'Rig')); },
+    run: async (e) => { ok(await executeValue(e.viewer, 'editor.createEmpty', { parentPath: '', name: 'Rig' })); },
     effect: (e) => e.root.children.some((c) => c.name === 'Rig'),
   },
   {
     method: 'reparentNodes',
     run: async (e) => {
-      ok(await e.tools.webEditorCreateEmpty('', 'Rig'));
-      ok(await e.tools.webEditorReparent(e.boxPath, 'Asset/Rig'));
+      ok(await executeValue(e.viewer, 'editor.createEmpty', { parentPath: '', name: 'Rig' }));
+      ok(await executeValue(e.viewer, 'editor.reparent', { paths: e.boxPath, newParentPath: 'Asset/Rig' }));
     },
     ops: 2,
     effect: (e) => !!node(e, 'Asset/Rig')?.children.some((c) => c.name === 'Box'),
@@ -218,9 +231,7 @@ const MUTATIONS: MutationRow[] = [
   {
     method: 'setMaterial + withTransaction',
     run: async (e) => {
-      const res = ok(await e.tools.webEditorMaterialize(
-        JSON.stringify([{ samplePath: e.meshPath, color: '#ff0000' }]),
-      ));
+      const res = ok(await executeValue(e.viewer, 'editor.materialize', { assignmentsJson: JSON.stringify([{ samplePath: e.meshPath, color: '#ff0000' }]) }));
       expect((res['applied'] as unknown[]).length).toBe(1);
     },
     // ONE op: the tool wraps every assignment in a single transaction, which is
@@ -248,7 +259,7 @@ describe('MCP editor tools — every mutation is recorded and undoable', () => {
       expect(row.effect(env)).toBe(!effectBefore);
 
       // Undo through the REAL tool, all the way back.
-      const undone = ok(await env.tools.webEditorUndo(row.ops ?? 1));
+      const undone = ok(await executeValue(env.viewer, 'editor.undo', { count: row.ops ?? 1 }));
       expect(undone['undone']).toBe(row.ops ?? 1);
       await env.doc.whenIdle();
       expect(env.doc.getSnapshot().opCount).toBe(before);
@@ -261,18 +272,18 @@ describe('MCP editor tools — every mutation is recorded and undoable', () => {
 
 describe('MCP editor tools — undo, redo, whenIdle, getSnapshot', () => {
   it('undo and redo report the document core back in the new shape', async () => {
-    ok(await env.tools.webEditorAddComponent(env.boxPath, 'Drive', ''));
+    ok(await executeValue(env.viewer, 'editor.addComponent', { path: env.boxPath, type: 'Drive', propsJson: '' }));
 
-    const undone = ok(await env.tools.webEditorUndo(1));
+    const undone = ok(await executeValue(env.viewer, 'editor.undo', { count: 1 }));
     expect(undone).toMatchObject({ undone: 1, canUndo: false, canRedo: true });
 
-    const redone = ok(await env.tools.webEditorRedo(1));
+    const redone = ok(await executeValue(env.viewer, 'editor.redo', { count: 1 }));
     expect(redone).toMatchObject({ redone: 1, canUndo: true, canRedo: false });
     expect('Drive' in rvOf(env.viewer, env.boxPath)).toBe(true);
   });
 
   it('undo stops at the floor instead of over-reporting', async () => {
-    const undone = ok(await env.tools.webEditorUndo(5));
+    const undone = ok(await executeValue(env.viewer, 'editor.undo', { count: 5 }));
     expect(undone).toMatchObject({ undone: 0, canUndo: false });
   });
 
@@ -280,19 +291,19 @@ describe('MCP editor tools — undo, redo, whenIdle, getSnapshot', () => {
     // `webEditorSetField` awaits `doc.whenIdle()` before serialising its result.
     // If that await were dropped, the value below would still be the old one at
     // the moment the caller reads the JSON.
-    ok(await env.tools.webEditorAddComponent(env.boxPath, 'Drive', ''));
-    const res = ok(await env.tools.webEditorSetField(env.boxPath, 'Drive', 'TargetSpeed', '55'));
+    ok(await executeValue(env.viewer, 'editor.addComponent', { path: env.boxPath, type: 'Drive', propsJson: '' }));
+    const res = ok(await executeValue(env.viewer, 'editor.setField', { path: env.boxPath, componentType: 'Drive', fieldName: 'TargetSpeed', valueJson: '55' }));
     expect(res['value']).toBe(55);
     expect(driveField(env, 'TargetSpeed')).toBe(55);
     expect(env.doc.getSnapshot().busy).toBe(false);
   });
 
   it('getSnapshot: project info reports dirty and opCount off the document core', async () => {
-    const clean = ok(await env.tools.webEditorProjectInfo());
+    const clean = ok(await queryValue(env.viewer, 'editor.projectInfo', {}));
     expect(clean).toMatchObject({ assetName: 'Untitled', dirty: false, opCount: 0 });
 
-    ok(await env.tools.webEditorAddComponent(env.boxPath, 'Drive', ''));
-    const dirty = ok(await env.tools.webEditorProjectInfo());
+    ok(await executeValue(env.viewer, 'editor.addComponent', { path: env.boxPath, type: 'Drive', propsJson: '' }));
+    const dirty = ok(await queryValue(env.viewer, 'editor.projectInfo', {}));
     expect(dirty).toMatchObject({ dirty: true, opCount: 1 });
   });
 });
@@ -325,7 +336,7 @@ describe('MCP editor tools at a bound (shared) document', () => {
   it('a mutation lands in the SHARED log and is still there after the way back', async () => {
     const { shared, bound } = bindShared();
     try {
-      ok(await env.tools.webEditorAddComponent(env.boxPath, 'Drive', ''));
+      ok(await executeValue(env.viewer, 'editor.addComponent', { path: env.boxPath, type: 'Drive', propsJson: '' }));
 
       // The op is in the document the scene is holding — one log, not two.
       expect(shared.opCount).toBe(1);
@@ -354,11 +365,11 @@ describe('MCP editor tools at a bound (shared) document', () => {
   it('the agent’s undo tool moves the SAME stack the scene reads', async () => {
     const { shared, bound } = bindShared();
     try {
-      ok(await env.tools.webEditorAddComponent(env.boxPath, 'Drive', ''));
-      ok(await env.tools.webEditorSetField(env.boxPath, 'Drive', 'TargetSpeed', '55'));
+      ok(await executeValue(env.viewer, 'editor.addComponent', { path: env.boxPath, type: 'Drive', propsJson: '' }));
+      ok(await executeValue(env.viewer, 'editor.setField', { path: env.boxPath, componentType: 'Drive', fieldName: 'TargetSpeed', valueJson: '55' }));
       expect(shared.opCount).toBe(2);
 
-      const undone = ok(await env.tools.webEditorUndo(1));
+      const undone = ok(await executeValue(env.viewer, 'editor.undo', { count: 1 }));
       expect(undone).toMatchObject({ undone: 1 });
       expect(shared.opCount).toBe(1);
       expect(shared.canRedo()).toBe(true);
@@ -378,7 +389,7 @@ describe('MCP editor tools at a bound (shared) document', () => {
         nodePath: env.boxPath, componentType: 'Drive', fieldName: 'TargetSpeed',
         value: 5, prev: 0,
       } as never);
-      const info = ok(await env.tools.webEditorProjectInfo());
+      const info = ok(await queryValue(env.viewer, 'editor.projectInfo', {}));
       expect(info).toMatchObject({ dirty: true, opCount: 1 });
     } finally {
       bound.dispose();
@@ -391,7 +402,7 @@ describe('MCP editor tools at a bound (shared) document', () => {
 
 describe('MCP editor tools — markSaved', () => {
   it('closing with ifDirty=discard re-bases the document and clears its draft', async () => {
-    ok(await env.tools.webEditorAddComponent(env.boxPath, 'Drive', ''));
+    ok(await executeValue(env.viewer, 'editor.addComponent', { path: env.boxPath, type: 'Drive', propsJson: '' }));
     expect(env.doc.dirty).toBe(true);
 
     const res = ok(await env.tools.webEditorClose('discard', ''));
@@ -402,7 +413,7 @@ describe('MCP editor tools — markSaved', () => {
   });
 
   it('refuses to close a dirty document without a policy — and changes nothing', async () => {
-    ok(await env.tools.webEditorAddComponent(env.boxPath, 'Drive', ''));
+    ok(await executeValue(env.viewer, 'editor.addComponent', { path: env.boxPath, type: 'Drive', propsJson: '' }));
     const res = JSON.parse(await env.tools.webEditorClose('', '')) as Record<string, unknown>;
     expect(res['error']).toContain('Unsaved changes');
     expect(env.doc.dirty).toBe(true);
@@ -414,9 +425,16 @@ describe('MCP editor tools — markSaved', () => {
 
 describe('MCP editor tools — importCad', () => {
   it('the tool refuses without a CAD provider, and records nothing', async () => {
-    const raw = await env.tools.webEditorImportCad('library/imports/x.step', '');
-    const res = JSON.parse(raw) as Record<string, unknown>;
-    expect(String(res['error'])).toMatch(/CAD provider|project/i);
+    ensureEditorCommandsRegistered();
+    setGatewayCommandClassesState('none');
+    const commands = new McpCommandTools(() => env.viewer);
+    const macros = new McpMacroTools(() => env.viewer);
+    const job = JSON.parse(await commands.webExecute('editor.importCad', JSON.stringify({ relPath: 'library/imports/x.step', quality: '' })));
+    expect(job.reason).toBe('long-running command');
+    await vi.waitFor(() => expect(macroJobs.get(job.jobId)?.state).not.toBe('running'));
+    const res = JSON.parse(await macros.webMacroStatus(job.jobId));
+    expect(String(res.report[0].error)).toMatch(/CAD provider|project/i);
+    macroJobs._resetForTest();
     expect(env.doc.getSnapshot().opCount).toBe(0);
     expect(env.doc.dirty).toBe(false);
   });
@@ -438,7 +456,7 @@ describe('MCP editor tools — importCad', () => {
     expect(env.doc.getSnapshot().canUndo).toBe(true);
     expect(env.doc.ops[0].kind).toBe('importCad');
 
-    ok(await env.tools.webEditorUndo(1));
+    ok(await executeValue(env.viewer, 'editor.undo', { count: 1 }));
     await env.doc.whenIdle();
     expect(env.doc.getSnapshot().opCount).toBe(0);
   });
@@ -452,7 +470,7 @@ describe('the asset canApply gate', () => {
     expect(env.doc.isBaseSwapping).toBe(true);
 
     // Through the REAL tool, exactly as an agent would issue it mid-re-import.
-    await env.tools.webEditorRename(env.boxPath, 'Crate');
+    await executeValue(env.viewer, 'editor.rename', { path: env.boxPath, name: 'Crate' });
     await env.doc.whenIdle();
 
     expect(env.doc.getSnapshot().opCount).toBe(0);
@@ -460,7 +478,7 @@ describe('the asset canApply gate', () => {
     expect(node(env, env.boxPath)?.name).toBe('Box');
 
     env.doc.endBaseSwap();
-    ok(await env.tools.webEditorRename(env.boxPath, 'Crate'));
+    ok(await executeValue(env.viewer, 'editor.rename', { path: env.boxPath, name: 'Crate' }));
     await env.doc.whenIdle();
     expect(env.doc.getSnapshot().opCount).toBe(1);
   });
@@ -488,3 +506,43 @@ function materialHex(e: Env, path: string): number | null {
   return mat?.color ? mat.color.getHex() : null;
 }
 
+
+
+describe('MCP named project-document save', () => {
+  it('renames the fresh document in place and hands the save its new path and unsaved ops', async () => {
+    const fake = installFakeDocumentProject({ documents: [
+      { id: 'doc_new', name: 'Untitled 7', path: 'Untitled 7.glb' },
+    ] });
+    fake.backend.statDocuments = async () => [...fake.files].map(([path, bytes]) => ({ path, size: bytes.length, mtime: 1 }));
+    env.doc.dispose();
+    env.doc = new AssetDocument(env.viewer, {
+      id: 'doc_new', name: 'Untitled 7',
+      base: { kind: 'document', documentId: 'doc_new', path: 'Untitled 7.glb', name: 'Untitled 7' },
+    });
+    setActiveAssetContext({ viewer: env.viewer, doc: env.doc });
+    env.doc.renameNode(env.boxPath, 'Authored', 'Box');
+    await env.doc.whenIdle();
+    const save = vi.fn(async () => {
+      expect(env.doc.base).toMatchObject({ documentId: 'doc_new', path: 'Part.glb' });
+      expect(env.doc.ops).toHaveLength(1);
+      expect(env.doc.dirty).toBe(true);
+      const current = await fake.backend.readDocument('Part.glb');
+      await fake.backend.writeDocument('Part.glb', fakeGlb('Authored'), { expectedRevision: current!.revision });
+      await env.doc.markSaved(env.doc.base, 'Part');
+      return { kind: 'saved', fileName: 'Part.glb', projectRelPath: 'Part.glb' };
+    });
+    // Keep the real rename and document; substitute only the GLB export boundary.
+    const load = vi.spyOn(env.tools as unknown as { _load(): Promise<unknown> }, '_load')
+      .mockResolvedValue({ save: { saveAssetAs: save } });
+    try {
+      expect(JSON.parse(await env.tools.webEditorSave('  Part  '))).toMatchObject({
+        saved: true, renamedFrom: 'Untitled 7', relPath: 'Part.glb',
+      });
+      expect(save).toHaveBeenCalledOnce();
+      expect(fake.documents()).toHaveLength(1);
+      expect(fake.documents()[0]).toMatchObject({ id: 'doc_new', path: 'Part.glb', name: 'Part' });
+      expect([...fake.files.keys()]).toEqual(['Part.glb']);
+      expect((await fake.backend.readManifest())?.documents?.[0].id).toBe('doc_new');
+    } finally { load.mockRestore(); fake.restore(); }
+  });
+});

@@ -149,6 +149,14 @@ export class FakeDir {
   requestPermissionCalls = 0;
   queryPermissionCalls = 0;
 
+  /**
+   * plan-778 (9.6): model the platform's user-activation rule — a SECOND
+   * `requestPermission` in the same tick (the activation consumed by the
+   * first) throws `SecurityError`. Off by default.
+   */
+  secondRequestInTickThrows = false;
+  private _requestedThisTick = false;
+
   readonly failures: FailureInjector;
 
   constructor(public name: string, failures?: FailureInjector) {
@@ -164,6 +172,11 @@ export class FakeDir {
 
   async requestPermission(opts?: { mode?: 'read' | 'readwrite' }): Promise<PermissionState> {
     this.requestPermissionCalls++;
+    if (this.secondRequestInTickThrows) {
+      if (this._requestedThisTick) throw namedError('SecurityError', 'requestPermission needs a fresh user activation');
+      this._requestedThisTick = true;
+      setTimeout(() => { this._requestedThisTick = false; }, 0);
+    }
     const mode = opts?.mode ?? 'read';
     if (this.permissions[mode] === 'denied') return 'denied';
     this.permissions[mode] = this.grantOnRequest;
@@ -244,6 +257,13 @@ export class FakeDir {
   /** Seed a text file without going through the writable stream. */
   seedText(name: string, text: string): FakeFile {
     const file = new FakeFile(name, new Blob([text]), this.failures);
+    this.children.set(name, file);
+    return file;
+  }
+
+  /** Seed a binary file (a GLB, plan-778) without going through the writable stream. */
+  seedBytes(name: string, bytes: Uint8Array): FakeFile {
+    const file = new FakeFile(name, new Blob([bytes as unknown as BlobPart]), this.failures);
     this.children.set(name, file);
     return file;
   }

@@ -210,7 +210,10 @@ describe('SDK phase 1b — conveyor-like JS (belt + sensor + downstream interloc
       muType: 'Box',
       onPark: (mu: LocalFlowMu) => parked.push(`park(${mu.id})`),
       onRelease: (mu: LocalFlowMu) => parked.push(`release(${mu.id})`),
-      onTransfer: (mu, portId) => transferred.push({ id: mu.id, port: portId }),
+      onTransfer: (mu, portId) => {
+        transferred.push({ id: mu.id, port: portId });
+        return 'moved';
+      },
     });
     const env = world.env(adapter);
     env.flow = flow;

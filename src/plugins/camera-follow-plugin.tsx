@@ -13,8 +13,8 @@
  * The tracking math lives in CameraManager (exposed via the RVViewer facade
  * `startCameraFollow` / `startCameraSitOn` / `stopCameraFollow` /
  * `applyCameraLookDelta`). This plugin only owns the mode lifecycle, the
- * mouse-look input for Sit-On, the conflict guards (FPV / XR), and the
- * camera-mode-changed event the toolbar listens to.
+ * mouse-look input for Sit-On and the conflict guards (FPV / XR).
+ * CameraManager reports mode changes through the viewer for the toolbar.
  *
  * Mutually exclusive with FPV and XR: entering a mode exits FPV; an FPV or XR
  * session start, a deselection, or a model clear exits this plugin.
@@ -22,6 +22,7 @@
 
 import { BaseViewerPlugin } from '../core/rv-base-plugin';
 import type { RVViewer } from '../core/rv-viewer';
+import type { PluginContext } from '../core/rv-plugin-context';
 import type { LoadResult } from '../core/engine/rv-scene-loader';
 import { resolveFollowSource } from '../core/engine/rv-follow-source';
 import type { CameraFollowPluginAPI, CameraFollowMode } from '../core/types/plugin-types';
@@ -32,7 +33,7 @@ export class CameraFollowPlugin extends BaseViewerPlugin implements CameraFollow
 
   // ── Private state ──
   private _viewer: RVViewer | null = null;
-  private _mode: CameraFollowMode = null;
+  private _selectionOff: (() => void) | null = null;
 
   // Right-click drag look listeners (Sit-On only)
   private _onPointerMove: ((e: PointerEvent) => void) | null = null;
@@ -41,39 +42,53 @@ export class CameraFollowPlugin extends BaseViewerPlugin implements CameraFollow
 
   // ── Lifecycle ──────────────────────────────────────────────────────
 
+  override init(viewer: RVViewer, context?: PluginContext): void {
+    super.init(viewer, context);
+    this._viewer = viewer;
+    // This subscription must survive BaseViewerPlugin.onModelCleared().
+    this._selectionOff?.();
+    this._selectionOff = viewer.on('selection-changed', () => {
+      if (this.mode && !this.canFollow()) this.exit();
+    });
+  }
+
   onModelLoaded(_result: LoadResult, viewer: RVViewer): void {
     this._viewer = viewer;
     this._setupLookListeners(viewer);
-    // FPV / XR start, or losing a followable selection, ends the mode.
+    // FPV / XR start ends the selection-owned mode.
     this.sub(viewer.on('fpv-enter', () => this.exit()));
     this.sub(viewer.on('xr-session-start', () => this.exit()));
-    this.sub(viewer.on('selection-changed', () => {
-      if (this._mode && !this.canFollow()) this.exit();
-    }));
   }
 
   override onModelCleared(viewer: RVViewer): void {
     // Scene gone → the followed node is stale; leave the mode without a restore
     // animation (the saved view belongs to the cleared model).
-    if (this._mode) this._exitImmediate();
+    if (this.mode) this._exitImmediate();
     super.onModelCleared(viewer); // flush viewer.on() subs
     this._viewer = viewer;
   }
 
   override dispose(): void {
-    if (this._mode) this._exitImmediate();
+    if (this.mode) this._exitImmediate();
+    this._selectionOff?.();
+    this._selectionOff = null;
     this._removeLookListeners();
     super.dispose();
+    this._viewer = null;
   }
 
   // ── Public API (CameraFollowPluginAPI) ─────────────────────────────
 
   /** The active mode, or null when neither Follow nor Sit-On is running. */
-  get mode(): CameraFollowMode { return this._mode; }
+  get mode(): CameraFollowMode {
+    const v = this._viewer;
+    if (!v || v.cameraFollowOwner !== 'selection') return null;
+    return v.cameraFollowMode === 'off' ? null : v.cameraFollowMode;
+  }
 
   /** Toggle a mode: re-clicking the active mode exits; otherwise enters it. */
   toggle(mode: 'follow' | 'siton'): void {
-    if (this._mode === mode) { this.exit(); return; }
+    if (this.mode === mode) { this.exit(); return; }
     this.enter(mode);
   }
 
@@ -94,21 +109,17 @@ export class CameraFollowPlugin extends BaseViewerPlugin implements CameraFollow
     // Exit FPV first (mutually exclusive camera ownership).
     v.getPlugin<{ id: string; exit?(): void }>('fpv')?.exit?.();
 
-    this._mode = mode;
     if (mode === 'follow') {
       v.startCameraFollow(src);
     } else {
       v.startCameraSitOn(src);
     }
-    v.emit('camera-mode-changed', { mode });
   }
 
   /** Leave the active mode and restore the entry view. */
   exit(): void {
-    if (!this._mode || !this._viewer) return;
-    this._mode = null;
+    if (!this.mode || !this._viewer) return;
     this._viewer.stopCameraFollow(true);
-    this._viewer.emit('camera-mode-changed', { mode: null });
   }
 
   /** Whether a followable part is currently selected (drives toolbar enabled state). */
@@ -122,10 +133,9 @@ export class CameraFollowPlugin extends BaseViewerPlugin implements CameraFollow
   // ── Private: exit without restore animation (model clear / dispose) ──
 
   private _exitImmediate(): void {
+    if (!this.mode) return;
     const v = this._viewer;
-    this._mode = null;
     v?.stopCameraFollow(false);
-    v?.emit('camera-mode-changed', { mode: null });
   }
 
   // ── Private: Sit-On mouse look (right-click drag, FPV-consistent) ──
@@ -138,14 +148,14 @@ export class CameraFollowPlugin extends BaseViewerPlugin implements CameraFollow
     // Right button held (bitmask) drives the look — works even if pointerdown
     // was consumed elsewhere. Left-click stays free for selection / UI.
     this._onPointerMove = (e: PointerEvent) => {
-      if (this._mode !== 'siton') return;
+      if (this.mode !== 'siton') return;
       if (!(e.buttons & 2)) return;
       viewer.applyCameraLookDelta(e.movementX, e.movementY);
     };
 
     // Suppress the context menu while looking around in Sit-On.
     this._onContextMenu = (e: Event) => {
-      if (this._mode === 'siton') e.preventDefault();
+      if (this.mode === 'siton') e.preventDefault();
     };
 
     window.addEventListener('pointermove', this._onPointerMove);

@@ -112,7 +112,7 @@ export function NewsDialog({ items, onSeen }: NewsDialogProps) {
                 variant="caption"
                 sx={{ display: 'block', color: 'text.secondary', fontSize: 11, lineHeight: 1.3 }}
               >
-                Neu in realvirtual WEB
+                New in realvirtual WEB
               </Typography>
               <Typography
                 component="span"
@@ -122,7 +122,7 @@ export function NewsDialog({ items, onSeen }: NewsDialogProps) {
               </Typography>
             </Box>
             <IconButton
-              aria-label="News schließen"
+              aria-label="Close news"
               onClick={acknowledgeAndClose}
               size="small"
               sx={{ position: 'absolute', top: 8, right: 8, color: 'text.secondary' }}
@@ -151,14 +151,14 @@ export function NewsDialog({ items, onSeen }: NewsDialogProps) {
                 rel="noopener noreferrer"
                 sx={{ display: 'inline-flex', mt: 1.5, fontSize: 13, fontWeight: 600 }}
               >
-                Mehr erfahren
+                Learn more
               </Link>
             )}
           </DialogContent>
 
           <DialogActions sx={{ justifyContent: 'space-between', px: 2, py: 1.25 }}>
             <Typography sx={{ color: 'text.secondary', fontFamily: 'monospace', fontSize: 11 }}>
-              {completed + 1} von {total}
+              {completed + 1} of {total}
             </Typography>
             <Button
               autoFocus
@@ -174,7 +174,7 @@ export function NewsDialog({ items, onSeen }: NewsDialogProps) {
                 '&:hover': { bgcolor: '#75d1f9' },
               }}
             >
-              {remaining.length > 1 ? 'Weiter' : 'Schließen'}
+              {remaining.length > 1 ? 'Next' : 'Close'}
             </Button>
           </DialogActions>
         </>

@@ -64,7 +64,7 @@ import {
   type KinematizeReport,
 } from './behavior-runtime';
 import { instanceScope } from './engine/rv-instance-scope';
-import { GENERATED_SIGNAL_FIELD, setTrackedSignal } from './engine/rv-signal-construction';
+import { GENERATED_SIGNAL_FIELD, reportSignalCollisionAt, setTrackedSignal } from './engine/rv-signal-construction';
 import { SignalStore } from './engine/rv-signal-store';
 import { DEDUP_SUFFIX_RE } from './engine/rv-node-naming';
 import { NodeRegistry } from './engine/rv-node-registry';
@@ -411,7 +411,16 @@ export class BehaviorManager {
         // node path/name below is rebuilt `/`-separated.
         const local = scope && sig.name.startsWith(`${scope}.`) ? sig.name.slice(scope.length + 1) : sig.name;
         const seed = store.get(sig.name) ?? sig.initialValue ?? (sig.type.includes('Bool') ? false : 0);
-        container ??= this.getOrCreateSignalsContainer(root);
+        if (!container) {
+          container = this.getOrCreateSignalsContainer(root);
+          // A bind after the load (a runtime placement, plan-681) has no loader
+          // traverse that registers the container itself — register it like the
+          // signal nodes below, so the hierarchy and the registry agree with a
+          // loaded root (`disposeBind` unregisters the container subtree again).
+          if (reg?.getPathForNode?.(container) == null) {
+            registerNode(rootPath ? `${rootPath}/${SIGNALS_CONTAINER_NAME}` : SIGNALS_CONTAINER_NAME, container);
+          }
+        }
         const path = rootPath ? `${rootPath}/${SIGNALS_CONTAINER_NAME}/${local}` : `${SIGNALS_CONTAINER_NAME}/${local}`;
         // Idempotent per container — a re-bind must not append a duplicate node.
         let node = container.children.find((n) => n.name === local) ?? null;
@@ -435,7 +444,12 @@ export class BehaviorManager {
         registerNode(path, node);
         store.register?.(sig.name, path, seed, sig.type);
         registerComp(sig.type, path, { address: path, signalName: sig.name });
-        if (store instanceof SignalStore) setTrackedSignal(store, node, { type: sig.type, name: sig.name, path });
+        if (store instanceof SignalStore) {
+          setTrackedSignal(store, node, { type: sig.type, name: sig.name, path });
+          // plan-559 Phase 2a: two embedded copies without `InstanceScope`
+          // declare the same unscoped name — report it (bind time, no behaviour change).
+          reportSignalCollisionAt(store, node, sig.name, path, false);
+        }
         registered++;
       } else {
         // No registry write surface — keep the store-only seed (preserve existing).
@@ -633,6 +647,27 @@ export class BehaviorManager {
     }
     this.active = remaining;
     this.dispatchedObjects.delete(key);
+  }
+
+  /**
+   * Dispose every bind scoped to a node INSIDE `root`, whoever owns it
+   * (plan-681 §2.3). {@link disposeObject} finds the binds of a planner
+   * placement by its placement key; a placement the FILE brought (a loaded
+   * reference node, no `_layoutId`) has its payload binds owned by the scene
+   * lifecycle and would keep them — hooks ticking on a removed node, its
+   * behaviour signals still in the store, so a re-placed node of the same name
+   * could not register its own. Matched by the bind identity (`<uuid>::type`).
+   */
+  disposeBindsUnder(root: Object3D): void {
+    const uuids = new Set<string>();
+    root.traverse((n) => { uuids.add(n.uuid); });
+    const remaining: ActiveBind[] = [];
+    for (const a of this.active) {
+      const sep = a.bindKey.indexOf('::');
+      if (sep > 0 && uuids.has(a.bindKey.slice(0, sep))) this.disposeBind(a);
+      else remaining.push(a);
+    }
+    this.active = remaining;
   }
 
   /** For tests: directly trigger the load logic without an event. */

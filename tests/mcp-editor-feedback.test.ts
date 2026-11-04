@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { setAiClicks } from '../src/core/hmi/ai-click-choreography-store';
+beforeEach(() => setAiClicks(true));
+afterEach(() => setAiClicks(true));
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { PerspectiveCamera, Mesh, BoxGeometry, MeshBasicMaterial, Object3D } from 'three';
 import { UserActivity } from '../src/core/rv-user-activity';
+import { choreographyToolOf } from '../src/plugins/mcp-bridge/rv-mcp-command-choreography';
 import { _resetFollowForTest } from '../src/plugins/mcp-bridge/rv-mcp-follow-policy';
 import { setFollowAgent, _resetFollowAgentForTest } from '../src/core/hmi/follow-agent-store';
 import { MCP_FOLLOW_AGENT_KEY } from '../src/core/hmi/rv-storage-keys';
@@ -16,7 +20,7 @@ import {
 import {
   getButtonSimSnapshot,
   _setSimTimingsForTest,
-} from '@rv-private/plugins/asset-editor/button-sim-store';
+} from '@rv-private/plugins/asset-editor/shared/button-sim-store';
 import { getAiTouches, _resetButtonSimStateForTest } from '../src/core/hmi/button-sim-state';
 import {
   getInspectorFieldReveal,
@@ -217,7 +221,13 @@ describe('prepareEditorChoreography', () => {
   });
 });
 
-// ─── Inspector field writes (web_editor_set_field / web_component_set) ──
+// ─── Inspector field writes (editor.setField / component.setFields) ──
+
+function componentFieldsFeedbackKey(): string {
+  const key = choreographyToolOf('component.setFields', new Map());
+  expect(key).toBe('web_component_set');
+  return key!;
+}
 
 /** A fake extras editor on top of the fake viewer: records how the inspector was opened. */
 function withEditor(f: FakeViewer, snap: { panelOpen: boolean; showInspector: boolean; selectedNodePath: string | null }) {
@@ -266,7 +276,7 @@ describe('inspector field choreography', () => {
     }
   });
 
-  it('web_component_set (unbound) presses the first field row itself and keeps an open hierarchy', async () => {
+  it('component.setFields presses the first field row itself and keeps an open hierarchy', async () => {
     _setSimTimingsForTest(10, 10);
     const key = inspectorFieldKey('A', 'Source', 'Interval');
     const row = document.createElement('div');
@@ -277,7 +287,7 @@ describe('inspector field choreography', () => {
       const ed = withEditor(f, { panelOpen: true, showInspector: false, selectedNodePath: null });
       const phases: string[] = [];
       const probe = setInterval(() => { const s = getButtonSimSnapshot(); if (s && phases[phases.length - 1] !== s.phase) phases.push(s.phase); }, 2);
-      await prepareEditorChoreography(f.viewer, 'web_component_set', { path: 'A', type: 'Source', props: '{"Interval":2,"Enabled":true}' });
+      await prepareEditorChoreography(f.viewer, componentFieldsFeedbackKey(), { path: 'A', type: 'Source', props: '{"Interval":2,"Enabled":true}' });
       clearInterval(probe);
       expect(ed.selectNode).toHaveBeenCalledWith('A', true);
       expect(ed.selectAndReveal).not.toHaveBeenCalled();
@@ -297,11 +307,11 @@ describe('inspector field choreography', () => {
     expect(getButtonSimSnapshot()).toBeNull();
   });
 
-  it('web_component_set leaves the afterglow on every APPLIED field, not on rejected ones', () => {
+  it('component.setFields leaves the afterglow on every APPLIED field, not on rejected ones', () => {
     const f = makeViewer({ A: meshAt(0, 0, 0) });
     applyEditorFeedback(
-      f.viewer, 'web_component_set', { path: 'A', type: 'Source', props: '{"Interval":2,"Bogus":1}' },
-      JSON.stringify({ path: 'A', type: 'Source', applied: { Interval: 2 }, rejected: { Bogus: 1 } }),
+      f.viewer, componentFieldsFeedbackKey(), { path: 'A', type: 'Source', props: '{"Interval":2,"Bogus":1}' },
+      JSON.stringify({ path: 'A', type: 'Source', applied: { Interval: 2 }, rejected: [{ field: 'Bogus', reason: 'Unknown field' }] }),
     );
     expect(getAiTouches().map((t) => t.buttonKey)).toEqual([inspectorFieldKey('A', 'Source', 'Interval')]);
     expect(f.selectPaths).toHaveBeenCalledWith(['A']);
@@ -352,18 +362,18 @@ describe('follow agent (plan-520)', () => {
     _resetFollowAgentForTest();
   });
 
-  it('idle + web_component_set on a small node flies once, tagged, BEFORE the tool runs', async () => {
+  it('idle + component.setFields on a small node flies once, tagged, BEFORE the tool runs', async () => {
     const f = makeViewer({ A: smallMeshAt(0, 0, 0) });
     withFollow(f, () => t);
     const decision = await prepareEditorChoreography(
-      f.viewer, 'web_component_set', { path: 'A', type: 'Source', props: '{"Interval":2}' },
+      f.viewer, componentFieldsFeedbackKey(), { path: 'A', type: 'Source', props: '{"Interval":2}' },
     );
     // The pre phase already flew — the tool body has not run yet.
     expect(decision).toBe('fly');
     expect(f.fitToNodes).toHaveBeenCalledTimes(1);
     expect(f.fitToNodes.mock.calls[0][2]).toMatchObject({ tag: 'follow-agent', easing: 'easeInOut' });
     expect(f.selectPaths).toHaveBeenCalledWith(['A']);
-    applyEditorFeedback(f.viewer, 'web_component_set', { path: 'A', type: 'Source', props: '{"Interval":2}' },
+    applyEditorFeedback(f.viewer, componentFieldsFeedbackKey(), { path: 'A', type: 'Source', props: '{"Interval":2}' },
       JSON.stringify({ path: 'A', applied: { Interval: 2 } }), decision);
     expect(f.fitToNodes).toHaveBeenCalledTimes(1);
   });
@@ -402,11 +412,11 @@ describe('follow agent (plan-520)', () => {
     expect(followCalls(f)).toHaveLength(3);
   });
 
-  it('user active → no flight for web_component_set; offscreen transform falls back to frameIfHelpful', async () => {
+  it('user active → no flight for component.setFields; offscreen transform falls back to frameIfHelpful', async () => {
     const f = makeViewer({ A: smallMeshAt(0, 0, 0), Off: meshAt(500, 0, 0) });
     const activity = withFollow(f, () => t);
     activity.markUserInput(t - 1000);
-    const d1 = await prepareEditorChoreography(f.viewer, 'web_component_set', { path: 'A', type: 'Source', props: '{"Interval":2}' });
+    const d1 = await prepareEditorChoreography(f.viewer, componentFieldsFeedbackKey(), { path: 'A', type: 'Source', props: '{"Interval":2}' });
     expect(d1).toBe('fallback');
     expect(f.fitToNodes).not.toHaveBeenCalled();
     const d2 = await prepareEditorChoreography(f.viewer, 'web_editor_transform', { path: 'Off' });
@@ -523,4 +533,68 @@ describe('follow agent (plan-520)', () => {
     expect(d).toBe('none');
     expect(f.fitToNodes).not.toHaveBeenCalled();
   });
+});
+
+
+describe('AI clicks disabled', () => {
+  afterEach(async () => {
+    const { setAiClicks } = await import('../src/core/hmi/ai-click-choreography-store');
+    setAiClicks(true);
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+  it('keeps selection and panel opening without timers', async () => {
+    const { setAiClicks } = await import('../src/core/hmi/ai-click-choreography-store');
+    setAiClicks(false);
+    vi.useFakeTimers();
+    const f = makeViewer({ A: meshAt(0, 0, 0) });
+    await prepareEditorChoreography(f.viewer, 'web_editor_to_ground', { path: 'A' }, 'qe.to-ground');
+    expect(f.selectPaths).toHaveBeenCalledWith(['A']);
+    expect(f.open).toHaveBeenCalled();
+    expect(getButtonSimSnapshot()).toBeNull();
+  });
+  it('opens the closed inspector and requests its field without waiting for DOM', async () => {
+    const { setAiClicks } = await import('../src/core/hmi/ai-click-choreography-store');
+    setAiClicks(false);
+    vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(1600);
+    _resetInspectorFieldRevealForTest();
+    vi.useFakeTimers();
+    const f = makeViewer({ A: meshAt(0, 0, 0) });
+    const ed = withEditor(f, { panelOpen: false, showInspector: false, selectedNodePath: null });
+    await prepareEditorChoreography(f.viewer, 'web_editor_set_field', { path: 'A', componentType: 'Drive', fieldName: 'TargetSpeed', valueJson: '500' });
+    expect(ed.selectAndReveal).toHaveBeenCalledWith('A', true);
+    expect(getInspectorFieldReveal()).not.toBeNull();
+  });
+  it('skips the non-editor click without timers', async () => {
+    const { setAiClicks } = await import('../src/core/hmi/ai-click-choreography-store');
+    const { prepareCommandChoreography } = await import('../src/plugins/mcp-bridge/rv-mcp-editor-feedback');
+    setAiClicks(false);
+    vi.useFakeTimers();
+    await prepareCommandChoreography('sim.play');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+
+it('AI click preference preserves the follow verdict and successful field afterglow', async () => {
+  const { setAiClicks } = await import('../src/core/hmi/ai-click-choreography-store');
+  const args = { path: 'A', type: 'Source', props: '{"Interval":2}' };
+  const decisions: unknown[] = [];
+  setFollowAgent(true);
+  try {
+    for (const on of [true, false]) {
+      setAiClicks(on);
+      _resetFollowForTest(() => 100000);
+      const f = makeViewer({ A: smallMeshAt(0, 0, 0) });
+      withFollow(f, () => 100000);
+      const decision = await prepareEditorChoreography(f.viewer, componentFieldsFeedbackKey(), args);
+      decisions.push(decision);
+      expect(followCalls(f)).toHaveLength(1);
+      _resetButtonSimStateForTest();
+      applyEditorFeedback(f.viewer, componentFieldsFeedbackKey(), args, '{"applied":{"Interval":2}}', decision);
+      expect(getAiTouches().length).toBeGreaterThan(0);
+      expect(f.selectPaths).toHaveBeenCalledWith(['A']);
+    }
+    expect(decisions).toEqual(['fly', 'fly']);
+  } finally { setAiClicks(true); }
 });

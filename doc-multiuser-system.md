@@ -188,8 +188,9 @@ Broadcast at 60 Hz (delta-only: only changed drives included).
 }
 ```
 
-#### drive_sync_idx (Opt 7: Path Table)
-Indexed variant sent to clients that acknowledged the path table.
+#### drive_sync_idx (Opt 7: Path Table) — not supported by the web client
+Indexed variant of `drive_sync` defined on the Unity side. The WebViewer multiuser plugin neither
+acknowledges a path table nor handles `drive_sync_idx`, so keep `UseDrivePathTable` off for web clients.
 
 ```json
 {
@@ -202,7 +203,8 @@ Indexed variant sent to clients that acknowledged the path table.
 ```
 
 #### mu_sync
-Broadcast at 50 Hz (delta-only).
+Broadcast at ~50 Hz. Each message carries the **complete** MU list (full snapshot, not a delta);
+the client adds new paths, removes missing ones and updates the rest (`_applyMUSync`).
 
 ```json
 {
@@ -418,7 +420,7 @@ The Unity-side component that acts as the multiuser host.
 | **Timeout / limits** | | | |
 | HandshakeTimeoutSeconds | float | 5 | Disconnect clients that don't send `room_join` in time |
 | MaxMessagesPerSecond | int | 200 | Per-client rate limit; excess messages are dropped with a warning |
-| UseDrivePathTable | bool | false | Enable indexed `drive_sync_idx` (Opt 7) |
+| UseDrivePathTable | bool | false | Enable indexed `drive_sync_idx` (Opt 7) — not understood by the WebViewer client |
 
 The three **Session** fields are `[ReadOnly]` status readouts, not settings — they
 report the live session back into the inspector.
@@ -577,7 +579,7 @@ In Teams context, the user's principal name (email prefix, e.g., `thomas` from `
 | Stream | Per Client | Total (5 clients) | Notes |
 |--------|-----------|-------------------|-------|
 | drive_sync (60 Hz) | ~30-60 KB/s | ~150-300 KB/s | Delta detection saves 80-90% |
-| mu_sync (50 Hz) | ~4 KB/s | ~20 KB/s | Delta detection saves 90-95% |
+| mu_sync (50 Hz) | ~4 KB/s | ~20 KB/s | Full snapshot each tick (no delta detection) |
 | avatar_broadcast (20 Hz) | ~0.4 KB/s | ~2 KB/s | Per-client overhead |
 | state_snapshot | ~50-200 KB | Once per join | Signals + drives + players |
 | **Total** | ~35-65 KB/s | ~175-325 KB/s | |

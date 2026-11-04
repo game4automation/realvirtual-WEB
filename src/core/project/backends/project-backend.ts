@@ -59,7 +59,6 @@ import {
 import type {
   RvDocumentEntry,
   RvProject,
-  RvProjectSceneEntry,
 } from '../rv-project-types';
 
 // ─── Kind ───────────────────────────────────────────────────────────────
@@ -104,11 +103,11 @@ export type BackendKind = 'bundled' | 'browser' | 'folder';
 export type DocRef = string | {
   path: string;
   id?: string;
-  meta?: RvProjectSceneEntry;
+  meta?: RvDocumentEntry;
 };
 
 /** `{ path, id, meta }` for either spelling of {@link DocRef}. */
-export function docRefOf(ref: DocRef): { path: string; id?: string; meta?: RvProjectSceneEntry } {
+export function docRefOf(ref: DocRef): { path: string; id?: string; meta?: RvDocumentEntry } {
   return typeof ref === 'string' ? { path: ref } : ref;
 }
 
@@ -131,7 +130,7 @@ export interface DocumentRecord {
   /** The stored body. GLB for a model or a scene, arbitrary bytes otherwise. */
   bytes: Uint8Array;
   /** Manifest metadata for this document (id, name, path, timestamps, …). */
-  meta: RvProjectSceneEntry;
+  meta: RvDocumentEntry;
   /** Revision of what was read. Hand it back as {@link WriteDocumentOptions.expectedRevision}. */
   revision: SceneRevision;
 }
@@ -147,7 +146,7 @@ export interface DocumentRecord {
  */
 export async function documentRecord(
   bytes: Uint8Array,
-  meta: Partial<RvProjectSceneEntry> & { path: string },
+  meta: Partial<RvDocumentEntry> & { path: string },
   revision?: SceneRevision,
 ): Promise<DocumentRecord> {
   return {
@@ -472,11 +471,14 @@ const INTERNAL_FILE_NAMES: ReadonlySet<string> = new Set([
 /**
  * Top-level folders whose contents are viewer artefacts rather than content.
  *
- * `thumbnails/` is the preview cache — regenerated at will, meaningless to a
- * human, and large. The rest of the reserved set (`settings`, `connect`, `rag`,
- * `.trash`) is deliberately NOT here: those hold files a user legitimately
- * looks at, and the tree already groups them under its collapsed *System* node
- * (`RESERVED_SYSTEM_FOLDERS`) instead of hiding them.
+ * The saved document previews live in `.thumbnails/` (plan-776), which the dot
+ * rule of {@link isInternalProjectPath} already hides at any depth. The one
+ * entry here is the undotted `thumbnails/` an older build used as its preview
+ * cache: nothing writes it any more, but a project that still carries one keeps
+ * it out of the tree. The rest of the reserved set (`settings`, `connect`,
+ * `rag`, `.trash`) is deliberately NOT here: those hold files a user
+ * legitimately looks at, and the tree already groups them under its collapsed
+ * *System* node (`RESERVED_SYSTEM_FOLDERS`) instead of hiding them.
  */
 const INTERNAL_FOLDERS: readonly string[] = ['thumbnails'];
 

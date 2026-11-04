@@ -302,10 +302,11 @@ export const DROPDOWN_Z_INDEX = 10000;
  *
  * The press/afterglow of each key is read through a hook, so the NUMBER of hook
  * calls must not depend on the array length — a render-mode trigger has three
- * keys in the viewer and four in the editor. Padding to a fixed slot count is
+ * keys in the viewer and four in the editor (plus the gated ray traced key and
+ * the two quality rows, plan-762: seven in all). Padding to a fixed slot count is
  * what keeps the hook order stable; keys beyond this are ignored.
  */
-const PROXY_KEY_SLOTS = 6;
+const PROXY_KEY_SLOTS = 7;
 
 /** Ein Segment, das ein Menue nach oben aufklappt. Teilt Optik und Masse mit ActionSegment. */
 export interface ActionDropdownSegmentProps {
@@ -397,14 +398,16 @@ function useProxyActivity(proxyKeys: readonly string[] | undefined): {
   const p3 = useButtonSimState(slots[3]);
   const p4 = useButtonSimState(slots[4]);
   const p5 = useButtonSimState(slots[5]);
+  const p6 = useButtonSimState(slots[6]);
   const t0 = useAiTouch(slots[0]);
   const t1 = useAiTouch(slots[1]);
   const t2 = useAiTouch(slots[2]);
   const t3 = useAiTouch(slots[3]);
   const t4 = useAiTouch(slots[4]);
   const t5 = useAiTouch(slots[5]);
-  const phases = [p0, p1, p2, p3, p4, p5];
-  const touches = [t0, t1, t2, t3, t4, t5];
+  const t6 = useAiTouch(slots[6]);
+  const phases = [p0, p1, p2, p3, p4, p5, p6];
+  const touches = [t0, t1, t2, t3, t4, t5, t6];
   const pressing = phases.find((p) => p === 'hover' || p === 'pressed');
   if (pressing) return { phase: pressing, touch: INERT_PROXY_TOUCH };
   let best: AiTouchView | null = null;

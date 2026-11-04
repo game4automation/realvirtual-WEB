@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, removeLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * LeftPanelManager — Centralized coordination for docked side panels.
  *
@@ -67,7 +69,7 @@ const LS_KEY_ACTIVE_PANEL = 'rv-left-panel-active';
 export function peekPersistedActivePanels(): Set<string> {
   const out = new Set<string>();
   try {
-    const saved = localStorage.getItem(LS_KEY_ACTIVE_PANEL);
+    const saved = readLocalStorage(LS_KEY_ACTIVE_PANEL);
     if (!saved) return out;
     const parsed = JSON.parse(saved);
     if (parsed && typeof parsed === 'object') {
@@ -167,7 +169,7 @@ export class LeftPanelManager {
    */
   restore(defaultWidths?: Record<string, number>): void {
     try {
-      const saved = localStorage.getItem(LS_KEY_ACTIVE_PANEL);
+      const saved = readLocalStorage(LS_KEY_ACTIVE_PANEL);
       if (!saved) return;
       const parsed = JSON.parse(saved) as
         | { id?: string; width?: number }                                          // legacy
@@ -239,9 +241,9 @@ export class LeftPanelManager {
         payload.right = { id: this._right.activePanel, width: this._right.activePanelWidth };
       }
       if (payload.left || payload.right) {
-        localStorage.setItem(LS_KEY_ACTIVE_PANEL, JSON.stringify(payload));
+        writeLocalStorage(LS_KEY_ACTIVE_PANEL, JSON.stringify(payload));
       } else {
-        localStorage.removeItem(LS_KEY_ACTIVE_PANEL);
+        removeLocalStorage(LS_KEY_ACTIVE_PANEL);
       }
     } catch { /* ignore */ }
   }

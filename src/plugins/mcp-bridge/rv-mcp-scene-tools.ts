@@ -28,6 +28,13 @@
  */
 
 import { Box3, Vector3 } from 'three';
+
+/** plan-769: `{ address }` of the node at a registry path, when it has one. */
+function addressField(reg: NodeRegistry, path: string): { address?: string } {
+  const node = reg.getNode(path);
+  const address = node ? reg.getAddressForNode(node) : null;
+  return address ? { address } : {};
+}
 import type { Object3D } from 'three';
 import type { RVViewer } from '../../core/rv-viewer';
 import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
@@ -43,22 +50,20 @@ import { findCompatibleLibraryAssets, ensureAssetIndex } from '../snap-point/lib
 import { flowsCompatible } from '../snap-point/snap-name-parser';
 import type { LayoutPlannerPlugin } from '../layout-planner';
 import type { LibraryCatalogEntry } from '../layout-planner/rv-layout-store';
-import type { RvExtrasEditorPlugin } from '../../core/hmi/rv-extras-editor';
 import { serializeProps } from './rv-mcp-serialize';
-import { listLibrarySources } from '../../core/library/library-source-registry';
+import { listBrowsableLibrarySources, listLibrarySources } from '../../core/library/library-source-registry';
 import { getDecodeTimings, clearDecodeTimings } from '../../core/engine/rv-model-cache';
 import { getLongTasks, clearLongTasks } from '../layout-planner/scene-mutations';
 import { getBakeTimings, clearBakeTimings } from '../../core/engine/rv-bake-timings';
 import { computeSubtreeAABB } from '../../core/engine/rv-traverse-utils';
 // plan-754 F11 — panel and agent classify a node with the SAME two predicates.
 import { NodeRegistry } from '../../core/engine/rv-node-registry';
-import {
-  bindStandalone,
-  commandErrorJson,
-  dispatchBoundCommand,
-  type McpCallContext,
-} from '../../core/hmi/rv-command-context';
-import { ensurePlannerCommandsRegistered, freeSnapsOf, pickSnap } from '../layout-planner/planner-commands';
+
+import { freeSnapsOf, pickSnap, resolvePlaceEntry } from '../layout-planner/planner-commands';
+import { PROJECT_LIBRARY_PROVIDER_ID, refreshProjectLibrary } from '../../core/library/project-library-provider';
+import { isProjectBackedProvider, LIBRARY_PROJECTS_PROVIDER_ID } from '../../core/library/library-origin';
+import { isLibraryProjectSource } from '../../core/library/library-projects-provider';
+import { listLibraries } from '../../core/library/project-library-attach';
 import { isChunkMesh, isRuntimeNode } from '../../core/engine/rv-node-classification';
 import { extractComponentTypes } from '../../core/hmi/rv-inspector-helpers';
 
@@ -93,6 +98,8 @@ export class McpSceneTools {
         path: r.path,
         name: lastPathSegment(r.path),
         types: r.types,
+        // plan-769: the node's absolute address (`<occurrence>#<id>`) — what a file stores.
+        ...addressField(reg, r.path),
       })));
     }
 
@@ -145,6 +152,7 @@ export class McpSceneTools {
       ...(matches.length > cap ? { truncated: true } : {}),
       results: matches.slice(0, cap).map((n) => ({
         path: n.path,
+        ...addressField(reg, n.path),
         name: n.name,
         types: n.components,
         size: n.bounds?.size ?? null,
@@ -301,28 +309,8 @@ export class McpSceneTools {
   // Authoring tools — BUILD layouts (not just inspect/run). They wrap the
   // mode manager, the layout-planner and the extras-editor. Typical flow:
   // web_mode_set('planner') -> web_catalog_list -> web_layout_place -> web_layout_move /
-  // web_component_set -> web_sim_play_pause -> web_document_save.
+  // web_execute("component.setFields", …) -> web_sim_play_pause -> web_document_save.
   // ═══════════════════════════════════════════════════════════════════
-
-  /**
-   * plan-499: THE one dispatch of a bound body — the command the call context
-   * resolved (bridge), or the decorator's binding for a direct call.
-   */
-  private _dispatch<R = Record<string, unknown>>(
-    ctx: McpCallContext | undefined, methodKey: string, wire: Record<string, unknown>,
-  ): ReturnType<typeof dispatchBoundCommand<R>> {
-    // Direct callers (tests, internal) may come before the plugin registered them.
-    ensurePlannerCommandsRegistered();
-    return dispatchBoundCommand<R>(ctx ?? bindStandalone(this, methodKey, wire, this.viewer), this.viewer);
-  }
-
-  /** Serialise a dispatch: `{error, ...details}` on refusal, else the shaped value. */
-  private _json<R>(
-    r: Awaited<ReturnType<typeof dispatchBoundCommand<R>>>,
-    shape: (v: R) => Record<string, unknown> = (v) => v as unknown as Record<string, unknown>,
-  ): string {
-    return JSON.stringify(r.ok ? shape(r.value) : commandErrorJson(r));
-  }
 
   /** Resolve the layout-planner plugin (helper — not an MCP tool). */
   private _planner(): LayoutPlannerPlugin | undefined {
@@ -340,54 +328,145 @@ export class McpSceneTools {
     return undefined;
   }
 
-  @McpTool('Switch the workspace mode: hmi (operate/monitor), planner (build layouts — required before web_layout_place), des (event simulation). For the asset editor use web_editor_open instead of setting mode directly.', { readOnly: false })
-  async webModeSet(
-    @McpParam('mode', 'Target mode: hmi | planner | des') mode: string,
-  ): Promise<string> {
-    const modes = this.viewer?.modes;
-    if (!modes) return JSON.stringify({ error: 'No viewer' });
-    if (!modes.has(mode)) {
-      return JSON.stringify({ error: `Unknown mode "${mode}"`, available: modes.list().map(m => m.id) });
+  /**
+   * plan-655 F3: THE one parts list — entries of the attached catalogs
+   * (`source: 'catalog'`, with the library URL) plus every document of the open
+   * project (`source: 'project'`, catalogId `project:<path>`, documentId). Both
+   * kinds are accepted by layout.place AND layout.snapAttach.
+   *
+   * plan-778 Phase 2: the third origin — every document of a DIRECT, ready
+   * library project (`source: 'library'`, `libraryProjectId`). Its catalogId is
+   * the document id, which another library may share: `layout.place` takes the
+   * `libraryProjectId` beside it to stay strict (F4). Transitive libraries are
+   * not placeable (Decision 4) and are not listed.
+   */
+  private _partsList(): Array<{ entry: LibraryCatalogEntry; source: 'catalog' | 'project' | 'library'; library: string | null }> {
+    const out: Array<{ entry: LibraryCatalogEntry; source: 'catalog' | 'project' | 'library'; library: string | null }> = [];
+    const planner = this._planner();
+    const seen = new Set<string>();
+    if (planner) {
+      for (const [url, cat] of planner.store.getSnapshot().catalogs) {
+        for (const e of cat.entries) {
+          if (seen.has(e.id)) continue;
+          seen.add(e.id);
+          out.push({ entry: e, source: 'catalog', library: url });
+        }
+      }
     }
-    modes.setMode(mode);
-    return JSON.stringify({ mode: modes.activeMode, available: modes.list().map(m => m.id) });
+    for (const { providerId, source } of listLibrarySources()) {
+      if (providerId !== PROJECT_LIBRARY_PROVIDER_ID) continue;
+      let entries: LibraryCatalogEntry[] = [];
+      try { entries = source.listEntries(); } catch { continue; }
+      for (const e of entries) {
+        if (seen.has(e.id)) continue;
+        seen.add(e.id);
+        out.push({ entry: e, source: 'project', library: null });
+      }
+    }
+    // plan-778: library projects — keyed (library, document), never deduped
+    // against another source by id: two libraries' `models/pump` are two parts.
+    for (const { providerId, source } of listLibrarySources()) {
+      if (providerId !== LIBRARY_PROJECTS_PROVIDER_ID || !isLibraryProjectSource(source) || !source.placeable) continue;
+      let entries: LibraryCatalogEntry[] = [];
+      try { entries = source.listEntries(); } catch { continue; }
+      for (const e of entries) out.push({ entry: e, source: 'library', library: source.id });
+    }
+    return out;
   }
 
-  @McpTool('List the placeable PARTS CATALOG of the layout planner: catalogId, name, category, footprintMm [x,z], short description. Catalog entries are templates you can place, NOT the project documents (those are web_document_list). Pass catalogId to web_layout_place / web_layout_snap_attach; full build docs via web_catalog_describe.', { readOnly: true })
-  async webCatalogList(): Promise<string> {
+  /** Read-only command body (plan-2007). */
+  async queryCatalogList(
+    source?: string,
+    query?: string,
+    limit?: number,
+  ): Promise<string> {
     const planner = this._planner();
-    if (!planner) return JSON.stringify({ error: 'Layout planner not available — call web_mode_set(\"planner\") first' });
-    const out: Array<{ catalogId: string; name: string; category: string; footprintMm: [number, number] | null; description: string | null }> = [];
-    for (const cat of planner.store.getSnapshot().catalogs.values()) {
-      for (const e of cat.entries) {
+    if (!planner) return JSON.stringify({ error: 'Layout planner not available — call web_execute("workspace.setMode", {mode:"planner"}) first' });
+    const want = (source ?? '').trim().toLowerCase();
+    const q = (query ?? '').trim().toLowerCase();
+    const max = Number.isFinite(limit) && Number(limit) > 0 ? Math.floor(Number(limit)) : 200;
+    const matches = (e: LibraryCatalogEntry): boolean => !q
+      || e.name.toLowerCase().includes(q)
+      || e.id.toLowerCase().includes(q)
+      || (e.localPath ?? '').toLowerCase().includes(q)
+      || e.category.toLowerCase().includes(q)
+      || (e.tags ?? []).some(t => t.toLowerCase().includes(q));
+    // plan-778: `library` (every direct library project) or `library-projects/<projectId>` (one).
+    const libPrefix = `${LIBRARY_PROJECTS_PROVIDER_ID}/`;
+    const libFilter = want.startsWith(libPrefix) ? want.slice(libPrefix.length) : null;
+    const wantOrigin = libFilter !== null || want === LIBRARY_PROJECTS_PROVIDER_ID ? 'library' : want;
+    const own = !wantOrigin || wantOrigin === 'catalog' || wantOrigin === 'project' || wantOrigin === 'library';
+    const seen = new Set<string>();
+    const out: Array<Record<string, unknown>> = [];
+    if (own) {
+      for (const { entry: e, source: src, library } of this._partsList()) {
+        if (out.length >= max) break;
+        if ((wantOrigin && src !== wantOrigin) || !matches(e)) continue;
+        if (libFilter !== null && (library ?? '').toLowerCase() !== libFilter) continue;
+        seen.add(e.id);
         out.push({
-          catalogId: e.id, name: e.name, category: e.category,
+          catalogId: e.id, name: e.name, category: e.category, source: src,
+          ...(src === 'catalog' ? { library }
+            : src === 'library' ? { libraryProjectId: library, documentId: e.documentId ?? e.id, path: e.localPath ?? null }
+            : { documentId: e.documentId ?? null, path: e.localPath ?? null }),
           footprintMm: e.footprintMm ?? null,
           description: this._behaviorForEntry(e)?.description ?? null,
         });
       }
     }
+    // plan-660 Phase 4: the other Library sources (SimReady via CONNECT, ...) — the
+    // feed the Library panel browses — reached by a query or by naming the provider.
+    let matchedProvider = false;
+    if ((q && !want) || !own) {
+      for (const { providerId, source: src } of listBrowsableLibrarySources()) {
+        // plan-778 provider-filter decision: both project-backed providers are
+        // listed above with their own origin (`project` / `library`) — never twice.
+        if (isProjectBackedProvider(providerId)) continue;
+        const key = `${providerId}/${src.id}`;
+        if (!own && want !== providerId.toLowerCase() && want !== key.toLowerCase()) continue;
+        matchedProvider = true;
+        let entries: LibraryCatalogEntry[];
+        try { entries = src.listEntries(); } catch { continue; }
+        for (const e of entries) {
+          if (out.length >= max) break;
+          if (seen.has(e.id) || !matches(e)) continue;
+          seen.add(e.id);
+          out.push({
+            catalogId: e.id, name: e.name, category: e.category, source: key,
+            footprintMm: e.footprintMm ?? null,
+            description: this._behaviorForEntry(e)?.description ?? null,
+          });
+        }
+      }
+    }
+    if (!own && !matchedProvider) {
+      return JSON.stringify({ error: 'source must be "catalog", "project", "library", "library-projects/<projectId>" or a Library provider id (or omitted for all three origins)' });
+    }
     return JSON.stringify(out);
   }
 
-  @McpTool('Describe one parts-catalog entry for building: purpose, material-flow direction, snap connections, key config. catalogId from web_catalog_list.', { readOnly: true })
-  async webCatalogDescribe(
-    @McpParam('catalogId', 'Catalog entry id (from web_catalog_list)') catalogId: string,
+  /** Read-only command body (plan-2007). */
+  async queryLibraryList(): Promise<string> {
+    return JSON.stringify(listLibraries());
+  }
+
+  /** Read-only command body (plan-2007). */
+  async queryCatalogDescribe(
+    catalogId: string,
   ): Promise<string> {
     const planner = this._planner();
-    if (!planner) return JSON.stringify({ error: 'Layout planner not available — call web_mode_set(\"planner\") first' });
-    let entry: LibraryCatalogEntry | undefined;
-    for (const cat of planner.store.getSnapshot().catalogs.values()) {
-      const f = cat.entries.find(e => e.id === catalogId);
-      if (f) { entry = f; break; }
-    }
-    if (!entry) return JSON.stringify({ error: `No catalog entry "${catalogId}". Use web_catalog_list.` });
+    if (!planner) return JSON.stringify({ error: 'Layout planner not available — call web_execute("workspace.setMode", {mode:"planner"}) first' });
+    // plan-655 F3 / plan-660: catalog entries, project parts (`project:<path>` / documentId),
+    // then every library source (the place command's own lookup).
+    const entry = resolvePlaceEntry(planner, catalogId);
+    if (!entry) return JSON.stringify({ error: `No catalog entry "${catalogId}". Use web_query("library.catalogList", {}).` });
     const def = this._behaviorForEntry(entry);
     return JSON.stringify({
       catalogId,
       name: entry.name,
       category: entry.category,
       footprintMm: entry.footprintMm ?? null,
+      ...(entry.tags?.length ? { tags: entry.tags } : {}),
       behaviorType: def?.type ?? null,
       description: def?.description ?? null,
       docs: def?.mcpDocs ?? null,
@@ -408,12 +487,12 @@ export class McpSceneTools {
   // computed before a byte moves, the row's id never changes, and references
   // keep resolving — plan-717 F6's "one rename path for every document".
 
-  @McpTool('Delete, rename or move a saved DOCUMENT or attachment file of the open project (path from web_document_list / web_project_tree — any folder, not just library/). Refused: the document currently open in the editor, reserved system paths, read-only projects. rename/move go through the dashboard tree machinery, so the document id never changes and references keep resolving. Delete moves the bytes to .trash/ and drops the manifest row. Folders are managed by web_project_folder.', { readOnly: false, destructive: true, timeoutMs: 120_000 })
-  async webDocumentUpdate(
-    @McpParam('action', 'delete | rename | move') action: string,
-    @McpParam('relPath', 'Project-relative document path, e.g. "library/Custom/MyAsset.glb" (from web_document_list). The legacy "Custom/…" spelling still resolves.') relPath: string,
-    @McpParam('newName', 'New document name (rename only; the extension is kept when omitted).', 'string', false) newName?: string,
-    @McpParam('toFolder', 'Destination folder, "" for the project root (move only; see web_project_tree).', 'string', false) toFolder?: string,
+  /** Operation body shared by the registry command (plan-2007). */
+  async updateDocument(
+    action: string,
+    relPath: string,
+    newName?: string,
+    toFolder?: string,
   ): Promise<string> {
     const verb = (action ?? '').trim().toLowerCase();
     if (verb !== 'delete' && verb !== 'rename' && verb !== 'move') {
@@ -513,6 +592,10 @@ export class McpSceneTools {
     }
 
     const outcome = await treeMod.performTreeEdit(loaded, node, verdict);
+    getSceneStore()?.adoptDocumentRename();
+    // plan-655 F5: the parts list (project library provider) re-lists before
+    // the answer, so web_catalog_list / layout.place see the new path at once.
+    await refreshProjectLibrary();
     return JSON.stringify({
       [verb === 'rename' ? 'renamed' : 'moved']: true,
       from: verdict.from,
@@ -523,23 +606,6 @@ export class McpSceneTools {
       refsRepointed: outcome.refRows,
       note: 'The document id is unchanged — references keep resolving.',
     });
-  }
-
-  @McpTool('Place a catalog component (planner mode; catalogId from web_catalog_list). Returns the placement id and the final position. y is the height of the part origin (0 = ground). To rest a pallet/MU ON a conveyor pass onto=<placement id>: the part is centred on that placement and its height is taken from the real transport surface of that placement — never guess a height. Persisted (booked like a UI edit).', { readOnly: false, command: 'layout.place' })
-  async webLayoutPlace(
-    @McpParam('catalogId', 'Catalog entry id (from web_catalog_list)') catalogId: string,
-    @McpParam('x', 'X position in meters', 'number') x: number,
-    @McpParam('y', 'Y position (height of the part origin) in meters; 0 = ground. Ignored when onto is given.', 'number') y: number,
-    @McpParam('z', 'Z position in meters', 'number') z: number,
-    @McpParam('onto', 'Placement id (from web_layout_list) to put the part ON: x/z become the centre of that placement, y its transport-surface top. x/y/z are then ignored.', 'string', false) onto?: string,
-    ctx?: McpCallContext,
-  ): Promise<string> {
-    // plan-499: a view of `layout.place` (add + height move = ONE undo step) —
-    // the library entry is the other; its afterglow marks the placed part.
-    return this._json(await this._dispatch(ctx, 'webLayoutPlace', { catalogId, x, y, z, onto }), (v) => ({
-      ...v,
-      next: 'Chain connected parts with web_layout_snap_attach; put MUs on a conveyor with onto=<placement id>',
-    }));
   }
 
   @McpTool('Placement performance timings: per-phase decode records (fetch/parse/uber-bake of a GLB, once per asset per document), per-phase chunk-bake records (roles/split/stage/pick per baked asset, plan-756) and per-phase scene-registration records (placeComponent: bakeWait, instantiate, registerPlaced, first frame; registerPlaced: processExtras, snap ports, announce), plus long tasks >= 100 ms. clear=true empties all rings after reading.', { readOnly: true })
@@ -573,35 +639,10 @@ export class McpSceneTools {
     return JSON.stringify({ now: Math.round(performance.now()), decode, bake, placements, measures, longTasks, frames });
   }
 
-  @McpTool('Move/rotate a placement (position meters, rotation degrees XYZ; omitted rotation axes keep their current value). Persisted — booked as one undoable edit, so web_document_save keeps it. To put a part on a conveyor prefer web_layout_place(onto=...). id from web_layout_list.', { readOnly: false, command: 'layout.move' })
-  async webLayoutMove(
-    @McpParam('id', 'Placement id (from web_layout_place / web_layout_list)') id: string,
-    @McpParam('x', 'X position in meters', 'number') x: number,
-    @McpParam('y', 'Y position in meters', 'number') y: number,
-    @McpParam('z', 'Z position in meters', 'number') z: number,
-    @McpParam('rx', 'X rotation in degrees (optional)', 'number', false) rx: number,
-    @McpParam('ry', 'Y rotation in degrees (optional)', 'number', false) ry: number,
-    @McpParam('rz', 'Z rotation in degrees (optional)', 'number', false) rz: number,
-    ctx?: McpCallContext,
-  ): Promise<string> {
-    // plan-499: a view of `layout.move` (one undo step).
-    return this._json(await this._dispatch(ctx, 'webLayoutMove', { id, x, y, z, rx, ry, rz }));
-  }
-
-  @McpTool('Remove a placed component by id (from web_layout_list). Persisted — booked as one undoable edit, so web_document_save no longer holds the part.', { readOnly: false, command: 'layout.remove' })
-  async webLayoutRemove(
-    @McpParam('id', 'Placement id (from web_layout_list)') id: string,
-    ctx?: McpCallContext,
-  ): Promise<string> {
-    // plan-499: a view of `layout.remove` — the planner toolbar Delete is the other.
-    return this._json(await this._dispatch<{ removed: string[] }>(ctx, 'webLayoutRemove', { id }),
-      () => ({ id, removed: true, persisted: true }));
-  }
-
-  @McpTool('List placed layout components: id, catalogId, label, position (m), rotation (deg), world bounds (center + size). The id source for web_layout_move / web_layout_remove / web_layout_snap_*.', { readOnly: true })
-  async webLayoutList(): Promise<string> {
+  /** Read-only command body (plan-2007). */
+  async queryLayoutList(): Promise<string> {
     const planner = this._planner();
-    if (!planner) return JSON.stringify({ error: 'Layout planner not available — call web_mode_set(\"planner\") first' });
+    if (!planner) return JSON.stringify({ error: 'Layout planner not available — call web_execute("workspace.setMode", {mode:"planner"}) first' });
     const snap = planner.snapshotPlacements();
     const box = new Box3();
     const center = new Vector3();
@@ -621,6 +662,8 @@ export class McpSceneTools {
       return {
         id: p.id,
         catalogId: p.catalogId,
+        // plan-778: the library project a qualified placement comes from.
+        ...(p.providerId === LIBRARY_PROJECTS_PROVIDER_ID && p.sourceId ? { libraryProjectId: p.sourceId } : {}),
         label: p.label,
         position: p.position,
         rotation: p.rotation,
@@ -639,7 +682,7 @@ export class McpSceneTools {
   // to be deleted in Phase 6 (risk 11). Built-in SOURCES are still listed by
   // `web_document_list`; they come from the model catalogue, not the scene store.
 
-  @McpTool('Save the current document. With name: saves a NEW named document and returns its documentId; without: saves the open one in place with compare-and-swap. Reports saveVerb (save | save-into-project | blocked with a reason), the same verb the save card shows. Reopen via web_document_open; raw planner layout JSON via web_layout_export.', { readOnly: false })
+  @McpTool('Save the current document. With name: saves a NEW named document and returns its documentId; without: saves the open one in place with compare-and-swap. Reports saveVerb (save | save-into-project | blocked with a reason), the same verb the save card shows. Reopen via web_document_open; raw planner layout JSON via layout.export.', { readOnly: false })
   async webDocumentSave(
     @McpParam('name', 'Document name (optional — omit to save the open document in place)', 'string', false) name: string,
   ): Promise<string> {
@@ -682,7 +725,7 @@ export class McpSceneTools {
   /**
    * The scene lineage's save verb, through the ONE decision function.
    *
-   * Mirrors `sceneDocumentView.sceneSaveDecision` clause for clause — the same
+   * Mirrors `plannerDocumentView.plannerSaveDecision` clause for clause — the same
    * two facts (`open`, `transient`) handed to the same `decideSaveVerb`. Not
    * imported from that module because it is not exported there and it lives
    * behind the view seam; duplicating the two-field projection is cheaper than
@@ -699,17 +742,17 @@ export class McpSceneTools {
       ]);
       const snap = store?.getSnapshot() ?? null;
       const d = decideSaveVerb(
-        { lineage: 'scene', open: !!snap?.draft, transient: snap?.transient === true },
+        { lineage: 'planner', open: !!snap?.draft, transient: snap?.transient === true },
         getProjectStore().getBackend(),
       );
       return { saveVerb: d.verb, ...(d.reason ? { saveReason: d.reason } : {}) };
     } catch { return {}; }
   }
 
-  @McpTool('Create a new empty DOCUMENT in the project and open it, returning its documentId and path. Optional name (default "Untitled", auto-suffixed when taken) and folder (project-relative, e.g. "parts" or "library/Machines", "" = project root; see web_project_tree — create folders first with web_project_folder). Places a file plus a manifest row, so the clean reset before building a layout survives a reload.', { readOnly: false, timeoutMs: 60_000 })
-  async webDocumentNew(
-    @McpParam('name', 'Document name (default "Untitled"; a taken name gets a numeric suffix).', 'string', false) name?: string,
-    @McpParam('folder', 'Project-relative folder to place it in (default: the project root).', 'string', false) folder?: string,
+  /** Operation body shared by the registry command (plan-2007). */
+  async createDocument(
+    name?: string,
+    folder?: string,
   ): Promise<string> {
     const store = getSceneStore();
     if (!store) return JSON.stringify({ error: 'Scene store not available' });
@@ -750,34 +793,11 @@ export class McpSceneTools {
   // All retired names are in the superseded list of
   // `rv-mcp-tool-conventions.test.ts`, so they cannot come back by accident.
 
-  @McpTool('Export the current planner layout as raw JSON (placements + catalogs + grid) without persisting anything. Exports the planner snapshot and touches no document.', { readOnly: true })
-  async webLayoutExport(): Promise<string> {
+  /** Read-only command body (plan-2007). */
+  async queryLayoutExport(): Promise<string> {
     const planner = this._planner();
-    if (!planner) return JSON.stringify({ error: 'Layout planner not available — call web_mode_set(\"planner\") first' });
+    if (!planner) return JSON.stringify({ error: 'Layout planner not available — call web_execute("workspace.setMode", {mode:"planner"}) first' });
     return JSON.stringify(planner.snapshotAsLayoutFile('Untitled'));
-  }
-
-  @McpTool('Set config properties on an existing component (rv_extras overrides, e.g. drive TargetSpeed, source spawn interval). props = JSON object of fieldName -> value. In the asset editor prefer web_editor_set_field (undoable).', { readOnly: false })
-  async webComponentSet(
-    @McpParam('path', 'Full hierarchy path of the node') path: string,
-    @McpParam('type', 'Component type (e.g. Drive, Source, Sensor, TransportSurface)') type: string,
-    @McpParam('props', 'JSON object of fieldName -> value, e.g. {"TargetSpeed": 500}') props: string,
-  ): Promise<string> {
-    const editor = this.viewer?.getPlugin<RvExtrasEditorPlugin>('rv-extras-editor');
-    if (!editor) return JSON.stringify({ error: 'Extras editor not available' });
-    let parsed: unknown;
-    try { parsed = JSON.parse(props); }
-    catch { return JSON.stringify({ error: 'props must be a JSON object string, e.g. {"TargetSpeed": 500}' }); }
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-      return JSON.stringify({ error: 'props must be a JSON object' });
-    }
-    const applied: Record<string, unknown> = {};
-    const rejected: Record<string, unknown> = {};
-    for (const [field, value] of Object.entries(parsed as Record<string, unknown>)) {
-      if (editor.updateOverlayField(path, type, field, value)) applied[field] = value;
-      else rejected[field] = value;
-    }
-    return JSON.stringify({ path, type, applied, rejected });
   }
 
   // (web_component_add was removed — superseded by web_editor_add_component,
@@ -798,14 +818,14 @@ export class McpSceneTools {
     return viewer ? freeSnapsOf({ viewer }, root) : [];
   }
 
-  @McpTool('List the free (unoccupied) snap points of a placement (id from web_layout_list): snapName, typeId, flow, axis, dirCode per open port. Feed snapName + id into web_layout_snap_attach.', { readOnly: true })
-  async webLayoutSnapList(
-    @McpParam('id', 'Placement id (from web_layout_place / web_layout_list)') id: string,
+  /** Read-only command body (plan-2007). */
+  async queryLayoutSnapList(
+    id: string,
   ): Promise<string> {
     const planner = this._planner();
-    if (!planner) return JSON.stringify({ error: 'Layout planner not available — call web_mode_set(\"planner\") first' });
+    if (!planner) return JSON.stringify({ error: 'Layout planner not available — call web_execute("workspace.setMode", {mode:"planner"}) first' });
     const root = planner.getPlacedRootById(id);
-    if (!root) return JSON.stringify({ error: `No placement "${id}". Use web_layout_list.` });
+    if (!root) return JSON.stringify({ error: `No placement "${id}". Use web_query("layout.list", {}).` });
     const reg = this.viewer?.getPlugin<SnapPointPlugin>('snap-point')?.getRegistry();
     if (!reg) return JSON.stringify({ error: 'Snap-point system not available' });
     const snaps = reg.getByOwnerRoot(root);
@@ -824,20 +844,20 @@ export class McpSceneTools {
     });
   }
 
-  @McpTool('Suggest library components compatible with a free snap (same typeId + compatible flow). Returns [{catalogId, name, ownSnapName}] — pass catalogId into web_layout_snap_attach.', { readOnly: true })
-  async webLayoutSnapSuggest(
-    @McpParam('targetId', 'Placement id to attach onto') targetId: string,
-    @McpParam('targetSnapName', 'Target snap node name (from web_layout_snap_list); omit to auto-pick the only free snap', 'string', false) targetSnapName: string,
+  /** Read-only command body (plan-2007). */
+  async queryLayoutSnapSuggest(
+    targetId: string,
+    targetSnapName?: string,
   ): Promise<string> {
     const planner = this._planner();
-    if (!planner) return JSON.stringify({ error: 'Layout planner not available — call web_mode_set(\"planner\") first' });
+    if (!planner) return JSON.stringify({ error: 'Layout planner not available — call web_execute("workspace.setMode", {mode:"planner"}) first' });
     const root = planner.getPlacedRootById(targetId);
-    if (!root) return JSON.stringify({ error: `No placement "${targetId}". Use web_layout_list.` });
+    if (!root) return JSON.stringify({ error: `No placement "${targetId}". Use web_query("layout.list", {}).` });
     const picked = this._pickSnap(this._freeSnaps(root), targetSnapName);
     if ('error' in picked) return JSON.stringify(picked);
     const target = picked.snap;
-    const entries: LibraryCatalogEntry[] = [];
-    for (const cat of planner.store.getSnapshot().catalogs.values()) entries.push(...cat.entries);
+    // plan-655 F3/F4: project parts are suggested too (indexed through their source).
+    const entries: LibraryCatalogEntry[] = this._partsList().map((p) => p.entry);
     const compat = await findCompatibleLibraryAssets(entries, target.typeId, oppositeDirection(target.dir), target.flow);
     return JSON.stringify({
       targetId,
@@ -848,15 +868,4 @@ export class McpSceneTools {
     });
   }
 
-  @McpTool('Attach a catalog component onto a free snap of a placement, auto-aligned — THE way to build connected conveyor lines. targetId from web_layout_list, catalogId from web_catalog_list / web_layout_snap_suggest; targetSnapName optional (defaults to the only free snap). flow picks the DIRECTION of the new part on a bidirectional target snap (a turntable side): "in" = it feeds INTO the target, "out" = it leads AWAY; omitted = the natural match. The answer reports the resulting flow. Returns the new placement id. Planner mode.', { readOnly: false, command: 'layout.snapAttach' })
-  async webLayoutSnapAttach(
-    @McpParam('targetId', 'Placement id to attach onto') targetId: string,
-    @McpParam('catalogId', 'Catalog entry id to attach (from web_catalog_list / web_layout_snap_suggest)') catalogId: string,
-    @McpParam('targetSnapName', 'Target snap node name (from web_layout_snap_list); omit to auto-pick the only free snap', 'string', false) targetSnapName: string,
-    @McpParam('flow', 'in | out — direction of the NEW part relative to the target: "in" feeds into the target (mates with the new part’s output snap), "out" leads away (mates with its input snap). Omit for the natural match.', 'string', false) flow?: string,
-    ctx?: McpCallContext,
-  ): Promise<string> {
-    // plan-499: a view of `layout.snapAttach` (one undo step).
-    return this._json(await this._dispatch(ctx, 'webLayoutSnapAttach', { targetId, catalogId, targetSnapName, flow }));
-  }
 }

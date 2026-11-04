@@ -39,9 +39,9 @@ import { getDefaultPathDockRegistry } from '../src/core/engine/rv-path-dock';
 import { clearLiveControl } from '../src/core/engine/rv-live-control';
 import AgvBehavior, { AgvFlow } from '../src/behaviors/Agv';
 import ConveyorBehavior from '../src/behaviors/Conveyor';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
-import { bindSceneToRunner } from '@rv-private/plugins/des/des-scene-binding';
-import { _resetDesHookCache } from '@rv-private/plugins/des/des-hook-adapter';
+import { DESRunner } from '@rv/plugins/des/des-runner';
+import { bindSceneToRunner } from '@rv/plugins/des/des-scene-binding';
+import { _resetDesHookCache } from '@rv/plugins/des/des-hook-adapter';
 
 const TICK = 1 / 60;
 

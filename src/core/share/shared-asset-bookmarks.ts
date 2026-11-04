@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage } from '../rv-safe-storage';
+
 /**
  * "Add to my library" for a shared GLB (plan-386 §2.9, F13).
  *
@@ -74,7 +76,7 @@ export function subscribeSharedBookmarks(listener: Listener): () => void {
 
 function read(): SharedAssetBookmark[] {
   try {
-    const raw = localStorage.getItem(SHARED_BOOKMARKS_KEY);
+    const raw = getLocalStorage()!.getItem(SHARED_BOOKMARKS_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw) as unknown;
     if (!Array.isArray(parsed)) return [];
@@ -103,7 +105,7 @@ function isBookmark(v: unknown): v is SharedAssetBookmark {
 function write(next: SharedAssetBookmark[]): boolean {
   cache = next;
   try {
-    localStorage.setItem(SHARED_BOOKMARKS_KEY, JSON.stringify(next));
+    getLocalStorage()!.setItem(SHARED_BOOKMARKS_KEY, JSON.stringify(next));
     return true;
   } catch {
     return false;

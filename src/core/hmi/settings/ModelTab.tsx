@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { listLocalStorageKeys, removeLocalStorage, writeLocalStorage } from '../../rv-safe-storage';
+
 import { useState, useCallback, useMemo, useEffect } from 'react';
 import { Typography, Box, Button } from '@mui/material';
 import { RestartAlt, FileDownload, FileUpload, CleaningServices, Cookie } from '@mui/icons-material';
@@ -19,8 +21,7 @@ import { WorkfolderMigrationSection } from './WorkfolderMigrationSection';
  */
 function listLegacyWebViewerKeys(): string[] {
   const out: string[] = [];
-  for (let i = 0; i < localStorage.length; i++) {
-    const k = localStorage.key(i);
+  for (const k of listLocalStorageKeys()) {
     if (!k) continue;
     if (
       k === 'rv-layouts-index' ||
@@ -81,9 +82,9 @@ export function BackupTab() {
       `Clear ${keys.length} legacy WebViewer entr${keys.length === 1 ? 'y' : 'ies'} from local storage? This cannot be undone.`,
     )) return;
     for (const k of keys) {
-      try { localStorage.removeItem(k); } catch { /* ignore */ }
+      removeLocalStorage(k);
     }
-    localStorage.setItem('rv-scenes-cleared-legacy', 'true');
+    writeLocalStorage('rv-scenes-cleared-legacy', 'true'); // persisted name — do not rename (plan-777 P1)
     window.location.reload();
   }, []);
 

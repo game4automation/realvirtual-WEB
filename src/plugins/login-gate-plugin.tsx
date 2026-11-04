@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage, readLocalStorage } from '../core/rv-safe-storage';
+
 /**
  * LoginGatePlugin — Full-screen login overlay that blocks access until
  * valid credentials are entered.
@@ -83,7 +85,7 @@ function teardownStandalone(): void {
 }
 
 function isAuthed(key: string): boolean {
-  return localStorage.getItem(key) === '1';
+  return readLocalStorage(key) === '1';
 }
 
 /** Gate on the config before any hook runs, so the form keeps one hook order. */
@@ -142,7 +144,7 @@ function LoginGateForm({ viewer, cfg }: UISlotProps & { cfg: LoginGateConfig }) 
     try {
       const ok = user.trim().toLowerCase() === atob(cfg.userB64) && pass === atob(cfg.passB64);
       if (ok) {
-        localStorage.setItem(key, '1');
+        getLocalStorage()!.setItem(key, '1');
         setAuthed(true);
         setError(false);
         _resolveGate?.();

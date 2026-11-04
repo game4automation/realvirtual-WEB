@@ -19,7 +19,7 @@
  *   100    Default (no order specified)
  *   150-249 Demo / process-specific plugins
  *   250-499 UI overlays (drive-gizmo, layout-planner, kiosk)
- *   500-989 Reserved
+ *   500-989 Reserved (900: outgoing live streams, LIVE_LINK)
  *   990-999 Debug & telemetry (mcp-bridge, debug-endpoint)
  *   1000+  Test / perf plugins
  */
@@ -45,6 +45,9 @@ export const PLUGIN_ORDER = {
   DEMO: 150,
   /** UI overlays (drive-gizmo, layout-planner, kiosk). */
   UI_OVERLAY: 250,
+  /** Outgoing live streams that READ the finished tick (USD live link to
+   *  Isaac Sim, plan-637): after drives, transport, grips and overlays. */
+  LIVE_LINK: 900,
   /** Debug / telemetry endpoints (mcp-bridge, debug-endpoint). */
   DEBUG: 990,
   /** Test / perf plugins. */

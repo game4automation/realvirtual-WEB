@@ -209,6 +209,23 @@ export default [
     },
   },
   {
+    name: 'rv/safe-storage',
+    files: ['src/**/*.{ts,tsx}'],
+    ignores: ['src/core/rv-safe-storage.ts'],
+    rules: {
+      'no-restricted-globals': ['error', ...['localStorage', 'sessionStorage'].map(name => ({
+        name,
+        message: 'Use src/core/rv-safe-storage.ts for storage access.',
+      }))],
+      'no-restricted-properties': ['error', ...['window', 'globalThis', 'self'].flatMap(object =>
+        ['localStorage', 'sessionStorage'].map(property => ({
+          object,
+          property,
+          message: 'Use src/core/rv-safe-storage.ts for storage access.',
+        })))],
+    },
+  },
+  {
     // plan-510 — HMI design guardrails for the inspector files (see top of file).
     name: 'rv/hmi-design',
     files: HMI_DESIGN_SCOPE,

@@ -264,7 +264,7 @@ describe('filter validation after a model load (§2.3)', () => {
   it('is wired into the hierarchy browser with the asset busy indicator', () => {
     expect(hierarchyBrowserSource).toContain('watchHierarchyFilterValidation({');
     expect(hierarchyBrowserSource).toContain('isAssetBusy: isAssetDocumentBusy');
-    expect(hierarchyBrowserSource).toContain("migrateLegacyFilter(localStorage.getItem('rv-hierarchy-type-filter'))");
+    expect(hierarchyBrowserSource).toContain("migrateLegacyFilter(readLocalStorage('rv-hierarchy-type-filter'))");
   });
 });
 

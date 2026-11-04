@@ -39,6 +39,7 @@
  * `src/core/hmi/`. Everything it needs is engine data.
  */
 
+import { applyAuthoredInactive } from './rv-authored-inactive';
 import { Object3D } from 'three';
 import { NodeRegistry } from './rv-node-registry';
 import {
@@ -60,6 +61,7 @@ import { relativeToRoot } from './rv-reference-resolver';
 import { RV_DRIVE_HOME_KEY, type DriveHomePose } from './rv-pre-bake-keys';
 import { debug } from './rv-debug';
 import { isSensorRuntimeVizName } from './rv-sensor-viz-names';
+import { getDecodeIdentity, type FileIdentity } from './rv-decode-identity';
 
 /**
  * Remove Sensor visualisation that a file saved before the `_sensorRay` export
@@ -108,7 +110,7 @@ export interface PrepareAndBakeContext {
   epoch?: number;
   /** Re-checked after every `await`; `false` aborts with {@link BakeAbortedError}. */
   isEpochCurrent?: () => boolean;
-  /** Forced chunk split (`AssetOverrides.trsByNodeId`, deferred placement roots). */
+  /** Forced chunk split (deferred placement roots; `trsByNodeId` is gone, plan-769 F14). */
   forceSplit?: (node: Object3D) => boolean;
   /**
    * Plugin bake claims (plan-754 D17) — main model only (D5). `complete: false`
@@ -125,6 +127,13 @@ export interface PrepareAndBakeContext {
    * materials and aliases run identically in both cases.
    */
   destructive?: boolean;
+  /**
+   * plan-769 Phase 1b: the decoded file's identity record. `prepare` (the Kinematic
+   * hook) and the survival model read every STORED reference by its verdict — the
+   * same one the registry reads after the bake ("Survival == Runtime"). Omitted =
+   * the record linked to `tmp` at decode (`getDecodeIdentity`); `null` = none.
+   */
+  identity?: FileIdentity | null;
 }
 
 // ─── Materials: dedup → uber, once per tree ──────────────────────────
@@ -189,6 +198,7 @@ export function preparedMaterialsOf(root: Object3D): PreparedMaterials | undefin
  * run of the asset editor, a placement, a delivery). An invisible mesh is
  * classified `keep` by the bake, survives as its own node and stays hidden.
  * The root's own visibility is the instance's concern and is left alone.
+ * The same holds for a node authored inactive (`activeSelf: false`, plan-2016 S5).
  * Returns the number of nodes hidden.
  */
 export function applyAuthoredHidden(root: Object3D): number {
@@ -200,6 +210,10 @@ export function applyAuthoredHidden(root: Object3D): number {
       node.visible = false;
       hidden++;
     }
+    // plan-2016 S5: a node authored inactive (Unity `activeSelf: false`) loads
+    // hidden too, flagged so a spawned MU clone keeps it hidden.
+    const wasVisible = node.visible;
+    if (applyAuthoredInactive(node) && wasVisible) hidden++;
   });
   return hidden;
 }
@@ -251,8 +265,11 @@ function collectAliases(
       if (rel !== '') out.push({ path: rel, template: node });
     }
   });
+  // A re-parented node's authored path is a PREFIX alias too (plan-610 Phase
+  // 5c): one entry covers the whole moved subtree, resolved exactly under the
+  // node's new place at lookup time — no per-descendant enumeration.
   for (const { node, path } of reparented) {
-    if (path !== '') out.push({ path, template: node });
+    if (path !== '') out.push({ path, template: node, subtree: true });
   }
   return out;
 }
@@ -293,7 +310,8 @@ export async function prepareAndBake(tmp: Object3D, ctx: PrepareAndBakeContext):
 
   // ── 2. prepare: hooks on the raw tree, driven by extras alone.
   const prepareRegistry = buildPreBakeRegistry(tmp, renamedNodes);
-  const session = createPreBakeContext(tmp, prepareRegistry, rootNames);
+  const identity = ctx.identity !== undefined ? ctx.identity : getDecodeIdentity(tmp);
+  const session = createPreBakeContext(tmp, prepareRegistry, rootNames, identity);
   const preBake = runPreBakeHooks(tmp, session);
   // A moved subtree gets its NEW path registered while the AUTHORED one stays
   // resolvable — the survival model must resolve what the runtime resolves.
@@ -310,7 +328,7 @@ export async function prepareAndBake(tmp: Object3D, ctx: PrepareAndBakeContext):
   const survival = recordBakeRemovalReport(
     ctx.assetId, tmp, prepareRegistry, ctx.claims?.list,
     (node) => NodeRegistry.computeNodePath(node),
-    { forceSplit: ctx.forceSplit, claimsComplete: ctx.claims?.complete ?? true, scope: session.scope },
+    { forceSplit: ctx.forceSplit, claimsComplete: ctx.claims?.complete ?? true, scope: session.scope, identity },
   );
 
   // ── 4. materials — the bake buckets by material, so both passes precede it.

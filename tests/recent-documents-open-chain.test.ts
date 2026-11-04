@@ -26,7 +26,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 const calls: string[] = [];
 
-vi.mock('@rv-private/plugins/asset-editor/pending-open-store', () => ({
+vi.mock('@rv-private/plugins/asset-editor/shared/pending-open-store', () => ({
   setPendingAssetOpen: () => { /* identity plumbing is pinned elsewhere */ },
 }));
 vi.mock('../src/core/editor/active-asset-store', async (original) => {

@@ -13,15 +13,15 @@
  * absolute ms gates are flaky in CI (style: rv-des-snapshot-scale.test.ts).
  * The only throughput assertion is the smoke check `eventsPerSecond > 0`.
  *
- * Runs only in the private build (imports `@rv-private/plugins/des/*`).
+ * Imports `@rv/plugins/des/*` — DES is core code since plan-680.
  */
 
 import { describe, it, expect } from 'vitest';
 import { Object3D } from 'three';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
-import { _resetDesHookCache } from '@rv-private/plugins/des/des-hook-adapter';
-import { resetDESMUCounter } from '@rv-private/plugins/des/rv-des-mu';
-import type { MaterialFlowAdapter } from '@rv-private/plugins/des/material-flow-adapter';
+import { DESRunner } from '@rv/plugins/des/des-runner';
+import { _resetDesHookCache } from '@rv/plugins/des/des-hook-adapter';
+import { resetDESMUCounter } from '@rv/plugins/des/rv-des-mu';
+import type { MaterialFlowAdapter } from '@rv/plugins/des/material-flow-adapter';
 import {
   createSelf,
   type MaterialFlowSelf,
@@ -135,7 +135,7 @@ async function runReferenceModel(seed: number): Promise<BenchResult> {
       canAcceptDownstream: (mu: MU) => adapters[index].nextComponents.some(c => c.canAccept(mu as never)),
       spawnMU: () => runner.createMU(),
     });
-    adapters.push(runner.addInstance(def, self, node));
+    adapters.push(runner.addInstance(def, self, node, undefined, { desId: node.name + '@' + def.type }));
   };
 
   addInstance(sourceDef, 'Source', 0);

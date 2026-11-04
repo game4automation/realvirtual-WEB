@@ -45,6 +45,21 @@ describe('NumberEditor min/max (plan-502 F8)', () => {
     expect(onChange).toHaveBeenCalledWith(0.95);
   });
 
+  it('keeps external updates after a focused live draft is acknowledged', () => {
+    const onChange = vi.fn();
+    const { rerender } = render(<NumberEditor value={10} onChange={onChange} liveCommit />);
+    fireEvent.focus(input());
+    fireEvent.change(input(), { target: { value: '15' } });
+    expect(onChange).toHaveBeenCalledExactlyOnceWith(15);
+
+    rerender(<NumberEditor value={15} onChange={onChange} liveCommit />);
+    rerender(<NumberEditor value={22} onChange={onChange} liveCommit />);
+    expect(input().value).toBe('22');
+    fireEvent.blur(input());
+    expect(input().value).toBe('22');
+    expect(onChange).toHaveBeenCalledExactlyOnceWith(15);
+  });
+
   it('shows the range hint and passes the bounds to the input', () => {
     render(<NumberEditor value={0.7} onChange={() => {}} min={0.5} max={1} unit="m" />);
     expect(screen.getByTestId('rv-number-range').textContent).toBe('0.5…1');
@@ -156,6 +171,35 @@ describe('NumberEditor decimal input (plan-510)', () => {
     expect(input().value).toBe('2.23456789012345');
     fireEvent.blur(input());
     expect(onChange).not.toHaveBeenCalled();
+  });
+});
+
+/** Focus alone must never turn an external update into a stale write. */
+describe.each([true, false])('NumberEditor external updates (liveCommit=%s)', (liveCommit) => {
+  it('follows external values while focused and untouched, without committing on blur', () => {
+    const onChange = vi.fn();
+    const { rerender } = render(<NumberEditor value={10} onChange={onChange} liveCommit={liveCommit} />);
+    fireEvent.focus(input());
+    rerender(<NumberEditor value={22} onChange={onChange} liveCommit={liveCommit} />);
+    expect(input().value).toBe('22');
+    fireEvent.blur(input());
+    expect(input().value).toBe('22');
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('preserves a user-edited draft across an external update and commits it on blur', () => {
+    const onChange = vi.fn();
+    const { rerender } = render(<NumberEditor value={10} onChange={onChange} liveCommit={liveCommit} />);
+    fireEvent.focus(input());
+    fireEvent.change(input(), { target: { value: '15' } });
+    onChange.mockClear();
+    rerender(<NumberEditor value={22} onChange={onChange} liveCommit={liveCommit} />);
+    expect(input().value).toBe('15');
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.blur(input());
+    expect(onChange).toHaveBeenCalledExactlyOnceWith(15);
+    fireEvent.blur(input());
+    expect(onChange).toHaveBeenCalledTimes(1);
   });
 });
 

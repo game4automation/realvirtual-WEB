@@ -5,7 +5,7 @@
 
 import { useLayoutEffect, useSyncExternalStore } from 'react';
 
-export type StartupModalId = 'welcome' | 'projects' | 'opener' | 'autoquality' | 'news';
+export type StartupModalId = 'welcome' | 'projects' | 'demo-welcome' | 'opener' | 'autoquality' | 'news';
 
 const PRIORITY: Readonly<Record<StartupModalId, number>> = {
   welcome: 1,
@@ -13,9 +13,13 @@ const PRIORITY: Readonly<Record<StartupModalId, number>> = {
   // was asked for (plan-372 §2.12), so it outranks every incidental dialog but
   // still yields to the welcome screen.
   projects: 2,
-  opener: 3,
-  autoquality: 4,
-  news: 5,
+  // The public-demo welcome window (plan-646 F14, private plugin `demo-welcome`, only in the
+  // `/demo` build). After the welcome screen and the Projects dashboard, before every
+  // incidental dialog: it waits while one of those two is up and reappears once it closes.
+  'demo-welcome': 3,
+  opener: 4,
+  autoquality: 5,
+  news: 6,
 };
 
 type Listener = () => void;
@@ -24,6 +28,7 @@ const listeners = new Set<Listener>();
 let openSnapshot: Readonly<Record<StartupModalId, boolean>> = {
   welcome: false,
   projects: false,
+  'demo-welcome': false,
   opener: false,
   autoquality: false,
   news: false,
@@ -78,6 +83,7 @@ export function _resetStartupModalCoordinatorForTests(): void {
   openSnapshot = {
     welcome: false,
     projects: false,
+    'demo-welcome': false,
     opener: false,
     autoquality: false,
     news: false,

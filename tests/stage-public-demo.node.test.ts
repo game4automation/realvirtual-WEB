@@ -431,17 +431,42 @@ describe('the repository demo stages, and the fixture does not travel', () => {
     expect(gate.documents.map(d => d.path)).toEqual([
       'DemoRealvirtualWeb.glb',
       'DemoPlanner.glb',
+      // Added 2026-10-26 (plan-680, Thomas): the PalletYard DES demo, public with the DES core.
+      'PalletYard.glb',
       'fmu-demo.glb',
       // Added 2026-09-26 (c659bd52): the Autonox delta kinematics model.
       'Autonox-DELTA-RL5-1900-6kg.glb',
       // Added 2026-10-05..07: the Laser Welding Assembly Station (the public VIBN demo
-      // for TIA/PLCSIM users). The AGV maze (plan-470) is devOnly since 2026-10-08
-      // (user decision: development only for now) and must NOT appear here.
+      // for TIA/PLCSIM users). The AGV maze (plan-470) left the demo folder on
+      // 2026-10-13 for the private Development project and must NOT appear here.
       'LaserWeldingAssemblyStation.glb',
+      // Added 2026-10-25 (plan-673 O16): the MuJoCo walking robot. It sat in
+      // the source manifest as a `devOnly` row — pruned, therefore absent from
+      // this list — until the two WASM runtimes became bundled dependencies and
+      // reached `dist/` through a `?url` seam. Publishing the row before that
+      // would have shipped a demo that dies in two 404s on `/node_modules/...`.
+      'MuJoCoWalker.glb',
       'demo.knowledge.md',
     ]);
     expect(gate.start.path).toBe('DemoRealvirtualWeb.glb');
     expect(gate.sidecars).toEqual(['DemoRealvirtualWeb.settings.json']);
+    // The PalletYard example ships its experiment matrix next to the document (c89786eb);
+    // the staging keeps a declared document's `experiments/<id>.rvexp.ndjson`.
+    expect(existsSync(join(stagedDemo, 'experiments', 'doc_palletyard_hzmdb6.rvexp.ndjson'))).toBe(true);
+    // Every shipped document that renders carries its saved preview (plan-776), and the
+    // staging keeps the `.thumbnails/` sidecar its row names — no placeholder cards.
+    const shipped = JSON.parse(readFileSync(join(stagedDemo, 'project.json'), 'utf8'));
+    for (const row of shipped.documents as Array<{ path: string; thumbnail?: string }>) {
+      if (!row.path.endsWith('.glb')) continue;
+      expect(row.thumbnail, `${row.path} has no thumbnail`).toMatch(/^\.thumbnails\/[^/]+\.webp$/);
+      expect(existsSync(join(stagedDemo, ...row.thumbnail!.split('/'))), row.thumbnail).toBe(true);
+    }
+    // The dev-only row's preview leaves with its row.
+    const devRow = (JSON.parse(readFileSync(
+      join(REPO, 'public', PUBLIC_DEMO_FOLDER, 'project.json'), 'utf8',
+    )).documents as Array<{ path: string; thumbnail?: string }>).find(d => d.path === DEV_ONLY_DOCUMENT);
+    expect(devRow?.thumbnail).toMatch(/^\.thumbnails\//);
+    expect(existsSync(join(stagedDemo, ...devRow!.thumbnail!.split('/')))).toBe(false);
 
     // The fixture the repository still authors is gone from the artefact — both
     // the file and its row. Asserting it against the SOURCE would only repeat

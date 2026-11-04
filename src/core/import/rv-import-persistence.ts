@@ -6,7 +6,8 @@
  * (plan-238 §2.2a, re-homed by plan-372 phase 11).
  *
  * Every additive non-catalog import (STEP, Onshape, local GLB file) is written
- * as a GLB into the OPEN PROJECT's `library/imports/` through the project
+ * as a GLB into the OPEN PROJECT's `library/imports/` (or a caller-selected
+ * subfolder of `library/`) through the project
  * backend — to disk for a folder project, to OPFS for a browser one — and
  * turned into a REGULAR catalog entry. The placement's op-log record then
  * references that entry's stable `catalogId`, so restore resolves it through
@@ -74,19 +75,27 @@ function ephemeralEntry(name: string, blob: Blob, warning: string): PersistImpor
 }
 
 /**
- * Persist imported GLB bytes into `<working-folder>/library/imports/` and
+ * Persist imported GLB bytes into the active project's `library/<subdir>/` and
  * return a catalog entry matching the local-folder scanner's conventions
  * (id, name, category, collections, localPath). Falls back to an ephemeral
  * blob entry when no working folder is available — see module docs.
+ * `subdir` defaults to `imports`; `entry.localPath` includes any collision suffix.
  */
 export async function persistImportedGlb(
   name: string,
   data: ArrayBuffer | Blob,
+  options: { subdir?: string } = {},
 ): Promise<PersistImportOutcome> {
+  const subdir = options.subdir ?? IMPORTS_SUBFOLDER;
+  // Keep the destination relative to library/, including for nested folders.
+  if (subdir.split('/').some(part => !part.trim() || part === '.' || part === '..')
+    || /[\\:*?"<>|#%\x00-\x1f]/.test(subdir)) {
+    throw new Error('Import subdir must be a relative folder path inside library/.');
+  }
   const blob = data instanceof Blob ? data : new Blob([data], { type: 'model/gltf-binary' });
   const base = sanitizeBaseName(name);
 
-  // plan-372 Phase 11: imports land in the ACTIVE PROJECT's library/imports/,
+  // plan-372 Phase 11: imports land in the ACTIVE PROJECT's library/ subfolder,
   // through the backend — so a folder project writes to disk and a browser
   // project to OPFS, with no work folder involved either way.
   const backend = getProjectStore().getBackend();
@@ -100,11 +109,11 @@ export async function persistImportedGlb(
     // Unique filename: never silently overwrite an unrelated same-name asset.
     let filename = `${base}.glb`;
     let n = 2;
-    while (await backendHasFile(backend, `library/${IMPORTS_SUBFOLDER}/${filename}`)) {
+    while (await backendHasFile(backend, `library/${subdir}/${filename}`)) {
       filename = `${base}-${n++}.glb`;
     }
 
-    const localPath = `${IMPORTS_SUBFOLDER}/${filename}`;
+    const localPath = `${subdir}/${filename}`;
     // `localPath` came from a free-name probe just above, so the target is new.
     await backend.writeDocument(
       `library/${localPath}`,
@@ -132,7 +141,7 @@ export async function persistImportedGlb(
       glbUrl,
       pivotToFloor: true,
       localPath,
-      collections: [IMPORTS_SUBFOLDER],
+      collections: [subdir],
     };
     return { entry, persisted: true };
   } catch (e) {
@@ -160,7 +169,8 @@ export async function persistImportedGlb(
 const importedUrls = new Map<string, { url: string; release: () => void }>();
 let projectWatch: { id: string | null; off: () => void } | null = null;
 
-function holdImportedGlbUrl(
+/** Adopt a resolved import URL, releasing the previous URL for this path first. */
+export function holdImportedGlbUrl(
   localPath: string,
   resolved: { url: string; release: () => void },
 ): string {

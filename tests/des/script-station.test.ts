@@ -14,13 +14,13 @@
  *   - the §6-appendix Turntable DES block runs FOR REAL: accept → timed
  *     rotation on the DES clock → `transfer(mu, selectedOutput)`.
  *
- * Runs only in the private build (imports `@rv-private/plugins/des/*`).
+ * Imports `@rv/plugins/des/*` — DES is core code since plan-680.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { Object3D } from 'three';
-import { DESManager, DESMode } from '@rv-private/plugins/des/rv-des-manager';
-import { makeScriptHookScheduler } from '@rv-private/plugins/des/rv-des-script-hook';
+import { DESManager, DESMode } from '@rv/plugins/des/rv-des-manager';
+import { makeScriptHookScheduler } from '@rv/plugins/des/rv-des-script-hook';
 import { RVScriptHost } from '../../src/core/engine/rv-script-host';
 import { createSdkComponent } from '../../src/core/sdk/rv-component-sdk';
 import { RVScriptComponentAdapter } from '../../src/core/sdk/rv-script-component-adapter';
@@ -54,7 +54,7 @@ function setup(self) {
     return Math.atan2(V.dot(dir, vAx), V.dot(dir, u)) * self.RAD2DEG;
   };
 
-  let clearTimer = 0, selectedOut = null;
+  const st = self.persist({ selectedOut: null });
   self.signal('Flow.Run').set(true);
   self.setState('idle');
 
@@ -64,13 +64,13 @@ function setup(self) {
       onAccept(mu, port) {
         const out = self.freeOutputs()[0];
         if (!out) { self.setState('holding'); return true; }
-        selectedOut = out.id;
+        st.selectedOut = out.id;
         self.in(Math.abs(angleToPort(out)) / (self.prop.RotationSpeed ?? 45), 'rotated', mu);
         self.setState('rotating_out'); return true;
       },
       on(hook, mu) {
         if (hook === 'rotated') {
-          self.transfer(mu, self.outputs().find((p) => p.id === selectedOut));
+          self.transfer(mu, self.outputs().find((p) => p.id === st.selectedOut));
           self.setState('idle');
         }
       },
@@ -247,11 +247,11 @@ describe('Script component as DES station (ScriptHook contract, phase 1b)', () =
     });
     const c = createSdkComponent(host, world.env(adapter), `
       function setup(self) {
-        var beats = [];
+        const st = self.persist({ beats: [] });
         self.every(1.0, 'beat');
         return {
-          des: { on: function (hook) { if (hook === 'beat') beats.push(self.now); } },
-          beats: function () { return beats; },
+          des: { on: function (hook) { if (hook === 'beat') st.beats.push(self.now); } },
+          beats: function () { return st.beats; },
         };
       }
     `, { callDeadlineMs: 500 });

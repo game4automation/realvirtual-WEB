@@ -19,13 +19,14 @@
 
 import { useState, useEffect, useSyncExternalStore, type ReactNode } from 'react';
 import { Box, Paper, IconButton, Tooltip, Divider, Menu, MenuItem, ListItemIcon, ListItemText, Badge } from '@mui/material';
-import { FolderOpen, AccountTree, PushPin, Settings, ViewInAr, Memory, MoreVert, Bolt, HelpOutline, ReportProblemOutlined } from '@mui/icons-material';
+import { FolderOpen, AccountTree, PushPin, Settings, ViewInAr, Memory, MoreVert, HelpOutline, ReportProblemOutlined } from '@mui/icons-material';
 import { useMode } from '../../hooks/use-mode';
 import { openRecentDocumentsOnHover, scheduleRecentDocumentsClose } from './projects/projects-dashboard-store';
 import { useMcpBridge } from '../../hooks/use-mcp-bridge';
 import { setAgentActivityAnchor } from './AgentActivityRow';
 import { useAiActivity } from './ai-activity-store';
 import { probeConnectReachable } from './ai-consent-store';
+import { getAiEntryHandler, useAiEntryOpen } from './ai-entry-store';
 import { AiBridgeDownloadDialog } from './AiBridgeGate';
 import { requestSettingsTab } from './settings-tab-store';
 import { useViewer } from '../../hooks/use-viewer';
@@ -37,6 +38,8 @@ import {
   SCENE_PANEL_WIDTH, SETTINGS_PANEL_WIDTH,
 } from './layout-constants';
 import { isSettingsLocked } from './rv-app-config';
+import { RV_SERVE_INFO } from '../rv-serve-info';
+import { DevToolbarButton } from './DevToolbarButton';
 import { getSceneStore } from './scene/scene-store-singleton';
 import { getProjectStore } from '../project/project-store';
 import {
@@ -90,17 +93,24 @@ export function projectsEntryTitle(
  * (first status frame, plan-541); an open CONNECT approval prompt is named.
  */
 export function aiBridgeTitle(
-  mcp: { connected: boolean; enabled: boolean; toolCount: number; failure?: string },
+  mcp: { connected: boolean; enabled: boolean; aiEnabled?: boolean; toolCount: number; failure?: string },
   activity: string | null,
 ): string {
+  // plan-668: the entry names AI CONTROL; the CONNECT channel may be up while it is off.
+  const ai = mcp.aiEnabled ?? mcp.enabled;
+  if (!ai) return 'AI control — off';
   if (!mcp.connected) {
-    if (!mcp.enabled) return 'AI Bridge — off';
     return mcp.failure === 'pairing-pending'
-      ? 'AI Bridge — waiting for approval in the CONNECT tray'
-      : 'AI Bridge — connecting…';
+      ? 'AI control — waiting for approval in the CONNECT tray'
+      : 'AI control — connecting…';
   }
-  const base = `AI Bridge — connected (${mcp.toolCount} tools)`;
+  const base = `AI control — on (${mcp.toolCount} tools)`;
   return activity ? `${base} · ${activity}` : base;
+}
+
+/** plan-668: the AI entry is accented only while AI control is on AND the channel is connected. */
+export function aiControlActive(mcp: { connected: boolean; enabled: boolean; aiEnabled?: boolean }): boolean {
+  return mcp.connected && (mcp.aiEnabled ?? mcp.enabled);
 }
 
 /** One icon button in the activity bar. */
@@ -214,7 +224,6 @@ export type ActivityBarEntryId =
   | 'annotations'
   | 'settings'
   | 'multiuser'
-  | 'omniverse'
   | 'ai-bridge'
   | 'ar'
   | 'help'
@@ -223,31 +232,6 @@ export type ActivityBarEntryId =
 interface ActivityBarProps {
   /** Optional local allowlist used by constrained shells such as CONNECT embed. */
   entryAllowlist?: readonly ActivityBarEntryId[];
-}
-
-/**
- * Omniverse RTX backend toggle (internal/experimental tier only).
- * Switches the 3D render layer between the local Three.js renderer and an
- * Omniverse RTX WebRTC stream (connects to the configured signaling port,
- * default 49100). Only shown when the omniverse backend factory is registered
- * (__RV_INTERNAL__ builds) — customer builds never see it.
- */
-function OmniverseButton({ placement }: { placement: 'right' | 'top' }) {
-  const viewer = useViewer();
-  const [backend, setBackend] = useState(viewer.renderBackend);
-  useEffect(() => viewer.onRenderBackendChange(setBackend), [viewer]);
-  if (!__RV_INTERNAL__ || !viewer.hasRenderBackend('omniverse')) return null;
-  const active = backend === 'omniverse';
-  return (
-    <ActivityButton
-      title={active ? 'Omniverse RTX Stream (on) — click for Three.js' : 'Omniverse RTX Stream'}
-      active={active}
-      onClick={() => { void viewer.setRenderBackend(active ? 'three' : 'omniverse'); }}
-      placement={placement}
-    >
-      <Bolt />
-    </ActivityButton>
-  );
 }
 
 export function ActivityBar({ entryAllowlist }: ActivityBarProps = {}) {
@@ -304,7 +288,6 @@ export function ActivityBar({ entryAllowlist }: ActivityBarProps = {}) {
   const showHierarchyEntry = useUIVisible('activity-hierarchy', { hiddenIn: ['mode:viewer'] });
   const showAnnotationsEntry = useUIVisible('activity-annotations', { hiddenIn: ['mode:viewer'] });
   const showMultiuserEntry = useUIVisible('activity-multiuser', { hiddenIn: ['mode:viewer'] });
-  const showOmniverseEntry = useUIVisible('activity-omniverse', { hiddenIn: ['mode:viewer'] });
   const showAiBridgeEntry = useUIVisible('activity-ai-bridge', { hiddenIn: ['mode:viewer'] });
 
   /**
@@ -319,7 +302,6 @@ export function ActivityBar({ entryAllowlist }: ActivityBarProps = {}) {
     hierarchy: showHierarchyEntry,
     annotations: showAnnotationsEntry,
     multiuser: showMultiuserEntry,
-    omniverse: showOmniverseEntry,
     'ai-bridge': showAiBridgeEntry,
   };
   const isEntryShown = (entry: ActivityBarEntryId) =>
@@ -331,10 +313,14 @@ export function ActivityBar({ entryAllowlist }: ActivityBarProps = {}) {
     (e) => isEntryAllowed(`plugin:${e.pluginId ?? 'unknown'}`)
       && (!e.visibilityRule || evaluateVisibilityRule(e.visibilityRule, contexts)),
   );
-  const pluginButtons = slotEntries.map((entry, i) => {
+  // `placement: 'bottom'` entries render in the lower group (after the spacer),
+  // all others in the upper plugin group — each entry exactly once.
+  const renderSlot = (entry: typeof slotEntries[number], i: number) => {
     const Comp = entry.component;
     return <Comp key={`act-${i}`} viewer={viewer} />;
-  });
+  };
+  const pluginButtons = slotEntries.filter((e) => e.placement !== 'bottom').map(renderSlot);
+  const pluginBottomButtons = slotEntries.filter((e) => e.placement === 'bottom').map(renderSlot);
 
   // ── Core left-window button handlers (single source of truth = lpm/plugin) ──
   // plan-372 §3.5: the entry point is the Projects dashboard, not the docked
@@ -365,6 +351,7 @@ export function ActivityBar({ entryAllowlist }: ActivityBarProps = {}) {
   // per-call signal stays where it reads better — the AiActivityOverlay pill and
   // the tooltip.
   const mcp = useMcpBridge();
+  const aiEntryOpen = useAiEntryOpen();
   const aiActivity = useAiActivity();
   const [aiProbe, setAiProbe] = useState<'idle' | 'probing' | 'unreachable'>('idle');
   const openAiSettings = () => {
@@ -378,6 +365,14 @@ export function ActivityBar({ entryAllowlist }: ActivityBarProps = {}) {
   // background: a live bridge goes straight through, otherwise `/health` decides
   // between the AI panel and the download dead end.
   const openAiEntry = async () => {
+    const handler = getAiEntryHandler();
+    if (handler) {
+      try {
+        if (await handler('toggle')) return;
+      } catch {
+        // A private handler must never break the established Settings/download route.
+      }
+    }
     if (aiProbe === 'probing') return;
     if (mcp.connected) { openAiSettings(); return; }
     setAiProbe('probing');
@@ -493,6 +488,9 @@ export function ActivityBar({ entryAllowlist }: ActivityBarProps = {}) {
           <IconButton onClick={(e) => setMenuAnchor(e.currentTarget)} aria-label="Menu">
             <MoreVert />
           </IconButton>
+          {/* Dev server only (plan-615) — the pill's last entry, in the dev and
+              the delivered view alike; dropped from every build. */}
+          {RV_SERVE_INFO !== null && <DevToolbarButton placement="top" />}
         </Paper>
         <Menu anchorEl={menuAnchor} open={!!menuAnchor} onClose={closeMenu}>
           {isEntryShown('models') && sceneStore && (
@@ -555,14 +553,14 @@ export function ActivityBar({ entryAllowlist }: ActivityBarProps = {}) {
       {/* Lowest-left entry above the bottom group — next to where the panel opens. */}
       {isEntryAllowed('problems') && <ProblemsButton placement={placement} />}
       {isEntryShown('multiuser') && <MultiuserButton placement={placement} />}
-      {isEntryShown('omniverse') && <OmniverseButton placement={placement} />}
+      {pluginBottomButtons}
       {/* Always offered — except where a deploy removed the entry through the
           feature matrix; `isEntryAllowed` still beats "always visible". */}
       {isEntryShown('ai-bridge') && (
         <Box sx={{ position: 'relative', display: 'flex', justifyContent: 'center', width: '100%' }}>
         <ActivityButton
           title={aiBridgeTitle(mcp, aiActivity)}
-          active={mcp.connected}
+          active={aiControlActive(mcp) || aiEntryOpen}
           onClick={() => { void openAiEntry(); }}
           placement={placement}
         >
@@ -574,8 +572,15 @@ export function ActivityBar({ entryAllowlist }: ActivityBarProps = {}) {
         </Box>
       )}
       {settingsButton}
-      {/* Bottom-most entry — the way out of the product into the documentation. */}
+      {/* The way out of the product into the documentation. */}
       {showHelp && <HelpButton placement={placement} />}
+      {/* The dev toolbar (plan-615): the bar's bottom-most entry, below Settings
+          and Help, in the dev AND the delivered view (same button, same place).
+          Deliberately NOT subject to `entryAllowlist` — like the former banner
+          it must show in the CONNECT embed shell too. Dev server only:
+          `RV_SERVE_INFO` is the literal null in every build, so the entry is
+          dropped there. */}
+      {RV_SERVE_INFO !== null && <DevToolbarButton placement={placement} />}
       {isEntryShown('ai-bridge') && (
         <AiBridgeDownloadDialog open={aiProbe === 'unreachable'} onClose={() => setAiProbe('idle')} />
       )}

@@ -28,6 +28,17 @@ describe('SignalStore', () => {
     expect(store.get('nonexistent')).toBeUndefined();
   });
 
+  it('answers undefined instead of throwing for a non-string path (object-form slot value)', () => {
+    // 2026-11-01: an AI-written drive signal slot held { type: 'ComponentReference', path }; the
+    // inspector passed it here during render and "path.replace is not a function" crashed the HMI.
+    const store = new SignalStore();
+    store.register('bool1', 'sig/bool1', false);
+    const objectRef = { type: 'ComponentReference', path: 'sig/bool1' } as unknown as string;
+    expect(() => store.nameForPath(objectRef)).not.toThrow();
+    expect(store.nameForPath(objectRef)).toBeUndefined();
+    expect(store.nameForPath(42 as unknown as string)).toBeUndefined();
+  });
+
   it('should set and get bool signals by name', () => {
     const store = new SignalStore();
     store.register('bool1', 'sig/bool1', false);

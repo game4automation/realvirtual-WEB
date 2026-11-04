@@ -399,3 +399,42 @@ describe('plan-462 B3 — unlock re-arms the draft write it cancelled', () => {
     expect(await listAllDocumentDrafts()).toHaveLength(0);
   });
 });
+
+describe('plan-527 / plan-764 port — the replace lock refuses like a test run', () => {
+  let doc: AssetDocument;
+
+  beforeEach(() => {
+    doc = scratchAssetDocument(makeViewer(), 'Replaced');
+  });
+
+  it('excludes save and test run, and is excluded by them', () => {
+    const replace = doc.tryLock('replace');
+    expect(replace).not.toBeNull();
+    expect(doc.tryLock('save')).toBeNull();
+    expect(doc.tryLock('test-run')).toBeNull();
+    expect(doc.tryLock('replace')).toBeNull();
+    doc.unlock(replace);
+    const save = doc.tryLock('save');
+    expect(doc.tryLock('replace')).toBeNull();
+    doc.unlock(save);
+  });
+
+  it('refuses edit, undo, redo, rename and save marking; the refusal names the replace', async () => {
+    const token = doc.tryLock('replace')!;
+    await expectLocked(() => doc.applyOp({
+      kind: 'setField', id: 'op1', at: 0, path: 'Asset/Box',
+      component: 'Drive', field: 'TargetSpeed', value: 99, prev: 50,
+    } as never));
+    await expectLocked(() => doc.undo());
+    await expectLocked(() => doc.redo());
+    await expectLocked(() => doc.renameDocument('Nope'));
+    await expectLocked(() => doc.markSaved(doc.base, 'Saved'));
+    let caught: DocumentLockedError | null = null;
+    try { await doc.undo(); } catch (e) { caught = e as DocumentLockedError; }
+    expect(caught?.owner.kind).toBe('replace');
+    expect(caught?.message).toContain('being replaced from outside');
+
+    doc.unlock(token);
+    expect(() => doc.renameDocument('Yes')).not.toThrow();
+  });
+});

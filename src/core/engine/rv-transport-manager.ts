@@ -9,6 +9,7 @@ import type { RVTransportStopper } from './rv-transport-stopper';
 import type { RVZone, ZoneHost } from './rv-zone';
 import type { IAccumulationQuery } from './rv-transport-surface';
 import type { RVSensor } from './rv-sensor';
+import type { RayScanSensorLike } from './rv-sensor-data-store';
 import type { RVSource } from './rv-source';
 import type { RVSink } from './rv-sink';
 import type { RVGrip } from './rv-grip';
@@ -23,9 +24,12 @@ import { debug } from './rv-debug';
 import { physicsRegistry, physicsSettings } from './rv-physics-registry';
 import type { IPhysicsMUHook, PhysicsPose, PhysicsProvider } from './rv-physics-registry';
 import { RVPhysicsZone } from './rv-physics-zone';
+import { isPhysicsOwned, resetMuOwner, setMuOwner, type MuOwner } from './rv-mu-owner';
+import type { IZone2DHook } from './rv-physics2d-registry';
 import { MM_TO_METERS } from './rv-constants';
 import { PHYSICS_DEFAULT_MU_MASS_KG } from './rv-physics-constants';
 import { readLoadSeatDepth, resolveLoads, type MULoadHost } from './rv-mu-load';
+import { collectRayColliders, type RayCollider } from './rv-ray-colliders';
 
 // Pre-allocated scratch for the driver-selection direction gate (no GC in the
 // per-tick transport hot path; single-threaded reuse is safe).
@@ -35,6 +39,10 @@ const _pickToMu = new Vector3();
 const _deadEndDir = new Vector3();
 // Scratch for the spawn grow-out effect setup/update (single-threaded reuse, no GC).
 const _growDir = new Vector3();
+const _settlePosition = new Vector3();
+const _settleDirection = new Vector3();
+// Reject tilted surfaces; yaw, horizontal scale and a Z-up CAD frame are safe.
+const SETTLE_HORIZONTAL_EPS = 1e-6;
 
 // Pre-allocated scratch for the physics handover (plan-276 F4). The provider
 // copies all values synchronously inside `addDynamicMU`, so single-threaded
@@ -99,6 +107,22 @@ interface SurfaceAdjacency {
 }
 
 /**
+ * Narrow injection seam for the unsupported-part detection (plan-2022), same
+ * pattern as {@link IMULifecycleHook}: the observer is assigned to
+ * `transportManager.dropHook` and rides inside the existing MU AABB pass, so
+ * the detection needs no second MU loop.
+ *
+ * `beginTick` runs once at the head of that pass (GripTarget occupancy set,
+ * ray budget), `evaluate` once per live MU on the FINAL state of the tick, and
+ * `endTick` once at the tail (the optional delete timers).
+ */
+export interface IDropDetectionHook {
+  beginTick(): void;
+  evaluate(mu: RVMovingUnit | InstancedMovingUnit, dt: number): void;
+  endTick(dt: number): void;
+}
+
+/**
  * Narrow injection seam for observers of the MU lifecycle (plan-394), same
  * pattern as {@link IPhysicsMUHook}: the observer is assigned to
  * `transportManager.muLifecycleHook`, and every spawn and every dispose path
@@ -114,6 +138,17 @@ export interface IMULifecycleHook {
   onMUSpawned(mu: RVMovingUnit | InstancedMovingUnit, role: string | undefined): void;
   /** `mu` is about to be disposed (any path). Idempotent for unknown MUs. */
   onMURemoved(mu: RVMovingUnit | InstancedMovingUnit): void;
+}
+
+/**
+ * A component that acts on MUs once per transport tick, right after the grips
+ * (plan-2016 S6b, e.g. `MUPusher`): drives of this tick are applied, MU boxes
+ * are refreshed afterwards. `onMUDisposed` / `reset` mirror the grip contract.
+ */
+export interface TransportTickHook {
+  fixedUpdate(dt: number): void;
+  onMUDisposed?(mu: RVMovingUnit): void;
+  reset?(): void;
 }
 
 /**
@@ -152,14 +187,79 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
     this._muGrid.queryXZ(this._zoneQueryAABB, this._zoneCandidates);
     return this._zoneCandidates;
   }
+  /**
+   * MU candidates whose AABB overlaps the world box `[min, max]` (plan-664):
+   * the broad-phase a ray sensor needs once per scan. Writes into the caller's
+   * `out` and returns the count — allocation-free, like `SpatialGridXZ.queryXZ`.
+   *
+   * Below `bruteForceThreshold` it returns ALL live MUs, exactly as
+   * {@link zoneCandidates} does: the caller runs the exact test anyway, so both
+   * paths give the same result, and a small scene avoids the grid overhead.
+   * It keeps its OWN scratch box — a scan and a zone query can run in the same
+   * tick and must not overwrite each other's query.
+   */
+  queryMUsXZ(min: ArrayLike<number>, max: ArrayLike<number>, out: (RVMovingUnit | InstancedMovingUnit)[]): number {
+    if (this.mus.length < this.bruteForceThreshold) {
+      out.length = 0;
+      for (let i = 0; i < this.mus.length; i++) out.push(this.mus[i]);
+      return out.length;
+    }
+    this._fanQueryAABB.min.set(min[0], min[1], min[2]);
+    this._fanQueryAABB.max.set(max[0], max[1], max[2]);
+    return this._muGrid.queryXZ(this._fanQueryAABB, out);
+  }
+
   surfaces: RVTransportSurface[] = [];
   sensors: RVSensor[] = [];
+  /**
+   * Ray-based sensors — `Rangefinder` / `LaserScanner` (plan-664 Phase 2).
+   *
+   * A separate list rather than an entry in {@link sensors}: an `RVSensor` is an
+   * overlap test against the MU grid with an occupancy signal, a ray sensor is a
+   * fan with a distance frame, and the ~30 consumers of `sensors` (grip, logic
+   * step, cell matrix, recorder, monitor plugin, MCP) all read that occupancy.
+   */
+  raySensors: RayScanSensorLike[] = [];
   sources: RVSource[] = [];
   sinks: RVSink[] = [];
   grips: RVGrip[] = [];
+  /** Per-tick MU actors after the grips (plan-2016 S6b) — see {@link TransportTickHook}. */
+  readonly tickHooks = new Set<TransportTickHook>();
   gripTargets: RVGripTarget[] = [];
   mus: (RVMovingUnit | InstancedMovingUnit)[] = [];
+  /**
+   * Companion of `mus`. External writers may use `mus.push(...)` and single
+   * size-changing `splice` calls; the next membership/mutation call repairs
+   * the set. Size-neutral external mutations and duplicates are unsupported.
+   */
+  private readonly _muSet = new Set<RVMovingUnit | InstancedMovingUnit>();
+
+  private _syncMuSet(): void {
+    if (this._muSet.size !== this.mus.length) {
+      this._muSet.clear();
+      for (const mu of this.mus) this._muSet.add(mu);
+      if (import.meta.env.DEV) {
+        console.assert(this._muSet.size === this.mus.length
+          && this.mus.every(mu => this._muSet.has(mu)), 'MU membership mismatch');
+      }
+    }
+  }
+
+  /** Whether the MU is currently in the active transport collection. */
+  hasMU(mu: RVMovingUnit | InstancedMovingUnit): boolean {
+    this._syncMuSet();
+    return this._muSet.has(mu);
+  }
+
   scene: Scene | null = null;
+
+  /**
+   * Unsupported-part detection (plan-2022). Set by RVViewer to its
+   * `RVDropManager`; null = no detection at all, which is also the state of
+   * every model without a `DropDetection` component. Rides inside the existing
+   * AABB pass — see {@link IDropDetectionHook}.
+   */
+  dropHook: IDropDetectionHook | null = null;
 
   /** True when the renderer is a WebGPURenderer — passed through to the
    *  GLSL-only MU dissolve/grow effects so they skip their onBeforeCompile
@@ -175,6 +275,17 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
 
   /** Monotonic tick counter shared with RVTransportSurface for per-tick world-direction refresh. */
   private _tickId = 0;
+
+  /**
+   * Sim time (s) of the ray-sensor stage (plan-664 Phase 2), accumulated from
+   * the fixed `dt` and reset with the simulation — the same accumulation the
+   * viewer's own `simTime` performs, so the two agree without this module
+   * reaching for the viewer.
+   */
+  private _rayScanTime = 0;
+
+  /** Sim time (s) the ray sensors are at (diagnostics / tests). */
+  get rayScanTime(): number { return this._rayScanTime; }
 
   // ── plan-469 spike: dev-only attribution + A/B prototypes ─────────
   /**
@@ -204,6 +315,32 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
    * pins that the production state is bit-identical to the reference snapshot.
    */
   refSlowPick = false;
+
+  /**
+   * Vertical reach of a transport surface in metres (plan-2016): a surface only
+   * takes over an MU whose collider bottom is at most this far above the surface
+   * top. Unity transports by contact (TransportSurface) or by a short downward
+   * raycast (GuidedMU, typically 0.3-0.5 m from the MU pivot), so a part released
+   * well above a belt — e.g. a barrel let go by a gripper 0.9 m above a garbage
+   * conveyor while the next gripper takes it — is never captured by that belt.
+   * Without the limit the XZ-only overlap test claimed it. Infinity = old behaviour.
+   */
+  surfaceVerticalReach = 0.1;
+
+  /** The vertical reach of one surface in metres: its authored `VerticalReach`
+   *  (mm) when set, else {@link surfaceVerticalReach}. Transport and drop
+   *  detection both ask here, so they never disagree about what a belt catches. */
+  reachOf(surface: RVTransportSurface): number {
+    const mm = surface.VerticalReach;
+    return mm > 0 ? mm / 1000 : this.surfaceVerticalReach;
+  }
+
+  /** Let supported kinematic MUs descend onto horizontal linear surfaces. */
+  settleEnabled = true;
+  /** Downward acceleration in m/s². */
+  settleGravity = 9.81;
+  /** Start settling only above this gap in metres (0.5 mm). */
+  settleMinGap = 0.0005;
 
 
   /** Pool-growth accounting for the long-step records: the previous tick's
@@ -254,6 +391,59 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
    *  segment (the sensor's own AABB does NOT cover the ray). Only min/max are
    *  ever written/read on this instance. */
   private readonly _rayQueryAABB = new AABB();
+  /** Largest `detectMargin` of any registered MU (plan-2016 S5 fix): a sensor's
+   *  grid query widens by it, because the grid indexes the mesh box while sensors
+   *  test the (possibly larger / offset) collider detection box. 0 = no widening. */
+  private _detectMargin = 0;
+
+  /** Non-MU colliders a raycast sensor's beam can hit (plan-2016 sensor parity,
+   *  `rv-ray-colliders.ts`) — collected per topology revision, again when the
+   *  sensor set changes or the model is unloaded. Activity (SetActive, removal) is
+   *  checked per collider and tick before its ray test, not by re-collecting.
+   *
+   *  Point (c): withdrawn 2026-10-29, REINSTATED 2026-10-30 on Thomas' decision
+   *  (point (b) stays out). The earlier reason "no blocker on any of the 18 sensors on the large CAD line
+   *  beams" was measured while this index was not collected at all, so it could only
+   *  ever come out zero. */
+  private _rayColliders: RayCollider[] | null = null;
+  private _rayCollidersSensors: RVSensor[] | null = null;
+  private _rayCollidersCount = -1;
+  /** Scene topology revision — bumped by {@link notifyTopologyChanged} (placements,
+   *  editor changes, removed subtrees); the collider list is rebuilt when it moves. */
+  private _topologyRevision = 0;
+  private _rayCollidersRevision = -1;
+
+  /** Hand a raycast sensor the scene's non-MU colliders (lazy, self-healing). */
+  private _syncRayColliders(sensor: RVSensor): void {
+    if (!sensor.UseRaycast) return;
+    if (this._rayColliders === null || this._rayCollidersSensors !== this.sensors
+      || this._rayCollidersCount !== this.sensors.length
+      || this._rayCollidersRevision !== this._topologyRevision) {
+      let root: Object3D = sensor.node;
+      while (root.parent) root = root.parent;
+      this._rayColliders = collectRayColliders(root);
+      this._rayCollidersSensors = this.sensors;
+      this._rayCollidersCount = this.sensors.length;
+      this._rayCollidersRevision = this._topologyRevision;
+    }
+    if (sensor.rayColliders !== this._rayColliders) sensor.rayColliders = this._rayColliders;
+  }
+
+  /** Raise {@link _detectMargin} for an MU with a separate detection box. */
+  private _noteDetectMargin(mu: RVMovingUnit | InstancedMovingUnit): void {
+    const m = mu.detectMargin ?? 0;
+    if (m > this._detectMargin) this._detectMargin = m;
+  }
+
+  /** Widen a sensor grid query box by {@link _detectMargin} in X and Z. */
+  private _widenForDetection(box: AABB): void {
+    const m = this._detectMargin;
+    if (m <= 0) return;
+    box.min.x -= m; box.min.z -= m;
+    box.max.x += m; box.max.z += m;
+  }
+  /** Own query bounds of {@link queryMUsXZ} (plan-664) — never shared with the RVSensor or zone query. */
+  private readonly _fanQueryAABB = new AABB();
 
   // ── Dead-end adjacency cache (plan-240 Baustein 2) ────────────────
   /** Per-surface junction topology for `_isAtDeadEnd`. `null` = invalidated
@@ -302,6 +492,55 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
    *  removal loop AND `removeMU()` call `onMUDisposed(mu)` BEFORE
    *  `mu.dispose()` so no physics body is ever orphaned on any dispose path. */
   physicsMUHook: IPhysicsMUHook | null = null;
+
+  /** Further physics dispose hooks (plan-661: Box2D zones next to Rapier).
+   *  Called after {@link physicsMUHook} at every dispose path, in insertion
+   *  order. Register via {@link addPhysicsMUHook}. */
+  private readonly _physicsMUHooks: IPhysicsMUHook[] = [];
+
+  /** Registers an additional physics dispose hook; returns the remover. */
+  addPhysicsMUHook(hook: IPhysicsMUHook): () => void {
+    if (!this._physicsMUHooks.includes(hook)) this._physicsMUHooks.push(hook);
+    return () => {
+      const i = this._physicsMUHooks.indexOf(hook);
+      if (i >= 0) this._physicsMUHooks.splice(i, 1);
+    };
+  }
+
+  /** Reset chokepoint fan-out: the Rapier slot plus every registered hook. */
+  notifyPhysicsMUDisposed(mu: RVMovingUnit | InstancedMovingUnit): void {
+    this.physicsMUHook?.onMUDisposed(mu);
+    const hooks = this._physicsMUHooks;
+    for (let i = 0; i < hooks.length; i++) hooks[i].onMUDisposed(mu);
+  }
+
+  /**
+   * Take a Rapier-owned MU back into the transport (plan-2016 S7) — Unity
+   * `MU.Fix` makes a falling Rigidbody kinematic the moment a grip takes it.
+   * Used by a DirectlyGrip grip only: a part a Source spawns INSIDE a physics
+   * zone is a body for the spawn tick (the handover runs before the sensors),
+   * and its DirectlyGrip sensor fires in the same tick, before the body moved.
+   * The body is freed through the Rapier dispose hook (body removed, owner
+   * reset). Box2D-owned MUs are not taken back. True when the transport owns
+   * the MU afterwards.
+   */
+  reclaimFromPhysics(mu: RVMovingUnit | InstancedMovingUnit): boolean {
+    if (mu.owner === 'transport') return true;
+    if (mu.owner !== 'rapier' || !this.physicsMUHook) return false;
+    this.physicsMUHook.onMUDisposed(mu);
+    if ((mu.owner as MuOwner) !== 'transport') return false;
+    mu.currentSurface = null;
+    mu.lastSurfaceTickId = undefined;
+    return true;
+  }
+
+  /** 2D interaction-zone entry seam (plan-661 Phase 4, narrow seam like
+   *  `physicsMUHook`, NO plugin import): the Box2D zone plugin installs itself
+   *  here. Asked once per tick for every kinematically moving MU after the
+   *  driving surface is picked — `'claimed'` hands the MU to Box2D, `'wait'`
+   *  holds it at an occupied zone entry (the infeed backs up), `'pass'` = as
+   *  usual. Null (default) = no 2D zones. */
+  zone2dHook: IZone2DHook | null = null;
 
   /** MU lifecycle observer (plan-394, pattern: `physicsMUHook`). Set by the
    *  viewer to the collision manager so spawned MUs join the collision check
@@ -399,18 +638,24 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
 
   /** IMPLEMENTS MULoadHost::deactivateMU — leaves the ticked set, nothing disposed. */
   deactivateMU(mu: RVMovingUnit): void {
+    this._syncMuSet();
+    if (!this._muSet.has(mu)) return;
     const idx = this.mus.indexOf(mu);
     if (idx < 0) return;
     this._muGrid.remove(mu);
     this.mus[idx] = this.mus[this.mus.length - 1];
     this.mus.pop();
+    this._muSet.delete(mu);
   }
 
   /** IMPLEMENTS MULoadHost::activateMU — joins the ticked set (idempotent). */
   activateMU(mu: RVMovingUnit): void {
-    if (this.mus.includes(mu)) return;
+    this._syncMuSet();
+    if (this._muSet.has(mu)) return;
     mu.updateAABB();
     this.mus.push(mu);
+    this._muSet.add(mu);
+    this._noteDetectMargin(mu);
   }
 
   /**
@@ -428,6 +673,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
    * @returns the number of free MUs registered.
    */
   activatePreplaced(): number {
+    this._syncMuSet();
     if (this._preplacedActive || this.preplacedActivationBlocked || this.preplacedMUs.length === 0) return 0;
     this._preplacedActive = true;
     const eligible: RVMovingUnit[] = [];
@@ -458,7 +704,11 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
       const parent = this._preplacedSpawnParent.get(mu);
       if (parent && mu.node.parent !== parent) parent.attach(mu.node);
       mu.updateAABB();
-      if (!this.mus.includes(mu)) this.mus.push(mu);
+      if (!this._muSet.has(mu)) {
+        this.mus.push(mu);
+        this._muSet.add(mu);
+      }
+      this._noteDetectMargin(mu);
     }
     return free.length;
   }
@@ -474,6 +724,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
    * simulating the pre-placed MUs.
    */
   restorePreplaced(activate: boolean): void {
+    this._syncMuSet();
     if (this.preplacedMUs.length > 0) {
       for (let i = this.mus.length - 1; i >= 0; i--) {
         const mu = this.mus[i];
@@ -483,6 +734,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
           this._releaseFromActive(m);
           this.mus[i] = this.mus[this.mus.length - 1];
           this.mus.pop();
+          this._muSet.delete(mu);
         } else if (m.loadedMus.length > 0) {
           // A spawned carrier keeps its spawned loads; pre-placed loads go home.
           for (let j = m.loadedMus.length - 1; j >= 0; j--) {
@@ -509,10 +761,11 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
   /** Release every reference the engine holds on an MU leaving `mus`. */
   private _releaseFromActive(mu: RVMovingUnit): void {
     this._muGrid.remove(mu);
-    this.physicsMUHook?.onMUDisposed(mu);
+    this.notifyPhysicsMUDisposed(mu);
     this.muLifecycleHook?.onMURemoved(mu);
     for (const grip of this.grips) grip.onMUDisposed(mu);
     for (const zone of this.zones) zone.onMUDisposed(mu);
+    for (const hook of this.tickHooks) hook.onMUDisposed?.(mu);
     for (const target of this.gripTargets) {
       if (target.occupiedBy === mu) target.clearOccupied();
     }
@@ -526,19 +779,33 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
     for (const inner of load.loadedMus) {
       if (!inner.preplaced) this._disposeSpawnedLoad(inner);
     }
-    this.physicsMUHook?.onMUDisposed(load);
+    this.notifyPhysicsMUDisposed(load);
     this.muLifecycleHook?.onMURemoved(load);
     load.dispose();
   }
 
-  private registerSourceMU(mu: RVMovingUnit | InstancedMovingUnit, source: RVSource): void {
+  /** Track a mirrored spawn without source hooks, grow effects or AABB updates. */
+  trackSpawnedMU(mu: RVMovingUnit | InstancedMovingUnit): void {
+    this._syncMuSet();
     this.mus.push(mu);
+    this._muSet.add(mu);
+    this.totalSpawned++;
+  }
+
+  private registerSourceMU(mu: RVMovingUnit | InstancedMovingUnit, source: RVSource): void {
+    this._syncMuSet();
+    if (mu.isInstanced) this._sourceOfInstanced.set(mu as InstancedMovingUnit, source);
+    this.mus.push(mu);
+    this._muSet.add(mu);
+    this._noteDetectMargin(mu);
     this.totalSpawned++;
     this.muLifecycleHook?.onMUSpawned(mu, source.CollisionRoleForMUs);
     this._startGrow(mu, source);
   }
   /** Total MUs consumed by sinks since start */
   totalConsumed = 0;
+  /** Instanced MU → its source, for {@link promoteInstancedMU} (plan-2016 S4). */
+  private readonly _sourceOfInstanced = new WeakMap<InstancedMovingUnit, RVSource>();
 
   /** Hard safety ceiling on simultaneously-live MUs. A source feeding a belt
    *  with no downstream sink (or a jammed line) would otherwise spawn without
@@ -750,6 +1017,13 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
     this._hasVanishing = false; // recomputed below while any MU is mid-dissolve
     this._hasGrowing = false;   // recomputed below while any MU is mid grow-out
     for (const mu of this.mus) {
+      // Holds/loads only exist on clones; gripping an instance promotes it first.
+      if (!this.settleEnabled || isPhysicsOwned(mu) || mu.markedForRemoval ||
+          (!mu.isInstanced && (mu.heldBy !== null || mu.loadedOn !== null)) ||
+          mu.settleSurface !== mu.currentSurface) {
+        mu.settleSpeed = 0;
+        mu.settleSurface = null;
+      }
       if (mu.markedForRemoval) continue;
 
       // Accumulation hygiene (plan-255): the gap clamp only runs for MOVING MUs
@@ -757,6 +1031,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
       // — a stopped belt or a runtime `Accumulate=false` toggle never leaves a
       // stale blocked=true behind.
       mu.blocked = false;
+      mu.blockedBy = null;
 
       // Spawn grow-out: a freshly-spawned clone MU plays a short clip effect that
       // grows it out of the source along its move direction. Purely visual — it
@@ -766,18 +1041,24 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
 
       if (!mu.isInstanced && (mu as RVMovingUnit).isGripped) continue;
 
+      // `Source.Destination` is SORTING, never a transport brake (Thomas, 2026-10-29 —
+      // plan-2016 S1 withdrawn): it says under which node the Source files its MUs, and
+      // a surface transports them from there exactly as it would under the spawn parent.
+      // Unity does not pause transport for it either; the skip that once stood here
+      // froze the standard demo (its Source authors `Destination: "DemoCell/MUs"`).
+
       // Physics ownership (plan-276 F4): the provider drives this MU — skip
       // the whole kinematic pipeline. MUST come AFTER the `mu.blocked = false`
       // reset above (a stale blocked flag would corrupt the accumulation
       // diagnostics) and AFTER the isGripped skip (gripped MUs are never
       // physics-owned — structural exclusion, see plan-276 §5.2/F15).
-      if (mu.physicsOwned) continue;
+      if (isPhysicsOwned(mu)) continue;
 
       // A Source-authored dynamic Rigidbody starts in free fall inside a zone.
       // Do not let an XZ-only conveyor lookup capture it from far above a belt.
-      if (mu.node.userData.physicsBody?.isKinematic === false) {
+      if (!this._isKinematicPreplaced(mu) && mu.node.userData.physicsBody?.isKinematic === false) {
         this._tryPhysicsHandover(mu);
-        if (mu.physicsOwned) continue;
+        if (isPhysicsOwned(mu)) continue;
       }
 
       // Pick the single surface that drives this MU this tick. When a good
@@ -788,6 +1069,26 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
       if (rh) rh.enter('pick');
       const driver = this._pickDrivingSurface(mu);
       if (rh) { rh.leave('pick'); rh.enter('transportExcl'); }
+      // 2D interaction zones (plan-661 Phase 4): entry into a Box2D zone, or a
+      // wait at an occupied entry. After the pick (the driver gives the
+      // handover speed), before the Rapier surface handover.
+      if (this.zone2dHook !== null) {
+        const claim = this.zone2dHook.tryClaim(mu, driver ?? mu.lastSurface ?? null);
+        if (claim === 'claimed') {
+          mu.settleSpeed = 0;
+          mu.settleSurface = null;
+          if (rh) rh.leave('transportExcl');
+          continue;
+        }
+        if (claim === 'wait') {
+          mu.settleSpeed = 0;
+          mu.settleSurface = null;
+          mu.blocked = true;
+          if (driver) { mu.currentSurface = driver; mu.lastSurface = driver; }
+          if (rh) rh.leave('transportExcl');
+          continue;
+        }
+      }
       if (driver) {
         // Physics-mode surface (plan-276 Phase 4, F5): the MU is handed to the
         // provider the MOMENT it enters a physics-managed surface (not only at
@@ -797,7 +1098,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
         // moving kinematically and the check retries next tick (F4 pattern).
         if (this.physicsManagedSurfaces !== null && this.physicsManagedSurfaces.has(driver)) {
           this._tryPhysicsSurfaceHandover(mu, driver);
-          if (mu.physicsOwned) { if (rh) rh.leave('transportExcl'); continue; } // provider owns it — skip transport + vanish
+          if (isPhysicsOwned(mu)) { if (rh) rh.leave('transportExcl'); continue; } // provider owns it — skip transport + vanish
         }
         if (driver !== prev) {
           // Ownership changed — clear the carry marker so `transportMU` doesn't
@@ -808,6 +1109,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
           debug('transport', `MU "${mu.getName()}" entered surface "${driver.node.name}"`);
         }
         driver.transportMU(mu, dt);
+        this._settleOnSurface(mu, driver, dt);
         // Tag AFTER the call so a STAY sees the previous tick's value (carry),
         // while a SWITCH already reset it to undefined above (no phantom carry).
         mu.lastSurfaceTickId = tickId;
@@ -823,6 +1125,8 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
         // becomes null).
         mu.lastSurface = driver;
       } else {
+        mu.settleSpeed = 0;
+        mu.settleSurface = null;
         mu.currentSurface = null;
         mu.lastSurfaceTickId = undefined;
         // Physics handover at the conveyor end (plan-276 F4): no driving
@@ -832,7 +1136,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
         // still loading; deliberately independent of the dead-end cache below,
         // which only serves the vanish feature).
         this._tryPhysicsHandover(mu);
-        if (mu.physicsOwned) { if (rh) rh.leave('transportExcl'); continue; } // handed over — skip vanish bookkeeping
+        if (isPhysicsOwned(mu)) { if (rh) rh.leave('transportExcl'); continue; } // handed over — skip vanish bookkeeping
       }
 
       // End-of-line vanish: an MU that has been transported and now sits at a
@@ -866,14 +1170,27 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
     for (const grip of this.grips) {
       grip.fixedUpdate(dt);
     }
+    // 3c. Tick hooks (plan-2016 S6b): MU actors that read this tick's drive poses.
+    for (const hook of this.tickHooks) hook.fixedUpdate(dt);
 
     if (rh) rh.enter('muAabbGrid');
+
+    // Drop detection (plan-2022), head of the pass: rebuild the GripTarget
+    // occupancy set ONCE (O(m), not O(n·m) — the engine only stores the
+    // target → MU direction) and refill the support-ray budget.
+    this.dropHook?.beginTick();
 
     // 4. Update MU AABBs after transport
     for (const mu of this.mus) {
       if (!mu.markedForRemoval) {
         if (pc) { if (mu.isInstanced) pc.instAabb++; else pc.cloneAabb++; }
         mu.updateAABB();
+        // Drop detection (plan-2022): the four state conditions on the FINAL
+        // state of this tick — after transport, grips (3b), the zone holds
+        // (beginTick) and every physics handover — and with the AABB this loop
+        // has just refreshed, which the support ray reads. Riding inside this
+        // existing pass rather than opening a second MU loop.
+        if (this.dropHook !== null) this.dropHook.evaluate(mu, dt);
         // Keep the MU grid current BEFORE the sensor/sink checks (steps 5/6):
         // `update()` lazy-inserts unknown MUs, so every MU that shows up in
         // `this.mus` — source spawn, multiuser follower push, direct test
@@ -884,6 +1201,11 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
         this._muGrid.update(mu);
       }
     }
+
+    // Drop detection (plan-2022), tail of the pass: advance the delete timers
+    // of the latched reports. Marking happens here, the DISPOSAL in step 7 —
+    // the one path that also notifies grips, zones and the physics provider.
+    this.dropHook?.endTick(dt);
 
     // Zones, part 3 of 3 (plan-521 §2.4): Detect on the current MU AABBs and
     // grid (newly spawned MUs included), before the sensors.
@@ -902,6 +1224,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
       // the active MUs (cheap guarded assignment, self-healing like the
       // surfaces' accumulation provider).
       if (sensor.loadRoots !== this.mus) sensor.loadRoots = this.mus;
+      this._syncRayColliders(sensor);
       sensor.updateAABB();
       // Physics-managed sensor (plan-276 Phase 5, F6): the provider owns its
       // detection — enter/leave events / raycasts drive `occupied` in the
@@ -917,12 +1240,30 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
         // sensor's own AABB does not (the ray extends RayCastLength beyond
         // the node). checkRaycast keeps the exact ray-vs-AABB test.
         sensor.computeRayQueryBounds(this._rayQueryAABB);
+        this._widenForDetection(this._rayQueryAABB);
+        this._muGrid.queryXZ(this._rayQueryAABB, this._muCandidates);
+        sensor.checkOverlap(this._muCandidates);
+      } else if (this._detectMargin > 0) {
+        this._rayQueryAABB.min.copy(sensor.aabb.min);
+        this._rayQueryAABB.max.copy(sensor.aabb.max);
+        this._widenForDetection(this._rayQueryAABB);
         this._muGrid.queryXZ(this._rayQueryAABB, this._muCandidates);
         sensor.checkOverlap(this._muCandidates);
       } else {
         this._muGrid.queryXZ(sensor.aabb, this._muCandidates);
         sensor.checkOverlap(this._muCandidates);
       }
+    }
+
+    // 5b. Ray sensors (plan-664 Phase 2): AFTER this tick's MU movement and
+    //     BEFORE `behaviors.tick`, so a scan sees the MUs where they are now and
+    //     the AGV poses of the previous tick — a fixed, deterministic one-tick
+    //     offset on the vehicle hulls, which a replay can reproduce. Sim time is
+    //     counted here from the same `dt` the viewer's clock uses; rate, latency
+    //     and noise never touch the wall clock.
+    if (this.raySensors.length > 0) {
+      this._rayScanTime += dt;
+      for (let i = 0; i < this.raySensors.length; i++) this.raySensors[i].scanStep(dt, this._rayScanTime);
     }
 
     // 6. Sinks: mark overlapping MUs (skip gripped MUs). Same candidate
@@ -941,6 +1282,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
 
     if (rh) { rh.leave('sinks'); rh.enter('removal'); }
     // 7. Remove marked MUs (reverse iteration, swap-and-pop — no splice!)
+    this._syncMuSet();
     for (let i = this.mus.length - 1; i >= 0; i--) {
       if (this.mus[i].markedForRemoval) {
         const removedMU = this.mus[i];
@@ -949,7 +1291,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
         this._muGrid.remove(removedMU);
         // Physics chokepoint (plan-276 F14): free the provider body BEFORE
         // mu.dispose() — the hook is idempotent for non-owned MUs.
-        this.physicsMUHook?.onMUDisposed(removedMU);
+        this.notifyPhysicsMUDisposed(removedMU);
         this.muLifecycleHook?.onMURemoved(removedMU);
         // Notify grips and zones of MU disposal
         if (!removedMU.isInstanced) {
@@ -957,6 +1299,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
             grip.onMUDisposed(removedMU as RVMovingUnit);
           }
           for (const zone of this.zones) zone.onMUDisposed(removedMU as RVMovingUnit);
+          for (const hook of this.tickHooks) hook.onMUDisposed?.(removedMU as RVMovingUnit);
         }
         // Clear gripTarget occupancy if this MU was placed on one
         for (const target of this.gripTargets) {
@@ -969,6 +1312,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
         // Swap with last element and pop
         this.mus[i] = this.mus[this.mus.length - 1];
         this.mus.pop();
+        this._muSet.delete(removedMU);
       }
     }
 
@@ -1041,6 +1385,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
       for (let i = 0; i < count; i++) {
         const s = this._surfaceCandidates[i];
         if (s.aabb.min.y > muTop) continue;
+        if (mu.aabb.min.y > s.aabb.max.y + this.reachOf(s)) continue; // out of vertical reach
         overlapping.push(s);
         if (s.aabb.max.y > topY) topY = s.aabb.max.y;
       }
@@ -1048,6 +1393,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
       for (const s of this.surfaces) {
         if (!s.aabb.overlapsXZ(mu.aabb)) continue;
         if (s.aabb.min.y > muTop) continue;
+        if (mu.aabb.min.y > s.aabb.max.y + this.reachOf(s)) continue; // out of vertical reach
         overlapping.push(s);
         if (s.aabb.max.y > topY) topY = s.aabb.max.y;
       }
@@ -1107,11 +1453,79 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
     if (!curr.aabb.overlapsXZ(mu.aabb)) return null;                         // (iv)
     if (!curr.isActive) return null;                                         // (v)
     if (curr.aabb.min.y > mu.aabb.max.y) return null;                        // (vii) another level
+    if (mu.aabb.min.y > curr.aabb.max.y + this.reachOf(curr)) return null; // (viii) out of vertical reach
     let topYUpper = curr.aabb.max.y;                                         // (vi)
     const cellTop = this._surfaceGrid.maxTopYOverSpan(mu.aabb);
     if (cellTop > topYUpper) topYUpper = cellTop;
     if (!(curr.aabb.max.y >= topYUpper - topEps)) return null;
     return curr;
+  }
+
+  /** Gravity-like descent only while a horizontal linear surface owns transport.
+   * No geometry search or allocations: use the surface's box top only when its
+   * local XZ plane is horizontal. Tilted/CAD Z-up and radial surfaces are skipped.
+   * Refresh the MU bounds AFTER transport (carry can have changed world Y).
+   */
+  /** True while a GripTarget holds `mu` in its seat (the engine stores only the
+   *  target → MU direction; scenes carry a handful of targets). */
+  private _seatedOnGripTarget(mu: RVMovingUnit | InstancedMovingUnit): boolean {
+    for (const target of this.gripTargets) if (target.occupiedBy === mu) return true;
+    return false;
+  }
+
+  private _settleOnSurface(mu: RVMovingUnit | InstancedMovingUnit, surface: RVTransportSurface, dt: number): void {
+    if (mu.settleSurface !== surface) mu.settleSpeed = 0;
+    mu.settleSurface = null;
+    if (!this.settleEnabled || !(dt > 0) || isPhysicsOwned(mu) ||
+        (!mu.isInstanced && (mu.heldBy !== null || mu.loadedOn !== null)) || surface.Radial ||
+        // Custom transport (e.g. TransportGuided arcs) has its own height
+        // contract. Do not infer a contact plane from its overall AABB.
+        surface.transportMU !== RVTransportSurface.prototype.transportMU ||
+        // A part seated on a GripTarget belongs to that target (placeOnGripTarget
+        // sets neither heldBy nor loadedOn); settling it would pull it out of its
+        // seat onto a belt below (Codex review 2026-11-04: 80 mm drop measured).
+        this._seatedOnGripTarget(mu)) {
+      mu.settleSpeed = 0;
+      return;
+    }
+    // The surface's "up" is whichever local axis points closest to world up (CAD
+    // imports are often Z-up: local X or Z is vertical, local Y lies in the belt
+    // plane), so test ALL three columns — the surface is horizontal when one of
+    // them is vertical — and require a horizontal travel direction.
+    const e = surface.node.matrixWorld.elements;
+    const eps = SETTLE_HORIZONTAL_EPS;
+    const upX = Math.abs(e[1]) / Math.hypot(e[0], e[1], e[2]);
+    const upY = Math.abs(e[5]) / Math.hypot(e[4], e[5], e[6]);
+    const upZ = Math.abs(e[9]) / Math.hypot(e[8], e[9], e[10]);
+    if (Math.max(upX, upY, upZ) < 1 - eps ||
+        Math.abs(surface.getWorldDirection(_settleDirection).y) > eps) {
+      mu.settleSpeed = 0;
+      return;
+    }
+    mu.updateAABB();
+    const gap = mu.aabb.min.y - surface.aabb.max.y;
+    // The threshold starts a fall; once started, finish the final sub-mm gap.
+    if (!(gap > 0) || gap > this.reachOf(surface) ||
+        (mu.settleSpeed === 0 && gap <= this.settleMinGap) ||
+        !mu.aabb.overlapsXZ(surface.aabb)) {
+      mu.settleSpeed = 0;
+      return;
+    }
+    mu.settleSpeed += this.settleGravity * dt;
+    const descent = Math.min(gap, mu.settleSpeed * dt);
+    mu.getWorldPosition(_settlePosition);
+    _settlePosition.y -= descent;
+    // Clones store parent-local positions; instances store world positions and
+    // require setPosition() to write the pool (getPosition() is shared scratch).
+    if (!mu.isInstanced && mu.node.parent) mu.node.parent.worldToLocal(_settlePosition);
+    mu.setPosition(_settlePosition);
+    if (descent >= gap) mu.settleSpeed = 0;
+    else mu.settleSurface = surface;
+  }
+
+  /** Authored kinematic MUs belong to the plugin's kinematic bodies, never dynamic handover. */
+  private _isKinematicPreplaced(mu: RVMovingUnit | InstancedMovingUnit): boolean {
+    return Boolean(mu.node.userData.physicsBody?.isKinematic);
   }
 
   /**
@@ -1146,19 +1560,24 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
   tryHandoverToPhysics(
     mu: RVMovingUnit | InstancedMovingUnit,
     initialVelocity?: { x: number; y: number; z: number },
+    from: MuOwner = 'transport',
   ): boolean {
-    if (mu.physicsOwned) return true;
-    if (mu.node.userData.physicsBody?.isKinematic) return false;
+    if (mu.owner === 'rapier') return true;
+    if (mu.owner !== from) return false;
+    if (this._isKinematicPreplaced(mu)) return false;
     if (!physicsSettings.enabled) return false;
     if (RVPhysicsZone.zones.length === 0) return false;
     const provider = physicsRegistry.provider;
     if (!provider || !provider.ready || provider.failed) return false;
 
-    const zone = RVPhysicsZone.findZoneOverlapping(mu.aabb);
+    // plan-2016 S7: a zone whose LimitToLayers filter rejects this MU does not
+    // take it — the MU passes kinematically (a gripped barrel crossing a scrap
+    // zone stays on its rails).
+    const zone = RVPhysicsZone.findZoneOverlapping(mu.aabb, mu);
     if (!zone || !zone.active) return false;
 
-    this._handoverToPhysics(mu, mu.lastSurface ?? null, provider, `zone "${zone.node.name}"`, initialVelocity);
-    return mu.physicsOwned;
+    this._handoverToPhysics(mu, mu.lastSurface ?? null, provider, `zone "${zone.node.name}"`, initialVelocity, from);
+    return (mu.owner as MuOwner) === 'rapier';
   }
 
   /**
@@ -1173,9 +1592,13 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
     mu: RVMovingUnit | InstancedMovingUnit,
     surface: RVTransportSurface,
   ): void {
-    if (mu.physicsOwned || !physicsSettings.enabled) return;
+    if (this._isKinematicPreplaced(mu) || isPhysicsOwned(mu) || !physicsSettings.enabled) return;
     const provider = physicsRegistry.provider;
     if (!provider || !provider.ready || provider.failed) return;
+    // plan-2016 S7: the zone holding the surface may filter MUs by layer — a
+    // rejected MU rides the surface kinematically.
+    const zone = RVPhysicsZone.findZoneOverlapping(surface.aabb);
+    if (zone && !zone.acceptsMU(mu)) return;
     this._handoverToPhysics(mu, surface, provider, `physics surface "${surface.node.name}"`);
   }
 
@@ -1193,6 +1616,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
     provider: PhysicsProvider,
     debugContext: string,
     initialVelocity?: { x: number; y: number; z: number },
+    from: MuOwner = 'transport',
   ): void {
     if (initialVelocity) {
       _handoverVel.set(initialVelocity.x, initialVelocity.y, initialVelocity.z);
@@ -1219,8 +1643,15 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
     _handoverPose.quat.w = _handoverQuat.w;
 
     const bodyId = String(mu.id);
+    // Owner first: a refused claim (MU already with another engine) must not
+    // leave a second Rapier body behind (plan-661).
+    // `from` = 'box2d' is the Box2D → Rapier transaction (plan-661 §2.4): the
+    // Rapier body exists and the owner is confirmed BEFORE the 2D plugin drops
+    // its body; a refusal leaves the MU where it was.
+    if (!setMuOwner(mu, 'rapier', from)) return;
+    mu.settleSpeed = 0;
+    mu.settleSurface = null;
     provider.addDynamicMU(bodyId, _handoverPose, mu.aabb.halfSize, _handoverVel, this._muMassKg(mu), mu.node.userData.physicsBody?.shapes);
-    mu.physicsOwned = true;
     mu.physicsBodyId = bodyId;
     debug('transport', `MU "${mu.getName()}" handed over to physics (${debugContext})`);
   }
@@ -1248,7 +1679,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
       }
     }
     if (mu.physicsMassKg !== undefined) return mu.physicsMassKg;
-    const zoneMass = RVPhysicsZone.findZoneOverlapping(mu.aabb)?.toZoneConfig().muMassKg;
+    const zoneMass = RVPhysicsZone.findZoneOverlapping(mu.aabb, mu)?.toZoneConfig().muMassKg;
     if (typeof zoneMass === 'number' && Number.isFinite(zoneMass) && zoneMass > 0) return zoneMass;
     return PHYSICS_DEFAULT_MU_MASS_KG;
   }
@@ -1555,11 +1986,19 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
    * `moveDir` (XZ); a candidate must also overlap the MU vertically, so a belt
    * on another level never blocks. Below `bruteForceThreshold` live MUs the plain array scan
    * is used (grid overhead > gain), above it the `_muGrid`. Self,
-   * `markedForRemoval`, gripped AND `physicsOwned` candidates are filtered
-   * here (gripped MUs stay indexed in the grid but hang from a gripper;
-   * physics-owned MUs are the provider's — plan-276, no gap-clamp double
-   * logic at the handover point); geometric front/lane/gap filtering stays
+   * `markedForRemoval` AND Rapier-owned candidates are filtered here
+   * (Rapier bodies are the provider's — plan-276, no gap-clamp double logic at
+   * the handover point). Box2D-owned MUs ARE leaders (plan-661 §2.4): their
+   * pose is current every tick, so the kinematic infeed backs up behind a 2D
+   * zone's tail instead of driving into it; geometric front/lane/gap filtering stays
    * with the caller. GC-free: reused scratch AABB + caller-owned `out`.
+   *
+   * HELD MUs (gripped, zone-held, StopOnExit) ARE leaders. They used to be
+   * skipped, so the moment a gripper closed on the head of a queue the next
+   * MU drove straight into it while it was still being lifted (pick-and-place cell,
+   * 2026-10-15: 10-47 mm penetration at every pick). Their AABB is refreshed
+   * every tick like any other (step 4), and the vertical-overlap test below
+   * releases the follower as soon as the held MU is lifted clear.
    */
   queryLeadingMU(
     mu: RVMovingUnit | InstancedMovingUnit,
@@ -1578,8 +2017,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
 
     if (this.mus.length < this.bruteForceThreshold) {
       for (const other of this.mus) {
-        if (other === mu || other.markedForRemoval || other.physicsOwned) continue;
-        if (!other.isInstanced && (other as RVMovingUnit).isGripped) continue;
+        if (other === mu || other.markedForRemoval || other.owner === 'rapier') continue;
         const a = other.aabb;
         if (a.min.x > qa.max.x || a.max.x < qa.min.x || a.min.z > qa.max.z || a.max.z < qa.min.z) continue;
         // Vertical overlap: an MU on a belt on another level (return belt under
@@ -1618,8 +2056,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
       const count = this._muGrid.queryXZ(qa, this._accumGridScratch);
       for (let i = 0; i < count; i++) {
         const other = this._accumGridScratch[i];
-        if (other === mu || other.markedForRemoval || other.physicsOwned) continue;
-        if (!other.isInstanced && (other as RVMovingUnit).isGripped) continue;
+        if (other === mu || other.markedForRemoval || other.owner === 'rapier') continue;
         const a = other.aabb;
         if (a.min.y > qa.max.y || a.max.y < qa.min.y) continue;
         out.push(other);
@@ -1639,7 +2076,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
   isAreaOccupiedByMU(area: AABB): boolean {
     if (this.mus.length < this.bruteForceThreshold) {
       for (const other of this.mus) {
-        if (other.markedForRemoval || other.physicsOwned) continue;
+        if (other.markedForRemoval || other.owner === 'rapier') continue;
         if (!other.isInstanced && (other as RVMovingUnit).isGripped) continue;
         if (other.aabb.overlaps(area)) return true;
       }
@@ -1648,7 +2085,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
     const count = this._muGrid.queryXZ(area, this._muCandidates);
     for (let i = 0; i < count; i++) {
       const other = this._muCandidates[i];
-      if (other.markedForRemoval || other.physicsOwned) continue;
+      if (other.markedForRemoval || other.owner === 'rapier') continue;
       if (!other.isInstanced && (other as RVMovingUnit).isGripped) continue;
       if (other.aabb.overlaps(area)) return true;
     }
@@ -1678,18 +2115,21 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
    * counter stays untouched.
    */
   removeMU(mu: RVMovingUnit | InstancedMovingUnit, countConsumed = true): void {
+    this._syncMuSet();
+    if (!this._muSet.has(mu)) return;
     const idx = this.mus.indexOf(mu);
     if (idx < 0) return;
 
     this._muGrid.remove(mu);
     // Physics chokepoint (plan-276 F14): this is a dispose path too.
-    this.physicsMUHook?.onMUDisposed(mu);
+    this.notifyPhysicsMUDisposed(mu);
     this.muLifecycleHook?.onMURemoved(mu);
     if (!mu.isInstanced) {
       for (const grip of this.grips) {
         grip.onMUDisposed(mu as RVMovingUnit);
       }
       for (const zone of this.zones) zone.onMUDisposed(mu as RVMovingUnit);
+      for (const hook of this.tickHooks) hook.onMUDisposed?.(mu as RVMovingUnit);
     }
     for (const target of this.gripTargets) {
       if (target.occupiedBy === mu) target.clearOccupied();
@@ -1705,10 +2145,60 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
     // Swap-and-pop (matches the update() removal loop).
     this.mus[idx] = this.mus[this.mus.length - 1];
     this.mus.pop();
+    this._muSet.delete(mu);
 
     // Refresh instanced pool matrices so a released slot stops rendering at
     // its stale position right away (clone removal already detached the node).
     if (mu.isInstanced) this.updatePoolMatrices();
+  }
+
+  /**
+   * Turn the instanced MU `inst` into a real clone in place (plan-2016 S4): a grip
+   * can only hold a node, and a `DirectlyGrip` grip must take whatever enters its
+   * sensor. The clone gets the instance's world pose, engine id and transport state,
+   * takes its slot in `mus` (order kept) and its grid cell, the sensors' tracking and
+   * the collision role; the pool slot is released. Not a spawn and not a consume:
+   * the counters stay. Event-scoped (once per gripped instance), never per tick.
+   *
+   * Returns the clone, or null when `inst` is not live here, is physics-owned or its
+   * source cannot clone.
+   */
+  promoteInstancedMU(inst: InstancedMovingUnit): RVMovingUnit | null {
+    this._syncMuSet();
+    if (inst.markedForRemoval || isPhysicsOwned(inst)) return null;
+    const idx = this.mus.indexOf(inst);
+    if (idx < 0) return null;
+    const source = this._sourceOfInstanced.get(inst);
+    if (!source) return null;
+    const clone = source.buildPromotedClone(inst);
+    if (!clone) return null;
+
+    // Transport state the next tick continues from.
+    clone.currentSurface = inst.currentSurface;
+    clone.lastSurface = inst.lastSurface;
+    clone.lastSurfaceTickId = inst.lastSurfaceTickId;
+    clone.everOnSurface = inst.everOnSurface;
+    clone.onLayoutObject = inst.onLayoutObject;
+    clone.offSurfaceTime = inst.offSurfaceTime;
+    clone.blocked = inst.blocked;
+    clone.blockedBy = inst.blockedBy;
+    clone.owner = inst.owner;
+
+    this._muGrid.remove(inst);
+    this.mus[idx] = clone;
+    this._muSet.delete(inst);
+    this._muSet.add(clone);
+    clone.updateAABB();
+    this._muGrid.insert(clone);
+    this._noteDetectMargin(clone);
+    for (const sensor of this.sensors) sensor.replaceTrackedMU(inst, clone);
+    this.muLifecycleHook?.onMURemoved(inst);
+    this.muLifecycleHook?.onMUSpawned(clone, source.CollisionRoleForMUs);
+    this._sourceOfInstanced.delete(inst);
+    inst.dispose();               // pool slot (swap-and-pop, onRelease hooks)
+    this.updatePoolMatrices();
+    debug('transport', `Instanced MU "${inst.getName()}" promoted to clone "${clone.getName()}"`);
+    return clone;
   }
 
   // ── Manual manipulation support (plan-567) ─────────────────────────
@@ -1739,6 +2229,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
     for (const sensor of this.sensors) {
       if (this.physicsManagedSensors !== null && this.physicsManagedSensors.has(sensor)) continue;
       if (sensor.loadRoots !== this.mus) sensor.loadRoots = this.mus;
+      this._syncRayColliders(sensor);
       sensor.updateAABB();
       sensor.checkOverlap(this.mus);
     }
@@ -1766,9 +2257,11 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
    * sink query sees it where it now is.
    */
   reindexMU(mu: RVMovingUnit | InstancedMovingUnit): void {
+    this._syncMuSet();
+    this._noteDetectMargin(mu);
     mu.updateAABB();
     if (this._muGrid.has(mu)) this._muGrid.update(mu);
-    else if (this.mus.includes(mu)) this._muGrid.insert(mu);
+    else if (this._muSet.has(mu)) this._muGrid.insert(mu);
   }
 
   /**
@@ -1842,6 +2335,9 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
    */
   notifyTopologyChanged(): void {
     this._surfaceGridDirty = true;
+    // plan-2016 Codex review: colliders may have been added or removed — the
+    // raycast sensors' non-MU collider list is rebuilt on the next use.
+    this._topologyRevision++;
     this._adjacencyCache = null;
     // Fresh topology → drop the learned moving-surface classification so a
     // surface that stopped moving can be cached as static again.
@@ -1852,6 +2348,7 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
 
   /** Reset all state */
   reset(disposeSources = false): void {
+    this._syncMuSet();
     // Zones first (plan-521 F12/F13): forget held MUs before they are disposed
     // or restored, clear the edge memory and the Detect state.
     for (const zone of this.zones) zone.reset();
@@ -1865,7 +2362,10 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
     // and is only dropped on model unload (disposeSources=true), avoiding a
     // needless full rebuild on every restart.
     this._muGrid.clear();
+    this._detectMargin = 0;
     if (disposeSources) {
+      this._rayColliders = null;
+      this._rayCollidersSensors = null;
       this._surfaceGrid.clear();
       this._lastSurfacesRef = null;
       this._lastSurfacesLen = -1;
@@ -1880,6 +2380,8 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
     for (const grip of this.grips) {
       grip.reset();
     }
+    for (const hook of this.tickHooks) hook.reset?.();
+    if (disposeSources) this.tickHooks.clear();
     for (const target of this.gripTargets) {
       target.clearOccupied();
     }
@@ -1888,21 +2390,27 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
       // chokepoint" — it serves resetSimulation(), clearModel() AND
       // SimulationKernel.setMode()→clearMUs(). Free the physics body BEFORE
       // mu.dispose() so no Rapier body is ever orphaned on a bulk dispose.
-      this.physicsMUHook?.onMUDisposed(mu);
+      this.notifyPhysicsMUDisposed(mu);
       this.muLifecycleHook?.onMURemoved(mu);
       mu.dispose();
     }
     this.mus.length = 0;
+    this._muSet.clear();
     // plan-516: pre-placed MUs go back to their authored pose and parent and are
     // NOT re-registered here — `reset()` serves model unload, mode switches and
     // executor disposal too. `RVViewer.resetSimulation()` re-activates them.
     this.restorePreplaced(false);
     this.totalSpawned = 0;
     this.totalConsumed = 0;
+    // plan-664: the ray-sensor clock restarts with the simulation, so a reset
+    // scene measures at the same sim times as the first run — the other half of
+    // "same scene + seed + tick sequence gives bit-identical scans".
+    this._rayScanTime = 0;
+    for (const raySensor of this.raySensors) raySensor.resetScan();
     for (const sensor of this.sensors) {
       // A sim reset clears through the change pipeline so bound PLC signals follow
       // (plan-569); a model unload just drops the state without writing signals.
-      if (disposeSources) { sensor.occupied = false; sensor.occupiedMU = null; } else sensor.resetDetection();
+      if (disposeSources) { sensor.occupied = false; sensor.occupiedMU = null; sensor.clearMuTracking(); } else sensor.resetDetection();
     }
     // Belt surfaces: on a sim restart rewind the scrolled textures + the radial
     // accumulator and drop stale world-matrix-delta tracking, so the conveyors
@@ -1956,19 +2464,28 @@ function restoreFromSnapshot(mu: RVMovingUnit): void {
   mu.heldBy = null;
   mu.parentBeforeGrip = null;
   mu.currentSurface = null;
+  mu.settleSpeed = 0;
+  mu.settleSurface = null;
   mu.lastSurface = null;
   mu.lastSurfaceTickId = undefined;
   mu.markedForRemoval = false;
   mu.blocked = false;
+  mu.blockedBy = null;
   mu.everOnSurface = undefined;
   mu.onLayoutObject = undefined;
   mu.offSurfaceTime = undefined;
   mu.vanishElapsed = undefined;
+  // Drop detection (plan-2022 E7): a reset part starts uncarried again, so a
+  // part that stood unsupported at its authored pose is not reported after reset.
+  mu.wasCarried = undefined;
+  mu.unsupportedTime = undefined;
+  mu.supportProbeAt = undefined;
+  mu.supported = undefined;
   mu.dissolve?.dispose();
   mu.dissolve = null;
   mu.grow?.dispose();
   mu.grow = null;
-  mu.physicsOwned = false;
+  resetMuOwner(mu);
   mu.physicsBodyId = null;
   const snap = mu.snapshot;
   if (!snap) return;

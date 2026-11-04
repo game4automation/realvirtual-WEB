@@ -49,11 +49,10 @@ import {
 } from './rv-document-classification';
 import { documentInfoCacheEquals, parseDocumentInfo, type DocumentInfo } from './rv-document-info';
 import {
-  assetEntryKey,
+  type LegacyProjectAssetEntry,
+  type LegacyProjectSceneEntry,
   type RvDocumentEntry,
   type RvProject,
-  type RvProjectAssetEntry,
-  type RvProjectSceneEntry,
 } from './rv-project-types';
 
 // ─── Sections: the legacy compatibility layer (plan-736) ────────────────
@@ -86,7 +85,7 @@ import {
 // route it down the blob branch; the gate on it — the slow delivery channels
 // carrying a client that no longer reads the field — was declared open, and
 // the risk of an old ctrlX snap or CONNECT-embedded appliance mis-routing a
-// browser scene saved from this build on is accepted and documented, not
+// browser document saved from this build on is accepted and documented, not
 // mitigated (plan-744 §5.4).
 //
 // Nothing outside those two purposes may grow a new caller here, and nothing
@@ -128,7 +127,7 @@ export function sectionOfDocument(entry: RvDocumentEntry): DocumentSection {
 /**
  * The key a document is addressed by.
  *
- * Same rule as {@link assetEntryKey} and as `documentTierKey` — id when it has
+ * Same rule as `documentTierKey` — id when it has
  * one, path otherwise — so an entry that gains an id keeps answering to the same
  * question it did before.
  *
@@ -199,7 +198,7 @@ function fnv32(text: string): number {
 // ─── Projection: legacy entry → document ────────────────────────────────
 
 /** Display name for an asset entry that has no name field of its own. */
-function assetNameOf(entry: RvProjectAssetEntry): string {
+function assetNameOf(entry: LegacyProjectAssetEntry): string {
   const label = typeof entry.label === 'string' ? entry.label.trim() : '';
   if (label !== '') return label;
   const path = typeof entry.path === 'string' ? entry.path : '';
@@ -228,14 +227,14 @@ function assetNameOf(entry: RvProjectAssetEntry): string {
  * re-deriving it from the filename would silently undo a rename.
  */
 export function documentOfEntry(
-  entry: RvProjectAssetEntry | RvProjectSceneEntry,
+  entry: LegacyProjectAssetEntry | LegacyProjectSceneEntry | RvDocumentEntry,
   mintId: (entry: { path: string }) => string = e => stableDocumentId(e.path),
 ): RvDocumentEntry {
   const id = typeof entry.id === 'string' && entry.id.trim() !== ''
     ? entry.id
     : mintId(entry as { path: string });
   const own = typeof entry.name === 'string' ? entry.name.trim() : '';
-  const asAsset = entry as unknown as RvProjectAssetEntry;
+  const asAsset = entry as unknown as LegacyProjectAssetEntry;
   return { ...entry, id, name: own !== '' ? own : assetNameOf(asAsset), path: entry.path };
 }
 
@@ -413,9 +412,9 @@ export function withDerivedDocuments(project: RvProject | null | undefined): RvP
   return {
     ...withoutLegacyArrays(project),
     documents: documentsFromLists({
-      scenes: listOf<RvProjectSceneEntry>(legacy.scenes),
-      models: listOf<RvProjectAssetEntry>(legacy.models),
-      library: listOf<RvProjectAssetEntry>(legacy.library),
+      scenes: listOf<LegacyProjectSceneEntry>(legacy.scenes),
+      models: listOf<LegacyProjectAssetEntry>(legacy.models),
+      library: listOf<LegacyProjectAssetEntry>(legacy.library),
     }),
   };
 }
@@ -468,9 +467,9 @@ export function withoutLegacyArrays(project: RvProject): RvProject {
  */
 export function documentsFromLists(
   lists: {
-    scenes?: readonly RvProjectSceneEntry[];
-    models?: readonly RvProjectAssetEntry[];
-    library?: readonly RvProjectAssetEntry[];
+    scenes?: readonly LegacyProjectSceneEntry[];
+    models?: readonly LegacyProjectAssetEntry[];
+    library?: readonly LegacyProjectAssetEntry[];
   },
   declared: readonly RvDocumentEntry[] = [],
   mintId: (entry: { path: string }) => string = e => stableDocumentId(e.path),
@@ -806,5 +805,3 @@ export function collectDocumentTags(documents: readonly RvDocumentEntry[]): stri
   return [...seen].sort();
 }
 
-/** Re-export so callers do not have to know both key helpers exist. */
-export { assetEntryKey };

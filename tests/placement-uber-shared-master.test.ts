@@ -43,7 +43,20 @@ import {
 } from '../src/core/engine/rv-uber-material';
 import { createPickBuildPort } from '../src/core/engine/rv-pick-build-port';
 import { BakeRegistry } from '../src/core/engine/rv-bake-registry';
-import viewerSource from '../src/core/rv-viewer.ts?raw';
+import viewerSourceRaw from '../src/core/rv-viewer.ts?raw';
+
+// `?raw` hands back the WORKING-TREE bytes, so a CRLF checkout carries `\r\n`.
+// The multi-line invariants below are written with `\n`, and the method slices
+// below count characters — normalise the line endings once, here.
+const viewerSource = viewerSourceRaw.replace(/\r\n/g, '\n');
+
+/** The body of a 2-space-indented class member, from its signature to its `}`. */
+function memberSource(source: string, signature: string): string {
+  const start = source.indexOf(signature);
+  expect(start, `signature not found: ${signature}`).toBeGreaterThanOrEqual(0);
+  const end = source.indexOf('\n  }\n', start);
+  return source.slice(start, end < 0 ? undefined : end + 5);
+}
 
 /** A GLTFLoader stand-in that hands back a fresh tree per decode. */
 function fakeLoader(make: () => Group): GLTFLoader {
@@ -294,13 +307,23 @@ describe('the uber material has ONE owner (plan-752 S2)', () => {
     // where the wiring is rather than through a full viewer boot.
     const plannerSource = (await import('../src/plugins/layout-planner/index.ts?raw')).default;
     const hook = plannerSource.slice(plannerSource.indexOf('onModelCleared(_viewer: RVViewer)'), 0
-      + plannerSource.indexOf('onModelCleared(_viewer: RVViewer)') + 900);
+      + plannerSource.indexOf('onModelCleared(_viewer: RVViewer)') + 1500);
     // The cache moved to the viewer's placement instancer (plan-753 structure
     // hardening): `clearDocument()` retires the bakes + drops the masters.
-    expect(hook).toContain('this._placements.clearDocument()');
+    // plan-774 F6: only for a host without `viewer.placements` — the viewer's
+    // own clear (pinned below) decides whether the bakes are kept for the next load.
+    // Review fix E8: only the planner's OWN fallback instancer (which exists
+    // exactly on such hosts) — never `this._placements`, which resolves to the
+    // viewer's instancer whenever the viewer has one.
+    expect(hook).toContain('this._ownPlacements?.clearDocument();');
+    expect(hook).not.toContain('this._placements.clearDocument()');
     const instancerSource = (await import('../src/core/engine/rv-placement-instancer.ts?raw')).default;
-    expect(instancerSource).toContain('this._cache?.clearDecoded()');
-    expect(viewerSource).toContain('this.placements.clearDocument()');
+    // plan-774 F6: the release is `releaseDocument` — `clearDecoded` unless the
+    // viewer's clear keeps the bakes for an authoring reload (default: retire).
+    expect(instancerSource).toContain('this._cache?.releaseDocument({ keepBaked })');
+    expect(viewerSource).toContain('this.placements.clearDocument({\n      keepBaked: opts?.keepBaked === true,');
+    // plan-774 leak fix: the clear also releases every instance in the dropped model roots.
+    expect(viewerSource).toContain('documentRoots: this._modelRootsOnScene(),');
     // …and the cache is constructed with the viewer's single owner.
     const integrateSource = (await import('../src/core/engine/rv-placement-integrate.ts?raw')).default;
     expect(integrateSource).toContain('uber: () => viewer.placementUberMaterial');
@@ -310,9 +333,7 @@ describe('the uber material has ONE owner (plan-752 S2)', () => {
     // The most common case of all — an empty document, first drop. Before
     // plan-752 this was the case that produced N arenas, because the only
     // owner of an uber material was a load that had not happened yet.
-    const getter = viewerSource.slice(
-      viewerSource.indexOf('get placementUberMaterial(): RVUberMaterial | null'),
-    ).slice(0, 700);
+    const getter = memberSource(viewerSource, 'get placementUberMaterial(): RVUberMaterial | null');
     expect(getter).toContain('if (this._lastLoadResult)');
     // plan-757 Phase 3 commit B: the bake is the only runtime, so before the
     // first load the answer is unconditionally the session material.

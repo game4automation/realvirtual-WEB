@@ -33,8 +33,8 @@ import type { Object3D } from 'three';
 import type { NodeRegistry } from './rv-node-registry';
 import type { SignalCatalogChange, SignalStore } from './rv-signal-store';
 import {
-  SIGNAL_TYPES, registerSignal, resolveSignalName, setTrackedSignal, trackedSignalOf,
-  type TrackedSignal,
+  SIGNAL_TYPES, reconcileSignalCollision, registerSignal, reportSignalCollisionAt, resolveSignalName,
+  setTrackedSignal, trackedSignalOf, type TrackedSignal,
 } from './rv-signal-construction';
 
 /** The part of the viewer the sync needs. */
@@ -51,7 +51,12 @@ export function isSignalEditorSyncEnabled(): boolean { return _enabled; }
 
 // ─── Waves: one catalog event per op ────────────────────────────────────────
 
-const _waves = new WeakMap<SignalStore, { depth: number; change: SignalCatalogChange }>();
+/**
+ * An open wave: its folded catalog change and the names whose ownership moved —
+ * their collision problems are reconciled once, when the wave closes and the
+ * store has its final state (a mid-wave look would see half a move).
+ */
+const _waves = new WeakMap<SignalStore, { depth: number; change: SignalCatalogChange; touched: Set<string> }>();
 
 function emptyChange(): SignalCatalogChange {
   return { registered: [], released: [], removed: [], metaChanged: [], renamed: [] };
@@ -62,7 +67,7 @@ export function beginSignalSyncWave(store: SignalStore | null | undefined): void
   if (!store) return;
   const w = _waves.get(store);
   if (w) w.depth++;
-  else _waves.set(store, { depth: 1, change: emptyChange() });
+  else _waves.set(store, { depth: 1, change: emptyChange(), touched: new Set() });
 }
 
 /** Close a wave; the outermost close emits ONE `onCatalogChanged` when anything changed. */
@@ -72,7 +77,13 @@ export function endSignalSyncWave(store: SignalStore | null | undefined): void {
   if (!w) return;
   if (--w.depth > 0) return;
   _waves.delete(store);
+  reconcileCollisions(store, w.touched);
   emit(store, w.change);
+}
+
+/** Clear or refresh the collision problems of every name whose owners changed. */
+function reconcileCollisions(store: SignalStore, names: Iterable<string>): void {
+  for (const name of names) reconcileSignalCollision(store, name);
 }
 
 function emit(store: SignalStore, change: SignalCatalogChange): void {
@@ -109,6 +120,7 @@ export function syncSignalSubtree(host: SignalSyncHost, root: Object3D): SignalC
   const store = host.signalStore;
   const registry = host.registry;
   if (!_enabled || !store || !registry) return change;
+  const touched = new Set<string>();
 
   root.traverse((node) => {
     let tracked = trackedSignalOf(store, node);
@@ -130,6 +142,8 @@ export function syncSignalSubtree(host: SignalSyncHost, root: Object3D): SignalC
           // Refresh registry entry, metadata and the snapshot under the new name;
           // `register()` keeps the moved value (the name already exists).
           registerSignal(node, ext.type, ext.data, path, store, registry, tracked.override);
+          touched.add(tracked.name);
+          touched.add(name);
           return;
         }
         tracked = { ...tracked, name };
@@ -144,16 +158,23 @@ export function syncSignalSubtree(host: SignalSyncHost, root: Object3D): SignalC
       // Register the NEW identity first, release the old one after: a pure
       // path move (rename / reparent of an ancestor) then never drops the name,
       // so its value, force pin and subscribers survive the move.
-      registerSignal(node, ext.type, ext.data, path, store, registry, tracked?.override);
+      // The collision check waits for the release: between the two the node
+      // owns its name under BOTH paths, which is not a second component.
+      registerSignal(node, ext.type, ext.data, path, store, registry, tracked?.override,
+        { reportCollision: false });
       store.indexPathSuffixes(path);
       change.registered.push(name);
       if (tracked) release(store, registry, tracked, path, name, change);
+      reportSignalCollisionAt(store, node, name, path, true);
+      touched.add(name);
+      if (tracked) touched.add(tracked.name);
       return;
     }
 
     if (tracked) {
       release(store, registry, tracked, null, null, change);
       setTrackedSignal(store, node, null);
+      touched.add(tracked.name);
     }
   });
 
@@ -164,7 +185,9 @@ export function syncSignalSubtree(host: SignalSyncHost, root: Object3D): SignalC
     w.change.removed.push(...change.removed);
     w.change.metaChanged.push(...change.metaChanged);
     w.change.renamed!.push(...change.renamed!);
+    for (const name of touched) w.touched.add(name);
   } else {
+    reconcileCollisions(store, touched);
     emit(store, change);
   }
   return change;

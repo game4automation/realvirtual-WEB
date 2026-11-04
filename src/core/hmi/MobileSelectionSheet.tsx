@@ -93,7 +93,7 @@ export function MobileSelectionSheet() {
         height: MOBILE_SHEET_HEIGHT, maxHeight: MOBILE_SHEET_MAX_HEIGHT,
         zIndex: LEFT_PANEL_MOBILE_ZINDEX,
         backgroundColor: `${WINDOW_DARK_BG} !important`,
-        borderRadius: '8px 8px 0 0',
+        borderRadius: '4px 4px 0 0',
         display: 'flex', flexDirection: 'column',
         pointerEvents: 'auto',
         pb: 'env(safe-area-inset-bottom, 0px)',

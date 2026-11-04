@@ -1,5 +1,7 @@
 # Component Scripting (JS-in-GLB)
 
+For event-kernel state, timers and continuation, see [DES scripting](doc-des-scripting.md). Scripts in the bundled demo project run without `?scripts`; see [Security and trust](#security-and-trust) for the trust boundary.
+
 > **Applies to:** Community runtime and public extension APIs. Examples of commercial or optional integrations require the corresponding feature or separate product.
 > **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
 > See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
@@ -50,7 +52,7 @@ You do **not** edit `project.json` to make the binding. Open the project in the 
 
 The chip also carries the **state** of the binding, which is the part a JSON edit could never show: bound, loaded, a file that is not there any more, a file with no `registerModelPlugins`/`unregisterModelPlugins` pair, or an error while importing or registering. A binding that used to fail silently in the browser console is now visible on the card.
 
-Over MCP the same write is `web_document_bind(document, field, ref)` — `field` takes `scriptRef` or its aliases `script` / `plugin`, and the binding is cleared when `ref` is omitted.
+Over MCP the same write is `web_execute("document.bind", {document, field, ref})` — `field` takes `scriptRef` or its aliases `script` / `plugin`, and the binding is cleared when `ref` is omitted.
 
 A document points at the module it wants, which may be the plugin file **itself** (`plugins/ribbon-tension-controls-plugin.tsx`). A collecting `plugins/index.ts` that re-exports several plugins is no longer needed and is no longer the recommended shape: one plugin, one file, one `scriptRef`.
 
@@ -74,7 +76,7 @@ npm run build:project-scripts -- <projectDir> --check  # verification between de
 
 `--check` is a *reporting* gate: it never produces an artefact, so it can only be run where the siblings already exist. In a clean project tree there are none — which is exactly why it is not the delivery gate.
 
-The artefact is a **self-contained ES module** (esbuild, `bundle: true`, `format: esm`): it is imported from a Blob URL, which has no directory, so a relative `import './util'` inside it could not resolve. Bare package imports (`three`, `react`, `@mui/material`) stay external and resolve against the viewer's copies.
+The artefact is a **self-contained ES module** (esbuild, `bundle: true`, `format: esm`): it is imported from a Blob URL, which has no directory, so a relative `import './util'` inside it could not resolve. Bare package imports (`three`, `react`, `@mui/material`, `@rv/*`) are left external by the compiler, but the viewer installs **no import map**: a Blob-URL module cannot resolve a bare specifier, so such an import fails at load time. Bundle what you need, or take it from the viewer/plugin context instead of importing it.
 
 **Consent.** Runtime-mode code is unsandboxed JavaScript that arrived with a project folder, so the first time a project wants to run some, the viewer asks once and remembers the answer **per project id**. Without consent the project still opens — only its own code stays off. The global scripting gate (the QuickJS trust gate above) is *not* a permission for this: it governs a different execution path. Build-mode code is not gated — it was compiled into this build from the repository and is as reviewable as the viewer around it.
 
@@ -105,7 +107,7 @@ Script execution is **off by default** for every loaded model. Three things guar
 
 - **Sandbox isolation.** Each script runs in its own QuickJS guest context on a shared runtime. The guest sees only what the SDK's minimal ambient `lib.d.ts` exposes — no `window`, no `fetch`, no DOM, no Node APIs. `Date`, `setTimeout`, `setInterval` and `Math.random` are not exposed at all; using them is a `ReferenceError` at runtime and an explicit lint error at save time (see DES-safety lint below), because they would break the determinism the two simulation kernels rely on.
 - **Resource limits.** The shared runtime enforces a guest heap limit (32 MB, covering *all* script contexts together) and every host→VM call (a tick, a handler invocation, `setup()` itself) runs under a wall-clock interrupt deadline (5 ms by default). A script that runs too long or allocates too much is aborted mid-call.
-- **Trust gate.** Loading a GLB that contains `WebComponent` entries never runs them automatically. The viewer logs how many script components were found and stays inert until scripting is explicitly allowed — via the `?scripts` URL parameter, or programmatically via the plugin's `setAllowScripts(true)`. Toggling the gate off disposes every running instance; toggling it on re-wires the currently loaded model.
+- **Trust gate.** Loading a GLB that contains `WebComponent` entries never runs them automatically. The viewer logs how many script components were found and stays inert until scripting is explicitly allowed — via the `?scripts` URL parameter, or programmatically via the plugin's `setAllowScripts(true)`. Toggling the gate off disposes every running instance; toggling it on re-wires the currently loaded model. One exception: a document of the **bundled demo project** — bytes read unmodified over HTTP, without a redirect, from this origin's own `<base>/demo-realvirtual/` folder and tokened at the fetch itself (a caller cannot name a source) — runs its own scripts without the opt-in, because those files carry the same trust as the viewer code served beside them (`src/core/engine/rv-script-trust.ts`; the log line then reads `execution enabled: bundled demo project`). The same GLB from another origin, a linked or local project folder, a file drop, a stored draft, a document with edits applied, an authoring load or content placed inside the demo document stays behind the gate.
 - **Poison backoff.** If a context is aborted by the interrupt deadline or a memory failure, it is marked poisoned *and* disabled: the disable callback fires once, and every further call returns a structured error without touching the VM again. There is no automatic retry per tick — that would turn a buggy `while (true)` into a poison loop. Re-enabling is an explicit, separate step; after a memory poison the practical fix is to dispose the instance and mint a fresh one with corrected code (which is exactly what a hot-reload does).
 
 Within one running instance, failure isolation is layered further: if `setup()` throws, or the *first* tick's handler throws, the instance disables itself and the rest of the scene keeps running unaffected. A handler failure *after* the first successful tick only logs a warning — unless the script itself declares an `onError` handler and asks to keep running (see below).
@@ -160,7 +162,7 @@ type ErrorPhase =
   'fixedUpdate' | 'hook' | 'signal' | 'message' | 'reset' | 'routing' | 'snapshot';
 ```
 
-- **`continuous.fixedUpdate(dt)`** — runs every 60 Hz simulation tick, before the frame's drive physics settle (`WebComponentPlugin` calls it from `onFixedUpdatePre`). This is the tick-polling path; it only exists in the continuous kernel (see [DES-safe scripting](#writing-des-safe-scripts) below).
+- **`continuous.fixedUpdate(dt)`** — runs every 60 Hz simulation tick, before the frame's drive physics settle (`WebComponentPlugin` calls it from `onFixedUpdatePre`). In DES it is display-only and runs only with animation; see [Time model](#time-model).
 - **`continuous.lateFixedUpdate(dt)`** — an optional second continuous pass, run after drive physics and transport for the tick (`onFixedUpdatePost`).
 - **`des.canAccept(mu, port)` / `des.onAccept(mu, port)` / `des.onDownstreamReady(port)`** — the same three-call contract every material-flow station uses: back-pressure probe, hand-off, and "a blocked output freed up" notification. Present in both kernels; the continuous kernel's ports/flow backend answers these the same way a native station would.
 - **`des.on(hook, mu, data)`** — fires for every due event previously scheduled with `self.in` / `self.at` / `self.every`, in *both* kernels (the continuous kernel drains its own timer heap on every tick; the event kernel dispatches the same hooks through its scheduler). This is the event-driven backbone a DES-safe script is built from.
@@ -173,40 +175,66 @@ type ErrorPhase =
 
 ### Snapshot / restore — persisting script state
 
-When the DES workspace saves a snapshot, the engine captures each script
-component's seeded `self.random()` position and FSM state automatically — but
-it cannot see **free closure variables** inside your `setup()` scope. The
-**only supported channel** for persistent script state is the hook pair:
+See [DES snapshot developer contract](doc-des-snapshot.md) for participants, preflight and restore limits.
+
+Call `self.persist(initial)` once during setup to declare runtime state. Keep the
+returned live object; restore replaces its contents in place. Initial and captured
+values must be plain JSON contract data: no functions, handles, aliases, cycles,
+accessors, sparse arrays, reserved `$map`/`$set`/`$num` keys, non-finite numbers or `-0`.
 
 ```js
 function setup(self) {
-  let count = 0;
-  let nextCycleAt = 0;
+  const st = self.persist({ count: 0 });
+  self.in(5, 'cycle');
   return {
-    des: { on(hook) { count++; nextCycleAt = self.now + 5; self.at(nextCycleAt, 'cycle'); } },
-    onSnapshot() { return { count, nextCycleAt }; },       // any JSON value
-    onRestore(s) { count = s.count; nextCycleAt = s.nextCycleAt; self.at(nextCycleAt, 'cycle'); },
+    des: { on(hook) {
+      if (hook !== 'cycle') return;
+      st.count++;
+      self.in(5, 'cycle');
+    } },
   };
 }
 ```
 
-Rules:
+The snapshot also preserves seeded RNG position, FSM state, pending hook events
+and `self.every` timer data and IDs. Do not re-arm timers in `onRestore`: doing so
+duplicates restored events. `onSnapshot()` / `onRestore(state)` remain a synchronous
+legacy facade with separately validated data; they do not exempt closure state
+from the AST check. `self.prop` is read-only configuration; use `self.persist` for
+runtime state.
 
-- `onSnapshot()` returns a JSON-serializable value; it is stored in the DES
-  snapshot and handed back to `onRestore(state)` after a load. Both hooks are
-  synchronous — never `await` inside them (the restore is atomic by design).
-- **Pending timers do not survive a restore.** Store the ABSOLUTE due time of
-  anything you scheduled (`self.now + delay`) in `onSnapshot()` and re-arm it
-  with `self.at(time, hook)` in `onRestore()` — that continues the run exactly
-  where it left off.
-- The `self.random()` stream position and the `self.setState()` FSM state are
-  restored BEFORE `onRestore()` runs, so randomness continues seamlessly.
-- **`self.prop` is read-only configuration.** Inside the sandbox, `self.prop`
-  is a VM-local copy of the `WebComponent` extras — writes to it are never
-  marshalled back to the host and are NOT persisted in snapshots. Use
-  `onSnapshot`/`onRestore` for runtime state instead. (The DES-safety lint
-  flags mutated closure variables in scripts without an `onSnapshot` hook as a
-  reproducibility warning.)
+Timers: use `self.in`, `self.at` and `self.every` only. Pending slices are saved with the
+event queue; keep the id returned by `self.every` in the persist object if you need to
+cancel it. `setTimeout`, `setInterval`, `Date` and `Math.random` are not available, and
+`dt` countdowns in `continuous.fixedUpdate` must not drive DES state.
+
+Not saved: callbacks registered after setup, script KPI statistics (`statState`
+statistics) and `self.prop` writes. Register callbacks in `setup`.
+
+Conversion pattern (closure variable to persisted state):
+
+```js
+// refused: des-script-undeclared-state
+let count = 0;
+function setup(self) { return { des: { on() { count++; } } }; }
+
+// accepted
+function setup(self) {
+  const st = self.persist({ count: 0 });
+  return { des: { on() { st.count++; } } };
+}
+```
+
+Complete example: `examples/scripts/des-counter-persist.js` (persist object, `self.every`
+timer id, no re-arming). For the user-facing page see "Saving and Restoring a Run" in the
+DES documentation.
+
+The Acorn AST gate refuses undeclared setup/module state, captured mutable locals,
+factory-created handlers and writes to global or captured properties. Use literal
+handlers with constants, `self`, their own locals and the persist object. Resolve
+SDK handles inside handlers rather than storing them in setup bindings. In DES
+mode `des-script-undeclared-state` is an error and the script is not bound; each
+finding gives a line and the hint `use self.persist(...)`.
 
 ### Hot reload is always cold
 
@@ -221,12 +249,13 @@ Everything a script can do goes through `self`, the single argument to `setup`. 
 | Member | Description |
 |---|---|
 | `self.name` | The component node's leaf name. |
-| `self.path` | Full hierarchy path of the component node (also the seed source for `self.random()`). |
+| `self.path` | Full hierarchy path of the component node (also the default RNG v1 script seed source). |
 | `self.self` | A `NodeHandle` for the component's own node. |
 | `self.state` / `self.setState(name)` | A free-form state string, readable by other script components via `component(path).state` and mirrored into per-component statistics. Separate from `statState()` — the FSM phase never pollutes the utilization statistics. |
-| `self.prop` | The `{ [key]: PropValue }` bag of extra fields on the `WebComponent` entry (numbers, strings, booleans, or `null`). **Read-only configuration** — writes stay VM-local, never reach the host and are not persisted; use `onSnapshot`/`onRestore` for runtime state. |
+| `self.persist(initial)` | Call once during setup; returns the live JSON state object restored in place. |
+| `self.prop` | The `{ [key]: PropValue }` bag of extra fields on the `WebComponent` entry (numbers, strings, booleans, or `null`). **Read-only configuration** — writes stay VM-local, never reach the host and are not persisted; use `self.persist(...)` for runtime state. |
 | `self.now` | Virtual simulation time in seconds — advances only through ticks (continuous) or the event scheduler (DES kernel). Never wall-clock. |
-| `self.random()` | A seeded PRNG (mulberry32), seeded from `self.path` by default — the same component path always produces the same sequence, in either kernel. There is no `Math.random()` in the sandbox. |
+| `self.random()` | Mulberry32: v1 defaults to a path-derived seed; DES v2 derives the seed from masterSeed, component id and purpose `script`. The same model, run seed and draw order reproduce the sequence. Setup draws and scripts created after start retain their initial seed until the next applicable reset/start. See [DES randomness](doc-des-randomness.md#script-rng-contract-v5). There is no `Math.random()` in the sandbox. |
 | `self.enabled` | `false` once `self.disable(reason)` has been called on this instance. |
 | `self.disable(reason)` | Disables the instance from within the script itself. |
 | `self.log(...)` / `self.warn(...)` / `self.error(...)` | Debug-log sinks (console-backed by default), prefixed with the component's node path. |
@@ -295,7 +324,7 @@ On a node beneath your sequence, author both `LogicStep_JavaScript: { Active: tr
 
 The sequence activates the step. The script reads `self.logicStep(self.path)` and calls `complete()` when its work is done. The sequence then advances. `runId` increases on each start, allowing the script to recognize a new cycle even when the sequence restarts within one frame. A disabled or failed script leaves the step waiting instead of silently advancing.
 
-The complete [random Source example](examples/scripts/random-source-step.js) uses `self.random()` to generate 1–3 parts, spaces them by 0.3 simulation seconds, retries when the Source is capped, and completes the step after the final part. Keep the Source's independent interval and automatic generation disabled when the script should be its sole trigger. The saved Festo sequence continues to generate exactly three parts; this example is optional.
+The complete [random Source example](examples/scripts/random-source-step.js) uses `self.random()` to generate 1–3 parts, spaces them by 0.3 simulation seconds, retries when the Source is capped, and completes the step after the final part. Keep the Source's independent interval and automatic generation disabled when the script should be its sole trigger. The saved pick-and-place sequence continues to generate exactly three parts; this example is optional.
 
 ### Signals
 
@@ -312,7 +341,7 @@ self.setSignals({ ConveyorStart: true, ConveyorSpeed: 200 });  // bulk write
 
 ```ts
 self.in(delaySec, hook, mu?, data?): number;   // relative delay, returns an event id
-self.at(timeSec, hook, mu?, data?): number;    // absolute virtual time
+self.at(timeSec, hook, mu?, data?): number;    // absolute virtual time (event kernel: < self.now throws)
 self.every(intervalSec, hook, data?): number;  // recurring, auto re-scheduled
 self.cancel(eventId): void;                     // cancels a pending self.in/at/every event
 ```
@@ -379,13 +408,13 @@ Typical routing pattern — a static routing table plus a station reservation:
 
 ```js
 function setup(self) {
-  var routeTo = { M: 'B' };                  // junction path id → chosen successor id
+  const st = self.persist({ routeTo: { M: 'B' } });                  // junction path id → chosen successor id
   self.paths.claim('LoadingBay');            // reserve a zone for this station
   return {
     routing: {
-      selectNextPath: function (ids, ctx) { return routeTo[ctx.currentPathId]; },
+      selectNextPath: function (ids, ctx) { return st.routeTo[ctx.currentPathId]; },
       onArrive: function (pathId, agvId) { /* track progress */ },
-      requestDispatch: function (agvId) { /* assign the next order, e.g. update routeTo */ },
+      requestDispatch: function (agvId) { /* assign the next order, e.g. update st.routeTo */ },
     },
   };
 }
@@ -499,23 +528,68 @@ Plus `self.DEG2RAD`, `self.RAD2DEG`, and `self.clamp(x, lo, hi)`.
 
 The sandbox deliberately does not expose `Date`, `Math.random()`, `setTimeout`, or `setInterval` — none of these exist inside the VM. Time comes only from `self.now` (virtual sim time) and randomness only from the seeded `self.random()`. This is what makes a script reproducible run-to-run and portable between the continuous kernel (real-time ticks) and the event kernel (time jumps between events) without behavior drift.
 
+## Time model
+
+In continuous mode, Model-Scripts (`WebComponent`) use the frame clock. In every DES run (animated, fast-forward or batch, including every replication), `self.now` and `self.in` / `self.at` / `self.every` use the DES event clock. Each run or replication rebuilds every script from its initial state, including persist, FSM and timers. With RNG v2, the run seed is derived from the master seed and script address and is available already in `setup()`; legacy v1 keeps path-based seeding. After run end, instances keep their end state until rebind or unbind, so final KPI values remain readable.
+
+During DES, `fixedUpdate` and `lateFixedUpdate` run only with animation (animated, hybrid or step), never in fast-forward or batch. They are display-only: SDK reads and logging are allowed; state-changing SDK calls throw `des-frame-hook-write`, with one warning per script instance. `self.random()` draws made in a frame hook are rolled back. Guest-local writes to persist or closure variables are **not prevented**: authors must not change them in frame hooks. The `fixed-update` lint warns about this pattern; put state and KPI changes in DES events.
+
 ## Writing DES-safe scripts
 
 A script is *DES-safe* when its only source of "doing things over time" is the event backbone (`self.in`/`self.at`/`self.every`, `sensor.on`, `signal.on`, `des.on`) rather than polling `continuous.fixedUpdate` every tick. DES-safe scripts run identically fast whether the model is being watched in real time or fast-forwarded through a headless event-based run.
 
-The build-time save pipeline runs a text-based lint (`rv-des-lint`) over every script before it is allowed to swap in:
+The save pipeline runs text rules and a lazy Acorn AST state check (`rv-des-lint`) over every script before it is allowed to swap in:
 
 | Rule | Trigger | Severity |
 |---|---|---|
-| `fixed-update` | A `continuous.fixedUpdate` handler is declared at all. | Warning (component is continuous-only); **error** if the component declares `DesSafe: true`. |
+| `fixed-update` | A `continuous.fixedUpdate` handler is declared at all. | Warning (display-only in DES); **error** if the component declares `DesSafe: true`. |
 | `dt-accumulation` | A `dt`-accumulation pattern (`x -= dt`, `x += dt`, `x = x - dt`) — a tick-polled timer that silently never fires in the event kernel. | Warning; **error** with `DesSafe: true`. Use `self.in(delaySec, hook)` instead. |
 | `blocked-global` | `Date`, `Math.random()`, `setTimeout()`, `setInterval()` used anywhere in the code. | Always **error** — these are not exposed in the sandbox at all; the message explains why instead of leaving a bare `ReferenceError`. |
-| `closure-state` | A `let`/`var` declared in the `setup()` closure and reassigned later — state that is silently **lost** on a DES snapshot/restore. Suppressed entirely when the script declares an `onSnapshot` hook; `for (let i = …)` loop counters are exempt. | Always **warning**, never escalated — legitimate transient locals would otherwise break the save gate. |
+| `des-script-undeclared-state` | Undeclared setup/module or captured state, factories, global/property writes. Legacy hooks do not exempt a script. | Warning, including at DES binding; **error** with `DesSafe: true`. Snapshot capture/restore refuses it. Use `self.persist(...)`. |
 | `geometry-sampling` | `worldPosition()` / `worldQuaternion()` / `worldDirection()` used in a component that also declares a `des:` block. Such a script needs the runner's per-event-time tween settle to read exact positions — which is handled, but keeps the FastForward settle fast path off for the **whole model**. | Always **warning**, never escalated. Prefer carrying positions in event data. |
 
-Setting `DesSafe: true` on the `WebComponent` entry is an author claim, checked (not proven) by this rule set. It escalates **only** `fixed-update` and `dt-accumulation` from advisory warnings to hard save-blocking errors — `blocked-global` is already an unconditional error, and `closure-state` / `geometry-sampling` stay advisory in every configuration. That escalation is the intended way to keep a station script honest as it evolves.
+Setting `DesSafe: true` escalates tick polling and undeclared state to save-blocking
+errors. Without that claim, undeclared-state warnings allow execution on the DES
+clock, but snapshot capture/restore refuses them. Geometry sampling remains advisory.
 
-The turntable example below (see [Complete examples](#complete-examples)) shows the idiomatic split: `continuous.fixedUpdate` drives the plain real-time state machine (a rotary axis moving under real physics has no other sensible representation), while the exact same instance also declares `des.canAccept`/`des.onAccept`/`des.on` so the *same* script runs as a proper DES station when an event-based runner is present — computing its own duration with `self.in(...)` instead of counting frames.
+### Fast-forward settle gate
+
+In FastForward the DES runner settles every running tween at each new event time only while
+something may read live geometry. A Model-Script turns this per-event settle on only when
+(plan-2212 Phase 4b):
+
+- it declares `des: { samplesLiveGeometry: true }` (explicit opt-in — always settle), or
+- a conservative static check (`desScriptMayReadLiveGeometry`, Acorn) cannot prove the source
+  geometry-free.
+
+The check proves "geometry-free" only when all of these hold:
+
+- `setup` is declared exactly once as a top-level `function setup(self)` or
+  `const|let|var setup = function|arrow`, and the name `setup` occurs nowhere else;
+- every use of `self` (and of setup's first parameter) is a plain, non-computed member access to
+  one of `now`, `in`, `at`, `every`, `cancel`, `statValue`, `statState`, `statOutput`,
+  `statCycleStart`, `statCycleEnd`, `persist`, `state`, `setState`, `prop`, `random`, `name`,
+  `path`, `enabled`, `disable`, `log`, `warn`, `error`, `raiseError`, `clearError`, `sink`,
+  `component`, `broadcast` and the math helpers (`vec3`, `quat`, `mat4`, `aabb`, `DEG2RAD`,
+  `RAD2DEG`, `clamp`) — `sink` / `component` only as a direct call;
+- handles stay opaque: every hook, callback and station argument (hydrated MUs, ports, message
+  data), every `self.sink(...)` / `self.component(...)` result, every member read of one
+  (`mu.id`, `mu.prop.sku`) and every call result of one (`s.on(cb)`, `p.occupied()`) may only be
+  compared (`===`, `!==`, `==`, `!=`), tested (`if (s)`, `s &&`, `!s`, `typeof`), read further
+  member by member, called, used as a bare statement or bound with `const`. Passing one to any
+  function (also `self.log` / `self.statValue`), spreading, returning, storing (also
+  `st.l.push(mu.id)`), iterating, templating or destructuring it keeps the settle on, and so does
+  writing a member of one (`p.copy = ...`, `mu.n++`, `delete mu.x`);
+- the source has no dynamic member access or key, no `.node` / `.partner` / `.worldAngle` /
+  node-handle read / `position` / `direction` / `constructor` / `prototype` / `toJSON` /
+  `valueOf` / `__*` name, no
+  `onSignal` handler, and no `this`, `with`, `import()`, `globalThis`, `eval`, `Function`,
+  `arguments` or reflection (`JSON`, `Object`, `Reflect`, `Proxy`, `structuredClone`, `Symbol`).
+
+Anything else keeps the settle on: a needless settle costs time, a missing one would return
+stale positions. The typical monitor (`self.sink(...).on` + `self.every` + `self.statValue` on
+its own counters, MU fields only compared) runs without it; a monitor that stores or logs
+`mu.id` keeps the settle on.
 
 ## The script editor
 
@@ -540,19 +614,16 @@ A sensor-triggered gate: a part occupies a sensor, the gate's drive swings open,
 
 ```js
 function setup(self) {
-  var drive = self.drive('Gate/Drive');
-  var gate = self.sensor('Gate/Sensor');
-  if (!drive || !gate) return self.disable('missing references');
-
-  var processed = 0;
+  const st = self.persist({ processed: 0 });
   self.setState('idle');
 
-  gate.on(function (occ) {
+  self.sensor('Gate/Sensor').on(function (occ) {
+    const drive = self.drive('Gate/Drive');
     if (occ && self.state === 'idle') {
       self.setState('processing');
       drive.moveTo(90);
       var t = self.prop.ProcessTime || 1;
-      self.in(t, 'done', { id: processed + 1 });
+      self.in(t, 'done', { id: st.processed + 1 });
     }
   });
 
@@ -560,10 +631,10 @@ function setup(self) {
     des: {
       on: function (hook, mu, data) {
         if (hook === 'done') {
-          processed++;
+          st.processed++;
           self.signal('Gate.Done').set(true);
-          self.setSignals({ 'Gate.Processed': processed });
-          drive.moveTo(0);
+          self.setSignals({ 'Gate.Processed': st.processed });
+          self.drive('Gate/Drive').moveTo(0);
           self.setState('idle');
         }
       },
@@ -576,70 +647,34 @@ This is fully DES-safe: it never touches `continuous.fixedUpdate`; all timing go
 
 ### A turntable (open angle math, snap-graph ports)
 
-A rotary turntable that aligns to whichever conveyor is waiting, receives the part, rotates to a free output and discharges — the angle math is computed live from world positions rather than hard-coded per port, and the same instance answers both kernels' contracts.
+A DES turntable computes its rotation duration inside the accepting handler and
+persists only the selected output ID. Ports and drive handles remain local.
 
 ```js
 function setup(self) {
-  const V = self.vec3, drive = self.drive('Drive-Rot-Y'), sensor = self.sensor('Sensor'), belt = self.belt('Transport');
-  if (!drive) return self.disable('no rotary drive');
-
-  // Rotation axis + a deterministic (u,v) basis perpendicular to it — computed once.
-  const axis = V.normalize(drive.node.worldDirection(V(0, 1, 0)));
-  const ref  = Math.abs(axis.x) > 0.9 ? V(0, 0, 1) : V(1, 0, 0);
-  const u    = V.normalize(V.cross(axis, ref));
-  const vAx  = V.cross(axis, u);
-
-  // Open angle calculation: project the centre→port direction onto the (u,v) plane.
-  const angleToPort = (port) => {
-    const dir = V.normalize(V.sub(port.node.worldPosition(), self.self.worldPosition()));
-    return Math.atan2(V.dot(dir, vAx), V.dot(dir, u)) * self.RAD2DEG;
-  };
-
-  let clearTimer = 0, selectedOut = null;
-  self.signal('Flow.Run').set(true);
+  const st = self.persist({ selectedOut: null });
   self.setState('idle');
-
-  sensor?.on((occ) => {
-    if (occ && self.state === 'receiving') {
-      const out = self.freeOutputs()[0];
-      if (!out) return self.setState('holding');
-      selectedOut = out.id; drive.moveTo(angleToPort(out)); self.setState('rotating_out');
-    } else if (!occ && self.state === 'discharging') {
-      clearTimer = 0.5; self.setState('discharge_clearing');
-    }
-  });
-
   return {
-    continuous: {
-      fixedUpdate(dt) {
-        switch (self.state) {
-          case 'idle':
-            belt?.run(false);
-            if (self.signal('Flow.Run').bool) {
-              const p = self.inputs().find((x) => x.upstreamWaiting());
-              if (p) { drive.moveTo(angleToPort(p)); self.setState('aligning_in'); }
-            }
-            break;
-          case 'aligning_in':  if (drive.isAtTarget) { self.setState('receiving');  belt?.run(true); } break;
-          case 'rotating_out': if (drive.isAtTarget) { self.setState('discharging'); belt?.run(true); } break;
-          case 'discharge_clearing':
-            clearTimer -= dt; if (clearTimer <= 0) { belt?.run(false); self.setState('idle'); }
-            break;
-        }
-      },
-    },
     des: {
       canAccept: (mu, port) => self.currentLoad < 1 && self.state === 'idle',
       onAccept(mu, port) {
         const out = self.freeOutputs()[0];
         if (!out) { self.setState('holding'); return true; }
-        selectedOut = out.id;
-        self.in(Math.abs(angleToPort(out)) / (self.prop.RotationSpeed ?? 45), 'rotated', mu);
+        const V = self.vec3;
+        const drive = self.drive('Drive-Rot-Y');
+        const axis = V.normalize(drive.node.worldDirection(V(0, 1, 0)));
+        const ref = Math.abs(axis.x) > 0.9 ? V(0, 0, 1) : V(1, 0, 0);
+        const u = V.normalize(V.cross(axis, ref));
+        const v = V.cross(axis, u);
+        const dir = V.normalize(V.sub(out.node.worldPosition(), self.self.worldPosition()));
+        const angle = Math.atan2(V.dot(dir, v), V.dot(dir, u)) * self.RAD2DEG;
+        st.selectedOut = out.id;
+        self.in(Math.abs(angle) / (self.prop.RotationSpeed ?? 45), 'rotated', mu);
         self.setState('rotating_out'); return true;
       },
       on(hook, mu) {
         if (hook === 'rotated') {
-          self.transfer(mu, self.outputs().find((p) => p.id === selectedOut));
+          self.transfer(mu, self.outputs().find(p => p.id === st.selectedOut));
           self.setState('idle');
         }
       },
@@ -647,8 +682,6 @@ function setup(self) {
   };
 }
 ```
-
-Note the honest limit here: `continuous.fixedUpdate` makes this component's real-time behavior continuous-only by the DES lint's own rule (a) — it is deliberately *not* claimed `DesSafe: true`. The `des` block lets the exact same script also run correctly under an event-based runner; the two code paths share the angle math and the port/state vocabulary, but the physical rotation itself is only simulated tick-by-tick in the continuous kernel.
 
 ### A supervisory cell coordinator
 
@@ -755,12 +788,30 @@ Booting sends `start` to every worker (delivered on each worker's next tick, so 
 | `self.downstreamOccupied(port?)` / `self.downstreamCanAccept(mu, port?)` | `=> boolean` |
 | `self.transfer(mu, fromPort?)` / `self.spawn()` | — / `=> MU` |
 | `self.mus` / `self.currentLoad` | `ReadonlyArray<MU>` / `number` |
-| `self.statState(name)` / `self.statOutput(n?)` / `self.statCycleStart()` / `self.statCycleEnd()` | Statistics sink |
+| `self.statState(name)` / `self.statOutput(n?)` / `self.statCycleStart()` / `self.statCycleEnd()` | Material-flow kernel utilization/throughput statistics; do not create hub rows |
+| `self.statValue(key, value, unit?, group?)` | `=> void` — row in Statistics → Scripts; `value: number \| string \| null` |
 | `self.paths.list()` / `self.paths.get(id)` / `self.paths.successors(id)` | Path-graph queries (`PathDesc` plain JSON, mm lengths) |
 | `self.paths.claim(zoneId, holderId?)` / `.release(...)` / `.isHolder(...)` | Zone reservation (shared with the AGV traffic control) |
 | `self.component(path)` | `=> ScriptComponentHandle \| null` |
 | `self.broadcast(topic, data?)` | `=> number` (receiver count) |
 | `self.connection(type)` | `=> ConnectionHandle` — `.call(params?, onReply?) => number` (delivered count) |
+
+### `self.statValue` — Statistics window rows
+
+`self.statValue(key, value, unit?, group?)` shows a row in the **Statistics** window's
+**Scripts** section. The last value for each key within a script instance wins. Rows group
+by `group`, or by the script's node path when omitted (enable **Group by group** in the
+window). Units are display-only. `value` must be `number | string | null`; anything else
+throws. Rows disappear with the script instance, including hot reload and model clear.
+
+```javascript
+self.statValue('Waiting', self.currentLoad, 'items', 'Dispatch');
+self.statValue('Status', 'Ready'); // grouped under this script's node path
+```
+
+`statState`, `statOutput` and `statCycle*` remain the material-flow kernel's
+utilization/throughput statistics API, unchanged; they do not create hub rows. For plugin
+and GLB-component contributions, see [Statistics contributions](doc-extending-webviewer.md#8e-statistics-contributions-plan-2011).
 
 ### Handlers — the returned object
 
@@ -779,6 +830,157 @@ Booting sends `start` to every worker (delivered on each worker's next tick, so 
 | `onRequest` | `(topic, params, reply) => void` — `reply` callable exactly once | `'hook'` |
 | `onSnapshot` / `onRestore` | `() => unknown` / `(state: unknown) => void` — both synchronous | `'snapshot'` |
 | `onError` | `(err: unknown, phase: ErrorPhase) => boolean \| void` | — |
+
+## Parametric part families (plan-650, preview)
+
+A **parametric part family** is a document whose node carries a `ParametricComponent`: base
+parts, a parameter schema and a small JavaScript *rule part*. Changing a value builds a new
+**variant** from the same base parts — duplicated, stretched, bent and positioned — and bakes it.
+It is the second, much narrower use of QuickJS next to script components: the rule part is a
+**pure function** run once per variant, never during the simulation. The authoring recipe for
+agents is `web_help("parametric")` (`src/plugins/mcp-bridge/help/parametric.md`); reference
+rules are `examples/parametric/rm8110.js`, `rm8120.js` and `aluprofile.js`. The schema entry is
+`schema/v1/specification.md` § 7a.67.
+
+> **Preview.** `ParametricComponent` is not authorable from the Add Component menu yet
+> (`PARAMETRIC_AUTHORABLE = false` in `src/core/engine/rv-parametric-component.ts`). Families are
+> created with `web_editor_parametric_define`; everything else (inspector mask, placement
+> parameters, share bundle) is live.
+
+### Data model
+
+```
+<Family node>  [ParametricComponent: ApiVersion, Params, Values, Code, CodeHash,
+ │                                   PartsRoot?, GeneratedRoot?, BakedInputHash?, Uses?]
+ ├─ _Parts       (PartsRoot — the base parts, each direct child is one part; hidden)
+ └─ _Generated   (GeneratedRoot — the baked variant for Values)
+```
+
+- `Params[]` — `{Name, Label?, Type: number|int|bool|enum, Unit?: mm|deg|'', Min?, Max?, Step?,
+  Enum?, Default}`. Signal types are refused as parameters.
+- `Values` — the values of the variant baked into `_Generated`. Before every run they are
+  **normalized**: default filled in, `int` rounded, snapped to `Step`, clamped to `Min`/`Max`; an
+  `enum` value outside `Enum` is an error, never silently clamped.
+- `Code` defines `function generate(values, parts)`; `parts` is `[{name, boundsMm:{min,max}}]`.
+- `Uses[]` — declared child families `{Family, FamilyNodeId, DocHash, Path?}` (see *Nested
+  families*).
+
+### Generator sandbox and budgets
+
+`src/core/engine/rv-parametric-generator.ts` owns its **own QuickJS runtime** (separate from
+`RVScriptHost`, so a generator never evicts running scripts): 16 MB heap, 512 KB stack, a fresh
+context per run with no `self`, no host functions, `Date` and `Math.random` removed. A wrapper
+calls `generate`, serializes the result with `JSON.stringify` **inside the VM** and checks its
+length (≤ 2 MB) — all under the same interrupt budget. The binding budget is **400 interrupt
+ticks** (`limit-ticks`); the 200 ms wallclock deadline is only an emergency brake
+(`limit-deadline`). The host parses the string and validates the structure: finite numbers,
+≤ 5000 instances, ≤ 2000 nodes, ≤ 500 components, ≤ 100 messages, ≤ 64 children, strings
+≤ 256 characters, depth ≤ 8, ≤ 16 stretches per instance, ≤ 2 M generated vertices. There is
+**no trust gate** — the sandbox has nothing to reach. Every failure is a visible error; the
+previous variant stays.
+
+The build plan the rule part returns:
+
+```js
+{ instances:  [{ part, name?, positionMm, rotationDeg?, stretch?: [{ axis, atMm, byMm }],
+                 bend?: { axis, radiusMm, centerSide, pivot?: 'start' | 'center' } }],
+  nodes?:      [{ name, positionMm, rotationDeg? }],     // Snap-*, markers
+  components?: [{ node, type, fields }],                 // validated against the registry schemas
+  children?:   [{ family, values, positionMm, rotationDeg? }],
+  messages?:   [{ level: 'info' | 'warning', text }] }
+```
+
+### Assembly
+
+`src/core/engine/rv-parametric-assembly.ts` turns the plan into the `_Generated` subtree.
+Instances without stretch **share** the base part's geometry. `stretchGeometry` shifts every
+vertex beyond the plane by `byMm` and checks the contract: every triangle crossing the plane must
+contain the stretch axis, and a shortening must stop before the nearest shifted vertex — else
+`stretch-plane-invalid`, never a silent normal recompute. `bendGeometry` maps a straight part onto
+an arc (≤ 2° per segment, stretch runs first); `pivot: 'center'` puts the arc centre at the
+instance origin, which a `Radial` `TransportSurface` needs. Coordinates are parts-local
+millimetres (SolidCraft axes, Z up); the family converts once (−90° about X, 0.001). Components
+with unknown types or fields, signal slots or a nested `ParametricComponent` are refused; a field
+pointing across a child boundary (`_Children/…`) is `parametric-cross-reference`.
+
+### Hash contract
+
+One hash (`src/core/engine/rv-parametric-hash.ts`, canonical JSON + SHA-256):
+`InputHash = sha256({ApiVersion, CodeHash, Values (normalized), PartsHash[, Uses]})`.
+`PartsHash` covers every base part's `{name, localMatrix, geometryHash, materialKey}` — renaming,
+moving or recolouring a base part changes it. `Uses` enters only when non-empty, so families
+without children keep their hash. `BakedInputHash` is the `InputHash` of the variant baked into the
+file; "unchanged" means `InputHash == BakedInputHash`, and then no code runs at all.
+
+### Editor path
+
+`web_editor_parametric_set` and the inspector mask run `regenerateParametric`
+(`src/core/editor/rv-parametric-regenerate.ts`): generator → assembly → GLB of `_Generated` →
+`putCadGlb` (converter `'parametric'`, `sha256 = InputHash`, `quality = 'param-v1'`) → one
+`composite` op (`deleteNode(_Generated)` + `importCad` + `reparentNode` under the family +
+`transformNode` + `setField(Values, BakedInputHash)`). One undo step; draft replay reads the same
+cache triple. Manual attaches under `_Generated` are refused (`parametric-manual-attach`). The
+editor never bakes and keeps `_Parts`.
+
+### Variant cache (placements)
+
+Values live **per placement** in
+`AssetOverrides.byAddress["#<familyNodeId>"].ParametricComponent.Values` (an old `byNodeId` record is read as `#<id>`).
+`PlacementInstancer.resolveBaked(ref, { overrides })` — used by place, copy, restore/undo and
+nested references alike — normalizes them and asks `ModelCache` for a variant. The base key stays
+unchanged; the variant key is derived internally as `<bakedKey>#param:<inputHash>` (combinable
+with `#split:`). Each variant bakes from its own freshly decoded tree. Before `prepareAndBake` an
+awaited step looks the variant up in the browser CAD-GLB cache (hit → no generator run), else runs
+generator + assembly and stores the result. A `ParametricComponent` pre-bake hook **always removes
+`_Parts`** — in the main model and in every placement. Equal values share one `BakedAsset`.
+Limits: 16 unreferenced variants per asset (LRU, a referenced one is never evicted), 64 distinct
+variants per scene (`parametric-variant-budget`). An invalidation of the base asset during a run
+discards the result (epoch check). Nothing is written to the project — the cache is pure
+acceleration.
+
+**Standstill invariant:** the generator never runs while the simulation runs (`state ===
+'detached'`, or `'paused'` with `simTime === 0` and DES render clock 0). A change made while the
+simulation runs is deferred (`parametric-deferred`; the mask shows "Applied when the simulation
+stops").
+
+### Commands
+
+| Command / tool | Where | Does |
+|---|---|---|
+| `web_editor_parametric_define(path, paramsJson, code, valuesJson?, partsRoot?)` | asset editor | writes the component and builds the first variant, one undo step |
+| `web_editor_parametric_set(path, valuesJson)` | asset editor | partial values → normalize → regenerate, one undo step |
+| `web_editor_parametric_inspect(path, valuesJson?, runGenerator?)` | read | values, hashes (`upToDate`), parts, build plan or generator error |
+| `layout.setParams` `{id, values, family?}` | layout planner, `web_execute` | writes the placement overrides and swaps the variant (the new variant bakes first, the old instance stays on error); undo/redo, sequence-numbered — a stale result is dropped |
+| `editor.parametricUse` `{path, family, glbUrl?, familyNodeId?, docHash?, assetPath?, remove?}` | asset editor, `web_execute` | adds, replaces or removes a `Uses` entry (≤ 32), reading `FamilyNodeId` + `DocHash` from `glbUrl`; one undo step including the regenerate |
+
+`layout.setParams` and `editor.parametricUse` have no MCP mirror by design (plan-641: new
+capabilities arrive as commands).
+
+### Nested families
+
+`children[]` places other families. The assembly emits one **empty, non-embedded
+`AssetReference` node** per child (`_Generated/_Children/<i>`, NodeId
+`<familyNodeId>:_Children:<i>`) carrying the child values as overrides (`byAddress`); the normal
+`PlacementInstancer` materializes it as a nested placement after the parent (see
+[doc-node-paths.md](doc-node-paths.md) § 9). Child content never enters the parent bake. A child
+must be declared in `Uses` (`parametric-undeclared-child`); `DocHash` is the SHA-256 of the child
+document's bytes. Limits per outermost placement: parametric depth ≤ 4 (`parametric-depth`),
+cycles refused (`parametric-cycle`), ≤ 256 child placements and ≤ 2 M baked vertices
+(`parametric-budget`) — each leaves a placeholder plus a problem, the rest stands. A warm load
+reads the child list from the cached `_Generated` GLB: zero generator runs.
+
+### Share bundle
+
+`src/core/engine/rv-parametric-bundle.ts` + `src/core/editor/rv-parametric-share.ts`: a share
+export (`exportAssetGlb` **with** share meta — plain save and GLB export stay byte-identical) packs
+all child families flat and transitively as bufferViews, manifest
+`asset.extras.realvirtual.parametricChildren`. A child whose bytes no longer match its `DocHash`
+is not bundled but reported (`parametric-child-missing`, phase `export`). Importing the GLB
+(`importObject` → `library/imports/`) unpacks the children **before** the weld into the project
+library (`Path` if it is a `library/…glb`, else `library/parametric/<Family>.glb`, suffix `-2` on
+a collision; a family the project already resolves is never overwritten) and adds manifest rows
+with `id = Family`. Known gap: opening a share link directly, without import, does not resolve
+children from the bundle yet — the parent stands, the child reports `parametric-child-missing`.
 
 ## See also
 

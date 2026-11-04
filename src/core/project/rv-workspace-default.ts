@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage } from '../rv-safe-storage';
+
 /**
  * rv-workspace-default — the "Browser project", the home every document has
  * (plan-716 §2.2, F2).
@@ -84,7 +86,7 @@ export function isWorkspaceDefaultBackend(
  */
 export function workspaceDefaultExists(): boolean {
   try {
-    return localStorage.getItem(browserManifestKey(WORKSPACE_DEFAULT_PROJECT_ID)) !== null;
+    return readLocalStorage(browserManifestKey(WORKSPACE_DEFAULT_PROJECT_ID)) !== null;
   } catch {
     // Private mode / storage disabled. "Not there" is the safe answer: the
     // caller then tries to write it, and that write fails softly too.
@@ -96,7 +98,7 @@ export function workspaceDefaultExists(): boolean {
  * Open the implicit browser project. Always the same project.
  *
  * This used to pass `adoptsUnowned: true`, so that a catalogue row with no
- * owner marker — a scene saved in the projectless mode this project replaced —
+ * owner marker — a document saved in the projectless mode this project replaced —
  * was listed here rather than nowhere. The eager migration converts those rows
  * into documents of THIS project before anything lists them (§2.3), so the
  * adoption rule had nothing left to adopt and went with the catalogue in

@@ -18,6 +18,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { Object3D, Vector3 } from 'three';
 import { RVGrip } from '../src/core/engine/rv-grip';
 import { RVGripTarget } from '../src/core/engine/rv-grip-target';
+import { ProgressWiring } from '../src/core/diagnostics/rv-progress-wiring';
 import { RVMovingUnit } from '../src/core/engine/rv-mu';
 import { RVZone } from '../src/core/engine/rv-zone';
 import { SignalStore } from '../src/core/engine/rv-signal-store';
@@ -187,6 +188,16 @@ describe('LoadOnCarrier: seat occupied (plan-577 F7/F8)', () => {
     expect(after.quat.angleTo(before.quat)).toBeLessThan(1e-9);
     expect(target.isFree).toBe(true);
     let probs = seatProblems();
+    const wiring = new ProgressWiring({ transport: tm, fleet: { all: () => [] },
+      clock: { now: () => 0 }, running: () => true });
+    try {
+      expect(wiring.waitRegistry.collect(0)).toContainEqual(expect.objectContaining({
+        waiterId: `mu:${valve1.id}`, resourceId: `grip-target:${target.node.uuid}`,
+        ownerIds: [`mu:${valve0.id}`], kind: 'grip', analysed: true,
+      }));
+      console.info('grip placement coverage', wiring.sample().coverage);
+      expect(wiring.sample().coverage.missing).toEqual([]);
+    } finally { wiring.dispose(); }
     expect(probs).toHaveLength(1);
     expect(probs[0].severity).toBe('warning');
     expect(probs[0].title).toBe('Grip could not place part — seat occupied');

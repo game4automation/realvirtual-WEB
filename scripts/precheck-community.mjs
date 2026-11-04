@@ -29,7 +29,7 @@
  */
 
 import { execFileSync, execSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -50,9 +50,9 @@ const DIM = '\x1b[2m';
 function log(msg) { console.log(msg); }
 function step(name) { log(`\n${CYAN}── ${name} ──${RESET}`); }
 
-function run(cmd, cwd) {
+function run(cmd, cwd, extraEnv = {}) {
   log(`${DIM}$ ${cmd}${RESET}`);
-  execSync(cmd, { cwd, stdio: 'inherit', env: { ...process.env, RV_INTERNAL: '' } });
+  execSync(cmd, { cwd, stdio: 'inherit', env: { ...process.env, RV_INTERNAL: '', ...extraEnv } });
 }
 
 // ─── 1. Stage tracked files only (mirror fidelity, no private sibling) ────
@@ -89,7 +89,10 @@ if (INSTALL) {
     process.exit(1);
   }
   // Junction on Windows needs no elevation; 'junction' is ignored on POSIX.
-  symlinkSync(nodeModules, join(staged, 'node_modules'), 'junction');
+  // Target = native real path (SUBST E: vs C:\Daten: two spellings of one tree break Rollup/Vite
+  // and the browser-mode guard test; measured in plan-2222). The shared checkout is the SUBST drive,
+  // so the junction must not carry the E: spelling into the staged tree.
+  symlinkSync(realpathSync.native(join(ROOT, 'node_modules')), join(staged, 'node_modules'), 'junction');
 }
 
 // ─── 3. Checks ────────────────────────────────────────────────────────────
@@ -121,10 +124,30 @@ const testFlags = `--testTimeout=${NODE_TEST_TIMEOUT_MS} --retry=${RETRIES}`;
 // what the interference is, fold it back into the suite.
 const ISOLATED_TEST = 'tests/eslint-boundaries.node.test.ts';
 
+// The DES soak+M3 compare spawns two of its own heavy vitest children (a 3-sim-day soak and an
+// 8h M3 run, ~150s combined standalone) and is itself watched by with-test-lock's per-file
+// timeout (RV_TEST_FILE_TIMEOUT_SECONDS, default 600s). Running concurrently with the rest of
+// the staged suite, it has repeatedly been pushed past that 600s budget by resource contention
+// (not a defect — standalone it passes in well under half that), aborting the whole run with a
+// false failure. Run it on its own, with a generous override, like the ESLint boundary guard
+// below — but gating: a genuinely broken M3/soak result must still fail the precheck.
+const SOAK_TEST = 'tests/des/pallet-yard-s10-compare.node.test.ts';
+const SOAK_TIMEOUT_ENV = { RV_TEST_FILE_TIMEOUT_SECONDS: '1200' };
+
+// test-hang-predict's A9/F3 case spawns its own child vitest run over a scratch tree and has been
+// pushed past the shared 120s --testTimeout by resource contention in the full staged suite
+// (standalone it finishes in well under 10s) — the same false-failure-from-contention class as
+// the DES soak+M3 compare above. Isolated, with its own generous --testTimeout (vitest's
+// per-test limit, not with-test-lock's per-file one) and RV_TEST_FILE_TIMEOUT_SECONDS override.
+// Still gating: a genuinely broken hang-predictor must still fail the precheck.
+const HANG_PREDICT_TEST = 'tests/test-hang-predict.node.test.ts';
+const HANG_PREDICT_FLAGS = `--testTimeout=600000 --retry=${RETRIES}`;
+const HANG_PREDICT_ENV = { RV_TEST_FILE_TIMEOUT_SECONDS: '1200' };
+
 const checks = [
   ['TypeScript (tsc --noEmit)', 'npx tsc --noEmit'],
   ['Production build (stubs active)', 'npm run build'],
-  ['Node tests', `npm run test:node -- ${testFlags} --exclude "${ISOLATED_TEST}"`],
+  ['Node tests', `npm run test:node -- ${testFlags} --exclude "${ISOLATED_TEST}" --exclude "${SOAK_TEST}" --exclude "${HANG_PREDICT_TEST}"`],
   ...(FULL ? [['Full browser test suite', `npm test -- ${testFlags}`]] : []),
 ];
 for (const [name, cmd] of checks) {
@@ -135,6 +158,28 @@ for (const [name, cmd] of checks) {
   } catch {
     failed = name;
     break;
+  }
+}
+
+// ─── 3a. DES soak + M3 compare — isolated, generous timeout, still gating ─
+if (!failed) {
+  step('DES soak + M3 compare (isolated, extended per-file timeout — see comment above)');
+  try {
+    run(`npm run test:node -- ${testFlags} "${SOAK_TEST}"`, staged, SOAK_TIMEOUT_ENV);
+    log(`${GREEN}✓ DES soak + M3 compare${RESET}`);
+  } catch {
+    failed = 'DES soak + M3 compare';
+  }
+}
+
+// ─── 3a2. test-hang-predict — isolated, generous timeout, still gating ───
+if (!failed) {
+  step('test-hang-predict (isolated, extended timeout — see comment above)');
+  try {
+    run(`npm run test:node -- ${HANG_PREDICT_FLAGS} "${HANG_PREDICT_TEST}"`, staged, HANG_PREDICT_ENV);
+    log(`${GREEN}✓ test-hang-predict${RESET}`);
+  } catch {
+    failed = 'test-hang-predict';
   }
 }
 

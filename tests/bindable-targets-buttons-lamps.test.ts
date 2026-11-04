@@ -222,7 +222,9 @@ describe('enumerateCompatibleTargets with buttons and lamps', () => {
     const compatible = enumerateCompatibleTargets(viewerOf(f.registry, manager), BOOL_OUTPUT_PAYLOAD);
 
     expect(compatible.map((t) => t.id)).toEqual(['Cell/SignalLamp']);
-    expect(compatible[0].compatibleSlotCount).toBe(1);
+    // The wired SignalLampOn plus the unwired SingalLampFlashing, which is
+    // directly bindable through SlotIO (plan-2012 Phase 3b).
+    expect(compatible[0].compatibleSlotCount).toBe(2);
   });
 
   it('rejects a viewer→PLC payload on the lamp (direction check)', () => {

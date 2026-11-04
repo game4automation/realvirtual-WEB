@@ -19,6 +19,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { userEvent } from 'vitest/browser';
 import { Vector3 } from 'three';
+import { commandRegistry } from '../src/core/hmi/rv-command-registry';
+import { ensureCameraCommandsRegistered } from '../src/core/hmi/camera-commands';
 import { RVViewerProvider } from '../src/hooks/use-viewer';
 import type { RVViewer } from '../src/core/rv-viewer';
 import type { LoadResult } from '../src/core/engine/rv-scene-loader';
@@ -68,12 +70,17 @@ function makeFake(): Fake {
     registry: { getNode: (p: string) => (p ? { isObject3D: true, children: [], userData: {}, name: p } : null) },
     getCameraState: () => ({ position: new Vector3(1, 2, 3), target: new Vector3(4, 5, 6) }),
     animateCameraTo: (p: Vector3, t: Vector3) => calls.push(`animate=${p.x},${t.x}`),
-    startCameraFollow: () => calls.push('startFollow'),
-    startCameraSitOn: () => calls.push('startSitOn'),
-    stopCameraFollow: () => calls.push('stopFollow'),
+    // Stateful stand-in for the CameraManager: mode + owner, and the same
+    // camera-mode-changed emission the real viewer wires to the manager hook.
+    cameraFollowMode: 'off' as 'off' | 'follow' | 'siton',
+    cameraFollowOwner: null as 'selection' | 'agent-eye' | null,
+    startCameraFollow() { calls.push('startFollow'); v.cameraFollowMode = 'follow'; v.cameraFollowOwner = 'selection'; emit('camera-mode-changed', { mode: 'follow' }); },
+    startCameraSitOn() { calls.push('startSitOn'); v.cameraFollowMode = 'siton'; v.cameraFollowOwner = 'selection'; emit('camera-mode-changed', { mode: 'siton' }); },
+    stopCameraFollow() { calls.push('stopFollow'); v.cameraFollowMode = 'off'; v.cameraFollowOwner = null; emit('camera-mode-changed', { mode: null }); },
     getPlugin: (id: string) => (id === 'camera-follow' ? plugin : null),
   };
   const plugin = new CameraFollowPlugin();
+  plugin.init(v as RVViewer);
   plugin.onModelLoaded({} as LoadResult, v as RVViewer);
   return {
     viewer: v as RVViewer,
@@ -102,7 +109,9 @@ const pill = () => screen.getByTestId('camera-pill');
 const dividers = () => pill().querySelectorAll('.MuiDivider-root');
 const segments = () => pill().querySelectorAll('button');
 
-beforeEach(() => {
+beforeEach(async () => {
+  ensureCameraCommandsRegistered();
+  await commandRegistry.preload(['camera.follow']);
   seedCameras([null, null, null]);
 });
 
@@ -232,6 +241,22 @@ describe('cameraBookmarkKey', () => {
 });
 
 describe('follow / sit-on are bound to the selection', () => {
+  it('hands Agent-Eye follow over to the selection without showing it as active', async () => {
+    const f = makeFake();
+    f.setSelection('Part/A');
+    Object.assign(f.viewer, { cameraFollowOwner: 'agent-eye', cameraFollowMode: 'follow' });
+    mount(f);
+    expect(screen.getByTestId('camera-follow')).toHaveAttribute('aria-pressed', 'false');
+
+    act(() => { f.emit('camera-mode-changed', { mode: 'follow' }); });
+    expect(screen.getByTestId('camera-follow')).toHaveAttribute('aria-pressed', 'false');
+
+    await act(async () => { fireEvent.click(screen.getByTestId('camera-follow')); });
+    expect(f.calls).toContain('startFollow');
+    expect(f.viewer.cameraFollowOwner).toBe('selection');
+    expect(screen.getByTestId('camera-follow')).toHaveAttribute('aria-pressed', 'true');
+  });
+
   it('follow/siton are absent without a followable selection', () => {
     seedCameras([bookmark(1), null, null]);
     mount(makeFake());
@@ -239,7 +264,7 @@ describe('follow / sit-on are bound to the selection', () => {
     expect(screen.queryByTestId('camera-siton')).toBeNull();
   });
 
-  it('deselection exits the plugin and removes the segments', () => {
+  it('deselection exits the plugin and removes the segments', async () => {
     seedCameras([bookmark(1), null, null]);
     const f = makeFake();
     mount(f);
@@ -247,7 +272,7 @@ describe('follow / sit-on are bound to the selection', () => {
     expect(screen.getByTestId('camera-follow')).toBeInTheDocument();
     expect(screen.getByTestId('camera-siton')).toBeInTheDocument();
 
-    act(() => { fireEvent.click(screen.getByTestId('camera-follow')); });
+    await act(async () => { fireEvent.click(screen.getByTestId('camera-follow')); });
     expect(f.calls).toContain('startFollow');
     expect(f.plugin.mode).toBe('follow');
 
@@ -259,7 +284,7 @@ describe('follow / sit-on are bound to the selection', () => {
     expect(screen.queryByTestId('camera-siton')).toBeNull();
   });
 
-  it('a rendered follow segment is always clickable (no canFollow guard)', () => {
+  it('a rendered follow segment is always clickable (no canFollow guard)', async () => {
     seedCameras([bookmark(1), null, null]);
     const f = makeFake();
     mount(f);
@@ -268,9 +293,9 @@ describe('follow / sit-on are bound to the selection', () => {
     expect(follow.disabled).toBe(false);
     // Re-clicking the active mode toggles it off — the former grey-out colour
     // plus click guard made exactly that impossible.
-    act(() => { fireEvent.click(follow); });
+    await act(async () => { fireEvent.click(follow); });
     expect(f.plugin.mode).toBe('follow');
-    act(() => { fireEvent.click(screen.getByTestId('camera-follow')); });
+    await act(async () => { fireEvent.click(screen.getByTestId('camera-follow')); });
     expect(f.plugin.mode).toBeNull();
     // And it is NOT painted in the old disabled grey.
     expect(getComputedStyle(screen.getByTestId('camera-follow')).color)

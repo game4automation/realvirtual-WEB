@@ -102,7 +102,7 @@ describe('resolveMcpBridgeTarget', () => {
   // the same either way.
   it('dev build with no pinned port → CONNECT on localhost:5100', () => {
     expect(
-      resolveMcpBridgeTarget(ctx({ host: 'localhost:15363', isDevServer: true })),
+      resolveMcpBridgeTarget(ctx({ host: 'localhost:15363', isDevServer: true, servedByConnect: false })),
     ).toBe('ws://localhost:5100/webviewer');
   });
 
@@ -114,7 +114,7 @@ describe('resolveMcpBridgeTarget', () => {
   it('dev build → CONNECT carries the ?apikey token even with cookie preference on', () => {
     expect(
       resolveMcpBridgeTarget(
-        ctx({ host: 'localhost:15363', isDevServer: true, authToken: 'dev key/1' }),
+        ctx({ host: 'localhost:15363', isDevServer: true, servedByConnect: false, authToken: 'dev key/1' }),
       ),
     ).toBe('ws://localhost:5100/webviewer?apikey=dev%20key%2F1');
   });
@@ -122,9 +122,26 @@ describe('resolveMcpBridgeTarget', () => {
   it('dev path ignores the same-origin host and the page scheme', () => {
     expect(
       resolveMcpBridgeTarget(
-        ctx({ host: 'localhost:15363', isDevServer: true, protocol: 'https:' }),
+        ctx({ host: 'localhost:15363', isDevServer: true, servedByConnect: false, protocol: 'https:' }),
       ),
     ).toBe('ws://localhost:5100/webviewer');
+  });
+
+  // SolidCraft autostart fix 2026-10-22: a dev page that CONNECT serves (same-origin /health
+  // answered) talks to THAT CONNECT — a worktree gateway on 5200 must not lose the tab's
+  // frames to the canonical one on 5100.
+  it('dev build served by CONNECT → same-origin bridge (worktree CONNECT on another port)', () => {
+    expect(
+      resolveMcpBridgeTarget(ctx({ host: 'localhost:5200', isDevServer: true, servedByConnect: true, isLoopbackPage: true })),
+    ).toBe('ws://localhost:5200/webviewer');
+  });
+
+  it('dev build served by CONNECT, but a pinned port still wins', () => {
+    expect(
+      resolveMcpBridgeTarget(ctx({
+        host: 'localhost:5200', isDevServer: true, servedByConnect: true, explicitPort: true, bridgePort: '18714',
+      })),
+    ).toBe('ws://localhost:18714/webviewer');
   });
 
   it('explicitly pinned port → localhost bridge even when not the dev server', () => {

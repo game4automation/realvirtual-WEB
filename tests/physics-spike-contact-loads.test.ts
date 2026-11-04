@@ -30,6 +30,7 @@
 // `/node_modules/...` URL import, the only form Vite leaves untouched.
 
 import { describe, it, expect, beforeAll } from 'vitest';
+import { loadRapier } from '@rv-private/physics/rapier-lib-loader';
 import { PHYSICS_FIXED_DT } from '../src/core/engine/rv-physics-constants';
 
 // ── Minimal structural types for the API surface used by this spike ─────────
@@ -123,25 +124,11 @@ const PLATE_HALF_Y = 0.025; // m → 0.05 m thick plate, top face at y = 0
 const PLATE_Y = -PLATE_HALF_Y;
 const FRICTION = 0.8;
 
-/** Out-of-band import seam — URL path, resolved by the vitest browser dev server. */
-const RAPIER_MJS_URL = '/node_modules/@dimforge/rapier3d-compat/rapier.mjs';
-
 let RAPIER: SpikeRapier;
 
 beforeAll(async () => {
   // NO graceful skip (plan-467 F15): a missing package is a hard failure.
-  let mod: SpikeRapier;
-  try {
-    mod = (await import(/* @vite-ignore */ RAPIER_MJS_URL)) as SpikeRapier;
-  } catch (err) {
-    throw new Error(
-      '@dimforge/rapier3d-compat is NOT installed. This spike requires the real WASM. ' +
-        'Run `npm i --no-save @dimforge/rapier3d-compat@0.19.3` in ' +
-        'Assets/realvirtual-WebViewer~ (see ' +
-        '../realvirtual-WebViewer-Private~/src/physics/README.md). Original error: ' +
-        String(err)
-    );
-  }
+  const mod = (await loadRapier()) as unknown as SpikeRapier; // already init()-ed; init() is idempotent
   await mod.init();
   RAPIER = mod;
 }, 60000);

@@ -14,6 +14,6 @@
 export type SnapCandidate = { kind: any; label: any; [key: string]: any };
 
 //! Snap picking is an editor interaction; nothing to query without it.
-export function querySnapCandidates(..._args: any[]): { nodePath: any; candidates: SnapCandidate[] } | null {
+export function querySnapCandidates(..._args: any[]): { nodePath: any; candidates: SnapCandidate[]; refused?: string } | null {
   return null;
 }

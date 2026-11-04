@@ -537,7 +537,7 @@ describe('plan-458 — the host wiring that only source can show', () => {
   });
 
   it('F5: the grid search field is flexible on the compact layout and 200px otherwise', () => {
-    expect(HOST_SOURCE).toContain("? { flex: '1 1 140px', minWidth: 0 }");
+    expect(HOST_SOURCE).toContain("? { flex: '1 1 calc(100% - 52px)', minWidth: 0 }");
     expect(HOST_SOURCE).toContain(': { width: 200, flexShrink: 0 }');
     // 16px on a coarse pointer, whatever the layout — the iOS zoom rule.
     expect(HOST_SOURCE).toContain('fontSize: touchInput ? 16 : 12');

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage, readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * rv-extras-overlay-store.ts — Overlay store for rv-extras overrides.
  *
@@ -54,7 +56,7 @@ function storageKey(glbName: string): string {
  */
 export function loadOverlay(glbName: string): RVExtrasOverlay | null {
   try {
-    const raw = localStorage.getItem(storageKey(glbName));
+    const raw = readLocalStorage(storageKey(glbName));
     if (!raw) return null;
     const parsed = JSON.parse(raw) as RVExtrasOverlay;
     if (parsed.$schema !== 'rv-extras-overlay/1.0') return null;
@@ -70,7 +72,9 @@ export function loadOverlay(glbName: string): RVExtrasOverlay | null {
  * @deprecated See `loadOverlay`. Overlays now live on `RvScene.overlay`.
  */
 export function saveOverlay(glbName: string, overlay: RVExtrasOverlay): void {
-  localStorage.setItem(storageKey(glbName), JSON.stringify(overlay));
+  const storage = getLocalStorage();
+  if (!storage) throw new Error('Storage is unavailable');
+  storage.setItem(storageKey(glbName), JSON.stringify(overlay));
 }
 
 // ─── Merge / Apply ──────────────────────────────────────────────────────
@@ -126,8 +130,8 @@ export function applyOverlayByNodeId(
     const target = resolve(nodeId);
     if (!target) {
       orphaned.push({
-        addressing: 'nodeId',
-        key: nodeId,
+        addressing: 'address',
+        key: `#${nodeId}`,
         occurrence: context.occurrence ?? ROOT_OCCURRENCE,
         assetId: context.assetId ?? '',
         componentTypes: Object.keys(patch ?? {}),
@@ -152,7 +156,9 @@ function originalsKey(glbName: string): string {
  */
 export function saveOriginals(glbName: string, originals: Map<string, unknown>): void {
   if (originals.size === 0) {
-    localStorage.removeItem(originalsKey(glbName));
+    const storage = getLocalStorage();
+    if (!storage) throw new Error('Storage is unavailable');
+    storage.removeItem(originalsKey(glbName));
     return;
   }
   const obj: Record<string, unknown> = {};
@@ -160,7 +166,7 @@ export function saveOriginals(glbName: string, originals: Map<string, unknown>):
     obj[k] = v;
   }
   try {
-    localStorage.setItem(originalsKey(glbName), JSON.stringify(obj));
+    writeLocalStorage(originalsKey(glbName), JSON.stringify(obj));
   } catch {
     // LS quota exceeded — silently ignore (reset will use scene values)
   }
@@ -172,7 +178,7 @@ export function saveOriginals(glbName: string, originals: Map<string, unknown>):
  */
 export function loadOriginals(glbName: string): Map<string, unknown> {
   try {
-    const raw = localStorage.getItem(originalsKey(glbName));
+    const raw = readLocalStorage(originalsKey(glbName));
     if (!raw) return new Map();
     const obj = JSON.parse(raw) as Record<string, unknown>;
     return new Map(Object.entries(obj));

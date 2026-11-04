@@ -142,6 +142,14 @@ export interface CadImportProvider {
   readonly order?: number;
   /** Hint shown instead of the form while availability() !== 'ready'. */
   readonly setupHint?: string;
+  /**
+   * Lower-case file extensions (no dot) this provider resolves from a single
+   * `{ kind: 'file' }` input, e.g. `['fbx']`. Declaring them makes the file
+   * importable without the dialog — `editor.importCad` falls back to the
+   * provider that claims the extension when no CAD geometry provider exists for
+   * it (mesh formats such as FBX or USD have nothing to re-tessellate).
+   */
+  readonly extensions?: readonly string[];
 
   /** Reactive availability — see {@link ProviderAvailability}. */
   availability(): ProviderAvailability;
@@ -209,6 +217,17 @@ export class ImportProviderRegistry {
     return this._providers.get(id);
   }
 
+  /**
+   * The provider that declares `fileName`'s extension in
+   * {@link CadImportProvider.extensions} (first in `list()` order), or
+   * `undefined` when none does.
+   */
+  forFileName(fileName: string): CadImportProvider | undefined {
+    const ext = fileExtensionOf(fileName);
+    if (!ext) return undefined;
+    return this.list().find((p) => p.extensions?.some((e) => e.toLowerCase() === ext));
+  }
+
   /** Subscribe to registry changes (register/unregister). Returns unsubscribe. */
   onChange(cb: () => void): () => void {
     this._listeners.add(cb);
@@ -220,6 +239,45 @@ export class ImportProviderRegistry {
       try { l(); } catch (e) { console.error('[ImportProviders] listener error:', e); }
     }
   }
+}
+
+/** Lower-case extension of a file name without the dot ('' when it has none). */
+export function fileExtensionOf(fileName: string): string {
+  const base = fileName.split(/[\\/]/).pop() ?? fileName;
+  const dot = base.lastIndexOf('.');
+  return dot > 0 ? base.slice(dot + 1).toLowerCase() : '';
+}
+
+/** Outcome of {@link resolveFileViaImportProvider}. */
+export type FileViaProviderResult =
+  | { ok: true; providerId: string; items: ImportResultItem[]; failed: { id: string; error: string }[] }
+  | { ok: false; error: string };
+
+/**
+ * Resolve one file through the import provider that declares its extension —
+ * the dialog-free path for formats without a CAD geometry provider (FBX, USD,
+ * DXF …). Never throws: a missing, not-ready or failing provider comes back as
+ * `{ ok: false, error }`, and a partial result keeps its `failed` entries.
+ */
+export async function resolveFileViaImportProvider(
+  registry: Pick<ImportProviderRegistry, 'forFileName'>,
+  file: File,
+  signal?: AbortSignal,
+): Promise<FileViaProviderResult> {
+  const provider = registry.forFileName(file.name);
+  if (!provider) {
+    return { ok: false, error: `No import provider for "${file.name}" (format not supported in this build)` };
+  }
+  const availability = provider.availability();
+  if (availability !== 'ready') {
+    return { ok: false, error: `${provider.label} import is not ready (${availability})` };
+  }
+  const result = await resolveProviderSafe(provider, { kind: 'file', file }, undefined, signal);
+  if (result.ok.length === 0) {
+    const reason = result.failed.map((f) => f.error).join('; ') || 'the provider returned nothing';
+    return { ok: false, error: `${provider.label} import of "${file.name}" failed: ${reason}` };
+  }
+  return { ok: true, providerId: provider.id, items: result.ok, failed: result.failed };
 }
 
 /** The global import provider registry (one per app). */

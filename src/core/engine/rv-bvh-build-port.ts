@@ -46,6 +46,8 @@ import { BufferGeometry, BufferAttribute, Mesh } from 'three';
 // ─── Types ──────────────────────────────────────────────────────────
 
 export interface BVHBuildOptions {
+  /** Rechecked at queue execution and immediately before transferring buffers. */
+  shouldAbort?: () => boolean;
   /** Build in indirect mode (preserves the original index-buffer ordering —
    *  required by the merged raycast geometries' face-range tables). */
   indirect?: boolean;
@@ -76,6 +78,79 @@ interface MeshBVHWorkerLike {
 }
 
 // ─── Prototype patches ──────────────────────────────────────────────
+
+/** Bypass WorkerBase.generate: three-mesh-bvh@0.9.15 discards its
+ * rejecting finally-promise. Own settlement and cancellation here, retaining
+ * the library's serialization and buffer restoration in runTask. */
+interface RawBVHWorker {
+  worker: Worker | null;
+  runTask(worker: Worker, geometry: BufferGeometry, options?: Record<string, unknown>): Promise<unknown>;
+  dispose(): void;
+}
+
+/** Port-own abort (disposed port / stale request) — not a worker failure. */
+class BVHAbortError extends Error {}
+
+function ownWorker(raw: RawBVHWorker, onDead: (reason: Error) => void): MeshBVHWorkerLike {
+  let cancel: ((reason: Error) => void) | undefined;
+  let dead: Error | undefined;
+  const fail = (reason: Error) => {
+    if (dead) return;
+    dead = reason;
+    // Reject with the worker failure before retirement can cancel as disposal.
+    cancel?.(reason);
+    onDead(reason);
+  };
+  const installErrorHandlers = () => {
+    if (!raw.worker || dead) return;
+    raw.worker.onerror = (event) => {
+      event.preventDefault?.();
+      fail(new Error(`BVH worker failed: ${event.message || 'could not load worker'}`));
+    };
+    raw.worker.onmessageerror = () => {
+      fail(new Error('BVH worker failed to deserialize a message'));
+    };
+  };
+  // Replace WorkerBase's throwing constructor handler, including before runTask.
+  installErrorHandlers();
+  return {
+    async generate(geometry, options) {
+      if (dead) throw dead;
+      if (!raw.worker) throw new Error('BVH worker is disposed');
+      if (cancel) throw new Error('BVH worker is already running');
+      const aborted = new Promise<never>((_, reject) => { cancel = reject; });
+      try {
+        return await Promise.race([raw.runTask(raw.worker, geometry, options), aborted]);
+      } finally {
+        cancel = undefined;
+        // runTask owns onerror while running; restore our idle handler afterward.
+        installErrorHandlers();
+      }
+    },
+    dispose() {
+      try {
+        if (raw.worker) {
+          raw.worker.onmessage = null;
+          raw.worker.onerror = null;
+          raw.worker.onmessageerror = null;
+          raw.dispose();
+        }
+      } finally {
+        cancel?.(new BVHAbortError('BVHBuildPort is disposed'));
+      }
+    },
+  };
+}
+
+/** A view distinguishes empty from detached buffers even without the newer
+ * ArrayBuffer.detached API. Shared buffers cannot detach. */
+function assertAttached(geometry: BufferGeometry): void {
+  for (const attribute of [geometry.getAttribute('position'), geometry.index]) {
+    if (!attribute) continue;
+    try { new Uint8Array(attribute.array.buffer); }
+    catch { throw new Error('BVH geometry has a detached buffer'); }
+  }
+}
 
 let patchesPromise: Promise<void> | null = null;
 
@@ -120,6 +195,7 @@ export function isTransferSafeGeometry(geometry: BufferGeometry): boolean {
   const pos = geometry.getAttribute('position');
   if (!pos) return false;
   if ((pos as unknown as { isInterleavedBufferAttribute?: boolean }).isInterleavedBufferAttribute) return false;
+  try { assertAttached(geometry); } catch { return false; }
   const posArr = pos.array as unknown as TypedArrayLike;
   if (posArr.byteOffset !== 0 || posArr.byteLength !== posArr.buffer.byteLength) return false;
 
@@ -192,16 +268,15 @@ class DefaultBVHPort implements BVHBuildPort {
 
   dispose(): void {
     this.disposed = true;
-    // Note: terminating mid-build leaves the in-flight promise unresolved —
-    // acceptable, dispose() only runs at viewer teardown (fire-and-forget
-    // builds are abandoned with the page).
+    // The adapter rejects the active job; queued jobs reject at entry.
     this.worker?.dispose();
     this.worker = null;
     this.workerPromise = null;
   }
 
   private async generateOne(geometry: BufferGeometry, options?: BVHBuildOptions): Promise<unknown> {
-    if (this.disposed) throw new Error('BVHBuildPort is disposed');
+    this.checkActive(options);
+    assertAttached(geometry);
 
     const workerPossible = !this.workerDead && typeof Worker !== 'undefined';
     const wantWorker = workerPossible && options?.transferable !== false && isTransferSafeGeometry(geometry);
@@ -217,12 +292,21 @@ class DefaultBVHPort implements BVHBuildPort {
 
     if (wantWorker || wantWorkerCopy) {
       const worker = await this.getWorker();
+      this.checkActive(options);
+      assertAttached(geometry);
       if (worker) {
+        // Termination cannot return transferred buffers. Keep recovery copies
+        // on the direct path, also usable for inline fallback after errors.
+        const position = geometry.getAttribute('position');
+        const index = geometry.index;
+        const savedPosition = wantWorker ? position.array.slice() : null;
+        const savedIndex = wantWorker && index ? index.array.slice() : null;
+        let input: BufferGeometry | undefined;
         try {
           // GenerateMeshBVHWorker passes options through to `new MeshBVH()`
           // in the worker, serializes the (indirect-aware) result and
           // restores the transferred buffers on resolve.
-          const input = wantWorker ? geometry : copyForTransfer(geometry);
+          input = wantWorker ? geometry : copyForTransfer(geometry);
           // A non-indirect MeshBVH REORDERS the index of the geometry it is
           // built on, and the worker writes that reordered index back onto ITS
           // input. On the copy path that is the throwaway copy — the original
@@ -232,17 +316,29 @@ class DefaultBVHPort implements BVHBuildPort {
           // hit, BVH missed). An indirect tree never touches the index, so it
           // is the only kind the copy path may hand back.
           const indirect = options?.indirect === true || input !== geometry;
+          this.checkActive(options);
+          assertAttached(input);
           const tree = await worker.generate(input, { indirect });
           if (input !== geometry) {
             (tree as { geometry?: BufferGeometry }).geometry = geometry;
-            input.dispose();
           }
-          return await this.rebrandToMainEntry(tree);
+          const result = await this.rebrandToMainEntry(tree);
+          this.checkActive(options);
+          return result;
         } catch (e) {
-          // Worker failures are treated as systemic (module load / runtime
-          // error) — retire the worker and continue inline.
-          console.warn('[BVHBuildPort] worker build failed — falling back to inline builds:', e);
-          this.retireWorker();
+          if (savedPosition) (position as BufferAttribute).array = savedPosition;
+          if (savedIndex && index) index.array = savedIndex;
+          // A real worker failure retires the worker EVEN when the request went
+          // stale meanwhile: the port outlives model loads, and a cached dead
+          // worker would swallow the next load's jobs. Our own abort errors say
+          // nothing about the worker's health.
+          if (!(e instanceof BVHAbortError)) {
+            console.warn('[BVHBuildPort] worker build failed — falling back to inline builds:', e);
+            this.retireWorker();
+          }
+          this.checkActive(options);
+        } finally {
+          if (input && input !== geometry) input.dispose();
         }
       }
     }
@@ -252,14 +348,27 @@ class DefaultBVHPort implements BVHBuildPort {
     finally { performance.measure('rv:bvh.inline', { start: __t0 }); }
   }
 
+  private checkActive(options?: BVHBuildOptions): void {
+    if (this.disposed) throw new BVHAbortError('BVHBuildPort is disposed');
+    if (options?.shouldAbort?.()) throw new BVHAbortError('BVH build request is stale');
+  }
+
   private getWorker(): Promise<MeshBVHWorkerLike | null> {
     if (!this.workerPromise) {
       // Dynamic import keeps the worker chunk out of the startup bundle.
       this.workerPromise = import('three-mesh-bvh/worker')
         .then((mod) => {
           if (this.disposed) return null;
-          this.worker = new mod.GenerateMeshBVHWorker() as unknown as MeshBVHWorkerLike;
-          return this.worker;
+          const worker = ownWorker(
+            new mod.GenerateMeshBVHWorker() as unknown as RawBVHWorker,
+            () => this.retireWorker(),
+          );
+          if (this.disposed) {
+            worker.dispose();
+            return null;
+          }
+          this.worker = worker;
+          return worker;
         })
         .catch((e) => {
           console.warn('[BVHBuildPort] worker unavailable — using inline builds:', e);
@@ -307,6 +416,8 @@ class DefaultBVHPort implements BVHBuildPort {
       await yieldMacrotask();
       this.lastYield = performance.now();
     }
+    this.checkActive(options);
+    assertAttached(geometry);
     // Direct MeshBVH construction (NOT computeBoundsTree) — the caller owns
     // the `geometry.boundsTree` assignment (load-generation guard).
     return new MeshBVH(geometry, options?.indirect ? { indirect: true } : undefined);

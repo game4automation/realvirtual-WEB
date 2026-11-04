@@ -11,6 +11,9 @@
  * - Missing fields (type, id) don't crash
  * - Missing viewer/signals/transport gracefully handled
  */
+import { ensureSimCommandsRegistered } from '../src/plugins/sim-controller/sim-commands';
+import { afterEach } from 'vitest';
+import { commandRegistry } from '../src/core/hmi/rv-command-registry';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { McpBridgePlugin } from '../src/plugins/mcp-bridge-plugin';
 import { buildMultiDispatcher } from '../src/core/engine/rv-mcp-tools';
@@ -132,8 +135,13 @@ type MockViewer = ReturnType<typeof createMockViewer>;
 
 // ── Helper: wire up plugin with mock viewer ──
 
+afterEach(() => vi.restoreAllMocks());
+
 function setupPlugin() {
+  ensureSimCommandsRegistered();
   const plugin = new McpBridgePlugin();
+  // plan-668: the test transport stands for a tab with AI control on.
+  (plugin as unknown as { _aiEnabled: boolean })._aiEnabled = true;
   const viewer = createMockViewer();
 
   // Inject viewer by simulating model loaded (skip WebSocket connection)
@@ -212,7 +220,10 @@ describe('McpBridgePlugin - Message Dispatch', () => {
     const { plugin } = setupPlugin();
     const { handleMessage, sent } = createMessageHandler(plugin);
 
-    await handleMessage(JSON.stringify({ type: 'call', id: 71, tool: 'web_status', arguments: {} }));
+    // plan-2005 F9: the cache block is part of detail:"render" — the lean default omits it.
+    await handleMessage(JSON.stringify({ type: 'call', id: 70, tool: 'web_status', arguments: {} }));
+    expect('cache' in JSON.parse(JSON.parse(sent.shift()!).result)).toBe(false);
+    await handleMessage(JSON.stringify({ type: 'call', id: 71, tool: 'web_status', arguments: { detail: 'render' } }));
     const cache = JSON.parse(JSON.parse(sent[0]).result).cache;
     expect(cache.outcomes).toHaveLength(20); // default
     expect(cache.outcomes.at(-1)).toMatchObject({ url: '/library/a29.glb', outcome: 'hash-mismatch' });
@@ -221,7 +232,7 @@ describe('McpBridgePlugin - Message Dispatch', () => {
     expect('storage' in cache).toBe(true);
     expect('persisted' in cache).toBe(true);
 
-    await handleMessage(JSON.stringify({ type: 'call', id: 72, tool: 'web_status', arguments: { cacheLast: 5 } }));
+    await handleMessage(JSON.stringify({ type: 'call', id: 72, tool: 'web_status', arguments: { cacheLast: 5, detail: 'render' } }));
     expect(JSON.parse(JSON.parse(sent[1]).result).cache.outcomes).toHaveLength(5);
     clearCacheOutcomes();
   });
@@ -233,15 +244,15 @@ describe('McpBridgePlugin - Message Dispatch', () => {
     await handleMessage(JSON.stringify({
       type: 'call',
       id: 2,
-      tool: 'web_drive_list',
-      arguments: {},
+      tool: 'web_query',
+      arguments: { command: 'drive.list', args: '{}' },
     }));
 
     const result = JSON.parse(sent[0]);
     expect(result.id).toBe(2);
     expect(result.error).toBeUndefined();
 
-    const drives = JSON.parse(result.result);
+    const drives = JSON.parse(result.result).value;
     expect(drives).toHaveLength(1);
     expect(drives[0].name).toBe('TestDrive1');
     expect(drives[0].currentPosition).toBeCloseTo(42.5, 2);
@@ -259,7 +270,11 @@ describe('McpBridgePlugin - Message Dispatch', () => {
     }));
 
     const result = JSON.parse(sent[0]);
-    const signals = JSON.parse(result.result);
+    // plan-2005 F8: {signals, total, truncated} instead of a bare array.
+    const payload = JSON.parse(result.result);
+    expect(payload.total).toBe(2);
+    expect(payload.truncated).toBe(false);
+    const signals = payload.signals;
     expect(signals).toHaveLength(2);
     const start = signals.find((s: { name: string }) => s.name === 'StartSignal');
     expect(start.value).toBe(true);
@@ -273,13 +288,13 @@ describe('McpBridgePlugin - Message Dispatch', () => {
     await handleMessage(JSON.stringify({
       type: 'call',
       id: 4,
-      tool: 'web_signal_set_bool',
-      arguments: { name: 'StartSignal', value: false },
+      tool: 'web_execute',
+      arguments: { command: 'signal.setBool', args: JSON.stringify({ name: 'StartSignal', value: false }) },
     }));
 
     const result = JSON.parse(sent[0]);
     expect(result.error).toBeUndefined();
-    const payload = JSON.parse(result.result);
+    const payload = JSON.parse(result.result).value;
     expect(payload.name).toBe('StartSignal');
     expect(payload.value).toBe(false);
     expect(payload.previous).toBe(true);
@@ -293,12 +308,12 @@ describe('McpBridgePlugin - Message Dispatch', () => {
     await handleMessage(JSON.stringify({
       type: 'call',
       id: 5,
-      tool: 'web_sensor_list',
-      arguments: {},
+      tool: 'web_query',
+      arguments: { command: 'sensor.list', args: '{}' },
     }));
 
     const result = JSON.parse(sent[0]);
-    const sensors = JSON.parse(result.result);
+    const sensors = JSON.parse(result.result).value;
     expect(sensors).toHaveLength(1);
     expect(sensors[0].name).toBe('TestSensor1');
     expect(sensors[0].occupied).toBe(true);
@@ -344,13 +359,13 @@ describe('McpBridgePlugin - Message Dispatch', () => {
     await handleMessage(JSON.stringify({
       type: 'call',
       id: 6,
-      tool: 'web_drive_jog',
-      arguments: { name: 'TestDrive1', forward: true },
+      tool: 'web_execute',
+      arguments: { command: 'drive.jog', args: JSON.stringify({ name: 'TestDrive1', forward: true }) },
     }));
 
     const result = JSON.parse(sent[0]);
     expect(result.error).toBeUndefined();
-    const payload = JSON.parse(result.result);
+    const payload = JSON.parse(result.result).value;
     expect(payload.jogForward).toBe(true);
     expect(payload.jogBackward).toBe(false);
     expect(viewer.drives[0].jogForward).toBe(true);
@@ -363,8 +378,8 @@ describe('McpBridgePlugin - Message Dispatch', () => {
     await handleMessage(JSON.stringify({
       type: 'call',
       id: 7,
-      tool: 'web_drive_stop',
-      arguments: { name: 'TestDrive1' },
+      tool: 'web_execute',
+      arguments: { command: 'drive.stop', args: JSON.stringify({ name: 'TestDrive1' }) },
     }));
 
     const result = JSON.parse(sent[0]);
@@ -401,8 +416,8 @@ describe('McpBridgePlugin - Error Handling', () => {
     await handleMessage(JSON.stringify({
       type: 'call',
       id: 11,
-      tool: 'web_drive_jog',
-      arguments: { name: 'NonexistentDrive', forward: true },
+      tool: 'web_execute',
+      arguments: { command: 'drive.jog', args: JSON.stringify({ name: 'NonexistentDrive', forward: true }) },
     }));
 
     const result = JSON.parse(sent[0]);
@@ -418,8 +433,8 @@ describe('McpBridgePlugin - Error Handling', () => {
     await handleMessage(JSON.stringify({
       type: 'call',
       id: 12,
-      tool: 'web_signal_set_bool',
-      arguments: { name: 'NonexistentSignal', value: true },
+      tool: 'web_execute',
+      arguments: { command: 'signal.setBool', args: JSON.stringify({ name: 'NonexistentSignal', value: true }) },
     }));
 
     const result = JSON.parse(sent[0]);
@@ -480,6 +495,8 @@ describe('McpBridgePlugin - Error Handling', () => {
 
   it('returns error when dispatcher is null', async () => {
     const plugin = new McpBridgePlugin();
+    // plan-668: the test transport stands for a tab with AI control on.
+    (plugin as unknown as { _aiEnabled: boolean })._aiEnabled = true;
     // Do NOT set up dispatcher — leave it null
     const sent: string[] = [];
     const fakeWs = {
@@ -514,12 +531,12 @@ describe('McpBridgePlugin - Transport and Logic tools', () => {
     await handleMessage(JSON.stringify({
       type: 'call',
       id: 40,
-      tool: 'web_transport_status',
-      arguments: {},
+      tool: 'web_query',
+      arguments: { command: 'transport.status', args: '{}' },
     }));
 
     const result = JSON.parse(sent[0]);
-    const payload = JSON.parse(result.result);
+    const payload = JSON.parse(result.result).value;
     expect(payload.totalSpawned).toBe(5);
     expect(payload.totalConsumed).toBe(3);
     expect(payload.activeMUs).toBe(0);
@@ -535,12 +552,12 @@ describe('McpBridgePlugin - Transport and Logic tools', () => {
     await handleMessage(JSON.stringify({
       type: 'call',
       id: 41,
-      tool: 'web_logic_flow',
-      arguments: {},
+      tool: 'web_query',
+      arguments: { command: 'logic.flow', args: '{}' },
     }));
 
     const result = JSON.parse(sent[0]);
-    const payload = JSON.parse(result.result);
+    const payload = JSON.parse(result.result).value;
     expect(payload.roots).toEqual([]);
     expect(payload.stats).toBeDefined();
   });
@@ -560,7 +577,8 @@ describe('McpBridgePlugin - verified effect delta (plan-707)', () => {
   function payloadOf(sent: string[], n = 0): Record<string, unknown> {
     const frame = JSON.parse(sent[n]);
     expect(frame.error, `frame ${n} carried a transport error`).toBeUndefined();
-    return JSON.parse(frame.result);
+    const answer = JSON.parse(frame.result);
+    return answer.ok ? { ...answer.value, delta: answer.delta } : answer;
   }
 
   it('a real write call carries `verified` in the sent frame, alongside its own fields', async () => {
@@ -568,8 +586,8 @@ describe('McpBridgePlugin - verified effect delta (plan-707)', () => {
     const { handleMessage, sent } = createMessageHandler(plugin);
 
     await handleMessage(JSON.stringify({
-      type: 'call', id: 700, tool: 'web_signal_set_bool',
-      arguments: { name: 'StartSignal', value: false },
+      type: 'call', id: 700, tool: 'web_execute',
+      arguments: { command: 'signal.setBool', args: JSON.stringify({ name: 'StartSignal', value: false }) },
     }));
 
     const payload = payloadOf(sent);
@@ -578,7 +596,7 @@ describe('McpBridgePlugin - verified effect delta (plan-707)', () => {
     expect(payload.value).toBe(false);
     expect(payload.previous).toBe(true);
     // …and the wrapper added what actually happened.
-    const verified = payload.verified as { changed: string[]; noop?: true };
+    const verified = payload.delta as { changed: string[]; noop?: true };
     expect(verified).toBeTruthy();
     expect(verified.changed).toEqual(['StartSignal.value: true→false']);
     expect(verified.noop).toBeUndefined();
@@ -590,11 +608,11 @@ describe('McpBridgePlugin - verified effect delta (plan-707)', () => {
 
     // StartSignal is already true — setting it to true is a successful no-change.
     await handleMessage(JSON.stringify({
-      type: 'call', id: 701, tool: 'web_signal_set_bool',
-      arguments: { name: 'StartSignal', value: true },
+      type: 'call', id: 701, tool: 'web_execute',
+      arguments: { command: 'signal.setBool', args: JSON.stringify({ name: 'StartSignal', value: true }) },
     }));
 
-    const verified = payloadOf(sent).verified as { noop?: true; why?: string };
+    const verified = payloadOf(sent).delta as { noop?: true; why?: string };
     expect(verified.noop).toBe(true);
     expect(verified.why).toBeTruthy();
   });
@@ -604,13 +622,13 @@ describe('McpBridgePlugin - verified effect delta (plan-707)', () => {
     const { handleMessage, sent } = createMessageHandler(plugin);
 
     await handleMessage(JSON.stringify({
-      type: 'call', id: 702, tool: 'web_signal_set_bool',
-      arguments: { name: 'NoSuchSignal', value: true },
+      type: 'call', id: 702, tool: 'web_execute',
+      arguments: { command: 'signal.setBool', args: JSON.stringify({ name: 'NoSuchSignal', value: true }) },
     }));
 
     const payload = payloadOf(sent);
     expect(payload.error).toContain('not found');
-    expect(payload.verified).toBeUndefined();
+    expect(payload.delta).toBeUndefined();
   });
 
   it('a read-only tool gets no verified field', async () => {
@@ -621,7 +639,7 @@ describe('McpBridgePlugin - verified effect delta (plan-707)', () => {
       type: 'call', id: 703, tool: 'web_status', arguments: {},
     }));
 
-    expect(payloadOf(sent).verified).toBeUndefined();
+    expect(payloadOf(sent).delta).toBeUndefined();
   });
 
   it('a probe that throws does not damage the call', async () => {
@@ -634,14 +652,14 @@ describe('McpBridgePlugin - verified effect delta (plan-707)', () => {
     probe.after = () => { throw new Error('after exploded'); };
     try {
       await handleMessage(JSON.stringify({
-        type: 'call', id: 704, tool: 'web_signal_set_bool',
-        arguments: { name: 'StartSignal', value: false },
+        type: 'call', id: 704, tool: 'web_execute',
+        arguments: { command: 'signal.setBool', args: JSON.stringify({ name: 'StartSignal', value: false }) },
       }));
       const payload = payloadOf(sent);
       // The call succeeded and its own answer is intact; only the delta is gone.
       expect(payload.name).toBe('StartSignal');
       expect(payload.previous).toBe(true);
-      expect(payload.verified).toBeUndefined();
+      expect(payload.delta).toBeUndefined();
     } finally {
       probe.before = originalBefore;
       probe.after = originalAfter;
@@ -658,79 +676,43 @@ describe('McpBridgePlugin - verified effect delta (plan-707)', () => {
    * inside its own probe window until the second has finished, which is
    * exactly the shape the unawaited `onmessage` handler makes possible.
    */
-  type ToolKey = 'webSignalSetBool' | 'webSignalSetFloat';
-
-  /**
-   * The instance that OWNS a tool method.
-   *
-   * The signal tools sat on the plugin until plan-713 Phase 1 moved them into
-   * `McpRuntimeTools`, so patching `plugin[key]` silently patched `undefined`.
-   * Asking the announced instance list which object carries the method keeps
-   * this test indifferent to where the tools live next.
-   */
-  function ownerOf(plugin: McpBridgePlugin, key: ToolKey):
-  Record<string, (...a: unknown[]) => Promise<string>> {
-    for (const instance of plugin.mcpToolInstances) {
-      if (typeof (instance as Record<string, unknown>)[key] === 'function') {
-        return instance as Record<string, (...a: unknown[]) => Promise<string>>;
-      }
-    }
-    throw new Error(`no announced instance owns ${key}`);
-  }
-
-  function nestCalls(plugin: McpBridgePlugin, outerKey: ToolKey, innerKey: ToolKey = outerKey) {
-    const target = ownerOf(plugin, outerKey);
-    const innerTarget = ownerOf(plugin, innerKey);
+  function nestCalls(_plugin: McpBridgePlugin, outerKey: string, innerKey = outerKey) {
+    const original = commandRegistry.execute.bind(commandRegistry);
     let release!: () => void;
-    const gate = new Promise<void>((r) => { release = r; });
-
-    if (outerKey === innerKey) {
-      // Same tool twice: the roles are told apart by invocation order.
-      const original = target[outerKey].bind(target);
-      let seen = 0;
-      target[outerKey] = async (...args: unknown[]) => {
-        if (++seen === 1) {
-          await gate;               // call #1 waits for call #2 to complete
-          return original(...args);
-        }
-        const out = await original(...args);
-        release();                  // call #2 done — let #1 through
-        return out;
-      };
-      return;
-    }
-
-    const outer = target[outerKey].bind(target);
-    const inner = innerTarget[innerKey].bind(innerTarget);
-    target[outerKey] = async (...args: unknown[]) => { await gate; return outer(...args); };
-    innerTarget[innerKey] = async (...args: unknown[]) => {
-      const out = await inner(...args);
-      release();
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let seen = 0;
+    vi.spyOn(commandRegistry, 'execute').mockImplementation(async (id, args, ctx) => {
+      if (id === outerKey && (outerKey !== innerKey || ++seen === 1)) {
+        await gate;
+        return original(id, args, ctx);
+      }
+      const out = await original(id, args, ctx);
+      if (id === innerKey) release();
       return out;
-    };
+    });
   }
 
   it('two nested writes on the SAME scope: neither claims the other\'s effect (R13)', async () => {
     const { plugin } = setupPlugin();
     const { handleMessage, sent } = createMessageHandler(plugin);
     _resetInFlightForTest();
-    nestCalls(plugin, 'webSignalSetBool');
+    nestCalls(plugin, 'signal.setBool');
 
     // Both drive StartSignal (true) to false, so a change genuinely happens
     // inside the shared window and the two calls cannot be told apart.
     await Promise.all([
       handleMessage(JSON.stringify({
-        type: 'call', id: 710, tool: 'web_signal_set_bool',
-        arguments: { name: 'StartSignal', value: false },
+        type: 'call', id: 710, tool: 'web_execute',
+        arguments: { command: 'signal.setBool', args: JSON.stringify({ name: 'StartSignal', value: false }) },
       })),
       handleMessage(JSON.stringify({
-        type: 'call', id: 711, tool: 'web_signal_set_bool',
-        arguments: { name: 'StartSignal', value: false },
+        type: 'call', id: 711, tool: 'web_execute',
+        arguments: { command: 'signal.setBool', args: JSON.stringify({ name: 'StartSignal', value: false }) },
       })),
     ]);
 
     expect(sent).toHaveLength(2);
-    const deltas = sent.map((_, i) => payloadOf(sent, i).verified as
+    const deltas = sent.map((_, i) => payloadOf(sent, i).delta as
       { changed?: string[]; ambiguous?: true; noop?: true; why?: string });
 
     for (const d of deltas) {
@@ -752,24 +734,24 @@ describe('McpBridgePlugin - verified effect delta (plan-707)', () => {
     const { plugin } = setupPlugin();
     const { handleMessage, sent } = createMessageHandler(plugin);
     _resetInFlightForTest();
-    nestCalls(plugin, 'webSignalSetBool', 'webSignalSetFloat');
+    nestCalls(plugin, 'signal.setBool', 'signal.setFloat');
 
     // Same nesting, different signals — the scopes do not touch, so both
     // deltas stay attributable. Overlap must cost precision only where it
     // genuinely exists.
     await Promise.all([
       handleMessage(JSON.stringify({
-        type: 'call', id: 720, tool: 'web_signal_set_bool',
-        arguments: { name: 'StartSignal', value: false },
+        type: 'call', id: 720, tool: 'web_execute',
+        arguments: { command: 'signal.setBool', args: JSON.stringify({ name: 'StartSignal', value: false }) },
       })),
       handleMessage(JSON.stringify({
-        type: 'call', id: 721, tool: 'web_signal_set_float',
-        arguments: { name: 'SpeedSignal', value: 9.5 },
+        type: 'call', id: 721, tool: 'web_execute',
+        arguments: { command: 'signal.setFloat', args: JSON.stringify({ name: 'SpeedSignal', value: 9.5 }) },
       })),
     ]);
 
     for (let i = 0; i < 2; i++) {
-      const v = payloadOf(sent, i).verified as { ambiguous?: true; changed: string[] };
+      const v = payloadOf(sent, i).delta as { ambiguous?: true; changed: string[] };
       expect(v.ambiguous, `frame ${i} should be attributable`).toBeUndefined();
       expect(v.changed).toHaveLength(1);
     }
@@ -788,6 +770,6 @@ describe('McpBridgePlugin - verified effect delta (plan-707)', () => {
     expect((payload.runtime as { signalCount: number }).signalCount).toBe(2);
     expect(payload.next).toBeTruthy();
     // read-only: no delta of its own
-    expect(payload.verified).toBeUndefined();
+    expect(payload.delta).toBeUndefined();
   });
 });

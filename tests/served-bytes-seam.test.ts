@@ -15,12 +15,13 @@ import {
   encryptGlb, deriveMasterKey, parseEnvelopeHeader, randomBytes, FRAGMENT_BYTES,
 } from '../src/core/persistence/rv-crypto-utils';
 import {
-  decryptServedBytes, fetchServedBytes, setSessionKey, clearSessionKeys, EncryptedWithoutKeyError, isEncryptedDeploy,
+  decryptingStatusFor, DECRYPTING_MODEL_LABEL, decryptServedBytes, fetchServedBytes, setSessionKey, clearSessionKeys, EncryptedWithoutKeyError, isEncryptedDeploy,
 } from '../src/core/persistence/rv-served-bytes';
 import { setAppConfig } from '../src/core/rv-app-config';
 import { BundledBackend } from '../src/core/project/backends/bundled-backend';
 import modelCacheSource from '../src/core/engine/rv-model-cache.ts?raw';
 import bundledBackendSource from '../src/core/project/backends/bundled-backend.ts?raw';
+import mainSource from '../src/main.ts?raw';
 
 const FRAG = randomBytes(FRAGMENT_BYTES);
 const SALT = randomBytes(16);
@@ -130,7 +131,25 @@ describe('no naked fetch of GLB bytes beside the seam (drift guard)', () => {
   });
 
   it('the bundled backend decrypts in _fetchBytes and in readDocumentUrl', () => {
-    expect(bundledBackendSource).toContain('decryptServedBytes(await resp.arrayBuffer()');
+    // Script trust (palletyard-script-kpi): the body is read through `readTrackedBody`
+    // so the loader can bind a fetch token to it; it is still decrypted at this one seam.
+    expect(bundledBackendSource).toContain('decryptServedBytes(await readTrackedBody(resp, { stream: false })');
     expect(bundledBackendSource).toContain('if (isEncryptedDeploy()) {');
+  });
+});
+
+describe('loading message while an encrypted model is decrypted', () => {
+  it('names the decrypt step for an envelope and stays silent for plain bytes', async () => {
+    expect(decryptingStatusFor(await envelope())).toBe('Decrypting model file…');
+    expect(DECRYPTING_MODEL_LABEL).toBe('Decrypting model file…');
+    expect(decryptingStatusFor(text(PLAIN))).toBeNull();
+    expect(decryptingStatusFor(text(PLAIN).buffer as ArrayBuffer)).toBeNull();
+  });
+
+  it('is shown by loadModel between the download and the decrypt seam', () => {
+    const show = mainSource.indexOf('decryptingStatusFor(data)');
+    const decrypt = mainSource.indexOf('data = await decryptServedBytes(data, url)');
+    expect(show).toBeGreaterThan(0);
+    expect(decrypt).toBeGreaterThan(show);
   });
 });

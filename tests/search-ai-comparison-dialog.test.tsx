@@ -167,7 +167,7 @@ describe('SearchAiDialog comparison tabs', () => {
     vi.stubGlobal('matchMedia', () => ({ matches: true }));
     await renderAnswer({
       diagnose: async () => ({
-        cause: '', remedy: 'Nicht in der Dokumentation gefunden.', sources: [],
+        cause: '', remedy: 'Not found in the documentation.', sources: [],
         provider: 'cloud', durationMs: 900,
         comparison: {
           cause: 'CLI found it', remedy: '', sources: [], provider: 'claude-cli', durationMs: 4100,

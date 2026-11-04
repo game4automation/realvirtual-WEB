@@ -63,8 +63,53 @@ export interface RvCustomer {
   inference?: RvCustomerInference;
   /** plan-759: the hosted-link key halves, in the entry like the licence. */
   hosted?: RvCustomerHosted;
+  /** plan-603: the partner's own Bunny zone, from which he publishes his own projects. */
+  publishing?: RvCustomerPublishing;
   secretsRef?: string;
 }
+
+/** A partner's publishing target — his own storage zone in our Bunny account (plan-603 D1). */
+export interface RvCustomerPublishing {
+  target: 'partner-zone';
+  /** Storage-zone name, e.g. `rv-partner-customer`. */
+  storageZone: string;
+  storageZoneId?: number;
+  pullZoneId?: number;
+  /** Public hostname of the pull zone, e.g. `customer.web.realvirtual.io`. */
+  hostname: string;
+  region?: 'DE' | 'NY' | 'LA' | 'SG';
+  /** Monthly bandwidth cap in GB; 0 means uncapped and is reported by the doctor. */
+  monthlyBandwidthGb?: number;
+  /** The zone password we issue to the partner (write + delete inside HIS zone only). */
+  storageKey?: string;
+}
+
+export interface RvPartnerPublishing {
+  target: 'partner-zone';
+  storageZone: string;
+  storageZoneId: number | null;
+  pullZoneId: number | null;
+  hostname: string;
+  region: 'DE' | 'NY' | 'LA' | 'SG';
+  monthlyBandwidthGb: number | null;
+  storageKey: string | null;
+}
+
+export const PUBLISHING_TARGETS: readonly ['partner-zone'];
+export const BUNNY_REGIONS: readonly ['DE', 'NY', 'LA', 'SG'];
+
+/** The partner's publishing target, or null when the entry has none. */
+export function resolvePartnerPublishing(customer: RvCustomer | null | undefined): RvPartnerPublishing | null;
+/** The `.env` lines the partner pastes into his clone (`BUNNY_STORAGE_KEY` only once known). */
+export function partnerDeployEnv(publishing: RvPartnerPublishing | null): Array<[string, string]>;
+/** Merges a provisioning result into `customers/<slug>.json`; refuses a silent zone swap. */
+export function recordPartnerPublishing(
+  privateRoot: string,
+  slug: string,
+  publishing: Partial<RvCustomerPublishing>,
+): RvCustomer;
+/** The entry with both register credentials masked for display. */
+export function redactRegisterSecrets<T extends RvCustomer>(customer: T): T;
 
 /** The two halves of a hosted deploy's key (plan-759 D6b). */
 export interface RvCustomerHosted {
@@ -97,6 +142,9 @@ export interface RvCustomerContext {
   privateRoot?: string;
   manifest?: any;
   presetsRoot?: string;
+  /** Doctor only: deep library resolution (default off - shape checks only). */
+  deepLibraries?: boolean;
+  librarySources?: { projectsDir?: string | null; libraries?: Record<string, string> };
 }
 
 export interface RvCustomerFindings {
@@ -136,6 +184,8 @@ export const SHARED_ORG: string;
 export const SHARED_REPO: string;
 
 export function isSharedForgejo(customer: Partial<RvCustomer> | null | undefined): boolean;
+/** plan-679 Phase 2: true when a delivery of this customer carries the diagnosis package (`support: "managed"`). */
+export function deliversDiagnosis(customer: unknown): boolean;
 
 export function customerRegistryPath(privateRoot: string, slug: string): string;
 export function customerSecretsPath(privateRoot: string, customer: Partial<RvCustomer>): string;
@@ -157,3 +207,10 @@ export function resolveCustomerSecrets(
     requireLicenseKey?: boolean;
   },
 ): RvCustomerSecrets;
+
+/** plan-778: library findings of projects/<key> (libraries[] shape, then resolution by id in projects/). */
+export function projectLibraryProblems(
+  privateRoot: string,
+  key: string,
+  opts?: { deep?: boolean; sources?: { projectsDir?: string | null; libraries?: Record<string, string> } },
+): string[];

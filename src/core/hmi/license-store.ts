@@ -69,6 +69,24 @@ let requestGeneration = 0;
 export const subscribeLicenseStore = store.subscribe;
 export const getLicenseSnapshot = store.getSnapshot;
 
+/**
+ * Calls `onLicensed` once per local `unlicensed -> licensed` edge (plan-2044): the license store
+ * saw `gatewayAllowed: false` and now sees `gatewayAllowed: true`. A snapshot without a status
+ * (not fetched yet, or cleared on a gateway switch) is no edge in either direction, so a page that
+ * loads against an already licensed gateway never fires, and a gateway switch never fires either.
+ * The baseline is the snapshot at subscription time. Returns the unsubscribe function.
+ */
+export function onGatewayLicensed(onLicensed: () => void): () => void {
+  let allowed = store.getSnapshot().status?.gatewayAllowed ?? null;
+  return store.subscribe(() => {
+    const status = store.getSnapshot().status;
+    if (!status) { allowed = null; return; }
+    const before = allowed;
+    allowed = status.gatewayAllowed;
+    if (before === false && allowed) onLicensed();
+  });
+}
+
 function finiteNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
@@ -126,6 +144,93 @@ function humanizeReason(reason: string | null | undefined): string {
     .replaceAll('_', ' ')
     .toLowerCase()
     .replace(/^./, (letter) => letter.toUpperCase());
+}
+
+export const OFFLINE_ACTIVATION_PORTAL_URL = 'https://portal.realvirtual.io/licenses';
+
+export type OfflineActivationKind = 'commercial' | 'community';
+
+export function offlineActivationErrorMessage(code: string | undefined, fallback: string): string {
+  switch (code) {
+    case 'LICENSE_FINGERPRINT_MISMATCH':
+      return 'This licence was issued for a different computer. Create the request code on this computer and request a new licence in the portal.';
+    case 'LICENSE_TOKEN_SIGNATURE_INVALID':
+    case 'LICENSE_TOKEN_KID_UNKNOWN':
+      return 'The licence signature is invalid. Copy the complete token from the portal or use the downloaded .rvlic file unchanged.';
+    case 'LICENSE_TOKEN_EMPTY':
+    case 'LICENSE_TOKEN_MALFORMED':
+    case 'LICENSE_TOKEN_BASE64URL_INVALID':
+    case 'LICENSE_TOKEN_JSON_INVALID':
+    case 'LICENSE_TOKEN_HEADER_INVALID':
+    case 'JSON_INVALID':
+    case 'HEADER_INVALID':
+      return 'This is not a valid realvirtual CONNECT licence token. Copy the complete token from the portal or choose the downloaded .rvlic file.';
+    case 'LICENSE_OFFLINE_KEY_REQUIRED':
+    case 'LICENSE_OFFLINE_KEY_INVALID':
+      return 'Enter your licence key in the format LIC-XXXX-XXXX-XXXX.';
+    case 'LICENSE_OFFLINE_EMAIL_INVALID':
+      return 'Enter a valid email address, or leave the optional email field empty.';
+    case 'LICENSE_FINGERPRINT_UNAVAILABLE':
+      return 'The hardware fingerprint is unavailable on this computer. Please contact realvirtual support.';
+    case 'LICENSE_STORE_UNAVAILABLE':
+      return 'CONNECT could not store the licence. Check that its data directory is writable, then try again.';
+    default:
+      return code ? humanizeReason(code) : fallback;
+  }
+}
+
+async function offlineResponseError(response: Response): Promise<string> {
+  const fallback = `CONNECT returned HTTP ${response.status}`;
+  try {
+    const body = await response.json() as { error?: unknown; message?: unknown; code?: unknown };
+    const message = typeof body.error === 'string'
+      ? body.error
+      : typeof body.message === 'string' ? body.message : fallback;
+    return offlineActivationErrorMessage(typeof body.code === 'string' ? body.code : undefined, message);
+  } catch {
+    return fallback;
+  }
+}
+
+export async function requestOfflineActivationCode(
+  serverUrl: string,
+  options: { kind: OfflineActivationKind; licenseKey?: string; email?: string },
+): Promise<{ code: string; portalUrl: string }> {
+  const params = new URLSearchParams({ kind: options.kind, termsVersion: LICENSE_TERMS_VERSION });
+  if (options.licenseKey?.trim()) params.set('licenseKey', options.licenseKey.trim());
+  if (options.email?.trim()) params.set('email', options.email.trim());
+  const response = await connectRestFetch(`${serverUrl}/license/offline-request?${params.toString()}`);
+  if (response.status === 404) {
+    throw new Error('This CONNECT version does not support offline activation yet. Please update CONNECT.');
+  }
+  if (!response.ok) throw new Error(await offlineResponseError(response));
+  const body = await response.json() as { code?: unknown; portalUrl?: unknown };
+  if (typeof body.code !== 'string' || !body.code) {
+    throw new Error('CONNECT returned an invalid offline activation response.');
+  }
+  return {
+    code: body.code,
+    portalUrl: typeof body.portalUrl === 'string' && body.portalUrl
+      ? body.portalUrl
+      : OFFLINE_ACTIVATION_PORTAL_URL,
+  };
+}
+
+export async function importLicenseToken(
+  serverUrl: string,
+  tokenText: string,
+  licenseKey?: string,
+): Promise<void> {
+  const token = tokenText.replace(/^\uFEFF/, '').trim();
+  if (!token) throw new Error('Paste the activation token or choose the licence file.');
+  const body: { token: string; licenseKey?: string } = { token };
+  if (licenseKey?.trim()) body.licenseKey = licenseKey.trim();
+  const response = await connectRestFetch(`${serverUrl}/license/token`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) throw new Error(await offlineResponseError(response));
+  await fetchLicenseStatus(serverUrl);
 }
 
 /** Derive all operator-facing state from one backend snapshot. */

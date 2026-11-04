@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage, listLocalStorageKeys, removeLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * rv-workspace-migration — the eager scene→document conversion (plan-716 §2.3,
  * F3).
@@ -103,6 +105,7 @@ export const SCENES_MIGRATION_MARKER_KEY = 'rv-migration/scenes-v1';
  * accident the graveyard exists to avoid. `'rv-scenes-retired/x'.startsWith(
  * 'rv-scenes/')` is false — the character after `rv-scenes` is a hyphen.
  */
+// Persisted name — do not rename (plan-777 P1).
 export const LS_KEY_SCENES_RETIRED_PREFIX = 'rv-scenes-retired/';
 
 /** Retired catalogue row: the former `rv-scenes/<id>`. */
@@ -203,7 +206,7 @@ export interface WorkspaceMigrationOptions {
    */
   backend?: MigrationBackend;
   /**
-   * Scene documents of a FOLDER project to alias (§2.3 step 5).
+   * Legacy `scn_` documents of a FOLDER project to alias (§2.3 step 5).
    *
    * Folder projects need no byte migration — their scenes have been
    * `documents[]` rows with a real file since plan-397/413. What they need is
@@ -503,7 +506,7 @@ async function _migrate(
 /** Has the catalogue been fully converted on this profile? */
 export function isScenesMigrationDone(): boolean {
   try {
-    return localStorage.getItem(SCENES_MIGRATION_MARKER_KEY) !== null;
+    return getLocalStorage()!.getItem(SCENES_MIGRATION_MARKER_KEY) !== null;
   } catch {
     // Storage disabled. Answering "done" is the safe lie: there is no catalogue
     // to convert either, and answering "not done" would run the whole walk on
@@ -514,7 +517,7 @@ export function isScenesMigrationDone(): boolean {
 
 function markScenesMigrationDone(at: string): void {
   try {
-    localStorage.setItem(SCENES_MIGRATION_MARKER_KEY, JSON.stringify({ at, state: 'done' }));
+    writeLocalStorage(SCENES_MIGRATION_MARKER_KEY, JSON.stringify({ at, state: 'done' }));
   } catch { /* the run still happened; the next boot repeats a cheap no-op walk */ }
 }
 
@@ -739,12 +742,12 @@ function moveDraftSlot(sceneId: string, documentId: string): boolean {
   const fromKey = LS_KEY_SCENE_GLB_PREFIX + DRAFT_SLOT_PREFIX + sceneId;
   const toKey = LS_KEY_SCENE_GLB_PREFIX + DRAFT_SLOT_PREFIX + documentId;
   try {
-    const raw = localStorage.getItem(fromKey);
+    const raw = getLocalStorage()!.getItem(fromKey);
     if (raw === null) return false;
     // A draft already at the destination wins: it was written by the migrated
     // identity, so it is newer than anything still sitting under the old key.
-    if (localStorage.getItem(toKey) === null) localStorage.setItem(toKey, raw);
-    localStorage.removeItem(fromKey);
+    if (getLocalStorage()!.getItem(toKey) === null) getLocalStorage()!.setItem(toKey, raw);
+    getLocalStorage()!.removeItem(fromKey);
     return true;
   } catch (e) {
     reportSceneStorageError({ op: 'write-draft', id: sceneId, cause: e });
@@ -775,10 +778,10 @@ function retireRow(sceneId: string): boolean {
  */
 function retireKey(fromKey: string, toKey: string): boolean {
   try {
-    const raw = localStorage.getItem(fromKey);
+    const raw = getLocalStorage()!.getItem(fromKey);
     if (raw === null) return false;
-    localStorage.setItem(toKey, raw);
-    localStorage.removeItem(fromKey);
+    getLocalStorage()!.setItem(toKey, raw);
+    getLocalStorage()!.removeItem(fromKey);
     return true;
   } catch (e) {
     // A full localStorage cannot accept the retired copy. Removing the source
@@ -811,7 +814,7 @@ function listOrphanBodies(rowIds: readonly string[]): string[] {
   );
 }
 
-/** `scn_`-shaped scene document ids of a folder project (§2.3 step 5). */
+/** `scn_`-shaped document ids of a folder project (§2.3 step 5). */
 function folderSceneIdsToAlias(project: RvProject | null): string[] {
   if (!project) return [];
   return documentsOf(project)
@@ -854,12 +857,11 @@ function normalisePath(path: string): string {
 /** Forget the marker and empty the graveyard. Tests only. */
 export function __resetWorkspaceMigrationForTests(): void {
   const doomed: string[] = [SCENES_MIGRATION_MARKER_KEY];
-  for (let i = 0; i < localStorage.length; i++) {
-    const k = localStorage.key(i);
+  for (const k of listLocalStorageKeys()) {
     if (k && k.startsWith(LS_KEY_SCENES_RETIRED_PREFIX)) doomed.push(k);
   }
   for (const k of doomed) {
-    try { localStorage.removeItem(k); } catch { /* ignore */ }
+    removeLocalStorage(k);
   }
 }
 
@@ -867,8 +869,7 @@ export function __resetWorkspaceMigrationForTests(): void {
 export function listRetiredKeys(): string[] {
   const out: string[] = [];
   try {
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
+    for (const k of listLocalStorageKeys()) {
       if (k && k.startsWith(LS_KEY_SCENES_RETIRED_PREFIX)) out.push(k);
     }
   } catch { /* ignore */ }

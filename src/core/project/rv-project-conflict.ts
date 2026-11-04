@@ -77,7 +77,7 @@ export interface FolderSceneState {
   /**
    * Content revision of the folder body (SHA-256), when known (plan-397 §2.8).
    *
-   * From `RvProjectSceneEntry.revision` or from a `SceneRecord` that was read.
+   * From `RvDocumentEntry.revision` or from a `SceneRecord` that was read.
    * It contributes **existence, not equality**: a manifest entry that carries
    * a revision proves the folder has a body here even when it carries no
    * `modifiedAt`, which is the shape a GLB entry has. What it is deliberately

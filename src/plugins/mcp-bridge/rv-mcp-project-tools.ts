@@ -189,7 +189,7 @@ export class McpProjectTools {
     + 'in the manifest) — repo fixtures no delivered channel ships, and ordinary `documents` '
     + 'rows. filter: case-insensitive substring of name/path; withNodeCount adds nodeCount by '
     + 'reading each GLB header (slower). Pass id/name/path to web_document_open, path to '
-    + 'web_document_update or web_editor_open(source=library).',
+    + 'document.delete / document.rename / document.move or web_editor_open(source=library).',
     { readOnly: true, timeoutMs: 60_000 },
   )
   async webDocumentList(
@@ -308,7 +308,7 @@ export class McpProjectTools {
     + 'built-in label or url from web_document_list; the special value "empty" opens an '
     + 'EMPTY viewport. '
     + 'Open "empty" BEFORE authoring a new asset: with a document still loaded, opening the '
-    + 'asset editor with source=new leaves it in the scene and web_editor_import_cad attaches '
+    + 'asset editor with source=new leaves it in the scene and editor.importCad attaches '
     + 'the import UNDER it — the new document silently adopts the whole scene, and a save '
     + 'would write the demo scene plus your part. '
     + 'Refused while the asset editor is open: the editor keeps its document (and its save '
@@ -352,7 +352,7 @@ export class McpProjectTools {
       //
       // Loading an empty MODEL is what actually clears it (same measurement:
       // nodeCount 53, rootPath "/3D-model_A_00808"). So prefer a built-in empty
-      // GLB and fall back to newEmpty() only when the install has none.
+      // GLB and fall back to openScratch() only when the install has none.
       const emptyBuiltin = builtinSources(this.viewer).find((b) => matchKey(b.label) === 'empty');
       if (emptyBuiltin) {
         await store.openBuiltin(emptyBuiltin.url, emptyBuiltin.label);
@@ -362,18 +362,17 @@ export class McpProjectTools {
           kind: 'builtin',
           url: emptyBuiltin.url,
           currentModel: this.viewer?.currentModelUrl ?? null,
-          next: 'Empty viewport. Now web_editor_open(source=new), then web_editor_import_cad. '
+          next: 'Empty viewport. Now web_editor_open(source=new), then web_execute("editor.importCad", …). '
             + 'Check web_editor_status: nodeCount must stay at the imported part count.',
         });
       }
-      // newEmpty, not openEmpty: openEmpty RESUMES the autosaved empty draft,
-      // which would silently bring a previous session's edits back into a
-      // viewport whose whole point here is to be blank.
-      await store.newEmpty();
+      // Discard the previous draft without creating a project document.
+      await store.openScratch();
       return JSON.stringify({
         opened: true,
         model: 'empty',
-        kind: 'scene',
+        kind: 'scratch',
+        note: 'Unsaved scratch workspace. Nothing is written to a project file until an explicit save.',
         currentModel: this.viewer?.currentModelUrl ?? null,
         warning: 'No built-in empty GLB in this install, so only the SCENE was cleared — a '
           + 'previously loaded model may still be in the viewport, and the asset editor would '
@@ -521,7 +520,7 @@ export class McpProjectTools {
     if (!force && store.hasUnpersistedWork()) {
       return JSON.stringify({
         error: 'The open project has unsaved work — refusing to switch.',
-        remedy: 'Save it (web_editor_save / scene save), or repeat with force=true to discard.',
+        remedy: 'Save it (web_editor_save / web_document_save), or repeat with force=true to discard.',
         currentProject: already?.name ?? null,
       });
     }
@@ -564,12 +563,12 @@ export class McpProjectTools {
   @McpTool(
     'Show the open project as a TREE — folders, documents and attachment files, nested, exactly '
     + 'as the Projects dashboard shows them. Each node: name, kind (folder/document/file/system), '
-    + 'path (project-relative — what web_document_open / web_document_update / web_project_folder '
+    + 'path (project-relative — what web_document_open / document.delete / document.rename / document.move / web_project_folder '
     + 'take), documentId for a GLB with a manifest row, and writable. Reserved machinery '
-    + '(settings/connect/rag/thumbnails/.trash) is grouped under one read-only "System" node. '
+    + '(settings/connect/rag/.thumbnails/.trash) is grouped under one read-only "System" node. '
     + 'Pass dir to start at a subfolder, maxDepth to limit nesting (childrenOmitted says what '
     + 'was cut). The flat alternative with sizes is web_document_list; files-with-glob is '
-    + 'web_editor_project_files.',
+    + 'editor.projectFiles.',
     { readOnly: true, timeoutMs: 60_000 },
   )
   async webProjectTree(
@@ -597,8 +596,9 @@ export class McpProjectTools {
       writable: loaded.writable,
       tree: tree.serializeTreeNode(start, depth),
       hint: 'Folders: web_project_folder(action=create|rename|move). Documents: '
-        + 'web_document_new(name, folder) to create here, web_document_update to '
-        + 'rename/move/delete, web_document_open to load.',
+        + 'web_execute("document.create", {name, folder}) to create here; '
+        + 'web_execute("document.rename", {relPath, newName}), web_execute("document.move", {relPath, toFolder}) '
+        + 'or web_execute("document.delete", {relPath}) to manage documents; web_document_open to load.',
     });
   }
 
@@ -609,7 +609,7 @@ export class McpProjectTools {
     + '(parents may exist or not; an empty folder is a declared manifest entry). action=rename: '
     + 'path + newName. action=move: path + toFolder (destination folder, "" = project root). '
     + 'Reserved system folders and catalog rows are refused; documents are managed by '
-    + 'web_document_update instead.',
+    + 'document.delete / document.rename / document.move instead.',
     { readOnly: false, timeoutMs: 120_000 },
   )
   async webProjectFolder(
@@ -635,7 +635,7 @@ export class McpProjectTools {
       if ('error' in made) return JSON.stringify(made);
       return JSON.stringify({
         created: true, path: made.path,
-        next: `web_document_new(name, folder="${made.path}") creates a document here; `
+        next: `web_execute("document.create", {name, folder:"${made.path}"}) creates a document here; `
           + 'web_project_tree shows the result.',
       });
     }
@@ -644,7 +644,8 @@ export class McpProjectTools {
     if (!node || node.kind !== 'folder') {
       return JSON.stringify({
         error: `No folder at "${treeMod.normaliseRelPath(path)}" — see web_project_tree. `
-          + '(For documents use web_document_update.)',
+          + '(For documents use web_execute("document.rename", {relPath, newName}) '
+          + 'or web_execute("document.move", {relPath, toFolder}).)',
       });
     }
 
@@ -681,22 +682,10 @@ export class McpProjectTools {
     });
   }
 
-  @McpTool(
-    'BIND or UNBIND one reference field of a document — the project.json edit the dashboard\'s '
-    + 'reference slots make. field=connectRef takes a *.connect.json, field=scriptRef a PLUGIN '
-    + '(.ts/.tsx under plugins/, loaded with the document), field=knowledgeRef a *.md. ref="" '
-    + 'clears it. document is a project-relative path, id or name (web_document_list). Touches '
-    + 'no file and deletes nothing: writes the field, reads it back, reports the stored state. '
-    + 'Refused for a read-only project, a bundled document, a ref leaving the project or a path '
-    + 'the field\'s rule rejects. Renaming or deleting the FILES is web_document_update.',
-    { readOnly: false, timeoutMs: 60_000 },
-  )
-  async webDocumentBind(
-    @McpParam('document', 'Project-relative path, document id or name of the document to bind (from web_document_list).')
+  /** Operation body shared by the registry command (plan-2007). */
+  async bindDocument(
     document: string,
-    @McpParam('field', 'connectRef | scriptRef | knowledgeRef (aliases: connect | plugin | knowledge)')
     field: string,
-    @McpParam('ref', 'Project-relative path of the file to bind. Empty string (or omitted) clears the binding.', 'string', false)
     ref?: string,
   ): Promise<string> {
     const [{ getProjectStore }, refs, docs, listing] = await Promise.all([
@@ -706,7 +695,7 @@ export class McpProjectTools {
       import('./rv-mcp-asset-listing'),
     ]);
 
-    // The check order of `webDocumentUpdate` (§2.2), and for the same reason:
+    // The check order of `updateDocument` (§2.2), and for the same reason:
     // each step is only answerable once the one before it held, so any other
     // order produces a message about the wrong problem.
     const store = getProjectStore();

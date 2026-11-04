@@ -13,6 +13,7 @@
  * is untouched. That is what makes the change safe for external agent sessions
  * holding paths from an earlier call.
  */
+import { executeValue } from './helpers/execute-value';
 import { afterEach, describe, it, expect } from 'vitest';
 import { Group, Object3D, Scene } from 'three';
 // plan-713 Phase 1 — web_node_tree moved off the plugin into McpSceneTools.
@@ -155,7 +156,7 @@ async function editorTools(modelRoot: Object3D, registry: NodeRegistry, doc: obj
   // registry guard, so the context is published for real as well.
   (tools as unknown as { _ctx: () => object })._ctx = () => ({ viewer, doc });
   setActiveAssetContext({ viewer, doc: { id: 'root-lock-doc', ...doc } } as never);
-  return tools;
+  return viewer;
 }
 
 describe('MCP editor tools refuse the model root', () => {
@@ -173,16 +174,11 @@ describe('MCP editor tools refuse the model root', () => {
       setNodeVisible: () => calls.push('visible'),
       whenIdle: async () => {},
     };
-    const tools = await editorTools(modelRoot, registry, doc);
+    const viewer = await editorTools(modelRoot, registry, doc);
 
-    const rename = JSON.parse(await (tools as never as { webEditorRename(p: string, n: string): Promise<string> })
-      .webEditorRename('Robot', 'Nope'));
-    const transform = JSON.parse(await (tools as never as {
-      webEditorTransform(...a: unknown[]): Promise<string>;
-    }).webEditorTransform('Robot', 1, 2, 3));
-    const visible = JSON.parse(await (tools as never as {
-      webEditorSetVisible(p: string, v: boolean): Promise<string>;
-    }).webEditorSetVisible('Robot', false));
+    const rename = JSON.parse(await executeValue(viewer, 'editor.rename', { path: 'Robot', name: 'Nope' }));
+    const transform = JSON.parse(await executeValue(viewer, 'editor.transform', { path: 'Robot', px: 1, py: 2, pz: 3 }));
+    const visible = JSON.parse(await executeValue(viewer, 'editor.setVisible', { paths: 'Robot', visible: false }));
 
     // Community edition (plan-499 F20): the command-bound verbs answer
     // "not available" before any rule; the unbound transform still locks.
@@ -200,16 +196,19 @@ describe('MCP editor tools refuse the model root', () => {
     const calls: string[] = [];
     const doc = {
       renameNode: () => calls.push('rename'),
+      // plan-610: web_editor_rename goes through the reference-safe, awaited rename.
+      renameNodeAwaited: async (path: string, name: string) => {
+        calls.push('rename');
+        return { path: path.slice(0, path.lastIndexOf('/') + 1) + name, referencesRewritten: 0, nameFieldsRewritten: 0, warnings: [] };
+      },
       transformNode: () => calls.push('transform'),
       setNodeVisible: () => calls.push('visible'),
       whenIdle: async () => {},
     };
-    const tools = await editorTools(modelRoot, registry, doc);
+    const viewer = await editorTools(modelRoot, registry, doc);
 
-    await (tools as never as { webEditorRename(p: string, n: string): Promise<string> })
-      .webEditorRename('Robot/Base', 'Plate');
-    await (tools as never as { webEditorSetVisible(p: string, v: boolean): Promise<string> })
-      .webEditorSetVisible('Robot/Base', false);
+    await executeValue(viewer, 'editor.rename', { path: 'Robot/Base', name: 'Plate' });
+    await executeValue(viewer, 'editor.setVisible', { paths: 'Robot/Base', visible: false });
 
     expect(calls).toEqual(__RV_HAS_PRIVATE__ ? ['rename', 'visible'] : []);
   });

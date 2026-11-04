@@ -11,6 +11,7 @@ import { NavButton } from '../core/hmi/NavButton';
 import { HistorianTrendPanel } from '../core/hmi/HistorianTrendPanel';
 import { historianStore, type HistorianStatus } from '../core/hmi/historian-store';
 import { getConnectSnapshot, subscribeConnectStore } from '../core/hmi/connect-store';
+import { onGatewayLicensed } from '../core/hmi/license-store';
 
 const STATUS_POLL_MS = 10_000;
 
@@ -25,6 +26,32 @@ export class HistorianTrendPlugin implements RVViewerPlugin {
   readonly slots: UISlotEntry[] = [
     { slot: 'button-group', component: HistorianTrendButton, order: 55 },
   ];
+
+  /** plan-2044: the one license-edge subscription of this plugin; null when none. */
+  private _licenseUnsubscribe: (() => void) | null = null;
+
+  init(): void { this._watchLicense(); }
+  onActivate(): void { this._watchLicense(); }
+  onDeactivate(): void { this._unwatchLicense(); }
+  dispose(): void { this._unwatchLicense(); }
+
+  /**
+   * plan-2044: re-read `/history/status` once on every local `unlicensed -> licensed` edge.
+   * An unlicensed CONNECT answers that route with 403 LICENSE_REQUIRED, which the store keeps
+   * as `disabledReason` and the CONNECT panel shows as "Historian not recording". The 10 s
+   * poll that would replace it lives in the toolbar button below, and the toolbar is not
+   * mounted in a recording, in focused workspace modes (planner, editor, ...) or in the
+   * viewer mode — the CONNECT panel is. So the edge is owned here, for the plugin's lifetime.
+   */
+  private _watchLicense(): void {
+    this._unwatchLicense();
+    this._licenseUnsubscribe = onGatewayLicensed(() => { void historianStore.refreshStatus(); });
+  }
+
+  private _unwatchLicense(): void {
+    this._licenseUnsubscribe?.();
+    this._licenseUnsubscribe = null;
+  }
 }
 
 function HistorianTrendButton(_props: UISlotProps) {

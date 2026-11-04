@@ -234,7 +234,7 @@ export class McpObserveTools {
 
   @McpTool('Measure BETWEEN parts (no side effects): for each pair of the given paths returns center distance, per-axis gap (negative = overlap depth), aabbGap (closest AABB separation, 0 = touching/overlapping) and overlaps flag. All meters, world space. The numeric grounding for clearances, conveyor gaps and pivot offsets. For a single node use web_node_bounds.', { readOnly: true })
   async webMeasure(
-    @McpParam('paths', 'Two or more node paths, comma/newline-separated. All pairs are measured.') paths: string,
+    @McpParam('paths', 'Two or more node paths, comma-separated (or newline-separated), or a JSON array of strings for names containing commas. All pairs are measured.') paths: string,
   ): Promise<string> {
     const v = this.viewer;
     const reg = v?.registry;
@@ -279,7 +279,7 @@ export class McpObserveTools {
 
   @McpTool('PCA shape analysis of nodes (no side effects): principal axes (world unit vectors), extents along them, shape class (cylinder-like | beam-like | disc-like | plate-like | compact) and the FUNCTIONAL AXIS — the rotation/symmetry axis for cylinder- and disc-like parts. Directly answers "which axis does this hinge/roller/shaft use" when kinematizing. Vertex-sampled (cap 20k).', { readOnly: true, timeoutMs: 30_000 })
   async webNodeShape(
-    @McpParam('paths', 'Node paths, comma/newline-separated.') paths: string,
+    @McpParam('paths', 'Node paths, comma-separated (or newline-separated), or a JSON array of strings for names containing commas.') paths: string,
   ): Promise<string> {
     const v = this.viewer;
     const reg = v?.registry;
@@ -354,7 +354,7 @@ export class McpObserveTools {
     return eyeChannelsFor(v);
   }
 
-  @McpTool('Render the AGENT camera (never the user viewport) into up to three channels from ONE pose in ONE call: beauty (materials), idmask (flat ID colors, white crease edges, legend), xray (LOOK INSIDE a part: the root subtree alone, translucent on black, every internal surface and crease drawn, so bores, cavities and buried components show through the shell). labels=true marks idmask only; beauty stays unannotated but pixel-aligned. The sidecar maps each label to node path, screen box and coverage. Distances in metres: web_measure or web_node_bounds. size = image HEIGHT 1024..2048; width follows the pose aspect. Move the camera first with web_camera_*. Requires the classic WebGL renderer.', { readOnly: true, timeoutMs: 60_000 })
+  @McpTool('Render the AGENT camera (never the user viewport) into up to three channels from ONE pose in ONE call: beauty (materials), idmask (flat ID colors, white crease edges, legend), xray (LOOK INSIDE a part: the root subtree alone, translucent on black, every internal surface and crease drawn, so bores, cavities and buried components show through the shell). labels=true marks idmask only; beauty stays unannotated but pixel-aligned. The sidecar maps each label to node path, screen box and coverage. Distances in metres: web_measure or web_node_bounds. size = image HEIGHT 1024..2048; width follows the pose aspect. Move the camera first with web_camera_*.', { readOnly: true, timeoutMs: 60_000 })
   async webEye(
     @McpParam('channels', 'Comma-separated: beauty, idmask, xray (default "beauty").', 'string', false) channels?: string,
     @McpParam('size', 'Image HEIGHT in px, 1024..2048 (default 1024); smaller values are raised to 1024. Width follows the pose aspect.', 'number', false) size?: number,
@@ -506,6 +506,12 @@ export class McpObserveTools {
       channels: rendered.channels.map((c) => c.channel),
       camera: rendered.camera,
       ...(rendered.crop ? { crop: rendered.crop } : {}),
+      // The viewport's isolate shapes the frame (plan-740 D-U3): say so, or the
+      // agent reads a dimmed machine as a lighting problem and a short legend
+      // as a missing part.
+      ...(rendered.isolate ? {
+        isolate: 'active: non-isolated parts are dimmed in beauty and have no identity in idmask/xray; web_execute("view.isolate", {paths:""}) with empty paths exits it',
+      } : {}),
       ...(rendered.legend.length > 0 ? { legend: rendered.legend } : {}),
       ...(visible.length > 0 ? { visible } : {}),
       ...(Object.keys(savedPaths).length > 0 ? { savedPaths } : {}),

@@ -25,6 +25,7 @@ import type { ContextMenuItem } from './hmi/context-menu-store';
 import type { StatisticsManager } from './material-flow/rv-statistics-manager';
 import { getSchemaDefaults } from './engine/rv-component-registry';
 import { instanceScope, scopeSignalName } from './engine/rv-instance-scope';
+import { isUnsafeObjectKey, ownExtrasOf, ownValue } from './engine/rv-safe-keys';
 
 // ─── Public Types ───────────────────────────────────────────────────────
 
@@ -186,7 +187,8 @@ export function resolveNode(root: Object3D, ref: NodeRef): Object3D | null {
 export function ensureExtras(node: Object3D): Record<string, unknown> {
   if (!node.userData) node.userData = {};
   const ud = node.userData as Record<string, unknown>;
-  let rv = ud.realvirtual as Record<string, unknown> | undefined;
+  // OWN record only (rv-safe-keys.ts): an inherited `realvirtual` is never merged into.
+  let rv = ownExtrasOf(ud);
   if (!rv) {
     rv = {};
     ud.realvirtual = rv;
@@ -208,6 +210,10 @@ export function axisCodeToVector(code: AxisCode): [number, number, number] {
  * and primitives are replaced wholesale. When `overwrite` is true, every
  * field in `patch` overwrites the corresponding field in `target`.
  *
+ * Content-safe (rv-safe-keys.ts): `__proto__` / `constructor` / `prototype`
+ * keys are skipped at every level, and only OWN values of `target` are merged
+ * into, so a patch can never reach `Object.prototype`.
+ *
  * Returns the (mutated) target for convenience.
  */
 export function deepMerge<T extends Record<string, unknown>>(
@@ -216,9 +222,10 @@ export function deepMerge<T extends Record<string, unknown>>(
   overwrite: boolean,
 ): T {
   for (const key of Object.keys(patch)) {
+    if (isUnsafeObjectKey(key)) continue;
     const pv = patch[key];
     if (pv === undefined) continue;
-    const tv = (target as Record<string, unknown>)[key];
+    const tv = ownValue(target, key);
     if (
       pv !== null && typeof pv === 'object' && !Array.isArray(pv) &&
       tv !== null && typeof tv === 'object' && !Array.isArray(tv)
@@ -505,10 +512,17 @@ export function applyKinematicsSpec(
       warnOrThrow(sink, `Behavior '${entry.type}': target not found: ${refDesc(entry.target)}`);
       continue;
     }
+    // A type naming a prototype slot would merge into Object.prototype (or a
+    // constructor): refused and reported, never applied (rv-safe-keys.ts).
+    if (typeof entry.type !== 'string' || entry.type === '' || isUnsafeObjectKey(entry.type)) {
+      warnOrThrow(sink, `Behavior: refused component type ${JSON.stringify(entry.type)}`);
+      continue;
+    }
     const extras = ensureExtras(node);
     const overwrite = globalOverwrite || !!entry.overwrite;
-    const cur = (extras[entry.type] as Record<string, unknown> | undefined) ?? {};
-    deepMerge(cur, entry.props, overwrite);
+    const own = ownValue(extras, entry.type);
+    const cur = (own !== null && typeof own === 'object' && !Array.isArray(own) ? own : {}) as Record<string, unknown>;
+    deepMerge(cur, (entry.props ?? {}) as Record<string, unknown>, overwrite);
     extras[entry.type] = cur;
     report.applied.behaviors++;
   }
@@ -553,6 +567,12 @@ export interface BindContextHost {
     unregister(pluginId: string): void;
   };
   drives: Array<{ name: string; node: Object3D; startMove?: (d?: number) => void; stop?: () => void; jogForward?: boolean; jogBackward?: boolean; TargetSpeed?: number; currentPosition?: number; isAtTarget?: boolean }>;
+  /** plan-2059 D7: address source for DES component ids on headless/test hosts
+   *  without a NodeRegistry (`#<id>` addresses). Production uses `registry`. */
+  desAddresses?: {
+    getAddressForNode(node: import('three').Object3D): string | null;
+    forEachNode(cb: (path: string, node: import('three').Object3D) => void): void;
+  } | null;
   registry?: {
     getNode?(path: string): Object3D | null;
     /** Optional write surface — used by the BehaviorManager to materialise
@@ -573,6 +593,15 @@ export interface BindContextHost {
    * per-component `StateStatistics` (`clockFn = () => host.simTime ?? 0`).
    */
   readonly simTime?: number;
+  /**
+   * Plan 632 — monotonic count of FIXED steps (every step, catch-up steps of one
+   * render frame included). RVViewer provides it (`get fixedStepCount`). The
+   * continuous Agv fleet uses it as the step key: all vehicles of one step share
+   * ONE clock advance and are drawn at the same sim time. Hosts that run fixed
+   * steps should provide it; a minimal/test host may omit it — the fleet then
+   * falls back to a restricted repeat-caller heuristic (see `Agv.ts`).
+   */
+  readonly fixedStepCount?: number;
   /**
    * Plan 201 (Phase 3) — per-component statistics registry. RVViewer provides a
    * shared `StatisticsManager`; minimal/test hosts may omit it (then no stats are

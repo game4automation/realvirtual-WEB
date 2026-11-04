@@ -33,10 +33,10 @@ export const DEFAULT_LICENSE_TEXTS_DIR = resolve(dirname(fileURLToPath(import.me
 
 /**
  * The mode our OWN release builds (staged `runBuild`, the embed build, CONNECT Release) use when
- * `RV_NOTICES_MODE` is not set. `warn` during the rollout; plan-544 Phase 6 flips this to
- * `enforce` in its own commit once every tier ran green.
+ * `RV_NOTICES_MODE` is not set. `enforce` since plan-544 Phase 6 (2026-10-21, every tier ran green);
+ * `RV_NOTICES_MODE=warn` is the emergency switch.
  */
-export const RELEASE_DEFAULT_MODE = 'warn';
+export const RELEASE_DEFAULT_MODE = 'enforce';
 
 /** Output file names — the same in every product. */
 export const NOTICES_TXT = 'THIRD-PARTY-NOTICES.txt';
@@ -332,7 +332,7 @@ export function loadPolicy(path, { scope, optional = false } = {}) {
     throw new Error(`Licence policy not found: ${path}`);
   }
   const data = JSON.parse(normalizeText(readFileSync(path, 'utf8')) || '{}');
-  return {
+  const policy = {
     path,
     scope,
     allowed: Array.isArray(data.allowed) ? data.allowed.map(String) : [],
@@ -340,6 +340,53 @@ export function loadPolicy(path, { scope, optional = false } = {}) {
     exceptions: Array.isArray(data.exceptions) ? data.exceptions : [],
     vendorTerms: Array.isArray(data.vendorTerms) ? data.vendorTerms : [],
   };
+  for (const kind of ['exceptions', 'vendorTerms']) {
+    for (const entry of policy[kind]) assertPolicyEntryTiers(entry, `${path} ${kind} ${entry?.name ?? '?'}`);
+  }
+  return policy;
+}
+
+// ── Tiers (plan-679 Phase 3) ──────────────────────────────────────────────────────────────
+
+/**
+ * The delivery tiers of a customer workspace — the same list as `DELIVERY_TIERS` in
+ * `_workspace-lib.mjs` (a drift test holds the two together; this module must not import the
+ * workspace library, which imports the world).
+ */
+export const NOTICE_DELIVERY_TIERS = Object.freeze(['core', 'commercial', 'restricted', 'internal']);
+
+/**
+ * What a policy entry's optional `tiers` field may name: a delivery tier, or `private` = the
+ * FULL build (unpruned private manifest: dev and Bunny private builds). Omniverse, for example,
+ * reaches no delivery tier at all — the staging prunes every `@nvidia/` dependency — only the full
+ * build, so its entry says `["private"]`.
+ */
+export const NOTICE_POLICY_TIERS = Object.freeze([...NOTICE_DELIVERY_TIERS, 'private']);
+
+function assertPolicyEntryTiers(entry, label) {
+  if (entry?.tiers === undefined) return;
+  const tiers = entry.tiers;
+  if (!Array.isArray(tiers) || tiers.length === 0
+      || tiers.some((tier) => !NOTICE_POLICY_TIERS.includes(tier))
+      || new Set(tiers).size !== tiers.length) {
+    throw new Error(`${label}: "tiers" must be a non-empty list of distinct values from `
+      + `${NOTICE_POLICY_TIERS.join(', ')} (got ${JSON.stringify(tiers)}).`);
+  }
+}
+
+/**
+ * True when a policy entry is expected to match something in a build of `tier`.
+ *
+ * - no `tiers` field: every tier (the behaviour before plan-679);
+ * - the full build (`private`): every entry — the full build carries everything, so an unused
+ *   entry there is stale exactly as before;
+ * - a delivery tier: only entries whose `tiers` names it;
+ * - `public` / `demo`: only entries without `tiers` (the vocabulary names no such tier).
+ */
+export function policyEntryAppliesToTier(entry, tier) {
+  if (!Array.isArray(entry?.tiers)) return true;
+  if (tier === 'private') return true;
+  return entry.tiers.includes(tier);
 }
 
 /** Merges policies: allowed/dynamicOnly in first-seen order (the public policy defines the rank). */
@@ -367,7 +414,9 @@ function isProposed(entry) {
  * on the components) and reports violations.
  *
  * Stale exceptions are violations per policy file and tier (F3): the public policy is checked in
- * every tier, a private policy only in the `private` tier, a customer policy never. An entry with
+ * every tier, a private policy in the full `private` build and in a delivery-tier build (plan-679:
+ * only its entries whose `tiers` name that delivery tier; the others are reported in
+ * `notInTier`, never as a violation), a customer policy never. An entry with
  * `decidedBy: "proposed"` is a proposal for a human decision — it never silences a violation and
  * is never reported as stale.
  *
@@ -458,14 +507,26 @@ export function applyPolicy(components, policies, { tier = 'public', declared = 
   }
 
   const staleExceptions = [];
+  const notInTier = [];
+  // plan-679 Phase 3: a delivery-tier build (customer workspace, RV_NOTICES_TIER) checks the
+  // private policy too, but only the entries marked for its tier. Before, it was checked as
+  // "private" by a side effect of VITE_PRIVATE_BUILD=1 — against a PRUNED manifest — and an
+  // entry for a package only the full build carries read as stale and aborted the delivery.
+  const deliveryTier = NOTICE_DELIVERY_TIERS.includes(tier);
   for (const policy of policies) {
-    const checkStale = policy.scope === 'public' || (policy.scope === 'private' && tier === 'private');
+    const checkStale = policy.scope === 'public'
+      || (policy.scope === 'private' && (tier === 'private' || deliveryTier));
     if (!checkStale) continue;
     for (const kind of ['exceptions', 'vendorTerms']) {
       const list = policy[kind] ?? [];
       for (let index = 0; index < list.length; index++) {
         const entry = list[index];
-        if (isProposed(entry) || used.has(usedKey(policy, kind, index)) || declaredNames.has(entry.name)) continue;
+        if (isProposed(entry) || used.has(usedKey(policy, kind, index))) continue;
+        if (!policyEntryAppliesToTier(entry, tier)) {
+          notInTier.push({ name: entry.name, version: String(entry.version ?? '*'), kind, policy: policy.path ?? policy.scope, tiers: entry.tiers });
+          continue;
+        }
+        if (declaredNames.has(entry.name)) continue;
         staleExceptions.push({ ...entry, kind, policy: policy.path ?? policy.scope });
         violations.push({
           name: entry.name, version: String(entry.version ?? '*'), rule: 'stale-exception',
@@ -475,7 +536,7 @@ export function applyPolicy(components, policies, { tier = 'public', declared = 
     }
   }
   violations.sort((a, b) => compareCodePoint(a.name, b.name) || compareCodePoint(a.version, b.version) || compareCodePoint(a.rule, b.rule));
-  return { violations, staleExceptions };
+  return { violations, staleExceptions, notInTier };
 }
 
 // ── Component records ─────────────────────────────────────────────────────────────────────

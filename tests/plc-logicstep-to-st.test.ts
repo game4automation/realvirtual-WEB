@@ -230,3 +230,24 @@ describe('LogicStep → ST conversion', () => {
     expect(warnings.some((w) => w.includes('LogicStep_GripPick is not supported'))).toBe(true);
   });
 });
+
+
+describe('ST v1.1 reserved LogicStep signal identifiers', () => {
+  it.each(['Exit', 'Return', 'Constant', 'RV_FirstScan'])('aliases signal %s', (name) => {
+    const root = serial('Logic_PLC_Test', [set('S0', name, true)]);
+    const { code, warnings } = convertLogicStepsToSt([root], { programName: 'P', resolveSignal });
+    expect(warnings).toEqual([]);
+    const alias = name === 'RV_FirstScan' ? 'RV_FirstScan_2' : `${name}_`;
+    expect(code).toContain(`${alias} : BOOL; (* @signal: ${name} *)`);
+    expect(code).toContain(`${alias} := TRUE;`);
+    expect(compileSt(code).diagnostics.filter((d) => d.severity === 'error')).toEqual([]);
+  });
+  it.each(['SHL', 'SHR', 'ROL', 'ROR'])('preserves non-reserved signal identifier %s', (name) => {
+    const root = serial('Logic_PLC_Test', [set('S0', name, true)]);
+    const { code, warnings } = convertLogicStepsToSt([root], { programName: 'P', resolveSignal });
+    expect(warnings).toEqual([]);
+    expect(code).toContain(`${name} : BOOL;`);
+    expect(code).toContain(`${name} := TRUE;`);
+    expect(compileSt(code).diagnostics.filter((d) => d.severity === 'error')).toEqual([]);
+  });
+});

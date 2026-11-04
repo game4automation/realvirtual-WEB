@@ -168,6 +168,13 @@ export const OP_FIXTURES: Readonly<Record<RvOpKind, RvOp>> = Object.freeze({
     outputs: [{ sourceIndices: [0, 1], role: 'root', ownerPath: 'Asset/Frame', name: 'Frame', groupNames: [] }],
     kept: [],
   },
+  replaceNodeGeometry: {
+    ...head('replaceNodeGeometry'), kind: 'replaceNodeGeometry', nodePath: 'Asset/Box',
+    sha256: 'sha_new', quality: 'source', converter: 'solidcraft', prevSha256: 'sha_old',
+  },
+  cloneNode: {
+    ...head('cloneNode'), kind: 'cloneNode', sourcePath: 'Asset/Box', nodePath: 'Asset/Box_1',
+  },
 });
 
 /** All fixtures, in a stable order. */

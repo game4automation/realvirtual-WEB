@@ -13,6 +13,7 @@ import {
   subscribeSignalDrag,
   subscribeSignalDragPos,
 } from '../../core/hmi/signal-drag-store';
+import { isSignalLinkingAllowed } from './signal-link-gate';
 import { enumerateCompatibleTargets, type CompatibleTarget } from './compatible-targets';
 import { makePortMarkerTexture } from './port-marker-texture';
 import type { SignalBindTarget } from './signal-bind-target';
@@ -298,6 +299,8 @@ export class DropTargetOverlayController {
     // visuals still present. Teardown is idempotent and makes rebuild atomic.
     this._teardown();
     if (this._backend !== 'three' || !this._viewer.signalBindingManager) return;
+    // No drop targets in an operator workspace (signal-link-gate.ts).
+    if (!isSignalLinkingAllowed(this._viewer)) return;
     const payload = getSignalDragPayload();
     if (!payload) return;
 

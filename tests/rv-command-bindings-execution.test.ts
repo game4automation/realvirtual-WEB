@@ -2,22 +2,24 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * plan-499 §9.8 — the PARITY GATE, part b (execution). Chromium: the tool
- * classes import viewer modules.
- *
- * For EVERY bound write tool, table-driven, with a hand-kept expectation
- * `EXPECTED_DISPATCH[tool] = {wire, id, args}` that is independent of the
- * production resolver:
- *  - one call → exactly ONE `commandRegistry.execute`, with that id and args;
- *  - a `value` fixture → the serialised result carries the fields the tool
- *    answered before the migration (`path`, `deleted`, `kinematicPath`, …);
- *  - a refusal → `{error: reason}` (plus `details`), and with a real registry
- *    and a stubbed implementation `run` is never called;
- *  - multiplexer branches (pivot) each dispatch once; an unknown branch none.
- * The table must cover exactly the tools that carry a binding.
+ * Phase 6 execution parity: former aliases are tombstones.
+ * Retired editor aliases answer MOVED; every former command case runs through
+ * web_execute, including pivot branches and real-registry refusal cases.
  */
 
+import { movedToolOf, movedToolAnswer } from '../src/plugins/mcp-bridge/rv-mcp-moved-tools';
+import { executeValue } from './helpers/execute-value';
+import { McpCommandTools } from '../src/plugins/mcp-bridge/rv-mcp-command-tools';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { createElement } from 'react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { RVViewerProvider } from '../src/hooks/use-viewer';
+import { useFollowSegments } from '../src/core/hmi/CameraBar';
+import { DESControllerToolbar } from '../src/plugins/sim-controller/DESControllerToolbar';
+import { useCommandView } from '../src/core/hmi/rv-command-view';
+import { ensureCameraCommandsRegistered } from '../src/core/hmi/camera-commands';
+import { ensureDesRunCommandsRegistered } from '../src/core/hmi/des-run-commands';
+import { setDesStatsWindowOpen } from '../src/plugins/sim-controller/des-stats-window-store';
 import { BoxGeometry, Mesh, Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { listToolEntries } from '../src/core/engine/rv-mcp-tools';
@@ -27,6 +29,12 @@ import { ensureEditorCommandsRegistered } from '../src/core/hmi/editor-command-d
 import { ensurePlannerCommandsRegistered } from '../src/plugins/layout-planner/planner-commands';
 import { ensureSimCommandsRegistered } from '../src/plugins/sim-controller/sim-commands';
 import { ensureViewCommandsRegistered } from '../src/core/hmi/view-commands';
+import { ensureSessionOverlayCommandsRegistered } from '../src/core/hmi/session-overlay-commands';
+import { ensureComponentCommandsRegistered } from '../src/core/hmi/component-commands';
+import { ensureQueryCommandsRegistered } from '../src/core/hmi/query-commands';
+import { ensureDocumentCommandsRegistered } from '../src/core/hmi/document-commands';
+import { ensureSignalAutomapCommandsRegistered } from '../src/core/hmi/signal-automap-commands';
+import { ensureDesPlcCommandsRegistered } from '../src/core/hmi/des-plc-commands';
 import { setActiveAssetContext, type ActiveAssetContext } from '../src/core/editor/active-asset-store';
 import { CIRCLE_INVALID, OWN_MESH_PIVOT } from '../src/core/hmi/editor-command-descriptors';
 import {
@@ -51,6 +59,102 @@ interface Expectation {
 }
 
 const EXPECTED_DISPATCH: Readonly<Record<string, Expectation>> = {
+  // plan-641 Nachtrag 2026-10-21: five more tools became views of commands; the
+  // command value is the tool answer verbatim.
+  web_knowledge_set: {
+    wire: { path: 'A', markdown: 'm', author: 'ai', confidence: 'high' }, id: 'knowledge.set',
+    args: { path: 'A', markdown: 'm', author: 'ai', confidence: 'high' },
+    value: { ok: true, path: 'A' }, result: { ok: true, path: 'A' },
+  },
+  web_document_info_set: {
+    wire: { document: 'D', summary: 's', description: 'd' }, id: 'document.infoSet',
+    args: { document: 'D', summary: 's', description: 'd' },
+    value: { ok: true, document: 'D' }, result: { ok: true, document: 'D' },
+  },
+  web_signal_bind: {
+    wire: { targetId: 'T', componentPath: 'C', slot: 'Forward', signal: 'S' }, id: 'signal.bind',
+    args: { targetId: 'T', componentPath: 'C', slot: 'Forward', signal: 'S' },
+    value: { ok: true, slot: 'Forward' }, result: { ok: true, slot: 'Forward' },
+  },
+  web_signal_unbind: {
+    wire: { targetId: 'T', componentPath: 'C', slot: 'Forward' }, id: 'signal.unbind',
+    args: { targetId: 'T', componentPath: 'C', slot: 'Forward' },
+    value: { ok: true, slot: 'Forward' }, result: { ok: true, slot: 'Forward' },
+  },
+  web_editor_separate: {
+    wire: { paths: 'A', mode: 'loose' }, id: 'editor.separate', args: { paths: 'A', mode: 'loose' },
+    value: { ok: true, created: 2 }, result: { ok: true, created: 2 },
+  },
+  // plan-773 Phase 3 Nachtrag 2026-10-23: the seven IK authoring tools became
+  // views of `ik.*` instead of allow-list entries. The wire args ARE the command
+  // args for all seven, so every row is a pass-through.
+  web_robot_rig_from_library: {
+    wire: { path: 'R', wristType: 'Spherical', elbowInUnityX: true }, id: 'ik.robot.rig',
+    args: { path: 'R', wristType: 'Spherical', elbowInUnityX: true },
+    value: { ok: true, path: 'R', verified: true }, result: { ok: true, path: 'R', verified: true },
+  },
+  web_robot_path_create: {
+    wire: { robotPath: 'R', name: 'P1', loopPath: true, speedOverride: 2 }, id: 'ik.path.create',
+    args: { robotPath: 'R', name: 'P1', loopPath: true, speedOverride: 2 },
+    value: { ok: true, path: 'R/P1', boundToRobot: true }, result: { ok: true, path: 'R/P1', boundToRobot: true },
+  },
+  web_robot_target_add: {
+    wire: {
+      pathPath: 'R/P1', positionJson: '[0,0,1]', rotationJson: '[0,0,0]', index: 0,
+      name: 'T1', fieldsJson: '{"WaitForSeconds":1}', allowUnreachable: true,
+    },
+    id: 'ik.target.add',
+    args: {
+      pathPath: 'R/P1', positionJson: '[0,0,1]', rotationJson: '[0,0,0]', index: 0,
+      name: 'T1', fieldsJson: '{"WaitForSeconds":1}', allowUnreachable: true,
+    },
+    value: { ok: true, created: true, path: 'R/P1/T1' }, result: { ok: true, created: true, path: 'R/P1/T1' },
+  },
+  web_robot_target_set: {
+    wire: {
+      targetPath: 'R/P1/T1', positionJson: '[1,0,0]', rotationJson: '[0,90,0]',
+      fieldsJson: '{"WaitForSeconds":2}', allowUnreachable: false,
+    },
+    id: 'ik.target.set',
+    args: {
+      targetPath: 'R/P1/T1', positionJson: '[1,0,0]', rotationJson: '[0,90,0]',
+      fieldsJson: '{"WaitForSeconds":2}', allowUnreachable: false,
+    },
+    value: { ok: true, changed: true, movedPose: true }, result: { ok: true, changed: true, movedPose: true },
+  },
+  web_robot_target_remove: {
+    wire: { targetPath: 'R/P1/T1' }, id: 'ik.target.remove', args: { targetPath: 'R/P1/T1' },
+    value: { ok: true, removedIndex: 0, nodeDeleted: true }, result: { ok: true, removedIndex: 0, nodeDeleted: true },
+  },
+  web_robot_target_reorder: {
+    wire: { fromIndex: 0, toIndex: 2, pathPath: 'R/P1' }, id: 'ik.target.reorder',
+    args: { fromIndex: 0, toIndex: 2, pathPath: 'R/P1' },
+    value: { ok: true, moved: true, fromIndex: 0, toIndex: 2 },
+    result: { ok: true, moved: true, fromIndex: 0, toIndex: 2 },
+  },
+  web_robot_solve_target: {
+    wire: { targetPath: 'R/P1/T1', solutionIndex: 1 }, id: 'ik.target.solve',
+    args: { targetPath: 'R/P1/T1', solutionIndex: 1 },
+    value: { ok: true, applied: true, reachable: true }, result: { ok: true, applied: true, reachable: true },
+  },
+  // plan-773 Phase 5: the export became a view of `ik.program.export` (read-only, bound).
+  // The row was missing on origin/main; added in the plan-675 merge. Pass-through like the seven above.
+  web_robot_program_export: {
+    wire: { vendor: 'abb-rapid', pathPath: 'R/P1', axisBased: false, includeLinkedPaths: true, download: false },
+    id: 'ik.program.export',
+    args: { vendor: 'abb-rapid', pathPath: 'R/P1', axisBased: false, includeLinkedPaths: true, download: false },
+    value: { ok: true, vendor: 'abb-rapid', files: [] }, result: { ok: true, vendor: 'abb-rapid', files: [] },
+  },
+  // plan-675: UV generation, the macro command `editor.generateUVs` (value verbatim).
+  web_editor_generate_uvs: {
+    wire: { paths: 'A', mode: 'auto', overwrite: false }, id: 'editor.generateUVs', args: { paths: 'A', mode: 'auto', overwrite: false },
+    value: { ok: true, generatedCount: 1 }, result: { ok: true, generatedCount: 1 },
+  },
+  // plan-641: the Transform field input became the command `editor.transform`.
+  web_editor_transform: {
+    wire: { path: 'A', px: 1 }, id: 'editor.transform', args: { path: 'A', px: 1 },
+    value: { ok: true, path: 'A', position: [1, 0, 0] }, result: { ok: true, path: 'A', position: [1, 0, 0] },
+  },
   web_editor_zero_position: {
     wire: { paths: 'A,B' }, id: 'editor.zeroPosition', args: { paths: 'A,B' },
     value: { count: 2 }, result: { ok: true, count: 2 },
@@ -222,10 +326,10 @@ const EXPECTED_DISPATCH: Readonly<Record<string, Expectation>> = {
   },
   // ── plan-499 Phase 3: planner ──
   web_layout_place: {
-    wire: { catalogId: 'c', x: 1, y: 0, z: 2, onto: undefined }, id: 'layout.place',
-    args: { catalogId: 'c', x: 1, y: 0, z: 2, onto: undefined },
+    wire: { catalogId: 'c', x: 1, y: 0, z: 2, onto: undefined, ry: undefined }, id: 'layout.place',
+    args: { catalogId: 'c', x: 1, y: 0, z: 2, onto: undefined, ry: undefined },
     value: { id: 'p1', catalogId: 'c', position: [1, 0, 2], placeMs: 3 },
-    result: { id: 'p1', catalogId: 'c', position: [1, 0, 2], placeMs: 3, next: expect.stringContaining('web_layout_snap_attach') },
+    result: { id: 'p1', catalogId: 'c', position: [1, 0, 2], placeMs: 3, next: expect.stringContaining('layout.snapAttach') },
   },
   web_layout_move: {
     wire: { id: 'p1', x: 1, y: 0, z: 0, rx: undefined, ry: 90, rz: undefined }, id: 'layout.move',
@@ -242,6 +346,19 @@ const EXPECTED_DISPATCH: Readonly<Record<string, Expectation>> = {
     args: { targetId: 'p1', catalogId: 'c', targetSnapName: undefined, flow: 'in' },
     value: { id: 'p2', catalogId: 'c', ownSnapName: 'Out', flow: 'in' },
     result: { id: 'p2', catalogId: 'c', ownSnapName: 'Out', flow: 'in' },
+  },
+  // ── plan-655: libraries of the open project ──
+  // plan-778 Phase 4: an external URL catalog (the bundled library catalog.json is gone).
+  web_library_attach: {
+    wire: { url: '/catalogs/partner/catalog.json', label: undefined }, id: 'library.attach',
+    args: { url: '/catalogs/partner/catalog.json', label: undefined },
+    value: { ok: true, url: '/catalogs/partner/catalog.json', alreadyAttached: false, entries: 19, libraries: ['/catalogs/partner/catalog.json'], next: 'n' },
+    result: { ok: true, url: '/catalogs/partner/catalog.json', alreadyAttached: false, entries: 19, libraries: ['/catalogs/partner/catalog.json'] },
+  },
+  web_library_detach: {
+    wire: { url: '/catalogs/partner/catalog.json' }, id: 'library.detach', args: { url: '/catalogs/partner/catalog.json' },
+    value: { ok: true, url: '/catalogs/partner/catalog.json', libraries: [] },
+    result: { ok: true, url: '/catalogs/partner/catalog.json', libraries: [] },
   },
   // ── plan-499 Phase 3: sim / runtime ──
   web_sim_play_pause: {
@@ -365,6 +482,20 @@ const EXPECTED_DISPATCH: Readonly<Record<string, Expectation>> = {
     value: { path: 'M/J', componentType: 'KinematicJoint', code: 'AnchorsApart', applied: { AnchorB: { x: 1, y: 0, z: 0 } } },
     result: { ok: true, path: 'M/J', code: 'AnchorsApart', applied: { AnchorB: { x: 1, y: 0, z: 0 } } },
   },
+  // ── plan-621: SolidCraft live sync (wire == args, 1:1; result = {ok: true, ...value}) ──
+  web_editor_solidcraft_connect: {
+    wire: { port: 7879, design: 'Arm' }, id: 'solidcraft.connect', args: { port: 7879, design: 'Arm' },
+    value: { docGen: 1, state: 'connected', connected: true, port: 7879 },
+    result: { ok: true, docGen: 1, state: 'connected', connected: true, port: 7879 },
+  },
+  web_editor_solidcraft_resync: {
+    wire: {}, id: 'solidcraft.resync', args: {},
+    value: { requested: true, state: 'connected' }, result: { ok: true, requested: true, state: 'connected' },
+  },
+  web_editor_solidcraft_disconnect: {
+    wire: {}, id: 'solidcraft.disconnect', args: {},
+    value: { disconnected: true, state: 'disconnected' }, result: { ok: true, disconnected: true, state: 'disconnected' },
+  },
 };
 
 /** The pivot branches, each once (hand-kept, not from PIVOT_BRANCHES). */
@@ -391,6 +522,12 @@ beforeAll(() => {
   ensurePlannerCommandsRegistered();
   ensureSimCommandsRegistered();
   ensureViewCommandsRegistered();
+  ensureSessionOverlayCommandsRegistered();
+  ensureComponentCommandsRegistered();
+  ensureQueryCommandsRegistered();
+  ensureDocumentCommandsRegistered();
+  ensureSignalAutomapCommandsRegistered();
+  ensureDesPlcCommandsRegistered();
   const delegates = Object.values(createMcpDelegates(() => viewer));
   bound = delegates.flatMap((inst) => listToolEntries(inst)
     .filter((e) => e.command)
@@ -403,45 +540,111 @@ beforeAll(() => {
 });
 
 afterEach(() => {
+  cleanup();
   vi.restoreAllMocks();
   setActiveAssetContext(null);
   setMechanismUiBridge(null);
 });
 
-async function callTool(b: Bound, wire: Wire): Promise<Record<string, unknown>> {
-  const ordered = b.params.map((p) => wire[p]);
-  return JSON.parse(await b.instance[b.methodKey](...ordered)) as Record<string, unknown>;
-}
+describe('plan-2031 button bindings', () => {
+  function fixture() {
+    const follow = { mode: null as 'follow' | 'siton' | null, canFollow: () => true };
+    const ctl = { subMode: 'animated', multiplier: 1, simTime: 0, endTime: 1200, statResetTime: 0,
+      eventStats: () => ({ currentTime: 0, processed: 0, pending: 1, nextEventTime: 7 }), instances: () => [] };
+    const view = {
+      on: () => () => {}, off() {}, getPlugin: (id: string) => id === 'camera-follow' ? follow : undefined,
+      simulationKernel: { mode: 'des', desControl: () => ctl, activeExecutor: ctl, hasDesRunner: () => true, isSwitching: false },
+      isSimulationPaused: false, simulationPauseReasons: [],
+      selectionManager: { selectedPaths: [], getSnapshot: () => ({ selectedPaths: [] }) },
+      highlighter: { clear() {} },
+    } as unknown as RVViewer;
+    return { view, follow };
+  }
+
+  async function ready() {
+    ensureCameraCommandsRegistered();
+    ensureDesRunCommandsRegistered();
+    await commandRegistry.preload(['camera.follow', 'des.fastForward', 'des.setMode', 'des.stats.window', 'des.badges']);
+  }
+
+  async function clickBound(selector: string, id: string, args: unknown, buttonKey: string, view: RVViewer) {
+    const button = document.querySelector<HTMLElement>(selector);
+    expect(button).not.toBeNull();
+    expect(button!.getAttribute('data-rv-command-id')).toBe(id);
+    expect(button!.getAttribute('data-rv-button-id')).toBe(buttonKey);
+    expect(button!.getAttribute('aria-disabled')).not.toBe('true');
+    const spy = vi.spyOn(commandRegistry, 'execute').mockResolvedValue({ ok: true, value: {} });
+    try {
+      fireEvent.click(button!);
+      await waitFor(() => expect(spy).toHaveBeenCalledExactlyOnceWith(id, args, { origin: 'ui', buttonKey, viewer: view }));
+    } finally { spy.mockRestore(); }
+  }
+
+  it('dispatches FastForward and the real speed menu 5x item', async () => {
+    await ready();
+    const { view } = fixture();
+    render(createElement(DESControllerToolbar, { viewer: view }));
+    await clickBound('[data-testid="des-submode-fastforward"]', 'des.fastForward', undefined, 'des.fastForward', view);
+    fireEvent.click(screen.getByTestId('des-speed'));
+    await waitFor(() => expect(document.querySelector('[data-rv-button-id="des.speed.5"]')).not.toBeNull());
+    await clickBound('[data-rv-button-id="des.speed.5"]', 'des.setMode', { subMode: 'hybrid', multiplier: 5 }, 'des.speed.5', view);
+  });
+
+  it('dispatches Follow and Sit from the real CameraBar segments, evaluating toggle args at click', async () => {
+    await ready();
+    const { view, follow } = fixture();
+    function FollowButtons() { return createElement('div', null, ...useFollowSegments()); }
+    render(createElement(RVViewerProvider, { value: view }, createElement(FollowButtons)));
+    await clickBound('[data-testid="camera-follow"]', 'camera.follow', { mode: 'follow' }, 'follow', view);
+    await clickBound('[data-testid="camera-siton"]', 'camera.follow', { mode: 'siton' }, 'siton', view);
+    follow.mode = 'follow';
+    await clickBound('[data-testid="camera-follow"]', 'camera.follow', { mode: 'off' }, 'follow', view);
+  });
+
+  it('retains Statistics and badges command bindings for custom controls after the stock slots retire', async () => {
+    await ready();
+    setDesStatsWindowOpen(false);
+    const { view } = fixture();
+    function CustomStatsControls() {
+      const stats = useCommandView({ id: 'des.stats.window', viewer: view, args: () => ({ open: true }) });
+      const badges = useCommandView({ id: 'des.badges', viewer: view, args: () => ({ on: true }) });
+      return createElement('div', null,
+        createElement('button', { ...stats.dataAttrs, onClick: stats.onClick, disabled: stats.disabled }),
+        createElement('button', { ...badges.dataAttrs, onClick: badges.onClick, disabled: badges.disabled }));
+    }
+    render(createElement(CustomStatsControls));
+    await clickBound('[data-rv-command-id="des.stats.window"]', 'des.stats.window', { open: true }, 'des.stats.window', view);
+    await clickBound('[data-rv-command-id="des.badges"]', 'des.badges', { on: true }, 'des.badges', view);
+  });
+});
+
 
 // ─── Tests ──────────────────────────────────────────────────────────────
 
 describe('parity gate (execution)', () => {
-  it('the expectation table covers exactly the bound tools', () => {
-    expect(bound.map((b) => b.name).sort()).toEqual(Object.keys(EXPECTED_DISPATCH).sort());
+  it('the former alias cases are all tombstones and no bound tools remain', () => {
+    expect(bound).toEqual([]);
+    for (const name of Object.keys(EXPECTED_DISPATCH)) expect(movedToolOf(name), name).toBeDefined();
   });
 
-  it('every bound tool: ONE execute with the expected id/args; the value serialises to the pre-migration shape', async () => {
-    for (const b of bound) {
-      const exp = EXPECTED_DISPATCH[b.name];
+  it('former aliases answer MOVED without execution; their commands run through web_execute', async () => {
+    for (const [name, exp] of Object.entries(EXPECTED_DISPATCH).filter(([name]) => movedToolOf(name))) {
+      const moved = movedToolOf(name)!;
       const spy = vi.spyOn(commandRegistry, 'execute').mockResolvedValue({ ok: true, value: exp.value });
-      const res = await callTool(b, exp.wire);
-      expect(spy, b.name).toHaveBeenCalledTimes(1);
-      expect(spy.mock.calls[0][0], b.name).toBe(exp.id);
-      expect(spy.mock.calls[0][1], b.name).toEqual(exp.args);
-      expect(spy.mock.calls[0][2], b.name).toMatchObject({ origin: 'mcp' });
-      expect(res, b.name).toMatchObject(exp.result);
-      spy.mockRestore();
-    }
-  });
-
-  it('every bound tool: a refusal comes back as {error: reason, ...details}', async () => {
-    for (const b of bound) {
-      const exp = EXPECTED_DISPATCH[b.name];
-      const spy = vi.spyOn(commandRegistry, 'execute').mockResolvedValue({
-        ok: false, kind: 'disabled', reason: 'X', details: { hint: 1 },
-      });
-      const res = await callTool(b, exp.wire);
-      expect(res, b.name).toEqual({ error: 'X', hint: 1 });
+      expect(JSON.parse(movedToolAnswer(moved))).toMatchObject({ error: 'MOVED', movedTo: moved.movedTo, use: moved.door });
+      expect(moved.movedTo, name).toContain(exp.id);
+      expect(spy).not.toHaveBeenCalled();
+      const res = JSON.parse(await new McpCommandTools(() => viewer).webExecute(exp.id, JSON.stringify(exp.args)));
+      expect(spy, name).toHaveBeenCalledTimes(1);
+      expect(spy.mock.calls[0].slice(0, 2), name).toEqual([exp.id, exp.args]);
+      expect(res, name).toMatchObject({ ok: true, value: exp.value });
+      if (moved.door === 'web_query') {
+        const query = JSON.parse(await new McpCommandTools(() => viewer).webQuery(exp.id, JSON.stringify(exp.args)));
+        expect(query, name).toMatchObject({ ok: true, value: exp.value });
+      }
+      spy.mockResolvedValue({ ok: false, kind: 'disabled', reason: 'X', details: { hint: 1 } });
+      expect(JSON.parse(await new McpCommandTools(() => viewer).webExecute(exp.id, JSON.stringify(exp.args))))
+        .toMatchObject({ ok: false, error: 'X', details: { hint: 1 } });
       spy.mockRestore();
     }
   });
@@ -452,8 +655,7 @@ describe('parity gate (execution)', () => {
     commandRegistry.register({ ...original, available: true, impl: async () => ({ enabled: () => ({ reason: 'X' }), run }) });
     setActiveAssetContext({ viewer, doc: { id: 'd', whenIdle: async () => {} } as unknown as ActiveAssetContext['doc'] });
     try {
-      const b = bound.find((x) => x.name === 'web_editor_to_ground')!;
-      expect(await callTool(b, { path: 'A' })).toEqual({ error: 'X' });
+      expect(JSON.parse(await executeValue(viewer, 'editor.toGround', { path: 'A' }))).toEqual({ error: 'X' });
       expect(run).not.toHaveBeenCalled();
     } finally {
       commandRegistry.register(original);
@@ -488,17 +690,18 @@ describe('parity gate (execution)', () => {
       // Readiness: the Anchor / Axis buttons are clickable BEFORE the pick.
       expect(commandRegistry.enabled('mechanism.setAnchorSnap', { path: 'M/J', componentType: 'KinematicJoint', side: 'A' }, viewer)).toBe(true);
       expect(commandRegistry.enabled('mechanism.setAxis', { path: 'M/J', componentType: 'KinematicJoint' }, viewer)).toBe(true);
-      const snap = bound.find((x) => x.name === 'web_editor_mechanism_set_anchor_snap')!;
-      const axis = bound.find((x) => x.name === 'web_editor_mechanism_set_axis')!;
+      const snap = 'mechanism.setAnchorSnap';
+      const axis = 'mechanism.setAxis';
+      const execute = async (id: string, args: Wire) => JSON.parse(await executeValue(viewer, id, args));
       // No source.
-      expect(await callTool(snap, { path: 'M/J', componentType: 'KinematicJoint', side: 'A' })).toEqual({ error: NEEDS_ANCHOR_SOURCE });
-      expect(await callTool(axis, { path: 'M/J', componentType: 'KinematicJoint' })).toEqual({ error: NEEDS_AXIS_SOURCE });
+      expect(await execute(snap, { path: 'M/J', componentType: 'KinematicJoint', side: 'A' })).toEqual({ error: NEEDS_ANCHOR_SOURCE });
+      expect(await execute(axis, { path: 'M/J', componentType: 'KinematicJoint' })).toEqual({ error: NEEDS_AXIS_SOURCE });
       // Both sources.
-      expect(await callTool(snap, {
+      expect(await execute(snap, {
         path: 'M/J', componentType: 'KinematicJoint', side: 'A', candidateId: 'snap1-0',
         pickJson: '{"nodePath":"M/J","worldPosition":[0,0,0],"worldNormal":[0,0,1]}',
       })).toEqual({ error: NEEDS_ANCHOR_SOURCE });
-      expect(await callTool(axis, {
+      expect(await execute(axis, {
         path: 'M/J', componentType: 'KinematicJoint', candidateId: 'snap1-0', axisWorldJson: '{"x":0,"y":1,"z":0}',
       })).toEqual({ error: NEEDS_AXIS_SOURCE });
       expect(withTransaction).not.toHaveBeenCalled();
@@ -507,21 +710,17 @@ describe('parity gate (execution)', () => {
     }
   });
 
-  it('pivot: every branch dispatches once with its own button; an unknown mode dispatches nothing', async () => {
-    const b = bound.find((x) => x.name === 'web_editor_pivot')!;
+  it('pivot: every former branch executes through web_execute; old modes answer MOVED', async () => {
     for (const c of PIVOT_CASES) {
       const spy = vi.spyOn(commandRegistry, 'execute').mockResolvedValue({ ok: true, value: { path: 'A', pivotWorld: null } });
-      await callTool(b, c.wire);
-      expect(spy, JSON.stringify(c.wire)).toHaveBeenCalledTimes(1);
-      expect(spy.mock.calls[0][0]).toBe(c.id);
-      expect(spy.mock.calls[0][1]).toEqual(c.args);
-      if (c.buttonKey) expect(spy.mock.calls[0][2]).toMatchObject({ buttonKey: c.buttonKey });
+      await new McpCommandTools(() => viewer).webExecute(c.id, JSON.stringify(c.args));
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy.mock.calls[0].slice(0, 2)).toEqual([c.id, c.args]);
       spy.mockRestore();
     }
-    const spy = vi.spyOn(commandRegistry, 'execute');
-    const res = await callTool(b, { path: 'A', mode: 'sideways' });
-    expect(spy).not.toHaveBeenCalled();
-    expect(res).toEqual({ error: 'mode must be bottom | object_center | group_center | align_y_up' });
+    expect(JSON.parse(movedToolAnswer(movedToolOf('web_editor_pivot')!))).toMatchObject({
+      error: 'MOVED', movedTo: PIVOT_CASES.map((c) => c.id),
+    });
   });
 
   it('editor.pivotToCircle (UI-only): a degenerate circle or a meshed node is refused, nothing is written', async () => {

@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
+// plan-559 Phase 0 M3 - throwaway measurement config (outside both repos).
+
+import base from '__PUBLIC_ROOT__/vite.config.ts';
+export default ((env: any) => {
+  const c: any = (base as any)(env);
+  c.root = '__PUBLIC_ROOT__';
+  c.test.include = ['__PUBLIC_ROOT__/node_modules/.m3/m3-palletyard.test.ts'];
+  c.test.exclude = [];
+  c.server.fs.allow.push('__PUBLIC_ROOT__/node_modules/.m3');
+  return c;
+});

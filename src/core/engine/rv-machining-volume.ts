@@ -58,6 +58,7 @@ import {
 } from './rv-machining-registry';
 import type { MachiningManager } from './rv-machining-manager';
 import { RVMachiningTool } from './rv-machining-tool';
+import { slotDeclare, slotUndeclare } from './rv-slot-io';
 
 // ─── Enum helpers ───────────────────────────────────────────────────────
 
@@ -189,6 +190,12 @@ export class RVMachiningVolume implements RVComponent, StockBoundsSource {
     // answers `null` until then, so the authored meshes keep speaking.
     this._collision = ctx.collisionManager ?? null;
     this._collision?.registerStockBounds?.(this);
+    // Unwired slots stay bindable in the viewer (SlotIO). The MachiningManager
+    // polls the two control slots per tick (neutralize = unbound default:
+    // spindle on, no reset) and publishes `SignalMachiningActive`.
+    slotDeclare(this, 'SignalSpindleOn', 'poll');
+    slotDeclare(this, 'SignalReset', 'poll');
+    slotDeclare(this, 'SignalMachiningActive', 'feedback', { initial: false });
   }
 
   /**
@@ -204,6 +211,7 @@ export class RVMachiningVolume implements RVComponent, StockBoundsSource {
   }
 
   dispose(): void {
+    slotUndeclare(this);
     this._manager?.unregister(this);
     this._manager = null;
     this.teardownRender();
@@ -276,10 +284,13 @@ export class RVMachiningVolume implements RVComponent, StockBoundsSource {
     }
     // Unresolved path string (the loader's fallback for a componentRefArray).
     if (typeof entry === 'string' && registry) {
-      const node = registry.getNode(entry);
+      // plan-769 Phase 1b: the raw path of a stored reference — the file's verdict
+      // for a path it carries (late: the tool may register after this volume).
+      const node = registry.storedNode(this.node, entry);
       const inst = node?.userData?._rvComponentInstance;
       if (inst instanceof RVMachiningTool) return inst;
-      for (const [type, i] of registry.getComponentsAt(entry)) {
+      const at = node ? (registry.getPathForNode(node) ?? entry) : entry;
+      for (const [type, i] of registry.getComponentsAt(at)) {
         if (type === 'MachiningTool' && i instanceof RVMachiningTool) return i;
       }
     }

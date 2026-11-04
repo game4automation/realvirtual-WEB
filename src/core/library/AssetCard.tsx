@@ -11,7 +11,7 @@
  * ## Presentational only — on purpose
  *
  * Everything behavioural stays with the caller: drag payload, hover-intent
- * prefetch, the context menu, and the preview request itself. The card takes
+ * prefetch, the context menu, and the picture it shows. The card takes
  * DOM handlers as props and spreads them onto its root. That is what let the
  * planner's drag behaviour move here *unchanged* rather than be reimplemented
  * — the handlers are the same functions, just passed in.
@@ -23,15 +23,16 @@
  * this component so a change to the visual language lands in both at once.
  */
 
-import { forwardRef, type ReactNode } from 'react';
-import { Box, Typography, Tooltip } from '@mui/material';
+import { forwardRef, useState, type ReactNode } from 'react';
+import { Box, CircularProgress, IconButton, Typography, Tooltip } from '@mui/material';
 import {
   TimerOutlined, Landscape, MenuBookOutlined, PrecisionManufacturingOutlined,
   SettingsEthernet, PictureAsPdfOutlined, SlideshowOutlined, MovieOutlined,
   ImageOutlined, TableChartOutlined, DescriptionOutlined, InsertDriveFileOutlined,
-  ArchiveOutlined, CategoryOutlined,
+  ArchiveOutlined, CategoryOutlined, ZoomIn, ViewInArOutlined,
 } from '@mui/icons-material';
 import type { LibraryCatalogEntry } from './library-types';
+import { LABEL_CHIP_SX, LABEL_CHIP_ON_PREVIEW_BG } from '../hmi/shared-sx';
 
 /** Matches `CatalogBrowserVariant`; kept structural to avoid a circular import. */
 export type AssetCardVariant = 'compact' | 'comfortable';
@@ -93,6 +94,13 @@ export interface AssetCardProps {
   variant?: AssetCardVariant;
   /** Shows a small badge when `'bundled'`. Omit or `'user'` for no badge. */
   tier?: AssetTier;
+  /**
+   * A caller-owned label for the preview's top-left corner (the dashboard puts
+   * the document's open mode there). The Bundled chip sits on the opposite
+   * edge, bottom-left, in the same chip look (`LABEL_CHIP_SX`) — the two never
+   * paint over each other.
+   */
+  cornerBadge?: ReactNode;
   /** Highlights the card as the active placement target. */
   selected?: boolean;
   /** Cursor hint only — the caller owns the actual drag payload. */
@@ -127,6 +135,20 @@ export interface AssetCardProps {
   tooltip?: ReactNode;
   /** Controlled tooltip visibility — suppressed while dragging. */
   tooltipOpen?: boolean;
+  /**
+   * Opens the larger view of the picture. When given and the card shows a
+   * thumbnail, a magnifier button sits on the picture (visible on hover and
+   * keyboard focus); clicking the picture itself keeps the card's own click.
+   */
+  onPreview?: () => void;
+  /**
+   * The asset is being prepared (decoded + baked) for placement. Shows a
+   * spinner over the card so a slow first drag is not a silent wait. The
+   * overlay ignores the pointer — the card stays draggable and clickable.
+   */
+  busy?: boolean;
+  /** Text under the spinner while {@link busy}. Defaults to "Preparing…". */
+  busyLabel?: string;
 
   onDragStart?: React.DragEventHandler<HTMLDivElement>;
   onDragEnd?: React.DragEventHandler<HTMLDivElement>;
@@ -160,6 +182,7 @@ export const AssetCard = forwardRef<HTMLDivElement, AssetCardProps>(function Ass
     entry,
     variant = 'compact',
     tier,
+    cornerBadge,
     selected = false,
     draggable = false,
     cursor,
@@ -168,11 +191,18 @@ export const AssetCard = forwardRef<HTMLDivElement, AssetCardProps>(function Ass
     glyph,
     tooltip,
     tooltipOpen,
+    onPreview,
+    busy = false,
+    busyLabel = 'Preparing…',
     ...handlers
   },
   ref,
 ) {
   const s = SCALE[variant];
+  // A picture that fails to load (a remote catalog without a preview for this
+  // asset, plan-660) falls back to the placeholder instead of an empty frame.
+  const [failedThumb, setFailedThumb] = useState<string | null>(null);
+  const thumbnailUrl = entry.thumbnailUrl && entry.thumbnailUrl !== failedThumb ? entry.thumbnailUrl : undefined;
 
   const preview = glyph === 'connect' ? (
     <GlyphTile
@@ -205,20 +235,64 @@ export const AssetCard = forwardRef<HTMLDivElement, AssetCardProps>(function Ass
         />
       );
     })()
-  ) : entry.thumbnailUrl ? (
-    <Box
-      component="img"
-      src={entry.thumbnailUrl}
-      alt={entry.name}
-      sx={{
-        width: '100%',
-        aspectRatio: '1',
-        objectFit: 'cover',
-        borderRadius: 0.5,
-        bgcolor: 'rgba(255,255,255,0.05)',
-      }}
-      draggable={false}
-    />
+  ) : thumbnailUrl ? (
+    <Box sx={{ position: 'relative', width: '100%' }}>
+      <Box
+        component="img"
+        src={thumbnailUrl}
+        onError={() => setFailedThumb(thumbnailUrl)}
+        alt={entry.name}
+        // Large remote catalogs (thousands of cards, plan-660) must only fetch
+        // the pictures that scroll into view. Fixed intrinsic size: the saved
+        // thumbnails are 512 px squares (plan-776), so the tile never shifts.
+        loading="lazy"
+        decoding="async"
+        width={512}
+        height={512}
+        sx={{
+          display: 'block',
+          width: '100%',
+          // `height: auto` is load-bearing: the height={512} attribute above would
+          // otherwise become the CSS height and stretch the card.
+          height: 'auto',
+          aspectRatio: '1',
+          objectFit: 'contain',
+          borderRadius: 0.5,
+          bgcolor: 'rgba(255,255,255,0.05)',
+        }}
+        draggable={false}
+      />
+      {onPreview && (
+        <IconButton
+          className="rv-asset-zoom"
+          size="small"
+          aria-label={`Show larger preview of ${entry.name}`}
+          title="Larger preview"
+          data-testid="asset-card-preview"
+          draggable={false}
+          onClick={(e) => { e.stopPropagation(); onPreview(); }}
+          onDragStart={(e) => { e.preventDefault(); e.stopPropagation(); }}
+          onPointerDown={(e) => e.stopPropagation()}
+          onKeyDown={(e) => e.stopPropagation()}
+          sx={{
+            position: 'absolute',
+            top: 2,
+            right: 2,
+            p: 0.25,
+            opacity: 0,
+            bgcolor: 'rgba(0,0,0,0.55)',
+            color: 'rgba(255,255,255,0.85)',
+            transition: 'opacity 0.15s',
+            '&:hover': { bgcolor: 'rgba(0,0,0,0.75)', color: `${ACCENT}, 1)` },
+            '&:focus-visible': { opacity: 1 },
+            // Touch has no hover: keep the button reachable there.
+            '@media (hover: none)': { opacity: 0.85 },
+          }}
+        >
+          <ZoomIn sx={{ fontSize: variant === 'comfortable' ? 18 : 14 }} />
+        </IconButton>
+      )}
+    </Box>
   ) : entry.virtual ? (
     <GlyphTile
       accent={ACCENT}
@@ -240,6 +314,16 @@ export const AssetCard = forwardRef<HTMLDivElement, AssetCardProps>(function Ass
       accent={NEUTRAL}
       icon={<PrecisionManufacturingOutlined sx={{ fontSize: s.glyph, color: `${NEUTRAL}, 0.45)` }} />}
       label="Empty"
+      labelSize={s.glyphLabel}
+    />
+  ) : !placeholderAction ? (
+    // No saved picture, or the named one does not load (plan-776 F9): the type
+    // tile — a missing file looks exactly like "no thumbnail yet", because to
+    // the user it is the same thing. Nothing is rendered to fill the gap.
+    <GlyphTile
+      accent={NEUTRAL}
+      icon={<ViewInArOutlined sx={{ fontSize: s.glyph, color: `${NEUTRAL}, 0.45)` }} />}
+      label="No preview"
       labelSize={s.glyphLabel}
     />
   ) : (
@@ -279,6 +363,7 @@ export const AssetCard = forwardRef<HTMLDivElement, AssetCardProps>(function Ass
           }
         : undefined}
       {...handlers}
+      aria-busy={busy || undefined}
       sx={{
         position: 'relative',
         display: 'flex',
@@ -291,6 +376,7 @@ export const AssetCard = forwardRef<HTMLDivElement, AssetCardProps>(function Ass
         bgcolor: selected ? `${ACCENT}, 0.15)` : 'rgba(255,255,255,0.03)',
         border: selected ? `1px solid ${ACCENT}, 0.5)` : '1px solid rgba(255,255,255,0.06)',
         '&:hover': { bgcolor: `${ACCENT}, 0.08)`, borderColor: `${ACCENT}, 0.2)` },
+        '&:hover .rv-asset-zoom, &:focus-within .rv-asset-zoom': { opacity: 1 },
         // DESIGN.md: a visible focus ring, never removed. Inset so the grid's
         // scroll container cannot clip it.
         '&:focus-visible': {
@@ -307,30 +393,86 @@ export const AssetCard = forwardRef<HTMLDivElement, AssetCardProps>(function Ass
         containIntrinsicSize: variant === 'comfortable' ? '180px 200px' : '92px 108px',
       }}
     >
-      {preview}
+      {(tier === 'bundled' || cornerBadge) ? (
+        // The preview carries the card's labels on its own corners, inert to
+        // the pointer so the card's clicks pass through: the caller's label
+        // (the dashboard's open mode) top-left, Bundled bottom-left. Opposite
+        // edges of the square, so the two never meet — whatever the card width
+        // (plan-776 follow-up, 2026-11-02). The wrapper is as wide as the
+        // preview and adds no height: the card keeps its size.
+        <Box data-testid="asset-card-preview-frame" sx={{ position: 'relative', width: '100%' }}>
+          {preview}
+          {cornerBadge && (
+            <Box
+              data-testid="asset-card-corner"
+              sx={{
+                position: 'absolute',
+                top: 4,
+                left: 4,
+                right: 4,
+                display: 'flex',
+                alignItems: 'flex-start',
+                pointerEvents: 'none',
+                // On the smallest cards the label ellipsizes inside the preview
+                // instead of running past its edge — like Bundled below.
+                '&& > *': { flexShrink: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' },
+              }}
+            >
+              {cornerBadge}
+            </Box>
+          )}
+          {tier === 'bundled' && (
+            // Same chip as the mode label — font, size, case, padding, border,
+            // backdrop — from the one shared definition.
+            <Box
+              component="span"
+              data-testid="asset-card-bundled"
+              title="Ships with this build — edits are saved as your own copy"
+              sx={{
+                ...LABEL_CHIP_SX,
+                bgcolor: LABEL_CHIP_ON_PREVIEW_BG,
+                position: 'absolute',
+                left: 4,
+                bottom: 4,
+                maxWidth: 'calc(100% - 8px)',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                pointerEvents: 'none',
+              }}
+            >
+              Bundled
+            </Box>
+          )}
+        </Box>
+      ) : preview}
 
-      {tier === 'bundled' && (
-        <Typography
-          component="span"
-          title="Ships with this build — edits are saved as your own copy"
+      {busy && (
+        // Over the whole card, pointer-transparent: the user may keep dragging
+        // the very card that is preparing. `role="status"` is the announcement —
+        // the 3D placeholder is invisible to a screen reader.
+        <Box
+          role="status"
+          data-testid="asset-card-busy"
           sx={{
             position: 'absolute',
-            top: 4,
-            right: 4,
-            fontSize: s.badge,
-            lineHeight: 1.2,
-            px: 0.5,
-            py: 0.125,
-            borderRadius: 0.5,
-            bgcolor: 'rgba(0,0,0,0.55)',
-            color: 'rgba(255,255,255,0.7)',
-            textTransform: 'uppercase',
-            letterSpacing: 0.5,
+            inset: 0,
+            zIndex: 1,
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 0.5,
+            borderRadius: 1,
+            bgcolor: 'rgba(0,0,0,0.5)',
+            border: `1px solid ${ACCENT}, 0.5)`,
             pointerEvents: 'none',
           }}
         >
-          Bundled
-        </Typography>
+          <CircularProgress size={variant === 'comfortable' ? 24 : 16} thickness={5} sx={{ color: `${ACCENT}, 1)` }} />
+          <Typography sx={{ fontSize: s.label, color: 'rgba(255,255,255,0.85)', lineHeight: 1.2 }}>
+            {busyLabel}
+          </Typography>
+        </Box>
       )}
 
       <Typography
@@ -394,6 +536,7 @@ function GlyphTile({ accent, icon, label, labelSize }: {
 }) {
   return (
     <Box
+      data-testid="glyph-tile"
       sx={{
         width: '100%',
         aspectRatio: '1',

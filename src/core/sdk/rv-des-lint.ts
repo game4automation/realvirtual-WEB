@@ -4,8 +4,8 @@
 /**
  * rv-des-lint.ts — DES-safety lint v1 (plan-210 §6b specification).
  *
- * Pure text analysis (no parser dependency): comments and string literals are
- * blanked offset-preserving, then three rules run over the remaining code:
+ * Text rules blank comments and strings without changing offsets. Rule (d)
+ * uses a lazily loaded Acorn analysis after loadDesAstCheck():
  *
  *  (a) `continuous.fixedUpdate` handler present → the component is
  *      continuous-only ("not DES-safe"). Warning; ERROR when the component is
@@ -28,13 +28,15 @@ export interface DesLintDiagnostic {
   col: number;
   message: string;
   severity: 'warning' | 'error';
-  /** Stable rule id: 'fixed-update' | 'dt-accumulation' | 'blocked-global' | 'closure-state' | 'geometry-sampling'. */
-  rule: 'fixed-update' | 'dt-accumulation' | 'blocked-global' | 'closure-state' | 'geometry-sampling';
+  /** Stable rule id: 'fixed-update' | 'dt-accumulation' | 'blocked-global' | 'geometry-sampling' | 'des-script-undeclared-state'. */
+  rule: 'fixed-update' | 'dt-accumulation' | 'blocked-global' | 'geometry-sampling' | 'des-script-undeclared-state';
 }
 
 export interface DesLintOptions {
   /** The component's `WebComponent.DesSafe` flag — escalates (a)+(b) to errors. */
   desSafe?: boolean;
+  /** Include async rule (d) after awaiting loadDesAstCheck(); text-only by default. */
+  checkState?: boolean;
 }
 
 /**
@@ -100,6 +102,52 @@ const DOC_HINT = 'see doc-webviewer scripting: DES-safe components use event hoo
  * `WebComponent.DesSafe` flag: rules (a)+(b) escalate from warning to error.
  */
 export function lintDesSafety(code: string, opts: DesLintOptions = {}): DesLintDiagnostic[] {
+  // plan-2212 Phase 4b (F): every DES replication rebuilds its Model-Scripts and
+  // lints them again - the result depends only on the text and the two flags.
+  const key = `${opts.desSafe === true ? 1 : 0}${opts.checkState === true ? 1 : 0}${code}`;
+  let cached = lintCache.get(key);
+  if (!cached) {
+    cached = lintUncached(code, opts);
+    remember(lintCache, key, cached);
+  }
+  return cached.map(d => ({ ...d }));
+}
+
+/** Bounded per-source caches (editor keystrokes must not grow them without limit). */
+const CACHE_LIMIT = 128;
+const lintCache = new Map<string, DesLintDiagnostic[]>();
+const geometryCache = new Map<string, LiveGeometryVerdict>();
+function remember<V>(cache: Map<string, V>, key: string, value: V): void {
+  if (cache.size >= CACHE_LIMIT) cache.delete(cache.keys().next().value as string);
+  cache.set(key, value);
+}
+
+/** Verdict of {@link desScriptMayReadLiveGeometry}. */
+export interface LiveGeometryVerdict {
+  /** False only when the source provably cannot read live geometry. */
+  mayRead: boolean;
+  /** Why the check could not prove it (empty when `mayRead` is false). */
+  reason: string;
+}
+
+/**
+ * plan-2212 Phase 4b (A): may this Model-Script read LIVE geometry (world
+ * transforms that the DES runner's per-event tween settle keeps exact)?
+ * Conservative: true unless the Acorn check proves the script geometry-free
+ * (see `checkLiveGeometry` in rv-des-ast-check.ts); true while the check is not
+ * loaded. Cached per source text.
+ */
+export function desScriptMayReadLiveGeometry(code: string): LiveGeometryVerdict {
+  if (!geometryCheck) return { mayRead: true, reason: 'geometry check not loaded' };
+  let verdict = geometryCache.get(code);
+  if (!verdict) {
+    verdict = geometryCheck(code);
+    remember(geometryCache, code, verdict);
+  }
+  return { ...verdict };
+}
+
+function lintUncached(code: string, opts: DesLintOptions): DesLintDiagnostic[] {
   const desSafe = opts.desSafe === true;
   const scan = blankNonCode(code);
   const diagnostics: DesLintDiagnostic[] = [];
@@ -152,35 +200,10 @@ export function lintDesSafety(code: string, opts: DesLintOptions = {}): DesLintD
     }
   }
 
-  // (d) free persistent closure variables (plan-261): a mutable `let`/`var`
-  // declared in the setup closure that is reassigned later holds state that
-  // does NOT survive a DES snapshot/restore unless the script persists it via
-  // the onSnapshot()/onRestore() hooks (the only supported channel — `self.prop`
-  // is read-only configuration in the sandbox). ALWAYS a warning (never error):
-  // legitimate transient locals would otherwise break the lint gate.
-  if (!/\bonSnapshot\s*[(:]/.test(scan)) {
-    const declRe = /\b(?:let|var)\s+([A-Za-z_$][\w$]*)/g;
-    const seen = new Set<string>();
-    for (const m of matches(declRe, scan)) {
-      const name = /\b(?:let|var)\s+([A-Za-z_$][\w$]*)/.exec(m.match)?.[1];
-      if (!name || seen.has(name)) continue;
-      seen.add(name);
-      // Loop counters (`for (let i = …`) are transient, not closure state.
-      if (/for\s*\(\s*$/.test(scan.slice(Math.max(0, m.index - 12), m.index))) continue;
-      // Mutated AFTER the declaration statement? (`x = …` not `x ==`, `x +=`, `x++`, …)
-      const rest = scan.slice(m.index + m.match.length);
-      const mutRe = new RegExp(
-        String.raw`(?<![\w$.])${name.replace(/\$/g, '\\$')}\s*(?:=(?!=)|[-+*/]=|\+\+|--)`,
-      );
-      if (!mutRe.test(rest)) continue;
-      const { line, col } = positionOf(code, m.index);
-      diagnostics.push({
-        line, col,
-        severity: 'warning',
-        rule: 'closure-state',
-        message: `'${name}' is persistent closure state — it is LOST on DES snapshot/restore. Persist it via onSnapshot() { return {…} } / onRestore(state), the only supported channel (self.prop is read-only configuration). ${DOC_HINT}.`,
-      });
-    }
+  // (d) Loaded before synchronous lint by the editor / script host.
+  if (opts.checkState) {
+    if (!astCheck) throw new Error('Await loadDesAstCheck() before linting script state');
+    diagnostics.push(...astCheck(code, opts));
   }
 
   // (e) live geometry sampling in a DES-hook component (plan-262): a script
@@ -218,4 +241,16 @@ function matches(re: RegExp, text: string): Array<{ index: number; match: string
     if (m.index === re.lastIndex) re.lastIndex++;
   }
   return out;
+}
+
+/** Load once at the async script/editor boundary; Acorn stays in a lazy chunk. */
+let astCheck: typeof import('./rv-des-ast-check').checkDesScriptState | undefined;
+let geometryCheck: typeof import('./rv-des-ast-check').checkLiveGeometry | undefined;
+let astReady: Promise<void> | undefined;
+export function loadDesAstCheck(): Promise<void> {
+  return astReady ??= import('./rv-des-ast-check').then(async module => {
+    await module.loadParser();
+    astCheck = module.checkDesScriptState;
+    geometryCheck = module.checkLiveGeometry;
+  });
 }

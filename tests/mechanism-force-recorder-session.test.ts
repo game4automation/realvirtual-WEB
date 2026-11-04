@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { executeValue } from './helpers/execute-value';
+import { queryValue } from './helpers/query-value';
+
 /**
  * plan-706 T7 / T8 / T9 / T10 / T2b — forces, statics and the session coupling.
  *
@@ -34,7 +37,7 @@ import {
   MECHANISM_FORCE_RECORDER_ID,
   ensureForceRecorder,
 } from '../src/plugins/mechanism-force-recorder-plugin';
-import { setActiveTestSession } from '@rv-private/plugins/asset-editor/test-session-store';
+import { setActiveTestSession } from '@rv-private/plugins/asset-editor/shared/test-session-store';
 import type { InPlaceTestSession, TestSessionState } from '@rv-private/plugins/asset-editor/in-place-test-session';
 import {
   setMechanismUiBridge,
@@ -213,13 +216,13 @@ describe('T7 — peak, RMS and holding per channel', () => {
     expect(recorder.metrics('ch').holding).toBe(95); // magnitude, sign-free
   });
 
-  it('web_editor_mechanism_forces reports the figures with their unit', async () => {
+  it.skipIf(!__RV_HAS_PRIVATE__)('web_editor_mechanism_forces reports the figures with their unit', async () => {
     setMechanismUiBridge(new FakeBridge());
     const plugin = ensureForceRecorder(env.viewer);
     plugin.start();
     for (let i = 0; i < 40; i++) plugin.onFixedUpdatePost(0.1);
 
-    const r = parse(await env.tools.webEditorMechanismForces('Mech', '', false));
+    const r = parse(await queryValue(env.viewer, 'mechanism.forces', { mechanismPath: 'Mech', channelId: '', series: false }));
     expect(r.error).toBeUndefined();
     expect(r.dynamicsValid).toBe(true);
     expect(r.channels).toHaveLength(2);
@@ -235,21 +238,21 @@ describe('T7 — peak, RMS and holding per channel', () => {
     expect(r.joints[0].torqueWorld).toEqual([4, 5, 6]);
   });
 
-  it('series=true without a channelId says so instead of guessing one', async () => {
+  it.skipIf(!__RV_HAS_PRIVATE__)('series=true without a channelId says so instead of guessing one', async () => {
     setMechanismUiBridge(new FakeBridge());
-    const r = parse(await env.tools.webEditorMechanismForces('Mech', '', true));
+    const r = parse(await queryValue(env.viewer, 'mechanism.forces', { mechanismPath: 'Mech', channelId: '', series: true }));
     expect(r.seriesNote).toContain('channelId');
     for (const c of r.channels) expect(c.series).toBeUndefined();
   });
 
-  it('series=true with a channelId returns a capped series for THAT channel only', async () => {
+  it.skipIf(!__RV_HAS_PRIVATE__)('series=true with a channelId returns a capped series for THAT channel only', async () => {
     setMechanismUiBridge(new FakeBridge());
     const plugin = ensureForceRecorder(env.viewer);
     plugin.start();
     for (let i = 0; i < 60; i++) plugin.onFixedUpdatePost(0.1);
 
     const id = 'Mech|dof0';
-    const r = parse(await env.tools.webEditorMechanismForces('Mech', id, true));
+    const r = parse(await queryValue(env.viewer, 'mechanism.forces', { mechanismPath: 'Mech', channelId: id, series: true }));
     const target = r.channels.find((c: Record<string, unknown>) => c.id === id);
     expect(target.series).toBeDefined();
     expect(target.series.values.length).toBeLessThanOrEqual(200);
@@ -258,9 +261,9 @@ describe('T7 — peak, RMS and holding per channel', () => {
     expect(other.series).toBeUndefined();
   });
 
-  it('an unknown mechanism names the ones that exist', async () => {
+  it.skipIf(!__RV_HAS_PRIVATE__)('an unknown mechanism names the ones that exist', async () => {
     setMechanismUiBridge(new FakeBridge());
-    const r = parse(await env.tools.webEditorMechanismForces('Nope', '', false));
+    const r = parse(await queryValue(env.viewer, 'mechanism.forces', { mechanismPath: 'Nope', channelId: '', series: false }));
     expect(r.error).toContain('Nope');
     expect(r.availablePaths).toEqual(['Mech']);
   });
@@ -272,7 +275,7 @@ describe('T8 — statics fills holding without moving the pose', () => {
   it('solveStatics once, jog never, and every channel gets its holding figure', async () => {
     const bridge = new FakeBridge();
     setMechanismUiBridge(bridge);
-    const r = parse(await env.tools.webEditorMechanismStatics('Mech'));
+    const r = parse(await executeValue(env.viewer, 'mechanism.statics', { mechanismPath: 'Mech' }));
 
     expect(r.error).toBeUndefined();
     expect(bridge.staticsCalls).toBe(1);
@@ -294,7 +297,7 @@ describe('T8 — statics fills holding without moving the pose', () => {
 
   it('an unsolvable mechanism points at the likely cause', async () => {
     setMechanismUiBridge(new FakeBridge());
-    const r = parse(await env.tools.webEditorMechanismStatics('Nope'));
+    const r = parse(await executeValue(env.viewer, 'mechanism.statics', { mechanismPath: 'Nope' }));
     expect(r.error).toContain('add_body');
   });
 });
@@ -327,7 +330,7 @@ describe('T9 — an MCP-started test session records forces with NO panel', () =
     expect(bridge.armed.get('Mech')).toBe(false);
   });
 
-  it('the buffers SURVIVE the stop — the cycle is read afterwards', async () => {
+  it.skipIf(!__RV_HAS_PRIVATE__)('the buffers SURVIVE the stop — the cycle is read afterwards', async () => {
     setMechanismUiBridge(new FakeBridge());
     const session = new FakeSession();
     setActiveTestSession(session as unknown as InPlaceTestSession);
@@ -337,7 +340,7 @@ describe('T9 — an MCP-started test session records forces with NO panel', () =
     for (let i = 0; i < 30; i++) plugin.onFixedUpdatePost(0.1);
     await env.tools.webEditorTestStop();
 
-    const r = parse(await env.tools.webEditorMechanismForces('Mech', '', false));
+    const r = parse(await queryValue(env.viewer, 'mechanism.forces', { mechanismPath: 'Mech', channelId: '', series: false }));
     expect(r.channels[0].sampleCount).toBeGreaterThan(0);
   });
 
@@ -439,6 +442,24 @@ describe('T2b — test_start/_stop stay usable WITHOUT the private bundle', () =
     expect(stopped.error).toBeUndefined();
     expect(stopped.ok).toBe(true);
     expect(stopped.forceRecording).toBe(false);
+  });
+
+  it('plan-769 Phase 7 (D24): the start reports the drive count and the placement progress; ok only when running', async () => {
+    const v = env.viewer as unknown as { drives: unknown[]; placements: { progress: Record<string, number> } };
+    v.drives = [{}, {}, {}];
+    v.placements = { progress: { total: 2, materialized: 1, pending: 0, missing: 1 } };
+    const session = new FakeSession();
+    setActiveTestSession(session as unknown as InPlaceTestSession);
+
+    const started = parse(await env.tools.webEditorTestStart());
+    expect(started).toMatchObject({ ok: true, state: 'running', drives: 3, placements: { total: 2, pending: 0, missing: 1 } });
+    await env.tools.webEditorTestStop();
+
+    // A start that did not reach `running` (superseded, failed) is not ok —
+    // and still says what it found instead of throwing.
+    session.start = async () => {};
+    const notRunning = parse(await env.tools.webEditorTestStart());
+    expect(notRunning).toMatchObject({ ok: false, state: 'idle', drives: 3 });
   });
 
   it('with no session at all they say what to do', async () => {

@@ -25,7 +25,7 @@ import { iterateFixedUpdate } from '../../src/core/behavior-runtime';
 import { setOverlayVisible } from '../../src/core/overlay-visibility-store';
 import { AgvScannerFieldPlugin } from '../../src/plugins/agv-scanner-field-plugin';
 import type { RVViewer } from '../../src/core/rv-viewer';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
+import { DESRunner } from '@rv/plugins/des/des-runner';
 import {
   TICK, makeHost, makeAgvRoot, bindDes, bindContinuous, clearShared, sig,
 } from '../helpers/agv-harness';

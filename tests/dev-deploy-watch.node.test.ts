@@ -270,6 +270,13 @@ function makeFixture(): Fixture {
     fetchTimeoutMs: 120000,
     prepublishTimeoutSeconds: 900,
     branch: 'main',
+    // The load guards are off in the fixture (their own cases below switch them on with seams):
+    // an in-process tick must not lower the vitest worker's priority, and a busy test machine
+    // must not defer the contract cases.
+    lowPriority: false,
+    minFreeMemoryMb: 0,
+    deferWhileTestLockHeld: false,
+    maxCpuPercent: 0,
   };
   const configPath = join(root, 'config.json');
   writeFileSync(configPath, JSON.stringify(config, null, 2));
@@ -1004,6 +1011,19 @@ describe.skipIf(!isWindows)('dev-deploy-watch — install, uninstall, purge (pla
     expect(calls[1]).toEqual(verifyQuery('rv-test-488-task'));
   });
 
+  it('a fresh install defaults to --dev-fast; a reinstall keeps deployArgs and the watcher options', () => {
+    const { config } = W.install(options(), deps());
+    expect(config.deployArgs).toEqual(['--demo', '--path', 'dev', '--dev-fast']);
+    const configPath = join(config.root, 'config.json');
+    const edited = { ...JSON.parse(readFileSync(configPath, 'utf8')), deployArgs: ['--demo', '--path', 'dev', '--no-smoke'],
+      lowPriority: false, minFreeMemoryMb: 4096, deferWhileTestLockHeld: false, testLockPort: 47999 };
+    writeFileSync(configPath, JSON.stringify(edited));
+    W.install(options(), deps());
+    const written = JSON.parse(readFileSync(configPath, 'utf8'));
+    expect(written.deployArgs).toEqual(['--demo', '--path', 'dev', '--no-smoke']);
+    expect(written).toMatchObject({ lowPriority: false, minFreeMemoryMb: 4096, deferWhileTestLockHeld: false, testLockPort: 47999 });
+  });
+
   it('task.xml carries the SID from whoami.exe at Principal and LogonTrigger, never a +-joined name', () => {
     whoamiResult = { status: 0, stdout: `"azuread\\thomasstrigl","${TEST_SID}"\r\n`, stderr: '' };
     const { xml } = W.install(options({ dryRun: true, systemRoot: 'C:\\Windows' }), deps());
@@ -1113,5 +1133,179 @@ describe.skipIf(!isWindows)('dev-deploy-watch — install, uninstall, purge (pla
     expect((await W.purge(cfg, configPath, {}, deps())).purged).toBe(true);
     expect(existsSync(config.root)).toBe(false);
     expect(calls.map((c) => c[1])).toEqual(['/Query', '/Delete']);
+  });
+});
+
+// ─── Load guards, priority, timing, failed-log copies (2026-10-25) ─────────
+
+const G = watchModule as unknown as {
+  DEFAULT_DEPLOY_ARGS: readonly string[];
+  deferReason(config: Record<string, any>, input: Record<string, unknown>): { reason: string; detail: string } | null;
+  parseDeployTimings(text: string): string[];
+  lowerOwnPriority(config: Record<string, any>, setPriority: (pid: number, priority: number) => void): boolean;
+  probeTestLock(options: { port: number; timeoutMs?: number }): Promise<Record<string, any> | null>;
+  preserveFailedDeployLog(config: Record<string, any>, pair: Pair, at?: number): string | null;
+  sampleCpuBusy(ms: number, readCpus?: () => Array<{ times: Record<string, number> }>): Promise<number | null>;
+  FAILED_LOGS_KEEP: number;
+};
+const GB = 1024 ** 3;
+
+describe('dev-deploy-watch — load guards (pure)', () => {
+  it('the default deploy args carry --dev-fast', () => {
+    expect(G.DEFAULT_DEPLOY_ARGS).toEqual(['--demo', '--path', 'dev', '--dev-fast']);
+  });
+
+  it('defers while a FOREIGN process holds the test lock, never for its own lock or when switched off', () => {
+    const holder = { pid: 4242, argv: ['scripts/with-test-lock.mjs', 'vitest', 'run'] };
+    expect(G.deferReason({}, { holder, freeBytes: 16 * GB })).toMatchObject({ reason: 'test-lock' });
+    expect(G.deferReason({}, { holder, freeBytes: 16 * GB })!.detail).toContain('PID 4242');
+    expect(G.deferReason({}, { holder, freeBytes: 16 * GB, ownLockPid: '4242' })).toBeNull();
+    expect(G.deferReason({ deferWhileTestLockHeld: false }, { holder, freeBytes: 16 * GB })).toBeNull();
+    expect(G.deferReason({}, { holder: null, freeBytes: 16 * GB })).toBeNull();
+  });
+
+  it('defers below 3 GB free memory by default; minFreeMemoryMb moves or disables the limit', () => {
+    expect(G.deferReason({}, { freeBytes: 2.5 * GB })).toMatchObject({ reason: 'low-memory' });
+    expect(G.deferReason({}, { freeBytes: 3.5 * GB })).toBeNull();
+    expect(G.deferReason({ minFreeMemoryMb: 4096 }, { freeBytes: 3.5 * GB })).toMatchObject({ reason: 'low-memory' });
+    expect(G.deferReason({ minFreeMemoryMb: 0 }, { freeBytes: 0.1 * GB })).toBeNull();
+    expect(G.deferReason({}, { freeBytes: null })).toBeNull();
+  });
+
+  it('defers above 85 % CPU over the window; overdue lifts test lock and CPU but never low memory', () => {
+    const holder = { pid: 4242, argv: ['vitest'] };
+    expect(G.deferReason({}, { freeBytes: 16 * GB, cpuPercent: 92 })).toMatchObject({ reason: 'cpu-busy' });
+    expect(G.deferReason({}, { freeBytes: 16 * GB, cpuPercent: 80 })).toBeNull();
+    expect(G.deferReason({ maxCpuPercent: 0 }, { freeBytes: 16 * GB, cpuPercent: 100 })).toBeNull();
+    expect(G.deferReason({}, { freeBytes: 16 * GB, cpuPercent: 100, holder, overdue: true })).toBeNull();
+    expect(G.deferReason({}, { freeBytes: 1 * GB, overdue: true })).toMatchObject({ reason: 'low-memory' });
+  });
+
+  it('sampleCpuBusy computes the busy share between two snapshots', async () => {
+    const snapshots = [
+      [{ times: { user: 100, nice: 0, sys: 0, idle: 900, irq: 0 } }],
+      [{ times: { user: 190, nice: 0, sys: 0, idle: 910, irq: 0 } }],
+    ];
+    let i = 0;
+    expect(await G.sampleCpuBusy(1, () => snapshots[i++])).toBeCloseTo(90);
+  });
+
+  it('lowers its own priority to below normal unless lowPriority is false', () => {
+    const calls: Array<[number, number]> = [];
+    const setPriority = (pid: number, priority: number) => { calls.push([pid, priority]); };
+    expect(G.lowerOwnPriority({}, setPriority)).toBe(true);
+    expect(calls).toEqual([[0, 10]]); // os.constants.priority.PRIORITY_BELOW_NORMAL
+    expect(G.lowerOwnPriority({ lowPriority: false }, setPriority)).toBe(false);
+    expect(calls).toHaveLength(1);
+    expect(G.lowerOwnPriority({}, () => { throw new Error('EACCES'); })).toBe(false);
+  });
+
+  it('parses the [timing] lines of a deploy log in order and ignores everything else', () => {
+    const text = 'noise\r\n[timing] features 1.2s\r\n[timing] stage 33.0s\nvite build\n[timing] vite-build 512.4s\n[timing] bad\n';
+    expect(G.parseDeployTimings(text)).toEqual(['features=1.2s', 'stage=33.0s', 'vite-build=512.4s']);
+  });
+
+  it('probeTestLock reads the holder of a test-lock port and answers null for a free port', async () => {
+    const http = await import('node:http');
+    const server = http.createServer((_req, res) => { res.end(JSON.stringify({ rvTestLock: 1, pid: 777, argv: ['vitest'] })); });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const port = (server.address() as { port: number }).port;
+    try {
+      expect(await G.probeTestLock({ port })).toMatchObject({ pid: 777 });
+    } finally {
+      await new Promise((r) => server.close(r));
+    }
+    expect(await G.probeTestLock({ port, timeoutMs: 500 })).toBeNull();
+  });
+});
+
+describe.skipIf(!isWindows)('dev-deploy-watch — load guards in a tick', { timeout: 60_000 }, () => {
+  let fx: Fixture;
+  const savedControl = process.env.RV488_STUB_CONTROL;
+  beforeEach(() => { fx = makeFixture(); });
+  afterEach(() => {
+    if (savedControl === undefined) delete process.env.RV488_STUB_CONTROL; else process.env.RV488_STUB_CONTROL = savedControl;
+    rmSync(fx.base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  });
+  const guarded = (extra: Record<string, unknown> = {}) => ({ ...fx.config, deferWhileTestLockHeld: true, minFreeMemoryMb: 3072, maxCpuPercent: 85, ...extra });
+  const idleCpu = async () => 10;
+  const foreign = async () => ({ rvTestLock: 1, pid: 999_999, argv: ['scripts/with-test-lock.mjs', 'vitest', 'run'] });
+  const noPriority = () => {};
+
+  it('a held test lock defers the deploy without using an attempt; the next free tick deploys attempt 1', async () => {
+    fx.control('ok');
+    const deferred = await W.runTick(guarded(), { probeTestLock: foreign, freeMemory: () => 16 * GB, cpuBusy: idleCpu, setPriority: noPriority });
+    expect(deferred.outcome).toBe('deferred');
+    expect(fx.records()).toHaveLength(0);
+    expect(fx.state()?.attempt ?? null).toBeNull();
+    expect(fx.log()).toMatch(/DEFER test-lock: test lock held by PID 999999 .*no attempt used/);
+
+    const deployed = await W.runTick(guarded(), { probeTestLock: async () => null, freeMemory: () => 16 * GB, cpuBusy: idleCpu, setPriority: noPriority });
+    expect(deployed.outcome).toBe('deployed');
+    expect(fx.log()).toMatch(/DEPLOY START attempt 1\/3/);
+  });
+
+  it('low free memory defers; an up-to-date pair never probes', async () => {
+    fx.control('ok');
+    let probes = 0;
+    const probe = async () => { probes++; return null; };
+    expect((await W.runTick(guarded(), { probeTestLock: probe, freeMemory: () => 2 * GB, cpuBusy: idleCpu, setPriority: noPriority })).outcome).toBe('deferred');
+    expect(fx.log()).toMatch(/DEFER low-memory: free memory 2\.0 GB < 3\.0 GB/);
+    expect((await W.runTick(guarded(), { probeTestLock: probe, freeMemory: () => 8 * GB, cpuBusy: idleCpu, setPriority: noPriority })).outcome).toBe('deployed');
+    const before = probes;
+    expect((await W.runTick(guarded(), { probeTestLock: probe, freeMemory: () => 1 * GB, cpuBusy: idleCpu, setPriority: noPriority })).outcome).toBe('idle');
+    expect(probes).toBe(before);
+  });
+
+  it('a busy CPU defers; after maxDeferMinutes of waiting (new pushes included) the deploy goes ahead', async () => {
+    fx.control('ok');
+    let clock = Date.UTC(2026, 9, 25, 10, 0, 0);
+    const busy = { probeTestLock: async () => null, freeMemory: () => 16 * GB, cpuBusy: async () => 97, setPriority: noPriority, now: () => clock };
+    expect((await W.runTick(guarded(), busy)).outcome).toBe('deferred');
+    expect(fx.log()).toMatch(/DEFER cpu-busy: CPU 97 % > 85 %/);
+    const since = (fx.state() as any).deferred.since;
+    fx.commit('web', 'pushed-while-waiting.txt', 'a new pair keeps the waiting clock');
+    clock += 30 * 60_000;
+    expect((await W.runTick(guarded(), busy)).outcome).toBe('deferred');
+    expect((fx.state() as any).deferred.since).toBe(since);
+    expect(fx.log()).toMatch(/waiting 30 min/);
+    clock += 31 * 60_000;
+    expect((await W.runTick(guarded(), busy)).outcome).toBe('deployed');
+    expect(fx.log()).toMatch(/DEFER LIMIT .* waited over 60 min/);
+    expect((fx.state() as any).deferred ?? null).toBeNull();
+  });
+
+  it('lowers its priority before the deploy, hands --dev-fast through and logs one TIMING line', async () => {
+    fx.control('ok');
+    const calls: Array<[number, number]> = [];
+    const config = guarded({ lowPriority: true, deployArgs: ['--demo', '--path', 'dev', '--no-smoke', '--dev-fast'] });
+    const result = await W.runTick(config, {
+      probeTestLock: async () => null, freeMemory: () => 16 * GB, cpuBusy: idleCpu, setPriority: (pid: number, p: number) => { calls.push([pid, p]); },
+    });
+    expect(result.outcome).toBe('deployed');
+    expect(calls).toEqual([[0, 10]]);
+    expect(fx.records()[0].argv).toEqual(['--demo', '--path', 'dev', '--no-smoke', '--dev-fast']);
+    expect(fx.log()).toMatch(/TIMING fetch=[\d.]+s reset=[\d.]+s deploy-child=[\d.]+s web=/);
+  });
+
+  it('a failed attempt keeps a timestamped copy of last-deploy.log', async () => {
+    fx.control('fail');
+    const result = await W.runTick(fx.config);
+    expect(result.outcome).toBe('deploy-failed');
+    const dir = join(fx.root, 'failed-deploys');
+    const copies = readdirSync(dir);
+    expect(copies).toHaveLength(1);
+    expect(copies[0]).toMatch(/^deploy-\d{4}-\d\d-\d\dT.*-[0-9a-f]{10}-[0-9a-f]{10}\.log$/);
+    expect(readFileSync(join(dir, copies[0]), 'utf8')).toBe(readFileSync(join(fx.root, 'last-deploy.log'), 'utf8'));
+    expect(fx.log()).toContain(`see ${join(dir, copies[0])}`);
+  });
+
+  it('keeps only the newest FAILED_LOGS_KEEP copies', () => {
+    writeFileSync(join(fx.root, 'last-deploy.log'), 'x');
+    const pair = { web: 'a'.repeat(40), private: 'b'.repeat(40) };
+    for (let i = 0; i < G.FAILED_LOGS_KEEP + 3; i++) G.preserveFailedDeployLog(fx.config, pair, Date.UTC(2026, 9, 25, 10, 0, i));
+    const copies = readdirSync(join(fx.root, 'failed-deploys')).sort();
+    expect(copies).toHaveLength(G.FAILED_LOGS_KEEP);
+    expect(copies[0]).toContain('10-00-03');
   });
 });

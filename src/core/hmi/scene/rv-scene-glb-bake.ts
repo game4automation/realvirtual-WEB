@@ -21,6 +21,10 @@
  *    and the geometry is bit-identical to the source.
  *  - **Full** — category 2 (`placements`) or 4 (`addedNodes`). The node ARRAY
  *    grows, so the file is rebuilt through `objectToGlb()` /`GLTFExporter`.
+ *    plan-628 8.7 adds `removedNodes` (authored path-network nodes the user
+ *    deleted): the node array SHRINKS, which the JSON patcher cannot do either —
+ *    the subtree is detached from the re-parsed tree, so the exporter never
+ *    writes it.
  *    Expensive, and only paid when the tree shape actually changed.
  *
  * Both paths end in the same file-level write, so `SceneCamera` and the
@@ -32,17 +36,15 @@
  *
  * The user's decision was that a referenced asset stays untouched. So an
  * override on a node that came out of a referenced file does NOT go into that
- * file: it becomes an `AssetOverrides.byNodeId` entry on the reference node in
+ * file: it becomes an `AssetOverrides.byAddress` entry (`#<id>`) on the reference node in
  * the file being written (§2.6). {@link BakeResolver} is what tells the two
  * cases apart, and a reference node that itself lives in a referenced file is a
  * refusal ({@link ReferencedFileWriteError}) rather than a guess.
  *
- * A MOVED node of a referenced file takes the same road since plan-444: its
- * local TRS becomes an `AssetOverrides.trsByNodeId` entry — a sibling block, not
- * a component patch — on the same reference node. Before that it was refused
- * outright, which made "import a STEP, drag a part into place, save" impossible;
- * a transform is glTF-native data on `nodes[i]` and simply had no home in a
- * componentType → fields map.
+ * A MOVED node of a referenced file is refused (plan-769 D11/F14,
+ * {@link NestedTransformRefusedError}): inside placed content only component
+ * values are overridable. plan-444's `trsByNodeId` is gone — an old file's moves
+ * are reported on load and never written again.
  *
  * ## What it refuses, and why refusing is the feature
  *
@@ -54,6 +56,7 @@
  */
 
 import { Euler, Matrix4, Object3D, Quaternion, Vector3 } from 'three';
+import { isUnsafeObjectKey, ownValue } from '../../engine/rv-safe-keys';
 import {
   defaultSceneExtras,
   ensureDefaultSceneExtras,
@@ -68,7 +71,7 @@ import {
   unrepresentableReason,
   warnDroppedUndefined,
 } from './rv-scene-settings-into-model';
-import type { MaterialisedEdits, NodeSpec } from './rv-scene-edits';
+import type { MaterialisedEdits, NodeSpec, PlacementTransform } from './rv-scene-edits';
 import type { PlacedComponent } from '../../../plugins/layout-planner/rv-layout-store';
 import type { RvConnection, ConnectionType } from '../../engine/rv-connection-registry';
 import {
@@ -94,12 +97,36 @@ import {
   isEmptyDocumentInfo,
   type DocumentInfo,
 } from '../../project/rv-document-info';
-import { RV_NODE_ID_KEY, ROOT_SOURCE_KEY, getNodeId } from '../../engine/rv-node-id';
-import { reportPlacementNameEmpty } from '../problems-store';
-import { getAssetReference } from '../../engine/rv-asset-reference';
+import { RV_NODE_ID_KEY, ROOT_SOURCE_KEY } from '../../engine/rv-node-id';
+import {
+  clearNestedTransformRefusedProblems, clearPlacementTransformOrphanedProblems, reportNestedTransformRefused,
+  reportPlacementNameEmpty, reportPlacementTransformOrphaned,
+} from '../problems-store';
+import {
+  canonicalizeAssetOverridesIn, getAssetReference, migrateStoredOverridePaths, overrideAddressInReference,
+  overrideAddressOf, overridePathMigrationOf,
+} from '../../engine/rv-asset-reference';
+import { identityIdOf } from '../../engine/rv-decode-identity';
 import { isPlacementRoot } from '../../engine/rv-placement-instancer';
 import type { NodeRegistry } from '../../engine/rv-node-registry';
 import type { ComposedFrame } from '../../engine/rv-glb-compose';
+import { RV_MACROS_KEY } from '../../editor/rv-macro-store';
+import {
+  RV_PLANNING_SCENARIOS_KEY, isEmptyScenarioBlock, planningScenariosPayload, type PlanningScenarioBlock,
+} from '../../planning/rv-planning-scenario';
+import { stampJsonIdentity, type JsonIdentityReport } from '../../engine/rv-json-identity';
+import { storedSignalMappingsOf } from '../../engine/rv-signal-mapping-address';
+import { reportSaveIdentityProblems } from '../problems-store';
+import { isQualifiedRef } from '../../library/library-origin';
+
+/** plan-769 Phase 3b: a re-minted duplicate id of a planner save is a visible Problem. */
+function reportJsonIdentity(r: JsonIdentityReport): void {
+  if (r.reminted.length === 0) return;
+  reportSaveIdentityProblems({
+    reminted: r.reminted.map((d) => ({ id: d.id, reminted: d.reminted, nodePath: d.name || `#${d.index}` })),
+    guessed: [],
+  });
+}
 
 /** Component key of the rv-ODT connections block, as carried in node extras. */
 const RV_CONNECTIONS_KEY = 'Connections';
@@ -129,15 +156,12 @@ export class ReferencedFileWriteError extends Error {
 /**
  * A moved node lies too deep for any file we may write.
  *
- * Since plan-444 this is the RESIDUAL case, not the common one. Moving a part
- * inside a referenced asset is now saved as an `AssetOverrides.trsByNodeId`
- * entry on the reference node — that was F3, and it is what makes "import a
- * STEP, drag a part, save" work at all. What is still refused is the NESTED
- * case: the part sits in an asset that is itself referenced from another
- * referenced asset, so the reference node that would have to hold the override
- * does not live in the file being written. Writing into the referenced asset
- * instead is what the user ruled out (it would move the part in every other
- * instance too), and dropping the move quietly is what F9 exists to prevent.
+ * The part is not in the file being written at all (`unknown`), or — the
+ * subclass {@link NestedTransformRefusedError} — it sits inside placed content,
+ * where a move has no vocabulary since plan-769 removed `trsByNodeId` (D11/F14).
+ * Writing into the referenced asset instead is what the user ruled out (it would
+ * move the part in every other instance too), and dropping the move quietly is
+ * what F9 exists to prevent.
  *
  * The message names the way out because the dialog shows it verbatim
  * (`SaveDialogs.tsx` renders the reason it is handed, and a raw
@@ -177,6 +201,33 @@ export class UnwritableTransformError extends Error {
 }
 
 /**
+ * A moved part sits inside a placement (plan-769 D11/F14, `nested-transform-refused`).
+ *
+ * Inside placed content only component VALUES can be overridden — at any depth.
+ * A part move has no vocabulary there any more (`trsByNodeId` was removed), so
+ * the save refuses it by name instead of dropping it.
+ */
+export class NestedTransformRefusedError extends UnwritableTransformError {
+  readonly code = 'nested-transform-refused';
+  /**
+   * @param paths     every moved node inside placed content, in op order
+   * @param owners    the placement (reference node) path of each, same order
+   * @param unknown   moved nodes absent from the file being written (see the base class)
+   */
+  constructor(paths: string[], public readonly owners: readonly string[], unknown: readonly string[] = []) {
+    super([...paths, ...unknown], unknown);
+    const list = (items: readonly string[]): string =>
+      items.slice(0, 8).join(', ') + (items.length > 8 ? `, … (+${items.length - 8} more)` : '');
+    const head = `${paths.length} moved part(s) sit inside a placement: ${list(paths)}`
+      + '.\nInside placed content only component values can be changed. Undo the move, then move the '
+      + 'whole placement — or open the referenced asset (double-click it) and move the part there; '
+      + 'the change then applies to every instance.';
+    this.message = unknown.length > 0 ? `${head}\n${this.message.split('\n').slice(-2).join('\n')}` : head;
+    this.name = 'NestedTransformRefusedError';
+  }
+}
+
+/**
  * The file being saved would reference itself.
  *
  * Composition detects a cycle on LOAD and refuses the whole model. Detecting the
@@ -186,7 +237,7 @@ export class UnwritableTransformError extends Error {
  */
 export class SaveReferenceCycleError extends Error {
   constructor(public readonly trail: string[]) {
-    super(`Referenzzyklus beim Speichern (reference cycle on save): ${trail.join(' → ')}`);
+    super(`Reference cycle on save: ${trail.join(' → ')}`);
     this.name = 'SaveReferenceCycleError';
   }
 }
@@ -211,6 +262,17 @@ export interface ReferencedBakeLocation {
   referenceNodePath: string;
   nodeId: string;
   sourceKey: string;
+  /**
+   * plan-769 Phase 4b — the override key on that reference node: `#<nodeId>`, or
+   * `<b>#<nodeId>` when the node is content of a nested reference `b` of the
+   * referenced asset (any depth, F13). Absent = `#<nodeId>`.
+   */
+  address?: string;
+}
+
+/** The `byAddress` key of a referenced location. */
+function locationAddress(location: ReferencedBakeLocation): string {
+  return location.address ?? overrideAddressOf(location.nodeId);
 }
 
 export type BakeLocation = RootBakeLocation | ReferencedBakeLocation;
@@ -238,6 +300,12 @@ export interface BakeResolver {
    * `locate`. Optional: a test resolver without placements simply omits it.
    */
   livePlacementIdOf?(nodePath: string): string | null;
+  /**
+   * plan-769 9.22 — the legacy `byPath` keys the LIVE reference node loaded from
+   * `nodes[index]` migrated (path → address), or null. The bake writes them as
+   * `byAddress`, so a migrated path never goes back into the file as a path.
+   */
+  overridePathMigrationAt?(index: number): Readonly<Record<string, string>> | null;
 }
 
 // ─── Options / result ────────────────────────────────────────────────────
@@ -304,6 +372,28 @@ export interface BakeOptions {
    * must not strip a description), `null` removes it, a value replaces it.
    */
   documentInfo?: DocumentInfo | null;
+  /**
+   * plan-641 M5 — the document's macros, written as `Macros` beside `DocumentInfo`.
+   * Same three states: `undefined` leaves an authored block alone (a save of a
+   * document whose macros nobody touched keeps them byte-identical), `null`
+   * removes it, an array replaces it.
+   */
+  macros?: readonly unknown[] | null;
+  /**
+   * plan-630 §2.8 — the planning scenarios, written as `PlanningScenarios` beside
+   * `DocumentInfo`. Same three states: `undefined` leaves an authored block alone (every
+   * save that has no opinion about scenarios keeps them), `null` — or a block with only the
+   * empty default scenario — removes it, a block replaces it.
+   */
+  planningScenarios?: PlanningScenarioBlock | null;
+  /**
+   * plan-2013 §2.8 — the document's variants, written as `Variants` beside `DocumentInfo`.
+   * The SERIALISED block (`serializeVariantsBlock`), so the bake never imports variant code.
+   * Same three states: `undefined` leaves an authored block alone (every save that has no
+   * opinion about variants keeps them — also a document whose variants were never loaded
+   * because the preference is off), `null` removes it, an object replaces it.
+   */
+  variants?: Record<string, unknown> | null;
 }
 
 export interface BakeResult {
@@ -323,17 +413,14 @@ export interface BakeResult {
   placements: number;
   /** Nodes created from `addNode` specs. */
   addedNodes: number;
+  /** plan-628 8.7: authored subtrees dropped from the file (`removedNodes`). */
+  removedNodes: number;
+  /** plan-769 Phase 7: base-file placement nodes whose TRS was patched (`baselinePlacementTransforms`). */
+  placementsMoved: number;
+  /** plan-769 Phase 7: base-file placement nodes dropped by `NodeId` (`removedPlacementIds`). */
+  placementsRemoved: number;
   /** Node transforms written as glTF-native TRS on this file's own nodes. */
   transforms: number;
-  /**
-   * Moved nodes of a REFERENCED asset, written as `AssetOverrides.trsByNodeId`
-   * entries on their reference node (plan-444 F3).
-   *
-   * Counted apart from {@link transforms} because they are a different write in
-   * a different place, and a save summary that added them together would say
-   * "12 transforms" for a file whose own nodes never moved.
-   */
-  referenceTransforms: number;
   connections: number;
   connectionTypes: number;
   /** True when a `SceneCamera` was written (false also when one was removed). */
@@ -399,7 +486,8 @@ export interface BakeResult {
  * would say "full".
  */
 export function bakeRequiresFullPath(edits: MaterialisedEdits): boolean {
-  return edits.placements.length > 0 || edits.addedNodes.length > 0;
+  return edits.placements.length > 0 || edits.addedNodes.length > 0 || (edits.removedNodes?.length ?? 0) > 0
+    || (edits.removedPlacementIds?.length ?? 0) > 0;
 }
 
 /** True when nothing at all would be written. */
@@ -407,6 +495,9 @@ export function bakeIsEmpty(edits: MaterialisedEdits): boolean {
   return Object.keys(edits.overlay.nodes).length === 0
     && edits.placements.length === 0
     && edits.addedNodes.length === 0
+    && (edits.removedNodes?.length ?? 0) === 0
+    && (edits.baselinePlacementTransforms?.size ?? 0) === 0
+    && (edits.removedPlacementIds?.length ?? 0) === 0
     && edits.nodeTransforms.length === 0
     && edits.connections.length === 0
     && edits.connectionTypes.length === 0
@@ -434,12 +525,21 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
+/** `obj[key]` as an OWN plain record, created when absent (never an inherited object). */
+function ownRecord(obj: Record<string, unknown>, key: string): Record<string, unknown> {
+  const cur = ownValue(obj, key);
+  if (isPlainObject(cur)) return cur;
+  const fresh: Record<string, unknown> = {};
+  obj[key] = fresh;
+  return fresh;
+}
+
 // ─── Category 1: overlay (split into own-file and reference overrides) ───
 
 interface SplitOverlay {
   /** glTF node index → the merge patch to apply to its `extras.realvirtual`. */
   own: Map<number, Record<string, Record<string, unknown>>>;
-  /** Reference node index → `byNodeId` block to merge into its AssetOverrides. */
+  /** Reference node index → override address → patch, merged into its `AssetOverrides.byAddress`. */
   routed: Map<number, Record<string, Record<string, Record<string, unknown>>>>;
   routedEntries: number;
 }
@@ -513,9 +613,10 @@ function splitOverlay(
     if (owner.kind !== 'root' || !gltfNodes[owner.index]) { unwritable.push(nodePath); continue; }
     checkIdentity(owner.index);
     const block = routed.get(owner.index) ?? {};
-    const existing = block[location.nodeId] ?? {};
+    const key = locationAddress(location);
+    const existing = block[key] ?? {};
     mergePatchInto(existing, patch);
-    block[location.nodeId] = existing;
+    block[key] = existing;
     routed.set(owner.index, block);
     routedEntries++;
   }
@@ -534,8 +635,9 @@ function mergePatchInto(
   patch: Record<string, Record<string, unknown>>,
 ): void {
   for (const [componentType, fields] of Object.entries(patch)) {
-    const slot = (target[componentType] ??= {});
-    Object.assign(slot, fields);
+    if (isUnsafeObjectKey(componentType)) continue;
+    const slot = ownRecord(target, componentType);
+    for (const [k, v] of Object.entries(fields)) if (!isUnsafeObjectKey(k)) slot[k] = v;
   }
 }
 
@@ -555,10 +657,13 @@ function applyPatchToGltfNode(
   let touched = false;
   let fields = 0;
   for (const [componentType, componentFields] of Object.entries(patch)) {
-    const target = (rv[componentType] ??= {});
+    // Content-safe (rv-safe-keys.ts): no prototype-slot keys, OWN records only.
+    if (isUnsafeObjectKey(componentType)) continue;
+    const target = ownRecord(rv, componentType);
     for (const [fieldName, value] of Object.entries(componentFields)) {
+      if (isUnsafeObjectKey(fieldName)) continue;
       if (value === null) {
-        if (fieldName in target) { delete target[fieldName]; fields++; touched = true; }
+        if (Object.prototype.hasOwnProperty.call(target, fieldName)) { delete target[fieldName]; fields++; touched = true; }
       } else {
         target[fieldName] = value;
         fields++;
@@ -569,61 +674,38 @@ function applyPatchToGltfNode(
   return { touched, fields };
 }
 
-/** Merge routed overrides into a reference node's `AssetOverrides.byNodeId`. */
+/**
+ * Merge routed overrides into a reference node's `AssetOverrides.byAddress` (plan-769):
+ * key `#<id>` = the node's id in the referenced asset. The record is brought into the
+ * 769 form first (`byNodeId` read as `#id`, `trsByNodeId` dropped, unresolved `byPath` kept).
+ */
 function applyRoutedOverrides(
   node: GltfNode,
   block: Record<string, Record<string, Record<string, unknown>>>,
 ): number {
   const rv = rvExtrasOf(node);
+  canonicalizeAssetOverridesIn(rv);
   const overrides = (rv[RV_ASSET_OVERRIDES_KEY] ??= {}) as Record<string, unknown>;
-  const byNodeId = isPlainObject(overrides.byNodeId)
-    ? overrides.byNodeId as Record<string, Record<string, Record<string, unknown>>>
+  const byAddress = isPlainObject(overrides.byAddress)
+    ? overrides.byAddress as Record<string, Record<string, Record<string, unknown>>>
     : {};
-  overrides.byNodeId = byNodeId;
+  overrides.byAddress = byAddress;
 
   let fields = 0;
-  for (const [nodeId, patch] of Object.entries(block)) {
-    const slot = (byNodeId[nodeId] ??= {});
+  for (const [address, patch] of Object.entries(block)) {
+    if (isUnsafeObjectKey(address)) continue;
+    const slot = ownRecord(byAddress, address) as Record<string, Record<string, unknown>>;
     for (const [componentType, componentFields] of Object.entries(patch)) {
-      const target = (slot[componentType] ??= {});
+      if (isUnsafeObjectKey(componentType)) continue;
+      const target = ownRecord(slot, componentType);
       for (const [fieldName, value] of Object.entries(componentFields)) {
+        if (isUnsafeObjectKey(fieldName)) continue;
         target[fieldName] = value;
         fields++;
       }
     }
   }
   return fields;
-}
-
-/**
- * Merge moved-node transforms into a reference node's `AssetOverrides.trsByNodeId`.
- *
- * A SIBLING of `byNodeId`, never a key inside it (plan-444 §2.3). `byNodeId` is
- * a componentType → fields map, so a `trs` entry in there would come back out of
- * the file as a component called "trs" and be written into the target node's
- * `extras.realvirtual` on every load. The sibling block is invisible to the
- * component patch path by construction.
- *
- * Last write wins per node id, which is the same "the file states the current
- * position" rule the root-file branch follows: two saves of the same moved part
- * leave one entry, not a history.
- */
-function applyRoutedTransformOverrides(
-  node: GltfNode,
-  block: Record<string, Record<string, number[]>>,
-): void {
-  const rv = rvExtrasOf(node);
-  const overrides = (rv[RV_ASSET_OVERRIDES_KEY] ??= {}) as Record<string, unknown>;
-  // The reader tolerates a missing `byNodeId`, but every writer before this one
-  // established the key; keeping the shape uniform means one less variant for
-  // an older viewer to meet.
-  if (!isPlainObject(overrides.byNodeId)) overrides.byNodeId = {};
-  const trsByNodeId = isPlainObject(overrides.trsByNodeId)
-    ? overrides.trsByNodeId as Record<string, Record<string, number[]>>
-    : {};
-  overrides.trsByNodeId = trsByNodeId;
-
-  for (const [nodeId, trs] of Object.entries(block)) trsByNodeId[nodeId] = trs;
 }
 
 // ─── Category 5: node transforms → glTF-native TRS ──────────────────────
@@ -837,6 +919,66 @@ export function writeDocumentInfo(
   return true;
 }
 
+// ─── Macros (plan-641 M5) ───────────────────────────────────────────────
+
+/**
+ * Write (or clear) the `Macros` block in the default scene extras — the sister
+ * of {@link writeDocumentInfo}, identical in its three states.
+ */
+export function writeMacros(json: Record<string, unknown>, macros: readonly unknown[] | null | undefined): boolean {
+  if (macros === undefined) return false;
+  if (macros === null || macros.length === 0) {
+    const rv = defaultSceneExtras(json)?.realvirtual;
+    if (isPlainObject(rv)) delete rv[RV_MACROS_KEY];
+    return false;
+  }
+  const sceneExtras = ensureDefaultSceneExtras(json);
+  const rv = (sceneExtras.realvirtual ??= {}) as Record<string, unknown>;
+  rv[RV_MACROS_KEY] = JSON.parse(JSON.stringify(macros));
+  return true;
+}
+
+// ─── PlanningScenarios (plan-630 §2.8) ──────────────────────────────────
+
+/**
+ * Write (or clear) the `PlanningScenarios` block in the default scene extras — the sister
+ * of {@link writeDocumentInfo}, identical in its three states. Only the own key is touched.
+ */
+export function writePlanningScenarios(
+  json: Record<string, unknown>,
+  block: PlanningScenarioBlock | null | undefined,
+): boolean {
+  if (block === undefined) return false;
+  if (block === null || isEmptyScenarioBlock(block)) {
+    const rv = defaultSceneExtras(json)?.realvirtual;
+    if (isPlainObject(rv)) delete rv[RV_PLANNING_SCENARIOS_KEY];
+    return false;
+  }
+  const sceneExtras = ensureDefaultSceneExtras(json);
+  const rv = (sceneExtras.realvirtual ??= {}) as Record<string, unknown>;
+  rv[RV_PLANNING_SCENARIOS_KEY] = planningScenariosPayload(block);
+  return true;
+}
+
+// ─── Variants (plan-2013 §2.8) ──────────────────────────────────────────
+
+/** Scene-extras key of the variants block (the model module re-exports the same name). */
+const RV_VARIANTS_KEY = 'Variants';
+
+/** Write (or clear) the `Variants` block — three states like {@link writePlanningScenarios}. */
+export function writeVariants(json: Record<string, unknown>, payload: Record<string, unknown> | null | undefined): boolean {
+  if (payload === undefined) return false;
+  if (payload === null) {
+    const rv = defaultSceneExtras(json)?.realvirtual;
+    if (isPlainObject(rv)) delete rv[RV_VARIANTS_KEY];
+    return false;
+  }
+  const sceneExtras = ensureDefaultSceneExtras(json);
+  const rv = (sceneExtras.realvirtual ??= {}) as Record<string, unknown>;
+  rv[RV_VARIANTS_KEY] = JSON.parse(JSON.stringify(payload));
+  return true;
+}
+
 // ─── File-level pass (shared by both paths) ─────────────────────────────
 
 /** Everything that belongs to the FILE rather than to one node. */
@@ -855,6 +997,9 @@ function writeFileLevel(
   const settingsWritten = writeSceneSettings(json, options.settings);
   const classificationWritten = writeClassification(json, options.classification);
   const documentInfoWritten = writeDocumentInfo(json, options.documentInfo);
+  writeMacros(json, options.macros);
+  writePlanningScenarios(json, options.planningScenarios);
+  writeVariants(json, options.variants);
   return { cameraWritten, settingsWritten, classificationWritten, documentInfoWritten };
 }
 
@@ -973,7 +1118,6 @@ interface NodeLevelCounts {
   fields: number;
   referenceOverrides: number;
   transforms: number;
-  referenceTransforms: number;
 }
 
 /** Categories 1 and 5 — everything that patches an EXISTING `nodes[]` entry. */
@@ -995,6 +1139,16 @@ function writeNodeLevel(
     );
   }
 
+  // plan-769 9.22: legacy paths the live reference node resolved are written as addresses.
+  if (resolver.overridePathMigrationAt) {
+    gltfNodes.forEach((n, index) => {
+      const rv = n.extras?.realvirtual as Record<string, unknown> | undefined;
+      if (!rv || !(RV_ASSET_OVERRIDES_KEY in rv)) return;
+      const migrated = resolver.overridePathMigrationAt!(index);
+      if (migrated) migrateStoredOverridePaths(rv, migrated);
+    });
+  }
+
   const split = splitOverlay(edits.overlay, resolver, gltfNodes, expected);
 
   let nodes = 0;
@@ -1008,32 +1162,26 @@ function writeNodeLevel(
     fields += applyRoutedOverrides(gltfNodes[index], block);
   }
 
-  // Category 5. Three outcomes, and which one applies is decided the same way
-  // category 1 decides it — by where the node lives (plan-444):
+  // Category 5. Two outcomes, decided the same way category 1 decides it — by
+  // where the node lives:
   //
   //  - own file          → glTF-native TRS on `nodes[i]`, as it always was;
-  //  - referenced, owned → `AssetOverrides.trsByNodeId` on the reference node,
-  //                        which is what makes a part moved after a CAD import
-  //                        saveable at all (F3);
-  //  - nested            → still refused ({@link UnwritableTransformError}, F5).
+  //  - inside a placement (referenced, any depth) → refused by name
+  //                        ({@link NestedTransformRefusedError}, plan-769 D11/F14:
+  //                        `trsByNodeId` is gone, only component values are overridable).
   //
   // The nodeTransforms array is ALREADY coalesced to the final TRS per node —
-  // `materialise` keys it by nodePath — so moving one part ten times produces
-  // one override, not ten.
-  const unwritable: string[] = [];
-  /** The subset of `unwritable` that is absent from the file rather than nested. */
+  // `materialise` keys it by nodePath.
   const unknown: string[] = [];
-  /** Reference node index → `trsByNodeId` block to merge into its overrides. */
-  const routedTrs = new Map<number, Record<string, Record<string, number[]>>>();
+  const refused: string[] = [];
+  const refusedOwners: string[] = [];
   let transforms = 0;
-  let referenceTransforms = 0;
   for (const entry of edits.nodeTransforms) {
     const location = resolver.locate(entry.nodePath);
-    if (!location) { unwritable.push(entry.nodePath); unknown.push(entry.nodePath); continue; }
+    if (!location) { unknown.push(entry.nodePath); continue; }
 
     if (location.kind === 'root') {
       if (!gltfNodes[location.index]) {
-        unwritable.push(entry.nodePath);
         unknown.push(entry.nodePath);
         continue;
       }
@@ -1048,44 +1196,22 @@ function writeNodeLevel(
       continue;
     }
 
-    // A node out of a referenced file: the move belongs on the reference node,
-    // which must itself live in the file being written — the identical
-    // ownership rule `splitOverlay` applies to component overrides.
-    const owner = resolver.locate(location.referenceNodePath);
-    if (!owner || owner.kind !== 'root' || !gltfNodes[owner.index]) {
-      unwritable.push(entry.nodePath);
-      continue;
-    }
-    if (expected && gltfNodes[owner.index].name !== expected[owner.index]) {
-      throw new ModelSourceChangedError(
-        `node ${owner.index} is now "${gltfNodes[owner.index].name ?? '<unnamed>'}" `
-        + `instead of "${expected[owner.index] ?? '<unnamed>'}"`,
-      );
-    }
-    const block = routedTrs.get(owner.index) ?? {};
-    // `NodeTransformEntry` carries no scale, and neither does the entry written
-    // here: the referenced asset owns its scale (a GLB node may carry mirror
-    // scale), and a save that invented one would silently change geometry the
-    // user never touched.
-    block[location.nodeId] = {
-      position: [entry.position[0], entry.position[1], entry.position[2]],
-      quaternion: [entry.quaternion[0], entry.quaternion[1], entry.quaternion[2], entry.quaternion[3]],
-    };
-    routedTrs.set(owner.index, block);
-    referenceTransforms++;
+    refused.push(entry.nodePath);
+    refusedOwners.push(location.referenceNodePath);
   }
-  if (unwritable.length > 0) throw new UnwritableTransformError(unwritable, unknown);
-
-  for (const [index, block] of routedTrs) {
-    applyRoutedTransformOverrides(gltfNodes[index], block);
+  if (refused.length > 0) {
+    // The save dialog shows the error; the Problems panel keeps one entry per refused
+    // node until the next save attempt or a document change.
+    refused.forEach((nodePath, i) => reportNestedTransformRefused({ nodePath, placementPath: refusedOwners[i]! }));
+    throw new NestedTransformRefusedError(refused, refusedOwners, unknown);
   }
+  if (unknown.length > 0) throw new UnwritableTransformError(unknown, unknown);
 
   return {
     nodes,
     fields,
     referenceOverrides: split.routedEntries,
     transforms,
-    referenceTransforms,
   };
 }
 
@@ -1134,26 +1260,37 @@ function findByScenePath(root: Object3D, path: string): Object3D | null {
  * every splat only to report it missing. Its catalog identity moves into
  * `PlacementMeta.catalogId` instead — the one case where that field is written.
  */
-function placementExtras(placement: PlacedComponent): Record<string, unknown> {
+export function placementExtras(placement: PlacedComponent): Record<string, unknown> {
   const isSplat = !!placement.splatUrl;
 
   const meta: PlacementMeta = {};
   if (isSplat) {
     meta.splatUrl = placement.splatUrl;
     if (placement.catalogId) meta.catalogId = placement.catalogId;
+    // plan-778: a splat has no AssetReference — its qualifier rides in the meta.
+    if (placement.providerId) meta.providerId = placement.providerId;
+    if (placement.sourceId) meta.sourceId = placement.sourceId;
   }
   if (placement.visible === false) meta.visible = false;
   if (placement.signalMappings?.length) {
-    meta.signalMappings = placement.signalMappings as unknown as Record<string, unknown>[];
+    // plan-769 F15: stored by ADDRESS (`componentAddress` / `sourceAddress`).
+    meta.signalMappings = storedSignalMappingsOf(placement) as unknown as Record<string, unknown>[];
   }
 
   const out: Record<string, unknown> = { [RV_NODE_ID_KEY]: placement.id };
   if (!isSplat) {
     const reference: Record<string, unknown> = { assetId: placement.catalogId };
+    // plan-778 F4: the qualifier as stored on the record — a qualified one
+    // (library project) is written WITHOUT a `path`: the library resolves it,
+    // a path could only ever point somewhere else. A legacy pair (pre-778
+    // `global` + catalog URL) is kept as it was written, never upgraded.
+    if (placement.providerId) reference.providerId = placement.providerId;
+    if (placement.sourceId) reference.sourceId = placement.sourceId;
+    const qualified = isQualifiedRef(placement);
     // A blob: URL is a session artifact (ResolvedAsset contract: volatile,
     // NEVER persisted) — dead on the next load, where it would shadow the
     // assetId resolution with a guaranteed fetch failure (plan-921 finding).
-    if (placement.glbUrl && !placement.glbUrl.startsWith('blob:')) reference.path = placement.glbUrl;
+    if (!qualified && placement.glbUrl && !placement.glbUrl.startsWith('blob:')) reference.path = placement.glbUrl;
     // The authoring half of plan-703 §2.8: the extents measured when the asset
     // was placed travel into the file, so a later load that cannot resolve it
     // still knows how big to draw the hole. Additive — a placement recorded
@@ -1234,50 +1371,49 @@ function mergePlacementPatch(
   patch: Record<string, Record<string, unknown>>,
 ): void {
   for (const [componentType, fields] of Object.entries(patch)) {
+    if (isUnsafeObjectKey(componentType)) continue;
     // plan-757 Phase 2 (4a): the routed `AssetOverrides` of a live placement
-    // merge PER NODE ID (byNodeId per component, trsByNodeId last-write-wins)
+    // merge PER ADDRESS (byAddress per component, plan-769)
     // into what the node already carries — a shallow assign would drop every
     // override of a node the patch does not mention.
     if (componentType === RV_ASSET_OVERRIDES_KEY) {
       rv[componentType] = mergeAssetOverrides(rv[componentType], fields);
       continue;
     }
-    const target = isPlainObject(rv[componentType])
-      ? { ...(rv[componentType] as Record<string, unknown>) }
-      : {};
-    Object.assign(target, fields);
+    const existing = ownValue(rv, componentType);
+    const target: Record<string, unknown> = isPlainObject(existing) ? { ...existing } : {};
+    for (const [k, v] of Object.entries(fields)) if (!isUnsafeObjectKey(k)) target[k] = v;
     rv[componentType] = target;
   }
 }
 
-/** `AssetOverrides` ⊕ patch: `byNodeId` per id per component, `trsByNodeId` per id, everything else replaced. */
+/** `AssetOverrides` ⊕ patch: `byAddress` per address per component (plan-769); the base in the 769 form. */
 function mergeAssetOverrides(existing: unknown, patch: Record<string, unknown>): Record<string, unknown> {
-  const base = isPlainObject(existing) ? { ...(existing as Record<string, unknown>) } : {};
-  const byNodeId = isPlainObject(base.byNodeId)
-    ? { ...(base.byNodeId as Record<string, Record<string, Record<string, unknown>>>) }
+  const holder: Record<string, unknown> = { [RV_ASSET_OVERRIDES_KEY]: existing };
+  canonicalizeAssetOverridesIn(holder);
+  const base = isPlainObject(holder[RV_ASSET_OVERRIDES_KEY])
+    ? { ...(holder[RV_ASSET_OVERRIDES_KEY] as Record<string, unknown>) }
     : {};
-  for (const [nodeId, components] of Object.entries((patch.byNodeId as Record<string, Record<string, Record<string, unknown>>> | undefined) ?? {})) {
-    const slot = { ...(byNodeId[nodeId] ?? {}) };
+  const byAddress = isPlainObject(base.byAddress)
+    ? { ...(base.byAddress as Record<string, Record<string, Record<string, unknown>>>) }
+    : {};
+  for (const [address, components] of Object.entries((patch.byAddress as Record<string, Record<string, Record<string, unknown>>> | undefined) ?? {})) {
+    const slot = { ...(byAddress[address] ?? {}) };
     mergePatchInto(slot, components);
-    byNodeId[nodeId] = slot;
+    byAddress[address] = slot;
   }
-  const trsByNodeId = {
-    ...(isPlainObject(base.trsByNodeId) ? (base.trsByNodeId as Record<string, unknown>) : {}),
-    ...((patch.trsByNodeId as Record<string, unknown> | undefined) ?? {}),
-  };
-  const out: Record<string, unknown> = { ...base, ...patch, byNodeId };
-  if (Object.keys(trsByNodeId).length > 0) out.trsByNodeId = trsByNodeId;
-  return out;
+  return { ...base, ...patch, byAddress };
 }
 
-/** An op-created node becomes an ordinary glTF node with its components. */
-function buildSpecNode(spec: NodeSpec): Object3D {
+/** An op-created node becomes an ordinary glTF node with its components — and its id (plan-769: `idMap.node`). */
+function buildSpecNode(spec: NodeSpec, nodeId?: string): Object3D {
   const node = new Object3D();
   node.name = spec.name;
   node.position.set(spec.position[0], spec.position[1], spec.position[2]);
   node.quaternion.set(spec.quaternion[0], spec.quaternion[1], spec.quaternion[2], spec.quaternion[3]);
   node.scale.set(spec.scale[0], spec.scale[1], spec.scale[2]);
   node.userData.realvirtual = JSON.parse(JSON.stringify(spec.components)) as Record<string, unknown>;
+  if (nodeId) (node.userData.realvirtual as Record<string, unknown>)[RV_NODE_ID_KEY] = nodeId;
   return node;
 }
 
@@ -1357,6 +1493,141 @@ function reconcilePlacements(
   return { updated, remaining };
 }
 
+// ─── plan-769 Phase 7: edits on placements the base file already holds ──
+
+/** `NodeId` → glTF node; the first occurrence wins, as in {@link reconcilePlacements}. */
+function gltfNodesByNodeId(json: Record<string, unknown>): Map<string, GltfNode> {
+  const byNodeId = new Map<string, GltfNode>();
+  for (const node of (json.nodes as GltfNode[] | undefined) ?? []) {
+    const rv = node.extras?.realvirtual;
+    if (!isPlainObject(rv)) continue;
+    const id = rv[RV_NODE_ID_KEY];
+    if (typeof id === 'string' && id && !byNodeId.has(id)) byNodeId.set(id, node);
+  }
+  return byNodeId;
+}
+
+/** A glTF node that is a placement / reference node (planner marker or `AssetReference`). */
+function isPlacementGltfNode(node: GltfNode): boolean {
+  const rv = node.extras?.realvirtual;
+  return isPlainObject(rv) && (RV_PLACEMENT_META_KEY in rv || RV_ASSET_REFERENCE_KEY in rv);
+}
+
+/**
+ * Move placements of the BASE file (D23): a TRS-only patch of the node that
+ * carries the placement id as `NodeId`. Nothing else on the node is touched —
+ * `AssetReference` (with its `bounds`), `PlacementMeta`, `AssetOverrides` stay
+ * as the file holds them; the planner never authored them in this session, so a
+ * wholesale rewrite from a record would lose what it does not know.
+ *
+ * An id the file does not hold as a placement is reported in `orphaned`: the
+ * move cannot be written, and saying so is the rule for every unresolvable edit.
+ */
+function patchBaselinePlacementTransforms(
+  json: Record<string, unknown>,
+  transforms: ReadonlyMap<string, PlacementTransform> | undefined,
+): { moved: number; orphaned: string[] } {
+  if (!transforms || transforms.size === 0) return { moved: 0, orphaned: [] };
+  const byNodeId = gltfNodesByNodeId(json);
+  const orphaned: string[] = [];
+  let moved = 0;
+  for (const [id, t] of transforms) {
+    const node = byNodeId.get(id);
+    if (!node || !isPlacementGltfNode(node)) { orphaned.push(id); continue; }
+    const quaternion = new Quaternion().setFromEuler(new Euler(
+      t.rotation[0] * DEG_TO_RAD,
+      t.rotation[1] * DEG_TO_RAD,
+      t.rotation[2] * DEG_TO_RAD,
+      'XYZ',
+    ));
+    writeNodeTransform(node, t.position, [quaternion.x, quaternion.y, quaternion.z, quaternion.w]);
+    const [sx, sy, sz] = t.scale;
+    if (sx === 1 && sy === 1 && sz === 1) delete node.scale;
+    else node.scale = [sx, sy, sz];
+    moved++;
+  }
+  return { moved, orphaned };
+}
+
+/**
+ * The base-file placements a save must drop: the removed ids the source still
+ * holds as a placement node. An id the file no longer holds is already in the
+ * target state — after "save as new" the saved bytes become the base while the
+ * log keeps its ops, so the same removal reaches every later save and must stay
+ * silent there.
+ */
+function presentRemovedPlacementIds(json: Record<string, unknown>, removed: readonly string[] | undefined): Set<string> {
+  const present = new Set<string>();
+  if (!removed || removed.length === 0) return present;
+  const byNodeId = gltfNodesByNodeId(json);
+  for (const id of removed) {
+    const node = byNodeId.get(id);
+    if (node && isPlacementGltfNode(node)) present.add(id);
+  }
+  return present;
+}
+
+/**
+ * Does the unresolvable edit path `nodePath` lie under (or on) a removed
+ * placement of the source file? Walked through the source's own names — the
+ * live registry can no longer answer, the placement is gone from the scene.
+ * Registry paths may carry the root's name as the first segment (the rule of
+ * {@link findByScenePath}), so both spellings are tried.
+ */
+function pathUnderRemovedPlacement(
+  json: Record<string, unknown>,
+  nodePath: string,
+  removed: ReadonlySet<string>,
+): boolean {
+  const nodes = (json.nodes as GltfNode[] | undefined) ?? [];
+  const scenes = (json.scenes as Array<{ nodes?: number[] }> | undefined) ?? [];
+  const sceneIndex = typeof json.scene === 'number' ? json.scene : 0;
+  const roots = scenes[sceneIndex]?.nodes ?? [];
+  const segments = nodePath.split('/').filter(Boolean);
+  const isRemoved = (index: number): boolean => {
+    const rv = nodes[index]?.extras?.realvirtual;
+    const id = isPlainObject(rv) ? rv[RV_NODE_ID_KEY] : undefined;
+    return typeof id === 'string' && removed.has(id);
+  };
+  const walk = (start: number): boolean => {
+    let level = roots;
+    for (let i = start; i < segments.length; i++) {
+      const next = level.find((n) => nodes[n]?.name === segments[i]);
+      if (next === undefined) return false;
+      if (isRemoved(next)) return true;
+      level = nodes[next]?.children ?? [];
+    }
+    return false;
+  };
+  return walk(0) || (segments.length > 1 && walk(1));
+}
+
+/**
+ * Edits under a removed base-file placement leave with it (D23): a component
+ * override on `P/Child`, then P removed — the entry no longer resolves in the
+ * live scene and would refuse the whole save (`NodeNotFoundError`). Only
+ * entries the live scene cannot place are dropped; a NEW placement that reuses
+ * the removed one's name keeps its own edits.
+ */
+function dropEditsUnderRemovedPlacements(
+  json: Record<string, unknown>,
+  edits: MaterialisedEdits,
+  resolver: BakeResolver,
+  removed: ReadonlySet<string>,
+): void {
+  if (removed.size === 0) return;
+  const resolvesLive = (nodePath: string): boolean =>
+    !!resolver.locate(nodePath) || !!resolver.livePlacementIdOf?.(nodePath);
+  for (const nodePath of Object.keys(edits.overlay.nodes)) {
+    if (!resolvesLive(nodePath) && pathUnderRemovedPlacement(json, nodePath, removed)) {
+      delete edits.overlay.nodes[nodePath];
+    }
+  }
+  edits.nodeTransforms = edits.nodeTransforms.filter(
+    (t) => resolvesLive(t.nodePath) || !pathUnderRemovedPlacement(json, t.nodePath, removed),
+  );
+}
+
 // ─── The bake ───────────────────────────────────────────────────────────
 
 /**
@@ -1372,7 +1643,16 @@ export async function bakeIntoGlb(
   resolver: BakeResolver,
   options: BakeOptions = {},
 ): Promise<BakeResult> {
+  // plan-769: a refused part move is reported per save attempt (see category 5).
+  clearNestedTransformRefusedProblems();
+  clearPlacementTransformOrphanedProblems();
   const chunks = parseGlbChunks(source);
+
+  // plan-769 Phase 7 (D23): placements of the base file the log removed. Only
+  // the ones the source still holds need work (absent = already the target
+  // state); edits under any of them leave with them before anything resolves.
+  const removedPlacements = presentRemovedPlacementIds(chunks.json, edits.removedPlacementIds);
+  dropEditsUnderRemovedPlacements(chunks.json, edits, resolver, removedPlacements);
 
   // Plan-921 — rv_extras overrides on LIVE planner placements: a placement
   // added THIS session has no composition frame and no base gltf node, so the
@@ -1393,7 +1673,7 @@ export async function bakeIntoGlb(
       }
       // plan-757 Phase 2 (4a): an edit INSIDE a live placement — `locate`
       // climbed to the placement root, which has no gltf node yet. It goes
-      // into that placement's `AssetOverrides.byNodeId`, exactly where the
+      // into that placement's `AssetOverrides.byAddress`, exactly where the
       // same edit lands for a placement the file already holds
       // (`applyRoutedOverrides`), and where `applyOverrides` reads it back.
       // An owner that is itself a nested reference (`locate` non-null, not
@@ -1403,31 +1683,13 @@ export async function bakeIntoGlb(
       if (!placementId) continue;
       const patch = placementPatches.get(placementId) ?? {};
       const overrides = (patch[RV_ASSET_OVERRIDES_KEY] ??= {}) as Record<string, unknown>;
-      const byNodeId = (overrides.byNodeId ??= {}) as Record<string, Record<string, Record<string, unknown>>>;
-      mergePatchInto(byNodeId[location.nodeId] ??= {}, edits.overlay.nodes[nodePath]);
+      const byAddress = (overrides.byAddress ??= {}) as Record<string, Record<string, Record<string, unknown>>>;
+      mergePatchInto(byAddress[locationAddress(location)] ??= {}, edits.overlay.nodes[nodePath]);
       placementPatches.set(placementId, patch);
       delete edits.overlay.nodes[nodePath];
     }
-    // The same routing for a moved node inside a live placement (4a, TRS):
-    // `AssetOverrides.trsByNodeId` on the placement, the sibling block
-    // `applyRoutedTransformOverrides` writes for an in-file owner.
-    const keptTransforms: typeof edits.nodeTransforms = [];
-    for (const entry of edits.nodeTransforms) {
-      const location = resolver.locate(entry.nodePath);
-      const placementId = location?.kind === 'referenced' && !resolver.locate(location.referenceNodePath)
-        ? resolver.livePlacementIdOf(location.referenceNodePath)
-        : null;
-      if (!placementId || location?.kind !== 'referenced') { keptTransforms.push(entry); continue; }
-      const patch = placementPatches.get(placementId) ?? {};
-      const overrides = (patch[RV_ASSET_OVERRIDES_KEY] ??= {}) as Record<string, unknown>;
-      const trsByNodeId = (overrides.trsByNodeId ??= {}) as Record<string, Record<string, number[]>>;
-      trsByNodeId[location.nodeId] = {
-        position: [entry.position[0], entry.position[1], entry.position[2]],
-        quaternion: [entry.quaternion[0], entry.quaternion[1], entry.quaternion[2], entry.quaternion[3]],
-      };
-      placementPatches.set(placementId, patch);
-    }
-    if (keptTransforms.length !== edits.nodeTransforms.length) edits.nodeTransforms = keptTransforms;
+    // A moved node inside a live placement is NOT routed (plan-769 F14): it stays in
+    // `nodeTransforms`, and category 5 refuses it by name (`nested-transform-refused`).
   }
 
   const counts = writeNodeLevel(chunks, edits, resolver, options);
@@ -1437,10 +1699,22 @@ export async function bakeIntoGlb(
   // re-save of an already-baked scene neither duplicates them nor drags the
   // whole file through the exporter for a transform change.
   const reconciled = reconcilePlacements(chunks.json, edits.placements, fallbackName, placementPatches);
-  const needsFullPath = reconciled.remaining.length > 0 || edits.addedNodes.length > 0;
+  // plan-769 Phase 7 (D23): moves of base-file placements — TRS only, in the JSON.
+  const baseline = patchBaselinePlacementTransforms(chunks.json, edits.baselinePlacementTransforms);
+  const warnings: string[] = [];
+  for (const id of baseline.orphaned) {
+    warnings.push(`Moved placement ${id} is not in the file any more — the move was not saved.`);
+    reportPlacementTransformOrphaned({ placementId: id });
+  }
+  const removedPaths = edits.removedNodes ?? [];
+  const needsFullPath = reconciled.remaining.length > 0 || edits.addedNodes.length > 0 || removedPaths.length > 0
+    || removedPlacements.size > 0;
 
   if (!needsFullPath) {
     const fileLevel = writeFileLevel(chunks.json, edits, options);
+    // plan-769 Phase 3b: ids, addresses and `idVersion` — the file is written ID-only.
+    const identity = stampJsonIdentity(chunks.json);
+    reportJsonIdentity(identity);
     const signatureDropped = dropSignature(chunks.json);
     assertNoSaveCycle(chunks.json, options.self);
     return {
@@ -1454,8 +1728,10 @@ export async function bakeIntoGlb(
       placements: reconciled.updated,
       placementsUpdated: reconciled.updated,
       addedNodes: 0,
+      removedNodes: 0,
+      placementsMoved: baseline.moved,
+      placementsRemoved: 0,
       transforms: counts.transforms,
-      referenceTransforms: counts.referenceTransforms,
       connections: edits.connections.length,
       connectionTypes: edits.connectionTypes.length,
       cameraWritten: fileLevel.cameraWritten,
@@ -1463,20 +1739,27 @@ export async function bakeIntoGlb(
       classificationWritten: fileLevel.classificationWritten,
       documentInfoWritten: fileLevel.documentInfoWritten,
       signatureDropped,
-      warnings: [],
+      warnings,
     };
   }
 
   // Structural: the node array grows, so the file is rebuilt. The node-level
   // categories are already in `chunks`, so the re-parse below sees them.
+  //
+  // plan-769 Phase 3b: ids + addresses are stamped HERE, on the source JSON, under the
+  // AUTHORED names: the re-parse below runs through the raw loader (sanitized, `_N`
+  // dedup names), so the authored index of the re-exported file would no longer find
+  // what the references say. The NodeIds ride through the re-parse as extras.
+  const sourceIdentity = stampJsonIdentity(chunks.json);
   const intermediate = rebuildGlbWithJson(chunks);
 
-  const [{ gltfLoader }, { objectToGlb, sceneMirroringLoad }, binaryResourcesModule] = await Promise.all([
+  const [{ gltfLoader }, { objectToGlb, sceneMirroringLoad }, binaryResourcesModule, decodeIdentityModule] = await Promise.all([
     import('../../engine/rv-glb-parse'),
     import('../../import/rv-import-object'),
     import('../../engine/rv-binary-resources'),
+    import('../../engine/rv-decode-identity'),
   ]);
-  // plan-498: FMU packages of the scene document's OWN `Fmu` nodes are glTF
+  // plan-498: FMU packages of the planner document's OWN `Fmu` nodes are glTF
   // bufferViews nothing in the node graph references — the exporter below
   // would drop them. They are taken from the SOURCE bytes here and appended
   // again after the export by the same writer the asset editor uses.
@@ -1501,10 +1784,53 @@ export async function bakeIntoGlb(
   // the output's scene extras below.
   const carriedSceneExtras = { ...(tree.userData as Record<string, unknown>) };
   tree.userData = {};
+  // plan-769 F2 (Inventur D4): the writer's re-parse is a decode like every other.
+  // Since Phase 3b every source node arrives WITH its `NodeId` (stamped on the source
+  // JSON above), so nothing is seeded here; the runtime keys are stripped before the
+  // export below and the re-exported JSON gets its own pass (added nodes, idVersion).
+  decodeIdentityModule.decodeIdentity(gltf as unknown as import('../../engine/rv-decode-identity').DecodedGltfLike, {
+    fileKey: 'scene-save', migrate: false,
+  });
 
-  const warnings: string[] = [];
+  // plan-769 Phase 7 (D23): base-file placements the log removed, dropped by
+  // `NodeId` — their own step, not `removedNodes`, whose eligibility rule is
+  // the path network's. A reference node carries no geometry of its own (the
+  // placed asset is fetched on load), so dropping it drops the placement.
+  // BEFORE the records below are added: an `addPlacement` with a removed id
+  // took that id out of the set in `materialise`, so nothing collides.
+  let placementsRemoved = 0;
+  if (removedPlacements.size > 0) {
+    const targets: Object3D[] = [];
+    tree.traverse((node) => {
+      const id = identityIdOf(node);
+      if (id && removedPlacements.has(id) && node !== tree) targets.push(node);
+    });
+    for (const node of targets) {
+      node.parent?.remove(node);
+      placementsRemoved++;
+    }
+  }
+
   for (const placement of reconciled.remaining) {
     tree.add(buildPlacementNode(placement, fallbackName, placementPatches.get(placement.id)));
+  }
+
+  // plan-628 8.7: authored removals BEFORE the added nodes (an added node may
+  // reuse a removed name). The eligibility rule is the core's — a subtree it does
+  // not admit stays in the file and is reported, never silently dropped.
+  let removedNodes = 0;
+  if (removedPaths.length > 0) {
+    const { isAuthoredSubtreeRemovable } = await import('../../engine/rv-scene-loader');
+    for (const removedPath of removedPaths) {
+      const target = findByScenePath(tree, removedPath);
+      if (!target || target === tree) continue; // already gone with an ancestor, or unknown
+      if (!isAuthoredSubtreeRemovable(target)) {
+        warnings.push(`Removed node ${removedPath} is not a path-network node — kept in the file.`);
+        continue;
+      }
+      target.parent?.remove(target);
+      removedNodes++;
+    }
   }
 
   const missingParents: string[] = [];
@@ -1512,15 +1838,32 @@ export async function bakeIntoGlb(
   for (const added of edits.addedNodes) {
     const parent = findByScenePath(tree, added.spec.parentPath);
     if (!parent) { missingParents.push(added.spec.parentPath); continue; }
-    parent.add(buildSpecNode(added.spec));
+    parent.add(buildSpecNode(added.spec, added.idMap?.node));
     addedNodes++;
   }
   if (missingParents.length > 0) throw new NodeNotFoundError(missingParents);
+
+  // plan-769 Phase 3b (the editor export's plan-765 F1 rule): the raw re-parse renamed
+  // the file's nodes (sanitized, `_N` dedup); every node of the SOURCE gets its authored
+  // name back before the export, so the file keeps the name space it was written in.
+  // AFTER the added nodes were attached — their parents are found by the runtime names.
+  const associations = (gltf as unknown as { parser?: { associations?: Map<unknown, { nodes?: number } | undefined> } })
+    .parser?.associations;
+  const sourceNodes = (chunks.json.nodes as GltfNode[] | undefined) ?? [];
+  if (associations) {
+    for (const [obj, ref] of associations) {
+      const o = obj as Object3D;
+      if (!o?.isObject3D || !ref || ref.nodes === undefined) continue;
+      const raw = sourceNodes[ref.nodes]?.name;
+      if (typeof raw === 'string' && raw !== o.name) o.name = raw;
+    }
+  }
 
   // Save is the exact inverse of load (plan-752 F4): `tree` IS the file's
   // scene, so it is exported as one — its name becomes the scene name and its
   // children become the file's nodes. Without this the exporter made `tree`
   // itself a node under an invented `AuxScene` and every save added a level.
+  decodeIdentityModule.stripSeededNodeIds(tree);
   let exported = await objectToGlb(sceneMirroringLoad(tree));
   const fmu = binaryResourcesModule.embedFmuBufferViews(
     exported,
@@ -1543,6 +1886,10 @@ export async function bakeIntoGlb(
     if (!(key in outSceneExtras)) outSceneExtras[key] = value;
   }
   const fileLevel = writeFileLevel(outChunks.json, edits, options);
+  // plan-769 Phase 3b: the nodes this bake added (placements, `addNode`) and `idVersion`;
+  // every source node already carries its id and its addresses (stamped above).
+  const outIdentity = stampJsonIdentity(outChunks.json);
+  reportJsonIdentity({ ...outIdentity, reminted: [...sourceIdentity.reminted, ...outIdentity.reminted] });
   const signatureDropped = dropSignature(outChunks.json);
   assertNoSaveCycle(outChunks.json, options.self);
 
@@ -1557,8 +1904,10 @@ export async function bakeIntoGlb(
     placements: edits.placements.length,
     placementsUpdated: reconciled.updated,
     addedNodes,
+    removedNodes,
+    placementsMoved: baseline.moved,
+    placementsRemoved,
     transforms: counts.transforms,
-    referenceTransforms: counts.referenceTransforms,
     connections: edits.connections.length,
     connectionTypes: edits.connectionTypes.length,
     cameraWritten: fileLevel.cameraWritten,
@@ -1573,11 +1922,13 @@ export async function bakeIntoGlb(
 // ─── Production wiring ──────────────────────────────────────────────────
 
 /** The nearest placement root strictly ABOVE `node` — a planner record's root or a nested one. */
-function placementRootAbove(node: Object3D): Object3D | null {
+function outermostOwnerAbove(node: Object3D): Object3D | null {
+  let owner: Object3D | null = null;
   for (let cur: Object3D | null = node.parent; cur; cur = cur.parent) {
-    if (isPlacementRoot(cur)) return cur;
+    const ref = getAssetReference(cur);
+    if (isPlacementRoot(cur) || (ref && ref.embedded !== true)) owner = cur;
   }
-  return null;
+  return owner;
 }
 
 /**
@@ -1611,45 +1962,33 @@ export function makeRegistryBakeResolver(
       const node = registry.getNode(nodePath);
       if (!node) return null;
 
-      const frame = frameOf.get(node);
-      if (frame) {
-        const nodeId = (node.userData?.realvirtual as Record<string, unknown> | undefined)
-          ?.[RV_NODE_ID_KEY];
-        if (typeof nodeId !== 'string' || !nodeId) return null;
-
-        const referenceNodePath = registry.getPathForNode(frame.referenceNode);
-        if (!referenceNodePath) return null;
-
-        return {
-          kind: 'referenced',
-          referenceNodePath,
-          nodeId,
-          sourceKey: frame.sourceKey,
-        };
-      }
-
-      // plan-757 Phase 2 (4a/4b): a node INSIDE a placement instance. The
-      // instance is a clone of the asset's template, NodeIds included, so the
-      // node is addressed exactly as a composed frame's: by the NodeId it has
-      // in the referenced file, on the reference node that owns it — the
-      // NEAREST placement root above it. A top-level placement root is a node
-      // of the file being written (or a live record the pre-pass routes); a
-      // NESTED placement root (`_layoutNestedOf`) resolves here again, one
-      // level up, so `splitOverlay` / `writeNodeLevel` see an owner that is
-      // not in this file and refuse by name (ReferencedFileWriteError /
-      // UnwritableTransformError, 4b) — never a silent drop.
-      const owner = placementRootAbove(node);
+      // plan-769 Phase 4b (F13): a node of referenced content — a composed frame or a
+      // placement instance, at ANY depth — belongs on the OUTERMOST reference node
+      // above it, the one the file being written holds (or a live record the
+      // pre-pass routes), addressed through the nested references in between
+      // (`<b>#<id>`). The plan-757 refusal of depth ≥ 2 for component values is gone;
+      // a MOVE in there stays refused (category 5, `nested-transform-refused`).
+      const owner = outermostOwnerAbove(node);
       if (!owner) return location ? { kind: 'root', index: location.index } : null;
-      const nodeId = getNodeId(node);
+      const nodeId = identityIdOf(node);
       if (!nodeId) return null;
+      const address = overrideAddressInReference(owner, node, identityIdOf);
+      if (!address) return null;
       const referenceNodePath = registry.getPathForNode(owner);
       if (!referenceNodePath) return null;
+      const ownerFrame = frames.find((f) => f.referenceNode === owner);
       return {
         kind: 'referenced',
         referenceNodePath,
         nodeId,
-        sourceKey: getAssetReference(owner)?.assetId ?? '',
+        sourceKey: ownerFrame?.sourceKey ?? getAssetReference(owner)?.assetId ?? frameOf.get(node)?.sourceKey ?? '',
+        address,
       };
+    },
+
+    overridePathMigrationAt(index: number): Readonly<Record<string, string>> | null {
+      const node = registry.getNodeAtGltfIndex(index);
+      return node ? overridePathMigrationOf(node) : null;
     },
 
     livePlacementIdOf(nodePath: string): string | null {

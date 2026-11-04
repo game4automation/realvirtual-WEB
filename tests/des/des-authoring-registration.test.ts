@@ -34,12 +34,12 @@ function makeHost(): BindContextHost {
 }
 
 describe('DES registration and planner authoring', () => {
-  it('registers every DES material-flow definition when DESPlugin loads', async () => {
+  it('registers every DES material-flow definition when the DES feature loads', async () => {
     vi.resetModules();
     const registry = await import('../../src/core/material-flow/registry');
     registry._resetMaterialFlowRegistry();
 
-    await import('@rv-private/plugins/des/des-plugin');
+    await import('../../src/features/des.body');
 
     for (const type of MATERIAL_FLOW_TYPES) {
       expect(registry.getMaterialFlow(type), `${type} is registered`).toBeDefined();
@@ -51,15 +51,15 @@ describe('DES registration and planner authoring', () => {
 
   it('round-trips virtual catalog nodes and binds the authored DES components', async () => {
     vi.resetModules();
-    await import('@rv-private/plugins/des/des-plugin');
-    const { DESHMIPlugin } = await import('@rv-private/plugins/des/hmi/des-hmi-plugin');
+    await import('../../src/features/des.body');
+    const { DESHMIPlugin } = await import('@rv/plugins/des/hmi/des-hmi-plugin');
     const { LayoutStore, normalizeCatalogEntry } = await import(
       '../../src/plugins/layout-planner/rv-layout-store'
     );
     const { buildVirtualNode } = await import('../../src/plugins/layout-planner/ghost-manager');
     const { pathFromNode } = await import('../../src/core/engine/rv-path');
-    const { DESRunner } = await import('@rv-private/plugins/des/des-runner');
-    const { bindSceneToRunner } = await import('@rv-private/plugins/des/des-scene-binding');
+    const { DESRunner } = await import('@rv/plugins/des/des-runner');
+    const { bindSceneToRunner } = await import('@rv/plugins/des/des-scene-binding');
 
     const store = new LayoutStore();
     // The catalog registers only while the DES mode is ACTIVE — it no longer

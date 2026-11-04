@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage, removeLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * rv-recording-hmi — the React HMI inside a frame-by-frame recording (plan-556).
  *
@@ -11,7 +13,8 @@
  *     UNDERLAY (`bitmaprenderer` canvas above the hidden `#rv-viewport`, below `#react-root`),
  *     so a page screenshot never depends on the WebGL compositor ({@link setUnderlay});
  *  2. the HMI settled on the frame's sim state ({@link captureHmiSettle}): recording ticks
- *     (`flushNow` — every wall-clock read-out timer is REPLACED while recording) → ONE commit
+ *     (`flushNow` — every wall-clock read-out timer is REPLACED while recording) → requested
+ *     CONNECT panel committed → ONE commit
  *     barrier (a frame counter in a store; `RecordingFrameProbe` in App.tsx acknowledges after
  *     React committed it) → every Web Animation frozen at the recording clock (`playbackRate = 0`
  *     + `currentTime`, never `pause()` — Playwright restarts paused infinite animations) → one rAF;
@@ -24,6 +27,7 @@
  */
 
 import { activateContext, deactivateContext } from '../hmi/ui-context-store';
+import { markConnectPanelPending, whenConnectPanelCommitted } from '../hmi/connect-panel-readiness';
 import { getUIZoom, setUIZoom } from '../hmi/visual-settings-store';
 import { flushNow, setRecordingTicks } from '../../hooks/shared-ui-ticker';
 
@@ -67,9 +71,9 @@ export function isRecordingOverlayAllowed(pluginId: string | undefined, isOperat
 const RECORDING_CSS = [
   // Full-bleed viewport: the composite is the browser viewport (DSF 1), the HMI lays out on it.
   '#rv-viewport{left:0 !important;top:0 !important;right:0 !important;bottom:0 !important;width:100vw !important;height:100vh !important}',
-  // Outside #react-root: ViewCube, the AGPL watermark (the recording shows the plant, the
+  // Outside #react-root: ViewCube, the AGPL watermark / demo notice (the recording shows the plant, the
   // watermark stays on every interactive page), anything marked as excluded.
-  `#rv-watermark,.rv-orientation-gizmo,[${RECORDING_EXCLUDE_ATTR}]{visibility:hidden !important}`,
+  `#rv-watermark,#rv-demo-notice,.rv-orientation-gizmo,[${RECORDING_EXCLUDE_ATTR}]{visibility:hidden !important}`,
   `html[${GRAB_ATTR}] [data-rv-recording-grab-exclude]{visibility:hidden !important}`,
   // Cinematic preview canvas: opacity, not display:none (its WebGPU presentation keeps running).
   '[data-rv-cinematic-preview]{opacity:0 !important}',
@@ -233,7 +237,8 @@ export interface HmiSettleResult {
 
 /**
  * Settles the HMI on the current sim state for one video frame (F4): recording clock = `simTimeMs`,
- * ticker flush, ONE commit barrier, animation freeze after the commit, one animation frame. Every
+ * ticker flush, requested CONNECT panel commit, ONE frame commit barrier, animation freeze,
+ * one animation frame. Every
  * step is bounded by `timeoutMs` and abortable.
  */
 export async function captureHmiSettle(
@@ -244,6 +249,7 @@ export async function captureHmiSettle(
   const timeoutMs = o.timeoutMs ?? RECORDING_SETTLE_TIMEOUT_MS;
   clockMs = simTimeMs;
   const flushed = flushNow();
+  await whenConnectPanelCommitted({ timeoutMs, signal: o.signal });
   const ackMs = await commitBarrier(timeoutMs, o.signal);
   const n = freezeAnimations(simTimeMs);
   if (o.signal?.aborted) throw new Error('Recording aborted.');
@@ -330,13 +336,50 @@ export function recordingPanelIds(host: RecordingHmiHost): { operator: string[];
   return { operator: [...operator].sort(), side: [...SUPPORTED_SIDE_PANELS] };
 }
 
+/**
+ * A panel a plugin opens for a recording: `--hmi-open <id>[:<arg>]` (e.g. `plc:Station04`). The
+ * plugin keeps its read-outs on recording ticks (`subscribePoll` / `subscribeTick`) and its overlay
+ * entry allow-listed ({@link allowRecordingOverlay}).
+ */
+export interface RecordingPanelOpener {
+  /** Refusal for `arg` (naming what is valid), or null. No side effects. */
+  validate?(arg: string | undefined): string | null;
+  /** Opens the panel for the session (called after a successful validate). */
+  open(arg: string | undefined): void;
+  /** Closes what `open` opened (session end). */
+  close?(): void;
+}
+
+const panelOpeners = new Map<string, RecordingPanelOpener>();
+const openedPluginPanels: RecordingPanelOpener[] = [];
+
+/** Registers a plugin panel for `--hmi-open <id>[:<arg>]`. Returns the unregister function. */
+export function registerRecordingPanel(id: string, opener: RecordingPanelOpener): () => void {
+  panelOpeners.set(id, opener);
+  return () => { if (panelOpeners.get(id) === opener) panelOpeners.delete(id); };
+}
+
+/** `plc:Station04` → `{ id: 'plc', arg: 'Station04' }`; a bare id has no arg. */
+function splitPanelSpec(spec: string): { id: string; arg: string | undefined } {
+  const i = spec.indexOf(':');
+  return i < 0 ? { id: spec, arg: undefined } : { id: spec.slice(0, i), arg: spec.slice(i + 1) };
+}
+
 /** Refusal of `--hmi-open` ids that are not supported (naming the supported list), or null. */
 export function validateHmiOpen(host: RecordingHmiHost, ids: readonly string[]): string | null {
   const { operator, side } = recordingPanelIds(host);
   const ok = new Set([...operator, ...side]);
-  const bad = ids.filter((id) => !ok.has(id));
+  const bad: string[] = [];
+  for (const spec of ids) {
+    if (ok.has(spec)) continue;
+    const { id, arg } = splitPanelSpec(spec);
+    const opener = panelOpeners.get(id);
+    if (!opener) { bad.push(spec); continue; }
+    const why = opener.validate?.(arg) ?? null;
+    if (why) return `--hmi-open ${spec}: ${why}`;
+  }
   if (bad.length === 0) return null;
-  const list = [...operator, ...side];
+  const list = [...operator, ...side, ...[...panelOpeners.keys()].sort()];
   return `--hmi-open: unsupported panel id${bad.length > 1 ? 's' : ''} ${bad.map((b) => `"${b}"`).join(', ')} — supported: ${list.length ? list.join(', ') : '(none in this model)'}.`;
 }
 
@@ -347,16 +390,16 @@ const openedSidePanels: string[] = [];
 
 function setStorage(key: string, value: string): void {
   try {
-    if (!restoredStorage.has(key)) restoredStorage.set(key, localStorage.getItem(key));
-    localStorage.setItem(key, value);
+    if (!restoredStorage.has(key)) restoredStorage.set(key, getLocalStorage()!.getItem(key));
+    writeLocalStorage(key, value);
   } catch { /* storage disabled — the panel keeps its state */ }
 }
 
 function restoreStorage(): void {
   for (const [key, value] of restoredStorage) {
     try {
-      if (value === null) localStorage.removeItem(key);
-      else localStorage.setItem(key, value);
+      if (value === null) removeLocalStorage(key);
+      else writeLocalStorage(key, value);
     } catch { /* storage disabled */ }
   }
   restoredStorage.clear();
@@ -396,9 +439,20 @@ export function enterRecordingHmi(host: RecordingHmiHost, o: EnterRecordingHmiOp
   }
   for (const id of o.open ?? []) {
     if (operator.includes(id)) setStorage(`${COLLAPSED_PREFIX}${id}`, '0');
-    else if (SUPPORTED_SIDE_PANELS.includes(id) && lpm && lpm.getActive('left') !== id && lpm.getActive('right') !== id) {
-      lpm.open(id, o.sidePanelWidth ?? 420);
-      openedSidePanels.push(id);
+    else if (SUPPORTED_SIDE_PANELS.includes(id)) {
+      if (lpm && lpm.getActive('left') !== id && lpm.getActive('right') !== id) {
+        lpm.open(id, o.sidePanelWidth ?? 420);
+        // The host's own pending mark only follows React's commit; a capture right after entering must already wait.
+        if (id === 'connect') markConnectPanelPending();
+        openedSidePanels.push(id);
+      }
+    } else {
+      const spec = splitPanelSpec(id);
+      const opener = panelOpeners.get(spec.id);
+      if (opener) {
+        opener.open(spec.arg);
+        openedPluginPanels.push(opener);
+      }
     }
   }
   if (!active) {
@@ -429,6 +483,9 @@ export function exitRecordingHmi(host?: RecordingHmiHost | null): void {
   restoreStorage();
   const lpm = host?.leftPanelManager;
   for (const id of openedSidePanels.splice(0)) lpm?.close(id);
+  for (const opener of openedPluginPanels.splice(0)) {
+    try { opener.close?.(); } catch { /* a failing plugin must not block the restore */ }
+  }
   if (!active) return;
   active = false;
   generation++;

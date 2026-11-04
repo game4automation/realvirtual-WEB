@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readSessionStorage, writeSessionStorage } from '../rv-safe-storage';
+
 /**
  * StorageNoticeBanner — the one place the storage layer gets to speak
  * (plan-397 phase 6).
@@ -55,6 +57,11 @@ interface Entry {
    * drafts — the same rule the autosave follows.
    */
   staleDraft?: { documentId: string; canRestore: boolean };
+  /**
+   * The resumed-draft decision: Discard (drop the draft, reload the file) /
+   * Keep (close the notice), bound to the notice's `documentId`.
+   */
+  draftRestored?: { documentId: string };
 }
 
 const PERSIST_DISMISS_KEY = 'rv-storage-persist-dismissed';
@@ -71,7 +78,7 @@ export function StorageNoticeBanner() {
 
   useEffect(() => {
     try {
-      if (sessionStorage.getItem(PERSIST_DISMISS_KEY) === '1') setDismissed(true);
+      if (readSessionStorage(PERSIST_DISMISS_KEY) === '1') setDismissed(true);
     } catch { /* private mode: best-effort */ }
   }, []);
 
@@ -142,9 +149,25 @@ export function StorageNoticeBanner() {
     ).catch((e: unknown) => console.error('[storage-notice] stale draft action failed:', e));
   };
 
+  /**
+   * Discard or keep the local changes a resumed draft brought back. Keep only
+   * withdraws the notice — globally, so a remount does not bring it back.
+   * Discard acts only while that document is still the open one.
+   */
+  const handleDraftRestored = (verb: 'discard' | 'keep') => {
+    const id = sync?.id;
+    const documentId = entry.draftRestored?.documentId;
+    if (id) clearSceneSyncNotice(id);
+    if (verb === 'keep' || !documentId) return;
+    const store = getSceneStore();
+    if (!store) return;
+    void store.discardRestoredDraft(documentId)
+      .catch((e: unknown) => console.error('[storage-notice] discarding the restored draft failed:', e));
+  };
+
   const handleDismiss = () => {
     if (entry.key === 'persist') {
-      try { sessionStorage.setItem(PERSIST_DISMISS_KEY, '1'); } catch { /* private mode */ }
+      writeSessionStorage(PERSIST_DISMISS_KEY, '1');
       setDismissed(true);
       return;
     }
@@ -182,7 +205,7 @@ export function StorageNoticeBanner() {
         py: 1,
         bgcolor: bg,
         border: `1px solid ${fg}`,
-        borderRadius: 2,
+        borderRadius: 1,
         boxShadow: '0 4px 16px rgba(0,0,0,0.4)',
         backdropFilter: 'blur(calc(8px * var(--rv-ui-blur-scale, 1)))',
       }}>
@@ -234,6 +257,26 @@ export function StorageNoticeBanner() {
             Discard
           </Button>
         )}
+        {entry.draftRestored && (
+          <Button
+            size="small"
+            variant="outlined"
+            onClick={() => handleDraftRestored('discard')}
+            sx={BANNER_BUTTON_SX}
+          >
+            Discard
+          </Button>
+        )}
+        {entry.draftRestored && (
+          <Button
+            size="small"
+            variant="outlined"
+            onClick={() => handleDraftRestored('keep')}
+            sx={BANNER_BUTTON_SX}
+          >
+            Keep
+          </Button>
+        )}
         <IconButton
           size="small"
           onClick={handleDismiss}
@@ -277,6 +320,9 @@ const SYNC_RANK: Record<SceneSyncNotice['kind'], number> = {
   // plan-546 — work at stake: unsaved changes are set aside until the user
   // decides. Same level as a failed autosave, above every hint below.
   'stale-draft': 1,
+  // Local changes the file will never get (read-only project): the user has to
+  // know the document is not what the file says. Below the set-aside notice.
+  'draft-restored': 1.5,
   // Below the "your work is not being kept" notices and above the hints: a
   // broken link is a dead end, not a threat to anything the user is holding.
   'missing-document': 2,
@@ -338,6 +384,15 @@ function pickEntry(
         documentId: sync.documentId,
         canRestore: getSceneStore()?.canWriteDrafts() ?? false,
       },
+    };
+  }
+  if (sync?.kind === 'draft-restored') {
+    return {
+      key: 'draft-restored',
+      severity: 'warning',
+      message: sync.message,
+      action: 'This project is read-only, so they cannot be saved into it. Discard them to see the file.',
+      draftRestored: { documentId: sync.documentId },
     };
   }
   if (sync?.kind === 'missing-document') {

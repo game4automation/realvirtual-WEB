@@ -36,6 +36,9 @@
  * is one tree, and the catalogs are roots of it rather than a second panel. What
  * the group still decides is the one thing it always decided first — whether an
  * open lands on the project list or inside the open project.
+ *
+ * `'scenes'` / `'models'` are persisted deep-link values — do not rename
+ * (plan-777 P1).
  */
 export type ProjectsRailGroup =
   | { kind: 'projects' }
@@ -78,6 +81,24 @@ export type ProjectsSelection =
   | { kind: 'asset'; providerId: string; sourceId: string; assetId: string };
 
 /**
+ * The document a `documentPath` selection describes (plan-777 F3).
+ *
+ * A bundled manifest declares its paths URL-style (`/models/x.glb`) while the
+ * tree hands out paths without the leading slash, so the comparison strips it
+ * on BOTH sides — for this lookup only; every other `documentByPath` consumer
+ * keeps the raw keys. A foreign row's `https://…` path has no leading slash and
+ * matches verbatim. This replaced the detail pane's detour through the store's
+ * `models` view, which was a place filter over this same list.
+ */
+export function documentForSelectedPath<D extends { path: string }>(
+  documents: readonly D[],
+  path: string,
+): D | undefined {
+  const wanted = path.replace(/^\/+/, '');
+  return documents.find(d => d.path.replace(/^\/+/, '') === wanted);
+}
+
+/**
  * Which of the two screens is showing.
  *
  * `projects` is the list (or the "no workspace yet" empty state); `project` is
@@ -110,6 +131,8 @@ export interface ProjectsDashboardSnapshot {
    * `null` when no open-in-place is running.
    */
   opening: string | null;
+  /** Bumped by {@link openAddLibraryDialog}; the host opens the dialog per increment. */
+  addLibraryRequest: number;
 }
 
 const NONE: ProjectsSelection = { kind: 'none' };
@@ -125,6 +148,7 @@ let _snapshot: ProjectsDashboardSnapshot = {
   chip: null,
   tag: null,
   opening: null,
+  addLibraryRequest: 0,
 };
 
 const _listeners = new Set<() => void>();
@@ -177,6 +201,19 @@ export function openProjectsDashboard(group?: ProjectsRailGroup): void {
       ? { view: group.kind === 'projects' ? 'projects' : 'project', group }
       : first ? { view: 'project' } : {}),
   });
+}
+
+/**
+ * Open the dashboard WITH the Add-library dialog showing (plan-655 F2).
+ *
+ * The planner's "Manage libraries…" used to land on the dashboard only, and the
+ * dialog that actually attaches a library sat behind a small "+" next to the
+ * Libraries heading that nobody found. The counter is a request, not a state:
+ * the host opens the dialog once per increment, and closing it needs no reset.
+ */
+export function openAddLibraryDialog(): void {
+  openProjectsDashboard({ kind: 'globalLibraries' });
+  publish({ addLibraryRequest: _snapshot.addLibraryRequest + 1 });
 }
 
 /**
@@ -247,7 +284,7 @@ export function setProjectsTag(tag: string | null): void {
 export function resetProjectsDashboardForTests(): void {
   _snapshot = {
     open: false, view: DEFAULT_VIEW, group: DEFAULT_GROUP, selection: NONE,
-    search: '', chip: null, tag: null, opening: null,
+    search: '', chip: null, tag: null, opening: null, addLibraryRequest: 0,
   };
   _everOpened = false;
   _listeners.clear();

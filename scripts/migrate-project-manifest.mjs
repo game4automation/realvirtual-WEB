@@ -171,7 +171,7 @@ export function migrateManifest(manifest, context = {}) {
   if (typeof next.canonicalName !== 'string' || !next.canonicalName.trim()) {
     // From the FOLDER, not the display name: the folder name is what the deploy
     // pipeline and the CONNECT bundle id already use, so deriving from the
-    // display name ("Toray OEE Showcase") would mint a third spelling.
+    // display name ("Acme OEE Showcase") would mint a third spelling.
     set('canonicalName', canonicalNameOf(folderName || next.name), 'derived from the folder name');
   }
   if (next.kind === undefined) {

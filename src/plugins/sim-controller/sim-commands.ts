@@ -27,7 +27,9 @@
  * (`mcp-bridge` / `'mcp'`, unchanged from the tool), a click as the HMI.
  */
 
+import { runLeaseBlocker } from '../../core/hmi/rv-run-lease';
 import type { Object3D } from 'three';
+import { connectionModeLabel } from '../../core/engine/rv-connection-mode';
 import { ArrowBack, ArrowForward, Stop, SwapVert } from '@mui/icons-material';
 import type { RVViewer } from '../../core/rv-viewer';
 import type { RVDrive } from '../../core/engine/rv-drive';
@@ -223,6 +225,19 @@ const playPause: CommandImpl<PlayPauseArgs, Record<string, unknown>> = {
     const userPaused = v.simulationPauseReasons.includes(USER_PAUSE_REASON);
     const toggled = !present(a?.paused);
     const next = toggled ? !userPaused : a.paused === true;
+    // DES: Play (or the toggle) after "Run finished" CONTINUES the run - the clock runs on.
+    let continued = false;
+    if (!(present(a?.paused) && a.paused === true)) {
+      const ctl = v.simulationKernel?.desControl?.() ?? null;
+      if (ctl?.runComplete && ctl.continueRun) continued = ctl.continueRun();
+    }
+    if (continued) {
+      v.setSimulationPaused(USER_PAUSE_REASON, false);
+      return {
+        wasPaused: userPaused, toggled, paused: v.isSimulationPaused, userPaused: false,
+        reasons: [...v.simulationPauseReasons], continued: true,
+      };
+    }
     v.setSimulationPaused(USER_PAUSE_REASON, next);
     return {
       wasPaused: userPaused,
@@ -240,6 +255,8 @@ const reset: CommandImpl<Record<string, never>, Record<string, unknown>> = {
     const tm = ctx.viewer.transportManager;
     const before = { mus: tm?.mus.length ?? 0, totalSpawned: tm?.totalSpawned ?? 0 };
     ctx.viewer.resetSimulation();
+    // DES: Reset never autostarts - the run waits at time 0, paused, until Play (Thomas 2026-10-27).
+    if (ctx.viewer.simulationKernel?.desControl?.()) ctx.viewer.setSimulationPaused(USER_PAUSE_REASON, true);
     const tm2 = ctx.viewer.transportManager;
     return { before, after: { mus: tm2?.mus.length ?? 0, totalSpawned: tm2?.totalSpawned ?? 0 } };
   },
@@ -366,11 +383,25 @@ const SPECS: readonly Spec[] = [
 ];
 
 /** Every runtime command id (preload, tests). */
-export const SIM_COMMAND_IDS: readonly string[] = SPECS.map((s) => s.id);
+export const SIM_COMMAND_IDS: readonly string[] = [...SPECS.map((s) => s.id), 'sim.setConnectionMode', 'sim.connectionMode'];
 
 /** Build the runtime descriptors (testable seam: no registry side effect). */
 export function createSimCommandDescriptors(): CommandDescriptor<never, unknown>[] {
-  return SPECS.map((s): CommandDescriptor<never, unknown> => ({
+  return [
+    {
+      id: 'drive.list', label: 'drive.list', readOnly: true, scope: 'none',
+      available: true, unavailableReason: 'Not available',
+      argsSchema: {},
+      impl: async () => {
+        const { McpRuntimeTools } = await import('../mcp-bridge/rv-mcp-runtime-tools');
+        const impl: CommandImpl<{}, unknown> = {
+          enabled: () => true,
+          run: async (ctx) => JSON.parse(await new McpRuntimeTools(() => ctx.viewer).queryDriveList()),
+        };
+        return impl;
+      },
+    } as CommandDescriptor<never, unknown>,
+    ...SPECS.map((s): CommandDescriptor<never, unknown> => ({
     id: s.id,
     label: s.label,
     readOnly: false,
@@ -381,9 +412,14 @@ export function createSimCommandDescriptors(): CommandDescriptor<never, unknown>
     buttonKey: s.buttonKey,
     mcp: s.mcp,
     argsSchema: s.argsSchema,
-    eagerImpl: s.impl,
-    impl: () => Promise.resolve(s.impl),
-  }));
+    eagerImpl: guardedSimImpl(s.impl),
+    impl: () => Promise.resolve(guardedSimImpl(s.impl)),
+  })), ...CONNECTION_MODE_SPECS.map((s): CommandDescriptor<never, unknown> => ({
+    id: s.id, label: s.label, readOnly: s.readOnly, scope: 'none', available: true,
+    unavailableReason: 'Not available', argsSchema: s.argsSchema,
+    eagerImpl: s.readOnly ? s.impl : guardedSimImpl(s.impl),
+    impl: () => Promise.resolve(s.readOnly ? s.impl : guardedSimImpl(s.impl)),
+  }))];
 }
 
 const registered = new WeakSet<CommandRegistry>();
@@ -469,4 +505,43 @@ export function registerRuntimeInspectorActions(): void {
   );
   componentActionRegistry.register('PLCOutputBool', [boolToggle]);
   componentActionRegistry.register('PLCInputBool', [boolToggle]);
+}
+
+export const simSetConnectionMode: CommandImpl<{ mode?: string }> = {
+  enabled: ({ viewer }) => viewer?.connectionMode ? true : { reason: 'No viewer' },
+  run: async ({ viewer }, { mode }) => {
+    const controller = viewer?.connectionMode;
+    if (!controller) return { error: 'No viewer' };
+    if (mode === undefined || mode === null || mode === '') {
+      const s = controller.state;
+      return { ...s, label: connectionModeLabel(s) };
+    }
+    const wanted = String(mode).trim().toLowerCase();
+    if (wanted !== 'simulation' && wanted !== 'plc') {
+      return { error: `Unknown mode "${mode}" — use Simulation or PLC` };
+    }
+    const r = controller.setMode(wanted === 'plc' ? 'PLC' : 'Simulation');
+    if ('error' in r) return { ...r, ...controller.state };
+    return { ...r, label: connectionModeLabel(r) };
+  },
+};
+
+export const simConnectionMode: CommandImpl = {
+  enabled: ({ viewer }) => viewer?.connectionMode ? true : { reason: 'No viewer' },
+  run: ({ viewer }) => {
+    const controller = viewer?.connectionMode;
+    if (!controller) return { error: 'No viewer' };
+    const s = controller.state;
+    return { ...s, label: connectionModeLabel(s) };
+  },
+};
+
+const CONNECTION_MODE_SPECS = [
+  { id: 'sim.setConnectionMode', label: 'Set connection mode', readOnly: false, argsSchema: { mode: 'string' } as Readonly<Record<string, CommandArgType>>, impl: simSetConnectionMode as CommandImpl<never, unknown> },
+  { id: 'sim.connectionMode', label: 'Connection mode', readOnly: true, argsSchema: {} as Readonly<Record<string, CommandArgType>>, impl: simConnectionMode as CommandImpl<never, unknown> },
+];
+
+/** Apply the lease check before argument validation for every simulation mutation. */
+function guardedSimImpl(impl: CommandImpl<never, unknown>): CommandImpl<never, unknown> {
+  return { ...impl, enabled: (ctx, args) => runLeaseBlocker() ?? impl.enabled(ctx, args) };
 }

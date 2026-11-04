@@ -19,7 +19,7 @@
  * therefore uses three's own `MeshDepthMaterial` with `RGBADepthPacking`
  * instead, and this material supplies only the normals.
  *
- * BATCHING CONTRACT (doc-render-picking §1.6 point 5 — do not break this).
+ * BATCHING CONTRACT (doc-bake-picking-internals §1.6 point 5 — do not break this).
  * The material is applied through `scene.overrideMaterial`, so it renders EVERY
  * object including the BatchedMesh arenas of the batched render pipeline. The
  * renderer injects `#define USE_BATCHING` and binds the batching textures per

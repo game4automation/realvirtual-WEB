@@ -75,6 +75,7 @@ export interface DragNumberFieldProps {
   inputWidth?: number;
   /** Error state — the draft can never become a number (e.g. "1.000,5"). */
   error?: boolean;
+  placeholder?: string;
 }
 
 export function DragNumberField({
@@ -95,6 +96,7 @@ export function DragNumberField({
   label,
   inputWidth = 92,
   error = false,
+  placeholder,
 }: DragNumberFieldProps) {
   const inline = label != null;
   const dragRef = useRef<{ startX: number; startValue: number } | null>(null);
@@ -227,6 +229,7 @@ export function DragNumberField({
         </Typography>
       )}
       <TextField
+        placeholder={placeholder}
         size="small"
         type="text"
         value={value}

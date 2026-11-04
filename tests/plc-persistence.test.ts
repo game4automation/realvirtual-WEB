@@ -19,6 +19,12 @@
  * and reports a distinguishable outcome ('existing' | 'created' |
  * 'live-only'); `persistPlcCodeEnsured` retries the ensure when the target
  * node is missing so autosave ops never silently target a non-existent path.
+ *
+ * Deploy persistence: `persistDeployedPlcCode` (behind the public
+ * `PlcPersistence` seam that `plc.deploy` awaits) writes the deployed source
+ * into PLCProgram.Code of the right node — created when the scene has none —
+ * in the scene or the open asset document, reads it back, and reports every
+ * failure instead of claiming success. `persistPlcCode` awaits its op.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -39,12 +45,18 @@ import {
 import {
   ensurePlcProgramNode,
   findPlcProgramNode,
+  findPlcProgramNodes,
+  persistDeployedPlcCode,
+  persistPlcCode,
   persistPlcCodeEnsured,
   readPlcProgramData,
   PLC_TEMPLATE_PROGRAM,
+  type PlcAssetDocLike,
+  type PlcProgramResolver,
   type PlcSceneStoreLike,
   type PlcViewerLike,
 } from '@rv-private/plugins/plc/plc-program-node';
+import type { PlcProgramInfo } from '../src/core/plc-control';
 
 const NODE = 'Cell/PLC';
 
@@ -308,5 +320,195 @@ describe('persistPlcCodeEnsured', () => {
     const result = await persistPlcCodeEnsured(f.viewer, 'Cell/PLC', 'SAME', f.store);
     expect(result.ok).toBe(true);
     expect(f.ops).toHaveLength(0);
+  });
+});
+
+// ─── persistPlcCode — awaited, failures propagate ────────────────────────────
+
+describe('persistPlcCode', () => {
+  it('awaits the op and rejects when the store refuses it', async () => {
+    const f = makeEnsureFixture();
+    await ensurePlcProgramNode(f.viewer, f.store);
+    const refusing: PlcSceneStoreLike = { applyOp: () => Promise.reject(new Error('refused')) };
+    await expect(persistPlcCode(f.viewer, 'Cell/PLC', 'NEW', refusing)).rejects.toThrow('refused');
+    // …and the editor's guard turns it into a visible ok=false.
+    expect(await persistPlcCodeEnsured(f.viewer, 'Cell/PLC', 'NEW', refusing)).toEqual({ ok: false, nodePath: null });
+  });
+
+  it("reports 'no-store' / 'unchanged' instead of pretending to write", async () => {
+    const f = makeEnsureFixture();
+    f.created.userData.realvirtual = { PLCProgram: { Code: 'SAME' } };
+    await ensurePlcProgramNode(f.viewer, f.store);
+    expect(await persistPlcCode(f.viewer, 'Cell/PLC', 'SAME', f.store)).toBe('unchanged');
+    expect(await persistPlcCode(f.viewer, 'Cell/PLC', 'OTHER', null)).toBe('no-store');
+  });
+});
+
+// ─── persistDeployedPlcCode — plc.deploy persistence ─────────────────────────
+
+/**
+ * A scene whose store EXECUTES the ops like the SceneStore does: addNode
+ * creates + registers the node with the spec's components, setField writes
+ * userData. Persisted code is then read straight from the node data — the
+ * PLC editor is never involved.
+ */
+function makeLiveScene(programs: Array<{ name: string; code: string }> = []) {
+  const root = new Object3D();
+  root.name = 'Scene';
+  const cell = new Object3D();
+  cell.name = 'Cell';
+  root.add(cell);
+  const nodes = new Map<string, Object3D>([['Cell', cell]]);
+  for (const p of programs) {
+    const n = new Object3D();
+    n.name = p.name;
+    n.userData.realvirtual = { PLCProgram: { Name: p.name, Code: p.code } };
+    cell.add(n);
+    nodes.set(`Cell/${p.name}`, n);
+  }
+  const ops: RvScenePrimitiveOp[] = [];
+  const store: PlcSceneStoreLike = {
+    applyOp: async (op) => {
+      ops.push(op);
+      if (op.kind === 'addNode') {
+        const n = new Object3D();
+        n.name = op.spec.name;
+        n.userData.realvirtual = structuredClone(op.spec.components);
+        nodes.get(op.spec.parentPath)!.add(n);
+        nodes.set(op.nodePath, n);
+      } else if (op.kind === 'setField') {
+        const rv = nodes.get(op.nodePath)!.userData.realvirtual as Record<string, Record<string, unknown>>;
+        rv[op.componentType][op.fieldName] = op.value;
+      }
+    },
+  };
+  const viewer: PlcViewerLike = {
+    scene: root,
+    registry: {
+      getPathForNode: (n) => [...nodes].find(([, v]) => v === n)?.[0] ?? null,
+      getNode: (path) => nodes.get(path) ?? null,
+    },
+  };
+  return { root, nodes, ops, store, viewer };
+}
+
+function resolver(list: Array<Pick<PlcProgramInfo, 'path' | 'name' | 'selected'>>): PlcProgramResolver {
+  const infos = list.map((p, i) => ({ ...p, order: i, state: 'running' as const, scanTimeMs: 0, lastError: null }));
+  return {
+    programs: () => infos,
+    pathOf: (n) => infos.find((p) => p.path === n || p.name.toLowerCase() === n.toLowerCase())?.path ?? null,
+  };
+}
+
+const DEPLOYED = 'PROGRAM Main\nVAR_EXTERNAL Q : BOOL; END_VAR\n  Q := TRUE;\nEND_PROGRAM\n';
+
+describe('persistDeployedPlcCode', () => {
+  it('creates the PLC node for a live-only program and persists the deployed code (survives a reload)', async () => {
+    const s = makeLiveScene();
+    const result = await persistDeployedPlcCode(
+      s.viewer, resolver([{ path: '', name: 'Main', selected: true }]), DEPLOYED, undefined, { scene: s.store });
+
+    expect(result).toEqual({ persisted: true, document: 'scene-doc', nodePath: 'Cell/PLC', created: true });
+    expect(s.ops.map((o) => o.kind)).toEqual(['addNode', 'setField']);
+    // Reload = rediscovery from node data: the deployed code is what a fresh load sees.
+    expect(findPlcProgramNodes(s.root).map((h) => [h.path, h.code])).toEqual([['Cell/PLC', DEPLOYED]]);
+    const setField = s.ops[1] as SetFieldOp;
+    expect(setField.prev).toBe(PLC_TEMPLATE_PROGRAM); // undo goes back to the template
+  });
+
+  it('writes a NAMED program into its own node, leaving the other programs alone', async () => {
+    const s = makeLiveScene([{ name: 'Infeed', code: 'A' }, { name: 'Outfeed', code: 'B' }]);
+    const programs = resolver([
+      { path: 'Cell/Infeed', name: 'Infeed', selected: true },
+      { path: 'Cell/Outfeed', name: 'Outfeed', selected: false },
+    ]);
+    const result = await persistDeployedPlcCode(s.viewer, programs, DEPLOYED, 'outfeed', { scene: s.store });
+
+    expect(result).toEqual({ persisted: true, document: 'scene-doc', nodePath: 'Cell/Outfeed' });
+    expect(Object.fromEntries(findPlcProgramNodes(s.root).map((h) => [h.name, h.code])))
+      .toEqual({ Infeed: 'A', Outfeed: DEPLOYED });
+    expect(s.ops).toHaveLength(1); // node existed — one setField, no addNode
+
+    // Without a program name the SELECTED program is the target.
+    await persistDeployedPlcCode(s.viewer, programs, 'SEL', undefined, { scene: s.store });
+    expect(findPlcProgramNodes(s.root).find((h) => h.name === 'Infeed')!.code).toBe('SEL');
+  });
+
+  it('an explicit target is never re-resolved against the current selection', async () => {
+    const s = makeLiveScene([{ name: 'A', code: 'A0' }, { name: 'B', code: 'B0' }]);
+    // B is selected by now, but the deploy was pinned to A.
+    const programs = resolver([
+      { path: 'Cell/A', name: 'A', selected: false },
+      { path: 'Cell/B', name: 'B', selected: true },
+    ]);
+    const result = await persistDeployedPlcCode(s.viewer, programs, DEPLOYED, 'Cell/A', { scene: s.store });
+    expect(result).toMatchObject({ persisted: true, nodePath: 'Cell/A' });
+    expect(Object.fromEntries(findPlcProgramNodes(s.root).map((h) => [h.name, h.code]))).toEqual({ A: DEPLOYED, B: 'B0' });
+
+    // '' pins the node-less editor buffer — refused here (other programs exist), never redirected to B.
+    const live = await persistDeployedPlcCode(s.viewer, programs, DEPLOYED, '', { scene: s.store });
+    expect(live.persisted).toBe(false);
+    expect(findPlcProgramNodes(s.root).find((h) => h.name === 'B')!.code).toBe('B0');
+  });
+
+  it('refuses to create a second node when the scene already has programs (would hit the wrong one)', async () => {
+    const s = makeLiveScene([{ name: 'Infeed', code: 'A' }]);
+    const result = await persistDeployedPlcCode(
+      s.viewer, resolver([{ path: '', name: 'Main', selected: true }]), DEPLOYED, undefined, { scene: s.store });
+    expect(result.persisted).toBe(false);
+    expect(result.error).toMatch(/no PLCProgram node/);
+    expect(s.ops).toHaveLength(0);
+  });
+
+  it('reports a refused op, a missing store and a write that did not land', async () => {
+    const s = makeLiveScene([{ name: 'PLC', code: 'OLD' }]);
+    const programs = resolver([{ path: 'Cell/PLC', name: 'PLC', selected: true }]);
+
+    const refused = await persistDeployedPlcCode(s.viewer, programs, DEPLOYED, undefined, {
+      scene: { applyOp: () => Promise.reject(new Error('op refused')) },
+    });
+    expect(refused).toMatchObject({ persisted: false, error: 'op refused' });
+
+    const noStore = await persistDeployedPlcCode(s.viewer, programs, DEPLOYED, undefined, { scene: null });
+    expect(noStore).toMatchObject({ persisted: false, error: 'no scene document to write into' });
+
+    // The op resolves but the executor swallowed it — the read-back catches it.
+    const swallowed = await persistDeployedPlcCode(s.viewer, programs, DEPLOYED, undefined, {
+      scene: { applyOp: () => Promise.resolve() },
+    });
+    expect(swallowed).toMatchObject({ persisted: false, nodePath: 'Cell/PLC' });
+    expect(swallowed.error).toMatch(/did not land/);
+    expect(findPlcProgramNodes(s.root)[0].code).toBe('OLD');
+
+    const unknown = await persistDeployedPlcCode(s.viewer, programs, DEPLOYED, 'Nope', { scene: s.store });
+    expect(unknown).toMatchObject({ persisted: false, error: "unknown PLC program 'Nope'" });
+  });
+
+  it('writes into the open asset document in the editor (node + component in ONE transaction)', async () => {
+    const s = makeLiveScene();
+    const calls: string[] = [];
+    const asset: PlcAssetDocLike = {
+      withTransaction: async (label, fn) => { calls.push(`tx:${label}`); await fn(); },
+      createEmptyNode: async (_parent, name) => {
+        calls.push('createEmptyNode');
+        const n = new Object3D();
+        n.name = name;
+        s.root.add(n);
+        s.nodes.set(name, n);
+        return name;
+      },
+      applyOp: async (op) => {
+        calls.push(op.kind);
+        s.nodes.get(op.nodePath)!.userData.realvirtual = { [op.componentType]: { ...op.fields } };
+      },
+      setFieldAwaited: async () => { calls.push('setFieldAwaited'); },
+    };
+    const result = await persistDeployedPlcCode(
+      s.viewer, resolver([{ path: '', name: 'Main', selected: true }]), DEPLOYED, undefined, { asset, scene: s.store });
+
+    expect(result).toEqual({ persisted: true, document: 'asset-doc', nodePath: 'PLC', created: true });
+    expect(calls).toEqual(['tx:Deploy PLC program', 'createEmptyNode', 'addComponent']);
+    expect(s.ops).toHaveLength(0); // the scene store is NOT written while the editor owns the document
+    expect(findPlcProgramNode(s.root)!.code).toBe(DEPLOYED);
   });
 });

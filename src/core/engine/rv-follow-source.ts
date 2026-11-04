@@ -23,6 +23,10 @@ import type { ViewerHost } from './rv-viewer-host';
 
 /** Per-frame world-pose provider for a follow target. */
 export interface FollowSource {
+  /** Local forward axis for Sit-On; defaults to the camera convention (-Z). */
+  readonly seatForward?: 'negZ' | 'posZ';
+  /** Optional Sit-On Y offset in the part frame, overriding the seat height. */
+  readonly seatHeight?: number;
   /** Write the target's current world position into `out`. */
   getWorldPosition(out: Vector3): void;
   /** Write the target's current world rotation into `out` (used by Sit-On). */
@@ -66,7 +70,7 @@ export class Object3DFollowSource implements FollowSource {
   readonly label: string;
   private readonly node: Object3D;
 
-  constructor(node: Object3D, label?: string) {
+  constructor(node: Object3D, label?: string, readonly seatForward: 'negZ' | 'posZ' = 'negZ') {
     this.node = node;
     this.label = label ?? node.name ?? 'node';
   }
@@ -110,5 +114,9 @@ export function resolveFollowSource(viewer: ViewerHost, path: string): FollowSou
   if (!registry) return null;
   const node = registry.getNode(path);
   if (!node) return null;
-  return new Object3DFollowSource(node, path);
+  // Agv stamps its resolved path on the pose-driving root. Its PathTraveler
+  // uses lookRotation(tangent, align), so that root's forward axis is +Z.
+  const agvPath = node.userData.realvirtual?.AgvBehavior?.Path;
+  const seatForward = typeof agvPath === 'string' && agvPath.length > 0 ? 'posZ' : 'negZ';
+  return new Object3DFollowSource(node, path, seatForward);
 }

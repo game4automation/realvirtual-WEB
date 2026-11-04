@@ -20,15 +20,22 @@
  */
 
 import { describe, it, expect, beforeAll } from 'vitest';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { resolve, join, matchesGlob } from 'node:path';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { resolve, join, relative, matchesGlob } from 'node:path';
 import ts from 'typescript';
 
 const ROOT = resolve(__dirname, '..');
 const ALLOWLIST_PATH = resolve(ROOT, 'tests/fixtures/ui-language-allowlist.json');
 
+/**
+ * Extra source roots scanned when they exist. The private extensions ship the
+ * same UI (feature matrix, render backends, asset editor) and must be English
+ * too; a public-only checkout simply has no such directory.
+ */
+const EXTRA_ROOTS = [resolve(ROOT, '../realvirtual-WebViewer-Private~/src')].filter((d) => existsSync(d));
+
 /** Frozen size of the allowlist — only ever LOWERED (bootstrap plan-510). */
-const ALLOWLIST_CEILING = 10;
+const ALLOWLIST_CEILING = 1;
 
 /**
  * Files that must be German-free with NO allowlist entry: the inspector lint
@@ -49,7 +56,7 @@ const LANGUAGE_SCOPE = [
 ];
 
 const UMLAUT = /[äöüÄÖÜß]/;
-const GERMAN_WORD = /\b(und|nicht|wird|läuft|übernehmen|zurück|abbrechen|speichern|löschen|neustart|vertrauen|datei|keine|entfernen|konflikte?|starten|fehler|wert|oder)\b/i;
+const GERMAN_WORD = /\b(und|oder|nicht|kein|keine|wird|werden|wurde|kann|muss|sind|läuft|geladen|lade|übernehmen|zurück|zurücksetzen|abbrechen|speichern|löschen|öffnen|schließen|weiter|wiederholen|neustart|vertrauen|datei|dateien|ordner|entfernen|hinzufügen|auswählen|konflikte?|starten|stoppen|fehler|warnung|achtung|wert|werte|anzahl|aktiv|aktiviert|deaktiviert|ausgeschaltet|eingeschaltet|einschalten|ausschalten|schalter|einstellung|einstellungen|anzeige|modus|gruppe|planung|dauer|puffer|spur|szene|verbindung|geschwindigkeit|variante|varianten|stationen|versand|flotte|erprobung|größe|plätze|platz|bitte|mehr|erfahren|von|verbinde|verbinden|konvertiere|fehlgeschlagen|beendet|dokumentation|antworte|sprache|deutsch|zweifel|passende|aufbau)\b/i;
 
 export interface LanguageFinding { file: string; text: string }
 
@@ -118,10 +125,11 @@ let allowlist: LanguageFinding[];
 beforeAll(() => {
   const files: string[] = [];
   walk(resolve(ROOT, 'src'), files);
+  for (const extra of EXTRA_ROOTS) walk(extra, files);
   findings = [];
   const seen = new Set<string>();
   for (const full of files) {
-    const file = full.slice(ROOT.length + 1).replace(/\\/g, '/');
+    const file = relative(ROOT, full).replace(/\\/g, '/');
     for (const text of scanSource(file, readFileSync(full, 'utf8'))) {
       const key = `${file}\u0000${text}`;
       if (seen.has(key)) continue;

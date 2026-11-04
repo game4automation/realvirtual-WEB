@@ -1,0 +1,240 @@
+{
+  "fingerprint": {
+    "timestamp": "2026-10-19T11:29:55.713Z",
+    "host": "surfacelaptop",
+    "os": "win32 10.0.26200",
+    "cpu": "Snapdragon(R) X 12-core X1E80100 @ 3.40 GHz",
+    "logicalCpus": 12,
+    "totalMemoryBytes": 16757260288,
+    "freeMemoryBytes": 4123181056,
+    "node": "v24.19.0",
+    "chromium": "145.0.7632.6",
+    "gitCommit": "9f6de32217595ff42f53c7068cd88d3f27283077",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+    "hardwareConcurrency": 12,
+    "deviceMemoryGiB": 8,
+    "devicePixelRatio": 1.0000000298023224,
+    "viewport": {
+      "width": 1600,
+      "height": 900
+    },
+    "longTaskObserver": true,
+    "preciseHeap": true,
+    "gpu": {
+      "vendor": "Google Inc. (Qualcomm)",
+      "renderer": "ANGLE (Qualcomm, Qualcomm(R) Adreno(TM) X1-85 GPU (0x36334330) Direct3D11 vs_5_0 ps_5_0, D3D11)"
+    }
+  },
+  "variant": "A",
+  "runs": 1,
+  "windowS": 5,
+  "uncapped": false,
+  "localStorage": {},
+  "skipped": [],
+  "models": {
+    "mauser": {
+      "url": "/private-models/mauser3dhmi/MauserCageline30.glb",
+      "failed": null,
+      "measuredRuns": 1,
+      "median": {
+        "loadMs": 1159.5,
+        "navToSceneReadyMs": 50826.90000000596,
+        "fps": 21.333333333333332,
+        "frameMs": 46.87777777777778,
+        "sceneCalls": 272,
+        "sceneTriangles": 7473340,
+        "heapBytes": 1457288927,
+        "sceneNodes": 18719,
+        "chunkMeshes": 295,
+        "matrixAutoUpdateNodes": 376,
+        "frozenWorldNodes": 13360
+      },
+      "placements": null,
+      "callsPerPlacement": null,
+      "bake": {
+        "assets": 0,
+        "chunks": 0,
+        "vertices": 0,
+        "triangles": 0,
+        "instances": 0,
+        "inflight": 0,
+        "placements": {
+          "instances": 1,
+          "assets": 1,
+          "chunks": 295,
+          "chunkMeshes": 295,
+          "keepMeshes": 1,
+          "drawCalls": 296,
+          "pickBytes": 4379416,
+          "nodeTableBytes": 353416,
+          "nodeTableRows": 17411,
+          "segments": 15461,
+          "clusters": 67552,
+          "segmentOnlyChunks": 0,
+          "geometryBytes": 236701308,
+          "pickPercent": 2
+        }
+      },
+      "survival": {
+        "assetId": "/private-models/mauser3dhmi/MauserCageline30.glb",
+        "counts": {
+          "nodes": 70203,
+          "survivors": 18060,
+          "removed": 52143,
+          "removedMeshes": 36693,
+          "mergedSurvivorMeshes": 2745,
+          "releasableGeometries": 9603,
+          "instancedTriangles": 0,
+          "tagOnlyChunkBoundaries": 29,
+          "unresolvedReferences": 46,
+          "unresolvedByField": {
+            "Grip.SignalPick": 10,
+            "LogicStep_SetSignalBool.Signal": 14,
+            "LogicStep_WaitForSignalBool.Signal": 21,
+            "CustomRuntimeInstruction.signal": 1
+          },
+          "unresolvedClaims": 1
+        },
+        "ms": 874.2000000029802,
+        "removalTopsTotal": 31124,
+        "removalTopsSample": [
+          "MauserCageline30/Errors/CUBE",
+          "MauserCageline30/Cube",
+          "MauserCageline30/Cube (1)",
+          "MauserCageline30/Cube (2)",
+          "MauserCageline30/Cube (3)",
+          "MauserCageline30/Cube (4)",
+          "MauserCageline30/Kinematics/Kinematics_MC01/Separation_MC01/SeparationUp1/Solid1_5957",
+          "MauserCageline30/Kinematics/Kinematics_MC01/Separation_MC01/SeparationUp1/Solid1_5958",
+          "MauserCageline30/Kinematics/Kinematics_MC01/Separation_MC01/SeparationUp1/Solid1_5959",
+          "MauserCageline30/Kinematics/Kinematics_MC01/Separation_MC01/SeparationUp2/Solid1_5966"
+        ],
+        "unresolvedClaims": [
+          {
+            "path": "MauserCageline30glb/3125524_low_qual_071125_CL/3125524iam/3125524iam_1/31221431/31220993/ENG-0487541_3",
+            "role": "merge"
+          }
+        ],
+        "g1Violations": []
+      },
+      "runs": [
+        {
+          "loadMs": 1159.5,
+          "navToSceneReadyMs": 50826.90000000596,
+          "fps": 21.333333333333332,
+          "fpsSamples": [
+            19,
+            21,
+            20,
+            23,
+            21,
+            22,
+            23,
+            21,
+            22
+          ],
+          "frameMs": 46.87777777777778,
+          "scene": {
+            "calls": 272,
+            "triangles": 7473340
+          },
+          "total": {
+            "calls": 553,
+            "triangles": 14946698
+          },
+          "heap": 1457288927,
+          "sceneNodes": 18719,
+          "sceneMeshes": 371,
+          "chunkMeshes": 295,
+          "matrixAutoUpdateNodes": 376,
+          "frozenWorldNodes": 13360,
+          "bake": {
+            "assets": 0,
+            "chunks": 0,
+            "vertices": 0,
+            "triangles": 0,
+            "instances": 0,
+            "inflight": 0,
+            "placements": {
+              "instances": 1,
+              "assets": 1,
+              "chunks": 295,
+              "chunkMeshes": 295,
+              "keepMeshes": 1,
+              "drawCalls": 296,
+              "pickBytes": 4379416,
+              "nodeTableBytes": 353416,
+              "nodeTableRows": 17411,
+              "segments": 15461,
+              "clusters": 67552,
+              "segmentOnlyChunks": 0,
+              "geometryBytes": 236701308,
+              "pickPercent": 2
+            }
+          },
+          "placements": null,
+          "drives": 169,
+          "loadTriangles": 7681013,
+          "loadInfo": {
+            "glbSize": "231.1 MB",
+            "loadTime": "36.6s"
+          },
+          "camera": {
+            "pos": [
+              18.694956368574925,
+              16.315171025891303,
+              14.335145834595988
+            ],
+            "target": [
+              1.1894514929275386,
+              1.7272502961851557,
+              -4.629151114022012
+            ]
+          },
+          "survival": {
+            "assetId": "/private-models/mauser3dhmi/MauserCageline30.glb",
+            "counts": {
+              "nodes": 70203,
+              "survivors": 18060,
+              "removed": 52143,
+              "removedMeshes": 36693,
+              "mergedSurvivorMeshes": 2745,
+              "releasableGeometries": 9603,
+              "instancedTriangles": 0,
+              "tagOnlyChunkBoundaries": 29,
+              "unresolvedReferences": 46,
+              "unresolvedByField": {
+                "Grip.SignalPick": 10,
+                "LogicStep_SetSignalBool.Signal": 14,
+                "LogicStep_WaitForSignalBool.Signal": 21,
+                "CustomRuntimeInstruction.signal": 1
+              },
+              "unresolvedClaims": 1
+            },
+            "ms": 874.2000000029802,
+            "removalTopsTotal": 31124,
+            "removalTopsSample": [
+              "MauserCageline30/Errors/CUBE",
+              "MauserCageline30/Cube",
+              "MauserCageline30/Cube (1)",
+              "MauserCageline30/Cube (2)",
+              "MauserCageline30/Cube (3)",
+              "MauserCageline30/Cube (4)",
+              "MauserCageline30/Kinematics/Kinematics_MC01/Separation_MC01/SeparationUp1/Solid1_5957",
+              "MauserCageline30/Kinematics/Kinematics_MC01/Separation_MC01/SeparationUp1/Solid1_5958",
+              "MauserCageline30/Kinematics/Kinematics_MC01/Separation_MC01/SeparationUp1/Solid1_5959",
+              "MauserCageline30/Kinematics/Kinematics_MC01/Separation_MC01/SeparationUp2/Solid1_5966"
+            ],
+            "unresolvedClaims": [
+              {
+                "path": "MauserCageline30glb/3125524_low_qual_071125_CL/3125524iam/3125524iam_1/31221431/31220993/ENG-0487541_3",
+                "role": "merge"
+              }
+            ],
+            "g1Violations": []
+          }
+        }
+      ]
+    }
+  }
+}

@@ -68,6 +68,50 @@ import {
   resolveWorldAxis, perspectiveViewportWorldHeight, computeGizmoScale, minGizmoScale,
 } from '../core/engine/drive-axis-math';
 
+/**
+ * plan-655 F8 (SOL R1-6): does this drive feed a TransportSurface?
+ *
+ * Runtime: a live RVDrive is flagged `isTransportSurface` by the surface that
+ * resolved it (the same association `RVTransportSurface.init` makes —
+ * `DriveReference` first, else the nearest Drive up the parent chain).
+ * Authoring (asset editor, no live components): the same two rules evaluated
+ * on rv_extras over the drive's asset tree — a TransportSurface whose
+ * `DriveReference` names this drive's node, or one without a reference whose
+ * nearest Drive-carrying ancestor-or-self IS this drive's node.
+ */
+export function driveFeedsTransportSurface(drive: DriveGizmoSource): boolean {
+  const live = (drive as unknown as { isTransportSurface?: boolean }).isTransportSurface;
+  if (live === true) return true;
+  const driveNode = drive.node;
+  let root: Object3D = driveNode;
+  while (root.parent && !(root.parent as { isScene?: boolean }).isScene) root = root.parent;
+  const drivePath: string[] = [];
+  for (let n: Object3D | null = driveNode; n && n !== root.parent; n = n.parent) drivePath.unshift(n.name);
+  let feeds = false;
+  root.traverse((n) => {
+    if (feeds) return;
+    const rv = n.userData?.realvirtual as Record<string, unknown> | undefined;
+    const ts = rv?.TransportSurface as Record<string, unknown> | undefined;
+    if (!ts) return;
+    const ref = ts.DriveReference as unknown;
+    const refPath = typeof ref === 'string' ? ref
+      : (ref && typeof ref === 'object' && typeof (ref as { path?: unknown }).path === 'string'
+        ? (ref as { path: string }).path : '');
+    if (refPath.trim()) {
+      const segs = refPath.split('/').filter(Boolean);
+      // Asset-relative or with the asset root's name — a suffix match either way.
+      if (segs.length > 0 && segs.length <= drivePath.length
+        && segs.every((s, i) => s === drivePath[drivePath.length - segs.length + i])) feeds = true;
+      return;
+    }
+    for (let a: Object3D | null = n; a; a = a.parent) {
+      const arv = a.userData?.realvirtual as Record<string, unknown> | undefined;
+      if (arv?.Drive !== undefined) { if (a === driveNode) feeds = true; return; }
+    }
+  });
+  return feeds;
+}
+
 /** Dedicated drive accent color (plan-249 §6) — deliberately different from the
  *  red/green/blue transform handles so "motion axis" ≠ "transform gizmo". */
 const DRIVE_GIZMO_COLOR = 0xff9800;
@@ -425,6 +469,7 @@ export class DriveAxisGizmoPlugin implements RVViewerPlugin {
   }
 
   // ── Selection → gizmos ──────────────────────────────────────────────
+  // (`driveFeedsTransportSurface` is module level — tests call it directly.)
 
   private onSelection(snap: SelectionSnapshot): void {
     this._lastSnap = snap;
@@ -449,6 +494,11 @@ export class DriveAxisGizmoPlugin implements RVViewerPlugin {
       if (!hit) continue;
       // Virtual drives (zero axis) never get a gizmo (F11).
       if (hit.drive.getAxis(this._localAxis).lengthSq() < AXIS_EPS) continue;
+      // plan-655 F8: a rotary drive that FEEDS a transport surface (a curve's
+      // belt drive, speed in °/s) moves nothing — its rotation ring next to the
+      // surface's own direction gizmo only misleads. A turntable drive that
+      // rotates its platform feeds no surface and keeps its ring.
+      if (hit.drive.isRotary && driveFeedsTransportSurface(hit.drive)) continue;
       wanted.set(hit.path, hit.drive);
     }
 
@@ -794,6 +844,7 @@ export class DriveAxisGizmoPlugin implements RVViewerPlugin {
     const driver = getDriveDragDriver();
     if (!driver || driver.isBlocked?.()) return; // yield to the transform gizmo
     if (!this._withinCanvas(e)) return;
+    if (this.viewer?.pointerPickBlocked) return; // plan-2215: no screen pick under a render strategy
     const hit = this._pickHandle(e);
     if (!hit) return;
     // Claim the gesture: block orbit, marquee, and click-select.
@@ -806,6 +857,11 @@ export class DriveAxisGizmoPlugin implements RVViewerPlugin {
     const viewer = this.viewer;
     if (!viewer) return;
     const drag = this._drag;
+    if (viewer.pointerPickBlocked) {
+      // plan-2215: a render strategy took over — the drive returns, the hover goes.
+      if (drag) this._cancelDrag();
+      return;
+    }
     if (!drag) { this._updateHover(e); return; }
     e.stopImmediatePropagation();
     e.preventDefault();

@@ -19,6 +19,8 @@
  */
 
 import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx';
 const result = spawnSync(
@@ -32,4 +34,26 @@ const result = spawnSync(
   },
 );
 
-process.exit(result.status ?? 1);
+if ((result.status ?? 1) !== 0) process.exit(result.status ?? 1);
+
+// plan-626 F2: the tool-class allowlist CONNECT reads (McpToolClassAllowlist.cs in the Connect repo).
+// plan-2211: the convention test registers the commercial experiment.* commands and lives in the
+// private sibling since the experiment manager moved there. Without the sibling there is nothing
+// to generate — say so instead of letting vitest report "No test files found".
+const CLASS_TEST = '../realvirtual-WebViewer-Private~/tests/des-experiments/mcp-tool-class-convention.node.test.ts';
+if (!existsSync(fileURLToPath(new URL(`../${CLASS_TEST}`, import.meta.url)))) {
+  console.warn(`[gen:mcp-docs] MCP docs regenerated. The tool/command class allowlists were NOT regenerated: `
+    + `${CLASS_TEST} is missing (no private sibling checkout). Run gen:mcp-docs in a workspace with realvirtual-WebViewer-Private~.`);
+  process.exit(0);
+}
+const classes = spawnSync(
+  npx,
+  ['vitest', 'run', '--config', 'vitest.node.config.ts', CLASS_TEST],
+  {
+    stdio: 'inherit',
+    env: { ...process.env, RV_UPDATE_MCP_CLASSES: '1' },
+    shell: process.platform === 'win32',
+  },
+);
+
+process.exit(classes.status ?? 1);

@@ -76,12 +76,68 @@ import { FLOOR_FADE_START_RATIO, FLOOR_FADE_END_RATIO } from './rv-ground-plane'
 import { drawCallsOf, addNestedDelta, getActiveFrameStats, type RenderInfoLike } from './rv-frame-stats';
 
 /** Overlay-blend gray that reproduces an unmodified ("full") reflection. */
-const FULL_MIRROR_GRAY = 0.5;
+export const FULL_MIRROR_GRAY = 0.5;
 
 /** Reflection minimum when viewed straight down (Fresnel floor). */
-const FRESNEL_MIN = 0.25;
+export const FRESNEL_MIN = 0.25;
 /** Fresnel exponent — higher = reflection concentrates toward grazing angles. */
-const FRESNEL_POWER = 3.0;
+export const FRESNEL_POWER = 3.0;
+
+/**
+ * What the viewer holds for EITHER mirror implementation (plan-763): the WebGL
+ * `Reflector` wrapped by {@link adaptWebGLReflector}, or the TSL mirror from
+ * `materials/rv-ground-reflector-tsl.ts`. The viewer scales, positions and
+ * shows `mesh`, pushes strength / blur, counts targets and disposes — nothing
+ * implementation-specific.
+ */
+export interface GroundReflector {
+  readonly mesh: Mesh;
+  setStrength(strength: number): void;
+  setBlur(blur: number): void;
+  renderTargets(): readonly unknown[];
+  dispose(): void;
+}
+
+/** The look constants the TSL mirror needs (it imports nothing relative). */
+export function groundReflectorConstants(): {
+  fullMirrorGray: number; fresnelMin: number; fresnelPower: number; fadeOpaqueRatio: number;
+} {
+  return {
+    fullMirrorGray: FULL_MIRROR_GRAY,
+    fresnelMin: FRESNEL_MIN,
+    fresnelPower: FRESNEL_POWER,
+    fadeOpaqueRatio: FLOOR_FADE_START_RATIO / FLOOR_FADE_END_RATIO,
+  };
+}
+
+/**
+ * Book one mirror render into the active frame stats as the nested
+ * `reflection` bucket — the WebGL wrapper does the same around
+ * `Reflector.onBeforeRender`; the TSL mirror calls this around its
+ * `updateBefore`.
+ */
+export function bookReflectionPass<T>(renderer: { info: unknown }, run: () => T): T {
+  const stats = getActiveFrameStats();
+  const info = renderer.info as RenderInfoLike;
+  const c0 = drawCallsOf(info);
+  const t0 = info.render.triangles;
+  try {
+    return run();
+  } finally {
+    if (stats) addNestedDelta(stats, 'reflection', info, c0, t0);
+  }
+}
+
+/** Wrap a classic `Reflector` from {@link createGroundReflector} in the {@link GroundReflector} shape. */
+export function adaptWebGLReflector(reflector: Reflector): GroundReflector {
+  return {
+    mesh: reflector,
+    setStrength: (s) => setReflectorStrength(reflector, s),
+    setBlur: (b) => setReflectorBlur(reflector, b),
+    renderTargets: () => getReflectorRenderTargets(reflector),
+    dispose: () => reflector.dispose(),
+  };
+}
 
 /** Iterated H+V blur pairs at blur = 1 (the settings slider scales this). Each
  *  pass is a STANDARD 9-tap Gaussian stepped by exactly one texel (offset =

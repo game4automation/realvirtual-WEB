@@ -37,6 +37,7 @@
 import { migrateManifest } from '../rv-project-storage';
 import { assertReadableScenePath } from '../rv-legacy-format';
 import { decryptServedBytes, isEncryptedDeploy } from '../../persistence/rv-served-bytes';
+import { readTrackedBody } from '../../engine/rv-script-trust';
 import {
   isValidProjectV2,
   type RvProject,
@@ -106,11 +107,15 @@ export const DEMO_PROJECT_FOLDER = 'demo-realvirtual';
  */
 export const DEMO_BASE_PATH = `${DEMO_PROJECT_FOLDER}/`;
 /**
- * Catalog of the realvirtual component library, relative to the deploy root.
- * NOT read by any boot path — a deploy manifest must reference it explicitly
- * (`libraries[]`) for the library to exist at runtime.
+ * The realvirtual component library AS A PROJECT, relative to the deploy root
+ * (plan-778 Phase 3): id `prj_realvirtual_library`, its document ids the former
+ * bundled catalog ids (that catalog file is gone since plan-778 Phase 4). This is the built-in location of that project — the library
+ * project loader (`library-project-backends.ts`) reads `<BASE_URL>library/`
+ * with a `BundledBackend`, so this file is what answers its `readManifest()`.
+ * App-level like the catalog: never read through the demo backend's base path
+ * and never trimmed from a delivery.
  */
-export const REALVIRTUAL_LIBRARY_PATH = 'library/catalog.json';
+export const REALVIRTUAL_LIBRARY_PROJECT_PATH = 'library/project.json';
 
 /**
  * The asset endings a manifest row must carry to BE a document — the same list
@@ -161,10 +166,10 @@ export interface BundledBackendOptions {
    * Absolute URLs (`https://…`, `blob:`, `data:`) bypass it, as they always
    * bypassed the base URL.
    *
-   * NOT applied to `library/catalog.json`: the library is app-level and lives
+   * NOT applied to `library/project.json`: the library is app-level and lives
    * beside the demo folder, not inside it. Nothing here fetches it — the
    * subscription in the demo manifest's `libraries[]` is resolved by
-   * `library-store` against the page base — and {@link REALVIRTUAL_LIBRARY_PATH}
+   * the library project loader against the page base — and {@link REALVIRTUAL_LIBRARY_PROJECT_PATH}
    * stays a deploy-root-relative constant for that reason.
    */
   basePath?: string;
@@ -585,7 +590,12 @@ export class BundledBackend implements ProjectBackend {
     if (!resp.ok) return null;
     // plan-759 F6: THE decrypt seam. An envelope without a session key is an
     // error the caller must see, never a null that reads like "no such file".
-    return new Uint8Array(await decryptServedBytes(await resp.arrayBuffer(), this._url(relPath)));
+    // `readTrackedBody` tokens exactly this body buffer with the final,
+    // non-redirected response URL (script trust, rv-script-trust.ts). A
+    // decrypted copy is a new buffer and carries no token; a plain body comes
+    // back unchanged and `arrayBufferOf` hands this same buffer to the loader.
+    const plain = await decryptServedBytes(await readTrackedBody(resp, { stream: false }), this._url(relPath));
+    return new Uint8Array(plain);
   }
 
   private async _fetchJson(relPath: string): Promise<unknown | null> {

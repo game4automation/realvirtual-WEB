@@ -67,8 +67,8 @@ function buildPlant(): Group {
   setNodeId(reference, 'ref-station');
   setAssetReference(reference, { assetId: 'assembly' });
   setAssetOverrides(reference, {
-    byNodeId: {},
-    byPath: { Axis: { Drive: { TargetSpeed: 42 } } },
+    byAddress: {},
+    legacyByPath: { Axis: { Drive: { TargetSpeed: 42 } } },
   });
   plant.add(reference);
   return plant;
@@ -139,7 +139,7 @@ describe('Die Hinweiszeile nennt die Anzahl (§2.7.2)', () => {
 
     expect(countInstanceOverrides(reference)).toBe(1);
     expect(describeSuppressedOverrides(countInstanceOverrides(reference)))
-      .toBe('1 Override dieser Instanz ist ausgeblendet');
+      .toBe('1 override of this instance is hidden');
   });
 
   it('ein Referenzknoten ohne Overrides erzeugt keine Zeile', () => {
@@ -152,11 +152,11 @@ describe('Die Hinweiszeile nennt die Anzahl (§2.7.2)', () => {
   it('mehrere Komponenten auf mehreren Knoten summieren sich', () => {
     const node = new Object3D();
     setAssetOverrides(node, {
-      byNodeId: { 'id-1': { Drive: { TargetSpeed: 1 }, Sensor: { Enabled: false } } },
-      byPath: { Axis: { Drive: { TargetSpeed: 2 } } },
+      byAddress: { '#id-1': { Drive: { TargetSpeed: 1 }, Sensor: { Enabled: false } } },
+      legacyByPath: { Axis: { Drive: { TargetSpeed: 2 } } },
     });
     expect(countInstanceOverrides(node)).toBe(3);
-    expect(describeSuppressedOverrides(3)).toBe('3 Overrides dieser Instanz sind ausgeblendet');
+    expect(describeSuppressedOverrides(3)).toBe('3 overrides of this instance are hidden');
   });
 });
 
@@ -175,6 +175,8 @@ interface CtrlHarness {
 function controllerHarness(opts?: {
   openChildFails?: boolean;
   pending?: RvPendingOverrideSource | null;
+  /** plan-774 F10: the host's "is this placement still materialising?" answer. */
+  materializing?: (reference: Object3D) => boolean;
 }): CtrlHarness {
   const viewer = createStackTestViewer();
   const stack = new RvDocumentStack({ viewer, projectId: 'proj' });
@@ -194,6 +196,7 @@ function controllerHarness(opts?: {
     },
     async reloadFrame(frame) { return { isolatedRoots: frame.isolatedRoots }; },
     pendingOverrides() { return opts?.pending ?? null; },
+    ...(opts?.materializing ? { isMaterializing: opts.materializing } : {}),
     detachRuntime() { state.detached++; },
     reportProblem(p) { problems.push(p); },
   };
@@ -248,6 +251,31 @@ describe('Descend-Sonderfaelle (§2.7.3)', () => {
     expect(h.controller.canDescend(node)).toEqual({ ok: false, reason: 'unresolved' });
   });
 
+  it('plan-774 F10: an empty reference whose placement is still materialising answers materializing, not unresolved', () => {
+    let materializing = true;
+    const h = controllerHarness({ materializing: () => materializing });
+    const node = referenceNode({ grafted: false });
+    expect(h.controller.canDescend(node)).toEqual({ ok: false, reason: 'materializing' });
+    // The placement arrives: the instance hangs under the reference node.
+    materializing = false;
+    node.add(new Object3D());
+    expect(h.controller.canDescend(node)).toEqual({ ok: true, assetId: 'assembly', referenceNodeId: 'ref-station' });
+  });
+
+  it('plan-774 F10: after a FAILED settle it is unresolved — never materializing forever', () => {
+    let materializing = true;
+    const h = controllerHarness({ materializing: () => materializing });
+    const node = referenceNode({ grafted: false });
+    expect(h.controller.canDescend(node).ok).toBe(false);
+    // The instancer settled the failure into its placeholder and let go of the id.
+    materializing = false;
+    node.add(buildMissingReferencePlaceholder({ label: 'Assembly.glb' }));
+    expect(h.controller.canDescend(node)).toEqual({ ok: false, reason: 'unresolved' });
+    // …and a settle that left the node empty (no placeholder) is unresolved too.
+    const empty = referenceNode({ grafted: false });
+    expect(h.controller.canDescend(empty)).toEqual({ ok: false, reason: 'unresolved' });
+  });
+
   it('Descend auf einer eingebetteten Referenz ist deaktiviert', () => {
     const h = controllerHarness();
     // A flat export already inlined the subtree — the reference is only a
@@ -280,14 +308,14 @@ describe('Descend-Sonderfaelle (§2.7.3)', () => {
     const h = controllerHarness();
     const reference = referenceNode();
     setAssetOverrides(reference, {
-      byNodeId: {},
-      byPath: { Axis: { Drive: { TargetSpeed: 42 } }, Tool: { Sensor: { Enabled: true } } },
+      byAddress: {},
+      legacyByPath: { Axis: { Drive: { TargetSpeed: 42 } }, Tool: { Sensor: { Enabled: true } } },
     });
 
     const frame = await h.controller.descend(reference);
 
     expect(frame.suppressedOverrides).toBe(2);
-    expect(h.stack.suppressionNotice()).toBe('2 Overrides dieser Instanz sind ausgeblendet');
+    expect(h.stack.suppressionNotice()).toBe('2 overrides of this instance are hidden');
     // …and the notice is gone again once the frame is left.
     h.stack.pop();
     expect(h.stack.suppressionNotice()).toBeNull();
@@ -375,16 +403,40 @@ function pendingHarness(): {
 }
 
 describe('Die Hinweiszeile zaehlt auch die ungespeicherten Overrides (§2.7.2, Lauf 12)', () => {
+  it('plan-774: on a PLACEMENT instance (the editor since Phase 2) the asset-relative path starts below the reference node', () => {
+    // A materialised placement: the instance root IS the reference node
+    // (`_layoutObject`) and the asset root's children hang directly under it.
+    const reference = new Object3D();
+    reference.name = 'Station';
+    reference.userData._layoutObject = true;
+    setNodeId(reference, 'ref-station');
+    setAssetReference(reference, { assetId: 'assembly' });
+    const axis = new Object3D();
+    axis.name = 'Axis';
+    setNodeId(axis, 'id-axis');
+    reference.add(axis);
+    // Persisted by legacy PATH: the re-typed field is the same override.
+    setAssetOverrides(reference, { byAddress: {}, legacyByPath: { Axis: { Drive: { TargetSpeed: 42 } } } });
+    const pending = pendingHarness();
+    pending.type('Plant/Station/Axis', axis, 'Drive', 'TargetSpeed', 99);
+    expect(countInstanceOverrides(reference, pending.source)).toBe(1);
+    // …and by ADDRESS (what the editor writes since plan-774 F1).
+    setAssetOverrides(reference, { byAddress: { '#id-axis': { Drive: { TargetSpeed: 42 } } } });
+    expect(countInstanceOverrides(reference, pending.source)).toBe(1);
+    pending.type('Plant/Station/Axis', axis, 'Sensor', 'Enabled', false);
+    expect(countInstanceOverrides(reference, pending.source)).toBe(2);
+  });
+
   it('ohne Pending-Quelle bleibt die Zahl exakt die persistierte', () => {
     const { reference } = instanceTree();
-    setAssetOverrides(reference, { byNodeId: {}, byPath: { Axis: { Drive: { TargetSpeed: 42 } } } });
+    setAssetOverrides(reference, { byAddress: {}, legacyByPath: { Axis: { Drive: { TargetSpeed: 42 } } } });
     expect(countInstanceOverrides(reference)).toBe(1);
     expect(countInstanceOverrides(reference, null)).toBe(1);
   });
 
   it('ein frisch getippter Wert erhoeht die Zahl sofort — und ein Revert senkt sie wieder', () => {
     const { reference, axis } = instanceTree();
-    setAssetOverrides(reference, { byNodeId: {}, byPath: { Axis: { Drive: { TargetSpeed: 42 } } } });
+    setAssetOverrides(reference, { byAddress: {}, legacyByPath: { Axis: { Drive: { TargetSpeed: 42 } } } });
     const pending = pendingHarness();
 
     expect(countInstanceOverrides(reference, pending.source)).toBe(1);
@@ -393,19 +445,19 @@ describe('Die Hinweiszeile zaehlt auch die ungespeicherten Overrides (§2.7.2, L
     pending.type('Plant/Station/Assembly/Axis', axis, 'Sensor', 'Enabled', false);
     expect(countInstanceOverrides(reference, pending.source)).toBe(2);
     expect(describeSuppressedOverrides(countInstanceOverrides(reference, pending.source)))
-      .toBe('2 Overrides dieser Instanz sind ausgeblendet');
+      .toBe('2 overrides of this instance are hidden');
 
     // …and takes it back.
     pending.revert('Plant/Station/Assembly/Axis', 'Sensor', 'Enabled');
     expect(countInstanceOverrides(reference, pending.source)).toBe(1);
     expect(describeSuppressedOverrides(countInstanceOverrides(reference, pending.source)))
-      .toBe('1 Override dieser Instanz ist ausgeblendet');
+      .toBe('1 override of this instance is hidden');
   });
 
   it('ein zweiter Griff an ein bereits ueberschriebenes Feld zaehlt nicht doppelt', () => {
     const { reference, axis } = instanceTree();
     // Persisted by PATH — the addressing a file written before NodeIds uses.
-    setAssetOverrides(reference, { byNodeId: {}, byPath: { Axis: { Drive: { TargetSpeed: 42 } } } });
+    setAssetOverrides(reference, { byAddress: {}, legacyByPath: { Axis: { Drive: { TargetSpeed: 42 } } } });
     const pending = pendingHarness();
     pending.type('Plant/Station/Assembly/Axis', axis, 'Drive', 'TargetSpeed', 99);
     expect(countInstanceOverrides(reference, pending.source)).toBe(1);
@@ -413,7 +465,7 @@ describe('Die Hinweiszeile zaehlt auch die ungespeicherten Overrides (§2.7.2, L
 
   it('…auch wenn der persistierte Eintrag ueber die NodeId adressiert ist', () => {
     const { reference, axis } = instanceTree();
-    setAssetOverrides(reference, { byNodeId: { 'id-axis': { Drive: { TargetSpeed: 42 } } } });
+    setAssetOverrides(reference, { byAddress: { '#id-axis': { Drive: { TargetSpeed: 42 } } } });
     const pending = pendingHarness();
     pending.type('Plant/Station/Assembly/Axis', axis, 'Drive', 'TargetSpeed', 99);
     expect(countInstanceOverrides(reference, pending.source)).toBe(1);
@@ -447,7 +499,7 @@ describe('Die Hinweiszeile zaehlt auch die ungespeicherten Overrides (§2.7.2, L
 
   it('der Descend traegt die erhoehte Zahl in den Frame und in die Hinweiszeile', async () => {
     const reference = referenceNode();
-    setAssetOverrides(reference, { byNodeId: {}, byPath: { Axis: { Drive: { TargetSpeed: 42 } } } });
+    setAssetOverrides(reference, { byAddress: {}, legacyByPath: { Axis: { Drive: { TargetSpeed: 42 } } } });
     // `referenceNode()` grafts a child root named 'Assembly'; hang a part in it
     // so an overlay path has something inside the reference to resolve to.
     const axis = new Object3D();
@@ -462,6 +514,6 @@ describe('Die Hinweiszeile zaehlt auch die ungespeicherten Overrides (§2.7.2, L
     const frame = await h.controller.descend(reference);
 
     expect(frame.suppressedOverrides).toBe(2);
-    expect(h.stack.suppressionNotice()).toBe('2 Overrides dieser Instanz sind ausgeblendet');
+    expect(h.stack.suppressionNotice()).toBe('2 overrides of this instance are hidden');
   });
 });

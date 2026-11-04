@@ -166,7 +166,7 @@ export async function resolveIdmaskGroups(
     // All copies of an identical part (geometry-signature match — the same
     // identity select_similar 'identical' uses) share one color.
     const { geometrySignature, signaturesMatch } =
-      await import('@rv-private/plugins/asset-editor/select-actions');
+      await import('@rv-private/plugins/asset-editor/shared/select-actions');
     const reps: Array<{
       sig: ReturnType<typeof geometrySignature>; path: string; meshes: Mesh[]; paths: string[];
     }> = [];

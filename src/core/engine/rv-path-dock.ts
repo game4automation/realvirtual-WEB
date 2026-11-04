@@ -63,6 +63,21 @@ export class PathDockRegistry {
     return this.docks.get(pathId) ?? null;
   }
 
+  /**
+   * Remove the dock bound to a segment, whoever registered it (plan-647 D3).
+   * Called when the path itself leaves the scene (`RVPathComponent.dispose`,
+   * placement removal): a dock on a path that no longer exists is dead, and a
+   * later registration on a re-added path must not warn about it.
+   */
+  unbindPath(pathId: string): void {
+    this.docks.delete(pathId);
+  }
+
+  /** Number of bound docks. */
+  get size(): number {
+    return this.docks.size;
+  }
+
   /** Test/model-cleared reset. */
   clear(): void {
     this.docks.clear();

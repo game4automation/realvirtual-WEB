@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { removeLocalStorage } from '../rv-safe-storage';
+
 /**
  * rv-project-legacy-cleanup — retire the workspace keys on the first boot after
  * plan-743.
@@ -63,14 +65,6 @@ export async function runLegacyCleanup(): Promise<void> {
   } catch {
     // No IndexedDB, or no such slot — both are already the desired end state.
   }
-  try {
-    localStorage.removeItem(LEGACY_LS_KEY_WORKSPACE);
-  } catch {
-    // Private mode.
-  }
-  try {
-    localStorage.removeItem(LEGACY_LS_KEY_RECENT);
-  } catch {
-    // Private mode.
-  }
+  removeLocalStorage(LEGACY_LS_KEY_WORKSPACE);
+  removeLocalStorage(LEGACY_LS_KEY_RECENT);
 }

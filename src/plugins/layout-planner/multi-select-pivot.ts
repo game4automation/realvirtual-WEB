@@ -97,6 +97,7 @@ export class MultiSelectPivot {
         if (!originalParent) continue;
         this._members.push({ obj: o, originalParent });
         pivot.attach(o); // preserves world transform
+        this._relink(o);
       }
       this._pivot = pivot;
       tc.attach(pivot);
@@ -206,10 +207,20 @@ export class MultiSelectPivot {
     if (!this._pivot) return;
     for (const { obj, originalParent } of this._members) {
       originalParent.attach(obj);
+      this._relink(obj);
     }
     this._members.length = 0;
     this._pivot.parent?.remove(this._pivot);
     this._pivot = null;
+  }
+
+  /** Re-record the bake nesting of a member that changed parent (plan-774):
+   *  out of the model root's placement while held by the pivot, back on
+   *  restore. The drag-end detour (`writeTransformsOnDragEnd`) re-parks the
+   *  members synchronously and needs none. */
+  private _relink(obj: Object3D): void {
+    // Optional chain: test hosts hand in a viewer stub without a registry.
+    this.deps.viewer?.bakeRegistry?.relinkSubtree?.(obj);
   }
 
   /** True when a multi-select pivot is active. */

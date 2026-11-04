@@ -18,7 +18,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { openSync, readSync, closeSync, readdirSync, existsSync } from 'node:fs';
+import { openSync, readSync, closeSync, readdirSync, existsSync, readFileSync } from 'node:fs';
 import { join, resolve, relative } from 'node:path';
 
 /** Registered material-flow types (the `type:` of every `defineLibraryComponent`). */
@@ -123,19 +123,33 @@ const key = (h: Hit): string => `${h.glb} :: ${h.node} :: ${h.type}`;
  */
 const ALLOWLIST: readonly string[] = [
   // ── plan-455's target: the DES course's three vehicles ────────────────────
-  '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVDemo.glb :: AGV_1 :: Agv',
-  '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVDemo.glb :: AGV_2 :: Agv',
-  '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVDemo.glb :: AGV_3 :: Agv',
+  'public/demo-realvirtual/AGVDemo.glb :: AGV_1 :: Agv',
+  'public/demo-realvirtual/AGVDemo.glb :: AGV_2 :: Agv',
+  'public/demo-realvirtual/AGVDemo.glb :: AGV_3 :: Agv',
   // Reviewed 2026-10-07: the plan-903/558 AGV DES demo scene - eight
   // path-following vehicles, intended `Agv` payloads on the continuous path.
-  '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_1 :: Agv',
-  '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_2 :: Agv',
-  '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_3 :: Agv',
-  '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_4 :: Agv',
-  '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_5 :: Agv',
-  '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_6 :: Agv',
-  '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_7 :: Agv',
-  '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_8 :: Agv',
+  'public/demo-realvirtual/AGVFactory.glb :: AGV_1 :: Agv',
+  'public/demo-realvirtual/AGVFactory.glb :: AGV_2 :: Agv',
+  'public/demo-realvirtual/AGVFactory.glb :: AGV_3 :: Agv',
+  'public/demo-realvirtual/AGVFactory.glb :: AGV_4 :: Agv',
+  'public/demo-realvirtual/AGVFactory.glb :: AGV_5 :: Agv',
+  'public/demo-realvirtual/AGVFactory.glb :: AGV_6 :: Agv',
+  'public/demo-realvirtual/AGVFactory.glb :: AGV_7 :: Agv',
+  'public/demo-realvirtual/AGVFactory.glb :: AGV_8 :: Agv',
+  // Reviewed 2026-10-17: plan-612 PalletYard - the forklift pallet DES demo scene: three
+  // forklifts (`Agv`) on the continuous path, plus two pallet sources and two sinks
+  // (engine-owned, visible to the DES kernel only). Since plan-612 CP1d-b (2026-10-20) the
+  // conveyors are AssetReference placements: their `Conveyor` component lives in the library
+  // asset (RollConveyor), no longer in this scene file, so the scene carries no Conveyor rows.
+  // The forklifts are placements too, but their Agv config stays on the reference node.
+  'public/demo-realvirtual/PalletYard.glb :: PalletYardRoot/Stapler_1 :: Agv',
+  'public/demo-realvirtual/PalletYard.glb :: PalletYardRoot/Stapler_2 :: Agv',
+  'public/demo-realvirtual/PalletYard.glb :: PalletYardRoot/Stapler_3 :: Agv',
+  // 2026-10-26: plan-680 - the same PalletYard scene ships publicly in the demo project
+  // (public/demo-realvirtual/PalletYard.glb, library paths made relative); same three Agvs.
+  // 2026-10-26: plan-681 phase 2 (private e55b294) made every PalletYard instance a placement -
+  // the pallet Sources and the two Sinks now live inside placed assets (AssetReference), so
+  // their four rows left the scene file and the allowlist. The three Stapler Agvs stay.
 
   // ── embedded self-spawning pallets / cell sources + sinks (engine-owned) ──
   'public/library/PalletHandling/CartonBox.glb :: CartonBox :: Source',
@@ -163,27 +177,42 @@ const ALLOWLIST: readonly string[] = [
   // The public copies under public/library/PalletHandling above are the same
   // assets and still cover the case.
   '../realvirtual-WebViewer-Private~/projects/mauser3dhmi/models/MauserCageline30.glb :: UsedWhenOperatingTwinWithoutPLC_Connection/Tube :: Source',
+  // aXite (2026-10-31): six Source carriers, one per vehicle body. They are template holders for
+  // the external entity stream (the SPI host spawns the vehicles, the plugin draws them through
+  // EntityPool); the Sources never generate MUs themselves.
+  '../realvirtual-WebViewer-Private~/projects/aXite/n201-junction-vri201234.glb :: VehicleSource_delivery :: Source',
+  '../realvirtual-WebViewer-Private~/projects/aXite/n201-junction-vri201234.glb :: VehicleSource_hatchback :: Source',
+  '../realvirtual-WebViewer-Private~/projects/aXite/n201-junction-vri201234.glb :: VehicleSource_sedan :: Source',
+  '../realvirtual-WebViewer-Private~/projects/aXite/n201-junction-vri201234.glb :: VehicleSource_suv :: Source',
+  '../realvirtual-WebViewer-Private~/projects/aXite/n201-junction-vri201234.glb :: VehicleSource_truck :: Source',
+  '../realvirtual-WebViewer-Private~/projects/aXite/n201-junction-vri201234.glb :: VehicleSource_van :: Source',
   // plan-569 (2026-10-09): the laser welding demo's FG05 cap feed (a Source driven by a
   // plant pulse, SourceGenerate) and the cap sink on the return conveyor (DeleteOnlyTag
   // "Cap") — engine-owned continuous path, same pattern as the cell sources above.
-  'public/demo-realvirtual/LaserWeldingAssemblyStation.glb :: CapRemoval_Sink :: Sink',
-  'public/demo-realvirtual/LaserWeldingAssemblyStation.glb :: FG05_CapSource :: Source',
-  '../realvirtual-WebViewer-Private~/projects/LaserWeldingAssemblyStation/LaserWeldingAssemblyStation-570.glb :: CapRemoval_Sink :: Sink',
-  '../realvirtual-WebViewer-Private~/projects/LaserWeldingAssemblyStation/LaserWeldingAssemblyStation-570.glb :: FG05_CapSource :: Source',
+  // 2026-10-16 (plan-610 Phase 5): the station hierarchy was restructured
+  // (top level -> Simulation/<station>/...) — unchanged pattern, path only. Phase 5b renamed the
+  // groups file-unique (Simulation -> Plant, FG05 -> FG05_Plant).
+  'public/demo-realvirtual/LaserWeldingAssemblyStation.glb :: Plant/CapRemoval/CapRemoval_Sink :: Sink',
+  'public/demo-realvirtual/LaserWeldingAssemblyStation.glb :: Plant/FG05_Plant/FG05_CapSource :: Source',
+  '../realvirtual-WebViewer-Private~/projects/LaserWeldingAssemblyStation/LaserWeldingAssemblyStation-570.glb :: Plant/CapRemoval/CapRemoval_Sink :: Sink',
+  '../realvirtual-WebViewer-Private~/projects/LaserWeldingAssemblyStation/LaserWeldingAssemblyStation-570.glb :: Plant/FG05_Plant/FG05_CapSource :: Source',
   // plan-569 Teil 4: the valve body circulates the same way - a source at the entry stopper
   // (plant pulse, SourceGenerate) and a sink on the return conveyor (DeleteOnlyTag "Valve").
-  'public/demo-realvirtual/LaserWeldingAssemblyStation.glb :: PartFeed_Source :: Source',
-  'public/demo-realvirtual/LaserWeldingAssemblyStation.glb :: ValveRemoval_Sink :: Sink',
-  '../realvirtual-WebViewer-Private~/projects/LaserWeldingAssemblyStation/LaserWeldingAssemblyStation-570.glb :: PartFeed_Source :: Source',
-  '../realvirtual-WebViewer-Private~/projects/LaserWeldingAssemblyStation/LaserWeldingAssemblyStation-570.glb :: ValveRemoval_Sink :: Sink',
+  'public/demo-realvirtual/LaserWeldingAssemblyStation.glb :: Plant/PartFeed/PartFeed_Source :: Source',
+  'public/demo-realvirtual/LaserWeldingAssemblyStation.glb :: Plant/ValveRemoval/ValveRemoval_Sink :: Sink',
+  '../realvirtual-WebViewer-Private~/projects/LaserWeldingAssemblyStation/LaserWeldingAssemblyStation-570.glb :: Plant/PartFeed/PartFeed_Source :: Source',
+  '../realvirtual-WebViewer-Private~/projects/LaserWeldingAssemblyStation/LaserWeldingAssemblyStation-570.glb :: Plant/ValveRemoval/ValveRemoval_Sink :: Sink',
   // Reviewed 2026-09-13: the Festo cell's two boxes are the same embedded
   // self-spawning pattern as the pallets above - a `Source` on a hidden inner
   // node (AutomaticGeneration, PlaceOnTransportSurface), engine-owned, so
   // nothing changes on the continuous path.
   // 2026-10-07: same two boxes, re-parented in the Festo hierarchy rework
   // (e06801631_asm/... -> Machine/Assembly/Boxen/...) — unchanged pattern, path only.
-  '../realvirtual-WebViewer-Private~/projects/festo/Festo.glb :: Machine/Assembly/Boxen/Box-Front :: Source',
-  '../realvirtual-WebViewer-Private~/projects/festo/Festo.glb :: Machine/Assembly/Boxen/Box-Rear :: Source',
+  // 2026-10-26: the three boxes lost their Source (private 5d5d04e, "boxes are pre-placed MUs,
+  // no sources", Thomas 24.10.) - entries removed, the boxes are plain MUs now.
+  // Reviewed 2026-10-15: a third box in the same self-spawning pattern (private 99e093f,
+  // "third box in the material flow") - unchanged case, one more instance. Cloned from
+  // Box-Front and started on the front belt since the filling fix (no queue at the funnel).
   // Reviewed 2026-09-27: the Festo logo demo (private b760563, "authored MU
   // physics for the Festo logo demo") spawns and removes its logo MUs through
   // an engine-owned Source/Sink pair - same case as the boxes above.
@@ -194,6 +223,32 @@ const ALLOWLIST: readonly string[] = [
   // at its end, engine-owned like the Festo pairs above.
   '../realvirtual-WebViewer-Private~/projects/CloverParkTechnicalCollege/META_201.glb :: ChuteSink :: Sink',
   '../realvirtual-WebViewer-Private~/projects/CloverParkTechnicalCollege/META_201.glb :: PartSource :: Source',
+  // Reviewed 2026-10-26: plan-661 Box2D jam-zone demos in the Development project (private
+  // 45280dd "Test Box2D Stau", f56a588 "Getränkelinie Stau"; bottles restyled 93b3ba2/889699e).
+  // Bottle Sources and end-of-line Sinks, engine-owned like the Festo logo pair above.
+  '../realvirtual-WebViewer-Private~/projects/Development/Getränkelinie Stau.glb :: getraenkelinie-base_glb/Getraenkelinie/Infeed/BottleSource1 :: Source',
+  '../realvirtual-WebViewer-Private~/projects/Development/Getränkelinie Stau.glb :: getraenkelinie-base_glb/Getraenkelinie/Infeed/BottleSource2 :: Source',
+  '../realvirtual-WebViewer-Private~/projects/Development/Getränkelinie Stau.glb :: getraenkelinie-base_glb/Getraenkelinie/Infeed/BottleSource3 :: Source',
+  '../realvirtual-WebViewer-Private~/projects/Development/Getränkelinie Stau.glb :: getraenkelinie-base_glb/Getraenkelinie/Outlet/Sink :: Sink',
+  '../realvirtual-WebViewer-Private~/projects/Development/Test Box2D Stau.glb :: Stautest/A_Box2D/BottleSource1 :: Source',
+  '../realvirtual-WebViewer-Private~/projects/Development/Test Box2D Stau.glb :: Stautest/A_Box2D/BottleSource2 :: Source',
+  '../realvirtual-WebViewer-Private~/projects/Development/Test Box2D Stau.glb :: Stautest/A_Box2D/Sink :: Sink',
+  '../realvirtual-WebViewer-Private~/projects/Development/Test Box2D Stau.glb :: Stautest/B_Referenz_ohne_Zone/BottleSource1 :: Source',
+  '../realvirtual-WebViewer-Private~/projects/Development/Test Box2D Stau.glb :: Stautest/B_Referenz_ohne_Zone/BottleSource2 :: Source',
+  '../realvirtual-WebViewer-Private~/projects/Development/Test Box2D Stau.glb :: Stautest/B_Referenz_ohne_Zone/Sink :: Sink',
+];
+
+/**
+ * Reviewed entries for private customer projects whose names must not appear in the
+ * public tree: they live in the private sibling (`tests/fixtures/behavior-extras-allowlist.json`,
+ * `{ "entries": [...] }`, reasons in its `_comment`) and are merged here when it is present.
+ */
+const PRIVATE_ALLOWLIST_FILE = join(PRIVATE, 'tests/fixtures/behavior-extras-allowlist.json');
+const FULL_ALLOWLIST: readonly string[] = [
+  ...ALLOWLIST,
+  ...(existsSync(PRIVATE_ALLOWLIST_FILE)
+    ? (JSON.parse(readFileSync(PRIVATE_ALLOWLIST_FILE, 'utf8')) as { entries: string[] }).entries
+    : []),
 ];
 
 const ROOTS = [
@@ -210,7 +265,7 @@ describe('plan-455 §9.9 — the binding inventory is a frozen contract', () => 
   it('no GLB carries a material-flow payload outside the reviewed allowlist', () => {
     // Placements already bound today via the asset-name glob — not new.
     const fresh = HITS.filter(h => !h.placed).map(key).sort();
-    const allowed = new Set(ALLOWLIST);
+    const allowed = new Set(FULL_ALLOWLIST);
     const unexpected = fresh.filter(k => !allowed.has(k));
 
     expect(unexpected,
@@ -220,24 +275,32 @@ describe('plan-455 §9.9 — the binding inventory is a frozen contract', () => 
     ).toEqual([]);
   });
 
-  it('the continuous kernel newly binds ONLY the AGVDemo three and the AGVFactory eight', () => {
+  it('the continuous kernel newly binds ONLY the AGVDemo three, the AGVFactory eight and the PalletYard three', () => {
     const continuous = HITS
       .filter(h => !h.placed && !ENGINE_OWNED.has(h.type))
       .map(key).sort();
 
-    // Strict frozen list: AGVDemo.glb (plan-455) + AGVFactory.glb (plan-903/558).
+    // Strict frozen list: AGVDemo.glb (plan-455) + AGVFactory.glb (plan-903/558)
+    // + PalletYard.glb (plan-612). PalletYard binds three here: its two pallet Sources
+    // and two Sinks are ENGINE_OWNED and reach the DES kernel only, and since plan-612
+    // CP1d-b (2026-10-20) its conveyors are AssetReference placements whose Conveyor
+    // component lives in the library asset, not in this scene file — so only the three
+    // Stapler Agvs (config on the reference node) remain in the scene inventory.
     expect(continuous).toEqual([
-      '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVDemo.glb :: AGV_1 :: Agv',
-      '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVDemo.glb :: AGV_2 :: Agv',
-      '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVDemo.glb :: AGV_3 :: Agv',
-      '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_1 :: Agv',
-      '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_2 :: Agv',
-      '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_3 :: Agv',
-      '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_4 :: Agv',
-      '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_5 :: Agv',
-      '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_6 :: Agv',
-      '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_7 :: Agv',
-      '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_8 :: Agv',
+      'public/demo-realvirtual/AGVDemo.glb :: AGV_1 :: Agv',
+      'public/demo-realvirtual/AGVDemo.glb :: AGV_2 :: Agv',
+      'public/demo-realvirtual/AGVDemo.glb :: AGV_3 :: Agv',
+      'public/demo-realvirtual/AGVFactory.glb :: AGV_1 :: Agv',
+      'public/demo-realvirtual/AGVFactory.glb :: AGV_2 :: Agv',
+      'public/demo-realvirtual/AGVFactory.glb :: AGV_3 :: Agv',
+      'public/demo-realvirtual/AGVFactory.glb :: AGV_4 :: Agv',
+      'public/demo-realvirtual/AGVFactory.glb :: AGV_5 :: Agv',
+      'public/demo-realvirtual/AGVFactory.glb :: AGV_6 :: Agv',
+      'public/demo-realvirtual/AGVFactory.glb :: AGV_7 :: Agv',
+      'public/demo-realvirtual/AGVFactory.glb :: AGV_8 :: Agv',
+      'public/demo-realvirtual/PalletYard.glb :: PalletYardRoot/Stapler_1 :: Agv',
+      'public/demo-realvirtual/PalletYard.glb :: PalletYardRoot/Stapler_2 :: Agv',
+      'public/demo-realvirtual/PalletYard.glb :: PalletYardRoot/Stapler_3 :: Agv',
     ]);
   });
 
@@ -245,6 +308,6 @@ describe('plan-455 §9.9 — the binding inventory is a frozen contract', () => 
     const present = new Set(HITS.filter(h => !h.placed).map(key));
     // Only meaningful with the private sibling checked out.
     if (!existsSync(PRIVATE)) return;
-    expect(ALLOWLIST.filter(k => !present.has(k))).toEqual([]);
+    expect(FULL_ALLOWLIST.filter(k => !present.has(k))).toEqual([]);
   });
 });

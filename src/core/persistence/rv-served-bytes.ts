@@ -31,6 +31,19 @@ export class EncryptedWithoutKeyError extends Error {
   }
 }
 
+/** Loading-overlay line shown while an encrypted model file is being decrypted. */
+export const DECRYPTING_MODEL_LABEL = 'Decrypting model file…';
+
+/**
+ * The loading-overlay line for these downloaded bytes when they still need
+ * decrypting (an RVE1 envelope), else null — so the message is shown only for
+ * a step that really happens.
+ */
+export function decryptingStatusFor(bytes: ArrayBuffer | Uint8Array): string | null {
+  const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  return isEncryptedEnvelope(view) ? DECRYPTING_MODEL_LABEL : null;
+}
+
 const _keys = new Map<string, CryptoKey>();
 
 export function saltHex(salt: Uint8Array): string {

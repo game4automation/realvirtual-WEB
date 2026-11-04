@@ -51,6 +51,7 @@ import {
 import type { RVMachiningVolume } from './rv-machining-volume';
 import type { RVMachiningTool } from './rv-machining-tool';
 import type { CollisionMachiningBridge } from './rv-collision-manager';
+import { slotReadBool, slotWrite } from './rv-slot-io';
 
 /**
  * Slice of `SignalStore` the manager needs. Structural — no import cycle.
@@ -73,6 +74,9 @@ export interface MachiningSignalHost {
  * unbounded buffer if the worker were to stop acknowledging entirely.
  */
 const COALESCE_HARD_CAP = 16 * MACHINING_MAX_SEGMENTS_PER_JOB;
+
+/** Stand-in host for an unwired read before the store is attached — never consulted. */
+const NO_SIGNALS: Pick<MachiningSignalHost, 'getBoolByPath'> = { getBoolByPath: () => false };
 
 /**
  * Seconds a volume may stay chunk-less after its grid was reported before the
@@ -241,7 +245,7 @@ export class MachiningManager {
     if (!bridge) return;
     const volume = entry.volume;
     const tools = volume.tools;
-    const spindleOn = this.readBool(volume.SignalSpindleOn, true);
+    const spindleOn = this.readBool(volume, 'SignalSpindleOn', true);
 
     // Tools are static after scene-ready, so the (O(n²)) stale scan only runs
     // when the counts actually disagree.
@@ -336,7 +340,7 @@ export class MachiningManager {
     let changed = false;
 
     // 1 ── Reset barrier on the rising edge only.
-    const resetNow = this.readBool(volume.SignalReset, false);
+    const resetNow = this.readBool(volume, 'SignalReset', false);
     const resetEdge = resetNow && !entry.lastResetSignal;
     entry.lastResetSignal = resetNow;
     if (resetEdge && !entry.resetting) {
@@ -345,7 +349,7 @@ export class MachiningManager {
     }
 
     // 2 ── Spindle gate.
-    const spindleOn = this.readBool(volume.SignalSpindleOn, true);
+    const spindleOn = this.readBool(volume, 'SignalSpindleOn', true);
     if (!spindleOn) {
       // Tools may keep moving; do NOT sweep over that motion later.
       for (const s of entry.sweep.values()) s.hasLastPose = false;
@@ -381,9 +385,8 @@ export class MachiningManager {
     const pendingChunks = ack ? ack.pendingChunks : 0;
     volume.PendingJobCount = pendingJobs;
     volume.PendingChunkCount = pendingChunks;
-    if (volume.SignalMachiningActive && this._signals) {
-      this._signals.setByPath(volume.SignalMachiningActive, pendingJobs + pendingChunks > 0);
-    }
+    slotWrite(volume, 'SignalMachiningActive', volume.SignalMachiningActive,
+      pendingJobs + pendingChunks > 0, this._signals);
 
     // 5 ── Throttled statistics (F8).
     entry.statsTimer += dt;
@@ -680,8 +683,18 @@ export class MachiningManager {
 
   // ── Helpers ──────────────────────────────────────────────────────────
 
-  private readBool(signal: string | null | undefined, fallback: boolean): boolean {
-    if (!signal || !this._signals) return fallback;
-    return this._signals.getBoolByPath(signal);
+  /**
+   * A volume's control signal: the wired store signal, else a direct viewer
+   * binding of the unwired slot (SlotIO, declared by the volume), else
+   * `fallback` — the unbound default.
+   */
+  private readBool(
+    volume: RVMachiningVolume,
+    field: 'SignalSpindleOn' | 'SignalReset',
+    fallback: boolean,
+  ): boolean {
+    const address = volume[field] || null;
+    if (address && !this._signals) return fallback;
+    return slotReadBool(this._signals ?? NO_SIGNALS, volume, field, address, fallback);
   }
 }

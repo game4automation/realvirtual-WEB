@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, removeLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * Environment presets — named combinations of background brightness, floor
  * brightness, floor color, and floor checker contrast. Surfaced in the
@@ -70,21 +72,17 @@ const ENV_USER_KEY = 'rv-env-user-modified';
  * the EnvironmentTab UI (as opposed to values written by a model preset).
  */
 export function hasUserEnvironmentOverride(): boolean {
-  try {
-    return localStorage.getItem(ENV_USER_KEY) === 'true';
-  } catch {
-    return false;
-  }
+  return readLocalStorage(ENV_USER_KEY) === 'true';
 }
 
 /** Mark that the user has manually customized environment settings. */
 export function markEnvironmentUserModified(): void {
-  try { localStorage.setItem(ENV_USER_KEY, 'true'); } catch { /* ignore */ }
+  writeLocalStorage(ENV_USER_KEY, 'true');
 }
 
 /** Clear the manual-modification flag (called when a model preset is applied). */
 export function clearEnvironmentUserModified(): void {
-  try { localStorage.removeItem(ENV_USER_KEY); } catch { /* ignore */ }
+  removeLocalStorage(ENV_USER_KEY);
 }
 
 /**

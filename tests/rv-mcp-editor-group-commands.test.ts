@@ -11,7 +11,9 @@
  * reflects a Kinematic added in this session.
  */
 
+import { executeValue } from './helpers/execute-value';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { queryValue } from './helpers/query-value';
 import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Scene, Group, Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
@@ -20,7 +22,6 @@ import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { GroupRegistry } from '../src/core/engine/rv-group-registry';
 import { syncSubtreeGroups } from '../src/core/engine/rv-group-sync';
 import { McpEditorTools } from '../src/plugins/mcp-bridge/rv-mcp-editor-tools';
-import { McpGroupsTools } from '../src/plugins/mcp-bridge/rv-mcp-groups-tools';
 import { setActiveAssetContext } from '../src/core/editor/active-asset-store';
 import { __clearDraftStoresForTests } from '../src/core/ops/rv-document-drafts';
 import { commandRegistry } from '../src/core/hmi/rv-command-registry';
@@ -36,7 +37,6 @@ interface Env {
   viewer: RVViewer;
   doc: AssetDocument;
   tools: McpEditorTools;
-  groupsTools: McpGroupsTools;
   groups: GroupRegistry;
   root: Group;
   selected: string[];
@@ -108,7 +108,6 @@ function makeEnv(): Env {
     viewer, doc, root, selected,
     groups: viewer.groups as GroupRegistry,
     tools: new McpEditorTools(() => viewer),
-    groupsTools: new McpGroupsTools(() => viewer),
   };
 }
 
@@ -144,11 +143,11 @@ afterEach(() => {
 // ─── Tests ──────────────────────────────────────────────────────────────
 
 describe('web_editor_group_* — schemas and bindings', () => {
-  it('announces the four verbs as writes bound to editor.group*', () => {
+  it('keeps the four group commands as writes while retiring their tool schemas', () => {
     ensureEditorCommandsRegistered();
     const names = allSchemas().map((s) => s.name);
     for (const n of ['web_editor_group_assign', 'web_editor_group_remove', 'web_editor_group_rename', 'web_editor_group_dissolve']) {
-      expect(names).toContain(n);
+      expect(names).not.toContain(n);
     }
     for (const id of [GROUP_ASSIGN_COMMAND, GROUP_REMOVE_COMMAND, GROUP_RENAME_COMMAND, GROUP_DISSOLVE_COMMAND]) {
       const d = commandRegistry.get(id);
@@ -161,20 +160,20 @@ describe('web_editor_group_* — schemas and bindings', () => {
 
 describe('web_editor_group_assign', () => {
   it('stamps a Group on the given nodes without creating a kinematic — one undoable op', async () => {
-    const r = ok(await env.tools.webEditorGroupAssign('Hood', 'Asset/Free, Asset/Part2'));
+    const r = ok(await executeValue(env.viewer, 'editor.groupAssign', { name: 'Hood', paths: 'Asset/Free, Asset/Part2' }));
     expect(r).toMatchObject({ ok: true, group: 'Hood', added: 2, skipped: 0, kinematicsUpdated: 0 });
     expect(env.groups.get('Hood')?.nodes).toHaveLength(2);
     expect(env.root.children.some((c) => c.name === 'Hood')).toBe(false);
     expect(env.doc.getSnapshot().opCount).toBe(1);
-    ok(await env.tools.webEditorUndo(1));
+    ok(await executeValue(env.viewer, 'editor.undo', { count: 1 }));
     expect(env.groups.get('Hood')).toBeUndefined();
   });
 
   it('falls back to the current selection when paths are omitted; nothing selected is refused', async () => {
-    const refused = err(await env.tools.webEditorGroupAssign('Hood', ''));
+    const refused = err(await executeValue(env.viewer, 'editor.groupAssign', { name: 'Hood', paths: '' }));
     expect(refused).toMatch(/nothing selected/i);
     env.selected.push('Asset/Free');
-    const r = ok(await env.tools.webEditorGroupAssign('Hood', ''));
+    const r = ok(await executeValue(env.viewer, 'editor.groupAssign', { name: 'Hood', paths: '' }));
     expect(r).toMatchObject({ added: 1 });
     expect(env.groups.get('Hood')?.nodes[0].name).toBe('Free');
   });
@@ -183,11 +182,11 @@ describe('web_editor_group_assign', () => {
 describe('web_editor_group_rename and _assign refuse "", "  " and "a/b" without touching the document', () => {
   for (const bad of ['', '  ', 'a/b']) {
     it(`name ${JSON.stringify(bad)}`, async () => {
-      expect(err(await env.tools.webEditorGroupAssign(bad, 'Asset/Free'))).toMatch(/empty|"\/"/);
-      expect(err(await env.tools.webEditorGroupRename('Cover', bad))).toMatch(/empty|"\/"/);
-      expect(err(await env.tools.webEditorGroupRename(bad, 'Hood'))).toMatch(/empty|"\/"/);
-      expect(err(await env.tools.webEditorGroupRemove(bad, 'Asset/Part'))).toMatch(/empty|"\/"/);
-      expect(err(await env.tools.webEditorGroupDissolve(bad))).toMatch(/empty|"\/"/);
+      expect(err(await executeValue(env.viewer, 'editor.groupAssign', { name: bad, paths: 'Asset/Free' }))).toMatch(/empty|"\/"/);
+      expect(err(await executeValue(env.viewer, 'editor.groupRename', { name: 'Cover', newName: bad }))).toMatch(/empty|"\/"/);
+      expect(err(await executeValue(env.viewer, 'editor.groupRename', { name: bad, newName: 'Hood' }))).toMatch(/empty|"\/"/);
+      expect(err(await executeValue(env.viewer, 'editor.groupRemove', { name: bad, paths: 'Asset/Part' }))).toMatch(/empty|"\/"/);
+      expect(err(await executeValue(env.viewer, 'editor.groupDissolve', { name: bad }))).toMatch(/empty|"\/"/);
       expect(env.doc.getSnapshot().opCount).toBe(0);
       expect(env.doc.dirty).toBe(false);
     });
@@ -196,35 +195,35 @@ describe('web_editor_group_rename and _assign refuse "", "  " and "a/b" without 
 
 describe('web_editor_group_rename', () => {
   it('dispatches editor.groupRename: members AND the owning Kinematic, one undoable op', async () => {
-    const r = ok(await env.tools.webEditorGroupRename('Axis1', 'Axis1_Rot'));
+    const r = ok(await executeValue(env.viewer, 'editor.groupRename', { name: 'Axis1', newName: 'Axis1_Rot' }));
     expect(r).toMatchObject({ ok: true, group: 'Axis1_Rot', previous: 'Axis1', renamed: 2, kinematicsUpdated: 1 });
     expect(env.groups.get('Axis1')).toBeUndefined();
     expect(env.groups.get('Axis1_Rot')?.nodes).toHaveLength(2);
     expect(rvOf(env, 'Asset/Axis1').Kinematic.GroupName).toBe('Axis1_Rot');
     expect(env.doc.getSnapshot().opCount).toBe(1);
-    ok(await env.tools.webEditorUndo(1));
+    ok(await executeValue(env.viewer, 'editor.undo', { count: 1 }));
     expect(env.groups.get('Axis1')?.nodes).toHaveLength(2);
     expect(rvOf(env, 'Asset/Axis1').Kinematic.GroupName).toBe('Axis1');
   });
 
   it('refuses a collision (registry and kinematic names) and an unknown group — nothing recorded', async () => {
-    expect(err(await env.tools.webEditorGroupRename('Cover', 'Axis1'))).toMatch(/already exists/);
-    expect(err(await env.tools.webEditorGroupRename('Nope', 'Hood'))).toMatch(/Unknown group/);
+    expect(err(await executeValue(env.viewer, 'editor.groupRename', { name: 'Cover', newName: 'Axis1' }))).toMatch(/already exists/);
+    expect(err(await executeValue(env.viewer, 'editor.groupRename', { name: 'Nope', newName: 'Hood' }))).toMatch(/Unknown group/);
     expect(env.doc.getSnapshot().opCount).toBe(0);
   });
 
   it('same name is a no-op without an op', async () => {
-    const r = ok(await env.tools.webEditorGroupRename('Cover', 'Cover'));
+    const r = ok(await executeValue(env.viewer, 'editor.groupRename', { name: 'Cover', newName: 'Cover' }));
     expect(r).toMatchObject({ group: 'Cover', renamed: 0, kinematicsUpdated: 0 });
     expect(env.doc.getSnapshot().opCount).toBe(0);
   });
 
   it('refuses a new name that would drop a prefixed key\'s prefix (case c)', async () => {
-    expect(err(await env.tools.webEditorGroupRename('FenceLeft', 'Hood'))).toMatch(/drop prefix "Fence" on Asset\/A/);
+    expect(err(await executeValue(env.viewer, 'editor.groupRename', { name: 'FenceLeft', newName: 'Hood' }))).toMatch(/drop prefix "Fence" on Asset\/A/);
     expect(env.doc.getSnapshot().opCount).toBe(0);
     expect(env.groups.get('FenceLeft')?.nodes).toHaveLength(2);
     // Keeping the prefix is fine: per-key suffix on A, full name on B.
-    ok(await env.tools.webEditorGroupRename('FenceLeft', 'FenceRight'));
+    ok(await executeValue(env.viewer, 'editor.groupRename', { name: 'FenceLeft', newName: 'FenceRight' }));
     expect(rvOf(env, 'Asset/A').Group.GroupName).toBe('Right');
     expect(rvOf(env, 'Asset/B').Group.GroupName).toBe('FenceRight');
   });
@@ -232,44 +231,44 @@ describe('web_editor_group_rename', () => {
 
 describe('web_editor_group_remove', () => {
   it('strips the matching Group keys, keeps other groups, reports non-members as skipped', async () => {
-    const r = ok(await env.tools.webEditorGroupRemove('Cover', 'Asset/Part, Asset/Part2'));
+    const r = ok(await executeValue(env.viewer, 'editor.groupRemove', { name: 'Cover', paths: 'Asset/Part, Asset/Part2' }));
     expect(r).toMatchObject({ ok: true, group: 'Cover', removed: 1, skipped: 1 });
     expect(rvOf(env, 'Asset/Part').Group_1).toBeUndefined();
     expect(rvOf(env, 'Asset/Part').Group.GroupName).toBe('Axis1');
     expect(env.groups.get('Cover')?.nodes).toHaveLength(1);
-    ok(await env.tools.webEditorUndo(1));
+    ok(await executeValue(env.viewer, 'editor.undo', { count: 1 }));
     expect(env.groups.get('Cover')?.nodes).toHaveLength(2);
   });
 
   it('refuses an unknown group', async () => {
-    expect(err(await env.tools.webEditorGroupRemove('Nope', 'Asset/Part'))).toMatch(/Unknown group/);
+    expect(err(await executeValue(env.viewer, 'editor.groupRemove', { name: 'Nope', paths: 'Asset/Part' }))).toMatch(/Unknown group/);
     expect(env.doc.getSnapshot().opCount).toBe(0);
   });
 });
 
 describe('web_editor_group_dissolve', () => {
   it('removes the members\' Group keys and clears the Kinematic link; undo restores both', async () => {
-    const r = ok(await env.tools.webEditorGroupDissolve('Axis1'));
+    const r = ok(await executeValue(env.viewer, 'editor.groupDissolve', { name: 'Axis1' }));
     expect(r).toMatchObject({ ok: true, group: 'Axis1', dissolved: 2, kinematicsUpdated: 1 });
     expect(env.groups.get('Axis1')).toBeUndefined();
     expect(rvOf(env, 'Asset/Axis1').Kinematic.GroupName).toBe('');
     expect(rvOf(env, 'Asset/Part').Group_1.GroupName).toBe('Cover');
     expect(env.viewer.registry!.getNode('Asset/Part')).not.toBeNull();
     expect(env.doc.getSnapshot().opCount).toBe(1);
-    ok(await env.tools.webEditorUndo(1));
+    ok(await executeValue(env.viewer, 'editor.undo', { count: 1 }));
     expect(env.groups.get('Axis1')?.nodes).toHaveLength(2);
     expect(rvOf(env, 'Asset/Axis1').Kinematic.GroupName).toBe('Axis1');
   });
 
   it('refuses an unknown group', async () => {
-    expect(err(await env.tools.webEditorGroupDissolve('Nope'))).toMatch(/Unknown group/);
+    expect(err(await executeValue(env.viewer, 'editor.groupDissolve', { name: 'Nope' }))).toMatch(/Unknown group/);
     expect(env.doc.getSnapshot().opCount).toBe(0);
   });
 });
 
 describe('web_group_list.kinematic', () => {
   it('reflects a Kinematic added this session (live scan OR load-time flag)', async () => {
-    const before = JSON.parse(await env.groupsTools.webGroupList()) as { groups: { name: string; kinematic: boolean }[] };
+    const before = JSON.parse(await queryValue(env.viewer, 'group.list')) as { groups: { name: string; kinematic: boolean }[] };
     expect(before.groups.find((g) => g.name === 'Cover')?.kinematic).toBe(false);
     expect(before.groups.find((g) => g.name === 'Axis1')?.kinematic).toBe(true);    // never marked by a loader
     expect(env.groups.isKinematic('Axis1')).toBe(false);
@@ -278,12 +277,12 @@ describe('web_group_list.kinematic', () => {
     // schema registry of this fixture knows no `Kinematic`, so not via the tool).
     env.doc.addComponent('Asset/Free', 'Kinematic', { GroupName: 'Cover' });
     await env.doc.whenIdle();
-    const after = JSON.parse(await env.groupsTools.webGroupList()) as { groups: { name: string; kinematic: boolean }[] };
+    const after = JSON.parse(await queryValue(env.viewer, 'group.list')) as { groups: { name: string; kinematic: boolean }[] };
     expect(after.groups.find((g) => g.name === 'Cover')?.kinematic).toBe(true);
 
     // The load-time mark still counts on its own (baked HMI models, no Kinematic in the scene).
     env.groups.markAsKinematic('FenceLeft');
-    const marked = JSON.parse(await env.groupsTools.webGroupList()) as { groups: { name: string; kinematic: boolean }[] };
+    const marked = JSON.parse(await queryValue(env.viewer, 'group.list')) as { groups: { name: string; kinematic: boolean }[] };
     expect(marked.groups.find((g) => g.name === 'FenceLeft')?.kinematic).toBe(true);
   });
 });

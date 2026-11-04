@@ -22,13 +22,18 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
  * on top of it.
  */
 const HANDLES = new Map<string, FileSystemDirectoryHandle>();
+/** Makes the fake store's delete reject, as a real IndexedDB failure would. */
+const STORE = { failDelete: false };
 
 vi.mock('../src/core/engine/rv-local-filesystem', () => ({
   projectHandleKey: (id: string) => `projectfolder:${id}`,
   listHandleKeys: async () => [...HANDLES.keys()],
   getHandle: async (key: string) => HANDLES.get(key) ?? null,
   putHandle: async (h: FileSystemDirectoryHandle, key: string) => { HANDLES.set(key, h); },
-  deleteStoredHandle: async (key: string) => { HANDLES.delete(key); },
+  deleteStoredHandle: async (key: string) => {
+    if (STORE.failDelete) throw new Error('IndexedDB delete failed');
+    HANDLES.delete(key);
+  },
 }));
 
 const {
@@ -59,6 +64,7 @@ async function link(id: string, folder: string, marker = folder): Promise<void> 
 beforeEach(() => {
   localStorage.removeItem(LS_KEY_LINKED_PROJECTS);
   HANDLES.clear();
+  STORE.failDelete = false;
 });
 
 describe('listLinkedProjects ordering', () => {
@@ -132,6 +138,19 @@ describe('unlinkProject / relinkProject', () => {
     // Both halves, or the orphan fallback would put the project straight back
     // into the list under "Untitled project".
     expect(await getHandle(projectHandleKey('p_gone'))).toBeNull();
+  });
+
+  it('a failing handle delete keeps the row, never an orphan handle', async () => {
+    recordLinkedProject({ id: 'p_stuck', name: 'Stuck' });
+    await link('p_stuck', 'stuck-folder');
+    STORE.failDelete = true;
+
+    await expect(unlinkProject('p_stuck')).rejects.toThrow('IndexedDB delete failed');
+
+    // Row gone with the handle left would resurface as "Untitled project";
+    // both staying lets the verb report the failure and be retried.
+    expect(readLinkedProjects().map(r => r.id)).toContain('p_stuck');
+    expect(await getHandle(projectHandleKey('p_stuck'))).not.toBeNull();
   });
 
   it('relink replaces only the handle and leaves the row identical', async () => {

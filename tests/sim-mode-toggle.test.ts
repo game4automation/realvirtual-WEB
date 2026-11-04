@@ -19,6 +19,10 @@
  * private) lives in `sim-mode-toggle.node.test.ts` (node-mode, fs-based).
  */
 
+import { createElement } from 'react';
+import { render, cleanup, waitFor, act } from '@testing-library/react';
+import { SimModeToggle } from '../src/plugins/sim-controller/SimModeToggle';
+import { acquireRunLease } from '../src/core/hmi/rv-run-lease';
 import { describe, it, expect } from 'vitest';
 import {
   SimulationKernel,
@@ -197,4 +201,26 @@ describe('SimControllerPlugin — toolbar slots', () => {
     expect(leading.length).toBe(1);
     expect(leading[0].order).toBe(10);
   });
+});
+
+it('disables DES sub-mode controls on lease changes and running batch progress', async () => {
+  const ctl = makeFakeDesControlExecutor([]);
+  let running = false;
+  ctl.batchProgressJson = () => running ? JSON.stringify({ exp: 'Base', replIndex: 1, total: 1, phase: 'running' }) : null;
+  const viewer = { simulationKernel: { mode: 'des', isSwitching: false, hasDesRunner: () => true, desControl: () => ctl }, on: () => () => {} };
+  const ui = render(createElement(SimModeToggle, { viewer } as never));
+  const controls = ['animated', 'hybrid', 'hybrid-multiplier', 'fastforward', 'step'];
+  const check = (disabled: boolean) => controls.forEach(id => expect((ui.getByTestId(`sim-submode-${id}`) as HTMLButtonElement).disabled).toBe(disabled));
+  const lease = { current: null as ReturnType<typeof acquireRunLease> };
+  try {
+    check(false);
+    act(() => { lease.current = acquireRunLease('toggle-test', 'des-batch'); });
+    check(true);
+    act(() => { lease.current?.release(); lease.current = null; });
+    check(false);
+    running = true;
+    await waitFor(() => check(true));
+    running = false;
+    await waitFor(() => check(false));
+  } finally { lease.current?.release(); cleanup(); }
 });

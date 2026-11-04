@@ -103,7 +103,22 @@ export class ConnectionSystemPlugin implements RVViewerPlugin {
     result.root.traverse((node) => {
       const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
       if (!rv || rv.Connections === undefined) return;
-      const p = parseConnectionsExtras(rv.Connections);
+      const p = parseConnectionsExtras(rv.Connections, node);
+      // plan-769 Phase 1b: `source` / `target` are stored paths of this node's
+      // file — read by the file's verdict and kept as the node's REGISTRY path, so
+      // every later lookup (`outOf`, the cable gizmo) is exact. A path the file
+      // does not carry (or an unresolved one) stays as written.
+      const reg = viewer.registry;
+      if (reg) {
+        const canonical = (path: string): string => {
+          const r = reg.readStoredRef(node, path);
+          return r.status === 'resolved' ? (reg.getPathForNode(r.node) ?? path) : path;
+        };
+        for (const c of p.connections) {
+          c.source = canonical(c.source);
+          c.target = canonical(c.target);
+        }
+      }
       parsed.connections.push(...p.connections);
       parsed.connectionTypes.push(...p.connectionTypes);
     });

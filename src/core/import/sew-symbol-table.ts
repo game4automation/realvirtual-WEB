@@ -60,6 +60,17 @@ export interface SewSymbolError {
 export interface SewImportResult {
   rows: SewSymbolRow[];
   errors: SewSymbolError[];
+  /** Empty names with a valid fixed-size type/direction; still reported in errors. */
+  reservedRows: SewSymbolRow[];
+}
+
+/** A fixed-size CONNECT UDP signal, ready for an interface's signals array. */
+export interface UdpImportSignal {
+  protocolAddress: string;
+  name: string;
+  type: string;
+  dataType: string;
+  record: boolean;
 }
 
 /** A CONNECT signal entry as the Json topic mode expects it (no address). */
@@ -185,6 +196,7 @@ export function parseSewSymbolTable(text: string): SewImportResult {
   const lines = text.split(/\r?\n/);
   const rows: SewSymbolRow[] = [];
   const errors: SewSymbolError[] = [];
+  const reservedRows: SewSymbolRow[] = [];
 
   let headerSeen = false;
   for (let i = 0; i < lines.length; i++) {
@@ -200,18 +212,23 @@ export function parseSewSymbolTable(text: string): SewImportResult {
     }
 
     const name = fields[0];
+    const type = TYPE_MAP[fields[1].toUpperCase()];
+    const dirRaw = fields[2].toUpperCase();
     if (name.length === 0) {
+      // UdpSymbolTable.cs counts bytes only after validating type and direction.
+      // Keep the existing MQTT error and rows unchanged, including for TEXT.
+      if (type && type !== 'TEXT' && (dirRaw === 'PLC_IN' || dirRaw === 'PLC_OUT')) {
+        reservedRows.push({ name, type, direction: dirRaw, line });
+      }
       errors.push({ line, reason: 'Missing signal name' });
       continue;
     }
 
-    const type = TYPE_MAP[fields[1].toUpperCase()];
     if (!type) {
       errors.push({ line, reason: `Unknown data type "${fields[1]}"` });
       continue;
     }
 
-    const dirRaw = fields[2].toUpperCase();
     if (dirRaw !== 'PLC_IN' && dirRaw !== 'PLC_OUT') {
       errors.push({ line, reason: `Unknown direction "${fields[2]}" (expected PLC_IN or PLC_OUT)` });
       continue;
@@ -220,7 +237,64 @@ export function parseSewSymbolTable(text: string): SewImportResult {
     rows.push({ name, type, direction: dirRaw, line });
   }
 
-  return { rows, errors };
+  return { rows, errors, reservedRows };
+}
+
+// ── Row → UDP signals ───────────────────────────────────────────────────────
+
+/**
+ * Mirror CONNECT Protocols/Udp/UdpSymbolTable.cs: no alignment, separate send
+ * and receive offsets, and case-sensitive names shared across both directions.
+ * Parser errors remain in result.errors; skipped reports builder rejections.
+ * Unlike C# Browse, filter oversized addresses here rather than at validation.
+ */
+export function buildUdpSignalsFromSewRows(result: SewImportResult): {
+  signals: UdpImportSignal[];
+  skipped: { line: number; name: string; reason: string }[];
+} {
+  const signals: UdpImportSignal[] = [];
+  const skipped: { line: number; name: string; reason: string }[] = [];
+  const names = new Set<string>();
+  let sendOffset = 0;
+  let receiveOffset = 0;
+
+  for (const row of [...result.rows, ...result.reservedRows].sort((a, b) => a.line - b.line)) {
+    const skip = (reason: string) => skipped.push({ line: row.line, name: row.name, reason });
+    if (row.type === 'TEXT') {
+      skip('no fixed size in a UDP telegram');
+      continue;
+    }
+
+    const size = row.type === 'BOOL' ? 1 : 4;
+    const offset = row.direction === 'PLC_IN' ? sendOffset : receiveOffset;
+    const end = offset + size;
+    if (row.direction === 'PLC_IN') sendOffset = end;
+    else receiveOffset = end;
+
+    if (row.name.length === 0) {
+      skip('missing name — bytes reserved');
+      continue;
+    }
+    if (names.has(row.name)) {
+      skip('duplicate name — bytes reserved');
+      continue;
+    }
+    // C# registers the name before address validation, including oversized fields.
+    names.add(row.name);
+    if (end > 65507) {
+      skip('beyond the largest UDP datagram (65507 bytes)');
+      continue;
+    }
+
+    signals.push({
+      protocolAddress: `${offset}:${row.type}`,
+      name: row.name,
+      type: sewWireType(row.type, row.direction),
+      dataType: row.type,
+      record: false,
+    });
+  }
+  return { signals, skipped };
 }
 
 // ── Row → Json topics ───────────────────────────────────────────────────────

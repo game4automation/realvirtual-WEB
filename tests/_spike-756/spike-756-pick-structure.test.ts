@@ -11,8 +11,29 @@ import {
   type PickStructure, type PickTree, type SegmentIn,
 } from './spike-pick-structure';
 import { makeRandom, mergeScene, makeThinSheet, makeFilletPart, type Merged } from './spike-geometry';
+import { devAssetAvailable } from '../fixtures/dev-asset-available';
 
 const MAUSER_URL = '/private-models/mauser3dhmi/mausercagelinenosource.glb';
+/**
+ * The Mauser GLB is a gitignored customer asset and exists in no checkout, so
+ * the one case that loads it must report `skipped` rather than fail.
+ *
+ * The probe — not `res.ok` — decides: the dev server answers every unknown path
+ * with the HTML SPA fallback (`200 text/html`), so `res.ok` is `true` for a file
+ * that is not there. Put the GLB at
+ * `realvirtual-WebViewer-Private~/projects/mauser3dhmi/models/mausercagelinenosource.glb`
+ * (the `/private-models/<project>/` mount of vite.config.ts) and the case runs,
+ * and can fail, again.
+ */
+const MAUSER_AVAILABLE = await devAssetAvailable(MAUSER_URL);
+/**
+ * The skip note, through `ctx.skip(note)` rather than `it.skipIf`: only a note
+ * reaches `[test-skips]` as `TestCase.result().note` — a `skipIf` would be
+ * listed as `no reason given` (see tests/helpers/webgpu-adapter-skip.ts).
+ */
+const MAUSER_SKIP_REASON =
+  `${MAUSER_URL} is not served — gitignored customer GLB, in no checkout; `
+  + 'put it in realvirtual-WebViewer-Private~/projects/mauser3dhmi/models/ to run this case';
 const REL_TOL = 1e-4;
 
 function log(row: Record<string, unknown>): void { console.log('SPIKE756 ' + JSON.stringify(row)); }
@@ -337,7 +358,8 @@ describe('SPIKE plan-756 — flat-cluster pick structure', () => {
     expect(await run(fillet, { clusterSizes: [128], nRays: 10000, bruteCheck: 300 })).toBe(0);
   }, 1_800_000);
 
-  it('Mauser cage line (real GLB)', async () => {
+  it('Mauser cage line (real GLB)', async (ctx) => {
+    if (!MAUSER_AVAILABLE) ctx.skip(MAUSER_SKIP_REASON);
     let t = performance.now();
     const res = await fetch(MAUSER_URL);
     expect(res.ok).toBe(true);

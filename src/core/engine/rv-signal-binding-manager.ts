@@ -62,6 +62,10 @@ import {
   type SlotId,
 } from './rv-slot-authority';
 import { signalSourceKey } from './rv-signal-provider';
+import { fromStoredMapping } from './rv-signal-mapping-address';
+
+/** plan-769 F19: the slot path of a mapping whose `componentAddress` names no node — matches no slot. */
+const UNRESOLVED_ADDRESS_PREFIX = '\u0000unresolved-address:';
 
 /** Default reconnect-hold window in milliseconds. */
 export const DEFAULT_HOLD_MS = 800;
@@ -526,7 +530,7 @@ export class SignalBindingManager {
   applyMappings(placedId: string, node: Object3D, mappings: readonly SignalMapping[]): SignalMapping[] {
     this._unbindAllSilent(placedId);
     const entry = this._ensureElement(placedId, node);
-    const { applied, unresolved } = this._resolveMappings(entry.slots, mappings);
+    const { applied, unresolved } = this._resolveMappings(entry.slots, this._readMappings(node, mappings));
     // Set unconditionally: an element that resolves cleanly must CLEAR a stale
     // finding from an earlier load, or a repaired binding keeps being reported.
     if (unresolved.length > 0) this._unresolved.set(placedId, unresolved);
@@ -546,7 +550,31 @@ export class SignalBindingManager {
   previewMappings(placedId: string, node: Object3D, mappings: readonly SignalMapping[]): SignalMapping[] {
     const slots = this._elements.get(placedId)?.slots
       ?? resolveBindableSlots(node, this._store, this._registry, this.getElementScope(placedId));
-    return this._resolveMappings(slots, mappings).applied;
+    return this._resolveMappings(slots, this._readMappings(node, mappings)).applied;
+  }
+
+  /**
+   * plan-769 F19 (Phase 1 — read only): migrate persisted mappings ON READ, in
+   * memory. A mapping in the address form (`componentAddress`, no `componentPath`)
+   * gets the slot path its address names under the bind target; one whose address
+   * names nothing gets a path no slot has, so it lands in the unresolved findings
+   * instead of binding by slot name alone. COPIES — the persisted records (layout
+   * store, SignalLinks extras) are never touched; nothing is written (F17).
+   */
+  private _readMappings(node: Object3D, mappings: readonly SignalMapping[]): readonly SignalMapping[] {
+    if (!mappings.some((m) => (m.componentPath === undefined && typeof m.componentAddress === 'string' && m.componentAddress)
+      || (m.sourceKind === 'internal' && typeof m.sourceAddress === 'string' && m.sourceAddress))) {
+      return mappings;
+    }
+    // plan-769 F15 (Phase 3b): the one reader of the stored form — the component by its
+    // address, an internal source by its node's current signal name.
+    return mappings.map((m) => {
+      const out = fromStoredMapping(m, node, this._registry, this._store);
+      if (out.componentPath === undefined && typeof out.componentAddress === 'string' && out.componentAddress) {
+        out.componentPath = `${UNRESOLVED_ADDRESS_PREFIX}${out.componentAddress}`;
+      }
+      return out;
+    });
   }
 
   /** The resolve loop shared by applyMappings and previewMappings — pure over `slots`. */

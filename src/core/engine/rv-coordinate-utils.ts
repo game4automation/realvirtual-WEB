@@ -37,6 +37,49 @@ export function unityPositionToGltf(x: number, y: number, z: number): Vector3 {
   return new Vector3(-x, y, z);
 }
 
+// ─── Frame Conversion (glTF ⇄ Unity), in place ───────────────────────
+
+/**
+ * Mirror a POSITION between the glTF (right-handed) and the Unity
+ * (left-handed) frame, in place: `(x, y, z) → (-x, y, z)`.
+ *
+ * The map is its own inverse, so one function serves both directions — which
+ * is why it is named "mirror" and not "toUnity".
+ *
+ * In place and on a tuple on purpose (plan-772 F5): the IK solve path writes
+ * into pre-allocated tuples and must not allocate per solve.
+ *
+ * Use it wherever a pose crosses INTO or OUT OF the Unity frame — the frame
+ * the serialized OPW parameters and the Pieper solver core live in. Before
+ * plan-772 this mirror existed only as an accident: `targetPoseInBase()`
+ * divided the position by the decomposed scale, and `Matrix4.decompose()`
+ * puts a negative determinant's sign on `scale.x`, so a target node authored
+ * with a mirrored scale got the X flip and every other target did not
+ * (measured: 91.56° off on an unmirrored demo target, 178.9° on a scaled one).
+ */
+export function mirrorPositionGltfUnity(out: [number, number, number]): void {
+  out[0] = -out[0];
+}
+
+/**
+ * Mirror a ROTATION quaternion between the glTF and the Unity frame, in
+ * place: `(x, y, z, w) → (x, -y, -z, w)` — the conversion derived at the top
+ * of this file, and likewise its own inverse.
+ *
+ * Why it was never missed: the map is conjugation by the unit quaternion `i`,
+ * so it leaves every rotation about X unchanged AND maps any 180° rotation
+ * about an axis in the YZ plane to its own negative, which is the SAME
+ * rotation. Tool frames are usually exactly that (flipped 180°, or rolled
+ * about the tool axis), so the demo targets agreed with Unity without it —
+ * until one did not: the six targets of the IRB's second demo path were a
+ * constant 60.00° off, and this conversion is what brings them to 0.00°
+ * (plan-772 Phase 3 measurement).
+ */
+export function mirrorQuaternionGltfUnity(out: [number, number, number, number]): void {
+  out[1] = -out[1];
+  out[2] = -out[2];
+}
+
 // ─── Direction Conversion ────────────────────────────────────────────
 
 /** Unity DIRECTION enum values (serialized as strings in GLB extras) */

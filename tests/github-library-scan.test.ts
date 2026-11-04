@@ -87,9 +87,9 @@ describe('isGitHubCatalogUrl (opt-in gate — never auto-loaded/persisted)', () 
   });
   it('does NOT match the bundled local library or other remote hosts', () => {
     expect(isGitHubCatalogUrl('bundled://library')).toBe(false);
-    expect(isGitHubCatalogUrl('/models/library/catalog.json')).toBe(false);
+    expect(isGitHubCatalogUrl('/models/partner/catalog.json')).toBe(false);
     expect(isGitHubCatalogUrl('https://example.com/lib/catalog.json')).toBe(false);
-    expect(isGitHubCatalogUrl('https://cdn.realvirtual.io/library/catalog.json')).toBe(false);
+    expect(isGitHubCatalogUrl('https://cdn.realvirtual.io/partner/catalog.json')).toBe(false);
   });
 });
 

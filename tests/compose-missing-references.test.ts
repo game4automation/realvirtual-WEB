@@ -370,7 +370,10 @@ describe('§9.10 — a save does not lose the broken reference', () => {
       expectedNames: loaded.registry.getGltfNodeNames(),
     });
 
-    const after = jsonNodeNamed(baked.glb, 'Roll_0');
+    // plan-769 Phase 3b: the save stamps the node's id — everything else byte-identical.
+    const after = jsonNodeNamed(baked.glb, 'Roll_0') as { extras?: { realvirtual?: Record<string, unknown> } };
+    expect(typeof after.extras?.realvirtual?.NodeId).toBe('string');
+    delete after.extras!.realvirtual!.NodeId;
     expect(JSON.stringify(after)).toBe(JSON.stringify(before));
   });
 

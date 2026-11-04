@@ -64,6 +64,9 @@ function setup(page: PageContext = HOSTED) {
   (plugin as unknown as { viewer: unknown }).viewer = viewer;
   const p = plugin as unknown as Internals;
   vi.spyOn(p, '_pageContext').mockReturnValue(page);
+  // plan-668: these tests drive the channel of a tab with AI control on (the
+  // pre-668 "enabled" bridge); channel-without-AI cases live in mcp-bridge-ai-gate.
+  (plugin as unknown as { _aiEnabled: boolean })._aiEnabled = true;
   return { plugin, p, viewer };
 }
 
@@ -361,12 +364,25 @@ describe('target through the real plugin (_resolveTarget)', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('dev server → localhost CONNECT on the default port, no probe', () => {
+  // SolidCraft autostart fix 2026-10-22: a dev page probes its own origin, because the CONNECT dev
+  // proxy sets no marker cookie — a bare Vite page (no CONNECT signature) keeps localhost:5100 ...
+  it('dev server without CONNECT behind its origin → localhost CONNECT on the default port', async () => {
     const calls = stubFetch(() => fakeResponse(500, ''));
     const { p } = setup(DEV);
     p._connect();
+    await flush();
+    expect(calls.map((c) => c.url)).toEqual(['http://localhost:15363/health']);
     expect(ws.last.url).toBe('ws://localhost:5100/webviewer');
-    expect(calls).toHaveLength(0);
+  });
+
+  // ... and a dev page served through a (worktree) CONNECT talks to THAT CONNECT, not to 5100.
+  it('dev server served through the CONNECT proxy → same-origin bridge', async () => {
+    stubFetch(() => fakeResponse(200, { status: 'ok', version: '1.5.0' }));
+    const { plugin, p } = setup(DEV);
+    p._connect();
+    await flush();
+    expect(ws.last.url).toBe('ws://localhost:15363/webviewer');
+    expect(plugin.getSnapshot().target).toBe('ws://localhost:15363/webviewer');
   });
 
   it('hosted + same-origin /health 404 → localhost:5100', async () => {
@@ -407,7 +423,10 @@ describe('target through the real plugin (_resolveTarget)', () => {
     expect(ws.instances).toHaveLength(2);
   });
 
-  it('no probe while the bridge is disabled (never on page load)', async () => {
+  // plan-668: with AI off the page still asks its OWN origin once (same-origin,
+  // no Local Network Access prompt) whether CONNECT serves it — a hosted page
+  // answers no, so no socket opens and nothing goes to localhost.
+  it('AI off on a hosted page: one same-origin probe, never a socket', async () => {
     const calls = stubFetch(() => fakeResponse(404, 'x', 'text/plain'));
     const { plugin } = setup(HOSTED);
     (plugin as unknown as { init: (v: unknown) => void }).init(
@@ -416,8 +435,9 @@ describe('target through the real plugin (_resolveTarget)', () => {
     plugin.getSnapshot();
     await flush();
     expect(plugin.mcpEnabled).toBe(false);
-    expect(calls).toHaveLength(0);
+    expect(calls.map((c) => c.url)).toEqual(['https://web.realvirtual.io/health']);
     expect(ws.instances).toHaveLength(0);
+    expect(plugin.getSnapshot().channelReason).toBe('none');
   });
 
   it('the snapshot target never carries the key', () => {

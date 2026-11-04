@@ -9,7 +9,7 @@
  * deterministically with `_tickOnce` (60 Hz). The GLB carries
  * `ConnectionMode { StartMode: 'Simulation' }` (plan-539 F15), so the viewer
  * starts disconnected by itself. The station control is the virtual PLC: eleven
- * Structured Text programs (PLC_Programs/*, auto-started on load) that write
+ * Structured Text programs (PLC/*, auto-started on load) that write
  * only while `RV_SimulationMode` is TRUE; plant roots (`Logic_Plant_*`, Active:
  * Always) keep running in commissioning. Commissioning cases connect like a
  * live PLC interface does (connect + first write to a model `%Q`, F15b); its disconnect
@@ -24,6 +24,8 @@
  * The scene graph is updated after every tick (`scene.updateMatrixWorld()`),
  * as the render loop does in the live viewer — transport surfaces riding a
  * lift read their world matrix from it.
+ * A per-test wall-clock guard checks every 60 ticks because synchronous loops
+ * block the browser runner's timeout; the guard is disabled during beforeAll.
  *
  * plan-570 (customer topology, edited in the WEB editor): `Transport01` drives the
  * lower return conveyor, `Transport02` the upper main conveyor; Stopper01
@@ -32,7 +34,7 @@
  * gone. Every cylinder runs in its valve mode (DoubleActing / SingleActingPositive).
  */
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { PlcPlugin } from '@rv-private/plugins/plc/plc-plugin';
 import { registerPlcProgramComponent } from '@rv-private/plc/rv-plc-program';
 import { getPlcRuntime } from '../src/core/plc-control';
@@ -59,7 +61,13 @@ interface Root extends RVLogicStep { name: string; completedCycles: number; curr
 
 let handle: TestViewerHandle;
 let viewer: RVViewer;
+let plc: PlcPlugin;
 let simTime = 0;
+let deadline = Infinity;
+let testStartedAt = 0;
+let testTimeout = 120_000;
+let testName = '';
+let budgetTicks = 0;
 
 // ── Harness ──────────────────────────────────────────────────────────────
 
@@ -91,6 +99,12 @@ function resetCycleCounts(): void {
 function tick(seconds: number, each?: () => void): void {
   const n = Math.max(1, Math.round(seconds / DT));
   for (let i = 0; i < n; i++) {
+    if (budgetTicks++ % 60 === 0) {
+      const now = performance.now();
+      if (now > deadline) {
+        throw new Error(`wall-clock budget exceeded: ${testName} ran ${((now - testStartedAt) / 1000).toFixed(1)} s, its timeout is ${testTimeout / 1000} s, at sim time ${simTime.toFixed(2)} s — the synchronous tick loop blocks the browser runner, which cannot enforce the timeout itself`);
+      }
+    }
     v()._tickOnce(DT);
     viewer.scene.updateMatrixWorld();
     simTime += DT;
@@ -114,13 +128,13 @@ function expectPlcHealthy(label = ''): void {
   }
   expect(getPlcRuntime()!.conflicts(), `${label} outputs written by two programs`).toEqual([]);
 }
-/** Waits (wall clock) until every program runs again — deploy and reset are asynchronous. */
-async function plcRunning(): Promise<void> {
-  for (let i = 0; i < 300; i++) {
-    const progs = plcPrograms();
-    if (progs.length === PROGRAMS.length && progs.every((p) => p.state === 'running')) return;
-    await new Promise((r) => setTimeout(r, 50));
-  }
+/**
+ * Every program runs — the final state check after `whenProgramsReady()` / `whenResetSettled()`
+ * (plan-602 F11: the plugin's own promises, no wall-clock polling).
+ */
+function plcRunning(): void {
+  const progs = plcPrograms();
+  if (progs.length === PROGRAMS.length && progs.every((p) => p.state === 'running')) return;
   throw new Error(`PLC programs not running: ${JSON.stringify(plcPrograms().map((p) => [p.name, p.state, p.lastError]))}`);
 }
 
@@ -159,7 +173,8 @@ async function restart(): Promise<void> {
   expect(viewer.connectionState, 'Simulation start mode').toBe('Disconnected');
   tick(DT); // the logic engine takes the connection state over on its next tick
   viewer.resetSimulation(); // also a COLD reset of every PLC program (asynchronous)
-  await plcRunning();
+  await plc.whenResetSettled();
+  plcRunning();
   tick(DT);
   resetCycleCounts();
 }
@@ -249,13 +264,14 @@ beforeAll(async () => {
   // The virtual PLC as the internal build wires it (features/plc.register):
   // component first, so the PLCProgram nodes are constructed during the load.
   registerPlcProgramComponent();
-  viewer.use(new PlcPlugin(), 'internal');
+  plc = new PlcPlugin();
+  viewer.use(plc, 'internal');
   await viewer.loadModel(MODEL);
-  // Let the asynchronous post-load work settle (scene ready + one wall-clock
-  // beat), as the live viewer has before a user acts.
+  // Let the asynchronous post-load work settle — the scene, and the auto-start of
+  // the Active programs (plan-602 F11: state, not a wall-clock beat).
   await viewer.whenSceneReady();
-  await new Promise((r) => setTimeout(r, 500));
-  await plcRunning(); // auto-start of the Active programs is asynchronous
+  await plc.whenProgramsReady();
+  plcRunning();
   // Online view: VAR values (the step of every chain) in the watch — for the timeout diagnostics.
   for (const p of PROGRAMS) getPlcRuntime()!.program(p)!.setOnlineView?.(true);
   viewer.scene.updateMatrixWorld();
@@ -263,6 +279,18 @@ beforeAll(async () => {
 }, 240_000);
 
 afterAll(() => handle?.dispose());
+
+beforeEach((ctx) => {
+  testStartedAt = performance.now();
+  testTimeout = ctx.task.timeout ?? 120_000;
+  testName = ctx.task.name;
+  deadline = testStartedAt + testTimeout;
+  budgetTicks = 0;
+});
+
+afterEach(() => {
+  deadline = Infinity;
+});
 
 // ── 1. Simulation ────────────────────────────────────────────────────────
 

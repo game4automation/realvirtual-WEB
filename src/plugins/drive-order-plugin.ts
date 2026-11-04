@@ -20,6 +20,7 @@ import type { RVViewer } from '../core/rv-viewer';
 import type { LoadResult } from '../core/engine/rv-scene-loader';
 import type { RVDrive } from '../core/engine/rv-drive';
 import { NodeRegistry } from '../core/engine/rv-node-registry';
+import { storedReferenceValue } from '../core/engine/rv-node-path-rewrite.mjs';
 
 export class DriveOrderPlugin implements RVViewerPlugin {
   readonly id = 'drive-order';
@@ -51,7 +52,7 @@ export class DriveOrderPlugin implements RVViewerPlugin {
 
   /** Re-run the topological sort over the viewer's current drive list. */
   sort(viewer: RVViewer): void {
-    const sorted = this.topologicalSort(viewer.drives);
+    const sorted = this.topologicalSort(viewer.drives, viewer.registry ?? null);
     // `topologicalSort` returns the SAME array instance when there is nothing to
     // reorder (no CAM/Gear dependencies). `sorted` would then alias viewer.drives,
     // so `length = 0` empties BOTH and the push re-adds nothing — silently wiping
@@ -62,11 +63,13 @@ export class DriveOrderPlugin implements RVViewerPlugin {
     viewer.drives.push(...sorted);
   }
 
-  private topologicalSort(drives: RVDrive[]): RVDrive[] {
+  private topologicalSort(drives: RVDrive[], registry: NodeRegistry | null = null): RVDrive[] {
     // Index drives by full node path and by name for master-ref resolution.
     const byPath = new Map<string, RVDrive>();
     const byName = new Map<string, RVDrive[]>();
+    const byNode = new Map<object, RVDrive>();
     for (const d of drives) {
+      byNode.set(d.node, d);
       byPath.set(NodeRegistry.computeNodePath(d.node), d);
       const list = byName.get(d.name) ?? [];
       list.push(d);
@@ -99,9 +102,22 @@ export class DriveOrderPlugin implements RVViewerPlugin {
     for (const d of drives) {
       const refs: RVDrive[] = [];
       for (const key of ['Drive_CAM', 'Drive_Gear']) {
-        const refPath = extractPath(d.BehaviorExtras[key]?.['MasterDrive']);
-        if (!refPath) continue;
-        const m = resolveMaster(refPath);
+        const raw = d.BehaviorExtras[key]?.['MasterDrive'];
+        const refPath = extractPath(raw);
+        // plan-769 Phase 3: a web-saved `MasterDrive` is `{ type, address, … }` — no path.
+        const stored = storedReferenceValue(raw);
+        if (!refPath && (stored === null || !registry)) continue;
+        // plan-769 Phase 1b: `MasterDrive` is a stored reference of the slave's
+        // file — the file's verdict names the master node (no name guess); only a
+        // path the file does not carry (or no registry / identity) keeps the old match.
+        let m: RVDrive | null;
+        if (registry) {
+          const r = registry.readStoredRef(d.node, raw as Parameters<NodeRegistry['readStoredRef']>[1]);
+          m = r.status === 'resolved' ? (byNode.get(r.node) ?? null)
+            : r.status === 'legacy' ? resolveMaster(r.path) : null;
+        } else {
+          m = resolveMaster(refPath!);
+        }
         if (m && m !== d && !refs.includes(m)) refs.push(m);
       }
       if (refs.length > 0) { masters.set(d, refs); hasDeps = true; }

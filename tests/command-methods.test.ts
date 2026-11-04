@@ -53,10 +53,10 @@ describe('component command methods', () => {
     // The v1 DIRECT set is named here, not derived. `bindingSlotRvKeys()` is
     // schema-derived since the resolver rewrite: it answers with every
     // registered type that has signal slots — Drive_SEWMovilink included —
-    // whose slots are deliberately reported as `unavailable` for lack of a
-    // command contract rather than carrying invented command methods. Deriving
-    // the list here would therefore demand command/neutralize pairs the design
-    // says must not exist. The three below are the drives that DO carry them.
+    // most of which are bound through SlotIO (rv-slot-io.ts) rather than
+    // carrying command methods. Deriving the list here would therefore demand
+    // command/neutralize pairs the design says must not exist. The three below
+    // are the drives that DO carry them.
     const V1_DIRECT_TYPES = ['Drive_Simple', 'Drive_Cylinder', 'Drive_DestinationMotor'] as const;
     // Still cross-checked against the schema registry, so a typo cannot make
     // this loop vacuous.

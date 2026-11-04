@@ -53,12 +53,10 @@ vi.mock('../src/core/editor/rv-asset-glb-export', async (original) => {
 
 // Thumbnails need a WebGL renderer; they are best-effort in the code and noise
 // here. Rendering `null` is the documented WebGPU path — no thumbnail write.
-vi.mock('../src/core/thumbnails/thumbnail-renderer', () => ({
-  ThumbnailRenderer: class {
-    render(): string | null { return null; }
-    dispose(): void {}
-  },
-}));
+// plan-776: the save reaches the renderer only through the thumbnail writer —
+// one shared stand-in for it (tests/helpers/mock-thumbnail-write.ts).
+vi.mock('../src/core/thumbnails/rv-thumbnail-write', async () =>
+  (await import('./helpers/mock-thumbnail-write')).mockThumbnailWriteModule());
 
 const writes: { path: string; expected: string | null | undefined }[] = [];
 
@@ -217,7 +215,7 @@ describe('decideSaveVerb', () => {
   it('routes each identity to its own origin', () => {
     expect(decideSaveVerb(
       {
-        lineage: 'asset',
+        lineage: 'editor',
         base: projectDocumentBase('models/Cell.glb', 'Cell'),
         name: 'Cell',
       },
@@ -226,7 +224,7 @@ describe('decideSaveVerb', () => {
 
     expect(decideSaveVerb(
       {
-        lineage: 'asset',
+        lineage: 'editor',
         base: libraryDocumentBase('Custom/Belt.glb'),
         name: 'Belt',
       },
@@ -237,7 +235,7 @@ describe('decideSaveVerb', () => {
   it('announces the COPY before the click for a source that cannot be written back', () => {
     const decision = decideSaveVerb(
       {
-        lineage: 'asset',
+        lineage: 'editor',
         base: { kind: 'builtinModel', url: '/models/Demo.glb', name: 'Demo' },
         name: 'Demo',
       },
@@ -253,11 +251,11 @@ describe('decideSaveVerb', () => {
     // document, which is exactly why both lineages share these three sentences.
     const someDocument = projectDocumentBase('models/Cell.glb', 'Cell');
     expect(decideSaveVerb(
-      { lineage: 'asset', base: someDocument, name: 'X' }, null,
+      { lineage: 'editor', base: someDocument, name: 'X' }, null,
     )).toMatchObject({ verb: 'blocked' });
     const readOnly = { ...backend, writable: false, kind: 'bundled' as const };
     const decision = decideSaveVerb(
-      { lineage: 'asset', base: someDocument, name: 'X' }, readOnly as never,
+      { lineage: 'editor', base: someDocument, name: 'X' }, readOnly as never,
     );
     expect(decision.verb).toBe('blocked');
     expect(decision.reason).toMatch(/ships with the application/i);
@@ -271,21 +269,21 @@ describe('decideSaveVerb', () => {
    * above assert, produced by one switch instead of two.
    */
   it('answers for the scene lineage out of the same refusals', () => {
-    expect(decideSaveVerb({ lineage: 'scene', open: false, transient: false }, backend as never))
+    expect(decideSaveVerb({ lineage: 'planner', open: false, transient: false }, backend as never))
       .toMatchObject({ verb: 'blocked', reason: 'Nothing is open.' });
 
-    expect(decideSaveVerb({ lineage: 'scene', open: true, transient: false }, null))
+    expect(decideSaveVerb({ lineage: 'planner', open: true, transient: false }, null))
       .toMatchObject({ verb: 'blocked', reason: /No project is open/ });
 
     const readOnly = { ...backend, writable: false, kind: 'bundled' as const };
-    expect(decideSaveVerb({ lineage: 'scene', open: true, transient: false }, readOnly as never))
+    expect(decideSaveVerb({ lineage: 'planner', open: true, transient: false }, readOnly as never))
       .toMatchObject({ verb: 'blocked', reason: /ships with the application/i });
 
-    expect(decideSaveVerb({ lineage: 'scene', open: true, transient: true }, backend as never))
+    expect(decideSaveVerb({ lineage: 'planner', open: true, transient: true }, backend as never))
       .toMatchObject({ verb: 'blocked', reason: /holds shared content/i });
 
     // A saveable scene carries no relPath: it is addressed by slot, not path.
-    expect(decideSaveVerb({ lineage: 'scene', open: true, transient: false }, backend as never))
+    expect(decideSaveVerb({ lineage: 'planner', open: true, transient: false }, backend as never))
       .toEqual({ verb: 'save' });
   });
 });

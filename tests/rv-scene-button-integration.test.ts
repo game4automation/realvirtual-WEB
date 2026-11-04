@@ -87,6 +87,20 @@ describe('SceneButton integration with the real demo hierarchy', () => {
     expect(cap.currentOffset).toBeCloseTo(0, 6);
   });
 
+  it('a click and hover on the cap (sibling of the base) reach the base via the wrapper', () => {
+    const h = buildButtonScene();
+    const viewer = mockViewer();
+    new ComponentEventDispatcher(viewer, h.registry);
+    const cap = h.cap(PATHS.pushCap);
+
+    viewer.emit('object-hover', { node: cap.node });
+    for (let i = 0; i < 60; i++) h.sceneButtonManager.update(1 / 60);
+    expect(cap.currentOffset).toBeCloseTo(cap.hoverOffset, 6);
+
+    viewer.emit('object-clicked', { node: cap.node, path: PATHS.pushCap });
+    expect(h.signalStore.getByPath(PATHS.automaticButtonSignal)).toBe(true);
+  });
+
   it('a click on a mesh below the base still finds it via the parent walk', () => {
     const h = buildButtonScene();
     const viewer = mockViewer();

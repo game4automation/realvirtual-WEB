@@ -63,6 +63,12 @@ import { join } from 'node:path';
 
 import { readJson } from './_rv-fs-utils.mjs';
 import { knownProjectKeys, looksLikeSecretValue, CONNECT_LICENSE_KEY_PATTERN } from './_rv-guards.mjs';
+import { planProjectLibraries } from './lib/rv-library-trim.mjs';
+import {
+  REALVIRTUAL_LIBRARY_PROJECT_ID,
+  libraryEntriesOf,
+  libraryProjectIdProblem,
+} from '../src/core/project/rv-library-trim-core.mjs';
 // Deliberate module cycle: `_workspace-lib.mjs` imports this file to read the
 // register, and this file imports the tier resolver from there so the
 // `restrictedFeatures` invariant is judged by the SAME rules the delivery uses
@@ -107,7 +113,21 @@ export const SHARED_REPO = 'realvirtual-commercial';
 const CUSTOMER_KEYS = new Set([
   'schemaVersion', 'customer', 'displayName', 'kind', 'support', 'status',
   'forgejo', 'contacts', 'licensing', 'delivery', 'billing', 'inference', 'hosted',
+  'publishing',
 ]);
+//! plan-603 D1/D5: where a partner publishes his OWN projects — his own Bunny storage
+//! zone in our account, his own pull zone, his own hostname. `storageKey` is that zone's
+//! password and the third credential the register is allowed to hold as a value: it is a
+//! credential we issue TO the partner and he holds it anyway, and it grants write and
+//! delete inside HIS zone only (which is the whole point of giving him one).
+const PUBLISHING_KEYS = new Set([
+  'target', 'storageZone', 'storageZoneId', 'pullZoneId', 'hostname', 'region',
+  'monthlyBandwidthGb', 'storageKey',
+]);
+//! The only publishing form that exists today. A second one would be a decision, not a typo.
+export const PUBLISHING_TARGETS = Object.freeze(['partner-zone']);
+//! Bunny's primary storage regions (`POST /storagezone`).
+export const BUNNY_REGIONS = Object.freeze(['DE', 'NY', 'LA', 'SG']);
 //! plan-759 D6/D6b: the hosted-link secrets live IN the entry, like the licence.
 //! `fragment` is link material (the `#k=` half of the key, base64url, 32 bytes),
 //! `password` the half the customer types. Both are exempt from the register's
@@ -127,6 +147,8 @@ const INFERENCE_KEYS = new Set(['requestyApiKey', 'requestyBaseUrl']);
 
 const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 const PROJECT_KEY_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
+//! A DNS hostname, lowercase, at least two labels (`wmyb.web.realvirtual.io`, `3d.partner.de`).
+const HOSTNAME_PATTERN = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
 
 //! Absolute path of one register entry.
 export function customerRegistryPath(privateRoot, slug) {
@@ -170,6 +192,24 @@ function isPlainObject(value) {
 export function isSharedForgejo(customer) {
   const forgejo = customer?.forgejo;
   return isPlainObject(forgejo) && forgejo.org === SHARED_ORG && forgejo.repo === SHARED_REPO;
+}
+
+/**
+ * True when a delivery of this customer carries the CONNECT diagnosis package (plan-679 Phase 2).
+ *
+ * The register already says it: `support: "managed"` means "we run diagnosis/RAG for them, a
+ * preset exists per project". A second field (`delivery.diagnosis`) would be a second truth for
+ * the same thing. A projectless or shared-repository customer has no corpus to embed, so it never
+ * carries the package — whatever `support` says.
+ *
+ * Accepts a register entry or a delivery config (both carry `support`; a delivery config carries
+ * `projects` at the top level instead of under `delivery`).
+ */
+export function deliversDiagnosis(customer) {
+  if (!customer || customer.support !== 'managed') return false;
+  if (isSharedForgejo(customer) || customer.sharedRepo === true) return false;
+  const projects = customer.delivery?.projects ?? customer.projects ?? [];
+  return Array.isArray(projects) && projects.length > 0;
 }
 
 function unknownKeys(value, allowed) {
@@ -466,6 +506,56 @@ export function assertCustomerInvariants(customer, context = {}) {
     }
   }
 
+  // ── publishing (plan-603) ─────────────────────────────────────────────
+  //
+  // A partner who publishes his own projects gets his own storage zone, because a
+  // Bunny storage-zone password is the smallest thing Bunny scopes: handing out the
+  // key of `realvitual-web` would hand out write and delete on every other customer's
+  // private project. The block is the record of that zone, and `provision-partner-zone`
+  // writes it. `monthlyBandwidthGb` 0 means "no cap" and must be deliberate (D4).
+  if (customer.publishing !== undefined) {
+    if (!isPlainObject(customer.publishing)) {
+      fail('"publishing" must be a JSON object.');
+    } else {
+      const publishing = customer.publishing;
+      for (const key of unknownKeys(publishing, PUBLISHING_KEYS)) {
+        fail(`publishing contains unknown field "${key}".`);
+      }
+      if (!PUBLISHING_TARGETS.includes(publishing.target)) {
+        fail(`publishing.target must be one of ${PUBLISHING_TARGETS.join(', ')}.`);
+      }
+      if (typeof publishing.storageZone !== 'string' || !SLUG_PATTERN.test(publishing.storageZone)) {
+        fail('publishing.storageZone must be a lowercase zone name like "rv-partner-wmyb".');
+      }
+      if (typeof publishing.hostname !== 'string' || !HOSTNAME_PATTERN.test(publishing.hostname)) {
+        fail('publishing.hostname must be a DNS hostname like "wmyb.web.realvirtual.io".');
+      }
+      for (const key of ['storageZoneId', 'pullZoneId']) {
+        if (publishing[key] !== undefined
+            && (!Number.isInteger(publishing[key]) || publishing[key] <= 0)) {
+          fail(`publishing.${key} must be a positive integer when present (Bunny's own id).`);
+        }
+      }
+      if (publishing.region !== undefined && !BUNNY_REGIONS.includes(publishing.region)) {
+        fail(`publishing.region must be one of ${BUNNY_REGIONS.join(', ')} when present.`);
+      }
+      if (publishing.monthlyBandwidthGb !== undefined
+          && (!Number.isInteger(publishing.monthlyBandwidthGb) || publishing.monthlyBandwidthGb < 0)) {
+        fail('publishing.monthlyBandwidthGb must be a non-negative integer (0 = no cap) when present.');
+      } else if (publishing.monthlyBandwidthGb === 0) {
+        // Not an error: an uncapped partner zone is a decision someone may take. It is
+        // a finding, because the traffic lands on our invoice (D4).
+        warn('publishing.monthlyBandwidthGb is 0 — this partner zone has NO bandwidth cap.');
+      } else if (publishing.monthlyBandwidthGb === undefined) {
+        warn('publishing carries no monthlyBandwidthGb — the partner zone runs uncapped on our invoice.');
+      }
+      if (publishing.storageKey !== undefined
+          && (typeof publishing.storageKey !== 'string' || !publishing.storageKey.trim())) {
+        fail('publishing.storageKey must be a non-empty string when present.');
+      }
+    }
+  }
+
   if (customer.inference !== undefined) {
     if (!isPlainObject(customer.inference)) {
       fail('"inference" must be a JSON object.');
@@ -493,7 +583,11 @@ export function assertCustomerInvariants(customer, context = {}) {
   // is still a hard error, so the exemption is a list of exact paths rather
   // than a relaxed pattern.
   // plan-759 D6b adds the two hosted-link halves; nothing else is exempt.
-  const CREDENTIAL_PATHS = new Set(['licensing.connect.key', 'inference.requestyApiKey', 'hosted.password', 'hosted.fragment']);
+  // plan-603 D5 adds the partner zone's password; nothing else is exempt.
+  const CREDENTIAL_PATHS = new Set([
+    'licensing.connect.key', 'inference.requestyApiKey', 'hosted.password', 'hosted.fragment',
+    'publishing.storageKey',
+  ]);
   for (const [path, value] of flattenStrings(customer)) {
     if (CREDENTIAL_PATHS.has(path)) continue;
     if (looksLikeSecretValue(value)) {
@@ -512,6 +606,17 @@ export function assertCustomerInvariants(customer, context = {}) {
           + '(project keys are case-sensitive).');
       }
     }
+    // plan-778 F15: SHAPE of the libraries[] of a delivered project - every entry names
+    // something and no id names a path. Deliberately shallow: the deep resolution (library
+    // folders, GLB reads, qualified references) is the doctor and the delivery itself, with
+    // the real --projects-dir / --library sources. Running it here made one customer's
+    // library problem break loading of EVERY customer and ignored --library.
+    for (const key of projects) {
+      if (known.has(key)) {
+        // `context.deepLibraries` is the doctor's switch (deep resolution); loadCustomer/list never set it.
+        for (const message of projectLibraryProblems(context.privateRoot, key, { deep: context.deepLibraries === true, sources: context.librarySources ?? {} })) fail(message);
+      }
+    }
     if (customer.support === 'managed') {
       for (const key of projects) {
         const preset = diagnosisPresetPath(context.privateRoot, key, context.presetsRoot);
@@ -524,6 +629,44 @@ export function assertCustomerInvariants(customer, context = {}) {
   }
 
   return { errors, warnings };
+}
+
+/**
+ * Library findings of `projects/<key>` (plan-778): shape of `libraries[]` always, then -
+ * only with `deep: true` (the doctor) and only when the project lists a library project
+ * other than the public realvirtual one - the delivery's own resolution
+ * (`planProjectLibraries`; by id in `projects/` plus `sources`, the `--projects-dir` /
+ * `--library` the delivery will use). Reading GLB JSON chunks is the expensive half.
+ */
+export function projectLibraryProblems(privateRoot, key, { deep = false, sources = {} } = {}) {
+  const projectDir = join(privateRoot, 'projects', key);
+  let manifest;
+  try { manifest = readJson(join(projectDir, 'project.json')); } catch { return []; }
+  const out = [];
+  let needsResolution = false;
+  libraryEntriesOf(manifest).forEach((entry, index) => {
+    const hasId = typeof entry.projectId === 'string' && entry.projectId.trim() !== '';
+    const hasUrl = typeof entry.url === 'string' && entry.url.trim() !== '';
+    if (!hasId && !hasUrl) {
+      out.push(`projects/${key}: libraries[${index}] has neither "projectId" nor "url".`);
+      return;
+    }
+    if (entry.projectId === undefined) return;
+    const problem = libraryProjectIdProblem(entry.projectId);
+    if (problem) out.push(`projects/${key}: libraries[${index}]: ${problem}.`);
+    else if (entry.projectId !== REALVIRTUAL_LIBRARY_PROJECT_ID) needsResolution = true;
+  });
+  if (!deep || !needsResolution || out.length > 0) return out;
+  try {
+    const plan = planProjectLibraries(projectDir, {
+      projectsDir: sources.projectsDir ?? join(privateRoot, 'projects'),
+      libraries: sources.libraries ?? {},
+    });
+    for (const error of plan.errors) out.push(`projects/${key}: ${error.message}`);
+  } catch (error) {
+    out.push(`projects/${key}: library resolution could not run (${error?.message ?? error}).`);
+  }
+  return out;
 }
 
 //! Every string leaf of the register, with its dotted path — the input of the secret-value check.
@@ -715,4 +858,91 @@ export function recordHostedFragment(privateRoot, slug, fragment) {
 export function redactHostedSecrets(customer) {
   if (!isPlainObject(customer?.hosted) || customer.hosted.password === undefined) return customer;
   return { ...customer, hosted: { ...customer.hosted, password: '••••••••' } };
+}
+
+// ─── Partner publishing (plan-603) ──────────────────────────────────────
+
+/**
+ * The partner's publishing target, or `null` if the entry has none.
+ *
+ * "Publishing" here is the partner putting HIS OWN projects on OUR CDN, which is a
+ * different thing from `hosted-link` (plan-759: we publish FOR a customer). The
+ * difference that matters technically is the credential: a hosted-link customer never
+ * sees a Bunny key, a publishing partner needs one — and because a Bunny storage-zone
+ * password is scoped to a whole zone, he gets a zone of his own (D1).
+ */
+export function resolvePartnerPublishing(customer) {
+  const publishing = customer?.publishing;
+  if (!isPlainObject(publishing)) return null;
+  return {
+    target: publishing.target,
+    storageZone: publishing.storageZone,
+    storageZoneId: publishing.storageZoneId ?? null,
+    pullZoneId: publishing.pullZoneId ?? null,
+    hostname: publishing.hostname,
+    region: publishing.region ?? 'DE',
+    monthlyBandwidthGb: publishing.monthlyBandwidthGb ?? null,
+    storageKey: typeof publishing.storageKey === 'string' && publishing.storageKey.trim()
+      ? publishing.storageKey.trim()
+      : null,
+  };
+}
+
+/**
+ * The `.env` lines the partner pastes into his clone — the handover artefact, so that
+ * what we tell him is derived from the register instead of retyped into a mail.
+ *
+ * `BUNNY_STORAGE_KEY` is omitted when the register has no key yet (the zone has not been
+ * provisioned): a half-filled block is better than a line that reads `=undefined`.
+ * `RV_PUBLIC_BASE_URL` is what makes the deploy print HIS url instead of ours (D7).
+ */
+export function partnerDeployEnv(publishing) {
+  if (!publishing) return [];
+  const lines = [
+    ['BUNNY_STORAGE_ZONE', publishing.storageZone],
+    ['BUNNY_PRIVATE_PROJECTS_DIR', 'projects'],
+    ['RV_PUBLIC_BASE_URL', `https://${publishing.hostname}`],
+  ];
+  if (publishing.storageKey) lines.splice(1, 0, ['BUNNY_STORAGE_KEY', publishing.storageKey]);
+  return lines;
+}
+
+/**
+ * Merges a provisioning result into `customers/<slug>.json` (`publishing`).
+ *
+ * Merge, not overwrite: `create` runs more than once (F2), and a second run that knows
+ * the pull-zone id but not the password must not drop the password. The one thing it
+ * refuses is a silent zone swap — pointing an existing entry at a DIFFERENT storage zone
+ * would orphan everything the partner has published, so that is a hand edit.
+ */
+export function recordPartnerPublishing(privateRoot, slug, publishing) {
+  if (!isPlainObject(publishing)) throw new Error('recordPartnerPublishing: publishing must be an object.');
+  const path = customerRegistryPath(privateRoot, slug);
+  const customer = readJson(path, `customers/${slug}.json`);
+  const current = isPlainObject(customer.publishing) ? customer.publishing : {};
+  if (typeof current.storageZone === 'string' && typeof publishing.storageZone === 'string'
+      && current.storageZone !== publishing.storageZone) {
+    throw new Error(`customers/${slug}.json points at storage zone "${current.storageZone}", not `
+      + `"${publishing.storageZone}". Moving a partner to another zone orphans everything he has `
+      + 'published; change it by hand if that is really what you mean.');
+  }
+  const merged = { target: 'partner-zone', ...current };
+  for (const [key, value] of Object.entries(publishing)) {
+    if (value !== undefined && value !== null) merged[key] = value;
+  }
+  customer.publishing = merged;
+  writeFileSync(path, JSON.stringify(customer, null, 2) + '\n');
+  return customer;
+}
+
+//! Both register credentials masked for display — what `/customers show` and the doctor print.
+export function redactRegisterSecrets(customer) {
+  const withoutHosted = redactHostedSecrets(customer);
+  if (!isPlainObject(withoutHosted?.publishing) || withoutHosted.publishing.storageKey === undefined) {
+    return withoutHosted;
+  }
+  return {
+    ...withoutHosted,
+    publishing: { ...withoutHosted.publishing, storageKey: '••••••••' },
+  };
 }

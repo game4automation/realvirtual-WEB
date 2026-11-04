@@ -35,6 +35,7 @@ import { PLC_SIGNAL_SLOT } from '../../core/engine/rv-binding-slot-resolver';
 import { SIGNAL_TYPES } from '../../core/engine/rv-signal-construction';
 import { baseComponentType } from '../../core/hmi/rv-inspector-helpers';
 import { openSignalBindPopover } from './signal-bind-store';
+import { isSignalLinkingAllowed } from './signal-link-gate';
 import {
   findSignalBindTarget,
   signalBindEligibility,
@@ -115,7 +116,8 @@ export function signalBindContextMenuItems(viewer: RVViewer): ContextMenuItem[] 
     label: (menuTarget) => resolvePLCBindMenuTarget(viewer, menuTarget)?.label ?? 'Link signal…',
     icon: 'link',
     order: 55,
-    condition: (menuTarget) => resolvePLCBindMenuTarget(viewer, menuTarget) !== null,
+    condition: (menuTarget) => isSignalLinkingAllowed(viewer)
+      && resolvePLCBindMenuTarget(viewer, menuTarget) !== null,
     action: (menuTarget) => {
       const resolved = resolvePLCBindMenuTarget(viewer, menuTarget);
       if (resolved) openSignalBindPopover(resolved.target);

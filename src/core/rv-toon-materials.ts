@@ -437,6 +437,7 @@ export class RVToonMaterialManager {
     this._suppressed = suppressed;
     this._syncPassEnabled();
     this._applyTslSaturation();
+    this._applyTslEdges();
     this.host.markRenderDirty();
   }
 
@@ -473,6 +474,7 @@ export class RVToonMaterialManager {
     if (this._sobelPass) this._sobelPass.enabled = false;
     if (this._saturationPass) this._saturationPass.enabled = false;
     this._applyTslSaturation(); // TSL path: back to identity (saturation 1)
+    this._applyTslEdges();      // TSL path: edge node leaves the graph
     this.host.markRenderDirty();
   }
 
@@ -580,7 +582,20 @@ export class RVToonMaterialManager {
       (u.outlineColor.value as Color).copy(this._outlineColor);
       this._syncPassEnabled();
     }
+    if (this.host.isWebGPU) this._applyTslEdges();
     this.host.markRenderDirty();
+  }
+
+  /** Push the edge-line state into the TSL pipeline (WebGPURenderer paths,
+   *  plan-763): the ONE rule for whether the edge node is in the graph, the
+   *  same rule `_syncPassEnabled` applies to the WebGL Sobel pass. */
+  private _applyTslEdges(): void {
+    if (!this._tslPost) return;
+    const on = this._active && !this._suppressed && this._outlineAmount > 0 && this._outlineThickness > 0;
+    this._tslPost.setToonEdges(
+      on, this._outlineAmount, this._outlineThickness, this._outlineThreshold,
+      this._outlineColor.getHex(), this._outlineDistance,
+    );
   }
 
   /**
@@ -780,8 +795,8 @@ export class RVToonMaterialManager {
     // WebGPURenderer (both backends): onBeforeCompile is silently ignored —
     // the recolor (metal tint + albedo grade) runs as a TSL colorNode chain
     // instead (plan-271 Phase 2 port #2). The saturation grade runs on the
-    // TSL post pipeline (Phase 3); only the Sobel edge lines stay disabled
-    // under WebGPU (open item).
+    // TSL post pipeline (Phase 3); the Sobel edge lines run as the edge node
+    // of that pipeline since plan-763.
     if (this.host.isWebGPU) {
       const tsl = getTslMaterials();
       if (tsl) {
@@ -924,6 +939,7 @@ export class RVToonMaterialManager {
         this._tslPost = this.host._ensureTslPost() ?? null;
       }
       this._applyTslSaturation();
+      this._applyTslEdges();
       return;
     }
     this.host._ensureComposer();

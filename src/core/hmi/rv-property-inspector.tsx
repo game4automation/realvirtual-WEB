@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * PropertyInspector — Editable property panel for the selected hierarchy node.
  *
@@ -21,7 +23,7 @@
  * - rv-component-section.tsx — Collapsible component section
  */
 
-import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
+import { lazy, Suspense, useState, useMemo, useCallback, useEffect, useRef, useSyncExternalStore } from 'react';
 import { useSignalTick } from '../../hooks/use-signal-tick';
 import { useChangeGatedTick } from '../../hooks/use-change-gated-tick';
 import { useEditorPlugin } from '../../hooks/use-editor-plugin';
@@ -30,6 +32,7 @@ import type { Object3D } from 'three';
 import { RV_SYNTHETIC_KEY } from '../engine/rv-bake-chunk';
 import { DIVIDER, FS, ICON_SIZE, LINK, OCCUPIED, RV_SCROLL_CLASS, SUCCESS, WARN, WARN_LIGHT } from './shared-sx';
 import { InspectorSubheader } from './rv-inspector-blocks';
+import { InspectorBurgerMenu } from './InspectorBurgerMenu';
 import {
   Box,
   Typography,
@@ -54,12 +57,7 @@ import type { RVViewer } from '../rv-viewer';
 import type { LayoutPlannerPlugin } from '../../plugins/layout-planner';
 import type { SnapPointPlugin } from '../../plugins/snap-point';
 import { getOverriddenFields } from '../engine/rv-extras-overlay-store';
-import {
-  overrideTargetOf,
-  revertComponentOverride,
-  writeOverride,
-} from '../ops/rv-reference-guard';
-import { referenceOverriddenFields } from './rv-field-override';
+import { referenceOverriddenFields, revertReferenceOverride } from './rv-field-override';
 import { USER_PAUSE_REASON } from '../engine/rv-constants';
 import { LeftPanel } from './LeftPanel';
 import { AasDetailHeaderAction } from '../../plugins/aas-link-plugin';
@@ -72,9 +70,16 @@ import {
   type ReverseReference,
 } from './rv-inspector-helpers';
 import { getPrimaryDisplayValue, applyLiveEdit, getLiveStateFor } from './rv-value-resolver';
+import { getActivePersistenceTarget, getEditTargetVersion, subscribeEditTarget } from './rv-edit-target';
 import { FMU_TYPE } from '../engine/rv-fmu-constants';
 import { navigateToRef } from './rv-reference-display';
 import { ComponentSection, runtimeRow } from './rv-component-section';
+import {
+  isSignalConnectorSection,
+  nodeHasSignalConnector,
+  useSignalConnectorDocumentRevision,
+  useSignalConnectorInspectorModule,
+} from './rv-signal-connector-inspector-entry';
 import { AddComponentSection } from './rv-add-component-section';
 import { buildBehaviorVirtualComponent, behaviorDisplayName, collectBehaviorData, type BehaviorViewerSnapshot } from './inspector-behavior-section';
 import { BehaviorSignalSlots } from '../../plugins/signal-bind/InlineSignalSlots';
@@ -94,6 +99,10 @@ import { PROVENANCE_REFERENCED_TITLE } from './signal-vocabulary';
 import { SignalUsageSection } from './rv-signal-usage-list';
 import { signalNameForPath } from './use-signal-usages';
 import { isSignalComponentTypeKey } from '../engine/rv-node-registry';
+import type { RvExtrasEditorPlugin } from './rv-extras-editor';
+
+// plan-778: loaded on first selection of a placement (keeps the startup graph lean).
+const LibraryOriginInspector = lazy(() => import('./rv-library-origin-inspector').then((m) => ({ default: m.LibraryOriginInspector })));
 
 // Re-export isHiddenComponentType for backward compatibility
 export { isHiddenComponentType } from './rv-inspector-helpers';
@@ -107,15 +116,14 @@ function loadConsumedOnly(): boolean {
   // Default ON: hide non-consumed ("N more fields") diagnostic fields until the
   // user opts into the full dump via the toggle. A stored preference wins.
   try {
-    const v = localStorage.getItem(LS_KEY_CONSUMED_ONLY);
+    const v = readLocalStorage(LS_KEY_CONSUMED_ONLY);
     return v === null ? true : v === 'true';
   }
   catch { return true; }
 }
 
 function loadDetached(): boolean {
-  try { return localStorage.getItem(LS_KEY_DETACHED) === 'true'; }
-  catch { return false; }
+  return readLocalStorage(LS_KEY_DETACHED) === 'true';
 }
 
 // ── Stable no-ops for read-only virtual ComponentSections ────────────────
@@ -125,31 +133,8 @@ const EMPTY_OVERRIDES: Set<string> = new Set();
 // `referenceOverriddenFields` moved to `rv-field-override.ts` (plan-512): the
 // unit auto-scale's write rule has to see exactly the override union the dot shows.
 
-/**
- * Drop the instance override for one field — or, with no field, for the whole
- * component.
- *
- * A no-op when the node is not inside a reference, which is the common case;
- * the caller does not branch, so a Revert always means the same thing.
- */
-function revertReferenceOverride(
-  viewer: RVViewer,
-  nodePath: string,
-  componentType: string,
-  fieldName?: string,
-): void {
-  if (viewer.modes.activeMode === 'viewer') return;
-  const node = viewer.registry?.getNode(nodePath);
-  if (!node) return;
-  const target = overrideTargetOf(node, viewer.currentModelRoot ?? null);
-  if (!target) return;
-  if (fieldName === undefined) {
-    revertComponentOverride(target.referenceNode, target.nodeId, componentType);
-  } else {
-    writeOverride(target.referenceNode, target.nodeId, componentType, fieldName, undefined);
-  }
-  viewer.markRenderDirty();
-}
+// `revertReferenceOverride` lives in `rv-field-override.ts` (plan-774): in the
+// asset editor the Revert's `unsetField` op owns the override write.
 const NOOP_FIELD_EDIT = (_fieldName: string, _value: unknown): void => { /* read-only */ };
 const NOOP_FIELD_RESET = (_fieldName: string): void => { /* read-only */ };
 const NOOP_RESET = (): void => { /* read-only */ };
@@ -626,6 +611,47 @@ export interface PropertyInspectorProps {
   viewer: RVViewer;
 }
 
+export function updateInspectorField(
+  plugin: Pick<RvExtrasEditorPlugin, 'updateOverlayField'>,
+  viewer: RVViewer,
+  nodePath: string,
+  componentType: string,
+  fieldName: string,
+  value: unknown,
+  apply: typeof applyLiveEdit = applyLiveEdit,
+): boolean {
+  const accepted = plugin.updateOverlayField(nodePath, componentType, fieldName, value);
+  if (getActivePersistenceTarget() !== 'variant') apply(viewer, nodePath, componentType, fieldName, value);
+  return accepted;
+}
+
+export function ResetAllButton({ disabled, onClick }: { disabled: boolean; onClick: () => void }) {
+  return (
+    <Tooltip title={disabled ? 'Switch to Base to reset base values' : ''}>
+      <span>
+        <Button
+          size="small"
+          variant="text"
+          disabled={disabled}
+          startIcon={<RestartAlt sx={{ fontSize: ICON_SIZE.xs }} />}
+          onClick={onClick}
+          sx={{
+            fontSize: FS.micro,
+            textTransform: 'none',
+            color: WARN,
+            py: 0,
+            px: 0.5,
+            minWidth: 0,
+            '&:hover': { bgcolor: `${WARN}1a` },
+          }}
+        >
+          Reset All
+        </Button>
+      </span>
+    </Tooltip>
+  );
+}
+
 /**
  * The path the inspector may WRITE against for a selection, or null.
  *
@@ -643,6 +669,8 @@ export function inspectorWritePath(node: Object3D | null | undefined, path: stri
 
 export function PropertyInspector({ viewer }: PropertyInspectorProps) {
   const { plugin, state } = useEditorPlugin();
+  useSyncExternalStore(subscribeEditTarget, getEditTargetVersion);
+  const baseResetDisabled = getActivePersistenceTarget() === 'variant';
   const selectedNode = state.selectedNode;
   const selectedPath = inspectorWritePath(selectedNode, state.selectedNodePath);
   /**
@@ -655,6 +683,11 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
   const isRuntimeSelection = !!selectedNode && !selectedPath;
 
   // Read the selected node's userData
+  // plan-2227: a SignalConnector's Mode changes through a command — re-read on every document commit.
+  const hasConnector = nodeHasSignalConnector(selectedNode?.userData?.realvirtual as Record<string, unknown> | undefined);
+  const connectorRevision = useSignalConnectorDocumentRevision(hasConnector);
+  // The connector section loads on demand (plan-2227); until it is there the section is generic.
+  const connectorUi = useSignalConnectorInspectorModule(hasConnector);
   const nodeData = useMemo(() => {
     const node = selectedNode;
     if (!node) return null;
@@ -686,7 +719,7 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
     // whose field rows are memoised on the `data` reference. Unchanged
     // components keep their identity, so their child memos stay stable.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedNode, state]);
+  }, [selectedNode, state, connectorRevision]);
 
   // Check if the selected node has a LayoutObject (for transform section)
   // Re-read Locked from live userData on any state change (state is always a new ref after notify())
@@ -850,13 +883,9 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
         }
       }
 
-      plugin.updateOverlayField(selectedPath, componentType, fieldName, value);
-
-      // Push the edit into the live component instance too, so a field that is
-      // part of the component's live state (e.g. Drive.TargetSpeed) takes
-      // effect and displays immediately instead of waiting for a scene reload.
-      // No-op for non-live / non-owner components.
-      applyLiveEdit(viewer, selectedPath, componentType, fieldName, value);
+      // Push ordinary edits into the live component instance too. A variant writes only
+      // through its apply transaction; the helper also returns synchronous refusals.
+      updateInspectorField(plugin, viewer, selectedPath, componentType, fieldName, value);
     },
     [plugin, selectedPath, selectedNode, viewer],
   );
@@ -897,7 +926,7 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
   const toggleConsumedOnly = useCallback(() => {
     setConsumedOnly(prev => {
       const next = !prev;
-      try { localStorage.setItem(LS_KEY_CONSUMED_ONLY, String(next)); } catch { /* */ }
+      try { writeLocalStorage(LS_KEY_CONSUMED_ONLY, String(next)); } catch { /* */ }
       return next;
     });
   }, []);
@@ -907,7 +936,7 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
   const toggleDetached = useCallback(() => {
     setDetached(prev => {
       const next = !prev;
-      try { localStorage.setItem(LS_KEY_DETACHED, String(next)); } catch { /* */ }
+      try { writeLocalStorage(LS_KEY_DETACHED, String(next)); } catch { /* */ }
       return next;
     });
   }, []);
@@ -976,6 +1005,7 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
           {detached ? <PushPin sx={{ fontSize: ICON_SIZE.sm }} /> : <OpenInNew sx={{ fontSize: ICON_SIZE.sm }} />}
         </IconButton>
       </Tooltip>
+      <InspectorBurgerMenu />
     </>
   );
 
@@ -1028,23 +1058,7 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
             : 'No overrides'}
         </Typography>
         {totalOverrides > 0 && (
-          <Button
-            size="small"
-            variant="text"
-            startIcon={<RestartAlt sx={{ fontSize: ICON_SIZE.xs }} />}
-            onClick={handleResetAll}
-            sx={{
-              fontSize: FS.micro,
-              textTransform: 'none',
-              color: WARN,
-              py: 0,
-              px: 0.5,
-              minWidth: 0,
-              '&:hover': { bgcolor: `${WARN}1a` },
-            }}
-          >
-            Reset All
-          </Button>
+          <ResetAllButton disabled={baseResetDisabled} onClick={handleResetAll} />
         )}
       </Box>
     </>
@@ -1157,6 +1171,11 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
         />
       )}
 
+      {/* plan-778: origin + library actions of a library placement (nothing otherwise). */}
+      {hasLayoutObject && selectedPath && (
+        <Suspense fallback={null}><LibraryOriginInspector viewer={viewer} node={selectedNode} /></Suspense>
+      )}
+
       {/* Model root: read-only Transform. No lock toggle and no visibility
           toggle — those are not "off by default" here, they do not exist. */}
       {!hasLayoutObject && isRootSelected && selectedPath && (
@@ -1208,6 +1227,9 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
             // components below — never as an editable/overridable field.
             // Header value: a compact live glance (signal value or drive pos).
             const headerValue = getPrimaryDisplayValue(viewer, selectedPath, type, data).text;
+            // plan-2227 Phase 2 (RR3): the SignalConnector hooks in HERE — Mode-dependent
+            // fields/slots, Mode as `signalConnector.setMode`, preview + bit connectors.
+            const connector = isSignalConnectorSection(type) ? connectorUi : null;
             return (
               <ComponentSection
                 // Keyed by NODE + type: a type-only key reused the section (and the
@@ -1223,11 +1245,21 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
                 headerAction={type === 'AASLink'
                   ? <AasDetailHeaderAction viewer={viewer} nodePath={selectedPath} data={data} />
                   : undefined}
-                onFieldEdit={(fieldName, value) => handleFieldEdit(type, fieldName, value)}
+                isFieldVisible={connector ? connector.signalConnectorFieldFilter(data) : undefined}
+                extraContent={connector
+                  ? <connector.SignalConnectorInspector viewer={viewer} signalStore={signalStore} nodePath={selectedPath} componentType={type} data={data} />
+                  : undefined}
+                onFieldEdit={connector
+                  ? (fieldName, value) => connector.editSignalConnectorField(viewer, selectedPath, type, fieldName, value, (f, v) => handleFieldEdit(type, f, v))
+                  : (fieldName, value) => handleFieldEdit(type, fieldName, value)}
                 onFieldReset={(fieldName) => handleFieldReset(type, fieldName)}
                 onResetComponent={() => handleComponentReset(type)}
                 viewer={viewer}
                 signalStore={signalStore}
+                getFieldEditState={(fieldName) => plugin.getFieldEditState(selectedPath, type, fieldName)}
+                onConfirmFieldEdit={(fieldName) => { plugin.confirmFieldEdit(selectedPath, type, fieldName); }}
+                onCancelFieldEdit={(fieldName) => plugin.cancelFieldEdit(selectedPath, type, fieldName)}
+                baseResetDisabled={baseResetDisabled}
               />
             );
           })}

@@ -32,6 +32,8 @@ import { RVBehavior } from '../core/rv-behavior';
 import type { LoadResult } from '../core/engine/rv-scene-loader';
 import type { RVLogicStep } from '../core/engine/rv-logic-step';
 import { getLastLogs } from '../core/engine/rv-debug';
+import { getDiagnosticsEntries } from '../core/diagnostics/rv-diagnostics-collector';
+export { serializeConsoleArg } from '../core/diagnostics/rv-diagnostics-collector';
 
 /** Serialize any object's own enumerable properties (primitives + shallow objects). */
 function serializeProps(obj: unknown, maxDepth = 2): Record<string, unknown> {
@@ -55,67 +57,7 @@ function serializeProps(obj: unknown, maxDepth = 2): Record<string, unknown> {
 
 // ── Console-argument serialization (crash-safe) ──
 
-/** Max characters kept per serialized console argument. */
-const MAX_ARG_LEN = 2000;
 /** Max characters kept for one buffered console message (all args joined). */
-const MAX_MESSAGE_LEN = 8000;
-
-/**
- * Serialize ONE console.error/warn argument for the error buffer. MUST NEVER
- * THROW — this runs inside the console monkey-patch, and an exception here
- * would swallow the ORIGINAL error and replace it with a serialization error
- * (seen live: `JSON.stringify` on a Three.js BufferGeometry walked
- * `BufferAttribute.toJSON` → `Array.from` over a typed array whose
- * ArrayBuffer was detached (worker transfer / disposed WASM heap) → TypeError
- * "Cannot perform %TypedArray%.prototype.values on a detached ArrayBuffer").
- *
- * Three.js objects (BufferGeometry / BufferAttribute / Object3D / Material)
- * are therefore NEVER JSON-serialized — they render as a short tag like
- * `[BufferGeometry name=Belt uuid=…]`. Anything else falls back through
- * try/catch chains: JSON.stringify → String(arg) → '[unserializable]'.
- *
- * Exported for tests.
- */
-export function serializeConsoleArg(arg: unknown): string {
-  try {
-    if (arg instanceof Error) return `${arg.message}\n${arg.stack ?? ''}`;
-    if (arg === null || typeof arg !== 'object') return String(arg).slice(0, MAX_ARG_LEN);
-
-    // Three.js objects: identify via their `is*` marker flags (stable public
-    // API). Their toJSON walks geometry buffers — potentially megabytes, and
-    // it THROWS on detached ArrayBuffers. Short tag instead.
-    const o = arg as {
-      isBufferGeometry?: boolean; isBufferAttribute?: boolean;
-      isInterleavedBufferAttribute?: boolean; isObject3D?: boolean;
-      isMaterial?: boolean; isTexture?: boolean;
-      type?: unknown; name?: unknown; uuid?: unknown;
-    };
-    if (
-      o.isBufferGeometry || o.isBufferAttribute || o.isInterleavedBufferAttribute ||
-      o.isObject3D || o.isMaterial || o.isTexture
-    ) {
-      const kind =
-        o.isBufferGeometry ? 'BufferGeometry' :
-        (o.isBufferAttribute || o.isInterleavedBufferAttribute) ? 'BufferAttribute' :
-        o.isObject3D ? 'Object3D' :
-        o.isMaterial ? 'Material' : 'Texture';
-      const type = typeof o.type === 'string' && o.type !== kind ? ` type=${o.type}` : '';
-      const name = typeof o.name === 'string' && o.name ? ` name=${o.name}` : '';
-      const uuid = typeof o.uuid === 'string' ? ` uuid=${o.uuid}` : '';
-      return `[${kind}${type}${name}${uuid}]`;
-    }
-
-    // Plain data: JSON — throws on cycles, BigInt, throwing toJSON/getters.
-    const json = JSON.stringify(arg);
-    return (json ?? String(arg)).slice(0, MAX_ARG_LEN);
-  } catch {
-    try {
-      return String(arg).slice(0, MAX_ARG_LEN);
-    } catch {
-      return '[unserializable]';
-    }
-  }
-}
 
 // ── Types ──
 
@@ -160,10 +102,6 @@ export class DebugEndpointPlugin extends RVBehavior {
   private _pollInterval = 500;   // ms between command polls
 
   // Error capture
-  private _errors: ErrorEntry[] = [];
-  private _origError: typeof console.error | null = null;
-  private _origWarn: typeof console.warn | null = null;
-  private static readonly MAX_ERRORS = 50;
 
   // Signal changelog
   private _changelog: ChangelogEntry[] = [];
@@ -177,18 +115,15 @@ export class DebugEndpointPlugin extends RVBehavior {
   private _tickTimer: ReturnType<typeof setInterval> | null = null;
 
   // Console monkey-patch guard — prevents double-patching on model reload
-  private _intercepted = false;
 
   // ── Lifecycle ──
 
   protected onStart(_result: LoadResult): void {
     this._lastPush = 0;
     this._lastPoll = 0;
-    this._errors = [];
     this._changelog = [];
     this._stateHistory = [{ state: 'started', timestamp: Date.now(), elapsed: 0 }];
 
-    this._setupErrorCapture();
     this._setupSignalChangelog();
     this._setupStateTracking();
     // Non-Three backends deliberately pause plugin onRender callbacks. Keep
@@ -201,7 +136,6 @@ export class DebugEndpointPlugin extends RVBehavior {
   protected onDestroy(): void {
     if (this._tickTimer) clearInterval(this._tickTimer);
     this._tickTimer = null;
-    this._restoreConsole();
     this._stateTrackingOff?.();
     this._stateTrackingOff = undefined;
   }
@@ -230,50 +164,6 @@ export class DebugEndpointPlugin extends RVBehavior {
       this._lastPoll = now;
       this._pollCommands();
     }
-  }
-
-  // ── Error Capture ──
-
-  private _setupErrorCapture(): void {
-    if (this._intercepted) return;
-    this._origError = console.error;
-    this._origWarn = console.warn;
-
-    // Buffering must NEVER prevent the original console call — a throwing
-    // _bufferError would swallow the actual error (belt and braces on top of
-    // the per-argument try/catch in serializeConsoleArg).
-    console.error = (...args: unknown[]) => {
-      try { this._bufferError('error', args); } catch { /* never block the original */ }
-      this._origError!.apply(console, args);
-    };
-
-    console.warn = (...args: unknown[]) => {
-      try { this._bufferError('warning', args); } catch { /* never block the original */ }
-      this._origWarn!.apply(console, args);
-    };
-
-    this._intercepted = true;
-    this.addCleanup(() => this._restoreConsole());
-  }
-
-  private _bufferError(level: 'error' | 'warning', args: unknown[]): void {
-    // Per-argument crash-safe serialization (see serializeConsoleArg) + a
-    // total length cap so one geometry dump can't bloat every 1 Hz snapshot.
-    const message = args.map(serializeConsoleArg).join(' ').slice(0, MAX_MESSAGE_LEN);
-
-    this._errors.push({
-      level,
-      message,
-      timestamp: Date.now(),
-      stack: new Error().stack?.split('\n').slice(3, 6).join('\n'),
-    });
-    if (this._errors.length > DebugEndpointPlugin.MAX_ERRORS) this._errors.shift();
-  }
-
-  private _restoreConsole(): void {
-    if (this._origError) { console.error = this._origError; this._origError = null; }
-    if (this._origWarn) { console.warn = this._origWarn; this._origWarn = null; }
-    this._intercepted = false;
   }
 
   // ── Signal Changelog ──
@@ -366,6 +256,13 @@ export class DebugEndpointPlugin extends RVBehavior {
           drive.startMove(cmd.position as number);
           break;
         }
+        case 'emitEvent': {
+          if (!this.viewer) { success = false; error = 'Viewer not available'; break; }
+          const eventName = cmd.event as string;
+          if (!eventName) { success = false; error = 'emitEvent needs "event"'; break; }
+          this.viewer.emit(eventName as never, cmd.payload as never);
+          break;
+        }
         case 'setRenderBackend': {
           const backend = cmd.backend;
           if (backend !== 'three' && backend !== 'omniverse') {
@@ -444,7 +341,12 @@ export class DebugEndpointPlugin extends RVBehavior {
       },
       playback: this._collectPlayback(),
       logs: getLastLogs(100),
-      errors: this._errors,
+      errors: getDiagnosticsEntries().filter(e => e.cat === 'console').slice(-50).map((e): ErrorEntry => ({
+        level: e.lvl === 'warn' ? 'warning' : 'error',
+        message: e.msg,
+        timestamp: Date.parse(e.t),
+        stack: e.stack,
+      })),
       changelog: this._changelog,
       stateHistory: this._stateHistory,
     };

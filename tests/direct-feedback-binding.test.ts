@@ -14,6 +14,7 @@ import {
 } from '../src/core/engine/rv-component-registry';
 import type { RVDrive } from '../src/core/engine/rv-drive';
 import type { FeedbackSource } from '../src/core/engine/rv-binding-slot-resolver';
+import { slotFeedbackValue } from '../src/core/engine/rv-slot-io';
 
 type FeedbackDriveBehavior =
   | 'Drive_Simple'
@@ -59,6 +60,13 @@ function fixture(
   };
 }
 
+/** The slot's current feedback value — own contract or SlotIO cache. */
+function readFeedback(f: Fixture, slot: string): boolean | number | undefined {
+  return typeof f.component.readFeedbackSlot === 'function'
+    ? f.component.readFeedbackSlot(slot)
+    : slotFeedbackValue(f.component, slot);
+}
+
 function bindFeedback(f: Fixture, slot: string, type: 'Bool' | 'Float'): void {
   f.store.register('PLC.Feedback', '__iface__/PLC.Feedback', type === 'Bool', `PLCInput${type}`);
   f.store.registerSignalProvider({ interfaceId: 'plc', signal: 'PLC.Feedback' }, true);
@@ -91,7 +99,7 @@ describe('DirectFeedbackSlot binding', () => {
       const f = fixture(type, extras);
       const set = vi.spyOn(f.store, 'set');
       bindFeedback(f, slot, plcType);
-      const initial = f.component.readFeedbackSlot(slot);
+      const initial = readFeedback(f, slot);
       expect(f.store.get('PLC.Feedback')).toBe(initial);
       const callsAfterInitial = set.mock.calls.length;
 
@@ -100,7 +108,7 @@ describe('DirectFeedbackSlot binding', () => {
 
       f.drive.StartPosition = changedPosition;
       f.drive.reset();
-      expect(f.store.get('PLC.Feedback')).toBe(f.component.readFeedbackSlot(slot));
+      expect(f.store.get('PLC.Feedback')).toBe(readFeedback(f, slot));
       expect(set.mock.calls.length).toBe(callsAfterInitial + 1);
 
       f.manager.unbind('axis', slot, '.');

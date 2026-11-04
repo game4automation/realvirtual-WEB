@@ -7,7 +7,7 @@
  * The button choreography (button-sim-state / button-sim-store, plan-499)
  * addresses its target by a key rendered as `data-rv-button-id`. A Property
  * Inspector field row carries such a key too — {@link inspectorFieldKey} — so
- * a field write through MCP (`web_editor_set_field`, `web_component_set`) gets
+ * a field write through MCP (`web_editor_set_field`, `web_execute("component.setFields", …)`) gets
  * the SAME hover → press → afterglow as a button: the row is the button.
  *
  * The one extra a field needs is a REVEAL: its component section may be

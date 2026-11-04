@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * library-store — catalog state, lifted out of the Layout Planner (plan-372 §2.6.1).
  *
@@ -73,9 +75,28 @@ function withAssetHash(
   return entry;
 }
 
+/**
+ * The picture of a raw catalog entry (plan-776 F11): an explicit `thumbnailUrl`
+ * (cloud, Asset Manager, SimReady — absolute, or relative to the catalog) wins;
+ * otherwise the saved-thumbnail pointer `thumbnail`
+ * (`<Category>/.thumbnails/<id>.<hash8>.webp`, written by the catalog builder),
+ * resolved against the catalog base URL. A relative pointer with a `..` segment
+ * is refused — a catalog names files inside itself. Catalog pointers are not
+ * validated against an id: a hand-written `PalletHandling/x.png` is a valid
+ * picture.
+ */
+function catalogThumbnailUrl(raw: { thumbnailUrl?: unknown; thumbnail?: unknown }, baseUrl: string): string {
+  if (typeof raw.thumbnailUrl === 'string' && raw.thumbnailUrl !== '') return resolveUrl(baseUrl, raw.thumbnailUrl);
+  const pointer = typeof raw.thumbnail === 'string' ? raw.thumbnail.trim() : '';
+  if (pointer === '') return '';
+  const relative = !/^[a-z][a-z0-9+.-]*:/i.test(pointer) && !pointer.startsWith('/');
+  if (relative && pointer.split('/').some(seg => seg === '..')) return '';
+  return resolveUrl(baseUrl, pointer);
+}
+
 /** Auto-fill missing fields on a catalog entry. */
 export function normalizeCatalogEntry(
-  raw: Partial<LibraryCatalogEntry> & { glbUrl?: string; splatUrl?: string },
+  raw: Partial<LibraryCatalogEntry> & { glbUrl?: string; splatUrl?: string; thumbnail?: string },
   baseUrl: string,
 ): LibraryCatalogEntry {
   // Virtual DES entries have no GLB — pass through with defaults
@@ -99,6 +120,25 @@ export function normalizeCatalogEntry(
     };
   }
 
+  // Procedural path blocks (plan-628 8.1) — no GLB, placed through the path
+  // network's commands; a missing kind/params never invents one.
+  if (raw.pathBlock && typeof raw.pathBlock.kind === 'string') {
+    return {
+      id: raw.id ?? `path-block:${raw.pathBlock.kind}`,
+      name: raw.name ?? raw.pathBlock.kind,
+      category: raw.category ?? 'des',
+      glbUrl: '',
+      thumbnailUrl: catalogThumbnailUrl(raw, baseUrl),
+      tags: raw.tags,
+      collections: raw.collections,
+      noPrefetch: true,
+      pathBlock: {
+        kind: raw.pathBlock.kind,
+        params: raw.pathBlock.params ? JSON.parse(JSON.stringify(raw.pathBlock.params)) as Record<string, unknown> : {},
+      },
+    };
+  }
+
   // Splat entries — splatUrl instead of glbUrl
   if (raw.splatUrl) {
     const splatUrlRaw = raw.splatUrl;
@@ -107,9 +147,7 @@ export function normalizeCatalogEntry(
     const id = raw.id ?? stem.toLowerCase().replace(/\s+/g, '-');
     const name = raw.name ?? stem.replace(/[_-]/g, ' ');
     const splatUrl = resolveUrl(baseUrl, splatUrlRaw);
-    const thumbnailUrl = raw.thumbnailUrl
-      ? resolveUrl(baseUrl, raw.thumbnailUrl)
-      : '';
+    const thumbnailUrl = catalogThumbnailUrl(raw, baseUrl);
     return withAssetHash({
       id,
       name,
@@ -131,9 +169,7 @@ export function normalizeCatalogEntry(
   const name = raw.name ?? stem.replace(/[_-]/g, ' ');
   const category = raw.category ?? 'custom';
   const glbUrl = resolveUrl(baseUrl, glbUrlRaw);
-  const thumbnailUrl = raw.thumbnailUrl
-    ? resolveUrl(baseUrl, raw.thumbnailUrl)
-    : '';
+  const thumbnailUrl = catalogThumbnailUrl(raw, baseUrl);
   return withAssetHash({
     id,
     name,
@@ -304,8 +340,6 @@ export class LibraryStore {
   private _pendingFetches = new Map<string, Promise<void>>();
   /** URLs added via addCatalogDirect (bundled) — excluded from localStorage. */
   private _bundledUrls = new Set<string>();
-  /** Entry ids currently being auto-thumbnailed (drives per-card spinner). */
-  private _thumbnailPending = new Set<string>();
   /** Per-URL origin (§2.6.3). Persisted so promotion survives a restart. */
   private _origins = new Map<string, LibraryOrigin>();
   /** URLs contributed by the active `project.json.libraries[]`. */
@@ -316,7 +350,7 @@ export class LibraryStore {
 
   constructor() {
     try {
-      const at = localStorage.getItem(LS_KEY_ACTIVE_TAB);
+      const at = readLocalStorage(LS_KEY_ACTIVE_TAB);
       if (at) this._activeTabUrl = at;
       this._restoreOrigins();
     } catch { /* ignore */ }
@@ -344,7 +378,6 @@ export class LibraryStore {
   get catalogUrls(): string[] { return this._catalogUrls; }
   get catalogErrors(): Map<string, string> { return this._catalogErrors; }
   get activeTabUrl(): string | null { return this._activeTabUrl; }
-  get thumbnailPending(): ReadonlySet<string> { return this._thumbnailPending; }
 
   /** Origin of a registered URL, or `null` when the URL is unknown. */
   getOrigin(url: string): LibraryOrigin | null { return this._origins.get(url) ?? null; }
@@ -440,7 +473,7 @@ export class LibraryStore {
           return;
         }
         // Derive baseUrl from catalog URL directory. A RELATIVE catalog URL (a
-        // deployed manifest's `libraries[]` may say `library/catalog.json`) is
+        // deployed manifest's `libraries[]` may say `catalogs/partner/catalog.json`) is
         // resolved against the page base first: a relative base would leak into
         // every entry's glbUrl, and `catalogEntryPath` only strips the
         // `…library/` prefix from absolute URLs — the dashboard tree then grew
@@ -483,37 +516,6 @@ export class LibraryStore {
     this._notify();
   }
 
-  /** Update the thumbnail URL for a specific catalog entry.
-   *
-   *  Immutable update: replaces the entry, its `entries` array, and the catalog
-   *  object so a new reference flows through the snapshot. The ThumbnailCard is
-   *  `React.memo`'d on the `entry` prop — mutating in place would leave the
-   *  reference unchanged and the card would only repaint if its spinner state
-   *  happened to toggle (which is why freshly-generated previews appeared only
-   *  after a reload). */
-  setEntryThumbnail(entryId: string, thumbnailUrl: string): void {
-    for (const [key, catalog] of this._catalogs) {
-      const idx = catalog.entries.findIndex(e => e.id === entryId);
-      if (idx !== -1) {
-        const entries = catalog.entries.slice();
-        entries[idx] = { ...entries[idx], thumbnailUrl };
-        this._catalogs.set(key, { ...catalog, entries });
-        this._notify();
-        return;
-      }
-    }
-  }
-
-  /** Mark/unmark an entry as having its preview auto-generated (drives the
-   *  per-card spinner). */
-  setThumbnailPending(entryId: string, pending: boolean): void {
-    const has = this._thumbnailPending.has(entryId);
-    if (pending === has) return;
-    if (pending) this._thumbnailPending.add(entryId);
-    else this._thumbnailPending.delete(entryId);
-    this._notify();
-  }
-
   removeCatalog(url: string): void {
     const idx = this._catalogUrls.indexOf(url);
     if (idx === -1) return;
@@ -533,7 +535,7 @@ export class LibraryStore {
   setActiveTab(url: string): void {
     if (!this._catalogUrls.includes(url)) return;
     this._activeTabUrl = url;
-    try { localStorage.setItem(LS_KEY_ACTIVE_TAB, url); } catch { /* ignore */ }
+    writeLocalStorage(LS_KEY_ACTIVE_TAB, url);
     this._notify();
   }
 
@@ -578,7 +580,7 @@ export class LibraryStore {
 
   async restoreFromStorage(): Promise<void> {
     try {
-      const urlsJson = localStorage.getItem(LS_KEY_URLS);
+      const urlsJson = readLocalStorage(LS_KEY_URLS);
       if (!urlsJson) return;
       const urls = (JSON.parse(urlsJson) as string[]).filter(u => u.trim() !== '');
       // Started TOGETHER, not one after the other. `addCatalog` registers its
@@ -620,7 +622,7 @@ export class LibraryStore {
   }
 
   private _restoreOrigins(): void {
-    const raw = localStorage.getItem(LS_KEY_ORIGINS);
+    const raw = readLocalStorage(LS_KEY_ORIGINS);
     if (!raw) return;
     try {
       const parsed = JSON.parse(raw) as Record<string, string> | null;
@@ -652,7 +654,7 @@ export class LibraryStore {
         if (isGitHubCatalogUrl(u)) return origin === 'user';
         return isPersistedOrigin(origin ?? 'user');
       });
-      localStorage.setItem(LS_KEY_URLS, JSON.stringify(userUrls));
+      writeLocalStorage(LS_KEY_URLS, JSON.stringify(userUrls));
 
       // The origin map is persisted for every non-bundled URL, not just the
       // persisted ones: that is what makes promotion monotone ACROSS restarts.
@@ -661,7 +663,7 @@ export class LibraryStore {
         if (this._bundledUrls.has(url)) continue;
         origins[url] = origin;
       }
-      localStorage.setItem(LS_KEY_ORIGINS, JSON.stringify(origins));
+      writeLocalStorage(LS_KEY_ORIGINS, JSON.stringify(origins));
     } catch { /* ignore */ }
   }
 
@@ -671,7 +673,6 @@ export class LibraryStore {
       catalogUrls: [...this._catalogUrls],
       catalogErrors: new Map(this._catalogErrors),
       activeTabUrl: this._activeTabUrl,
-      thumbnailPending: new Set(this._thumbnailPending),
     };
   }
 

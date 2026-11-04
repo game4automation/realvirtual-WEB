@@ -7,6 +7,14 @@
  * seconds so sub-second progress is visible, mirroring the C# DESManager time.
  */
 
+/** Rounded completion time as HH:MM:SS, with hours allowed to exceed 24. */
+export function formatRunFinishedTime(totalSeconds: number): string {
+  if (!Number.isFinite(totalSeconds)) return '—';
+  const s = Math.max(0, Math.round(totalSeconds));
+  const p = (n: number): string => String(n).padStart(2, '0');
+  return `${p(Math.floor(s / 3600))}:${p(Math.floor((s % 3600) / 60))}:${p(s % 60)}`;
+}
+
 /** Format seconds to an editable DD:HH:MM:SS string (no tenths) for inputs. */
 export function formatDesDuration(totalSeconds: number): string {
   if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) return '';

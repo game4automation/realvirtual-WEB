@@ -16,6 +16,7 @@ import {
 } from './rv-component-registry';
 import { parseColorToHex } from './rv-error-visual';
 import { wireValueSignal } from './rv-signal-wiring';
+import { slotCommand, slotTryRead } from './rv-slot-io';
 import type { LampManager } from './rv-lamp-manager';
 
 const DEFAULT_ON_COLOR = 0xff0000;
@@ -72,7 +73,7 @@ export class RVLamp implements RVComponent {
   }
 
   private _tagNode(): void {
-    this._onColorHex = parseColorToHex(this._readOnColor(), DEFAULT_ON_COLOR);
+    this._onColorHex = this._resolveOnColor();
     if (!this.node.userData._rvType) {
       this.node.userData._rvType = 'Lamp';
       this._setLampType = true;
@@ -106,6 +107,7 @@ export class RVLamp implements RVComponent {
     this._mesh = mesh;
     this._originals = original;
     this._clones = clones;
+    this._onColorHex = this._resolveOnColor();
     mesh.material = Array.isArray(original) ? clones : clones[0];
     mesh.userData._rvLampMesh = true;
     this._bound = true;
@@ -128,6 +130,10 @@ export class RVLamp implements RVComponent {
     const ctx = this._ctx;
     if (!ctx) return;
 
+    // An unwired slot is re-declared below (SlotIO); a value a viewer binding
+    // commanded directly must survive the rebind — the binding still holds it.
+    const directOn = slotTryRead(ctx.signalStore, this, 'SignalLampOn', null);
+    const directFlash = slotTryRead(ctx.signalStore, this, 'SingalLampFlashing', null);
     this._unsubOn?.();
     this._unsubOn = undefined;
     this._unsubFlash?.();
@@ -136,7 +142,7 @@ export class RVLamp implements RVComponent {
     this._lampManager = undefined;
     this._blinkPhase = 0;
 
-    this._onColorHex = parseColorToHex(this._readOnColor(), DEFAULT_ON_COLOR);
+    this._onColorHex = this._resolveOnColor();
     resolveComponentRefs(this as unknown as Record<string, unknown>, ctx.registry);
 
     // plan-427: the helpers register a re-apply slot, so a lamp that is lit by a
@@ -144,15 +150,20 @@ export class RVLamp implements RVComponent {
     // (`_displayedLit` guard in `_apply`), so a replay costs nothing. The
     // initial call must NOT drive the optics yet — `_rebind()` applies the
     // combined state itself at the end — hence the `_wiring` gate below.
+    // Unwired slots are bound directly (SlotIO); neutralize switches them off.
     this._wiring = true;
     this._unsubOn = wireValueSignal(ctx.signalStore, this.SignalLampOn, (value) => {
       this.LampOn = Boolean(value);
       if (!this._wiring && !this.Flashing) this._apply(this.LampOn);
-    }, undefined, ctx.reapply).unsubscribe;
+    }, undefined, ctx.reapply, { instance: this, field: 'SignalLampOn', unbound: false }).unsubscribe;
     this._unsubFlash = wireValueSignal(ctx.signalStore, this.SingalLampFlashing, (value) => {
       this.Flashing = Boolean(value);
       if (!this._wiring) this._syncManager();
-    }, undefined, ctx.reapply).unsubscribe;
+    }, undefined, ctx.reapply, { instance: this, field: 'SingalLampFlashing', unbound: false }).unsubscribe;
+    if (directOn !== undefined && typeof this.SignalLampOn !== 'string') slotCommand(this, 'SignalLampOn', directOn);
+    if (directFlash !== undefined && typeof this.SingalLampFlashing !== 'string') {
+      slotCommand(this, 'SingalLampFlashing', directFlash);
+    }
     this._wiring = false;
     this._ensureBound();
     this._syncManager();
@@ -224,6 +235,15 @@ export class RVLamp implements RVComponent {
       material.emissiveIntensity = lit ? Math.max(0, this.Intensity) : 0;
     }
     return true;
+  }
+
+  /** The authored OnColor; without one the lamp lights in its own lens colour
+   *  (a green segment of a stack light glows green), red only without a mesh. */
+  private _resolveOnColor(): number {
+    const authored = this._readOnColor();
+    if (authored !== null) return parseColorToHex(authored, DEFAULT_ON_COLOR);
+    const lens = this._clones[0];
+    return lens ? lens.color.getHex() : DEFAULT_ON_COLOR;
   }
 
   private _readOnColor(): unknown {

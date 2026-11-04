@@ -14,8 +14,8 @@
  * project but is not. Everything it does therefore leans conservative:
  *
  * - **A copy gets a fresh `id`.** Two projects sharing an id would fight over
- *   the same `rv-project/last` slot, the same scene-ownership markers and the
- *   same thumbnail cache keys. Importing is a copy, so the copy is a new
+ *   the same `rv-project/last` slot and the same scene-ownership markers.
+ *   Importing is a copy, so the copy is a new
  *   project — the name is kept, the identity is not.
  * - **Ignored paths never travel.** Caches and secrets are excluded on the way
  *   *out*, using the same list `.rvprojectignore` documents. An export that
@@ -77,6 +77,8 @@ export function isExcludedFromExport(relPath: string): boolean {
   if (NEVER_EXPORT.some(prefix => path === prefix.slice(0, -1) || path.startsWith(prefix))) return true;
   const name = path.split('/').pop() ?? path;
   if (NEVER_EXPORT_NAMES.includes(name)) return true;
+  // Confidential contract documents (mirrors `/^\.contracts$/i` in SECRET_FILE_PATTERNS).
+  if (path.split('/').some(segment => segment.toLowerCase() === '.contracts')) return true;
   // `.env.production`, `.env.local`, … — the dotted variants matter as much as
   // the bare name, and are the ones people actually forget.
   if (name.startsWith('.env.')) return true;
@@ -222,7 +224,7 @@ export async function importProject(
     }
 
     // A copy is a NEW project: a shared id would make two projects fight over
-    // the same last-opened slot, ownership markers and thumbnail cache keys.
+    // the same last-opened slot and ownership markers.
     const copy: RvProject = { ...source, ...newProject(source.name ?? target.name), name: source.name ?? target.name };
     copy.id = newProject(copy.name).id;
 

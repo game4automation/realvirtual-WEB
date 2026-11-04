@@ -13,6 +13,7 @@
 
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react';
+import { budgeted } from './helpers/wait-budget';
 import { DocumentInfoEditor } from '../src/core/hmi/projects/DocumentInfoEditor';
 import {
   documentInfoDraftKey,
@@ -159,7 +160,8 @@ describe('plan-506 §9.6 — read-only and preview', () => {
       v: 1, description: 'See ![plant photo](https://tracker.example/pixel.png) and [the manual](https://example.com/m)',
     };
     const { container } = render(<DocumentInfoEditor projectId="p" documentId="a" info={info} onCommit={async () => {}} />);
-    const link = await screen.findByText('the manual');
+    // Budgeted findBy: async preview rendering has no test-controlled completion signal.
+    const link = await screen.findByText('the manual', undefined, budgeted());
     expect(link.tagName).toBe('A');
     expect(link.getAttribute('rel')).toBe('noopener noreferrer');
     expect(link.getAttribute('target')).toBe('_blank');

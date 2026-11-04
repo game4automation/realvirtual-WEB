@@ -87,11 +87,102 @@ export interface PanelEstopConfig extends PanelCell {
   lamp?: PanelLampConfig;
 }
 
+/**
+ * A continuous operator input (a setpoint potentiometer): writes a NUMBER to
+ * its signal, live while dragged (plan-659).
+ *
+ * The only analog INPUT of the panel. Everything else here is boolean, because
+ * a control box is boolean; a setpoint dial is the one device on a real
+ * enclosure that is not, and a policy-driven machine (a speed command, the
+ * strength of a disturbance) cannot be operated without one.
+ */
+export interface PanelSliderConfig extends PanelCell {
+  /** Accessible name, e.g. "Walk speed". */
+  label: string;
+  /** Caption below the slider; defaults to the label. */
+  caption?: string;
+  /** The input it writes (a float signal). */
+  signal: string;
+  min: number;
+  max: number;
+  /** Step of the dial. Default 1. */
+  step?: number;
+  /** Unit shown with the live value, e.g. "m/s". */
+  unit?: string;
+  /** Decimals of the live value. Default 0. */
+  decimals?: number;
+  /** Columns the device spans. Default 1. */
+  span?: number;
+}
+
+/**
+ * A numeric readout (a digital panel meter): READS a signal and shows its
+ * value, scaled and with its unit (plan-659).
+ *
+ * The only analog OUTPUT of the panel. A lamp answers "is it so?"; a readout
+ * answers "how much?" - telemetry a station shows next to its lamps (a
+ * travelled distance, a height, a real-time factor) has no boolean form.
+ */
+export interface PanelReadoutConfig extends PanelCell {
+  /** Accessible name and the legend above the value, e.g. "Distance". */
+  label: string;
+  /** The output it reads — a single value. Mutually exclusive with {@link signals}. */
+  signal?: string;
+  /**
+   * A VECTOR of outputs, shown as one instrument with its components side by
+   * side (2 to 4). Mutually exclusive with {@link signal}.
+   *
+   * Here because the measured quantities of a machine are routinely vectors —
+   * an angular rate, a projected gravity, a force — and splitting one into
+   * three separate instruments loses that they belong together, costs three
+   * legends and three grid cells. One element, one legend, n figures.
+   */
+  signals?: string[];
+  /** Component captions for {@link signals}, e.g. ["X","Y","Z"]. Same length. */
+  componentLabels?: string[];
+  /** Unit shown after the value, e.g. "m". */
+  unit?: string;
+  /** Decimals. Default 0. */
+  decimals?: number;
+  /** The raw value is multiplied by this before display (m to mm: 1000). Default 1. */
+  scale?: number;
+  /** Columns the device spans. Default 1. */
+  span?: number;
+}
+
 export interface PanelTowerSegmentConfig {
   name: string;
   signal: string;
   color: IecLampColor;
   simDriven?: boolean;
+}
+
+/** One row of a {@link PanelKeyLegendConfig}: the keys, and what they do. */
+export interface PanelKeyLegendRowConfig {
+  /** The keys, e.g. `"W / S"`. A `/` draws each key as its own cap. */
+  key: string;
+  /** What they do, e.g. `"Away from / toward the camera"`. */
+  text: string;
+}
+
+/**
+ * The engraved legend card of the panel (plan-659): which KEYS operate the
+ * machine, and what each one does.
+ *
+ * The one thing a plate of devices cannot say by itself. A lamp, a dial and a
+ * readout each answer a question the operator already has; a keyboard binding
+ * answers one he cannot even ask, because nothing on the plate hints that a
+ * key does anything at all. So a panel that is ALSO driven by keys carries
+ * their legend the way a real control box carries its printed card: always
+ * visible, no signals, no state, nothing to open — and omitted entirely by a
+ * panel operated by pointer alone.
+ */
+export interface PanelKeyLegendConfig {
+  /** Heading of the card, e.g. "Keyboard — hold". Optional. */
+  title?: string;
+  keys: PanelKeyLegendRowConfig[];
+  /** One line of prose under the rows, for what a key/effect table cannot say. */
+  note?: string;
 }
 
 /** A title-bar chip shown while its condition holds (e.g. HAND). */
@@ -130,15 +221,40 @@ export interface OperatorPanelConfig {
   title: string;
   /** Window width in px. Default 300. */
   width?: number;
+  /**
+   * Let the operator resize the window (plan-659). Default false — a control
+   * box is as big as its plate. A panel carrying live readouts is the
+   * exception; it then also gets a real {@link height}.
+   */
+  resizable?: boolean;
+  /** Window height in px when `resizable`; ignored otherwise. Default 420. */
+  height?: number;
+  /**
+   * How tightly the plate is packed (plan-659). Default `'comfortable'` — the
+   * metrics every panel built before this was drawn with, unchanged.
+   *
+   * `'compact'` is for a plate that is an ACCESSORY to what the operator is
+   * actually watching: a demo robot, a machine on the same screen. It tightens
+   * the gaps, the status strip and the readout windows — never the controls, so
+   * a button and a knob keep the size a finger needs. Devices, signals and
+   * layout are identical in both.
+   */
+  density?: 'comfortable' | 'compact';
   position?: { x: number; y: number };
   /** Grid columns (equal widths). Default 3. */
   columns?: number;
   buttons: PanelButtonConfig[];
   selectors: PanelSelectorConfig[];
   estops: PanelEstopConfig[];
+  /** Setpoint sliders (analog inputs). Optional - a boolean-only panel has none. */
+  sliders?: PanelSliderConfig[];
+  /** Numeric readouts (analog outputs). Optional. */
+  readouts?: PanelReadoutConfig[];
   /** Top to bottom, as the tower shows them. */
   stackLight: PanelTowerSegmentConfig[];
   chips?: PanelChipConfig[];
+  /** The keyboard legend, drawn under the devices. Optional. */
+  keyLegend?: PanelKeyLegendConfig;
   status: PanelStatusRule[];
   /** The restart sequence the status steps refer to. */
   restart?: { hint: string; steps: string[] };
@@ -184,6 +300,24 @@ export function operatorPanelSignals(config: OperatorPanelConfig): string[] {
   for (const e of config.estops) { out.add(e.signal); lamp(e.lamp); }
   for (const c of config.chips ?? []) conditionSignals(c.when, out);
   for (const r of config.status) if (r.when) conditionSignals(r.when, out);
+  return [...out];
+}
+
+/**
+ * The NUMERIC signals of a panel: its sliders and readouts (plan-659).
+ *
+ * Deliberately separate from {@link operatorPanelSignals}, which keeps its
+ * boolean-only meaning: the controller reads these with `getFloat` and puts
+ * them in `snapshot.numbers`, the boolean ones with `getBool` into
+ * `snapshot.values`. A caller that only knows about booleans is unaffected.
+ */
+export function operatorPanelAnalogSignals(config: OperatorPanelConfig): string[] {
+  const out = new Set<string>();
+  for (const s of config.sliders ?? []) out.add(s.signal);
+  for (const r of config.readouts ?? []) {
+    if (r.signal) out.add(r.signal);
+    for (const s of r.signals ?? []) out.add(s);
+  }
   return [...out];
 }
 
@@ -247,6 +381,10 @@ export function validateOperatorPanelConfigIssues(
     if (o[k] === undefined && optional) return;
     if (typeof o[k] !== 'string' || (o[k] as string).length === 0) err(key(path, k), 'must be a non-empty string');
   };
+  const num = (o: Obj, k: string, path: IssuePath, optional = false) => {
+    if (o[k] === undefined && optional) return;
+    if (typeof o[k] !== 'number' || !Number.isFinite(o[k])) err(key(path, k), 'must be a finite number');
+  };
   const oneOf = (o: Obj, k: string, path: IssuePath, allowed: readonly string[], optional = false) => {
     if (o[k] === undefined && optional) return;
     if (!allowed.includes(o[k] as string)) err(key(path, k), `must be one of ${allowed.join(', ')} (got ${JSON.stringify(o[k])})`);
@@ -296,6 +434,11 @@ export function validateOperatorPanelConfigIssues(
   if (raw.version !== 1) err(top('version'), 'must be 1');
   str(raw, 'id', CONFIG_ROOT);
   str(raw, 'title', CONFIG_ROOT);
+  if (raw.resizable !== undefined && typeof raw.resizable !== 'boolean') err(top('resizable'), 'must be true or false');
+  if (raw.height !== undefined && (typeof raw.height !== 'number' || !(raw.height > 0))) err(top('height'), 'must be a number greater than 0');
+  if (raw.density !== undefined && raw.density !== 'comfortable' && raw.density !== 'compact') {
+    err(top('density'), "must be 'comfortable' or 'compact'");
+  }
   list('buttons', (o, p) => {
     str(o, 'label', p); str(o, 'legend', p, true); str(o, 'signal', p);
     oneOf(o, 'capColor', p, Object.keys(IEC_CAP));
@@ -321,6 +464,40 @@ export function validateOperatorPanelConfigIssues(
     lamp(o.lamp, key(p, 'lamp'));
     cell(o, p);
   });
+  // plan-659: the two analog devices. Both optional — a boolean-only panel
+  // (every panel before this) omits them and validates byte-for-byte as before.
+  list('sliders', (o, p) => {
+    str(o, 'label', p); str(o, 'caption', p, true); str(o, 'signal', p); str(o, 'unit', p, true);
+    num(o, 'min', p); num(o, 'max', p);
+    num(o, 'step', p, true); num(o, 'decimals', p, true); num(o, 'span', p, true);
+    if (typeof o.min === 'number' && typeof o.max === 'number' && o.max <= o.min) {
+      err(key(p, 'max'), 'must be greater than min');
+    }
+    if (typeof o.step === 'number' && o.step <= 0) err(key(p, 'step'), 'must be greater than 0');
+    cell(o, p);
+  }, true);
+  list('readouts', (o, p) => {
+    str(o, 'label', p); str(o, 'unit', p, true);
+    // Exactly one of `signal` / `signals`: a readout that names both has two
+    // answers to "what does this instrument show".
+    const hasOne = o.signal !== undefined;
+    const hasMany = o.signals !== undefined;
+    if (hasOne === hasMany) err(p, "must have either 'signal' or 'signals'");
+    if (hasOne) str(o, 'signal', p);
+    if (hasMany) {
+      const v = o.signals;
+      if (!Array.isArray(v) || v.length < 2 || v.length > 4 || v.some((x) => typeof x !== 'string' || !x)) {
+        err(key(p, 'signals'), 'must be 2 to 4 non-empty signal names');
+      } else if (o.componentLabels !== undefined) {
+        const labels = o.componentLabels;
+        if (!Array.isArray(labels) || labels.length !== v.length || labels.some((x) => typeof x !== 'string')) {
+          err(key(p, 'componentLabels'), `must be ${v.length} strings (one per signal)`);
+        }
+      }
+    }
+    num(o, 'decimals', p, true); num(o, 'scale', p, true); num(o, 'span', p, true);
+    cell(o, p);
+  }, true);
   list('stackLight', (o, p) => { str(o, 'name', p); str(o, 'signal', p); oneOf(o, 'color', p, Object.keys(IEC_LAMP)); });
   list('chips', (o, p) => { str(o, 'label', p); str(o, 'text', p); condition(o.when, key(p, 'when')); oneOf(o, 'tone', p, ['warn', 'neutral'], true); }, true);
   list('status', (o, p) => {
@@ -330,6 +507,26 @@ export function validateOperatorPanelConfigIssues(
     if (o.when !== undefined) condition(o.when, key(p, 'when'));
     if (o.step !== undefined && (!Number.isInteger(o.step) || (o.step as number) < 1)) err(key(p, 'step'), 'must be an integer ≥ 1');
   });
+  // plan-659: the keyboard legend. Text only — no signals, no cell, so it is
+  // checked here rather than through `list` (it is one object, not a device).
+  if (raw.keyLegend !== undefined) {
+    const kl = raw.keyLegend;
+    if (!isObj(kl)) err(top('keyLegend'), 'must be an object');
+    else {
+      str(kl, 'title', top('keyLegend'), true);
+      str(kl, 'note', top('keyLegend'), true);
+      if (!Array.isArray(kl.keys) || kl.keys.length === 0) {
+        err(key(top('keyLegend'), 'keys'), 'must be a non-empty array');
+      } else {
+        kl.keys.forEach((row, i) => {
+          const p = index(key(top('keyLegend'), 'keys'), i);
+          if (!isObj(row)) { err(p, 'must be an object'); return; }
+          str(row, 'key', p);
+          str(row, 'text', p);
+        });
+      }
+    }
+  }
   if (raw.restart !== undefined) {
     const r = raw.restart;
     if (!isObj(r)) err(top('restart'), 'must be an object');
@@ -360,6 +557,11 @@ export function validateOperatorPanelConfigIssues(
     config.buttons.forEach((b, i) => { note(b.signal, key(item('buttons', i), 'signal')); lampPaths(b.lamp, item('buttons', i)); });
     config.estops.forEach((e, i) => { note(e.signal, key(item('estops', i), 'signal')); lampPaths(e.lamp, item('estops', i)); });
     config.stackLight.forEach((t, i) => note(t.signal, key(item('stackLight', i), 'signal')));
+    (config.sliders ?? []).forEach((s, i) => note(s.signal, key(item('sliders', i), 'signal')));
+    (config.readouts ?? []).forEach((r, i) => {
+      if (r.signal) note(r.signal, key(item('readouts', i), 'signal'));
+      (r.signals ?? []).forEach((s, j) => note(s, index(key(item('readouts', i), 'signals'), j)));
+    });
     (config.chips ?? []).forEach((c, i) => condPaths(c.when, key(item('chips', i), 'when')));
     config.status.forEach((r, i) => { if (r.when) condPaths(r.when, key(item('status', i), 'when')); });
     for (const [signal, path] of where) {
@@ -376,12 +578,22 @@ export interface OperatorPanelSnapshot {
   /** False until the model carries every signal of the panel; the controls render disabled. */
   ready: boolean;
   values: Readonly<Record<string, boolean>>;
+  /** Live values of the NUMERIC signals (sliders, readouts) — plan-659. */
+  numbers: Readonly<Record<string, number>>;
   /** The Simulation / PLC label. */
   modeLabel: string;
   /** True while the simulation drives the outputs (no interface has taken over). */
   simulated: boolean;
   /** Validation errors (JSON, structure, or signals the model lacks). */
   errors: readonly string[];
+  /**
+   * True while signals are missing but a feature that could still bring them is
+   * loading (plan-673): the panel is STARTING UP, not misconfigured. `errors`
+   * then carries one plain sentence rather than the per-signal complaints, and
+   * the window draws it with its controls disabled exactly as it draws a real
+   * error — the difference is who is to blame and whether it will fix itself.
+   */
+  pending: boolean;
 }
 
 /** The read side a window needs; {@link OperatorPanelController} provides it. */
@@ -390,6 +602,22 @@ export interface OperatorPanelSource {
   subscribe(listener: () => void): () => void;
   getSnapshot(): OperatorPanelSnapshot;
   write(signal: string, value: boolean): void;
+  /** Writes an analog operator input (a slider). Optional: a boolean-only source has none. */
+  writeNumber?(signal: string, value: number): void;
+}
+
+/**
+ * "Code that may still register signals is on its way" (plan-673) — the one
+ * fact that decides between {@link OperatorPanelSnapshot.pending} and a real
+ * error. Supplied by the viewer from its `FeatureLoader`; a host that has none
+ * (a unit test, the embed facade) leaves it out and gets the immediate,
+ * synchronous verdict this controller has always given.
+ */
+export interface OperatorPanelFeatureActivity {
+  /** True while at least one feature activation has not settled. */
+  readonly pending: boolean;
+  /** Fires whenever that answer may have changed. */
+  subscribe(cb: () => void): () => void;
 }
 
 /** What the controller needs from a viewer: the signal store and the Simulation / PLC mode. */
@@ -399,9 +627,18 @@ export interface OperatorPanelHostViewer {
     readonly state: Pick<ConnectionModeState, 'mode' | 'source'> & Partial<Pick<ConnectionModeState, 'interfaceConnected'>>;
     subscribe(cb: () => void): () => void;
   } | null;
+  /** Lazy-feature activity; absent = no lazy features in this host (plan-673). */
+  readonly featureActivity?: OperatorPanelFeatureActivity | null;
 }
 
-export const OFFLINE_SNAPSHOT: OperatorPanelSnapshot = { ready: false, values: {}, modeLabel: '', simulated: true, errors: [] };
+export const OFFLINE_SNAPSHOT: OperatorPanelSnapshot = { ready: false, values: {}, numbers: {}, modeLabel: '', simulated: true, errors: [], pending: false };
+
+/** The sentence a starting-up panel shows instead of its per-signal complaints. */
+export function pendingSignalsMessage(missing: number): string {
+  return missing === 1
+    ? 'Starting up — waiting for 1 signal the model has not registered yet.'
+    : `Starting up — waiting for ${missing} signals the model has not registered yet.`;
+}
 
 /**
  * One operator panel's runtime, React-free: validates the config, subscribes
@@ -415,9 +652,22 @@ export class OperatorPanelController implements OperatorPanelSource {
   readonly config: OperatorPanelConfig | null;
   private readonly _structureErrors: string[];
   private readonly _signals: string[];
+  /** The numeric signals (sliders, readouts) — read with `getFloat` (plan-659). */
+  private readonly _analog: string[];
   private _writer: SignalWriter | null = null;
   private _viewer: OperatorPanelHostViewer | null = null;
   private _cleanups: (() => void)[] = [];
+  /** Unsubscribes of the `pending` state only (plan-673): signal-added + feature activity. */
+  private _waitCleanups: (() => void)[] = [];
+  /** The names still missing while `pending`; null when not waiting. */
+  private _missing: Set<string> | null = null;
+  /**
+   * Bumped by every {@link stop}. A late `signal-added` or feature-status
+   * callback of a controller the host has already replaced must do nothing —
+   * the unsubscribes make that rare, not impossible (a listener set is copied
+   * before it is walked).
+   */
+  private _generation = 0;
   private readonly _listeners = new Set<() => void>();
   private _snapshot: OperatorPanelSnapshot;
 
@@ -434,11 +684,17 @@ export class OperatorPanelController implements OperatorPanelSource {
     const rawId = isObj(raw) && typeof raw.id === 'string' && raw.id ? raw.id : null;
     this.id = opts.id ?? checked.config?.id ?? rawId ?? 'operator-panel';
     this._signals = checked.config ? operatorPanelSignals(checked.config) : [];
+    this._analog = checked.config ? operatorPanelAnalogSignals(checked.config) : [];
     this._snapshot = { ...OFFLINE_SNAPSHOT, errors: checked.errors };
   }
 
-  /** Every signal the panel reads or writes. */
-  get signalNames(): readonly string[] { return this._signals; }
+  /** Every signal the panel reads or writes, boolean and numeric. */
+  get signalNames(): readonly string[] {
+    return this._analog.length === 0 ? this._signals : [...this._signals, ...this._analog];
+  }
+
+  /** Only the numeric ones (sliders, readouts). */
+  get analogSignalNames(): readonly string[] { return this._analog; }
 
   /** True between {@link start} and {@link stop}. */
   get started(): boolean { return this._viewer !== null; }
@@ -457,38 +713,157 @@ export class OperatorPanelController implements OperatorPanelSource {
   }
 
   /**
+   * Writes an ANALOG operator input (a slider) — plan-659. Same writer, same
+   * `hmi` kind, same ready guard as {@link write}; a non-finite value is
+   * dropped rather than put into the store.
+   */
+  writeNumber(signal: string, value: number): void {
+    if (!this._snapshot.ready || !this._writer) return;
+    if (!Number.isFinite(value)) return;
+    this._writer.set(signal, value);
+  }
+
+  /**
    * Connects to the viewer's signals. A config naming signals the model lacks
    * stays disabled and says which (with the JSON path).
+   *
+   * ## Late signals (plan-673)
+   *
+   * Binding used to be ONE synchronous check: whatever the store held at this
+   * moment decided for good, and the host never rebuilds an unchanged
+   * component. That is wrong for a LAZY feature, which registers its signal
+   * interface only after its chunk and its WASM are in — 8-17 s on the MuJoCo
+   * walker. For those seconds a perfectly good panel showed thirteen "not
+   * found in model" complaints and stayed dead for the rest of the session
+   * unless the feature remembered to call `WebOperatorPanelHost.reset()`.
+   *
+   * So a missing signal now has TWO readings, and which one applies is decided
+   * by {@link OperatorPanelHostViewer.featureActivity} rather than by a clock:
+   *
+   *  - **pending** — activations are still in flight. The window says "starting
+   *    up, waiting for n signals", the Problems entry is `info`, the console
+   *    stays quiet, and the controller listens on
+   *    {@link SignalStore.onSignalAdded} for exactly the names it still misses.
+   *    The moment the last one arrives it binds itself — no reset, no rescan,
+   *    no polling, and nothing per frame.
+   *  - **invalid** — nothing is coming any more. Exactly the old behaviour:
+   *    the per-signal messages with their JSON paths, a console warning and a
+   *    `warning` in the Problems panel. A typo in a signal name therefore still
+   *    complains, loudly, at the first opportunity.
+   *
+   * The first attempt never passes the final verdict when a `featureActivity`
+   * is present: it runs INSIDE the `model-loaded` dispatch, ahead of the
+   * probe-driven `ensure()` calls of the feature stubs that run in the same
+   * dispatch, so "nothing in flight" is not yet an answer there. The verdict is
+   * taken one microtask later, when the dispatch has unwound — the same
+   * coalescing trick the host uses for its rescan. A host WITHOUT
+   * `featureActivity` keeps the fully synchronous old path.
    */
   start(viewer: OperatorPanelHostViewer): void {
     this.stop();
     const store = viewer.signalStore;
     if (!store || !this.config) return;
     this._viewer = viewer;
-    const { errors } = validateOperatorPanelConfig(this.config, (name) => store.get(name) !== undefined);
-    if (errors.length > 0) {
-      console.warn(`[${this.id}] ${errors.join('; ')} — the operator panel stays disabled.`);
-      this._publish({ ...OFFLINE_SNAPSHOT, errors });
-      return;
-    }
-    // Operator kind, like the scene buttons a panel replaces: the PLC side
-    // (virtual or real) reads these inputs exactly as it read a 3D panel.
-    this._writer = createSignalWriter(store, `hmi:${this.id}`, 'hmi');
-    const sync = () => this._sync();
-    for (const name of this._signals) this._cleanups.push(store.subscribe(name, sync));
-    const mode = viewer.connectionMode;
-    if (mode) this._cleanups.push(mode.subscribe(sync));
-    this._sync();
+    this._evaluate(true);
   }
 
   /** Disconnects; the window shows the panel disabled (or its config errors). */
   stop(): void {
     for (const fn of this._cleanups) fn();
     this._cleanups = [];
+    this._releaseWaits();
     const wasStarted = this._viewer !== null;
     this._viewer = null;
     this._writer = null;
+    this._generation++;
     if (wasStarted) this._publish({ ...OFFLINE_SNAPSHOT, errors: this._structureErrors });
+  }
+
+  /**
+   * One binding attempt. `first` marks the synchronous attempt from
+   * {@link start} (see its doc comment for why that one never decides).
+   */
+  private _evaluate(first: boolean): void {
+    const viewer = this._viewer;
+    const store = viewer?.signalStore;
+    if (!viewer || !store || !this.config) return;
+    const { errors } = validateOperatorPanelConfig(this.config, (name) => store.get(name) !== undefined);
+    if (errors.length === 0) {
+      this._bind(viewer, store);
+      return;
+    }
+    const activity = viewer.featureActivity;
+    if (activity && (first || activity.pending)) {
+      this._waitForSignals(viewer, store, errors);
+      return;
+    }
+    this._refuse(errors);
+  }
+
+  /** The old, unchanged verdict: the panel is misconfigured and says so. */
+  private _refuse(errors: readonly string[]): void {
+    this._releaseWaits();
+    console.warn(`[${this.id}] ${errors.join('; ')} — the operator panel stays disabled.`);
+    this._publish({ ...OFFLINE_SNAPSHOT, errors: [...errors] });
+  }
+
+  /** The panel is complete: subscribe, publish, accept operator writes. */
+  private _bind(viewer: OperatorPanelHostViewer, store: SignalStore): void {
+    this._releaseWaits();
+    // Operator kind, like the scene buttons a panel replaces: the PLC side
+    // (virtual or real) reads these inputs exactly as it read a 3D panel.
+    this._writer = createSignalWriter(store, `hmi:${this.id}`, 'hmi');
+    const sync = () => this._sync();
+    for (const name of this._signals) this._cleanups.push(store.subscribe(name, sync));
+    for (const name of this._analog) this._cleanups.push(store.subscribe(name, sync));
+    const mode = viewer.connectionMode;
+    if (mode) this._cleanups.push(mode.subscribe(sync));
+    this._sync();
+  }
+
+  /**
+   * Publish `pending` and wait for the names we still miss.
+   *
+   * Only the MISSING names are watched, and only while they are missing: the
+   * `signal-added` channel is otherwise unsubscribed, so `register()` pays
+   * nothing for this during a model load. The whole configuration is never
+   * re-validated per event — only the remaining set is crossed off, and the
+   * full validator runs once, when it is empty.
+   */
+  private _waitForSignals(viewer: OperatorPanelHostViewer, store: SignalStore, errors: readonly string[]): void {
+    const missing = new Set(this.signalNames.filter((name) => store.get(name) === undefined));
+    this._missing = missing;
+    this._publish({
+      ...OFFLINE_SNAPSHOT,
+      pending: true,
+      errors: [pendingSignalsMessage(missing.size === 0 ? errors.length : missing.size)],
+    });
+    if (this._waitCleanups.length > 0) return;  // already waiting — keep the one subscription
+    const generation = this._generation;
+    const recheck = (): void => {
+      if (generation !== this._generation) return;
+      this._evaluate(false);
+    };
+    this._waitCleanups.push(store.onSignalAdded((name) => {
+      if (generation !== this._generation) return;
+      const left = this._missing;
+      if (!left) return;
+      left.delete(name);
+      if (left.size === 0) recheck();
+    }));
+    const activity = viewer.featureActivity;
+    // The verdict hangs on the END of the feature activations, never on a
+    // timeout: once nothing is in flight any more, a still-missing signal is a
+    // configuration error and is reported as one. A microtask covers the
+    // `model-loaded` dispatch itself, in which no `ensure()` has run yet.
+    if (activity) this._waitCleanups.push(activity.subscribe(recheck));
+    queueMicrotask(recheck);
+  }
+
+  private _releaseWaits(): void {
+    for (const fn of this._waitCleanups) fn();
+    this._waitCleanups = [];
+    this._missing = null;
   }
 
   private _sync(): void {
@@ -500,11 +875,22 @@ export class OperatorPanelController implements OperatorPanelSource {
       values[name] = store.getBool(name);
       if (values[name] !== this._snapshot.values[name]) changed = true;
     }
+    // plan-659: the numeric side. An empty `_analog` reuses the previous object,
+    // so a boolean-only panel allocates nothing extra and publishes as before.
+    let numbers = this._snapshot.numbers;
+    if (this._analog.length > 0) {
+      const next: Record<string, number> = {};
+      for (const name of this._analog) {
+        next[name] = store.getFloat(name);
+        if (next[name] !== this._snapshot.numbers[name]) changed = true;
+      }
+      numbers = next;
+    }
     const mode = this._viewer?.connectionMode;
     const modeLabel = mode ? connectionModeLabel(mode.state) : '';
     const simulated = mode ? mode.state.mode === 'Simulation' && mode.state.source !== 'interface' : true;
     if (!changed && modeLabel === this._snapshot.modeLabel && simulated === this._snapshot.simulated) return;
-    this._publish({ ready: true, values, modeLabel, simulated, errors: [] });
+    this._publish({ ready: true, values, numbers, modeLabel, simulated, errors: [], pending: false });
   }
 
   private _publish(next: OperatorPanelSnapshot): void {

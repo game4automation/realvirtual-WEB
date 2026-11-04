@@ -42,8 +42,9 @@ console.log(validate({ Direction: 'LinearX', TargetSpeed: 200 }));
 ## Who uses it
 
 - **realvirtual WEB** — the AGPL browser viewer/simulator is the reference
-  implementation; its runtime component schemas are loaded directly from
-  `rv-odt.json` (zero drift by construction).
+  implementation; its runtime component schemas are generated from
+  `rv-odt.json` (`npm run gen:odt-split` splits the descriptions into a lazily
+  loaded file; a drift test keeps the split files in sync).
 - **realvirtual Unity framework** — exports rv-ODT GLBs from Unity scenes.
 - **Third-party tools** — Blender add-ons, CAD pipelines, CI validators,
   documentation generators. The format is open; build on it.

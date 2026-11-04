@@ -13,9 +13,12 @@ import { useMobileLayout } from '../../hooks/use-mobile-layout';
 import { WelcomeModal } from './WelcomeModal';
 import { useCustomBranding } from './branding-store';
 import { useKioskHasTour, startKioskFromWelcome } from '../../plugins/kiosk-plugin';
-import { useActiveContexts, evaluateVisibilityRule, useUIVisible } from './ui-context-store';
+import { useActiveContexts, useUIVisible } from './ui-context-store';
 import { WELCOME_AUTO_OPEN_UI_ELEMENT_ID, WELCOME_AUTO_OPEN_VISIBILITY_RULE } from './welcome-modal-store';
 import { useMode } from '../../hooks/use-mode';
+import { computeToolSections, countToolEntries } from './button-panel-sections';
+import { FIELD_BORDER_HOVER } from './shared-sx';
+import { readLocalStorage, writeLocalStorage } from './rv-storage-keys';
 
 /* Logo URL: use BASE_URL so it resolves correctly under sub-folder deploys (e.g. Bunny CDN /demo/) */
 const logoUrl = `${import.meta.env.BASE_URL}logo.png`;
@@ -30,7 +33,7 @@ function BrandingContent() {
 
   // No branding, or branding that doesn't override the activity-bar mark →
   // keep the default realvirtual logo. A project sets `logoUrl` only when it
-  // wants its own mark here; Mauser leaves it so the platform logo stays.
+  // wants its own mark here; the large CAD line leaves it so the platform logo stays.
   if (!custom?.logoUrl) {
     return <img src={logoUrl} alt="realvirtual" style={{ height: 24, width: 24 }} />;
   }
@@ -54,7 +57,7 @@ export function LogoBadge() {
   //  - `manualOpen`  — the user clicked the logo. Honoured in every workspace.
   //  - `autoPending` — first visit in this browser; the dialog shows itself.
   const [manualOpen, setManualOpen] = useState(false);
-  const [autoPending, setAutoPending] = useState(() => !localStorage.getItem(WELCOME_DISMISSED_KEY));
+  const [autoPending, setAutoPending] = useState(() => !readLocalStorage(WELCOME_DISMISSED_KEY));
 
   // plan-387 (F4): in the Viewer workspace the dialog must not open ITSELF —
   // it is a product pitch whose "Planner Demo" button is an authoring entry
@@ -92,7 +95,7 @@ export function LogoBadge() {
         onClose={() => {
           setManualOpen(false);
           setAutoPending(false);
-          localStorage.setItem(WELCOME_DISMISSED_KEY, '1');
+          writeLocalStorage(WELCOME_DISMISSED_KEY, '1');
         }}
       />
     </>
@@ -120,6 +123,14 @@ function WelcomeModalHost({ open, onClose }: { open: boolean; onClose: () => voi
  * activity bar and any open left-docked window.
  *
  * NOT the activity bar — window-opener buttons live in ActivityBar.tsx.
+ *
+ * Sections (plan-2010): entries carrying a `group` render in fixed-rank
+ * sections (ungrouped → editing → model → analysis → view → other groups, see
+ * `button-panel-sections.ts`), each one wrapper with `data-rv-tool-group`. The
+ * divider between two sections is CSS on the container: an empty wrapper (all
+ * its components rendered `null`) is hidden by `:empty`, and only a non-empty
+ * section that FOLLOWS another non-empty one draws the line — so there is never
+ * a leading, trailing or doubled divider, whatever the components render.
  */
 export function ButtonPanel({ dock = false }: { dock?: boolean } = {}) {
   const viewer = useViewer();
@@ -128,23 +139,14 @@ export function ButtonPanel({ dock = false }: { dock?: boolean } = {}) {
   // Active UI contexts (planner, fpv, xr, …). Drives entry visibility filtering.
   const contexts = useActiveContexts();
 
-  /**
-   * Filter slot entries to those that should currently render.
-   *  - Entry has explicit `visibilityRule` → evaluate it directly.
-   *  - No rule → visible by default, EXCEPT in a "focused" workspace mode
-   *    (any active mode other than the default `hmi`, e.g. Planner or DES),
-   *    where only buttons that opt in via a visibility rule are shown.
-   */
+  // Visibility filter (rule → evaluate; no rule → hidden in focused modes) and
+  // the split into sections — one pure function, see button-panel-sections.ts.
   const { active: activeMode } = useMode();
-  const entries = useMemo(() => {
-    const focusedMode = activeMode !== null && activeMode !== 'hmi';
-    return allEntries.filter((entry) => {
-      if (entry.visibilityRule) {
-        return evaluateVisibilityRule(entry.visibilityRule, contexts);
-      }
-      return !focusedMode;
-    });
-  }, [allEntries, contexts, activeMode]);
+  const sections = useMemo(
+    () => computeToolSections(allEntries, contexts, activeMode),
+    [allEntries, contexts, activeMode],
+  );
+  const entryCount = countToolEntries(sections);
 
   const isMobile = useMobileLayout();
 
@@ -174,14 +176,45 @@ export function ButtonPanel({ dock = false }: { dock?: boolean } = {}) {
     const ro = new ResizeObserver(updateScrollHint);
     ro.observe(el);
     return () => { el.removeEventListener('scroll', updateScrollHint); ro.disconnect(); };
-  }, [isMobile, updateScrollHint, entries.length]);
+  }, [isMobile, updateScrollHint, entryCount]);
 
-  if (entries.length === 0) return null;
+  if (entryCount === 0) return null;
 
-  const buttons = entries.map((entry, i) => {
-    const Comp = entry.component;
-    return <Comp key={`btn-${i}`} viewer={viewer} />;
-  });
+  const buttons = sections.map((section) => (
+    <Box
+      key={section.key}
+      data-rv-tool-group={section.key}
+      // The ungrouped section has no name — an unnamed `group` would only add noise.
+      {...(section.label ? { role: 'group', 'aria-label': section.label } : null)}
+      sx={{
+        display: 'flex',
+        flexDirection: isMobile ? 'row' : 'column',
+        gap: 0.25,
+        ...(isMobile && { '& > *': { flexShrink: 0 } }),
+      }}
+    >
+      {section.entries.map(({ entry, key }) => {
+        const Comp = entry.component;
+        return <Comp key={key} viewer={viewer} />;
+      })}
+    </Box>
+  ));
+
+  // Dividers between non-empty sections (decision E3) — on the element whose
+  // DIRECT children the section wrappers are.
+  const sectionSx = isMobile
+    ? {
+      '& > [data-rv-tool-group]:empty': { display: 'none' },
+      '& > [data-rv-tool-group]:not(:empty) ~ [data-rv-tool-group]:not(:empty)': {
+        borderLeft: `1px solid ${FIELD_BORDER_HOVER}`, pl: 0.5, ml: 0.25,
+      },
+    }
+    : {
+      '& > [data-rv-tool-group]:empty': { display: 'none' },
+      '& > [data-rv-tool-group]:not(:empty) ~ [data-rv-tool-group]:not(:empty)': {
+        borderTop: `1px solid ${FIELD_BORDER_HOVER}`, pt: 0.5, mt: 0.25,
+      },
+    };
 
   const paper = (
     <Paper
@@ -193,9 +226,10 @@ export function ButtonPanel({ dock = false }: { dock?: boolean } = {}) {
         flexDirection: 'column',
         gap: 0.25,
         p: 0.5,
-        borderRadius: isMobile ? 0 : 2,
+        borderRadius: isMobile ? 0 : 1,
         pointerEvents: 'auto',
         ...(isMobile && { width: '100%' }),
+        ...(!isMobile && sectionSx),
       }}
     >
       {isMobile ? (
@@ -211,6 +245,7 @@ export function ButtonPanel({ dock = false }: { dock?: boolean } = {}) {
               // Touch-friendly hit targets (~44px) + slightly larger icons.
               '& .MuiIconButton-root': { minWidth: 44, minHeight: 44 },
               '& .MuiSvgIcon-root': { fontSize: 22 },
+              ...sectionSx,
             }}
           >
             {buttons}

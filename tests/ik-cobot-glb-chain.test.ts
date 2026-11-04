@@ -33,6 +33,23 @@
  * The path execution is solver-agnostic; only the per-step solve routes by
  * wrist type.
  *
+ * ## It loads the BAKED tree (plan-772 Phase 1)
+ *
+ * It used to load with `preserveHierarchy: true`, "to skip the uber/merge bakes
+ * so local transforms stay authored". Two things were wrong with that. The
+ * flag does not even reach the bake on its own — the destructive pipeline is
+ * also gated on `options.bakeRegistry`, which this file never passed, so
+ * `{ data }` and `{ data, preserveHierarchy }` both loaded the same 117-node
+ * authoring tree where production has 78 (plan-772 B3). And the authoring tree
+ * is not the tree these assertions are about: the whole point here is that
+ * live-solve and replay agree in the tree the viewer actually builds. They did
+ * not — the TCP node was removed by the bake and the chain collapsed onto the
+ * A6 flange, 239.90 mm / 180.00° off, with this suite green throughout
+ * (plan-772 B2).
+ *
+ * It now loads through {@link loadBakedGLB}, which passes a registry, refuses
+ * the authoring flags and proves from the RESULT that the bake ran.
+ *
  * Needs the DemoRealvirtual project's DemoRobotIK.glb (served by the vitest browser
  * server via the rv-private-models middleware) and the private WASM solver.
  * Skips when either is absent - which, until plan-395, this comment only
@@ -44,7 +61,8 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { Scene, Vector3, Quaternion, Matrix4 } from 'three';
-import { loadGLB, type LoadResult } from '../src/core/engine/rv-scene-loader';
+import { type LoadResult } from '../src/core/engine/rv-scene-loader';
+import { loadBakedGLB } from './helpers/load-baked-glb';
 import { ikSolverRegistry, targetPoseInBase, type JointChainParams } from '../src/core/engine/rv-ik-solver';
 import type { RVRobotIK } from '../src/core/engine/rv-robot-ik';
 import type { RVIKTarget } from '../src/core/engine/rv-ik-target';
@@ -147,9 +165,8 @@ beforeAll(async () => {
     // are a GLB and a short read is a real defect rather than an absent file.
     const bytes = await (await fetch(GLB_URL)).arrayBuffer();
     const scene = new Scene();
-    // preserveHierarchy: skip the uber/merge bakes so local transforms stay
-    // authored — the drive-application check below recomputes world matrices.
-    result = await loadGLB(GLB_URL, scene, { data: bytes, preserveHierarchy: true });
+    // The PRODUCTION load: destructive bake, no authoring flag (plan-772 F2).
+    result = await loadBakedGLB(GLB_URL, scene, { data: bytes });
     const robots = result.registry.getAll<RVRobotIK>('RobotIK');
     allRobots = robots.map((r) => r.instance).filter((r) => r.getAxisDrives().length === 6);
     robot = allRobots.find((r) => r.WristType === 'NonSpherical') ?? null;
@@ -196,7 +213,7 @@ describe.skipIf(!DEV_ASSETS)('Cobot joint chain from the real GLB (FANUC CRX)', 
     const p3: [number, number, number] = [0, 0, 0];
     const q4: Q = [0, 0, 0, 1];
     for (const t of targets) {
-      targetPoseInBase(robot!.node.matrixWorld, t.node.matrixWorld, p3, q4);
+      targetPoseInBase(robot!.node.matrixWorld, t.node.matrixWorld, p3, q4, 'chain');
       const { pos, rot } = fk(t.AxisPos, chain);
       // Baked AxisPos are float32 + Unity solve tolerance → allow ~1 cm / 2°.
       expect(posDist(pos, p3), `pos mismatch at "${t.node.name}"`).toBeLessThan(0.01);
@@ -254,7 +271,7 @@ describe.skipIf(!DEV_ASSETS)('Cobot joint chain from the real GLB (FANUC CRX)', 
     const p3: [number, number, number] = [0, 0, 0];
     const q4: Q = [0, 0, 0, 1];
     for (const t of targets) {
-      targetPoseInBase(robot!.node.matrixWorld, t.node.matrixWorld, p3, q4);
+      targetPoseInBase(robot!.node.matrixWorld, t.node.matrixWorld, p3, q4, 'chain');
       const sols = ikSolverRegistry.solveCobot(chain, p3, q4, {
         opw: opw!,
         warmStart: new Float64Array(t.AxisPos),

@@ -416,3 +416,188 @@ describe('Edge cases', () => {
     expect(step.estimatedMinutes).toBe(0);
   });
 });
+
+// ─── plan-522 §9.3: web-authored procedure (one node per step) ─────────
+
+const nodeRef = (path: string) => ({ type: 'ComponentReference', path, componentType: '' });
+
+/**
+ * Scene
+ *  └─ Machine
+ *      ├─ Door, NozzleTip_1, NozzleTip_2, Housing, Signals/Lamp   (reference targets)
+ *      └─ Maintenance  [LogicStep_MaintenanceProcedure]
+ *          ├─ 01 Cell stopped     [MaintenanceStep]
+ *          ├─ 02 Open doors       [MaintenanceStep][DriveTo][DriveTo_1][SetSignalBool]
+ *          └─ 03 Look inside      [MaintenanceStep][SetTransparency][Effect][AnimateTransform_1]
+ */
+function createWebProcedure(): { root: Object3D; proc: Object3D; steps: Object3D[] } {
+  const root = new Object3D();
+  root.name = 'Scene';
+  const machine = mockNode('Machine');
+  root.add(machine);
+  for (const n of ['Door', 'NozzleTip_1', 'NozzleTip_2', 'Housing', 'Signals']) machine.add(mockNode(n));
+  machine.children.find((c) => c.name === 'Signals')!.add(mockNode('Lamp'));
+  const proc = mockNode('Maintenance', {
+    LogicStep_MaintenanceProcedure: { ProcedureName: 'Coolant Nozzle Cleaning', EstimatedMinutes: 0 },
+  });
+  machine.add(proc);
+  const s1 = mockNode('01 Cell stopped', {
+    LogicStep_MaintenanceStep: {
+      Title: 'Cell stopped', CompletionType: 'Checkbox', EstimatedMinutes: 2,
+      CameraPosition: { x: 1.2, y: 1.45, z: 0.8 }, CameraTarget: { x: 0.3, y: 1.1, z: 0 },
+      HighlightTargets: [nodeRef('Door')],
+    },
+  });
+  const s2 = mockNode('02 Open doors', {
+    LogicStep_MaintenanceStep: { Title: '', CompletionType: 'ConfirmWarning', EstimatedMinutes: 3 },
+    LogicStep_DriveTo: { drive: { type: 'ComponentReference', path: 'Door', componentType: 'realvirtual.Drive' }, Destination: 500 },
+    LogicStep_DriveTo_1: { drive: { type: 'ComponentReference', path: 'Machine/Door', componentType: 'realvirtual.Drive' }, Destination: 0 },
+    LogicStep_SetSignalBool: { Signal: { type: 'ComponentReference', path: 'Signals/Lamp', componentType: 'realvirtual.PLCOutputBool' }, SetToTrue: true },
+  });
+  const s3 = mockNode('03 Look inside', {
+    LogicStep_MaintenanceStep: { Title: 'Look inside', CompletionType: 'Observation' },
+    LogicStep_SetTransparency: { Targets: [nodeRef('Housing')], Opacity: 0.25, StartDelay: 0.5 },
+    LogicStep_Effect: { Type: 'CoolantSpray', Anchors: [nodeRef('NozzleTip_1'), nodeRef('NozzleTip_2')], Intensity: 1, StartDelay: 1.5 },
+    LogicStep_AnimateTransform_1: { Targets: [nodeRef('NozzleTip_1')], RotationAngle: 720 },
+  });
+  proc.add(s1, s2, s3);
+  return { root, proc, steps: [s1, s2, s3] };
+}
+
+type Rv = Record<string, Record<string, unknown>>;
+const rvOf = (n: Object3D): Rv => n.userData.realvirtual as Rv;
+
+describe('plan-522 §9.3 — web-authored procedure', () => {
+  test('steps = direct children with MaintenanceStep, in hierarchy order; reordering changes the order', () => {
+    const { root, proc, steps } = createWebProcedure();
+    let [p] = parseMaintenanceProcedures(root);
+    expect(p.name).toBe('Coolant Nozzle Cleaning');
+    expect(p.steps.map((s) => s.title)).toEqual(['Cell stopped', '02 Open doors', 'Look inside']);
+    expect(p.steps.map((s) => s.index)).toEqual([0, 1, 2]);
+    expect(p.estimatedMinutes).toBe(5); // 0 = sum of the steps
+    expect(p.warnings).toEqual([]);
+
+    // Hierarchy drag & drop: step 3 moves to the front.
+    proc.remove(steps[2]);
+    proc.add(steps[2]);
+    proc.children.unshift(proc.children.pop()!);
+    [p] = parseMaintenanceProcedures(root);
+    expect(p.steps.map((s) => s.title)).toEqual(['Look inside', 'Cell stopped', '02 Open doors']);
+    expect(p.steps.map((s) => s.index)).toEqual([0, 1, 2]);
+  });
+
+  test('empty Title / ProcedureName fall back to the AUTHORED name a loader dedup kept in _rvOrigName (Phase 5)', () => {
+    const { root, proc, steps } = createWebProcedure();
+    proc.userData.realvirtual = { LogicStep_MaintenanceProcedure: { ProcedureName: '' } };
+    proc.name = 'Maintenance_1';
+    proc.userData._rvOrigName = 'Maintenance';
+    steps[1].name = '02_Open_doors_1';
+    steps[1].userData._rvOrigName = '02 Open doors';
+    const [p] = parseMaintenanceProcedures(root);
+    expect(p.name).toBe('Maintenance');
+    expect(p.steps[1].title).toBe('02 Open doors');
+  });
+
+  test('a declared EstimatedMinutes > 0 wins over the sum; empty ProcedureName = node name', () => {
+    const { root, proc } = createWebProcedure();
+    proc.userData.realvirtual = { LogicStep_MaintenanceProcedure: { ProcedureName: '', EstimatedMinutes: 25 } };
+    const [p] = parseMaintenanceProcedures(root);
+    expect(p.name).toBe('Maintenance');
+    expect(p.estimatedMinutes).toBe(25);
+  });
+
+  test('actions per step from the components of the node, incl. `_N` keys, with startDelay', () => {
+    const { root, steps } = createWebProcedure();
+    const [p] = parseMaintenanceProcedures(root);
+    expect(p.steps[0].actions).toEqual([]);
+
+    const a2 = p.steps[1].actions;
+    expect(a2.map((a) => a.type)).toEqual(['DriveTo', 'DriveTo', 'SetSignalBool']);
+    expect(a2.map((a) => a.data['Destination'])).toEqual([500, 0, undefined]);
+    expect(a2.every((a) => a.node === steps[1])).toBe(true);
+    expect(a2.every((a) => a.startDelay === 0)).toBe(true);
+
+    const a3 = p.steps[2].actions;
+    expect(a3.map((a) => [a.type, a.startDelay])).toEqual([
+      ['SetTransparency', 0.5],
+      ['Effect', 1.5],
+      ['AnimateTransform', 0],
+    ]);
+    // data is the component's rv_extras block (the runtime interprets it).
+    expect(a3[0].data).toBe(rvOf(steps[2])['LogicStep_SetTransparency']);
+  });
+
+  test('unsupported steps on a step node and children without MaintenanceStep → warnings', () => {
+    const { root, proc, steps } = createWebProcedure();
+    Object.assign(rvOf(steps[0]), {
+      LogicStep_Delay: { Duration: 2 },
+      LogicStep_WaitForSignalBool: { WaitForTrue: true },
+      LogicStep_Enable_1: {},
+    });
+    proc.add(mockNode('Notes'));
+    // Deeper nodes do not belong to the procedure (no warning, no step).
+    steps[0].add(mockNode('Deep', { LogicStep_MaintenanceStep: { Title: 'Deep' } }));
+    const [p] = parseMaintenanceProcedures(root);
+    expect(p.steps).toHaveLength(3);
+    expect(p.steps[0].actions).toEqual([]);
+    const w = p.warnings.join('\n');
+    expect(p.warnings).toHaveLength(4);
+    expect(w).toContain('LogicStep_Delay');
+    expect(w).toContain('LogicStep_WaitForSignalBool');
+    expect(w).toContain('LogicStep_Enable_1');
+    expect(w).toContain('"Notes"');
+    expect(w).not.toContain('Deep');
+  });
+
+  test('unresolvable references → warning, the action stays in the list', () => {
+    const { root, steps } = createWebProcedure();
+    rvOf(steps[2])['LogicStep_SetTransparency'].Targets = [nodeRef('Housing'), nodeRef('Gone/Part')];
+    const [p] = parseMaintenanceProcedures(root);
+    expect(p.steps[2].actions.map((a) => a.type)).toContain('SetTransparency');
+    expect(p.warnings).toHaveLength(1);
+    expect(p.warnings[0]).toContain('Gone/Part');
+    expect(p.warnings[0]).toContain('LogicStep_SetTransparency');
+  });
+
+  test('CameraPosition / CameraTarget are taken without conversion; (0,0,0)+(0,0,0) = no camera', () => {
+    const { root, steps } = createWebProcedure();
+    rvOf(steps[1])['LogicStep_MaintenanceStep'].CameraPosition = { x: 0, y: 0, z: 0 };
+    rvOf(steps[1])['LogicStep_MaintenanceStep'].CameraTarget = { x: 0, y: 0, z: 0 };
+    const [p] = parseMaintenanceProcedures(root);
+    expect(p.steps[0].camera).toEqual({ px: 1.2, py: 1.45, pz: 0.8, tx: 0.3, ty: 1.1, tz: 0 });
+    expect(p.steps[1].camera).toBeNull();
+    expect(p.steps[2].camera).toBeNull();
+    expect(p.steps[0].highlightPaths).toEqual(['Door']);
+  });
+
+  test('the old CameraPos format inside a MaintenanceStep keeps the Unity conversion', () => {
+    const { root, steps } = createWebProcedure();
+    rvOf(steps[0])['LogicStep_MaintenanceStep'].CameraPosition = {
+      type: 'ScriptableObject', data: { CameraTransformPos: { x: -1, y: 2, z: 3 }, TargetPos: { x: 4, y: 0, z: 0 } },
+    };
+    const [p] = parseMaintenanceProcedures(root);
+    expect(p.steps[0].camera).toEqual({ px: 1, py: 2, pz: 3, tx: -4, ty: 0, tz: 0 });
+  });
+
+  test('old SerialContainer formats parse as before, with empty actions / warnings', () => {
+    const [combined] = parseMaintenanceProcedures(createMockSceneWithMaintenanceSteps());
+    expect(combined.steps).toHaveLength(3);
+    expect(combined.warnings).toEqual([]);
+    expect(combined.steps.every((s) => Array.isArray(s.actions) && s.actions.length === 0)).toBe(true);
+    // Unity CameraPos conversion unchanged (x negated).
+    expect(combined.steps[1].camera).toEqual({ px: 2, py: 1.5, pz: 2, tx: 1, ty: 0.5, tz: 1 });
+
+    const [composable] = parseMaintenanceProcedures(createMockSceneWithComposableSteps());
+    expect(composable.steps).toHaveLength(2);
+    expect(composable.warnings).toEqual([]);
+    expect(composable.steps.every((s) => s.actions.length === 0)).toBe(true);
+  });
+
+  test('a procedure without any step node yields no procedure', () => {
+    const root = mockNode('Scene');
+    const proc = mockNode('Maintenance', { LogicStep_MaintenanceProcedure: {} });
+    root.add(proc);
+    proc.add(mockNode('Notes'));
+    expect(parseMaintenanceProcedures(root)).toEqual([]);
+  });
+});

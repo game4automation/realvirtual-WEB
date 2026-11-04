@@ -178,7 +178,22 @@ export function fingerprint(mat: Material): string {
     texKey(m.emissiveMap),
     texKey(m.alphaMap),
     texKey(m.lightMap),
+    // plan-675 (spike M5, SOL R2-1): the animated-mantle marker and its speed
+    // group. An unmarked twin with the same map must NOT be folded into a marked
+    // material (it would spin along), and two speed groups must stay two
+    // materials — one chunk each, one offset each. Only present when set, so
+    // every other fingerprint is unchanged.
+    ...spinKey(mat),
   ].join('|');
+}
+
+/** Spin marker + speed group of a material (plan-675), `[]` for any other material. */
+function spinKey(mat: Material): string[] {
+  const ud = mat.userData as Record<string, unknown> | undefined;
+  const spin = (ud?.['rvMaterialPreset'] as { spin?: string } | undefined)?.spin;
+  const group = ud?.['rvSpinGroup'];
+  if (!spin && group === undefined) return [];
+  return [`spin:${spin ?? '-'}`, `grp:${group ?? '-'}`];
 }
 
 /**
@@ -187,9 +202,28 @@ export function fingerprint(mat: Material): string {
  */
 function texKey(t: Texture | null | undefined): string {
   if (!t) return 'null';
+  return texSourceKey(t) + texTransformKey(t);
+}
+
+function texSourceKey(t: Texture): string {
   const src = (t.source as unknown as { data?: { src?: string } } | undefined)?.data?.src;
   if (src) return src;
   const imgSrc = (t.image as unknown as { src?: string } | undefined)?.src;
   if (imgSrc) return imgSrc;
   return t.uuid;
+}
+
+/**
+ * plan-675 (SOL R2-2): the EFFECTIVE texture transform. Two materials on the same
+ * image but with different tiling (a textured preset at 0.25 m vs 1 m per tile)
+ * sample different texels — merging them would re-tile one of them. Empty for
+ * the identity transform, so the fingerprint of every untransformed map is
+ * unchanged (the wrap mode only matters once the transform leaves [0, 1]).
+ */
+function texTransformKey(t: Texture): string {
+  const q = (v: number): string => String(Math.round(v * 10000));
+  const identity = t.repeat.x === 1 && t.repeat.y === 1 && t.offset.x === 0 && t.offset.y === 0
+    && t.rotation === 0 && t.center.x === 0 && t.center.y === 0;
+  if (identity) return '';
+  return `#r${q(t.repeat.x)},${q(t.repeat.y)}o${q(t.offset.x)},${q(t.offset.y)}a${q(t.rotation)}c${q(t.center.x)},${q(t.center.y)}w${t.wrapS},${t.wrapT}`;
 }

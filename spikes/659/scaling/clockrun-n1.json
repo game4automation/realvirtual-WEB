@@ -1,0 +1,45 @@
+{
+  "plan": 659,
+  "what": "parallel Microduck scaling (processes)",
+  "generatedAt": "2026-10-22T19:43:07.790Z",
+  "config": {
+    "ns": [
+      1
+    ],
+    "reps": 1,
+    "episodes": 64,
+    "steps": 1500,
+    "pin": "1",
+    "latency": "0"
+  },
+  "node": "v24.18.0",
+  "runs": [
+    {
+      "n": 1,
+      "windowS": 13.4841294,
+      "simSecondsTotal": 1920,
+      "aggregateThroughput": 142.38961545415012,
+      "perWorkerThroughputMean": 142.39869323092532,
+      "workerWindowMinS": 13.4832698,
+      "workerWindowMaxS": 13.4832698,
+      "stragglerSpreadPct": 0,
+      "falls": 0,
+      "allWorkersSameDisplacement": true,
+      "displacementXFirst": 3.291281750448731,
+      "loadMsMax": 759.2362,
+      "warmMsMax": 70.18819999999994,
+      "latencyMedianMs": null,
+      "latencyP95Ms": null,
+      "rep": 1,
+      "baselineLoad": {
+        "meanPct": 13,
+        "minPct": 13,
+        "maxPct": 13,
+        "samples": [
+          13
+        ],
+        "seconds": 1
+      }
+    }
+  ]
+}

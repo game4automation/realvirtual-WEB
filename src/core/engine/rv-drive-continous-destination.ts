@@ -13,6 +13,7 @@ import {
 } from './rv-signal-store';
 import { debug } from './rv-debug';
 import { scaleFeedbackPosition } from './rv-signal-wiring';
+import { slotDeclare, slotUndeclare, slotWrite } from './rv-slot-io';
 
 /**
  * RVDriveContinousDestination — TypeScript port of Drive_ContinousDestination.cs
@@ -94,6 +95,32 @@ export class RVDriveContinousDestination implements IDriveBehavior, RVComponent 
 
     // Register self as a drive behavior so drive.update() calls our update().
     drive.driveBehaviors.push(this);
+    // Unwired slots stay bindable in the viewer (SlotIO, rv-slot-io.ts).
+    // A direct command overrides the property; neutralize restores the authored value.
+    const authoredDestination = this.Destination;
+    const authoredTargetSpeed = this.TargetSpeed;
+    const authoredAcceleration = this.Acceleration;
+    slotDeclare(this, 'SignalDestination', 'setter', {
+      apply: (value) => {
+        this.Destination = Number(value) * this.CurrentPositionScale + this.CurrentPositionOffset;
+      },
+      neutral: () => { this.Destination = authoredDestination; },
+      reapply: context.reapply,
+    });
+    slotDeclare(this, 'SignalTargetSpeed', 'setter', {
+      apply: (value) => { this.TargetSpeed = Number(value); },
+      neutral: () => { this.TargetSpeed = authoredTargetSpeed; },
+      reapply: context.reapply,
+    });
+    slotDeclare(this, 'SignalAcceleration', 'setter', {
+      apply: (value) => { this.Acceleration = Number(value); },
+      neutral: () => { this.Acceleration = authoredAcceleration; },
+      reapply: context.reapply,
+    });
+    slotDeclare(this, 'SignalIsAtPosition', 'feedback');
+    slotDeclare(this, 'SignalIsAtSpeed', 'feedback');
+    slotDeclare(this, 'SignalIsAtDestination', 'feedback', { initial: false });
+    slotDeclare(this, 'SignalIsDriving', 'feedback', { initial: false });
 
     debug('loader',
       `  Drive_ContinousDestination "${drive.name}": ` +
@@ -122,23 +149,22 @@ export class RVDriveContinousDestination implements IDriveBehavior, RVComponent 
 
     // ── Feedback (drive → PLC) — from the drive's previous-tick state, exactly
     //    like C# reads Drive.CurrentPosition inside its FixedUpdate. ──
-    const writer = this.signalWriter!;
-    if (this.SignalIsAtPosition) {
-      writer.setByPath(this.SignalIsAtPosition, scaleFeedbackPosition(
-        drive.currentPosition,
-        this.ScaleFeedbackPosition,
-        this.CurrentPositionScale,
-        this.CurrentPositionOffset,
-      ));
-    }
-    if (this.SignalIsAtDestination) writer.setByPath(this.SignalIsAtDestination, drive.isAtTarget);
-    if (this.SignalIsDriving) writer.setByPath(this.SignalIsDriving, drive.isRunning);
-    if (this.SignalIsAtSpeed) writer.setByPath(this.SignalIsAtSpeed, drive.currentSpeed);
+    const writer = this.signalWriter;
+    slotWrite(this, 'SignalIsAtPosition', this.SignalIsAtPosition, scaleFeedbackPosition(
+      drive.currentPosition,
+      this.ScaleFeedbackPosition,
+      this.CurrentPositionScale,
+      this.CurrentPositionOffset,
+    ), writer);
+    slotWrite(this, 'SignalIsAtDestination', this.SignalIsAtDestination, drive.isAtTarget, writer);
+    slotWrite(this, 'SignalIsDriving', this.SignalIsDriving, drive.isRunning, writer);
+    slotWrite(this, 'SignalIsAtSpeed', this.SignalIsAtSpeed, drive.currentSpeed, writer);
 
     this.destinationBefore = this.Destination;
   }
 
   dispose(): void {
+    slotUndeclare(this);
     if (this.drive) {
       const index = this.drive.driveBehaviors.indexOf(this);
       if (index >= 0) this.drive.driveBehaviors.splice(index, 1);

@@ -34,35 +34,54 @@ import { DEFAULT_TRANSPORT_SPEED_MM_S } from './engine/rv-constants';
 
 // ─── Name parsers ───────────────────────────────────────────────────────
 
-/** Drive-Lin-X / Drive-Rot-Y / ... — returns Direction enum value or null. */
+/** three.js `GLTFLoader` dedup suffix (`_1`, `_12`, ...), as a regex
+ *  source fragment. `GLTFLoader.createUniqueName` makes node names unique per
+ *  FILE, so the second instance of the same library in one GLB carries
+ *  `Transport-Z_1`, `Sensor_1`, ... (plan-622). Exactly `_<digits>` at the end —
+ *  no wildcard: `Transport-Zfoo`, `Transport-Z_` and `Transport-Z_a` stay unknown. */
+const DEDUP_SUFFIX = String.raw`(?:_\d+)`;
+
+/** Unity/exporter duplicate-name suffix `_(N)` / ` (N)` (two same-named nodes →
+ *  one gets a `(N)` suffix on GLB export). Historically only accepted for
+ *  `Sensor` / `Carrier`; kept exactly there. */
+const UNITY_DUP_SUFFIX = String.raw`(?:[_ ]?\(\d+\))`;
+
+const DRIVE_NAME_RE = new RegExp(String.raw`^Drive-(Lin|Rot)-([XYZ])${DEDUP_SUFFIX}?$`);
+const TRANSPORT_NAME_RE = new RegExp(String.raw`^Transport-([XYZ])${DEDUP_SUFFIX}?$`);
+const SENSOR_NAME_RE = new RegExp(String.raw`^Sensor(?:-.*)?(?:${DEDUP_SUFFIX}|${UNITY_DUP_SUFFIX})?$`);
+const CARRIER_NAME_RE = new RegExp(String.raw`^Carrier(?:-.*)?(?:${DEDUP_SUFFIX}|${UNITY_DUP_SUFFIX})?$`);
+
+/** Drive-Lin-X / Drive-Rot-Y / ... — returns Direction enum value or null.
+ *  Tolerates the three.js dedup suffix (`Drive-Lin-Y_2`). */
 export function parseDriveName(name: string): DirectionEnum | null {
-  const m = /^Drive-(Lin|Rot)-([XYZ])$/.exec(name);
+  const m = DRIVE_NAME_RE.exec(name);
   if (!m) return null;
   const kind = m[1] === 'Lin' ? 'Linear' : 'Rotation';
   return (kind + m[2]) as DirectionEnum;
 }
 
-/** Transport-X / Transport-Y / Transport-Z — returns axis code or null. */
+/** Transport-X / Transport-Y / Transport-Z — returns axis code or null.
+ *  Tolerates the three.js dedup suffix (`Transport-Z_1`). */
 export function parseTransportName(name: string): AxisCode | null {
-  const m = /^Transport-([XYZ])$/.exec(name);
+  const m = TRANSPORT_NAME_RE.exec(name);
   if (!m) return null;
   return ('+' + m[1]) as AxisCode;
 }
 
 /** Sensor — bare `Sensor` or `Sensor-<id>` (e.g. `Sensor-1`, `Sensor-Infeed`), also
  *  tolerating a Unity/exporter duplicate-name suffix like `Sensor_(1)` / `Sensor (1)`
- *  (two same-named nodes → one gets a `(N)` suffix on GLB export). */
+ *  and the three.js dedup suffix `Sensor_1` (plan-622). */
 export function isSensorName(name: string): boolean {
-  return /^Sensor(-.*)?([_ ]?\(\d+\))?$/.test(name);
+  return SENSOR_NAME_RE.test(name);
 }
 
 /** Carrier — bare `Carrier` or `Carrier-<id>` (e.g. `Carrier-1`, `Carrier-Front`),
- *  same suffix tolerance as sensors (plan-268 Phase 4). Overhead-conveyor carriers
+ *  same suffix tolerance as sensors (plan-268 Phase 4, plan-622). Overhead-conveyor carriers
  *  are inherently PLURAL, so they are bound via `self.findAll('carrier')` (DFS
  *  traversal order = deterministic pitch index), NOT via the `requires` block
  *  (which injects only the first match). */
 export function isCarrierName(name: string): boolean {
-  return /^Carrier(-.*)?([_ ]?\(\d+\))?$/.test(name);
+  return CARRIER_NAME_RE.test(name);
 }
 
 // ─── Node finders (for behavior files) ──────────────────────────────────
@@ -157,7 +176,7 @@ export function scanLibraryComponent(root: Object3D): KinematicsSpec {
     const driveDir = parseDriveName(node.name);
     if (driveDir) {
       spec.drives!.push({ target: node, direction: driveDir });
-    } else if (isSensorName(node.name)) {
+    } else if (isSensorName(node.name) && !isAuthoredHidden(node)) {
       // Sensor / Sensor-<id> → RVSensor. AutoRay derives a raycast beam along the
       // node's longest bounding-box edge (centre face → centre face) for both the
       // colored line visualization and detection.
@@ -194,6 +213,20 @@ export function scanLibraryComponent(root: Object3D): KinematicsSpec {
 
   traverse(root);
   return spec;
+}
+
+/**
+ * plan-675 D5: a node named `Sensor…` that is hidden — `visible === false`, or
+ * the authored `Hidden` flag that `applyAuthoredHidden` turns into exactly that
+ * a step LATER in `prepareAndBake` (so both are read here, order-independent) —
+ * is a construction aid (a hidden detection body, a reflector stand-in), not a
+ * light barrier. Only the Sensor branch looks at it: a hidden `Drive-*` or
+ * `Transport-*` keeps working (hiding geometry must not stop a machine).
+ */
+function isAuthoredHidden(node: Object3D): boolean {
+  if (node.visible === false) return true;
+  const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
+  return rv?.['Hidden'] === true;
 }
 
 /**

@@ -83,6 +83,8 @@ describe('isModelRootPath', () => {
  * an op store and an executor, none of which the GUARD depends on. What is
  * exercised here is the exact code path the real class runs — the guard method
  * and the three call sites — with `_voidApply` observed instead of applied.
+ * Since plan-610 a rename is PLANNED (reference rewrite) instead of queued as a
+ * bare op: its hand-off, `_renameNodePlanned`, is observed the same way.
  */
 async function makeDocUnderTest(modelRoot: Object3D | null, registry: { getNode(p: string): Object3D | null }) {
   const { AssetDocument } = await import('../src/core/editor/rv-asset-document');
@@ -90,6 +92,8 @@ async function makeDocUnderTest(modelRoot: Object3D | null, registry: { getNode(
   const doc = Object.create(AssetDocument.prototype) as any;
   doc.viewer = { registry, currentModelRoot: modelRoot };
   doc._voidApply = (op: { kind: string }) => { applied.push(op.kind); };
+  doc._renameNodePlanned = async () => { applied.push('renameNode'); };
+  doc._doc = { trackDetached: (p: Promise<unknown>) => { void p.catch(() => {}); } };
   return { doc, applied };
 }
 

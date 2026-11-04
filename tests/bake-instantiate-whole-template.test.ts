@@ -189,6 +189,9 @@ describe('instantiate() clones the whole template (plan-757 D2 / F3)', () => {
     const inst = reg.instantiate(baked, root);
     expect(inst.aliases.map((a) => a.path).sort()).toEqual(paths);
     expect(inst.aliases.find((a) => a.path === 'Cad/Kine')!.node).toBe(root.getObjectByName('Kine'));
+    // plan-610 Phase 5c: the re-parent entry keeps its SUBTREE flag per instance; a dedup spelling has none.
+    expect(inst.aliases.find((a) => a.path === 'Cad/Kine')!.subtree).toBe(true);
+    expect(inst.aliases.find((a) => a.path === 'Axis/Axis')!.subtree).toBeUndefined();
 
     // What the place step does with them (`initSubtree` step 2b), against a runtime registry.
     const registry = new NodeRegistry();

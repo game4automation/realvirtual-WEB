@@ -24,9 +24,10 @@
  * Every consumer of a cached asset falls in one of three classes, and the
  * classification is the whole content of Phase 1b:
  *
- *  - (b) GEOMETRY ONLY — the drag ghost (`GhostManager` → `loadEntryModel`) and
- *    the thumbnail render (`generateThumbnail`), both through
- *    `PlacementInstancer.loadModel`. They draw the asset and throw it away, so
+ *  - (b) GEOMETRY ONLY — the drag ghost (`GhostManager` → `loadEntryModel`),
+ *    through `PlacementInstancer.loadModel` (library thumbnails are no longer
+ *    rendered from a cached asset — a save writes them, plan-776). It draws the
+ *    asset and throws it away, so
  *    the pruned template is not a downgrade: it carries every triangle, in one
  *    mesh per boundary × material instead of N source meshes.
  *  - (c) FULL SOURCE TREE — {@link ModelCache.decodeFresh}
@@ -53,18 +54,20 @@ import { disposeSubtree } from './rv-traverse-utils';
 import type { RVUberMaterial } from './rv-uber-material';
 import { BakeAbortedError } from './rv-bake-pipeline';
 import { prepareAndBake } from './rv-prepare-and-bake';
+import { canonicalRequestKey, type ParametricRequest } from './rv-parametric-component';
 import type { BakedAsset } from './rv-bake-chunk';
 import type { PickBuildPort } from './rv-pick-build-port';
 import { applyKinematicsSpec } from '../behavior-runtime';
 import { applyNamingScan } from './rv-naming-scan';
 import { RVAssetBlobCache, rejectUnlessGlb } from './rv-asset-blob-cache';
 import { unwrapGltfRoot } from './rv-gltf-unwrap';
-import { getNodeId } from './rv-node-id';
 import { detectRenamedNodes, type GltfParserLike } from './rv-glb-parse';
 import { verifyRvSigBuffer, type SignatureState } from '../persistence/rv-sig-verify';
+import { recordDocumentBytes } from './rv-model-content-ledger';
 import { fetchServedBytes, isEncryptedDeploy } from '../persistence/rv-served-bytes';
 import { tryFetchSidecarSpec } from './rv-scene-loader';
 import { binaryResources, parseGlbCollectingResources } from './rv-binary-resources';
+import { getDecodeIdentity, type FileIdentity } from './rv-decode-identity';
 import {
   RESOLVED_KEY_PREFIX as REGISTRY_RESOLVED_KEY_PREFIX,
   hashForUrl,
@@ -116,6 +119,31 @@ const _glbBlobCache = new RVAssetBlobCache({
   legacyBuckets: LEGACY_GLB_CACHE_BUCKETS,
   reject: rejectUnlessGlb,
 });
+
+/**
+ * Forget the cached BYTES of one url in both tiers of the shared GLB blob cache
+ * (plan-527, ported for plan-764): a document whose file was replaced from
+ * outside must not be re-decoded from the pre-replace bytes. `blob:` / `data:`
+ * urls never enter the cache, so this is a no-op for them. Never rejects.
+ */
+export async function evictCachedGlbBytes(url: string): Promise<void> {
+  if (!url || url.startsWith('blob:') || url.startsWith('data:')) return;
+  try { await _glbBlobCache.evict(url); } catch { /* best effort */ }
+}
+
+/**
+ * GLB bytes for `url` through the shared blob cache — the byte rule ModelCache's
+ * decode uses (an encrypted deploy and `blob:` / `data:` urls bypass the cache),
+ * so a reader that only needs the JSON chunk (the library snap index) and the
+ * later placement share ONE download.
+ */
+export async function getGlbBytes(url: string): Promise<ArrayBuffer> {
+  const sha256 = hashForUrl(url)?.sha256;
+  const fromBlobCache = !url.startsWith('blob:') && !url.startsWith('data:') && !isEncryptedDeploy();
+  return fromBlobCache
+    ? (await _glbBlobCache.getBlob(url, { sha256 })).arrayBuffer()
+    : fetchServedBytes(url);
+}
 
 /** The rejection an aborted `getOrLoad` consumer receives. */
 export class AbortError extends Error {
@@ -200,9 +228,40 @@ export function resolvedCacheKey(providerId: string, sourceId: string, entryId: 
   return resolvedAssetKey(providerId, sourceId, entryId);
 }
 
-/** Cache key of a forced-split bake (plan-753 I7): `<cacheKey>#split:<id>,<id>`. */
-function bakedKeyWithSplit(cacheKey: string, sortedIds: readonly string[]): string {
-  return cacheKey + '#split:' + sortedIds.join(',');
+/**
+ * Infix of a parametric variant bake (plan-650 Phase 5): `<bakedKey>#param:<variantHash>`,
+ * where `<bakedKey>` is the base key (plan-769 F14: the `#split:` bake of `trsByNodeId` is gone). Derived, internal — the
+ * base key (registry hash, epoch, decode) is never changed.
+ */
+const PARAM_INFIX = '#param:';
+/** Infix of a parametric REQUEST alias (raw override values → the baked key they resolved to). */
+const PARAM_REQUEST_INFIX = '#paramreq:';
+
+/** Max. parametric variants kept per asset (LRU, only unreferenced ones are evicted). */
+export const PARAMETRIC_VARIANTS_PER_ASSET = 16;
+/** Scene-wide budget of distinct parametric variants (F16). */
+export const PARAMETRIC_VARIANT_BUDGET = 64;
+
+/** The scene-wide parametric variant budget (F16) is exhausted by referenced variants. */
+export class ParametricVariantBudgetError extends Error {
+  readonly code = 'parametric-variant-budget';
+  constructor(budget: number) {
+    super(`more than ${budget} different parametric variants in this document — reuse parameter values or remove placements`);
+    this.name = 'ParametricVariantBudgetError';
+  }
+}
+
+/** Is `key` a derived (parametric) key of `cacheKey`? */
+function isDerivedKeyOf(key: string, cacheKey: string): boolean {
+  return key.startsWith(cacheKey + PARAM_INFIX) || key.startsWith(cacheKey + PARAM_REQUEST_INFIX);
+}
+
+/** The base cache key of a (possibly derived) key — the key its epoch lives under. */
+function baseKeyOf(key: string): string {
+  const variant = key.indexOf(PARAM_INFIX);
+  const request = key.indexOf(PARAM_REQUEST_INFIX);
+  const cut = [variant, request].filter((i) => i >= 0);
+  return cut.length > 0 ? key.slice(0, Math.min(...cut)) : key;
 }
 
 /** The URL path's acquire: the key IS the transport, and there is nothing to
@@ -258,6 +317,14 @@ export interface ModelCacheUberOptions {
    * `false` = self-contained load (the loader's `loadKinematicsSidecar: false`).
    */
   loadKinematicsSidecar?: () => boolean;
+  /**
+   * plan-650 §2.6a: may a parametric generator run NOW? The viewer answers with the
+   * standstill guard (`canRegenerate`). Default: allowed. A variant that needs a generator
+   * run while this says no is refused (`ParametricDeferredError`), never generated.
+   */
+  canRunParametricGenerator?: () => boolean;
+  /** plan-650 test seam: variants kept per asset / scene budget (defaults 16 / 64). */
+  parametricLimits?: { perAsset?: number; budget?: number };
 }
 
 /**
@@ -308,6 +375,8 @@ interface DecodeMeta {
   renamedNodes: Map<Object3D, string>;
   /** The url the bytes were read from — `BakedAsset.url` (plan-757 Phase 2, F3). */
   url: string;
+  /** plan-769: the file's identity record from the decode (`BakedAsset.identity`). */
+  identity: FileIdentity | null;
 }
 
 /** The slice of a GLTF loader `_decode` uses. The real `GLTFLoader` has both;
@@ -366,6 +435,24 @@ export class ModelCache {
   private _baked = new Map<string, BakedAsset>();
   /** In-flight BAKES by cache key — one bake per key, later askers join. */
   private _bakedInflight = new Map<string, Promise<BakedAsset>>();
+  /** plan-650: parametric request key → the baked key it resolved to (variant or base). */
+  private _paramAlias = new Map<string, string>();
+  /** plan-650: in-flight parametric resolutions by request key. */
+  private _paramInflight = new Map<string, Promise<BakedAsset>>();
+  /** plan-650: last-use tick of every parametric variant key (LRU). */
+  private _paramUse = new Map<string, number>();
+  private _paramTick = 0;
+  /** plan-650: variant bakes / generator runs / cache hits of the placement path (A7, tests). */
+  private _paramStats = { variantBakes: 0, generatorRuns: 0, cacheHits: 0 };
+  /** plan-774 F6: assets published into `_baked` over this cache's life (monotonic). */
+  private _bakeCount = 0;
+  /**
+   * plan-774 F6: the uber material the kept assets' chunks were baked onto,
+   * recorded by `releaseDocument({ keepBaked: true })`; `undefined` = no kept
+   * window open. A kept asset is served only while the host still answers the
+   * SAME material — a different one retires every kept asset first.
+   */
+  private _keptUber: unknown = undefined;
   /** What each decoded root's bytes said — see {@link DecodeMeta}. */
   private readonly _decodeMeta = new WeakMap<Group, DecodeMeta>();
   /**
@@ -407,9 +494,9 @@ export class ModelCache {
   /** True when any tier of this cache holds something for `cacheKey` (split bakes included). */
   private _isKnown(cacheKey: string): boolean {
     if (this._decoded.has(cacheKey) || this._inflight.has(cacheKey)) return true;
-    const splitPrefix = bakedKeyWithSplit(cacheKey, []);
-    for (const k of this._baked.keys()) if (k === cacheKey || k.startsWith(splitPrefix)) return true;
-    for (const k of this._bakedInflight.keys()) if (k === cacheKey || k.startsWith(splitPrefix)) return true;
+    for (const k of this._baked.keys()) if (k === cacheKey || isDerivedKeyOf(k, cacheKey)) return true;
+    for (const k of this._bakedInflight.keys()) if (k === cacheKey || isDerivedKeyOf(k, cacheKey)) return true;
+    for (const k of this._paramInflight.keys()) if (isDerivedKeyOf(k, cacheKey)) return true;
     return false;
   }
 
@@ -419,6 +506,9 @@ export class ModelCache {
    * none: nothing changes. A new hash for a key this cache holds invalidates it.
    */
   private _syncExpectedHash(cacheKey: string, hash: string | undefined): void {
+    // Every public entry passes here before it looks at a tier — the one place
+    // the kept window's material check (plan-774 F6) cannot be skipped.
+    this._validateKept();
     if (!hash) return;
     if (this._expectedHash.get(cacheKey) === hash) return;
     if (this._isKnown(cacheKey)) this.invalidate(cacheKey);
@@ -430,8 +520,8 @@ export class ModelCache {
     const keys = new Set<string>([
       ...this._expectedHash.keys(), ...this._decoded.keys(), ...this._inflight.keys(),
     ]);
-    for (const k of this._baked.keys()) if (!k.includes('#split:')) keys.add(k);
-    for (const k of this._bakedInflight.keys()) if (!k.includes('#split:')) keys.add(k);
+    for (const k of this._baked.keys()) if (!k.includes(PARAM_INFIX)) keys.add(k);
+    for (const k of this._bakedInflight.keys()) if (!k.includes(PARAM_INFIX)) keys.add(k);
     for (const key of keys) this._syncExpectedHash(key, this._registryHash(key));
   }
 
@@ -516,22 +606,182 @@ export class ModelCache {
   async getOrLoadBaked(
     cacheKey: string,
     resolve?: ResolveFn,
-    opts?: { signal?: AbortSignal; forceSplitNodeIds?: readonly string[] },
+    opts?: {
+      signal?: AbortSignal;
+      /** plan-650 Phase 5: family values of THIS placement (`parametricRequestsOf(overrides)`). */
+      parametric?: readonly ParametricRequest[];
+    },
   ): Promise<BakedAsset> {
     const signal = opts?.signal;
     throwIfAborted(signal);
     this._syncExpectedHash(cacheKey, this._registryHash(cacheKey));
-    // A forced chunk split (plan-753 I7: `AssetOverrides.trsByNodeId`) is a
-    // DIFFERENT bake of the same master — cached under a derived key, retired
-    // together with the base key (see `_retireBaked`).
-    const splitIds = opts?.forceSplitNodeIds && opts.forceSplitNodeIds.length > 0
-      ? [...new Set(opts.forceSplitNodeIds)].sort()
-      : null;
-    const bakedKey = splitIds ? bakedKeyWithSplit(cacheKey, splitIds) : cacheKey;
+    // plan-769 F14: one bake per asset — the forced-split bake of `trsByNodeId` is gone.
+    const bakedKey = cacheKey;
+    const acquire = resolve ? acquireResolved(resolve) : acquireUrl(cacheKey);
+    if (opts?.parametric && opts.parametric.length > 0) {
+      return detachOnAbort(this._sharedParametric(cacheKey, bakedKey, acquire, opts.parametric), signal);
+    }
     const cached = this._baked.get(bakedKey);
     if (cached) return cached;
-    const acquire = resolve ? acquireResolved(resolve) : acquireUrl(cacheKey);
-    return detachOnAbort(this._sharedBake(cacheKey, bakedKey, acquire, splitIds), signal);
+    return detachOnAbort(this._sharedBake(cacheKey, bakedKey, acquire), signal);
+  }
+
+  // ── plan-650 Phase 5: parametric variants ───────────────────────────
+
+  /** Counters of the parametric placement path (A7 / tests). */
+  getParametricStats(): { variants: number; aliases: number; variantBakes: number; generatorRuns: number; cacheHits: number } {
+    let variants = 0;
+    for (const k of this._baked.keys()) if (k.includes(PARAM_INFIX)) variants++;
+    return { variants, aliases: this._paramAlias.size, ...this._paramStats };
+  }
+
+  /**
+   * The ONE resolution of a parametric request: request key → alias (warm) →
+   * in-flight join → {@link _bakeParametric}. Two placements with the same
+   * values share one job and one `BakedAsset`; values that normalize to the
+   * baked default resolve to the BASE bake.
+   */
+  private _sharedParametric(
+    cacheKey: string, bakedKey: string, acquire: AcquireFn,
+    requests: readonly ParametricRequest[],
+  ): Promise<BakedAsset> {
+    const reqKey = bakedKey + PARAM_REQUEST_INFIX + canonicalRequestKey(requests);
+    const alias = this._paramAlias.get(reqKey);
+    if (alias) {
+      const hit = this._baked.get(alias);
+      if (hit && !hit.disposed) { this._touchVariant(alias); return Promise.resolve(hit); }
+      this._paramAlias.delete(reqKey);
+    }
+    const existing = this._paramInflight.get(reqKey);
+    if (existing) return existing;
+    const job = this._bakeParametric(cacheKey, bakedKey, acquire, requests, reqKey);
+    this._paramInflight.set(reqKey, job);
+    const settle = (): void => {
+      if (this._paramInflight.get(reqKey) === job) this._paramInflight.delete(reqKey);
+    };
+    job.then(settle, settle);
+    return job;
+  }
+
+  /**
+   * Decode a tree of its own (never the shared master — parallel variants must
+   * not share a throwaway tree), resolve the family inputs, and bake the
+   * variant under `<bakedKey>#param:<variantHash>` — or hand back the base bake
+   * when every family is at its baked values. Epoch = the BASE key's: an
+   * invalidation while the generator runs discards the result.
+   */
+  private async _bakeParametric(
+    cacheKey: string, bakedKey: string, acquire: AcquireFn,
+    requests: readonly ParametricRequest[], reqKey: string,
+  ): Promise<BakedAsset> {
+    const epoch = this._epoch.get(cacheKey) ?? 0;
+    const isEpochCurrent = (): boolean => (this._epoch.get(cacheKey) ?? 0) === epoch;
+    const variantMod = await import('./rv-parametric-variant');
+    const tree = await this._decode(cacheKey, acquire, { cache: false });
+    let consumed = false;
+    try {
+      if (!isEpochCurrent()) throw new BakeAbortedError(cacheKey);
+      const prepared = await variantMod.resolveParametricVariant(tree, requests);
+      if (!isEpochCurrent()) throw new BakeAbortedError(cacheKey);
+      if (!prepared.variantHash) {
+        const base = this._baked.get(bakedKey) ?? await this._sharedBake(cacheKey, bakedKey, acquire);
+        if (this._baked.get(bakedKey) === base) this._paramAlias.set(reqKey, bakedKey);
+        return base;
+      }
+      const variantKey = bakedKey + PARAM_INFIX + prepared.variantHash;
+      const warm = this._baked.get(variantKey);
+      if (warm && !warm.disposed) {
+        this._paramAlias.set(reqKey, variantKey);
+        this._touchVariant(variantKey);
+        return warm;
+      }
+      let job = this._bakedInflight.get(variantKey);
+      if (!job) {
+        this._makeRoomForVariant(cacheKey);
+        consumed = true;
+        job = (async () => {
+          try {
+            const stats = await variantMod.applyParametricVariant(prepared, {
+              canRunGenerator: this._uberOptions.canRunParametricGenerator,
+            });
+            this._paramStats.generatorRuns += stats.generatorRuns;
+            this._paramStats.cacheHits += stats.cacheHits;
+            if (!isEpochCurrent()) throw new BakeAbortedError(cacheKey);
+          } catch (e) {
+            disposeSubtree(tree); // never reached the bake
+            throw e;
+          }
+          const asset = await this._bakeTree(cacheKey, variantKey, tree, epoch, isEpochCurrent);
+          this._paramStats.variantBakes++;
+          return asset;
+        })();
+        this._bakedInflight.set(variantKey, job);
+        const settle = (): void => {
+          if (this._bakedInflight.get(variantKey) === job) this._bakedInflight.delete(variantKey);
+        };
+        job.then(settle, settle);
+      }
+      const asset = await job;
+      if (this._baked.get(variantKey) === asset) {
+        this._paramAlias.set(reqKey, variantKey);
+        this._touchVariant(variantKey);
+        this._evictVariants(cacheKey, variantKey);
+      }
+      return asset;
+    } finally {
+      // A tree that was not handed to the variant bake is ours to free.
+      if (!consumed) disposeSubtree(tree);
+    }
+  }
+
+  private _touchVariant(key: string): void {
+    if (key.includes(PARAM_INFIX)) this._paramUse.set(key, ++this._paramTick);
+  }
+
+  /** Unreferenced parametric variants, oldest first (optionally of one asset). */
+  private _idleVariants(cacheKey?: string): string[] {
+    const out: string[] = [];
+    for (const [k, a] of this._baked) {
+      if (!k.includes(PARAM_INFIX)) continue;
+      if (cacheKey !== undefined && !isDerivedKeyOf(k, cacheKey)) continue;
+      if (a.instances === 0) out.push(k);
+    }
+    return out.sort((a, b) => (this._paramUse.get(a) ?? 0) - (this._paramUse.get(b) ?? 0));
+  }
+
+  /** F16: before a NEW variant bakes — evict an idle one when the budget is full, else refuse. */
+  private _makeRoomForVariant(cacheKey: string): void {
+    let total = 0;
+    for (const k of this._baked.keys()) if (k.includes(PARAM_INFIX)) total++;
+    for (const k of this._bakedInflight.keys()) if (k.includes(PARAM_INFIX)) total++;
+    const budget = this._uberOptions.parametricLimits?.budget ?? PARAMETRIC_VARIANT_BUDGET;
+    if (total < budget) return;
+    const victim = this._idleVariants(cacheKey)[0] ?? this._idleVariants()[0];
+    if (!victim) throw new ParametricVariantBudgetError(budget);
+    this._retireKey(victim);
+  }
+
+  /** LRU per asset: keep at most {@link PARAMETRIC_VARIANTS_PER_ASSET}, never a referenced one. */
+  private _evictVariants(cacheKey: string, keep: string): void {
+    let count = 0;
+    for (const k of this._baked.keys()) if (k.includes(PARAM_INFIX) && isDerivedKeyOf(k, cacheKey)) count++;
+    for (const victim of this._idleVariants(cacheKey)) {
+      if (count <= (this._uberOptions.parametricLimits?.perAsset ?? PARAMETRIC_VARIANTS_PER_ASSET)) break;
+      if (victim === keep) continue;
+      this._retireKey(victim);
+      count--;
+    }
+  }
+
+  /** Retire ONE baked key (a variant) and every alias pointing at it. */
+  private _retireKey(key: string): void {
+    const asset = this._baked.get(key);
+    this._baked.delete(key);
+    this._paramUse.delete(key);
+    for (const [req, target] of [...this._paramAlias]) if (target === key) this._paramAlias.delete(req);
+    if (!asset) return;
+    asset.retired = true;
+    if (asset.instances === 0) asset.dispose();
   }
 
   /**
@@ -566,8 +816,8 @@ export class ModelCache {
    * A clone of the pruned TEMPLATE of a destructively baked asset, or null.
    *
    * After a destructive bake the full decode is gone (plan-754 §2.6), so the
-   * geometry-only consumers of {@link getOrLoad} — the drag ghost and the
-   * thumbnail render — are served from the template: survivors, keep meshes and
+   * geometry-only consumers of {@link getOrLoad} — the drag ghost — are served
+   * from the template: survivors, keep meshes and
    * the chunk meshes, which together carry every triangle the asset draws.
    * Callers that need the source CAD hierarchy use {@link decodeFresh}.
    *
@@ -595,8 +845,21 @@ export class ModelCache {
     return stats;
   }
 
+  /**
+   * Every base key this cache holds a decoded master or a baked asset for,
+   * with the url its bytes came from (`''` when unknown) — plan-774 F6, the
+   * document-save invalidation matches saved paths against both.
+   */
+  knownEntries(): Array<{ key: string; url: string }> {
+    const out: Array<{ key: string; url: string }> = [];
+    for (const [key, asset] of this._baked) out.push({ key: baseKeyOf(key), url: asset.url ?? '' });
+    for (const [key, master] of this._decoded) out.push({ key, url: this._decodeMeta.get(master)?.url ?? '' });
+    return out;
+  }
+
   /** The cached baked asset for `cacheKey`, if any (no load). */
   peekBaked(cacheKey: string): BakedAsset | undefined {
+    this._validateKept();
     return this._baked.get(cacheKey);
   }
 
@@ -618,7 +881,7 @@ export class ModelCache {
     this._syncExpectedHash(url, this._registryHash(url));
     if (opts?.bake) {
       if (this._baked.has(url)) return;
-      this._sharedBake(url, url, acquireUrl(url), null).catch(() => { /* speculative — the real load reports */ });
+      this._sharedBake(url, url, acquireUrl(url)).catch(() => { /* speculative — the real load reports */ });
       return;
     }
     // A baked asset already IS the warm state of this key — re-decoding the
@@ -637,7 +900,7 @@ export class ModelCache {
     this._syncExpectedHash(cacheKey, this._registryHash(cacheKey));
     if (opts?.bake) {
       if (this._baked.has(cacheKey)) return;
-      this._sharedBake(cacheKey, cacheKey, acquireResolved(resolve), null).catch(() => { /* speculative */ });
+      this._sharedBake(cacheKey, cacheKey, acquireResolved(resolve)).catch(() => { /* speculative */ });
       return;
     }
     if (this._decoded.has(cacheKey) || this._baked.has(cacheKey)) return;
@@ -650,12 +913,12 @@ export class ModelCache {
    * {@link _shared}, same three rules (cleanup in every case, no signal here,
    * epoch guard at publish time).
    */
-  private _sharedBake(cacheKey: string, bakedKey: string, acquire: AcquireFn, splitIds: readonly string[] | null): Promise<BakedAsset> {
+  private _sharedBake(cacheKey: string, bakedKey: string, acquire: AcquireFn): Promise<BakedAsset> {
     // Same gate as the public entries — idempotent when they already ran it.
     this._syncExpectedHash(cacheKey, this._registryHash(cacheKey));
     const existing = this._bakedInflight.get(bakedKey);
     if (existing) return existing;
-    const job = this._bake(cacheKey, bakedKey, acquire, splitIds);
+    const job = this._bake(cacheKey, bakedKey, acquire);
     this._bakedInflight.set(bakedKey, job);
     const settle = (): void => {
       if (this._bakedInflight.get(bakedKey) === job) this._bakedInflight.delete(bakedKey);
@@ -680,16 +943,23 @@ export class ModelCache {
    *    `getOrLoad` serves the pruned template and `decodeFresh` is the only
    *    door to the source hierarchy.
    */
-  private async _bake(cacheKey: string, bakedKey: string, acquire: AcquireFn, splitIds: readonly string[] | null): Promise<BakedAsset> {
+  private async _bake(cacheKey: string, bakedKey: string, acquire: AcquireFn): Promise<BakedAsset> {
     const epoch = this._epoch.get(cacheKey) ?? 0;
     const isEpochCurrent = (): boolean => (this._epoch.get(cacheKey) ?? 0) === epoch;
-    // The destructive bake eats its input. A forced split runs while the base
-    // bake has (or will have) consumed the shared decode, so it never shares a
-    // tree with it — it decodes its own, uncached.
-    const master = splitIds
-      ? await this._decode(cacheKey, acquire, { cache: false })
-      : this._decoded.get(cacheKey) ?? await this._shared(cacheKey, acquire);
+    const master = this._decoded.get(cacheKey) ?? await this._shared(cacheKey, acquire);
     if (!isEpochCurrent()) throw new BakeAbortedError(cacheKey);
+    return this._bakeTree(cacheKey, bakedKey, master, epoch, isEpochCurrent);
+  }
+
+  /**
+   * Bake `master` (consumed when destructive) and publish it under `bakedKey`
+   * at an unchanged epoch — the second half of {@link _bake}, shared with the
+   * parametric variant bake (plan-650), which brings its own decoded tree.
+   */
+  private async _bakeTree(
+    cacheKey: string, bakedKey: string, master: Group,
+    epoch: number, isEpochCurrent: () => boolean,
+  ): Promise<BakedAsset> {
     // Same gate the loader uses (`destructivePipeline`, rv-scene-loader.ts): a
     // master that draws nothing bakes to nothing, and pruning a tree whose only
     // content is references would throw the document away for no chunk at all.
@@ -697,10 +967,6 @@ export class ModelCache {
     // The host's own master hook (test / embedder seam) — the recipe's naming
     // scan is idempotent with it (plan-753 §5.3).
     (this._uberOptions.prepareMaster ?? applyNamingScanToMaster)(master);
-    const splitSet = splitIds ? new Set(splitIds) : null;
-    const forceSplit = splitSet
-      ? (node: Object3D): boolean => { const id = getNodeId(node); return !!id && splitSet.has(id); }
-      : undefined;
     // plan-757 D1: THE recipe — the same `prepareAndBake` the loader runs for
     // the main model: hooks, survival + removal report, dedup → uber, bake,
     // aliases. Per-source context only; no plugin claims (D5: main model only).
@@ -717,8 +983,10 @@ export class ModelCache {
       pickPort: this._uberOptions.pickPort?.(),
       epoch,
       isEpochCurrent,
-      forceSplit,
       destructive,
+      // plan-769 Phase 1b: prepare and survival read the file's stored references
+      // by the same verdict the placement's registry reads after the bake.
+      identity: meta?.identity ?? null,
     });
     // The tree the bake just consumed must not be handed out again. Dropped
     // only on SUCCESS: an aborted bake leaves `tmp` intact, and the next ask
@@ -732,8 +1000,11 @@ export class ModelCache {
     // A master without geometry (an empty document, a reference-only layout)
     // bakes to nothing. The asker gets its empty asset, but the cache does not
     // keep it — `bake.assets` counts real assets only.
+    // plan-769: every instance of this asset shares the file's identity record.
+    asset.identity = meta?.identity ?? null;
     if (asset.chunks.length === 0 && asset.keep.length === 0 && asset.triangles === 0) return asset;
     this._baked.set(bakedKey, asset);
+    this._bakeCount++;
     return asset;
   }
 
@@ -744,14 +1015,17 @@ export class ModelCache {
    * forced-split derivative of it.
    */
   private _retireBaked(cacheKey: string): void {
-    const splitPrefix = bakedKeyWithSplit(cacheKey, []);
     for (const key of [...this._bakedInflight.keys()]) {
-      if (key === cacheKey || key.startsWith(splitPrefix)) this._bakedInflight.delete(key);
+      if (key === cacheKey || isDerivedKeyOf(key, cacheKey)) this._bakedInflight.delete(key);
     }
+    // plan-650: request aliases and in-flight parametric resolutions follow the base key.
+    for (const key of [...this._paramInflight.keys()]) if (isDerivedKeyOf(key, cacheKey)) this._paramInflight.delete(key);
+    for (const key of [...this._paramAlias.keys()]) if (isDerivedKeyOf(key, cacheKey)) this._paramAlias.delete(key);
     for (const key of [...this._baked.keys()]) {
-      if (key !== cacheKey && !key.startsWith(splitPrefix)) continue;
+      if (key !== cacheKey && !isDerivedKeyOf(key, cacheKey)) continue;
       const asset = this._baked.get(key)!;
       this._baked.delete(key);
+      this._paramUse.delete(key);
       asset.retired = true;
       if (asset.instances === 0) asset.dispose();
     }
@@ -859,6 +1133,13 @@ export class ModelCache {
         mark('blobCache');
         try {
           const verified = await verifyRvSigBuffer(bytes);
+          // plan-2059: the strict DES fingerprint hashes the exact bytes of every
+          // placement asset, keyed like its bake (`assetId` = cacheKey) — taken
+          // after verification (the only transferring step), never awaited.
+          // Same epoch rule as `_decoded`: an abandoned decode never publishes.
+          if (publish) {
+            void recordDocumentBytes(cacheKey, verified.buffer, { isCurrent: () => (this._epoch.get(cacheKey) ?? 0) === epoch });
+          }
           signatureState = verified.state;
           signaturePresent = verified.signaturePresent;
           mark('verify');
@@ -888,6 +1169,9 @@ export class ModelCache {
       // restored in place, genuine `_N` dedups recorded — the map feeds the
       // asset's alias table, the `_rvOrigName` stamps travel with every clone.
       const renamedNodes = detectRenamedNodes(gltf.parser);
+      // plan-769 F2/F3: the identity the parse wrapper built (null for a loader
+      // without parser JSON — the URL seam of the test fakes).
+      const identity = getDecodeIdentity(gltf.scene);
       // Release the parser explicitly (plan-754 §2.6). `GLTFParser.associations`
       // maps every Object3D/Material/Texture back to its glTF def and
       // `parser.cache` holds one resolved promise per node, mesh and material —
@@ -918,7 +1202,7 @@ export class ModelCache {
       }
       // (plan-752's master uber bake used to run here; since plan-757 the
       // material phase is part of the recipe `_bake` runs — dedup → uber, once.)
-      this._decodeMeta.set(source, { signatureState, renamedNodes, url });
+      this._decodeMeta.set(source, { signatureState, renamedNodes, url, identity });
       // Publish only if this decode has not been invalidated while it ran. The
       // caller still gets its result — it asked before the invalidate — but the
       // CACHE must not be repopulated with a superseded tree.
@@ -1001,6 +1285,108 @@ export class ModelCache {
    */
   clearDecoded(): void {
     this._retireAll();
+    this._disposeDecoded();
+  }
+
+  /**
+   * Assets published into the baked tier over this cache's life — monotonic,
+   * never reset by a clear (plan-774 F6). The counter a test or a measurement
+   * reads to prove a reload re-instantiated from the cache instead of baking.
+   */
+  get bakeCount(): number { return this._bakeCount; }
+
+  /**
+   * The document-change release (plan-774 F6) — what {@link clearDecoded} does
+   * for every other caller, with ONE optional exception: the baked tier.
+   *
+   * Always (both modes): every in-flight decode / bake is abandoned — its epoch
+   * bumped so it can no longer publish, and `_inflight`, `_bakedInflight`,
+   * `_paramInflight`, `_paramAlias` CLEARED, or the next load would join a
+   * stale job (`_sharedBake`) and get its `BakeAbortedError`; every decoded
+   * master is disposed and its binary resources (FMU bytes) released.
+   *
+   * `keepBaked: false` — {@link clearDecoded}: every baked asset retired.
+   *
+   * `keepBaked: true` — `_baked` (and the variants' `_paramUse` ticks) survive,
+   * each asset flagged `keptForNextLoad`. A destructively baked asset holds no
+   * reference to its decoded master (`_bakeTree` drops it on success), so this
+   * is the steady state between two placements of one document, not a new
+   * one. A NON-destructive asset (a master without a drawable mesh) may still
+   * point into the decoded master this call disposes — it is retired instead.
+   * The host's uber material is recorded: a kept asset is served only while
+   * the host answers the same one ({@link _validateKept}).
+   *
+   * The window is closed by {@link retireKept} (the instancer calls it when the
+   * next load settled) or by any other retire path, which keep precedence:
+   * {@link invalidate}, the expected-hash gate, the variant LRU, a clear.
+   */
+  releaseDocument(opts: { keepBaked: boolean }): void {
+    if (!opts.keepBaked) {
+      this.clearDecoded();
+      return;
+    }
+    this._abandonInflight(new Set([...this._decoded.keys()]));
+    for (const [key, asset] of [...this._baked]) {
+      if (!asset.destructive) { this._retireKey(key); continue; }
+      asset.keptForNextLoad = true;
+    }
+    this._disposeDecoded();
+    this._keptUber = this._baked.size > 0 ? (this._uberOptions.uber?.() ?? null) : undefined;
+  }
+
+  /**
+   * End the kept window (plan-774 F6): every asset still flagged
+   * `keptForNextLoad` that no instance claimed is retired (and disposed — it
+   * has no instance); a claimed one simply loses the flag and lives on as an
+   * asset of the current document. Idempotent; a no-op without a window.
+   */
+  retireKept(): void {
+    this._keptUber = undefined;
+    for (const [key, asset] of [...this._baked]) {
+      if (!asset.keptForNextLoad) continue;
+      asset.keptForNextLoad = false;
+      if (asset.instances === 0) this._retireKey(key);
+    }
+  }
+
+  /**
+   * The kept window's material check: kept chunks carry the uber material of
+   * the document they were baked for. The viewer's is a session singleton, so
+   * this holds in practice — but a host that answers a DIFFERENT material (or
+   * none) must not be handed chunks drawn with the old one: every kept asset
+   * is retired before anything is served.
+   */
+  private _validateKept(): void {
+    if (this._keptUber === undefined) return;
+    const now = this._uberOptions.uber?.() ?? null;
+    if (now === this._keptUber) return;
+    this._keptUber = undefined;
+    for (const [key, asset] of [...this._baked]) {
+      if (!asset.keptForNextLoad) continue;
+      asset.keptForNextLoad = false;
+      this._retireKey(key);
+    }
+  }
+
+  /**
+   * Bump the epoch of every in-flight decode / bake (plus `extraKeys`) and
+   * forget the in-flight maps: an abandoned job runs to completion but can no
+   * longer publish, and nobody joins it again. Derived (parametric) keys are
+   * bumped through their BASE key — the epoch a variant bake checks.
+   */
+  private _abandonInflight(extraKeys: Set<string>): void {
+    const keys = new Set<string>([...extraKeys, ...this._inflight.keys()]);
+    for (const k of this._bakedInflight.keys()) { keys.add(k); keys.add(baseKeyOf(k)); }
+    for (const k of this._paramInflight.keys()) keys.add(baseKeyOf(k));
+    for (const key of keys) this._epoch.set(key, (this._epoch.get(key) ?? 0) + 1);
+    this._inflight.clear();
+    this._bakedInflight.clear();
+    this._paramInflight.clear();
+    this._paramAlias.clear();
+  }
+
+  /** Dispose every decoded master and release its binary resources. */
+  private _disposeDecoded(): void {
     for (const [key, model] of this._decoded) {
       disposeSubtree(model);
       binaryResources.releaseDocument(modelCacheDocumentId(key));
@@ -1010,14 +1396,11 @@ export class ModelCache {
 
   /** Bump every known epoch, abandon in-flight decodes/bakes, retire every baked asset. */
   private _retireAll(): void {
-    const keys = new Set([
-      ...this._decoded.keys(), ...this._inflight.keys(),
-      ...this._baked.keys(), ...this._bakedInflight.keys(),
-    ]);
-    for (const key of keys) this._epoch.set(key, (this._epoch.get(key) ?? 0) + 1);
-    this._inflight.clear();
+    this._keptUber = undefined;
+    // `_retireBaked` drops in-flight bakes of the key as well — the in-flight
+    // maps are abandoned FIRST so nothing they hold escapes the epoch bump.
+    this._abandonInflight(new Set([...this._decoded.keys(), ...this._baked.keys()]));
     for (const key of [...this._baked.keys()]) this._retireBaked(key);
-    this._bakedInflight.clear();
   }
 
   /** Clear the persistent browser cache for all planner GLBs. */

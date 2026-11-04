@@ -57,7 +57,6 @@ import type { RvProject } from './rv-project-types';
 import { findDocumentById, moveDocumentPath } from './rv-asset-identity';
 import { retagRecentDocumentPath } from './rv-project-recents-store';
 import { repointDocumentRefs } from './rv-project-refs';
-import { migrateLegacyThumbnailForMove } from '../library/resolve-document-thumbnail';
 import {
   DOCS_INDEX_FILE,
   parseDocsIndex,
@@ -230,20 +229,8 @@ export async function applyTreeMove(
     }
   }
 
-  // ── The thumbnail, carried under the id BEFORE the path goes (plan-744) ──
-  //
-  // The lazy migration in `resolve-document-thumbnail.ts` keys off the OLD
-  // path-mirrored convention, `library/.thumbnails/<rel>.png`, and it can only
-  // find that file while the document still says `library/…`. A document moved
-  // out of `library/` before anything ever rendered its card would therefore
-  // lose its picture for good (Review #5). So the same copy runs here, first,
-  // for the paths that could have one.
-  //
-  // Best-effort in both directions: it never fails a move, and it never
-  // overwrites a sidecar that is already there.
-  for (const step of withIds) {
-    await migrateLegacyThumbnailForMove(io, step.documentId!, step.from);
-  }
+  // The thumbnail needs nothing here (plan-776 F5): it is keyed by the
+  // document id, which a move does not change.
 
   for (const step of steps) {
     const bytes = await io.readBytes(step.from);

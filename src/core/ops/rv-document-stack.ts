@@ -49,8 +49,9 @@
  */
 
 import type { Object3D } from 'three';
-import { ROOT_OCCURRENCE, childOccurrence, getNodeId } from '../engine/rv-node-id';
-import { getAssetOverrides } from '../engine/rv-asset-reference';
+import { ROOT_OCCURRENCE, childOccurrence } from '../engine/rv-node-id';
+import { identityIdOf } from '../engine/rv-decode-identity';
+import { getAssetOverrides, overrideAddressInReference } from '../engine/rv-asset-reference';
 import type { RvDocument } from './rv-document';
 import type { RvDraftFrameKey } from './rv-document-drafts';
 
@@ -92,7 +93,7 @@ export interface RvStackDocument {
 
 /** Why a frame no longer describes the file it was opened from. */
 export type RvStackStaleReason =
-  /** A lower frame of the same asset saved while this one was open (§2.7.1). */
+  /** A lower frame of the same document saved while this one was open (§2.7.1). */
   | 'saved-below'
   /** The child file was deleted or moved out from under the frame (§2.7.3). */
   | 'source-gone';
@@ -171,14 +172,13 @@ export interface RvChildFrameInput {
 /**
  * The hint line §2.7.2 requires.
  *
- * German, because it is user-facing UI copy in a German-language product
- * surface and the plan quotes it verbatim.
+ * English, like every user-facing string in the product (tests/ui-language.node.test.ts).
  */
 export function describeSuppressedOverrides(count: number): string | null {
   if (count <= 0) return null;
   return count === 1
-    ? '1 Override dieser Instanz ist ausgeblendet'
-    : `${count} Overrides dieser Instanz sind ausgeblendet`;
+    ? '1 override of this instance is hidden'
+    : `${count} overrides of this instance are hidden`;
 }
 
 /**
@@ -186,8 +186,9 @@ export function describeSuppressedOverrides(count: number): string | null {
  *
  * A field the user has just typed inside a referenced subtree is a real
  * instance override — `guardReferenceOp` admits it as `scope: 'override'` and
- * the bake routes it into `AssetOverrides.byNodeId` — but until the document is
- * SAVED it exists only in the op log and in the inspector's overlay cache. The
+ * the setField executor writes it into `AssetOverrides.byAddress` of the
+ * outermost reference (plan-774 F1) — but until that op has landed it exists
+ * only in the inspector's optimistic overlay cache. The
  * descend hint reads persisted state, so without this it would say "0" about an
  * edit the descend is, in fact, about to hide.
  *
@@ -207,10 +208,12 @@ export interface RvPendingOverrideSource {
 
 /** How a node inside a reference is addressed by an `AssetOverrides` key. */
 interface ReferenceAddress {
-  /** The node's own id — `byNodeId`'s key. Null when the node carries none. */
+  /** The node's override ADDRESS (`#<id>`, `<b>#<id>`) — `byAddress`' key. Null when an id is missing. */
   nodeId: string | null;
   /**
-   * Path relative to the GRAFTED CHILD ROOT — `byPath`'s key.
+   * Path relative to the referenced ASSET ROOT — `byPath`'s key. For a
+   * placement instance (the editor since plan-774) that is the path below the
+   * reference node; for a grafted composition the child root is skipped.
    *
    * The frame is `makeSubtreeResolvers(clone)`'s, where `clone` is the child
    * root composition added under the reference node
@@ -236,7 +239,14 @@ function addressInReference(referenceNode: Object3D, node: Object3D): ReferenceA
     cur = cur.parent;
   }
   if (!cur.parent) return null;
-  return { nodeId: getNodeId(node), relPath: segments.join('/') };
+  // plan-774: in the editor a reference is a PLACEMENT — the instance root IS
+  // the reference node (`_layoutObject`, stamped by the instancer) and the
+  // asset root's children hang directly below it, so the direct child is a
+  // real segment of the asset-relative path. Only a GRAFTED child root (a
+  // direct `loadGLB` composition) contributes none.
+  if (referenceNode.userData?._layoutObject === true) segments.unshift(cur.name);
+  // plan-769 4b: the override ADDRESS (nested references included), the same key the record uses.
+  return { nodeId: overrideAddressInReference(referenceNode, node, identityIdOf), relPath: segments.join('/') };
 }
 
 /**
@@ -250,8 +260,8 @@ function addressInReference(referenceNode: Object3D, node: Object3D): ReferenceA
  * too — unless the same (node, component) is ALREADY persisted, in which case
  * it is the same override being re-typed and the save will merge the two into
  * one entry. The de-duplication tries both addressings in the order
- * `applyAssetOverrides` resolves them (`byNodeId`, then `byPath`), because a
- * file written before ids existed addresses the same node the other way.
+ * `applyAssetOverrides` resolves them (`byAddress`, then the legacy `byPath`),
+ * because a file written before ids existed addresses the same node the other way.
  */
 export function countInstanceOverrides(
   referenceNode: Object3D,
@@ -263,13 +273,15 @@ export function countInstanceOverrides(
   // old plain sum: two entries addressing one node two ways were counted twice
   // before and still are. Only the PENDING side de-duplicates against them.
   const persisted = new Set<string>();
-  for (const [nodeId, patch] of Object.entries(overrides?.byNodeId ?? {})) {
+  for (const [address, patch] of Object.entries(overrides?.byAddress ?? {})) {
+    // The address IS the key the pending side computes (`overrideAddressInReference`).
+    const nodeId = address;
     for (const componentType of Object.keys(patch)) {
       persisted.add(`id:${nodeId} ${componentType}`);
       count++;
     }
   }
-  for (const [relPath, patch] of Object.entries(overrides?.byPath ?? {})) {
+  for (const [relPath, patch] of Object.entries(overrides?.legacyByPath ?? {})) {
     for (const componentType of Object.keys(patch)) {
       persisted.add(`path:${relPath} ${componentType}`);
       count++;

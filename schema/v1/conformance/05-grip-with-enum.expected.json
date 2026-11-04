@@ -1,12 +1,16 @@
 {
   "description": "Grip with a canonical enum wire string (Physics) and WebError with a LEGACY integer-index enum wire value ('1' -> 'FlashObject' via the enumMap).",
+  "maintenance": "Hand-written, deliberately: generating it from the parser or the schema this suite checks would be a mirror, not a test (plan-2047). A new rv-odt property with a default therefore has to be added here by hand; the schema-default coverage test in tests/conformance.test.ts names any that is missing. AlignRotation / DirectlyGrip / PickAlignWithObject were added by 7a7b64b7 (Grip.DirectlyGrip grips on sensor entry and aligns to PickAlignWithObject, Unity parity) and carry that commit's schema defaults.",
   "nodes": {
     "Gripper": {
       "Grip": {
         "GripRange": 80,
         "OneBitControl": true,
         "PlaceMode": "Physics",
-        "GripTargetSearchRadius": 500
+        "GripTargetSearchRadius": 500,
+        "AlignRotation": true,
+        "DirectlyGrip": false,
+        "PickAlignWithObject": ""
       }
     },
     "FaultLamp": {

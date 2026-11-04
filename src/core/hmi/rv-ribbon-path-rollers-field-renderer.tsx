@@ -31,7 +31,9 @@ import { ReorderableList, type ReorderableListItem } from './ReorderableList';
 import { fieldRendererRegistry, type FieldRendererProps } from './rv-field-renderer-registry';
 import { persistFieldOp } from './scene/scene-field-ops';
 import type { ComponentRef } from '../engine/rv-node-registry';
+import { isComponentReference, storedReferenceLabel, storedReferenceValue } from '../engine/rv-node-path-rewrite.mjs';
 import { assetRelativePath } from '../engine/rv-reference-resolver';
+import { authoredAssetRelativePath } from './rv-reference-field';
 import { EMPTY_SNAPSHOT } from '../engine/rv-selection-manager';
 import { FS } from './shared-sx';
 
@@ -44,9 +46,8 @@ function lastSeg(path: string): string {
 }
 
 function isRef(v: unknown): v is ComponentRef {
-  return !!v && typeof v === 'object'
-    && (v as Record<string, unknown>).type === 'ComponentReference'
-    && typeof (v as Record<string, unknown>).path === 'string';
+  // plan-769 Phase 3: THE guard — every stored form (path, address, kept path).
+  return isComponentReference(v);
 }
 
 // Stable no-op store fns for when the viewer is absent (keeps hook order stable).
@@ -74,8 +75,13 @@ export function RibbonPathRollersRenderer({ value, fieldName, nodePath, viewer }
   // Through the ONE resolver, relative to the RibbonPath's own asset (plan-757 F7).
   const ownerNode = registry?.getNode(nodePath) ?? null;
   const resolved = order.map((ref) => {
-    const node = registry ? (registry.resolvePath(ref.path, ownerNode) ?? registry.getNode(ref.path)) : null;
-    const curPath = node ? (registry?.getPathForNode(node) ?? ref.path) : ref.path;
+    // plan-769 Phase 3: an address-form ref is read by the owner's document.
+    const written = ref.path ?? storedReferenceLabel(ref) ?? '';
+    const node = !registry ? null
+      : typeof ref.path === 'string'
+        ? (registry.resolvePath(ref.path, ownerNode) ?? registry.getNode(ref.path))
+        : (ownerNode ? registry.storedNode(ownerNode, storedReferenceValue(ref)) : null);
+    const curPath = node ? (registry?.getPathForNode(node) ?? written) : written;
     return { ref, curPath, missing: !node };
   });
 
@@ -120,8 +126,18 @@ export function RibbonPathRollersRenderer({ value, fieldName, nodePath, viewer }
     // asset the RibbonPath node belongs to (the enclosing reference scope) —
     // and read tolerantly, so the same file works as a document and as a
     // placement. A target outside that asset keeps its full path.
+    // plan-765 F3: node-first — the selected node is spelled through the ONE
+    // writer in AUTHORED names (`NL6:501`, not the loader's `NL6501_1`), so the
+    // reference survives save + reload. Only a selection that resolves to no
+    // node inside the scope keeps the string rule.
     const owner = registry?.getNode(nodePath) ?? null;
-    const written = owner && registry ? assetRelativePath(primaryPath, registry.enclosingScope(owner)) : primaryPath;
+    let written = primaryPath;
+    if (owner && registry) {
+      const scope = registry.enclosingScope(owner);
+      const target = registry.getNode(primaryPath);
+      written = (target ? authoredAssetRelativePath(target, scope.root) : null)
+        ?? assetRelativePath(primaryPath, scope);
+    }
     if (order.some((ref) => ref.path === written || ref.path === primaryPath)) return;
     commit([...order, { type: 'ComponentReference', path: written, componentType: TRANSFORM_TYPE } as ComponentRef]);
   };

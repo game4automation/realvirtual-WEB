@@ -1,0 +1,2752 @@
+{
+ "tool": "scripts/rv-reference-baseline.mjs",
+ "plan": 769,
+ "entries": "nontrivial",
+ "perCustomer": {
+  "public": {
+   "glbs": 40,
+   "refs": 658,
+   "guessOnly": 0,
+   "disagree": 0,
+   "unresolvedAfter": 2,
+   "todayUnresolved": 2,
+   "byPath": 2,
+   "byNodeId": 0,
+   "trsByNodeId": 0,
+   "seedCollisions": 0
+  }
+ },
+ "glbs": {
+  "private:projects/mauser3dhmi/models/MauserCageline30.glb": {
+   "bytes": 193282676,
+   "jsonSha1": "e412749a8e847cc9",
+   "nodes": 70437,
+   "reachable": 70437,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 70438,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 515,
+    "sameNameSiblings": 7200,
+    "names": {
+     "slash": 152,
+     "bracket": 89,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 41
+   },
+   "refs": {
+    "total": 34529,
+    "byKind": {
+     "ref": 34494,
+     "path": 34,
+     "name": 1
+    },
+    "byStage": {
+     "exact": 32074,
+     "alias": 2408,
+     "unresolved": 47
+    },
+    "byVia": {
+     "authored": 34482,
+     "unresolved": 46,
+     "name-as-path:authored": 1
+    },
+    "unresolved": {
+     "missing": 46,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 47,
+    "healedByMigration": 1,
+    "lostByMigration": 0
+   },
+   "refsDigest": "ea5e9fe8a1e629ea2adb",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 378,
+    "explicitName": 8,
+    "nameFollowsNode": 370
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": [
+    {
+     "referrer": "Kinematics/Kinematics_MC02/Table_Horizontal/Table_Vertical/Gripper_1",
+     "component": "Grip",
+     "field": "SignalPick",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Table_Arrestor_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Kinematics/Kinematics_MC02/Table_Horizontal/Table_Vertical/Gripper_2",
+     "component": "Grip",
+     "field": "SignalPick",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Table_Arrestor_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Kinematics/Kinematics_MC02/Table_Horizontal/Table_Vertical/Gripper_3",
+     "component": "Grip",
+     "field": "SignalPick",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Table_Arrestor_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_1/StepChain_rv1/StepsPickUp/SetSignalSignal_Gripper_1_Closed",
+     "component": "LogicStep_SetSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_1_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_1/StepChain_rv1/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_1/StepChain_rv1/StepsPutDown/ResetSignalSignal_Gripper_1_Closed",
+     "component": "LogicStep_SetSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_1_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_2/StepChain_rv2/StepsPickUp/SetSignalSignal_Gripper_2_Closed",
+     "component": "LogicStep_SetSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_2_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_2/StepChain_rv2/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_2/StepChain_rv2/StepsPutDown/ResetSignalSignal_Gripper_2_Closed",
+     "component": "LogicStep_SetSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_2_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_3/StepChain_rv3/StepsPickUp/SetSignalSignal_Gripper_3_Closed",
+     "component": "LogicStep_SetSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_3_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_3/StepChain_rv3/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_3/StepChain_rv3/StepsPutDown/ResetSignalSignal_Gripper_3_Closed",
+     "component": "LogicStep_SetSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_3_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_4/StepChain_rv4/StepsPickUp/SetSignalSignal_Gripper_4_Closed",
+     "component": "LogicStep_SetSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_4_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_4/StepChain_rv4/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_4/StepChain_rv4/StepsPutDown/ResetSignalSignal_Gripper_4_Closed",
+     "component": "LogicStep_SetSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_4_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_5/StepChain_rv5/StepsPickUp/SetSignalSignal_Gripper_5_Closed",
+     "component": "LogicStep_SetSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_5_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_5/StepChain_rv5/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_5/StepChain_rv5/StepsPutDown/ResetSignalSignal_Gripper_5_Closed",
+     "component": "LogicStep_SetSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_5_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_6/StepChain_rv6/StepsPickUp/SetSignalSignal_Gripper_6_Closed",
+     "component": "LogicStep_SetSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_6_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_6/StepChain_rv6/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_6/StepChain_rv6/StepsPutDown/ResetSignalSignal_Gripper_6_Closed",
+     "component": "LogicStep_SetSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_6_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_7/StepChain_rv7/StepsPickUp/SetSignalSignal_Gripper_7_Closed",
+     "component": "LogicStep_SetSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_7_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_7/StepChain_rv7/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_1_7/StepChain_rv7/StepsPutDown/ResetSignalSignal_Gripper_7_Closed",
+     "component": "LogicStep_SetSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_7_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_2_1/StepChain_rv8/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_2_2/StepChain_rv9/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_2_3/StepChain_rv10/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_2_4/StepChain_rv11/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_2_5/StepChain_rv12/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_2_6/StepChain_rv13/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_2_7/StepChain_rv14/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_3_1/Gripper_1_Sensor",
+     "component": "Grip",
+     "field": "SignalPick",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_1_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_3_1/StepChain_rv15/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_3_2/Gripper_2_Sensor",
+     "component": "Grip",
+     "field": "SignalPick",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_2_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_3_2/StepChain_rv16/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_3_3/Gripper_3_Sensor",
+     "component": "Grip",
+     "field": "SignalPick",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_3_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_3_3/StepChain_rv17/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_3_4/Gripper_4_Sensor",
+     "component": "Grip",
+     "field": "SignalPick",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_4_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_3_4/StepChain_rv18/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_3_5/Gripper_5_Sensor",
+     "component": "Grip",
+     "field": "SignalPick",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_5_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_3_5/StepChain_rv19/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_3_6/Gripper_6_Sensor",
+     "component": "Grip",
+     "field": "SignalPick",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_6_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_3_6/StepChain_rv20/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_3_7/Gripper_7_Sensor",
+     "component": "Grip",
+     "field": "SignalPick",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Gripper_7_Closed",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Grippers_MC03_Transport_System/Grp_3_7/StepChain_rv21/StepsPutDown/WaitStartsignal",
+     "component": "LogicStep_WaitForSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/StartPutDownSteps_rv1",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "MessageDefinitions/Maintenance M2",
+     "component": "CustomRuntimeInstruction",
+     "field": "signal",
+     "kind": "ref",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Logic Steps Module 3/Signal_Maintainance",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "UsedWhenOperatingTwinWithoutPLC_Connection/Tube",
+     "component": "Source",
+     "field": "ThisObjectAsMU",
+     "kind": "name",
+     "path": "UsedWhenOperatingTwinWithoutPLC_Connection/Tube",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "name-as-path:authored",
+     "target": "UsedWhenOperatingTwinWithoutPLC_Connection/Tube"
+    }
+   ]
+  },
+  "public:public/demo-realvirtual/AGVDemo.glb": {
+   "bytes": 15085712,
+   "jsonSha1": "4edaa0a12dd3906c",
+   "nodes": 95,
+   "reachable": 95,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 96,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/demo-realvirtual/AGVFactory.glb": {
+   "bytes": 15143012,
+   "jsonSha1": "fb39fd0064544bd2",
+   "nodes": 769,
+   "reachable": 293,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 294,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/demo-realvirtual/Autonox-DELTA-RL5-1900-6kg.glb": {
+   "bytes": 9777208,
+   "jsonSha1": "7420329ba67199f6",
+   "nodes": 98,
+   "reachable": 98,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 99,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 57,
+    "byKind": {
+     "ref": 57
+    },
+    "byStage": {
+     "exact": 57
+    },
+    "byVia": {
+     "authored-root-stripped": 57
+    },
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "e94ad03c466a52141590",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/demo-realvirtual/DemoPlanner.glb": {
+   "bytes": 6800,
+   "jsonSha1": "3d4eade19ee24530",
+   "nodes": 15,
+   "reachable": 15,
+   "seed": {
+    "existingIds": 13,
+    "seeded": 3,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 1
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/demo-realvirtual/DemoRealvirtualWeb.glb": {
+   "bytes": 8908584,
+   "jsonSha1": "917d7556a66b4404",
+   "nodes": 343,
+   "reachable": 343,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 344,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 8,
+    "sameNameSiblings": 4,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 159,
+    "byKind": {
+     "ref": 157,
+     "path": 1,
+     "name": 1
+    },
+    "byStage": {
+     "exact": 147,
+     "alias": 11,
+     "name": 1
+    },
+    "byVia": {
+     "authored": 158,
+     "name-as-path:authored": 1
+    },
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "c30235ac364a0d45d453",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 41,
+    "explicitName": 6,
+    "nameFollowsNode": 35
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/demo-realvirtual/fmu-demo.glb": {
+   "bytes": 221176,
+   "jsonSha1": "d7300f7de82f7547",
+   "nodes": 4,
+   "reachable": 4,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 5,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 2,
+    "byKind": {
+     "ref": 2
+    },
+    "byStage": {
+     "unresolved": 2
+    },
+    "byVia": {
+     "unresolved": 2
+    },
+    "unresolved": {
+     "missing": 2,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 2,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "ae97b6181661e23b2283",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": [
+    {
+     "referrer": "Ball",
+     "component": "Drive_FollowPosition",
+     "field": "Position",
+     "kind": "ref",
+     "path": "Ball/Signals/h",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    },
+    {
+     "referrer": "Sequence/RestartBall",
+     "component": "LogicStep_SetSignalBool",
+     "field": "Signal",
+     "kind": "ref",
+     "path": "Ball/Signals/Restart",
+     "stage": "unresolved",
+     "todayTarget": null,
+     "via": "unresolved",
+     "reason": "missing"
+    }
+   ]
+  },
+  "public:public/demo-realvirtual/LaserWeldingAssemblyStation.glb": {
+   "bytes": 21873864,
+   "jsonSha1": "f6eddcae6bb0ffac",
+   "nodes": 2391,
+   "reachable": 2375,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 2376,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 10,
+    "sameNameSiblings": 10,
+    "names": {
+     "slash": 3,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 1
+   },
+   "refs": {
+    "total": 393,
+    "byKind": {
+     "ref": 391,
+     "name": 2
+    },
+    "byStage": {
+     "exact": 391,
+     "name": 2
+    },
+    "byVia": {
+     "authored": 391,
+     "authored-name-in-file": 2
+    },
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "b56d743c8d5f176a35c7",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 226,
+    "explicitName": 226,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/demo-realvirtual/library/AGV.glb": {
+   "bytes": 5076120,
+   "jsonSha1": "04ca3f5e6fd4e04f",
+   "nodes": 2,
+   "reachable": 2,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 3,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/demo-realvirtual/library/Custom/Course.glb": {
+   "bytes": 1160,
+   "jsonSha1": "3a12be2f436ff997",
+   "nodes": 4,
+   "reachable": 4,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 5,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/demo-realvirtual/MuJoCoWalker.glb": {
+   "bytes": 1120680,
+   "jsonSha1": "5c53bae2560e25b0",
+   "nodes": 59,
+   "reachable": 59,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 60,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/demo-realvirtual/PalletYard.glb": {
+   "bytes": 35592,
+   "jsonSha1": "e31e2d8d38fca95f",
+   "nodes": 113,
+   "reachable": 113,
+   "seed": {
+    "existingIds": 30,
+    "seeded": 84,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 2,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/demo-realvirtual/Test-DES-Turntable-Loop.glb": {
+   "bytes": 3084,
+   "jsonSha1": "dc78c6b5e6e1dbd4",
+   "nodes": 8,
+   "reachable": 8,
+   "seed": {
+    "existingIds": 7,
+    "seeded": 2,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 1,
+    "sameNameSiblings": 3,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 1
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/embed/vignettes/conveyor-sensor.glb": {
+   "bytes": 1852532,
+   "jsonSha1": "8c2028f95b3cbb27",
+   "nodes": 79,
+   "reachable": 79,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 80,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 8,
+    "byKind": {
+     "ref": 6,
+     "path": 1,
+     "name": 1
+    },
+    "byStage": {
+     "exact": 7,
+     "name": 1
+    },
+    "byVia": {
+     "authored": 7,
+     "name-as-path:authored": 1
+    },
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "b83df8e6560f586a6246",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 4,
+    "explicitName": 0,
+    "nameFollowsNode": 4
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/MobileRobots/AGVStacker.glb": {
+   "bytes": 464024,
+   "jsonSha1": "3116c082a8afbef5",
+   "nodes": 68,
+   "reachable": 68,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 69,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 1,
+    "byKind": {
+     "ref": 1
+    },
+    "byStage": {
+     "exact": 1
+    },
+    "byVia": {
+     "authored": 1
+    },
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "983bb759b1bfe33e500e",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/CartonBox.glb": {
+   "bytes": 15598364,
+   "jsonSha1": "7cd801a64ba72d01",
+   "nodes": 2,
+   "reachable": 2,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 3,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 1,
+    "byKind": {
+     "name": 1
+    },
+    "byStage": {
+     "name": 1
+    },
+    "byVia": {
+     "authored-name-in-owner": 1
+    },
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "4deb845b184159275f1a",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/ChainConveyor-1m.glb": {
+   "bytes": 2344316,
+   "jsonSha1": "8c2811c435de8ae8",
+   "nodes": 12,
+   "reachable": 12,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 13,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/ChainConveyor-2m.glb": {
+   "bytes": 4975564,
+   "jsonSha1": "a6f82aa1364ffaa6",
+   "nodes": 12,
+   "reachable": 12,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 13,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/ChainConveyor-3m.glb": {
+   "bytes": 7199324,
+   "jsonSha1": "11e74ce64768caf0",
+   "nodes": 12,
+   "reachable": 12,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 13,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/ChainTransferLeft.glb": {
+   "bytes": 2458172,
+   "jsonSha1": "31d362277d7554f4",
+   "nodes": 13,
+   "reachable": 13,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 14,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 1,
+    "sameNameSiblings": 1,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/ChainTransferRight.glb": {
+   "bytes": 2459816,
+   "jsonSha1": "4a75942feb91e474",
+   "nodes": 13,
+   "reachable": 13,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 14,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 1,
+    "sameNameSiblings": 1,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/Europallet.glb": {
+   "bytes": 1760176,
+   "jsonSha1": "c6139ba50ce3c29d",
+   "nodes": 2,
+   "reachable": 2,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 3,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 1,
+    "byKind": {
+     "name": 1
+    },
+    "byStage": {
+     "name": 1
+    },
+    "byVia": {
+     "authored-name-in-owner": 1
+    },
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "c6ba4463dd07c1a10e0a",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/EuropalletLoaded.glb": {
+   "bytes": 17361652,
+   "jsonSha1": "3ab9dd8e5e58a848",
+   "nodes": 11,
+   "reachable": 11,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 12,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 1,
+    "byKind": {
+     "name": 1
+    },
+    "byStage": {
+     "name": 1
+    },
+    "byVia": {
+     "authored-name-in-owner": 1
+    },
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "9d44b0e4c0d9025f9b0b",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/LoadingGantry.glb": {
+   "bytes": 1161092,
+   "jsonSha1": "b1da23c66076715a",
+   "nodes": 9,
+   "reachable": 9,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 10,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/PalletScanner.glb": {
+   "bytes": 1529356,
+   "jsonSha1": "dec3cb1213f363c4",
+   "nodes": 51,
+   "reachable": 51,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 52,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 19,
+    "byKind": {
+     "ref": 19
+    },
+    "byStage": {
+     "alias": 19
+    },
+    "byVia": {
+     "authored-content-root": 19
+    },
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "bf03672fecdcd40aaedb",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/PalletSink.glb": {
+   "bytes": 4232,
+   "jsonSha1": "2fd883d7ddb6abbb",
+   "nodes": 1,
+   "reachable": 1,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 2,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/PalletYardChargerStation.glb": {
+   "bytes": 3144,
+   "jsonSha1": "6922bd7743d7a948",
+   "nodes": 3,
+   "reachable": 3,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 4,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/PalletYardEndEast.glb": {
+   "bytes": 26532,
+   "jsonSha1": "c5afbf417c2ee78b",
+   "nodes": 7,
+   "reachable": 7,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 8,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/PalletYardEndWest.glb": {
+   "bytes": 26528,
+   "jsonSha1": "250fe0e69824f3ee",
+   "nodes": 7,
+   "reachable": 7,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 8,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/PalletYardModule.glb": {
+   "bytes": 1968,
+   "jsonSha1": "36b2787285646f25",
+   "nodes": 5,
+   "reachable": 5,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 6,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/PalletYardSlotMarking.glb": {
+   "bytes": 3164,
+   "jsonSha1": "5cc12b3e4e4f13ba",
+   "nodes": 6,
+   "reachable": 6,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 7,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/PalletYardWaitMarking.glb": {
+   "bytes": 1736,
+   "jsonSha1": "99466f334c2b526c",
+   "nodes": 2,
+   "reachable": 2,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 3,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/RollConveyor-1m.glb": {
+   "bytes": 1703204,
+   "jsonSha1": "e71b2c83b16a444d",
+   "nodes": 10,
+   "reachable": 10,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 11,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/RollConveyor-2m.glb": {
+   "bytes": 2528204,
+   "jsonSha1": "74fae710ca4c50c4",
+   "nodes": 14,
+   "reachable": 14,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 15,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 1,
+    "sameNameSiblings": 1,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/RollConveyor-3m-edit.glb": {
+   "bytes": 3352972,
+   "jsonSha1": "f9968f114be090a2",
+   "nodes": 16,
+   "reachable": 16,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 17,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 1,
+    "sameNameSiblings": 2,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/RollConveyor-3m.glb": {
+   "bytes": 3352996,
+   "jsonSha1": "42beb1a828451020",
+   "nodes": 16,
+   "reachable": 16,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 17,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 1,
+    "sameNameSiblings": 2,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/SphereMirror.glb": {
+   "bytes": 35996,
+   "jsonSha1": "dc447cacd62e6d6f",
+   "nodes": 1,
+   "reachable": 1,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 2,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/SphereRed.glb": {
+   "bytes": 279460,
+   "jsonSha1": "6e4b8f6362dec0a6",
+   "nodes": 1,
+   "reachable": 1,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 2,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/PalletHandling/Turntable.glb": {
+   "bytes": 1278428,
+   "jsonSha1": "29fb863f0aabf234",
+   "nodes": 16,
+   "reachable": 16,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 17,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 0,
+    "byKind": {},
+    "byStage": {},
+    "byVia": {},
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "da39a3ee5e6b4b0d3255",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/library/Robots/FanucCRX-10iA-L.glb": {
+   "bytes": 796256,
+   "jsonSha1": "141facd91d459964",
+   "nodes": 24,
+   "reachable": 24,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 25,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 14,
+    "byKind": {
+     "ref": 13,
+     "path": 1
+    },
+    "byStage": {
+     "exact": 14
+    },
+    "byVia": {
+     "authored": 14
+    },
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "7fdefbb103a8e32a8346",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  },
+  "public:public/perf/Robots/FanucCRX-10iA-L-erratic.glb": {
+   "bytes": 792784,
+   "jsonSha1": "30f4376554c17d0a",
+   "nodes": 18,
+   "reachable": 18,
+   "seed": {
+    "existingIds": 0,
+    "seeded": 19,
+    "collisions": 0,
+    "duplicateExistingIds": 0,
+    "canonicalPathsUnique": true,
+    "ambiguousRawPaths": 0,
+    "sameNameSiblings": 0,
+    "names": {
+     "slash": 0,
+     "bracket": 0,
+     "backslash": 0,
+     "hashLead": 0,
+     "empty": 0
+    },
+    "seedMs": 0
+   },
+   "refs": {
+    "total": 2,
+    "byKind": {
+     "ref": 2
+    },
+    "byStage": {
+     "exact": 2
+    },
+    "byVia": {
+     "authored": 2
+    },
+    "unresolved": {
+     "missing": 0,
+     "ambiguous": 0
+    },
+    "guessOnly": 0,
+    "disagree": 0,
+    "todayUnresolved": 0,
+    "healedByMigration": 0,
+    "lostByMigration": 0
+   },
+   "refsDigest": "2f94d5af8e6b28d944bd",
+   "guessOnlyByComponent": {},
+   "signals": {
+    "total": 0,
+    "explicitName": 0,
+    "nameFollowsNode": 0
+   },
+   "overrides": {
+    "byNodeId": 0,
+    "byPath": 0,
+    "trsByNodeId": 0
+   },
+   "entries": []
+  }
+ },
+ "jsonOverrides": {},
+ "errors": {}
+}

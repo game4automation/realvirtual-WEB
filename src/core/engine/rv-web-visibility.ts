@@ -28,6 +28,7 @@ import type { ComponentContext, ComponentSchema, RVComponent } from './rv-compon
 import { registerComponent, setComponentInstance, loadSchemaFromSpec } from './rv-component-registry';
 import type { GizmoHandle } from './rv-gizmo-manager';
 import { NodeRegistry } from './rv-node-registry';
+import { storedReferenceValue } from './rv-node-path-rewrite.mjs';
 import { wireValueSignal } from './rv-signal-wiring';
 import {
   ERROR_COLOR,
@@ -157,9 +158,11 @@ export class RVWebVisibility implements RVComponent {
     const list = Array.isArray(raw) ? raw : this.AdditionalTargets;
     if (!Array.isArray(list)) return;
     for (const item of list) {
-      const path = this._refToPath(item);
-      if (!path) continue;
-      const target = ctx.registry.getNode(path);
+      // plan-769 Phase 1b / 3: a stored reference in any form — the file's verdict,
+      // never a guess (a path, a ComponentReference, an address).
+      const stored = storedReferenceValue(item);
+      if (stored === null) continue;
+      const target = ctx.registry.storedNode(this.node, stored);
       if (target && target !== this.node) this._additionalNodes.push(target);
     }
   }
@@ -169,17 +172,6 @@ export class RVWebVisibility implements RVComponent {
   private _readErrorColor(): unknown {
     const rv = this.node.userData?.realvirtual as Record<string, Record<string, unknown>> | undefined;
     return rv?.['WebVisibility']?.['ErrorColor'] ?? null;
-  }
-
-  /** Extract a node path from an AdditionalTargets entry (raw ComponentRef object,
-   *  or a plain path string left by the loader's ref-array fallback). */
-  private _refToPath(item: unknown): string | null {
-    if (typeof item === 'string') return item.length ? item : null;
-    if (item && typeof item === 'object') {
-      const p = (item as Record<string, unknown>).path;
-      if (typeof p === 'string' && p.length) return p;
-    }
-    return null;
   }
 
   private _onVisibleChange(raw: boolean): void {

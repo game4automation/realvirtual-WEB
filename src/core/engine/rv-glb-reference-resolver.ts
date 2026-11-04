@@ -24,6 +24,20 @@
  * 4. Nothing — reported as a miss, never an exception, so one unavailable
  *    library does not take the whole scene down with it.
  *
+ * ## A qualified reference skips the whole order (plan-778 F4)
+ *
+ * `providerId: 'library-projects'` + `sourceId` names ONE library project.
+ * It resolves in that source by canonical document id, or not at all: no other
+ * source, no alias, no manifest row of the open project, no stored path. While
+ * that source is pending the resolver waits for it alone (never for the
+ * others); locked / unknown / error → null → placeholder, and the placement
+ * instancer re-resolves when the source becomes ready (F8).
+ *
+ * The legacy search (step 1 for an unqualified reference) is
+ * `findLegacyOrigin`: canonical ids over every source first, then aliases;
+ * a pre-778 `global` + realvirtual-catalog qualifier maps to the realvirtual
+ * library project (F5).
+ *
  * `sha256` is deliberately not a resolution key. The user decided that library
  * corrections must reach every referencing plant; a hash key would pin each
  * file to the bytes it last saw and quietly defeat that.
@@ -35,7 +49,17 @@
 
 import type { ReferenceResolver, ResolvedReference } from './rv-glb-compose';
 import type { AssetReference } from './rv-asset-reference';
-import { listLibrarySources, type ResolvedAsset } from '../library/library-source-registry';
+import {
+  hasPendingLibrarySources,
+  whenLibrarySourcesSettled,
+  type ResolvedAsset,
+} from '../library/library-source-registry';
+import {
+  findLegacyOrigin,
+  findQualifiedOrigin,
+  findQualifiedOriginSettled,
+  isQualifiedRef,
+} from '../library/library-origin';
 import { verifyRvSigBuffer } from '../persistence/rv-sig-verify';
 import { sha256Hex } from '../import/rv-cad-glb-cache';
 import { debug } from './rv-debug';
@@ -57,7 +81,27 @@ async function fetchBytes(url: string): Promise<ArrayBuffer | null> {
 }
 
 /**
- * Find an asset id in ANY registered source.
+ * A QUALIFIED reference through the ONE source it names (plan-778 F4). Waits
+ * for that source while it is pending — and only for it; anything else
+ * (locked, unknown, error, not registered, no such document) is null.
+ */
+export async function resolveQualifiedReference(
+  ref: Pick<AssetReference, 'assetId' | 'providerId' | 'sourceId'>,
+): Promise<{ resolved: ResolvedAsset; url: string } | null> {
+  if (!isQualifiedRef(ref) || !ref.assetId) return null;
+  const found = await findQualifiedOriginSettled({ ...ref, assetId: ref.assetId });
+  if (!found) return null;
+  try {
+    const resolved = await found.registered.source.resolveAsset(found.entry.id, 'place');
+    return { resolved, url: resolved.url };
+  } catch (e) {
+    debug('loader', `[compose] library "${ref.sourceId}" failed to resolve "${ref.assetId}": ${String(e)}`);
+    return null;
+  }
+}
+
+/**
+ * Find a LEGACY asset id in the registered sources (plan-778 F5).
  *
  * `providerId`/`sourceId` on the reference narrow the search when present, but
  * are not required to match: a library that was reorganised — or a scene opened
@@ -66,20 +110,29 @@ async function fetchBytes(url: string): Promise<ArrayBuffer | null> {
  */
 async function resolveThroughLibrary(ref: AssetReference): Promise<{ resolved: ResolvedAsset; url: string } | null> {
   if (!ref.assetId) return null;
-  const sources = listLibrarySources();
-  const preferred = sources.filter(
-    (s) => (!ref.providerId || s.providerId === ref.providerId) && (!ref.sourceId || s.source.id === ref.sourceId),
-  );
-  for (const { source } of [...preferred, ...sources]) {
-    if (!source.getEntry(ref.assetId)) continue;
-    try {
-      const resolved = await source.resolveAsset(ref.assetId, 'place');
-      return { resolved, url: resolved.url };
-    } catch (e) {
-      debug('loader', `[compose] source "${source.id}" failed to resolve "${ref.assetId}": ${String(e)}`);
-    }
+  const found = await findInLibrarySources(ref);
+  if (found || !hasPendingLibrarySources()) return found;
+  // Not found YET: a catalog the active project subscribed to may still be
+  // fetching its listing. Falling through to `path` now would fetch a file the
+  // id would have resolved correctly a moment later — for the bundled demo a
+  // 404 (`/demo-realvirtual/library/…`; the library is app-level). Wait for
+  // the listings, then ask once more.
+  await whenLibrarySourcesSettled();
+  return findInLibrarySources(ref);
+}
+
+async function findInLibrarySources(ref: AssetReference): Promise<{ resolved: ResolvedAsset; url: string } | null> {
+  if (!ref.assetId) return null;
+  // Canonical ids over every source first, then aliases (findLegacyOrigin).
+  const origin = findLegacyOrigin(ref.assetId, ref);
+  if (!origin) return null;
+  try {
+    const resolved = await origin.source.resolveAsset(ref.assetId, 'place');
+    return { resolved, url: resolved.url };
+  } catch (e) {
+    debug('loader', `[compose] source "${origin.source.id}" failed to resolve "${ref.assetId}": ${String(e)}`);
+    return null;
   }
-  return null;
 }
 
 /**
@@ -126,6 +179,17 @@ export function createReferenceResolver(): ReferenceResolver {
     let bytes: ArrayBuffer | null = null;
     let url = '';
 
+    // plan-778 F4: a qualified reference resolves in its own library or not at
+    // all — the manifest and path steps below never run for it.
+    if (isQualifiedRef(ref)) {
+      const viaQualified = await resolveQualifiedReference(ref);
+      if (!viaQualified) return null;
+      url = viaQualified.url;
+      bytes = await fetchBytes(url);
+      viaQualified.resolved.revokeUrl?.();
+      return bytes ? verifiedReference(bytes, url) : null;
+    }
+
     const viaLibrary = await resolveThroughLibrary(ref);
     if (viaLibrary) {
       url = viaLibrary.url;
@@ -150,14 +214,18 @@ export function createReferenceResolver(): ReferenceResolver {
     }
 
     if (!bytes) return null;
+    return verifiedReference(bytes, url);
+  };
+}
 
-    const verified = await verifyRvSigBuffer(bytes);
-    return {
-      bytes: verified.buffer,
-      url,
-      sha256: await sha256Hex(verified.buffer),
-      signatureState: verified.state,
-      signaturePresent: verified.signaturePresent,
-    };
+/** The verified form of fetched bytes — every resolved file carries its OWN signature state (§2.9). */
+async function verifiedReference(bytes: ArrayBuffer, url: string): Promise<ResolvedReference> {
+  const verified = await verifyRvSigBuffer(bytes);
+  return {
+    bytes: verified.buffer,
+    url,
+    sha256: await sha256Hex(verified.buffer),
+    signatureState: verified.state,
+    signaturePresent: verified.signaturePresent,
   };
 }

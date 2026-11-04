@@ -49,7 +49,14 @@ describe('playwright.config.ts — prod-demo contract (plan-503 §9.4)', () => {
 
   it('has no prod-demo project and both webServers without RV_SMOKE_BASE_URL', async () => {
     const config = await loadConfig({});
-    expect(config.projects.map((p: any) => p.name)).toEqual(['chromium', 'embed-chromium']);
+    expect(config.projects.map((p: any) => p.name)).toEqual(['chromium', 'chrome', 'embed-chromium']);
+    // plan-766: the GPU-measuring editor-arena specs run in the installed Google
+    // Chrome, and only there (each spec in exactly one project).
+    const chrome = config.projects.find((p: any) => p.name === 'chrome');
+    expect(chrome.use.channel).toBe('chrome');
+    expect(chrome.testMatch.test('e2e/editor-arena-perf.spec.ts')).toBe(true);
+    const chromium = config.projects.find((p: any) => p.name === 'chromium');
+    expect((chromium.testIgnore as RegExp[]).some((re) => re.test('e2e/editor-arena-perf.spec.ts'))).toBe(true);
     expect(config.webServer).toHaveLength(2);
     expect(config.workers).toBeUndefined();
   });
@@ -158,5 +165,12 @@ describe('boot smoke 404 allowlist (plan-503 F2)', () => {
     // The root of ANOTHER deploy is not this deploy's root.
     expect(isAllowedNotFound('https://web.realvirtual.io/project.json', BASE)).toBe(false);
     expect(isAllowedNotFound('https://web.realvirtual.io/project.json', 'https://web.realvirtual.io/')).toBe(true);
+  });
+
+  it('allows the MCP bridge same-origin /health probe (plan-668), nothing else named health', () => {
+    expect(isAllowedNotFound('https://web.realvirtual.io/health', BASE)).toBe(true);
+    expect(isAllowedNotFound('http://localhost:5100/health', BASE)).toBe(false);
+    expect(isAllowedNotFound(`${BASE}health`, BASE)).toBe(false);
+    expect(isAllowedNotFound('https://web.realvirtual.io/health/x', BASE)).toBe(false);
   });
 });

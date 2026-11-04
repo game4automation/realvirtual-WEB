@@ -38,7 +38,9 @@ export {
 // ── Transit-timing helper (Plan 197 §2b — already landed) ──────────────────
 export {
   createTransitTimer,
+  POSE_ALIGN_TOLERANCE_M,
   type TransitTimer,
+  type PoseProjection,
 } from './transit-timing';
 
 /**

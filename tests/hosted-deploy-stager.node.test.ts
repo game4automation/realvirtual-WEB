@@ -140,6 +140,7 @@ describe('stageHostedProject — layout & deny (§9.1)', () => {
       expect(settings.projectUrl).toBe('p/');
       expect(settings.projectAssetsPath).toBe('p/');
       expect(settings.defaultModel).toBeUndefined(); // D14: the root is the dashboard
+      expect(settings.hostedDeploy).toBe(true); // plan-640: the marker that lets settings.start apply
       expect(settings.encryption).toBeUndefined();
       expect(settings.analytics).toEqual({ googleAnalyticsId: '' });
     } finally {
@@ -164,9 +165,13 @@ describe('stageHostedProject — layout & deny (§9.1)', () => {
         analytics: { googleAnalyticsId: 'UA-EVIL' },
         encryption: { enabled: false },
         generated: '1999-01-01T00:00:00Z',
+        hostedDeploy: false,
+        defaultModel: 'models/a.glb',
       },
     }));
     expect(s.theme).toBe('dark');
+    expect(s.hostedDeploy).toBe(true); // plan-640: a project file cannot switch the marker off
+    expect(s.defaultModel).toBeUndefined();
     expect(s.projectUrl).toBe('p/');
     expect(s.projectAssetsPath).toBe('p/');
     expect(s.analytics).toEqual({ googleAnalyticsId: '' });

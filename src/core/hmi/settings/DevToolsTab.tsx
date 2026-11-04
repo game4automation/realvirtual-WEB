@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { writeLocalStorage } from '../../rv-safe-storage';
+
+import { useState, useEffect, useCallback, useRef, useMemo, useSyncExternalStore } from 'react';
+import type { FeatureStatus } from '../../rv-feature-loader';
 import { Typography, Box, Button, CircularProgress, Switch, TextField } from '@mui/material';
 import { PlayArrow, CleaningServices } from '@mui/icons-material';
 import { useViewer } from '../../../hooks/use-viewer';
@@ -232,6 +235,41 @@ function AssetCacheSection({ version, onClearPersistent, clearing }: {
             Clear persistent cache
           </Button>
         </Box>
+      </Box>
+    </SettingsSection>
+  );
+}
+
+const NO_FEATURES: readonly FeatureStatus[] = [];
+const FEATURE_STATE_COLOR: Record<FeatureStatus['state'], string> = {
+  declared: 'rgba(255,255,255,0.45)', loading: '#ffa726', active: '#66bb6a', failed: '#ef5350',
+};
+
+/**
+ * DevTools › Features (plan-652): every feature the FeatureLoader knows — state,
+ * the trigger that loaded it, the cost in ms and (in a built deploy) the chunk bytes.
+ */
+function FeaturesSection() {
+  const viewer = useViewer();
+  const loader = viewer?.features;
+  const rows = useSyncExternalStore(
+    (cb) => loader?.subscribe(cb) ?? (() => {}),
+    () => loader?.statuses() ?? NO_FEATURES,
+  );
+  const total = rows.filter((r) => r.trigger === 'startup').reduce((sum, r) => sum + (r.ms ?? 0), 0);
+  return (
+    <SettingsSection id="devtools-features" title="Features" defaultExpanded={false}>
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.25 }}>
+        <SubRow text={rows.length ? `${rows.length} features · startup ${Math.round(total)} ms` : 'no features'} />
+        {rows.map((r) => (
+          <Box key={r.id} sx={{ display: 'flex', gap: 1, fontFamily: 'monospace', fontSize: 10, alignItems: 'baseline' }} title={r.error ?? r.activation.join(', ')}>
+            <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'rgba(255,255,255,0.7)' }}>{r.id}</span>
+            <span style={{ color: FEATURE_STATE_COLOR[r.state], minWidth: 52 }}>{r.state}</span>
+            <span style={{ color: 'rgba(255,255,255,0.45)', minWidth: 84, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.trigger ?? '—'}</span>
+            <span style={{ color: 'rgba(255,255,255,0.45)', minWidth: 44, textAlign: 'right' }}>{r.ms !== undefined ? `${Math.round(r.ms)}ms` : '—'}</span>
+            <span style={{ color: 'rgba(255,255,255,0.35)', minWidth: 48, textAlign: 'right' }}>{r.bytes != null ? `${Math.round(r.bytes / 1024)} KB` : ''}</span>
+          </Box>
+        ))}
       </Box>
     </SettingsSection>
   );
@@ -562,7 +600,8 @@ export function DevToolsTab() {
         programs: info.programs,
         heapMB,
         heapLimitMB,
-        renderer: viewer.isWebGPU ? 'WebGPU' : 'WebGL',
+        renderer: viewer.rendererKind === 'webgpu' ? 'WebGPU'
+          : viewer.rendererKind === 'webgpu-gl' ? 'WebGPU (GL backend)' : 'WebGL',
         bakeAssets: plannerBake?.assets ?? bake.assets,
         bakeChunks: plannerBake?.chunks ?? bake.chunks,
         bakeVertices: plannerBake?.vertices ?? -1,
@@ -656,7 +695,7 @@ export function DevToolsTab() {
           <Switch
             size="small"
             checked={isMetadataLoadingEnabled()}
-            onChange={(_, v) => { localStorage.setItem(DISABLE_METADATA_LS_KEY, v ? '0' : '1'); window.location.reload(); }}
+            onChange={(_, v) => { writeLocalStorage(DISABLE_METADATA_LS_KEY, v ? '0' : '1'); window.location.reload(); }}
           />
         </FieldRow>
       </SettingsSection>
@@ -716,6 +755,9 @@ export function DevToolsTab() {
 
       {/* Asset cache — blob-cache outcomes under the bake stats (plan-508 F7) */}
       <AssetCacheSection version={s?.cacheVersion ?? 0} onClearPersistent={clearLibraryCache} clearing={clearingCache} />
+
+      {/* Features — what the FeatureLoader activated, when, at what cost (plan-652) */}
+      <FeaturesSection />
 
       {/* Load Diagnostics — loader-internal counters, read by other plans; collapsed by default */}
       <SettingsSection id="devtools-load-diagnostics" title="Load Diagnostics" defaultExpanded={false}>

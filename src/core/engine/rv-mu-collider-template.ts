@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
-import { Matrix4, Object3D, Vector3 } from 'three';
+import { Matrix4, Object3D, Quaternion, Vector3 } from 'three';
 import type { PhysicsShape } from './rv-physics-registry';
 
 export interface MUColliderTemplate {
@@ -14,7 +14,9 @@ export function readMUColliderTemplate(root: Object3D): MUColliderTemplate | und
   const rigidbody = root.userData.realvirtual?.Rigidbody;
   if (!rigidbody) return undefined;
   root.updateWorldMatrix(true, true);
-  const inverse = root.matrixWorld.clone().invert();
+  const inverse = new Matrix4().compose(
+    root.getWorldPosition(new Vector3()), root.getWorldQuaternion(new Quaternion()), new Vector3(1, 1, 1),
+  ).invert();
   const shapes: MUColliderTemplate['shapes'] = [];
   root.traverse(node => {
     const box = node.userData.realvirtual?.BoxCollider;

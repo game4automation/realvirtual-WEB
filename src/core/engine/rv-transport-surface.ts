@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { Box3, Object3D, Vector2, Vector3, Quaternion, MathUtils, Matrix4, Mesh, MeshBasicMaterial, PlaneGeometry, Shape, ShapeGeometry, DoubleSide, EdgesGeometry, LineSegments, LineBasicMaterial } from 'three';
+import { Box3, Object3D, Vector2, Vector3, Quaternion, MathUtils, Matrix4, Mesh, MeshBasicMaterial, PlaneGeometry, RingGeometry, Shape, ShapeGeometry, DoubleSide, EdgesGeometry, LineSegments, LineBasicMaterial } from 'three';
 import { debug } from './rv-debug';
 import { MM_TO_METERS } from './rv-constants';
 import type { Texture } from 'three';
@@ -9,12 +9,17 @@ import { AABB } from './rv-aabb';
 import type { PhysicsAABB } from './rv-physics-registry';
 import type { RVDrive } from './rv-drive';
 import type { RVMovingUnit, InstancedMovingUnit } from './rv-mu';
+import type { RollerSpinBinding } from './rv-roller-spin';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
 import { registerComponent, loadSchemaFromSpec } from './rv-component-registry';
 import { traverseMeshes } from './rv-traverse-utils';
 import { cloneScrollableMaps, resetMapOffsets, scrollMaps } from './rv-texture-scroll';
 import type { GizmoOverlayManager } from './rv-gizmo-manager';
 import { subscribeOverlayVisibility, isOverlayVisible } from '../overlay-visibility-store';
+import { buildArcArrowGeometry, gizmoBasis, radialSector, toCanonical, type GizmoBasis, type RadialSector } from './rv-transport-gizmo-geometry';
+
+/** Canonical up of the selection gizmo frame (plan-655 F7). */
+const _gizmoUp = new Vector3(0, 1, 0);
 
 // Pre-allocated temp vectors (no GC in hot path)
 const _movement = new Vector3();
@@ -24,11 +29,9 @@ const _scratchInv = new Matrix4();
 const _quatCarry = new Quaternion();
 // Scratch for the parent-local↔world carry conversion in transportMU.
 const _scratchVecA = new Vector3();
+const _scratchVecB = new Vector3();
 const _scratchQuatA = new Quaternion();
 const _scratchQuatB = new Quaternion();
-// Scratch for the rotation-aware AABB-extent recompute in updateAABB().
-const _aabbQuat = new Quaternion();
-const _aabbRotMat = new Matrix4();
 // Lateral belt-centering: world up + scratch cross axis, and the per-tick lerp
 // fraction pulling MUs toward the belt's center line (see transportMU).
 const WORLD_UP = new Vector3(0, 1, 0);
@@ -126,6 +129,10 @@ export class RVTransportSurface implements RVComponent {
   Accumulate = true;
   /** Minimum front gap in millimetres kept between accumulated MUs. */
   MinGap = 0;
+  /** How far above its top the surface still takes over an MU, in millimetres;
+   *  0 = the transport default (`RVTransportManager.surfaceVerticalReach`). The
+   *  drop detection reads the same value (`RVTransportManager.reachOf`). */
+  VerticalReach = 0;
 
   /** Physics mode (plan-276 Phase 4, F5): when true AND the surface lies FULLY
    *  inside a physics zone, the surface is physics-managed — the provider runs
@@ -198,6 +205,14 @@ export class RVTransportSurface implements RVComponent {
   private _directionTickId = -1;
   /** Rotation axis for radial transport */
   private rotationAxis = new Vector3();
+  /**
+   * plan-675 Phase 3: the animated roller mantles of the placement this surface
+   * belongs to (set by `rv-roller-spin.ts`, ticked with the texture animation,
+   * reset with the surface, disposed when the placement is released).
+   */
+  rollerSpin: RollerSpinBinding | null = null;
+  /** plan-675 D3: cached mid radius of the radial sector in world metres (−1 = not measured yet). */
+  private _radialMidM = -1;
 
   // ── Per-tick world-matrix delta — carries MUs along with a rotating platform.
   /** Snapshot of `node.matrixWorld` at the end of the previous tick. */
@@ -271,7 +286,10 @@ export class RVTransportSurface implements RVComponent {
 
   constructor(node: Object3D, aabb: AABB) {
     this.node = node;
-    this.aabb = aabb;
+    // plan-653: `localCenter` (and `_localHalfExtents`, see init) are NODE-LOCAL,
+    // scale included. On a scaled node (SolidCraft body: −90° X, scale 0.001) the
+    // world footprint must apply that scale; on a unit-scale node nothing changes.
+    this.aabb = aabb.useNodeLocalFrame();
   }
 
   /** Reusable quaternion for world-space direction transform */
@@ -286,12 +304,19 @@ export class RVTransportSurface implements RVComponent {
    *  derivation; safe to re-run after a live edit. */
   private _deriveLocalDirection(): void {
     this.localDirection.copy(this.TransportDirection).normalize();
+    // plan-2016 Phase 3: an export without TransportDirection ((0,0,0) — Unity
+    // computes it only at runtime in TransportSurface.Init as
+    // `transform.InverseTransformDirection(drive.GetGlobalDirection())`) takes the
+    // Drive axis, expressed in this surface's local frame. The ONE place for it:
+    // init and every reapply come through here, the authored zero stays untouched.
+    if (this.localDirection.lengthSq() === 0 && this.drive) this._directionFromDrive(this.drive);
     if (this.localDirection.lengthSq() === 0) this.localDirection.set(1, 0, 0);
   }
 
   /** Re-derive runtime state after an inspector edit re-applied the schema.
    *  IMPLEMENTS RVComponent::reapplyConfig */
   reapplyConfig(): void {
+    this._radialMidM = -1;
     this._deriveLocalDirection();
     this._refreshWorldDirection();
   }
@@ -312,11 +337,7 @@ export class RVTransportSurface implements RVComponent {
     // (or a surface whose AABB was built before its reload rotation was applied)
     // keeps a stale axis-aligned footprint and goods fail to hand off at the seam.
     this.node.updateMatrixWorld(true);
-    const localBox = this._computeLocalAABB();
-    if (localBox) {
-      this._localHalfExtents = localBox.getSize(new Vector3()).multiplyScalar(0.5);
-      localBox.getCenter(this.aabb.localCenter); // keep centre consistent with the local extents
-    }
+    this.refreshContactBox();
 
     // Lateral belt-centering is LIBRARY-ONLY: a placed library object (conveyor,
     // turntable, chain transfer) pulls its MUs onto the centre line; a conveyor
@@ -337,6 +358,15 @@ export class RVTransportSurface implements RVComponent {
     }
     if (!this.drive) {
       console.warn(`  TransportSurface "${this.node.name}": no Drive found - will not transport`);
+    }
+
+    // plan-2016 Phase 3: re-derive now that the Drive is known — an authored
+    // (0,0,0) TransportDirection takes the Drive axis (see _deriveLocalDirection).
+    // Without this the surface fell back to local +X (Unity -X) and carried the
+    // goods sideways (the blow-moulding line inlet Part1/Part3, Drive LinearZ).
+    if (this.drive && this.TransportDirection.lengthSq() === 0) {
+      this._deriveLocalDirection();
+      this._refreshWorldDirection();
     }
 
     // Mark drive as transport surface drive (matches Unity's _istransportsurface flag).
@@ -460,28 +490,65 @@ export class RVTransportSurface implements RVComponent {
     // gizmo reflects only its own belt (collision AABB is untouched).
     const localBox = this._computeGizmoAABB();
     if (!localBox || localBox.isEmpty()) return;
-    const lmin = localBox.min;
-    const lmax = localBox.max;
+
+    // plan-655 F7: "up" comes from the WORLD, not from local +Y. The canonical
+    // frame (u, n, w) has n = the local axis closest to world up; for a Y-up
+    // node it is the identity, so the classic gizmo is unchanged bit for bit.
+    const basis = gizmoBasis(this.node.getWorldQuaternion(new Quaternion()));
+    const cmin = new Vector3(Infinity, Infinity, Infinity);
+    const cmax = new Vector3(-Infinity, -Infinity, -Infinity);
+    {
+      const corner = new Vector3();
+      const c = new Vector3();
+      for (let i = 0; i < 8; i++) {
+        corner.set(
+          i & 1 ? localBox.max.x : localBox.min.x,
+          i & 2 ? localBox.max.y : localBox.min.y,
+          i & 4 ? localBox.max.z : localBox.min.z,
+        );
+        toCanonical(basis, corner, c);
+        cmin.min(c);
+        cmax.max(c);
+      }
+    }
+    const lmin = cmin;
+    const lmax = cmax;
     const cx = (lmin.x + lmax.x) / 2;
     const cz = (lmin.z + lmax.z) / 2;
+    // Canonical point → local position of an overlay child.
+    const local = (x: number, y: number, z: number): Vector3 =>
+      new Vector3(x, y, z).applyQuaternion(basis.quat);
+    const eps = Math.max(lmax.y - lmin.y, 1e-3) * 0.02 + 1e-4;
+    const lineMat = (): LineBasicMaterial => new LineBasicMaterial({
+      color: 0x8ec5ff,         // light blue
+      transparent: true,
+      opacity: 0.6,
+      depthTest: false,
+      depthWrite: false,
+    });
+    const arrowMat = (): MeshBasicMaterial => new MeshBasicMaterial({
+      color: 0x33b5ff,           // bright blue
+      transparent: true,
+      opacity: 0.6,
+      side: DoubleSide,
+      depthTest: false,
+      depthWrite: false,
+    });
+
+    if (this.Radial && this._showRadialGizmo(basis, lmax.y, eps, local, lineMat, arrowMat)) return;
+
     {
       const sx = Math.max(lmax.x - lmin.x, 1e-4);
       const sz = Math.max(lmax.z - lmin.z, 1e-4);
       const planeGeo = new PlaneGeometry(sx, sz);
-      planeGeo.rotateX(-Math.PI / 2); // lie flat in the local XZ plane (normal = +Y)
+      planeGeo.rotateX(-Math.PI / 2); // lie flat in the canonical XZ plane (normal = +Y)
       // Edges only (no filled overlay) — EdgesGeometry of a quad yields just the
       // 4 border segments (the shared diagonal is coplanar and dropped).
       const geo = new EdgesGeometry(planeGeo);
       planeGeo.dispose(); // EdgesGeometry copied the positions; source no longer needed
-      const mat = new LineBasicMaterial({
-        color: 0x8ec5ff,         // light blue
-        transparent: true,
-        opacity: 0.6,
-        depthTest: false,
-        depthWrite: false,
-      });
-      const surf = new LineSegments(geo, mat);
-      surf.position.set(cx, lmax.y, cz);
+      const surf = new LineSegments(geo, lineMat());
+      surf.position.copy(local(cx, lmax.y, cz));
+      surf.quaternion.copy(basis.quat);
       surf.renderOrder = 2001;
       surf.userData._highlightOverlay = true;
       surf.raycast = () => { /* never a click target */ };
@@ -499,10 +566,10 @@ export class RVTransportSurface implements RVComponent {
     if (localDir.lengthSq() === 0) return;
     localDir.normalize();
 
-    // Project onto the local XZ plane (the arrow lies flat). Skip when the
+    // Project onto the canonical top plane (the arrow lies flat). Skip when the
     // transport is (near-)vertical — a flat arrow would be meaningless.
-    const dx = localDir.x;
-    const dz = localDir.z;
+    const dx = localDir.dot(basis.u);
+    const dz = localDir.dot(basis.w);
     const dlen = Math.hypot(dx, dz);
     if (dlen < 1e-4) return;
     const ndx = dx / dlen;
@@ -511,32 +578,117 @@ export class RVTransportSurface implements RVComponent {
     // Fixed 0.5 m arrow in WORLD space. The arrow is parented to `this.node`,
     // so its size is interpreted in node-local units — divide by the node's
     // world scale along the arrow direction so it renders at a true 0.5 m
-    // regardless of any scale baked into the surface (e.g. library placements).
+    // regardless of any scale baked into the surface (library placements, a
+    // SolidCraft body authored in millimetres).
     const ARROW_WORLD_LENGTH = 0.5; // metres
     const ws = new Vector3();
     this.node.getWorldScale(ws);
-    const scaleAlongDir = Math.hypot(ws.x * ndx, ws.z * ndz) || 1;
+    const dirLocal = new Vector3().addScaledVector(basis.u, ndx).addScaledVector(basis.w, ndz);
+    const scaleAlongDir = Math.hypot(ws.x * dirLocal.x, ws.y * dirLocal.y, ws.z * dirLocal.z) || 1;
     const L = ARROW_WORLD_LENGTH / scaleAlongDir;
 
-    const arrow = new Mesh(this._buildArrowGeometry(L), new MeshBasicMaterial({
-      color: 0x33b5ff,           // bright blue
-      transparent: true,
-      opacity: 0.6,
-      side: DoubleSide,
-      depthTest: false,
-      depthWrite: false,
-    }));
-    // Aim local +X along the (XZ-projected) transport direction. A +Y rotation
+    const arrow = new Mesh(this._buildArrowGeometry(L), arrowMat());
+    // Aim canonical +X along the projected transport direction. A +Y rotation
     // by φ maps +X → (cosφ, 0, -sinφ), so φ = atan2(-dz, dx).
-    arrow.rotation.y = Math.atan2(-ndz, ndx);
+    const aim = new Quaternion().setFromAxisAngle(_gizmoUp, Math.atan2(-ndz, ndx));
+    arrow.quaternion.copy(basis.quat).multiply(aim);
     // Sit just above the belt top so it never z-fights with the surface.
-    const eps = Math.max(lmax.y - lmin.y, 1e-3) * 0.02 + 1e-4;
-    arrow.position.set(cx, lmax.y + eps, cz);
+    arrow.position.copy(local(cx, lmax.y + eps, cz));
     arrow.renderOrder = 2002;
     arrow.userData._highlightOverlay = true;
     arrow.raycast = () => { /* never a click target */ };
     this.node.add(arrow);
     this._selArrow = arrow;
+  }
+
+  /**
+   * plan-655 F7 — the RADIAL gizmo: a ring-sector outline around the transport
+   * rotation axis at the node origin (r_min / r_max and the angle range from
+   * the mesh vertices), plus a flat arc arrow in the drawn rotation direction.
+   * A sector covering the whole circle (turntable) becomes a full ring.
+   * Returns false when there is nothing to draw (the box gizmo is used then).
+   */
+  private _showRadialGizmo(
+    basis: GizmoBasis, top: number, eps: number,
+    local: (x: number, y: number, z: number) => Vector3,
+    lineMat: () => LineBasicMaterial, arrowMat: () => MeshBasicMaterial,
+  ): boolean {
+    const pts = this._canonicalVertices(basis);
+    const sector = radialSector(pts);
+    if (!sector || sector.rMax - sector.rMin < 1e-6) return false;
+    const ringGeo = new RingGeometry(sector.rMin, sector.rMax, sector.full ? 64 : Math.max(8, Math.ceil(sector.thetaLength / (Math.PI / 32))), 1, sector.thetaStart, sector.thetaLength);
+    ringGeo.rotateX(-Math.PI / 2);
+    const edges = new EdgesGeometry(ringGeo);
+    ringGeo.dispose();
+    const outline = new LineSegments(edges, lineMat());
+    outline.position.copy(local(0, top, 0));
+    outline.quaternion.copy(basis.quat);
+    outline.renderOrder = 2001;
+    outline.userData._highlightOverlay = true;
+    outline.raycast = () => { /* never a click target */ };
+    this.node.add(outline);
+    this._selTopSurface = outline;
+
+    // Drawn rotation direction: + = increasing canonical angle = counter-
+    // clockwise seen from above. A positive drive speed rotates around the
+    // local transport axis; that axis points along +n or −n.
+    const axisLocal = this.localDirection.lengthSq() > 0 ? this.localDirection : this.TransportDirection;
+    const axisSign = Math.sign(axisLocal.dot(basis.n)) || 1;
+    const drv = this.drive as unknown as { TargetSpeed?: number } | null;
+    const speedSign = Math.sign(this.speed) || Math.sign(drv?.TargetSpeed ?? 0) || 1;
+    const dir = axisSign * speedSign;
+    // Arrow over the middle 60 % of the sector (a 120° arc on a full ring).
+    const span = sector.full ? (2 * Math.PI) / 3 : sector.thetaLength * 0.6;
+    const mid = sector.full ? Math.PI / 2 : sector.thetaStart + sector.thetaLength / 2;
+    const from = mid - (dir * span) / 2;
+    const to = mid + (dir * span) / 2;
+    const rMid = (sector.rMin + sector.rMax) / 2;
+    const width = sector.rMax - sector.rMin;
+    const arrow = new Mesh(
+      buildArcArrowGeometry(rMid, width * 0.09, width * 0.23, from, to),
+      arrowMat(),
+    );
+    arrow.position.copy(local(0, top + eps, 0));
+    arrow.quaternion.copy(basis.quat);
+    arrow.renderOrder = 2002;
+    arrow.userData._highlightOverlay = true;
+    arrow.raycast = () => { /* never a click target */ };
+    this.node.add(arrow);
+    this._selArrow = arrow;
+    return true;
+  }
+
+  /**
+   * Mesh vertices of this surface (same pruning as the gizmo box: no nested
+   * surfaces, no sensors) as canonical (u, w) pairs in the node's local frame.
+   * Sampled to at most ~20 000 vertices so a dense CAD mesh stays cheap.
+   */
+  private _canonicalVertices(basis: GizmoBasis): Array<[number, number]> {
+    const out: Array<[number, number]> = [];
+    const invNode = new Matrix4().copy(this.node.matrixWorld).invert();
+    const m = new Matrix4();
+    const v = new Vector3();
+    const meshes: Mesh[] = [];
+    let total = 0;
+    const visit = (obj: Object3D): void => {
+      if (obj !== this.node && (this._isSensorNode(obj) || this._isNestedSurfaceNode(obj))) return;
+      if ((obj.userData as { _highlightOverlay?: boolean })._highlightOverlay) return;
+      const mesh = obj as Mesh;
+      const pos = mesh.isMesh ? mesh.geometry?.getAttribute('position') : undefined;
+      if (pos) { meshes.push(mesh); total += pos.count; }
+      for (const c of obj.children) visit(c);
+    };
+    visit(this.node);
+    const stride = Math.max(1, Math.ceil(total / 20000));
+    for (const mesh of meshes) {
+      const pos = mesh.geometry.getAttribute('position');
+      m.multiplyMatrices(invNode, mesh.matrixWorld);
+      for (let i = 0; i < pos.count; i += stride) {
+        v.fromBufferAttribute(pos, i).applyMatrix4(m);
+        out.push([v.dot(basis.u), v.dot(basis.w)]);
+      }
+    }
+    return out;
   }
 
   /**
@@ -682,6 +834,47 @@ export class RVTransportSurface implements RVComponent {
     return this._accumulateLocalAABB((o) => this._isSensorNode(o));
   }
 
+  /** NODE-LOCAL contact box of the surface (collision footprint used by the
+   *  transport manager). Default: the surface's own mesh bounds. A subclass whose
+   *  footprint is defined by parameters instead of geometry (plan-2016
+   *  `TransportGuided`, Unity's generated BoxCollider) overrides this. */
+  protected computeContactLocalBox(): Box3 | null {
+    return this._computeLocalAABB();
+  }
+
+  /** (Re)capture the NODE-LOCAL contact half-extents + centre from
+   *  {@link computeContactLocalBox}. Called by init;
+   *  a parameter-defined footprint calls it again after a config change. */
+  protected refreshContactBox(): void {
+    const localBox = this.computeContactLocalBox();
+    if (localBox) {
+      this._localHalfExtents = localBox.getSize(new Vector3()).multiplyScalar(0.5);
+      localBox.getCenter(this.aabb.localCenter); // keep centre consistent with the local extents
+    }
+  }
+
+  /** Write the Drive axis, in this surface's LOCAL frame, into `localDirection`
+   *  (Unity parity for an export without TransportDirection — called only from
+   *  `_deriveLocalDirection`). No-op for an axis-less (Virtual) drive. */
+  private _directionFromDrive(drive: RVDrive): void {
+    const axis = typeof drive.getAxis === 'function' ? drive.getAxis(_scratchVecA) : null;
+    if (!axis || axis.lengthSq() < 1e-12) return;
+    if (drive.node !== this.node) {
+      drive.node.updateWorldMatrix(true, false);
+      this.node.updateWorldMatrix(true, false);
+      axis.applyQuaternion(drive.node.getWorldQuaternion(_scratchQuatA));
+      this.node.getWorldQuaternion(_scratchQuatB).invert();
+      axis.applyQuaternion(_scratchQuatB);
+    }
+    axis.normalize();
+    this.localDirection.copy(axis);
+    // Texture scrolling reads the Unity-coordinate axis (glTF X negated back).
+    this.rawLocalDir = { x: -axis.x, y: axis.y, z: axis.z };
+    this._uvDirX = -axis.x;
+    this._uvDirY = axis.y;
+    this._uvDirZ = axis.z;
+  }
+
   /**
    * Build a transient horizontal drop-target plane at the TOP of this surface's
    * AABB, in WORLD space. Used by the planner's drop-to-surface so objects can
@@ -742,6 +935,7 @@ export class RVTransportSurface implements RVComponent {
    */
   reset(): void {
     resetMapOffsets(this._texMaps);
+    this.rollerSpin?.reset();
     this._radialOffsetX = 0;
     this._lastMatrixCaptured = false;
     this._hasTransformDelta = false;
@@ -872,6 +1066,7 @@ export class RVTransportSurface implements RVComponent {
         const n = this.accumulationProvider.queryLeadingMU(mu, _accumDir, lookahead, _accumCandidates);
 
         let minFrontGap = Infinity;
+        let leadingId: number | null = null;
         for (let i = 0; i < n; i++) {
           const ca = _accumCandidates[i].aabb;
           const dx = ca.center.x - muA.center.x;
@@ -892,17 +1087,22 @@ export class RVTransportSurface implements RVComponent {
           // only NEW penetration is prevented; the pair frees itself by driving
           // apart (F5b, no permanent deadlock, no push-back).
           if (frontGap < 0) continue;
-          if (frontGap < minFrontGap) minFrontGap = frontGap;
+          if (frontGap < minFrontGap) {
+            minFrontGap = frontGap;
+            leadingId = _accumCandidates[i].id;
+          }
         }
 
         if (minFrontGap !== Infinity) {
           const allowed = Math.max(0, minFrontGap - minGapM - ACCUM_CONTACT_EPS);
           mu.blocked = allowed < moveDist;
+          mu.blockedBy = mu.blocked ? leadingId : null;
           if (mu.blocked) moveDist = allowed;
         }
         const stopperDistance = this.accumulationProvider.clampStopperTravel?.(mu, _accumDir, moveDist) ?? moveDist;
         if (stopperDistance < moveDist) {
           mu.blocked = true;
+          mu.blockedBy = null;
           moveDist = stopperDistance;
         }
       }
@@ -1029,20 +1229,100 @@ export class RVTransportSurface implements RVComponent {
     // Speed is in degrees/s for rotational drives
     const angleDeg = this.speed * dt;
     const angleRad = MathUtils.degToRad(angleDeg);
+    if (angleRad === 0) return;
+
+    // plan-675 D3: the axis is the CURRENT world transport axis (refreshed once
+    // per tick by `transportMU`), not the copy taken at init — a placement that
+    // is moved after init keeps rotating about its own axis.
+    this.rotationAxis.copy(this.direction);
 
     // Get surface center in world space
     const surfacePos = this.node.getWorldPosition(_offset);
 
-    // Offset from surface center to MU
-    _movement.copy(mu.getPosition()).sub(surfacePos);
-    // Rotate offset around axis
-    _movement.applyAxisAngle(this.rotationAxis, angleRad);
-    // Apply new position
-    _offset.copy(surfacePos).add(_movement);
-    mu.setPosition(_offset);
+    // plan-675 D3: the pivot and the axis are WORLD quantities, while a clone
+    // MU's position/quaternion are PARENT-local (a pre-placed MU or one below a
+    // transformed node). Do the step in world space and convert back — the
+    // same frame handling as the linear carry above. Instanced MUs and
+    // scene-root clones are already in world space.
+    const muNode: Object3D | null = (mu as RVMovingUnit).node ?? null;
+    const muParent: Object3D | null = (muNode && !(mu as { isInstanced?: boolean }).isInstanced)
+      ? muNode.parent
+      : null;
+    _scratchVecA.copy(mu.getPosition());
+    if (muParent) muParent.localToWorld(_scratchVecA);
 
-    // Also rotate the MU itself
-    mu.rotateOnAxis(this.rotationAxis, angleRad);
+    // Offset from surface center to MU, rotated around the axis.
+    _movement.copy(_scratchVecA).sub(surfacePos).applyAxisAngle(this.rotationAxis, angleRad);
+
+    // plan-675 D3: a placed LIBRARY curve (a sector, never a full turntable)
+    // eases its MUs onto the mid radius of its sector, as a placed linear belt
+    // eases them onto its centre line. A
+    // pivot that is off by a millimetre (a snap port authored 1 mm outside the
+    // end plane leaves a 2 mm gap per seam) would otherwise turn the four
+    // rotations of a ring into a net translation per lap — the MU walks off.
+    if (this._belongsToLibraryObject) {
+      const rMid = this._radialMidWorld();
+      if (rMid > 0) {
+        const along = _movement.dot(this.rotationAxis);
+        _scratchVecB.copy(this.rotationAxis).multiplyScalar(along);
+        _movement.sub(_scratchVecB); // radial part
+        const r = _movement.length();
+        if (r > 1e-6) _movement.multiplyScalar(1 + ((rMid - r) / r) * CENTER_MU_LERP);
+        _movement.add(_scratchVecB);
+      }
+    }
+
+    _scratchVecA.copy(surfacePos).add(_movement);
+    if (muParent) muParent.worldToLocal(_scratchVecA);
+    mu.setPosition(_scratchVecA);
+
+    // Rotate the MU itself about the WORLD axis: newWorld = qAxis · world, i.e.
+    // newLocal = parentWorld⁻¹ · qAxis · parentWorld · local.
+    if (typeof mu.getQuaternion !== 'function') {
+      // Minimal MU stand-ins (tests, planner mocks) only rotate.
+      mu.rotateOnAxis(this.rotationAxis, angleRad);
+      return;
+    }
+    _quatCarry.setFromAxisAngle(this.rotationAxis, angleRad);
+    if (muParent) {
+      muParent.getWorldQuaternion(_scratchQuatA);
+      _scratchQuatB.copy(_scratchQuatA).invert().multiply(_quatCarry).multiply(_scratchQuatA).multiply(mu.getQuaternion());
+    } else {
+      _scratchQuatB.copy(_quatCarry).multiply(mu.getQuaternion());
+    }
+    mu.setQuaternion(_scratchQuatB);
+  }
+
+  /** Mid radius of this radial surface's sector in WORLD metres (0 when the
+   *  sector cannot be derived). Measured once from the surface's own mesh
+   *  vertices (same pruning as the gizmo) and cached; see {@link getRadialSector}. */
+  private _radialMidWorld(): number {
+    if (this._radialMidM < 0) {
+      const s = this.getRadialSector();
+      // A CURVE only: a turntable (full ring / disc) carries goods at any radius
+      // and must never pull them anywhere.
+      this._radialMidM = s && !s.full ? (s.rMin + s.rMax) / 2 : 0;
+    }
+    return this._radialMidM;
+  }
+
+  /**
+   * Sector of a radial surface in WORLD metres around its pivot (the node
+   * origin): radii and the angle range in the canonical frame of
+   * `rv-transport-gizmo-geometry` (`canonicalAngle`). Null for a linear
+   * surface or one without mesh vertices. Not cached — callers cache.
+   */
+  getRadialSector(): (RadialSector & { basis: GizmoBasis; worldScale: number }) | null {
+    if (!this.Radial) return null;
+    this.node.updateWorldMatrix(true, false);
+    const basis = gizmoBasis(this.node.getWorldQuaternion(new Quaternion()));
+    const sector = radialSector(this._canonicalVertices(basis));
+    if (!sector) return null;
+    // Local radii → world: the node's scale within the canonical plane (a
+    // SolidCraft body carries a uniform 0.001).
+    const ws = this.node.getWorldScale(new Vector3());
+    const worldScale = (Math.abs(ws.dot(basis.u)) + Math.abs(ws.dot(basis.w))) / 2 || 1;
+    return { ...sector, rMin: sector.rMin * worldScale, rMax: sector.rMax * worldScale, basis, worldScale };
   }
 
   /**
@@ -1050,6 +1330,8 @@ export class RVTransportSurface implements RVComponent {
    * Mirrors Unity's TransportSurface.UpdateTextureAnimation().
    */
   updateTextureAnimation(dt: number): void {
+    // plan-675: the animated roller mantles of this surface's placement.
+    if (this.rollerSpin && this.drive) this.rollerSpin.tick(dt);
     if (this._texMaps.length === 0 || !this.drive || this.speed === 0) return;
 
     if (this.Radial) {
@@ -1070,15 +1352,9 @@ export class RVTransportSurface implements RVComponent {
    *  neighbour works. */
   updateAABB(): void {
     const h = this._localHalfExtents;
-    if (h) {
-      this.node.getWorldQuaternion(_aabbQuat);
-      const e = _aabbRotMat.makeRotationFromQuaternion(_aabbQuat).elements;
-      this.aabb.halfSize.set(
-        Math.abs(e[0]) * h.x + Math.abs(e[4]) * h.y + Math.abs(e[8]) * h.z,
-        Math.abs(e[1]) * h.x + Math.abs(e[5]) * h.y + Math.abs(e[9]) * h.z,
-        Math.abs(e[2]) * h.x + Math.abs(e[6]) * h.y + Math.abs(e[10]) * h.z,
-      );
-    }
+    // plan-653: |M_ij| of the node's world 3×3 INCLUDING scale (mm-scaled
+    // SolidCraft body); on a rigid node the same rotation-only formula as before.
+    if (h) this.aabb.setHalfSizeFromNodeExtents(h);
     this.aabb.update();
   }
 

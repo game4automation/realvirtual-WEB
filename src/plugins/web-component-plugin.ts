@@ -34,6 +34,7 @@
  *    workstream). Monaco loads lazily on first panel open.
  */
 
+import { getScriptStatsCollector } from '../core/stats/script-stats-collector';
 import { Code } from '@mui/icons-material';
 import type { Object3D } from 'three';
 import type { RVViewerPlugin } from '../core/rv-plugin';
@@ -50,12 +51,17 @@ import { RVJavaScriptStep } from '../core/engine/rv-logic-step';
 import { createSceneScriptAccess } from '../core/sdk/rv-sdk-scene';
 import { createSignalWriter, type SignalStore } from '../core/engine/rv-signal-store';
 import { RVScriptHost } from '../core/engine/rv-script-host';
+import { bundledDemoScriptTrust } from '../core/engine/rv-script-trust';
+import { ownExtrasOf, ownValue } from '../core/engine/rv-safe-keys';
 import {
+  DES_SCRIPTS_UNAVAILABLE_CODE,
   RVWebComponentRegistry,
   computeWebComponentNodePath,
   countWebComponents,
   parseWebComponent,
   wireWebComponents,
+  type WebComponentDesBinding,
+  type WebComponentDesSinkRef,
   type WebComponentEnvFactory,
   type WebComponentInstance,
 } from '../core/engine/rv-web-component-registry';
@@ -78,16 +84,30 @@ import { WEB_COMPONENT_TYPE } from '../core/hmi/scene/rv-scene-edits';
 import { ScriptEditorPanel } from '../core/hmi/script/ScriptEditorPanel';
 import { ScriptToolbarButton } from '../core/hmi/script/ScriptToolbarButton';
 import { openScriptEditor, resetScriptEditorStore } from '../core/hmi/script/script-editor-store';
+import { clearProblem, clearProblemsOfCode, reportProblem } from '../core/hmi/problems-store';
+
+/** plan-2212 Phase 2: a script's `self.sink(path)` names no sink of the DES run. */
+export const DES_SCRIPT_SINK_UNRESOLVED_CODE = 'des-script-sink-unresolved';
+/** plan-2212 Phase 2: a script subscribes / unsubscribes a DES sink outside setup(). */
+export const DES_SCRIPT_SINK_RUNTIME_CODE = 'des-script-sink-runtime';
 
 export interface WebComponentPluginOptions {
   /** Trust gate (§10): create + run script instances. Default: false. */
   allowScripts?: boolean;
   /** Per host→VM call deadline in ms (default: script-host default, 5 ms). */
   callDeadlineMs?: number;
+  /** QuickJS host factory (default: `RVScriptHost.create`). Tests inject a cold / failing host here. */
+  createHost?: () => Promise<RVScriptHost>;
 }
 
 /** Guard: the component-action registry accumulates — register once per session. */
 let actionRegistered = false;
+
+/** Node-address source of DES ids: a headless host's `desAddresses`, else the viewer's NodeRegistry. */
+function desAddressSource(viewer: RVViewer): { getAddressForNode(node: Object3D): string | null } | null {
+  const host = viewer as unknown as { desAddresses?: { getAddressForNode(node: Object3D): string | null } | null };
+  return host.desAddresses ?? viewer.registry ?? null;
+}
 
 /** Register the SDK-visible script error output with an explicit PLC type. */
 export function ensureWebComponentErrorSignal(
@@ -100,6 +120,15 @@ export function ensureWebComponentErrorSignal(
     signals.register(errorSignal, `${nodePath}/Error`, false, 'PLCInputBool');
   }
   return errorSignal;
+}
+
+/** True when `node` sits inside a placement (planner placement or nested reference content) below `root`. */
+function isInPlacedContent(node: Object3D, root: Object3D): boolean {
+  for (let cur: Object3D | null = node; cur && cur !== root; cur = cur.parent) {
+    const ud = cur.userData as { _layoutId?: unknown; _layoutNestedOf?: unknown } | undefined;
+    if (typeof ud?._layoutId === 'string' || typeof ud?._layoutNestedOf === 'string') return true;
+  }
+  return false;
 }
 
 export class WebComponentPlugin implements RVViewerPlugin {
@@ -128,10 +157,20 @@ export class WebComponentPlugin implements RVViewerPlugin {
   private lastLoad: { result: LoadResult; viewer: RVViewer } | null = null;
   /** Wiring in flight (`wire` / `wirePlaced`) — what {@link whenWired} joins on. */
   private readonly pendingWires = new Set<Promise<void>>();
+  private readonly createHost: () => Promise<RVScriptHost>;
+  /**
+   * Active DES binding (plan-2212), applied to the current registry AND to a
+   * registry created later (QuickJS loaded after the run started, trust
+   * release) — every instance minted while it is set runs on the DES clock.
+   */
+  private desBinding: WebComponentDesBinding | null = null;
+  /** Why the last wiring could not create script instances (QuickJS load failure); null when fine. */
+  private lastWireError: string | null = null;
 
   constructor(opts: WebComponentPluginOptions = {}) {
     this.allowScripts = opts.allowScripts === true;
     this.callDeadlineMs = opts.callDeadlineMs;
+    this.createHost = opts.createHost ?? (() => RVScriptHost.create());
     // The Monaco script editor is authoring — gone in the Viewer (plan-387 F4).
     // Gated per-entry rather than with a `modes` declaration on the plugin, for
     // two independent reasons:
@@ -162,7 +201,10 @@ export class WebComponentPlugin implements RVViewerPlugin {
     this.viewer = viewer;
     this.unsubs.push(
       viewer.on('simulation-reset', () => {
-        this.registry?.resetAll();
+        // plan-2212: DES-bound instances are rebuilt by the DES runner's reset
+        // (fresh VM, run seed) — an `onReset` here would run on the outgoing
+        // VM BEFORE the run is archived and schedule onto the old queue.
+        if (!this.registry?.desBound) this.registry?.resetAll();
         // Flow-ledger reset coupling (plan-259 §5.2): a restarted sim must not
         // see ghost MUs parked in a script component's ledger. The engine-side
         // holds/reply handles are reset by the ConnectionSystemPlugin.
@@ -187,6 +229,10 @@ export class WebComponentPlugin implements RVViewerPlugin {
   // ── Lifecycle ──────────────────────────────────────────────────────────
 
   onModelLoaded(result: LoadResult, viewer: RVViewer): void {
+    // plan-2212: a refusal of the previous document's DES run is not this one's.
+    clearProblem(DES_SCRIPTS_UNAVAILABLE_CODE);
+    clearProblemsOfCode(DES_SCRIPT_SINK_UNRESOLVED_CODE);
+    clearProblemsOfCode(DES_SCRIPT_SINK_RUNTIME_CODE);
     this.lastLoad = { result, viewer };
     this.track(this.wire(result, viewer));
   }
@@ -194,6 +240,11 @@ export class WebComponentPlugin implements RVViewerPlugin {
   onModelCleared(): void {
     this.wireToken++;               // cancels an in-flight async wire
     this.lastLoad = null;
+    this.lastWireError = null;
+    // plan-2212: the DES run's "scripts unavailable" belongs to the document that goes.
+    clearProblem(DES_SCRIPTS_UNAVAILABLE_CODE);
+    clearProblemsOfCode(DES_SCRIPT_SINK_UNRESOLVED_CODE);
+    clearProblemsOfCode(DES_SCRIPT_SINK_RUNTIME_CODE);
     this.registry?.dispose();
     this.registry = null;
     resetScriptEditorStore();
@@ -264,12 +315,48 @@ export class WebComponentPlugin implements RVViewerPlugin {
     this.pendingWires.add(settled);
   }
 
+  // ── DES binding (plan-2212) — called structurally by the DES runner ─────
+
+  /**
+   * Bind every script component to the DES run: each instance is rebuilt on
+   * the DES event clock with its run seed fixed before `setup()`. The binding
+   * stays active until {@link unbindDes}, so instances created later (a cold
+   * QuickJS host, a placement, a trust release, an editor reload) are built
+   * the same way. Called again for every replication.
+   */
+  bindDes(binding: WebComponentDesBinding): void {
+    this.desBinding = binding;
+    this.registry?.bindDes(binding);
+  }
+
+  /** Back to the frame clock: every instance is rebuilt continuous (fresh state). */
+  unbindDes(): void {
+    if (!this.desBinding) return;
+    this.desBinding = null;
+    this.registry?.unbindDes();
+  }
+
+  /** True while a DES binding is active. */
+  get desBound(): boolean {
+    return this.desBinding !== null;
+  }
+
+  /** True while a wiring is in flight — the scripts of the current scene do not all exist yet. */
+  get wiringPending(): boolean {
+    return this.pendingWires.size > 0;
+  }
+
+  /** Why the last wiring created no script instances (QuickJS load failure), else null. */
+  wiringError(): string | null {
+    return this.lastWireError;
+  }
+
   /**
    * Live script components + kernel adapters for the DES snapshot pipeline
    * (plan-261 B4). Resolved by the (private) DES runner via
    * `host.getPlugin('web-component')` — structural, public types only.
    */
-  listScriptComponents(): Array<{ path: string; adapter: import('../core/sdk/rv-script-component-adapter').RVScriptComponentAdapter }> {
+  listScriptComponents(): ReturnType<RVWebComponentRegistry['listScriptComponents']> {
     return this.registry?.listScriptComponents() ?? [];
   }
 
@@ -310,8 +397,7 @@ export class WebComponentPlugin implements RVViewerPlugin {
       console.warn(`[web-component] reloadOrCreate('${nodePath}'): node not found in the loaded scene`);
       return false;
     }
-    const raw = ((node as { userData?: Record<string, unknown> }).userData?.realvirtual as
-      Record<string, unknown> | undefined)?.[WEB_COMPONENT_TYPE];
+    const raw = ownValue(ownExtrasOf((node as { userData?: unknown }).userData), WEB_COMPONENT_TYPE);
     const meta = parseWebComponent(raw) ?? parseWebComponent({})!;
     registry.create(nodePath, node, { ...meta, code: jsCode });
     viewer.emit('component-reloaded', { nodePath });
@@ -326,15 +412,26 @@ export class WebComponentPlugin implements RVViewerPlugin {
 
     const found = countWebComponents(result.root);
     if (found === 0) return;
-    if (!this.allowScripts) {
-      console.info(`[web-component] ${found} script component(s) in this model — execution disabled (trust gate, plan-210 §10). Enable via setAllowScripts(true) or ?scripts.`);
+    // The one exception to the gate (rv-script-trust.ts): a document of the
+    // bundled demo project, read unmodified from this origin's deploy. It opens
+    // THIS document only — placed content (references) keeps the gate, and the
+    // session-wide `allowScripts` is not touched.
+    const trust = this.allowScripts ? null : bundledDemoScriptTrust(viewer.currentModelSource ?? null);
+    if (!this.allowScripts && !trust?.trusted) {
+      console.info(`[web-component] ${found} script component(s) in this model — execution disabled (trust gate, plan-210 §10; ${trust?.reason ?? 'not trusted'}). Enable via setAllowScripts(true) or ?scripts.`);
       return;
+    }
+    if (trust?.trusted) {
+      console.info(`[web-component] ${found} script component(s) in this model — execution enabled: ${trust.reason} (trust gate, plan-210 §10).`);
     }
 
     const registry = await this.ensureRegistry(result, viewer);
     if (!registry) return;
 
-    const wired = wireWebComponents(result.root, registry, { allowScripts: true });
+    const wired = wireWebComponents(result.root, registry, {
+      allowScripts: true,
+      ...(trust?.trusted ? { include: (node: Object3D) => !isInPlacedContent(node, result.root) } : {}),
+    });
     if (wired.malformed > 0) {
       console.warn(`[web-component] ${wired.malformed} WebComponent entr${wired.malformed === 1 ? 'y' : 'ies'} failed the defensive parse and were skipped`);
     }
@@ -391,12 +488,20 @@ export class WebComponentPlugin implements RVViewerPlugin {
       host = await this.ensureHost();
     } catch (err) {
       console.warn('[web-component] QuickJS host failed to load — script components stay inactive:', err);
+      this.lastWireError = `QuickJS script host failed to load: ${err instanceof Error ? err.message : String(err)}`;
       return null;
     }
+    this.lastWireError = null;
+    // plan-2212: the host is there - an earlier "scripts unavailable" refusal is resolved.
+    clearProblem(DES_SCRIPTS_UNAVAILABLE_CODE);
     if (token !== this.wireToken) return null;   // superseded by newer load/clear
     if (this.registry) return this.registry;     // a concurrent caller won
 
     const registry = new RVWebComponentRegistry({
+      // plan-2212 Phase 3: the SAME address source the DES runner keys components
+      // by (`desAddresses ?? registry`), so a script's desId and the snapshot's
+      // component ids come from one registration.
+      getAddressForNode: (node) => desAddressSource(viewer)?.getAddressForNode(node) ?? null,
       host,
       buildEnv: this.makeEnvFactory(result, viewer),
       callDeadlineMs: this.callDeadlineMs,
@@ -405,6 +510,7 @@ export class WebComponentPlugin implements RVViewerPlugin {
         console.warn(`[web-component:${nodePath}] disabled: ${reason}`),
     });
     this.registry = registry;
+    if (this.desBinding) registry.bindDes(this.desBinding);
     return registry;
   }
 
@@ -426,9 +532,12 @@ export class WebComponentPlugin implements RVViewerPlugin {
 
   private ensureHost(): Promise<RVScriptHost> {
     if (this.host) return Promise.resolve(this.host);
-    this.hostPromise ??= RVScriptHost.create().then((host) => {
+    this.hostPromise ??= this.createHost().then((host) => {
       this.host = host;
       return host;
+    }, (err: unknown) => {
+      this.hostPromise = null;   // a later wiring may retry
+      throw err;
     });
     return this.hostPromise;
   }
@@ -491,7 +600,7 @@ export class WebComponentPlugin implements RVViewerPlugin {
       };
     };
 
-    return ({ nodePath, nodeName, node, props, scheduler, addTeardown }) => {
+    return ({ nodePath, nodeName, node, props, scheduler, addTeardown, des, phase }) => {
       const sourceTarget = (p: string) => {
         const s = registry.getByPath<RVSource>('Source', p);
         return s ? {
@@ -510,9 +619,72 @@ export class WebComponentPlugin implements RVViewerPlugin {
           },
         } : null;
       };
+      type SinkCb = (mu: { id: number; prop: Record<string, never> }) => void;
+      // plan-2212 Phase 2: in DES the arrivals happen at the DES sink (material-flow
+      // adapter), not at the frame-clock RVSink. The listener is ordered by THIS
+      // script's node path among all scripts on that sink.
+      //  - Subscriptions are DECLARED in setup(): a DES snapshot does not carry
+      //    them (the VM's setup() re-creates them), so `.on()` or an unsubscribe
+      //    while the run is going is refused visibly (problem + error).
+      //  - Every subscription is also released by the instance teardown (unbindDes,
+      //    each replication rebuild, rebindScene, a single reload) - no leak, even
+      //    when the guest dropped its token.
+      //  - A sink the run does not have is a visible problem, never a silent
+      //    fall-back to the frame-clock sink (whose KPIs would stay at zero).
+      const desSinks = des?.sinks ?? null;
+      const sinkProblemId = (kind: 'unresolved' | 'runtime') => `${kind === 'unresolved'
+        ? DES_SCRIPT_SINK_UNRESOLVED_CODE : DES_SCRIPT_SINK_RUNTIME_CODE}:${nodePath}`;
+      if (desSinks) {
+        addTeardown(() => {
+          clearProblem(sinkProblemId('unresolved'));
+          clearProblem(sinkProblemId('runtime'));
+        });
+      }
+      const refuseRuntime = (what: string, sinkPath: string): void => {
+        reportProblem({
+          id: sinkProblemId('runtime'), code: DES_SCRIPT_SINK_RUNTIME_CODE, severity: 'warning',
+          title: 'Script changes a sink subscription during a DES run',
+          detail: `Script ${nodePath}: ${what} on sink '${sinkPath}' while the DES run is going. In DES, `
+            + 'self.sink(...).on() and its unsubscribe belong in setup() - a snapshot restores them from there. '
+            + 'Subscribe in setup() and filter inside the callback instead.',
+          nodePath,
+        });
+      };
+      const desSinkTarget = (ref: WebComponentDesSinkRef, sinkPath: string) => ({
+        node: ref.node,
+        subscribe: (cb: SinkCb) => {
+          if (phase && phase() !== 'setup') {
+            refuseRuntime('subscribe (.on)', sinkPath);
+            throw new Error(`des-sink-subscribe-outside-setup: ${nodePath} -> ${sinkPath}`);
+          }
+          const release = ref.subscribe(mu => cb({ id: mu.id, prop: {} }), nodePath);
+          addTeardown(release);
+          return () => {
+            if (phase && phase() === 'running') {
+              refuseRuntime('unsubscribe', sinkPath);
+              throw Object.assign(new Error(`des-sink-unsubscribe-outside-setup: ${nodePath} -> ${sinkPath}`), { refused: true });
+            }
+            release();
+          };
+        },
+      });
       const sinkTarget = (p: string) => {
         const s = registry.getByPath<RVSink>('Sink', p);
-        return s ? { node: s.node, subscribe: (cb: (mu: { id: number; prop: Record<string, never> }) => void) =>
+        if (desSinks) {
+          let at: Object3D | null = s?.node ?? null;
+          if (!at) { try { at = registry.getNode(p); } catch { at = null; } }
+          const ref = desSinks.find(p, at);
+          if (ref) return desSinkTarget(ref, p);
+          reportProblem({
+            id: sinkProblemId('unresolved'), code: DES_SCRIPT_SINK_UNRESOLVED_CODE, severity: 'warning',
+            title: 'Script sink not found in the DES run',
+            detail: `Script ${nodePath} listens to sink '${p}', but the DES run has no sink there - `
+              + 'its sink callbacks never fire and KPIs built on them stay at zero. Check the path.',
+            nodePath,
+          });
+          return null;
+        }
+        return s ? { node: s.node, subscribe: (cb: SinkCb) =>
           s.subscribeConsumed(mu => cb({ id: mu.id, prop: {} })) } : null;
       };
       const gripTarget = (p: string) => {
@@ -586,7 +758,10 @@ export class WebComponentPlugin implements RVViewerPlugin {
       const mgr = viewer.statisticsManager;
       let stats: { output(n: number): void; cycleStart(): void; cycleEnd(): void; state(name: string): void } | undefined;
       if (mgr) {
-        const s = new StateStatistics(() => viewer.simTime ?? 0);
+        // plan-2212 review #4: the instance's OWN clock (frame clock continuous,
+        // DES event clock when DES-bound). `viewer.simTime` still belongs to the
+        // outgoing mode while a mode switch rebuilds the scripts (negative durations).
+        const s = new StateStatistics(() => scheduler.now);
         mgr.register(nodePath, s);
         addTeardown(() => mgr.unregister(nodePath));
         stats = {
@@ -619,7 +794,9 @@ export class WebComponentPlugin implements RVViewerPlugin {
         },
         componentsAll: {
           source: () => registry.getAll('Source').map(e => sourceTarget(e.path)!),
-          sink: () => registry.getAll('Sink').map(e => sinkTarget(e.path)!),
+          sink: () => desSinks
+            ? desSinks.all().map(ref => desSinkTarget(ref, ref.node.name))
+            : registry.getAll('Sink').map(e => sinkTarget(e.path)!),
           grip: () => registry.getAll('Grip').map(e => gripTarget(e.path)!),
           logicStep: () => [...(viewer.logicEngine?.stepByPath.keys() ?? [])].map(p => logicTarget(p)!),
           drive: () => registry.getAll<RVDrive>('Drive').map((e) => e.instance),
@@ -653,6 +830,7 @@ export class WebComponentPlugin implements RVViewerPlugin {
           },
         },
         stats,
+        statRows: getScriptStatsCollector(viewer.stats).forOwner(nodePath),
         occupied: (n) => isSurfaceOccupied(viewer, n),
         signals: {
           get: (n) => signals.get(n),

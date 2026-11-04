@@ -21,6 +21,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll, vi } from 'vitest';
+import { loadRapier } from '@rv-private/physics/rapier-lib-loader';
 import { Box3, Object3D, Scene, Vector3 } from 'three';
 import { AABB } from '../src/core/engine/rv-aabb';
 import { RVTransportManager } from '../src/core/engine/rv-transport-manager';
@@ -516,27 +517,16 @@ interface T7Rapier {
   ColliderDesc: { cuboid(hx: number, hy: number, hz: number): T7ColliderDesc };
 }
 
-/** Out-of-band import seam — URL path, resolved by the vitest browser server. */
-const RAPIER_MJS_URL = '/node_modules/@dimforge/rapier3d-compat/rapier.mjs';
-
 let RAPIER: T7Rapier | null = null;
 
 beforeAll(async () => {
-  try {
-    const mod = (await import(/* @vite-ignore */ RAPIER_MJS_URL)) as T7Rapier;
-    await mod.init();
-    RAPIER = mod;
-  } catch {
-    RAPIER = null; // package not installed (out-of-band) — test skips gracefully
-  }
+  // NO graceful skip: an unloadable Rapier is a hard failure (shared loader = the vite alias).
+  RAPIER = (await loadRapier()) as unknown as T7Rapier;
 }, 30000);
 
 describe('T7 real Rapier: MU rests on the synthetic floor plate', () => {
   it('body dropped over the plate rests on its top face, never falls through, gains no lateral velocity', () => {
-    if (!RAPIER) {
-      console.warn('[plan-428 T7] @dimforge/rapier3d-compat not installed (out-of-band) — skipping');
-      return;
-    }
+    if (!RAPIER) throw new Error('[plan-428 T7] @dimforge/rapier3d-compat did not load (beforeAll)');
     const world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
     world.timestep = PHYSICS_FIXED_DT;
     try {

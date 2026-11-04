@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage } from '../rv-safe-storage';
+
 /** Shared layout constants — kept dependency-free to avoid circular imports. */
 
 /** Height of the bottom bar area (search + padding) for layout calculations. */
@@ -117,7 +119,7 @@ export const LS_KEY_MATERIALS_PANEL_WIDTH = 'rv-materials-panel-width';
 
 export function getStoredMaterialsPanelWidth(): number {
   try {
-    const raw = localStorage.getItem(LS_KEY_MATERIALS_PANEL_WIDTH);
+    const raw = readLocalStorage(LS_KEY_MATERIALS_PANEL_WIDTH);
     if (raw) {
       const n = Number(raw);
       if (Number.isFinite(n)) {
@@ -133,7 +135,7 @@ export function getStoredMaterialsPanelWidth(): number {
  *  toolbar toggle so the viewport shift always matches the rendered width. */
 export function getStoredKinematicsPanelWidth(): number {
   try {
-    const raw = localStorage.getItem(LS_KEY_KINEMATICS_PANEL_WIDTH);
+    const raw = readLocalStorage(LS_KEY_KINEMATICS_PANEL_WIDTH);
     if (raw != null) {
       const n = Number(raw);
       if (!Number.isNaN(n))
@@ -159,7 +161,7 @@ export const LS_KEY_KINEMATICS_LIST_HEIGHT = 'rv-kinematics-list-height';
  *  (clamped to the bounds) or the default. */
 export function getStoredKinematicsListHeight(): number {
   try {
-    const raw = localStorage.getItem(LS_KEY_KINEMATICS_LIST_HEIGHT);
+    const raw = readLocalStorage(LS_KEY_KINEMATICS_LIST_HEIGHT);
     if (raw != null) {
       const n = Number(raw);
       if (Number.isFinite(n))
@@ -185,7 +187,7 @@ export const LS_KEY_GROUPS_LIST_HEIGHT = 'rv-groups-list-height';
  *  to the bounds) or the default. */
 export function getStoredGroupsListHeight(): number {
   try {
-    const raw = localStorage.getItem(LS_KEY_GROUPS_LIST_HEIGHT);
+    const raw = readLocalStorage(LS_KEY_GROUPS_LIST_HEIGHT);
     if (raw != null) {
       const n = Number(raw);
       if (Number.isFinite(n))
@@ -212,7 +214,7 @@ export const LS_KEY_CONNECT_PANEL_WIDTH = 'rv-connect-panel-width';
  */
 export function getStoredConnectPanelWidth(): number {
   try {
-    const raw = localStorage.getItem(LS_KEY_CONNECT_PANEL_WIDTH);
+    const raw = readLocalStorage(LS_KEY_CONNECT_PANEL_WIDTH);
     if (raw != null) {
       const n = Number(raw);
       if (!Number.isNaN(n))

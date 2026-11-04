@@ -61,8 +61,9 @@ interface SnapHostShape {
 /**
  * Build the `SdkEnvironment.ports` backend: every call re-resolves the
  * current snap-graph (the graph mutates as assets are placed — same laziness
- * as `MaterialFlowSelf.ports`). Returns `[]` when the snap-point plugin is
- * unavailable (headless / minimal hosts).
+ * as `MaterialFlowSelf.ports`). The registry is the connection core's
+ * `getConnectionRegistry(host)` (via the snap-graph helpers): the snap-point
+ * plugin's, else a headless one a DES binding attached; `[]` when neither.
  */
 export function createSnapGraphPortsBackend(opts: SnapGraphPortsOptions): () => SdkPortTarget[] {
   const host = opts.viewer as SnapHostShape;

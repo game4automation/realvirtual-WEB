@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 
+import { bumpModelEditEpoch } from './rv-model-edit-epoch';
 /**
  * rv-placement-instancer.ts — THE primitive that turns a placed reference
  * (asset key + transform + overrides + id/label) into an instance in the scene
@@ -43,11 +44,12 @@
  * record's `_layoutId` ({@link recordRootOf}).
  */
 
+import { addPatchTypes, collectComponentTypes } from './rv-component-types';
 import { Group } from 'three';
 import type { Object3D } from 'three';
 import type { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { ModelCache, resolvedCacheKey, type BakeStats, type ModelCacheUberOptions } from './rv-model-cache';
-import type { BakeRegistry, PlacementInstance } from './rv-bake-registry';
+import type { BakeRegistry, InstanceOverrideLayer, PlacementInstance } from './rv-bake-registry';
 import { RV_BAKE_CHUNK_KEY } from './rv-bake-registry';
 import type { BakedAsset } from './rv-bake-chunk';
 import type { SignatureState } from '../persistence/rv-sig-verify';
@@ -63,9 +65,18 @@ import {
   getPlacementMeta,
   isUnresolvedReferenceNode,
   markDeferredPlacement,
+  RV_AUTHORED_LAYOUT_OBJECT_KEY,
+  RV_LAYOUT_OBJECT_STAMP_KEY,
   type AssetOverrides,
+  type NestedOverride,
+  type OrphanReason,
 } from './rv-asset-reference';
-import { childOccurrence, getNodeId } from './rv-node-id';
+import { childOccurrence } from './rv-node-id';
+import { isMissingReferencePlaceholder } from './rv-missing-reference-placeholder';
+import { NodeRegistry } from './rv-node-registry';
+import { reportOverrideOrphaned } from '../hmi/problems-store';
+import { identityIdOf } from './rv-decode-identity';
+import { parametricRequestsOf } from './rv-parametric-component';
 import { resolveReferenceUrl, weakestSignatureState } from './rv-glb-compose';
 import { gltfLoader as sharedGltfLoader } from './rv-glb-parse';
 import {
@@ -73,6 +84,14 @@ import {
   findRegistryOrigin,
   rebaseLocalLibraryUrl,
 } from '../library/rv-placement-source';
+import {
+  findQualifiedOrigin,
+  isQualifiedRef,
+  qualifiedSourceState,
+  findWhenQualifiedSourceSettled,
+  qualifyInLibrary,
+} from '../library/library-origin';
+import { subscribeLibrarySources } from '../library/library-source-registry';
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -89,6 +108,29 @@ export interface PlacementRef {
   /** A pre-resolved fetch url that wins over {@link glbUrl} — the planner's
    *  catalog / cloud fallback for a saved `blob:` url that died with its session. */
   url?: string;
+  /**
+   * The reference's qualifier (plan-778 F4). `providerId: 'library-projects'`
+   * + `sourceId` = a STRICT reference into one library project: resolved in
+   * that source only, checked BEFORE any url / path, never through the host's
+   * fallback. Any other pair (a pre-778 `global` + catalog URL) is a legacy
+   * hint for {@link findRegistryOrigin}.
+   */
+  providerId?: string;
+  sourceId?: string;
+}
+
+/** The qualifier fields of an `AssetReference` as {@link PlacementRef} fields (none when absent). */
+function qualifierFieldsOf(reference: { providerId?: string; sourceId?: string } | null): Pick<PlacementRef, 'providerId' | 'sourceId'> {
+  if (!reference?.providerId && !reference?.sourceId) return {};
+  return {
+    ...(reference.providerId ? { providerId: reference.providerId } : {}),
+    ...(reference.sourceId ? { sourceId: reference.sourceId } : {}),
+  };
+}
+
+/** The bake / chain key of a QUALIFIED reference — stable whether or not its source is ready. */
+function qualifiedKeyOf(ref: PlacementRef): string {
+  return resolvedCacheKey(ref.providerId as string, ref.sourceId as string, ref.catalogId);
 }
 
 /** The cache key + transport of a {@link PlacementRef}. */
@@ -103,8 +145,7 @@ export interface MaterializeSpec {
   id: string;
   label: string;
   catalogId: string;
-  /** Saved `AssetOverrides` (byNodeId / trsByNodeId). Applied AFTER the pivot:
-   *  a saved TRS is a position in the pivoted frame. */
+  /** Saved `AssetOverrides` (`byAddress`, plan-769; component values only). Applied after the pivot. */
   overrides?: AssetOverrides | null;
   /** Floor-centre pivot of the instantiated content. Default true; false for
    *  multi-part CAD assemblies that keep their functional origin (plan-238). */
@@ -122,6 +163,14 @@ export interface MaterializeSpec {
   chainState?: SignatureState;
   /** Occurrence chain of this placement (default: `id`). */
   occurrence?: string;
+  /**
+   * plan-650 Phase 5b: parametric nesting level of THIS placement (1 = a
+   * family placement whose overrides carry family values, +1 per nested child
+   * family) - bounded by {@link MAX_PARAMETRIC_DEPTH}. Absent = 0.
+   */
+  paramDepth?: number;
+  /** plan-650 Phase 5b: id of the outermost placement - the key of the aggregated child budget. */
+  paramRoot?: string;
   /**
    * The parent placement's id when THIS root is a nested reference node inside
    * a placed asset (F5). Such a root is content of its parent: it gets
@@ -164,10 +213,30 @@ export interface DeferredPlacementEntry {
   pivot?: boolean;
   /** The parent placement's id for a NESTED reference (F5); absent at the document level. */
   nestedOf?: string;
+  /**
+   * plan-650 Phase 5b: parametric nesting level of THIS placement (1 = a
+   * family placement whose overrides carry family values, +1 per nested child
+   * family) - bounded by {@link MAX_PARAMETRIC_DEPTH}. Absent = 0.
+   */
+  paramDepth?: number;
+  /** plan-650 Phase 5b: id of the outermost placement - the key of the aggregated child budget. */
+  paramRoot?: string;
 }
 
 /** Why a nested reference was NOT queued as a placement (per node). */
-export type NestedRefusalReason = 'cycle' | 'depth';
+export type NestedRefusalReason = 'cycle' | 'depth' | 'parametric-cycle' | 'parametric-depth' | 'parametric-budget';
+
+/** plan-650 Phase 5b: most parametric levels in one placement tree (the family itself = 1). */
+export const MAX_PARAMETRIC_DEPTH = 4;
+/** plan-650 Phase 5b: most nested child-family placements below ONE outermost placement. */
+export const MAX_PARAMETRIC_TREE_PLACEMENTS = 256;
+/** plan-650 Phase 5b: most baked vertices of all child-family placements below ONE outermost placement. */
+export const MAX_PARAMETRIC_TREE_VERTICES = 2_000_000;
+
+/** Is `node` a parametric child reference (its overrides carry family values)? */
+export function isParametricReferenceNode(node: Object3D): boolean {
+  return parametricRequestsOf(getAssetOverrides(node)).length > 0;
+}
 
 /** One nested reference the instancer refused — reported, never dropped silently. */
 export interface NestedReferenceRefusal {
@@ -226,6 +295,17 @@ export interface DeferredPlacementHooks {
   register?(entry: DeferredPlacementEntry, instance: PlacementInstance): void;
   /** The asset could not be loaded — draw the hole, report the problem. */
   missing?(entry: DeferredPlacementEntry, error: unknown): void;
+  /**
+   * plan-778 Decision D / F8, the other direction: the library source of a
+   * QUALIFIED placement went away (detached, error, permission lost) while its
+   * instance stands. Undo what `register` did to the runtime (components,
+   * drives, behaviours, snap ports …) and release the instance, but KEEP the
+   * reference node — the instancer draws the placeholder right after
+   * (`missing`) and brings the content back when the source answers again.
+   */
+  lost?(entry: DeferredPlacementEntry, instance: PlacementInstance): void;
+  /** Overrides when the root carries none (a live placement's values sit in the host record; plan-778). */
+  overridesOf?(entry: DeferredPlacementEntry): AssetOverrides | null | undefined;
 }
 
 /** How the instancer reaches its host — injected, the engine must not know `RVViewer`. */
@@ -234,6 +314,12 @@ export interface PlacementInstancerDeps extends ModelCacheUberOptions {
   bakeRegistry: () => BakeRegistry;
   /** Match a subtree to the active render mode (toon swap + recompile). */
   applyRenderMode?: (root: Object3D) => void;
+  /**
+   * plan-652 Phase 3: activates the on-demand features the placement's component
+   * types need (DES) before {@link PlacementInstancer.materialize} builds them —
+   * the asset's own types plus those its overrides add.
+   */
+  ensureComponentTypes?: (types: Iterable<string>) => Promise<void>;
   /** GLTF loader of the model cache. Default: the engine's shared loader. */
   loader?: GLTFLoader;
   /** Default liveness test of a deferred root (viewer: under `currentModel`). */
@@ -242,6 +328,8 @@ export interface PlacementInstancerDeps extends ModelCacheUberOptions {
   registerDefault?: (entry: DeferredPlacementEntry, instance: PlacementInstance) => void;
   /** Default missing-asset handling when no hook handles it. */
   missingDefault?: (entry: DeferredPlacementEntry, error: unknown) => void;
+  /** Default {@link DeferredPlacementHooks.lost} when no hook handles it. */
+  lostDefault?: (entry: DeferredPlacementEntry, instance: PlacementInstance) => void;
   /**
    * The placements of a load settled — called exactly once per sealed load
    * ({@link PlacementInstancer.sealLoad}), also with zero references, and with
@@ -275,6 +363,12 @@ export interface PlacementInstancerDeps extends ModelCacheUberOptions {
    * decode, or `null` = missing. Keyed by the reference's bare identity.
    */
   resolveReference?: (ref: PlacementRef) => Promise<{ url: string; revokeUrl?(): void } | null>;
+  /**
+   * plan-778 F8: a placeholder placement is about to be re-resolved because its
+   * library source became ready — the placeholder child is already removed;
+   * the host clears what else it attached (the missing-reference problem).
+   */
+  onReresolve?: (entry: DeferredPlacementEntry) => void;
 }
 
 /** `materializing` while at least one deferred placement waits for / runs its bake. */
@@ -304,16 +398,45 @@ export interface PlacementsSettledInfo {
 
 // ─── Markers ────────────────────────────────────────────────────────────
 
+/**
+ * userData flag of a reference node between `materializeDeferred` (deferred
+ * mark consumed) and its marker stamp — keeps it a signal-scope root in that
+ * window (plan-612 #149, read inline by `rv-instance-scope.ts`).
+ */
+const PLACEMENT_PENDING_KEY = '_rvPlacementPending';
+
 /** Marker + `LayoutObject` stamp of a placement root — one definition (F2). */
-export function stampPlacementMarkers(root: Object3D, id: string, label: string, catalogId: string): void {
+export function stampPlacementMarkers(root: Object3D, id: string, label: string, catalogId: string, locked = false): void {
   root.userData._layoutObject = true;
   root.userData._layoutId = id;
   delete root.userData._layoutNestedOf;
+  delete root.userData[PLACEMENT_PENDING_KEY];
+  // plan-774 review fix E2: the PURE stamp, so the editor's save can tell a
+  // runtime-only field from one the user changed (`dropRuntimePlacementStamps`).
+  root.userData[RV_LAYOUT_OBJECT_STAMP_KEY] = { Label: label, CatalogId: catalogId, Locked: locked };
   if (root.userData.realvirtual && typeof root.userData.realvirtual === 'object') {
-    (root.userData.realvirtual as Record<string, unknown>).LayoutObject = { Label: label, CatalogId: catalogId, Locked: false };
+    (root.userData.realvirtual as Record<string, unknown>).LayoutObject = { Label: label, CatalogId: catalogId, Locked: locked };
   } else {
-    root.userData.realvirtual = { LayoutObject: { Label: label, CatalogId: catalogId, Locked: false } };
+    root.userData.realvirtual = { LayoutObject: { Label: label, CatalogId: catalogId, Locked: locked } };
   }
+}
+
+/**
+ * plan-774 review fix E2: a reference node whose FILE authored a `LayoutObject`
+ * (recorded by the loader as `_rvAuthoredLayoutObject` before any stamp) keeps
+ * it — every authored field wins (`Locked`, `Visible`, its own `Label` /
+ * `CatalogId`, …); the stamp only adds the runtime fields the file did not
+ * write. Without a record (a live drop, a nested root) the stamp stands as is.
+ */
+function mergeAuthoredLayoutObject(root: Object3D): void {
+  const authored = root.userData[RV_AUTHORED_LAYOUT_OBJECT_KEY];
+  if (!authored || typeof authored !== 'object') return;
+  const rv = root.userData.realvirtual as Record<string, unknown> | undefined;
+  const stamp = rv?.LayoutObject as Record<string, unknown> | undefined;
+  if (!rv || !stamp || typeof stamp !== 'object') return;
+  const merged: Record<string, unknown> = JSON.parse(JSON.stringify(authored));
+  for (const [key, value] of Object.entries(stamp)) if (!(key in merged)) merged[key] = value;
+  rv.LayoutObject = merged;
 }
 
 /**
@@ -329,6 +452,7 @@ export function stampPlacementMarkers(root: Object3D, id: string, label: string,
 export function stampNestedPlacementMarkers(root: Object3D, parentId: string, id?: string): void {
   root.userData._layoutObject = true;
   root.userData._layoutNestedOf = parentId;
+  delete root.userData[PLACEMENT_PENDING_KEY];
   // The occurrence-chain id (`<parent id>/<reference NodeId>`), STABLE across
   // reloads — what per-object services (placed behaviors) key a nested root by
   // instead of the uuid (plan-757 Phase 2b, F18). Never a record id.
@@ -386,7 +510,8 @@ export function collectDeferredPlacements(root: Object3D): DeferredPlacementEntr
       // its own (compose derives one only when the file's sha256 is known) —
       // the occurrence chain compose assigned is its id then. Without EITHER
       // the node is a reference nobody can address; it stays empty.
-      const id = getNodeId(node) ?? mark.occurrence;
+      // plan-769 F12: the node's IDENTITY (authored NodeId or decode seed) first.
+      const id = identityIdOf(node) ?? mark.occurrence;
       if (id) {
         out.push({
           node,
@@ -395,10 +520,15 @@ export function collectDeferredPlacements(root: Object3D): DeferredPlacementEntr
           occurrence: mark.occurrence || id,
           // The path resolved against the CONTAINING file where the mark carries
           // it (a relative `path` of a deferred document reference), else as written.
-          ref: {
-            catalogId: reference?.assetId || getPlacementMeta(node)?.catalogId || '',
-            glbUrl: mark.resolvedPath || reference?.path || '',
-          },
+          // plan-778 F4: a qualified reference never carries a url — a stored
+          // `path` beside a qualifier is ignored, it must not win over the library.
+          ref: isQualifiedRef(reference)
+            ? { catalogId: reference!.assetId, glbUrl: '', ...qualifierFieldsOf(reference) }
+            : {
+                catalogId: reference?.assetId || getPlacementMeta(node)?.catalogId || '',
+                glbUrl: mark.resolvedPath || reference?.path || '',
+                ...qualifierFieldsOf(reference),
+              },
           // The pivot rule of the reference node (spike S2 finding 3): a planner
           // placement is floor-centre pivoted, a hand-authored CAD sub-assembly
           // keeps its child transforms — what `compose()` applies when it grafts.
@@ -418,6 +548,14 @@ function assetKeyOf(ref: PlacementRef): string {
   return ref.catalogId || ref.url || ref.glbUrl || '';
 }
 
+/** Does a cache key / url name the project-relative file `relPath` (normalized, no leading `/`)? */
+function addressesPath(keyOrUrl: string, relPath: string): boolean {
+  if (!keyOrUrl || !relPath) return false;
+  const k = keyOrUrl.replace(/\\/g, '/').split(/[?#]/)[0].toLowerCase();
+  const p = relPath.toLowerCase();
+  return k === p || k.endsWith('/' + p) || k.endsWith(':' + p);
+}
+
 /** What the nested scan needs to know about the PARENT asset of the references it finds. */
 export interface NestedScanContext {
   /** The parent asset's cache key (`BakedAsset.assetId`) — appended to the chain. */
@@ -428,6 +566,8 @@ export interface NestedScanContext {
   parentState: SignatureState;
   /** ONE key derivation for the cycle guard (F13): `PlacementInstancer.sourceOf(ref).key`. */
   keyOf: (ref: PlacementRef) => string;
+  /** plan-778: the library the parent asset comes from — its unqualified nested references are that library's. */
+  parentLibrary?: { providerId: string; sourceId: string };
   /**
    * The reference nodes of the instance, when the caller already knows them
    * (F14: the instancer memoises the template's reference nodes per asset and
@@ -437,7 +577,7 @@ export interface NestedScanContext {
 }
 
 /** The parent placement, as the nested scan sees it. */
-export type NestedScanParent = Pick<DeferredPlacementEntry, 'node' | 'id' | 'occurrence' | 'chain' | 'depth' | 'chainState'>;
+export type NestedScanParent = Pick<DeferredPlacementEntry, 'node' | 'id' | 'occurrence' | 'chain' | 'depth' | 'chainState' | 'paramDepth' | 'paramRoot'>;
 
 /**
  * The reference nodes INSIDE an instance (walk form): below the instance root,
@@ -488,18 +628,36 @@ export function collectNestedReferences(
   const chainState = parent.chainState === undefined
     ? ctx.parentState
     : weakestSignatureState(parent.chainState, ctx.parentState);
-  let ordinal = 0;
   for (const node of ctx.nodes ?? walkReferenceNodes(parent.node)) {
     const reference = getAssetReference(node);
     if (!reference) continue;
-    const segment = getNodeId(node) ?? `@${ordinal}`;
-    ordinal++;
-    const glbUrl = reference.path ? resolveReferenceUrl(ctx.parentUrl, reference.path) : '';
-    const ref: PlacementRef = { catalogId: reference.assetId || getPlacementMeta(node)?.catalogId || '', glbUrl };
+    // plan-769 F12: the occurrence segment is the reference node's IDENTITY — its
+    // authored NodeId or its decode seed (every decoded node has one). The
+    // positional `@ordinal` fallback is gone: an id-less reference node names no
+    // occurrence anybody could address again, so it stays empty, visibly.
+    const segment = identityIdOf(node);
+    if (!segment) {
+      console.warn(`[placement] nested reference "${node.name}" carries no identity (no NodeId, no decode seed) — left empty`);
+      continue;
+    }
+    // plan-778 F4: a qualified nested reference ignores any stored path.
+    const catalogId = reference.assetId || getPlacementMeta(node)?.catalogId || '';
+    // plan-778: inside a library document, `project:<path>` / a bare id is THAT library's.
+    const inLibrary = !isQualifiedRef(reference) && ctx.parentLibrary ? qualifyInLibrary(catalogId, ctx.parentLibrary) : null;
+    const qualified = isQualifiedRef(reference) || !!inLibrary;
+    const glbUrl = !qualified && reference.path ? resolveReferenceUrl(ctx.parentUrl, reference.path) : '';
+    const ref: PlacementRef = inLibrary
+      ? { ...inLibrary, glbUrl: '' }
+      : { catalogId, glbUrl, ...qualifierFieldsOf(reference) };
     const key = ctx.keyOf(ref);
     const base = { node, label: node.name, ref, assetKey: key, chain, depth };
-    if (chain.includes(key)) refused.push({ reason: 'cycle', ...base });
+    // plan-650 Phase 5b: a reference whose overrides carry family values is a
+    // parametric level - its own cycle code and the tighter depth bound.
+    const isParam = isParametricReferenceNode(node);
+    const paramDepth = (parent.paramDepth ?? 0) + (isParam ? 1 : 0);
+    if (chain.includes(key)) refused.push({ reason: isParam ? 'parametric-cycle' : 'cycle', ...base });
     else if (depth > MAX_REFERENCE_DEPTH) refused.push({ reason: 'depth', ...base });
+    else if (isParam && paramDepth > MAX_PARAMETRIC_DEPTH) refused.push({ reason: 'parametric-depth', ...base });
     else {
       entries.push({
         node,
@@ -512,10 +670,40 @@ export function collectNestedReferences(
         chainState,
         pivot: getPlacementMeta(node) !== null,
         nestedOf: parent.id,
+        paramDepth,
+        paramRoot: parent.paramRoot ?? parent.id,
       });
     }
   }
   return { entries, refused };
+}
+
+/**
+ * plan-769 Phase 4b (F13): one override an outer placement aims into a nested
+ * occurrence, waiting for (or already applied to) that occurrence's instance.
+ */
+interface RoutedOverride {
+  /** Occurrence of the placement that STORES the override. */
+  sourceOcc: string;
+  /** Depth of the file holding the record — the storing placement's depth (outer = smaller = stronger). */
+  depth: number;
+  /** ONE entry, addressed relative to the TARGET occurrence's asset (`#<id>`, `<c>#<id>`, or a legacy path). */
+  overrides: AssetOverrides;
+  /** The storing reference node, for the Problems panel: its path, label, asset, the key as it wrote it. */
+  source: { nodePath: string; label: string; assetId: string; occurrence: string; key: string; addressing: 'address' | 'path' };
+}
+
+/** The override set of a {@link NestedOverride}'s remainder. */
+function remainderOverrides(n: NestedOverride): AssetOverrides {
+  return n.address !== undefined
+    ? { byAddress: { [n.address]: n.patch } }
+    : { byAddress: {}, legacyByPath: { [n.path ?? '']: n.patch } };
+}
+
+function occurrenceBelow(base: string, segments: readonly string[]): string {
+  let occ = base;
+  for (const seg of segments) occ = childOccurrence(occ, seg);
+  return occ;
 }
 
 // ─── Instancer ──────────────────────────────────────────────────────────
@@ -550,9 +738,59 @@ export class PlacementInstancer {
    * viewer per load; cleared with the document.
    */
   private _documentKey: string | null = null;
+  /**
+   * plan-774 F6: state of the kept-baked window. `open` = the last clear kept
+   * the bakes and the next settle retires the unclaimed ones; `held` = a
+   * descend keeps them past that settle; `none` = nothing kept.
+   */
+  private _keptWindow: 'none' | 'open' | 'held' = 'none';
   /** Per-load cap bookkeeping (F9) — one aggregated report, re-issued as it grows. */
   private _capRefused = 0;
   private readonly _capNodes: Object3D[] = [];
+  /**
+   * plan-769 Phase 4b (F13): overrides outer placements route into nested
+   * occurrences, by TARGET occurrence — applied with the target's own record when
+   * it materialises (`applyOverrideLayers`: the outer file wins), at once when it
+   * is already live. Flushed with a reason on missing / cap / refusal, cleared with
+   * the document; what is left once nothing is pending is an orphan (`missing`).
+   */
+  private readonly _routed = new Map<string, RoutedOverride[]>();
+  /** Live instance per occurrence — where a routed override lands at once. */
+  private readonly _instanceByOcc = new Map<string, PlacementInstance>();
+  /** plan-650 Phase 5b: aggregated child-family budget per outermost placement id. */
+  private readonly _paramTree = new Map<string, { placements: number; vertices: number }>();
+  /** plan-650 Phase 5b: child-family placements per outermost placement ({@link MAX_PARAMETRIC_TREE_PLACEMENTS}). */
+  maxParametricTreePlacements = MAX_PARAMETRIC_TREE_PLACEMENTS;
+  /** plan-650 Phase 5b: baked vertices of all child families per outermost placement ({@link MAX_PARAMETRIC_TREE_VERTICES}). */
+  maxParametricTreeVertices = MAX_PARAMETRIC_TREE_VERTICES;
+  /**
+   * plan-778 F8: deferred placements that fell into their placeholder, by id,
+   * with the key of the registry answer at that moment. Re-queued when it changes.
+   */
+  private readonly _unresolved = new Map<string, {
+    entry: DeferredPlacementEntry;
+    hooks: DeferredPlacementHooks | undefined;
+    generation: number;
+    source: string | null;
+  }>();
+  private _unsubSources: (() => void) | null = null;
+  /**
+   * plan-778 Decision D: placements with a QUALIFIED reference that stand as
+   * live instances, by id — materialised through the deferred path, or handed
+   * in by the host for a live drop ({@link watchQualified}). When the library
+   * source they name stops answering (detached, error, permission lost) they
+   * fall back into their placeholder without a reload; the unresolved list
+   * above brings them back. `counted` = part of the load's progress counters
+   * (deferred); a live drop joins them only when it turns into a placeholder.
+   */
+  private readonly _liveQualified = new Map<string, {
+    entry: DeferredPlacementEntry;
+    hooks: DeferredPlacementHooks | undefined;
+    generation: number;
+    instance: PlacementInstance;
+    counted: boolean;
+  }>();
+  private _unsubLive: (() => void) | null = null;
   /** F14: the template's reference nodes per asset — mapped per instance through `nodeOf`. */
   private readonly _templateRefs = new WeakMap<BakedAsset, readonly Object3D[]>();
   /**
@@ -607,12 +845,32 @@ export class PlacementInstancer {
    */
   sourceOf(ref: PlacementRef): PlacementSource | null {
     const catalogId = ref.catalogId ?? '';
+    // plan-778 F4: the qualifier is checked FIRST — before the url branch
+    // below, which used to return early on any url. A qualified reference has
+    // a source only while its ONE library answers; nothing else stands in.
+    if (isQualifiedRef(ref)) {
+      const found = findQualifiedOrigin({ assetId: catalogId, providerId: ref.providerId, sourceId: ref.sourceId });
+      if (!found) return null;
+      const source = found.registered.source;
+      const entryId = found.entry.id;
+      const key = qualifiedKeyOf(ref);
+      this._libraryOfKey.set(key, { providerId: ref.providerId!, sourceId: ref.sourceId! });
+      return { key, resolve: () => source.resolveAsset(entryId, 'place') };
+    }
     const isProject = catalogId.startsWith(PROJECT_PLACEMENT_PREFIX);
     if (!isProject) {
       const raw = (ref.url || ref.glbUrl || '').trim();
-      if (raw) return { key: rebaseLocalLibraryUrl(raw) ?? raw };
+      // An UNANCHORED relative path (no scheme, no leading `/`) is what
+      // `resolveReferenceUrl` leaves behind under an opaque base — a document
+      // opened from a project (`rvproject:`) or from bytes (`blob:`). Fetched
+      // as is it resolves against the page root and 404s, and the asset id
+      // never gets its turn. With an id and a host resolver it goes through
+      // `_fallbackSource` instead: library, open project's manifest, then path.
+      const key = raw ? (rebaseLocalLibraryUrl(raw) ?? raw) : '';
+      const unanchored = !!key && !/^[a-z][a-z0-9+.-]*:/i.test(key) && !key.startsWith('/');
+      if (key && !(unanchored && catalogId && this._deps.resolveReference)) return { key };
     }
-    const origin = findRegistryOrigin(catalogId);
+    const origin = findRegistryOrigin(catalogId, ref);
     if (!origin) return null;
     return {
       key: resolvedCacheKey(origin.providerId, origin.source.id, catalogId),
@@ -620,9 +878,13 @@ export class PlacementInstancer {
     };
   }
 
-  /** The chain key of a reference: its source key, else its bare identity (F13). */
+  /**
+   * The chain key of a reference: its source key, else its bare identity (F13).
+   * A qualified reference keys by (library, document) even while its library is
+   * not ready — two libraries' equal document ids are two assets (plan-778).
+   */
   keyOf(ref: PlacementRef): string {
-    return this.sourceOf(ref)?.key ?? assetKeyOf(ref);
+    return this.sourceOf(ref)?.key ?? (isQualifiedRef(ref) ? qualifiedKeyOf(ref) : assetKeyOf(ref));
   }
 
   /**
@@ -639,13 +901,20 @@ export class PlacementInstancer {
   /**
    * The shared `BakedAsset` of a reference (plan-753 F1): decodes + bakes once
    * per (asset, document); concurrent askers join the in-flight bake.
-   * `forceSplitNodeIds` (a `trsByNodeId` override) is a different bake of the
-   * same master. `signal` detaches THIS asker only.
+   * `signal` detaches THIS asker only.
+   *
+   * plan-650 Phase 5 (SOL-Finding 3/6, R2-Finding 4): `overrides` are THIS
+   * placement's `AssetOverrides`; their `ParametricComponent.Values` pick the
+   * parametric variant (a derived `#param:` bake of the same base key, values
+   * at the baked default = the base bake). Every caller passes them: the
+   * deferred reload (the reference node's), a copy (the source's), a restore /
+   * undo (the record's). Absent = the standard variant.
    */
   resolveBaked(
     ref: PlacementRef,
-    opts?: { signal?: AbortSignal; forceSplitNodeIds?: readonly string[] },
+    opts?: { signal?: AbortSignal; overrides?: AssetOverrides | null },
   ): Promise<BakedAsset> {
+    if (isQualifiedRef(ref)) return this._resolveQualifiedBaked(ref, opts);
     const source = this.sourceOf(ref) ?? this._fallbackSource(ref);
     if (!source) {
       return Promise.reject(new Error(
@@ -654,7 +923,35 @@ export class PlacementInstancer {
           : `Entry "${ref.catalogId}" has no glbUrl and no registry origin.`,
       ));
     }
-    return this.modelCache.getOrLoadBaked(source.key, source.resolve, opts);
+    const parametric = parametricRequestsOf(opts?.overrides);
+    return this.modelCache.getOrLoadBaked(source.key, source.resolve, {
+      signal: opts?.signal,
+      ...(parametric.length > 0 ? { parametric } : {}),
+    });
+  }
+
+  /**
+   * plan-778 F4: the baked asset of a QUALIFIED reference. Waits for its ONE
+   * library while that is pending (never for any other source), then resolves
+   * there or rejects — never the host fallback, the open project's manifest or
+   * a path. A rejection is not cached (the cache only keeps settled bakes), so
+   * a later attempt after the library became ready bakes normally (F8).
+   */
+  private async _resolveQualifiedBaked(
+    ref: PlacementRef,
+    opts?: { signal?: AbortSignal; overrides?: AssetOverrides | null },
+  ): Promise<BakedAsset> {
+    const source = await findWhenQualifiedSourceSettled(ref, () => this.sourceOf(ref));
+    if (!source) {
+      throw new Error(qualifiedSourceState(ref) === 'ready'
+        ? `Document "${ref.catalogId}" is not in library "${ref.sourceId}".`
+        : `Library "${ref.sourceId}" is not available — "${ref.catalogId}" cannot be placed.`);
+    }
+    const parametric = parametricRequestsOf(opts?.overrides);
+    return this.modelCache.getOrLoadBaked(source.key, source.resolve, {
+      signal: opts?.signal,
+      ...(parametric.length > 0 ? { parametric } : {}),
+    });
   }
 
   /**
@@ -664,6 +961,7 @@ export class PlacementInstancer {
    * the host resolves. `null` without a host resolver or an identity.
    */
   private _fallbackSource(ref: PlacementRef): PlacementSource | null {
+    if (isQualifiedRef(ref)) return null;   // plan-778 F4: strict — no host fallback
     const resolve = this._deps.resolveReference;
     const key = assetKeyOf(ref);
     if (!resolve || !key) return null;
@@ -727,6 +1025,33 @@ export class PlacementInstancer {
     if (source) this.modelCache.invalidate(source.key);
   }
 
+  /**
+   * plan-774 F6 — a DOCUMENT was written (`document-saved`): retire every
+   * cache entry baked from it, so the next placement of it (a Back after a
+   * descend-save above all) bakes the new bytes. Keys come from the ONE
+   * derivation ({@link keyOf}): the document as a project placement
+   * (`project:<path>`) and by its manifest id; plus every entry the cache holds
+   * whose key or source url ends in the document's path (a reference that named
+   * the file by a relative path is keyed by its url). Over-matching costs a
+   * re-bake, never a wrong picture. Returns the keys invalidated.
+   */
+  invalidateDocument(doc: { documentId?: string | null; relPath?: string | null }): string[] {
+    const path = (doc.relPath ?? '').replace(/\\/g, '/').replace(/^\/+/, '');
+    const keys = new Set<string>();
+    for (const catalogId of [path ? `${PROJECT_PLACEMENT_PREFIX}${path}` : '', doc.documentId ?? '']) {
+      if (!catalogId) continue;
+      const key = this.keyOf({ catalogId, glbUrl: '' });
+      if (key) keys.add(key);
+    }
+    if (path && this._cache) {
+      for (const e of this._cache.knownEntries()) {
+        if (addressesPath(e.key, path) || addressesPath(e.url, path)) keys.add(e.key);
+      }
+    }
+    if (this._cache) for (const key of keys) this._cache.invalidate(key);
+    return [...keys];
+  }
+
   // ── Materialise / release — the ONE order ───────────────────────────
 
   /** A fresh transform-neutral placement root for `baked` (named after the master). */
@@ -766,19 +1091,23 @@ export class PlacementInstancer {
     root.matrixWorldAutoUpdate = true;
 
     if (spec.nestedOf) stampNestedPlacementMarkers(root, spec.nestedOf, spec.id);
-    else stampPlacementMarkers(root, spec.id, spec.label, spec.catalogId);
+    else {
+      stampPlacementMarkers(root, spec.id, spec.label, spec.catalogId);
+      mergeAuthoredLayoutObject(root);
+    }
     // What RVSource's self-template detection compares against — the name
     // BEFORE any unique-name suffix the host adds.
     root.userData._originalName ??= root.name;
 
     const registry = this.bakeRegistry;
     const instance = registry.instantiate(baked, root);
+    bumpModelEditEpoch('placement-instance');
     // F7: the trust the chain above withholds is a property of the instance (absent = no chain).
     instance.chainState = spec.chainState;
     root.traverse(markLayoutObject);
     applyShadowFlags(root);
     if (spec.pivot !== false) pivotWithDriveHomeStamps(root as Group);
-    if (spec.overrides) registry.applyOverrides(instance, spec.overrides);
+    this._applyOverrides(instance, spec);
     root.updateMatrixWorld(true);
     this._deps.applyRenderMode?.(root);
     this._queueNested(instance, spec, hooks);
@@ -792,8 +1121,21 @@ export class PlacementInstancer {
    */
   release(root: Object3D): boolean {
     const registry = this.bakeRegistry;
-    for (const r of registry.instanceRootsUnder(root)) this._ownedRoots.delete(r);
-    return registry.releaseSubtree(root) > 0;
+    const released = new Set(registry.instanceRootsUnder(root));
+    for (const r of released) this._ownedRoots.delete(r);
+    // A released placement takes what it routed and what was routed into it along
+    // (a removal is no orphan); a re-materialisation routes again.
+    for (const [occ, inst] of this._instanceByOcc) {
+      if (!released.has(inst.root)) continue;
+      this._instanceByOcc.delete(occ);
+      this._dropRoutedFrom(occ);
+      this._routed.delete(occ);
+    }
+    for (const [id, live] of this._liveQualified) if (released.has(live.instance.root)) this._liveQualified.delete(id);
+    if (this._liveQualified.size === 0) this._stopLiveWatch();
+    const removed = registry.releaseSubtree(root) > 0;
+    if (removed) bumpModelEditEpoch('placement-removal');
+    return removed;
   }
 
   /** The instance whose root is `root`, or null. */
@@ -823,7 +1165,10 @@ export class PlacementInstancer {
     for (const e of entries) {
       if (!getDeferredPlacement(e.node) || this._materializing.has(e.id)) continue;
       clearDeferredPlacement(e.node);
-      const key = e.ref.catalogId || e.ref.glbUrl || e.id;
+      // plan-612 #149: still a placement root for the signal scope while its
+      // asset bakes (`rv-instance-scope` reads it; the stamp removes it).
+      e.node.userData[PLACEMENT_PENDING_KEY] = true;
+      const key = isQualifiedRef(e.ref) ? qualifiedKeyOf(e.ref) : (e.ref.catalogId || e.ref.glbUrl || e.id);
       const group = groups.get(key);
       if (group) group.push(e); else groups.set(key, [e]);
       queued++;
@@ -904,6 +1249,7 @@ export class PlacementInstancer {
 
   private _notifyIdle(): void {
     if (this._materializing.size > 0) return;
+    this._settleRouted();
     this._publishState();
     // The event first: a `whenMaterialized()` continuation then already sees
     // what the `placements-materialized` listeners did (camera refit, DES bind).
@@ -921,6 +1267,9 @@ export class PlacementInstancer {
   }
 
   private _emitSettled(aborted: boolean): void {
+    // plan-774 F6: the load after a kept release settled (or was overtaken) —
+    // whatever it did not claim is retired now, before anyone is told.
+    this._endKeptWindow();
     const onSettled = this._deps.onSettled;
     if (!onSettled) return;
     try {
@@ -950,19 +1299,21 @@ export class PlacementInstancer {
     generation: number,
   ): Promise<void> {
     if (generation !== this._generation) return;
-    const overrides = getAssetOverrides(entry.node);
-    const forceSplitNodeIds = overrides?.trsByNodeId ? Object.keys(overrides.trsByNodeId) : undefined;
+    const overrides = getAssetOverrides(entry.node) ?? hooks?.overridesOf?.(entry) ?? null;
     const missing = hooks?.missing ?? this._deps.missingDefault;
 
     let baked: BakedAsset;
     try {
       const isProject = entry.ref.catalogId.startsWith(PROJECT_PLACEMENT_PREFIX);
-      const url = !isProject && hooks?.resolveUrl ? await hooks.resolveUrl(entry) : undefined;
+      // plan-778 F4: a qualified reference never takes the host's url fallback.
+      const url = !isProject && !isQualifiedRef(entry.ref) && hooks?.resolveUrl ? await hooks.resolveUrl(entry) : undefined;
       if (generation !== this._generation) return;
-      baked = await this.resolveBaked(url ? { ...entry.ref, url } : entry.ref, { forceSplitNodeIds });
+      baked = await this.resolveBaked(url ? { ...entry.ref, url } : entry.ref, { overrides });
     } catch (err) {
       if (generation !== this._generation) return;
+      this._flushRouted(entry.occurrence, 'placement-missing');
       missing?.(entry, err);
+      this._recordUnresolved(entry, hooks);
       return;
     }
     // The load moved on while the asset baked (clearModel / a newer document):
@@ -970,6 +1321,26 @@ export class PlacementInstancer {
     if (generation !== this._generation || baked.disposed) return;
     const isLive = hooks?.isLive ?? this._deps.isLive;
     if (isLive && !isLive(entry.node)) return;
+    if (!this._chargeParametricVertices(entry, baked)) return;
+
+    // plan-652 Phase 3 (§2.4.3 #2): the build below is synchronous — activate the
+    // features this placement's components need first. The asset's types are cached
+    // per baked asset (a cache hit asks again, a no-op once active); override types
+    // are added per placement (SOL #2). A failed activation is reported by the
+    // loader and does not lose the placement.
+    if (this._deps.ensureComponentTypes) {
+      const types = new Set(componentTypesOf(baked));
+      // plan-769: overrides are `byAddress` (+ the read-only `legacyByPath` bridge).
+      addPatchTypes(types, overrides?.byAddress);
+      addPatchTypes(types, overrides?.legacyByPath);
+      try {
+        await this._deps.ensureComponentTypes(types);
+      } catch (err) {
+        console.warn(`[PlacementInstancer] feature activation for "${entry.label}" failed: ${err}`);
+      }
+      if (generation !== this._generation || baked.disposed) return;
+      if (isLive && !isLive(entry.node)) return;
+    }
 
     // The ONE order — its last step queues the nested references of this
     // instance (F1/F8), synchronously, while this entry's id is still in
@@ -982,6 +1353,7 @@ export class PlacementInstancer {
       pivot: entry.pivot,
       chain: entry.chain, depth: entry.depth, chainState: entry.chainState,
       occurrence: entry.occurrence, nestedOf: entry.nestedOf,
+      paramDepth: entry.paramDepth, paramRoot: entry.paramRoot,
     }, hooks);
     this._materialized++;
     // F11: a throwing host registration neither loses the instance nor its
@@ -999,7 +1371,111 @@ export class PlacementInstancer {
         console.warn(`[PlacementInstancer] onRegisterFailed failed: ${e}`);
       }
     }
+    if (isQualifiedRef(entry.ref)) this._trackLiveQualified(entry, hooks, instance);
   }
+
+  /**
+   * plan-769 Phase 4b — the overrides of a fresh instance: its OWN record and every
+   * override an outer placement routed into its occurrence, as layers of ONE
+   * `applyOverrideLayers` call (outer wins). What aims further down is routed on.
+   */
+  private _applyOverrides(instance: PlacementInstance, spec: MaterializeSpec): void {
+    const occ = spec.occurrence ?? spec.id;
+    const depth = spec.depth ?? 0;
+    const routed = this._routed.get(occ) ?? [];
+    const layers: InstanceOverrideLayer[] = [];
+    if (spec.overrides) layers.push({ overrides: spec.overrides, depth, own: true });
+    for (const r of routed) layers.push({ overrides: r.overrides, depth: r.depth, source: r.source });
+    // This placement re-derives everything it routes (a re-materialisation replaces).
+    this._dropRoutedFrom(occ);
+    this._instanceByOcc.set(occ, instance);
+    if (layers.length === 0) return;
+    const results = this.bakeRegistry.applyOverrideLayers(instance, layers);
+    const offset = spec.overrides ? 1 : 0;
+    const root = instance.root;
+    const ownSource = (n: NestedOverride): RoutedOverride['source'] => ({
+      nodePath: NodeRegistry.computeNodePath(root) || root.name,
+      label: root.name,
+      assetId: instance.baked.assetId,
+      occurrence: occ,
+      key: n.key,
+      addressing: n.addressing,
+    });
+    results.forEach((res, i) => {
+      const from = i < offset ? null : routed[i - offset]!;
+      for (const n of res.nested) {
+        this._deliver(occurrenceBelow(occ, n.segments), {
+          sourceOcc: from ? from.sourceOcc : occ,
+          depth: from ? from.depth : depth,
+          overrides: remainderOverrides(n),
+          source: from ? from.source : ownSource(n),
+        });
+      }
+    });
+  }
+
+  /** Route one override to `target`; applied at once when that occurrence is live. */
+  private _deliver(target: string, entry: RoutedOverride): void {
+    const list = this._routed.get(target) ?? [];
+    const at = list.findIndex((e) => e.sourceOcc === entry.sourceOcc && e.source.key === entry.source.key);
+    if (at >= 0) list[at] = entry; else list.push(entry);
+    this._routed.set(target, list);
+    const inst = this._instanceByOcc.get(target);
+    if (!inst || inst.released) return;
+    const [res] = this.bakeRegistry.applyOverrideLayers(inst, [{ overrides: entry.overrides, depth: entry.depth, source: entry.source }]);
+    for (const n of res?.nested ?? []) {
+      this._deliver(occurrenceBelow(target, n.segments), { ...entry, overrides: remainderOverrides(n) });
+    }
+  }
+
+  /** Forget what the placement at `sourceOcc` routed (it is about to route again). */
+  private _dropRoutedFrom(sourceOcc: string): void {
+    for (const [target, list] of this._routed) {
+      const keep = list.filter((e) => e.sourceOcc !== sourceOcc);
+      if (keep.length === list.length) continue;
+      if (keep.length > 0) this._routed.set(target, keep); else this._routed.delete(target);
+    }
+  }
+
+  /**
+   * Flush the overrides routed into `occurrence` and everything below it with
+   * `reason` — the nested placement failed to load, was capped or refused.
+   */
+  private _flushRouted(occurrence: string, reason: OrphanReason): void {
+    for (const [target, list] of [...this._routed]) {
+      if (target !== occurrence && !target.startsWith(occurrence + '/')) continue;
+      this._routed.delete(target);
+      for (const e of list) this._reportRouted(e, reason);
+    }
+  }
+
+  /** The orphan verdict (F13): no placement is pending, a routed override without a live target is missing. */
+  private _settleRouted(): void {
+    for (const [target, list] of [...this._routed]) {
+      const inst = this._instanceByOcc.get(target);
+      if (inst && !inst.released) continue;
+      this._routed.delete(target);
+      for (const e of list) this._reportRouted(e, 'missing');
+    }
+  }
+
+  private _reportRouted(e: RoutedOverride, reason: OrphanReason): void {
+    const patch = Object.values(e.overrides.byAddress ?? {})[0] ?? Object.values(e.overrides.legacyByPath ?? {})[0] ?? {};
+    reportOverrideOrphaned({
+      nodePath: e.source.nodePath, label: e.source.label, assetId: e.source.assetId,
+      addressing: e.source.addressing, key: e.source.key, componentTypes: Object.keys(patch), reason,
+    });
+  }
+
+  /** How many overrides wait for a nested occurrence (diagnostics, tests). */
+  get routedOverrideCount(): number {
+    let n = 0;
+    for (const list of this._routed.values()) n += list.length;
+    return n;
+  }
+
+  /** plan-778: asset key → the library it comes from — the scope of its nested references. */
+  private readonly _libraryOfKey = new Map<string, { providerId: string; sourceId: string }>();
 
   /** F14: the template's reference nodes of `baked`, memoised per asset. */
   private _templateReferenceNodesOf(baked: BakedAsset): readonly Object3D[] {
@@ -1035,15 +1511,36 @@ export class PlacementInstancer {
       chain: spec.chain ?? this._documentChain(),
       depth: spec.depth ?? 0,
       chainState: spec.chainState,
+      paramDepth: spec.paramDepth ?? (parametricRequestsOf(spec.overrides).length > 0 ? 1 : 0),
+      paramRoot: spec.paramRoot ?? spec.id,
     };
+    // A re-materialised OUTERMOST placement starts its child budget afresh.
+    if (spec.nestedOf === undefined) this._paramTree.delete(spec.id);
     const { entries, refused } = collectNestedReferences(parent, {
       parentKey: baked.assetId,
       parentUrl: baked.url,
       parentState: baked.signatureState,
       keyOf: (ref) => this.keyOf(ref),
       nodes,
+      parentLibrary: this._libraryOfKey.get(baked.assetId),
     });
+    // plan-650 Phase 5b: the aggregated child budget of the placement tree.
+    const budgeted: DeferredPlacementEntry[] = [];
+    for (const e of entries) {
+      if (e.paramRoot !== undefined && isParametricReferenceNode(e.node)) {
+        const tally = this._paramTreeOf(e.paramRoot);
+        if (tally.placements >= this.maxParametricTreePlacements) {
+          refused.push({ reason: 'parametric-budget', node: e.node, label: e.label, ref: e.ref,
+            assetKey: this.keyOf(e.ref), chain: e.chain ?? [], depth: e.depth ?? 0 });
+          continue;
+        }
+        tally.placements++;
+      }
+      budgeted.push(e);
+    }
     for (const r of refused) {
+      const seg = identityIdOf(r.node);
+      if (seg) this._flushRouted(childOccurrence(parent.occurrence, seg), 'placement-refused');
       try { this._deps.onNestedRefused?.(r); } catch (err) {
         console.warn(`[PlacementInstancer] onNestedRefused failed: ${err}`);
       }
@@ -1051,8 +1548,9 @@ export class PlacementInstancer {
     const cap = this.maxPlacementsPerLoad;
     const accepted: DeferredPlacementEntry[] = [];
     let capped = 0;
-    for (const e of entries) {
+    for (const e of budgeted) {
       if (this._total + accepted.length >= cap) {
+        this._flushRouted(e.occurrence, 'placement-cap');
         capped++;
         this._capRefused++;
         if (this._capNodes.length < PLACEMENT_CAP_REPORTED_NODES) this._capNodes.push(e.node);
@@ -1073,7 +1571,205 @@ export class PlacementInstancer {
     this.materializeDeferred(accepted, nestedHooks);
   }
 
+  private _paramTreeOf(root: string): { placements: number; vertices: number } {
+    let t = this._paramTree.get(root);
+    if (!t) { t = { placements: 0, vertices: 0 }; this._paramTree.set(root, t); }
+    return t;
+  }
+
+  /**
+   * plan-650 Phase 5b: charge a nested child family's baked vertices to its
+   * placement tree. Over {@link maxParametricTreeVertices} -> refused as
+   * `parametric-budget` (the host draws the hole), nothing is materialised.
+   */
+  private _chargeParametricVertices(entry: DeferredPlacementEntry, baked: BakedAsset): boolean {
+    if (entry.nestedOf === undefined || entry.paramRoot === undefined || !isParametricReferenceNode(entry.node)) return true;
+    const tally = this._paramTreeOf(entry.paramRoot);
+    if (tally.vertices + baked.vertices > this.maxParametricTreeVertices) {
+      try {
+        this._deps.onNestedRefused?.({ reason: 'parametric-budget', node: entry.node, label: entry.label, ref: entry.ref,
+          assetKey: this.keyOf(entry.ref), chain: entry.chain ?? [], depth: entry.depth ?? 0 });
+      } catch (err) {
+        console.warn(`[PlacementInstancer] onNestedRefused failed: ${err}`);
+      }
+      // plan-769 F13: what outer placements routed into this occurrence has no target now.
+      this._flushRouted(entry.occurrence, 'placement-refused');
+      return false;
+    }
+    tally.vertices += baked.vertices;
+    return true;
+  }
+
   /** The chain a document-level placement starts from: the document's own key (F13). */
+  // ── Re-resolve (plan-778 F8) ─────────────────────────────────────────
+
+  /**
+   * A deferred placement fell into its placeholder. Remember it — with the
+   * library source that answered for it at that moment (null = none) — so a
+   * later change of the library registry can bring it back without a reload:
+   * Grant, Locate, a retry, a library that simply finished loading late.
+   * Only references with an identity are kept (a bare url never changes
+   * with the registry).
+   */
+  private _recordUnresolved(entry: DeferredPlacementEntry, hooks: DeferredPlacementHooks | undefined): void {
+    if (!entry.ref.catalogId) return;
+    this._unresolved.set(entry.id, { entry, hooks, generation: this._generation, source: this._registrySourceOf(entry.ref) });
+    if (!this._unsubSources) {
+      this._unsubSources = subscribeLibrarySources(() => this._reresolveUnresolved());
+    }
+  }
+
+  /** The registry answer as a key (null = none), never source identity — providers rebuild sources per notify (review C5). */
+  private _registrySourceOf(ref: PlacementRef): string | null {
+    const r = isQualifiedRef(ref)
+      ? findQualifiedOrigin({ assetId: ref.catalogId, providerId: ref.providerId, sourceId: ref.sourceId })?.registered
+      : findRegistryOrigin(ref.catalogId, ref);
+    return r ? `${r.providerId}|${r.source.id}|${r.source.loaded}|${r.source.error ?? ''}` : null;
+  }
+
+  /**
+   * The registry changed: every remembered placeholder whose reference now has
+   * a DIFFERENT answering source than when it failed (a qualified one: its own
+   * library turned ready; a legacy one: any source that now owns the id) is
+   * queued again. Its placeholder is removed first, the host is told
+   * ({@link PlacementInstancerDeps.onReresolve}) and the node re-marked as
+   * deferred — then it runs the one materialise order like a reload would.
+   * Nothing negative is cached anywhere on that path.
+   */
+  private _reresolveUnresolved(): void {
+    if (this._unresolved.size === 0) return;
+    const byHooks = new Map<DeferredPlacementHooks | undefined, DeferredPlacementEntry[]>();
+    for (const [id, u] of [...this._unresolved]) {
+      if (u.generation !== this._generation) { this._unresolved.delete(id); continue; }
+      const now = this._registrySourceOf(u.entry.ref);
+      if (!now || now === u.source) continue;
+      const node = u.entry.node;
+      const isLive = u.hooks?.isLive ?? this._deps.isLive;
+      this._unresolved.delete(id);
+      if (isLive && !isLive(node)) continue;
+      if (this._materializing.has(id)) continue;
+      for (const child of [...node.children]) {
+        if (!isMissingReferencePlaceholder(child)) continue;
+        node.remove(child);
+        disposePlaceholder(child);
+      }
+      try { this._deps.onReresolve?.(u.entry); } catch (err) {
+        console.warn(`[PlacementInstancer] onReresolve of "${u.entry.label}" failed: ${err}`);
+      }
+      markDeferredPlacement(node, u.entry.occurrence);
+      // It was counted once already; `materializeDeferred` counts it again.
+      this._total = Math.max(0, this._total - 1);
+      const list = byHooks.get(u.hooks);
+      if (list) list.push(u.entry); else byHooks.set(u.hooks, [u.entry]);
+    }
+    for (const [hooks, entries] of byHooks) this.materializeDeferred(entries, hooks);
+    if (this._unresolved.size === 0) this._clearUnresolved();
+  }
+
+  private _clearUnresolved(): void {
+    this._unresolved.clear();
+    this._unsubSources?.();
+    this._unsubSources = null;
+  }
+
+  /** Placeholders waiting for a library source (diagnostics, tests). */
+  get unresolvedCount(): number { return this._unresolved.size; }
+
+  // ── Source lost (plan-778 Decision D, the reverse of the re-resolve) ──
+
+  /**
+   * plan-778 Decision D for a placement that did NOT come through
+   * {@link materializeDeferred} — a live drop, a copy, a snap place, an undo
+   * restore, MCP `layout.place`: the host hands in its standing qualified
+   * placement (`entry.node` = the placement root, `entry.ref` with the stored
+   * qualifier) together with the hooks a reloaded one of it would get, and from
+   * then on it is treated exactly like a reloaded one: source gone →
+   * `lost` + placeholder (`missing`) + remembered as unresolved; source back →
+   * re-resolved in place through `register`.
+   *
+   * Idempotent per (id, instance), a no-op for a legacy reference, a root
+   * without an instance or one still materialising. A placement whose source
+   * is ALREADY gone when it is handed in is unseated right away — the host may
+   * call this from its own registry listener, in either order with the
+   * instancer's.
+   */
+  watchQualified(entry: DeferredPlacementEntry, hooks?: DeferredPlacementHooks): void {
+    if (!isQualifiedRef(entry.ref) || this._materializing.has(entry.id)) return;
+    const instance = this.instanceOf(entry.node);
+    if (!instance) return;
+    if (this._liveQualified.get(entry.id)?.instance === instance) return;
+    this._trackLiveQualified(entry, hooks, instance, false);
+    this._unseatLostQualified();
+  }
+
+  /** True while the qualified placement `id` is watched for its source going away (diagnostics, tests). */
+  isWatchingQualified(id: string): boolean {
+    return this._liveQualified.has(id);
+  }
+
+  private _trackLiveQualified(
+    entry: DeferredPlacementEntry,
+    hooks: DeferredPlacementHooks | undefined,
+    instance: PlacementInstance,
+    counted = true,
+  ): void {
+    this._liveQualified.set(entry.id, { entry, hooks, generation: this._generation, instance, counted });
+    this._unsubLive ??= subscribeLibrarySources(() => this._unseatLostQualified());
+  }
+
+  private _stopLiveWatch(): void {
+    this._unsubLive?.();
+    this._unsubLive = null;
+  }
+
+  /**
+   * The registry changed: every live qualified placement whose OWN source no
+   * longer answers for it (unregistered, locked, unknown, error — or the
+   * document is gone from a ready source) falls back into its placeholder: the
+   * host undoes its registration, the instance is released, the reference node
+   * stays and gets the same "Missing: <doc> from library <label>" placeholder
+   * a reload would draw, and the placement is remembered as unresolved so the
+   * source coming back (re-attach, Grant) restores it. A source that is merely
+   * PENDING (a project switch re-reading it) is not lost — the instance stands.
+   */
+  private _unseatLostQualified(): void {
+    if (this._liveQualified.size === 0) return;
+    for (const [id, live] of [...this._liveQualified]) {
+      if (live.generation !== this._generation) { this._liveQualified.delete(id); continue; }
+      const ref = live.entry.ref;
+      const qualifier = { assetId: ref.catalogId, providerId: ref.providerId, sourceId: ref.sourceId };
+      if (findQualifiedOrigin(qualifier)) continue;
+      if (qualifiedSourceState(qualifier) === 'pending') continue;
+      this._liveQualified.delete(id);
+      const node = live.entry.node;
+      const isLive = live.hooks?.isLive ?? this._deps.isLive;
+      if (isLive && !isLive(node)) continue;
+      if (this._materializing.has(id)) continue;
+      const lost = live.hooks?.lost ?? this._deps.lostDefault;
+      try { lost?.(live.entry, live.instance); } catch (err) {
+        console.warn(`[PlacementInstancer] lost() of "${live.entry.label}" failed: ${err}`);
+      }
+      // The host's teardown may already have released the instance; the call is a no-op then.
+      this.release(node);
+      for (const child of [...node.children]) {
+        if (isMissingReferencePlaceholder(child)) continue;
+        node.remove(child);
+      }
+      // A reloaded placement leaves the materialised count; a live one was never in
+      // the load's counters and joins them as missing (the re-resolve counts it as
+      // a deferred placement from here on).
+      if (live.counted) this._materialized = Math.max(0, this._materialized - 1);
+      else this._total++;
+      const missing = live.hooks?.missing ?? this._deps.missingDefault;
+      const reason = new Error(`library "${ref.sourceId}" is no longer available`);
+      try { missing?.(live.entry, reason); } catch (err) {
+        console.warn(`[PlacementInstancer] missing() of "${live.entry.label}" failed: ${err}`);
+      }
+      this._recordUnresolved(live.entry, live.hooks);
+    }
+    if (this._liveQualified.size === 0) this._stopLiveWatch();
+  }
+
   private _documentChain(): readonly string[] {
     return this._documentKey ? [this._documentKey] : [];
   }
@@ -1086,7 +1782,34 @@ export class PlacementInstancer {
    * own), THEN retire the document's bakes and drop the decoded masters. The
    * blob cache underneath keeps the bytes.
    */
-  clearDocument(): void {
+  clearDocument(opts?: {
+    /**
+     * plan-774 F6: keep the document's BAKED assets for the next load
+     * (`ModelCache.releaseDocument({ keepBaked: true })`) — instances are
+     * released as always, decoded masters and in-flight work are dropped as
+     * always. The next load that settles retires what it did not claim
+     * (`ModelCache.retireKept`). Default false = every bake retired (today).
+     */
+    keepBaked?: boolean;
+    /**
+     * plan-774 F6, descend: the next load is a CHILD of a document that comes
+     * back (Back) — its settle must not close the kept window, or the parent's
+     * other assets would be gone when Back reloads it. The window then stays
+     * open until a load cleared WITHOUT `holdKept` settles, or a clear without
+     * `keepBaked` retires everything. Ignored without `keepBaked`.
+     */
+    holdKept?: boolean;
+    /**
+     * The roots of the document being dropped (the viewer's model roots).
+     * Every bake instance under them is released HERE, whoever registered it —
+     * this instancer (`_ownedRoots`), a host hook (`DeferredPlacementHooks.register`,
+     * the layout planner's records) or a live drop. Keep = ASSETS, never
+     * instances: an instance left registered would hang in a detached tree
+     * until its host happened to release it, and would make a kept asset look
+     * claimed to the next load's `retireKept`.
+     */
+    documentRoots?: Iterable<Object3D>;
+  }): void {
     this._generation++;
     // A load that still owed its settle notification — sealed and pending, or
     // overtaken before the viewer could seal it — ends HERE, as aborted. A
@@ -1096,18 +1819,56 @@ export class PlacementInstancer {
     this._queue = Promise.resolve();
     this._loadOpen = false;
     if (owed) this._emitSettled(true);
+    // A kept window whose load never sealed (overtaken inside `loadModel`) ends
+    // here as well — BEFORE the release below, so what that load claimed counts
+    // as claimed and is kept again by this clear (aborted loads included).
+    this._endKeptWindow();
     this._total = 0;
     this._materialized = 0;
     this._capRefused = 0;
     this._capNodes.length = 0;
+    this._paramTree.clear();
     this._documentKey = null;
+    // 'unloaded': the document is gone, its overrides with it — nothing to report.
+    this._routed.clear();
+    this._instanceByOcc.clear();
+    this._clearUnresolved();
+    this._liveQualified.clear();
+    this._stopLiveWatch();
     this._notifyIdle();
     const registry = this.bakeRegistry;
     // Nested instances go with their owner (F4); a nested root owned here as
     // well is released by the first pass and a no-op for the second.
     for (const root of this._ownedRoots) registry.releaseSubtree(root);
     this._ownedRoots.clear();
-    this._cache?.clearDecoded();
+    // …and every other instance of the dropped document (host-registered
+    // placements included) — BEFORE the release below decides which assets are
+    // kept, and before the viewer's subtree dispose walks those roots.
+    if (opts?.documentRoots) for (const root of opts.documentRoots) registry.releaseSubtree(root);
+    const keepBaked = opts?.keepBaked === true;
+    this._cache?.releaseDocument({ keepBaked });
+    this._keptWindow = keepBaked && this._cache !== null ? (opts?.holdKept === true ? 'held' : 'open') : 'none';
+  }
+
+  /**
+   * Close the kept window (plan-774 F6) at the settle of the load that followed
+   * a `clearDocument({ keepBaked: true })` — settled or aborted — unless that
+   * clear held it (descend). Retires the kept assets this load did not claim.
+   */
+  /**
+   * plan-774 review fix E7: end an OPEN kept window now — for a load that
+   * failed (it never seals, so `_emitSettled` would never close it). Retires
+   * the kept assets nothing claimed. A held window (descend) and no window are
+   * left alone.
+   */
+  endKeptWindow(): void {
+    this._endKeptWindow();
+  }
+
+  private _endKeptWindow(): void {
+    if (this._keptWindow !== 'open') return;
+    this._keptWindow = 'none';
+    this._cache?.retireKept();
   }
 
   /** Terminal teardown — call AFTER every placement released its instance. */
@@ -1151,8 +1912,32 @@ function pivotWithDriveHomeStamps(root: Group): void {
   }
 }
 
+/** Free the GPU side of a removed missing-reference placeholder (LineSegments). */
+function disposePlaceholder(node: Object3D): void {
+  node.traverse((o) => {
+    const mesh = o as Object3D & { geometry?: { dispose?: () => void }; material?: { dispose?: () => void } | Array<{ dispose?: () => void }> };
+    mesh.geometry?.dispose?.();
+    const mats = Array.isArray(mesh.material) ? mesh.material : mesh.material ? [mesh.material] : [];
+    for (const m of mats) m.dispose?.();
+  });
+}
+
 function boundsVolume(node: Object3D): number {
   const b = getAssetReference(node)?.bounds;
   if (!b) return Number.POSITIVE_INFINITY;
   return (b.max[0] - b.min[0]) * (b.max[1] - b.min[1]) * (b.max[2] - b.min[2]);
+}
+
+/** Component types of a baked asset's template, cached per asset (plan-652 Phase 3). */
+const assetTypes = new WeakMap<BakedAsset, readonly string[]>();
+function componentTypesOf(baked: BakedAsset): readonly string[] {
+  let types = assetTypes.get(baked);
+  if (!types) {
+    const set = collectComponentTypes(baked.template);
+    // Logic-node templates may live outside the template graph (in-place bake).
+    for (const logic of baked.logicNodes) for (const t of collectComponentTypes(logic.template)) set.add(t);
+    types = [...set];
+    assetTypes.set(baked, types);
+  }
+  return types;
 }

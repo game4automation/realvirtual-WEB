@@ -4,6 +4,7 @@ import { RVScriptHost } from '../src/core/engine/rv-script-host';
 import { RVLogicEngine } from '../src/core/engine/rv-logic-engine';
 import { RVJavaScriptStep, StepState } from '../src/core/engine/rv-logic-step';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
+import { StatsRegistry } from '../src/core/stats/rv-stats-registry';
 import { RVTransportManager } from '../src/core/engine/rv-transport-manager';
 import { SignalStore } from '../src/core/engine/rv-signal-store';
 import type { RVSensor } from '../src/core/engine/rv-sensor';
@@ -44,7 +45,9 @@ describe('web-native scripting scene API', () => {
     const f = fixture();
     expect(f.step).toBeInstanceOf(RVJavaScriptStep);
     const plugin = new WebComponentPlugin();
-    const viewer = { transportManager: f.manager, logicEngine: f.logic } as RVViewer;
+    // plan-2011: the script env takes its stat rows from the viewer's own registry
+    // (`viewer.stats`), so the double carries a real one rather than undefined.
+    const viewer = { transportManager: f.manager, logicEngine: f.logic, stats: new StatsRegistry() } as RVViewer;
     const build = (plugin as unknown as { makeEnvFactory(result: LoadResult, viewer: RVViewer): WebComponentEnvFactory })
       .makeEnvFactory({ root: f.root, registry: f.registry, signalStore: f.signals } as LoadResult, viewer);
     const env = build({ nodePath: 'Festo/Script', nodeName: 'Script', node: f.stepNode, props: {},

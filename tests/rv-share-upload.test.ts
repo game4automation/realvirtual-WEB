@@ -581,6 +581,8 @@ describe('plan-386 §9.3 — dialog and magic link', () => {
     expect((screen.getByTestId('share-terms') as HTMLInputElement).checked).toBe(true);
     expect(screen.getByTestId('share-identity').textContent).toContain(email);
 
+    // The upload stays locked until /limits answered for this session (plan-2209).
+    await waitFor(() => expect((screen.getByTestId('share-submit') as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(screen.getByTestId('share-submit'));
     const link = await screen.findByTestId('share-link');
     expect((link as HTMLInputElement).value).toContain('glb=s%3A');
@@ -613,7 +615,8 @@ describe('plan-386 §9.3 — dialog and magic link', () => {
     expect((screen.getByTestId('share-submit') as HTMLButtonElement).disabled).toBe(true);
 
     fireEvent.click(screen.getByTestId('share-terms'));
-    expect((screen.getByTestId('share-submit') as HTMLButtonElement).disabled).toBe(false);
+    // The upload stays locked until /limits answered for this session (plan-2209).
+    await waitFor(() => expect((screen.getByTestId('share-submit') as HTMLButtonElement).disabled).toBe(false));
 
     // Default expiry is "never" and downloads are allowed unless switched off.
     expect((screen.getByTestId('share-expiry-never') as HTMLInputElement).checked).toBe(true);
@@ -626,11 +629,13 @@ describe('plan-386 §9.3 — dialog and magic link', () => {
     }));
 
     fireEvent.click(screen.getByTestId('share-terms'));
+    // The upload stays locked until /limits answered for this session (plan-2209).
+    await waitFor(() => expect((screen.getByTestId('share-submit') as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(screen.getByTestId('share-submit'));
 
     await screen.findByTestId('share-email');
     // Not one byte was offered before the sign-in step (F9).
-    expect(stub.requests).toHaveLength(0);
+    expect(stub.requests.filter(r => !r.url.endsWith('/limits'))).toHaveLength(0);
     // And the form was saved so the round trip returns to a filled dialog.
     expect(loadShareDraft()?.terms?.version).toBe(SHARE_TERMS_VERSION);
   });
@@ -662,7 +667,7 @@ describe('plan-386 §9.3 — dialog and magic link', () => {
     expect((link as HTMLInputElement).value)
       .toBe(`${LINK_BASE}?glb=${encodeURIComponent('https://raw.githubusercontent.test/me/repo/main/cell.glb')}&mode=viewer`);
     expect(getShareSession()).toBeNull();
-    expect(stub.requests).toHaveLength(0);
+    expect(stub.requests.filter(r => !r.url.endsWith('/limits'))).toHaveLength(0);
     expect(screen.queryByTestId('share-expires')).toBeNull();
   });
 });

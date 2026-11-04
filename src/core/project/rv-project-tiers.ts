@@ -36,7 +36,6 @@
 import type {
   RvDocumentEntry,
   RvProject,
-  RvProjectAssetEntry,
 } from './rv-project-types';
 
 /** Which level an entry came from. */
@@ -50,11 +49,10 @@ export type ProjectTier = 'bundled' | 'user';
 // were moved off it in Phase 5 — so what remained was a second answer to a
 // question with one answer. `tests/document-tiers-scan.test.ts` covers the
 // surviving merge.
-
-export type TieredAssetEntry = RvProjectAssetEntry & {
-  tier: ProjectTier;
-  forkedFrom?: string;
-};
+//
+// `TieredAssetEntry` and `mergeAssetTiers` followed (plan-777 P3): they fed the
+// snapshot's `models` view, a place filter over `documents` with one reader
+// that already had the document row in hand.
 
 /** Result of merging the two levels of one section. */
 export interface MergedTiers<T> {
@@ -65,15 +63,6 @@ export interface MergedTiers<T> {
 }
 
 // ─── Merge ──────────────────────────────────────────────────────────────
-
-/** Same merge for `models[]` / `library[]`, keyed on `path`. */
-export function mergeAssetTiers(
-  bundled: readonly RvProjectAssetEntry[],
-  user: readonly RvProjectAssetEntry[],
-  hidden: readonly string[] = [],
-): MergedTiers<TieredAssetEntry> {
-  return mergeTiers(bundled, user, hidden, e => e.path);
-}
 
 function mergeTiers<E extends Record<string, unknown>>(
   bundled: readonly E[],
@@ -151,11 +140,11 @@ export type TieredDocumentEntry = RvDocumentEntry & {
 };
 
 /**
- * The one merge. It replaced a scene-shaped and an asset-shaped variant; only
- * {@link mergeAssetTiers} is still around, for the models list.
+ * The one merge. It replaced a scene-shaped and an asset-shaped variant, and
+ * since plan-777 also the asset-shaped merge of the models view.
  *
- * Same algorithm, one key rule: `id` when the entry has one, `path` otherwise —
- * `assetEntryKey()` semantics, which is what makes a document minted from an
+ * Same algorithm, one key rule: `id` when the entry has one, `path` otherwise,
+ * which is what makes a document minted from an
  * id-less asset entry keep answering to the path it was addressed by. A fork's
  * `forkedFrom` is looked up under **both**, because the two legacy merges
  * recorded two different things there and neither may stop working

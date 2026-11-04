@@ -1,6 +1,6 @@
 # AI Integration & the MCP Bridge
 
-> **Applies to:** Community browser inspection/control through CONNECT or the Node fallback. Tools for commercial authoring, DES or PLC require those modules. CONNECT and Unity are separate installations.
+> **Applies to:** Community browser inspection/control through CONNECT or the Node fallback. Tools for commercial authoring or the virtual PLC require those modules; DES core tools are Community; experiment-manager tools become commercial (ADR-054). CONNECT and Unity are separate installations.
 > **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
 > See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
 
@@ -9,6 +9,28 @@ Desktop) through an **MCP bridge**. Once connected, the assistant can inspect
 and control the live browser scene — read drives, signals, sensors and transport
 state, drive the simulation, capture screenshots, and build layouts in the Layout
 Planner — using a set of `web_*` tools.
+
+## Tools, commands and the read door (plan-2007)
+
+Tools cover session, navigation, meta operations and images. Every model or simulation
+change goes through a registry command via `web_execute("<id>", args)` or `web_batch`:
+the same rule check and, where supported, undo step and macro line as the UI.
+Domain queries are read-only commands via `web_query("<id>", args)`;
+`web_commands(query)` lists ids, argument schemas and the appropriate `door`.
+
+Long commands with `timeoutMs > 120000` (120 s), including `editor.importCad` and
+`mechanism.trajectoryRun`, automatically return a `jobId`. Follow it with
+`web_macro_status` or request cancellation with `web_macro_cancel`; imports are
+not cancellable and return `kind:"not-cancellable"` while continuing to completion.
+For one release, an old tool name returns
+`{"error":"MOVED", movedTo, use, example, removedAfter:"6.7.0"}` with its replacement;
+it is absent from `tools/list`.
+
+CONNECT classifies `web_execute` and `web_batch` by the strictest named command in
+`McpCommandClassAllowlist.cs`; unparsable calls are `destructive`, and `web_query`
+is `read`. `web_macro_replay` uses the strictest class of all macro-enabled commands.
+An outdated CONNECT without `capabilities.commandClasses` refuses moved sim/signal/file
+commands (and other moved targets stricter than edit) with `kind:'gateway-outdated'`.
 
 **realvirtual CONNECT is the default transport.** It hosts the MCP endpoint itself, so
 nothing extra has to be installed. The local **Node bridge** remains fully supported as the
@@ -19,18 +41,58 @@ in-app **AI Bridge** status panel, the AI activity indicator, the `web_screensho
 options, and troubleshooting. For the exhaustive per-tool reference see
 [`webviewer.mcp.md`](webviewer.mcp.md).
 
+## Choosing viewer or CONNECT configuration tools
+
+Choose by the object being changed:
+
+| Coupling | Task | Tools |
+|---|---|---|
+| K1: model signal ↔ interface signal | Configure a controller signal under the exact model signal name | CONNECT `interface_signal_list`, then `interface_signals_apply` |
+| K2: interface ↔ interface | Mirror a source into MQTT/SHM, or map one signal to another | CONNECT `bridge_list`, then `bridges_apply` |
+| K3: component slot ↔ signal | Assign a signal to a model component's slot | Viewer `web_query("signal.bindingsList")`, `web_query("signal.sourcesList")`, then `web_execute` with `signal.bind` |
+
+Use `web_*` for inspecting or editing the viewer, scene, components and slot bindings. The CONNECT
+configuration tools run against the gateway and do not require a browser scene. They do not edit
+model slots. Read first: `interface_signal_list` returns the address schema and containers, and both
+read tools return `revision` and `instance`. Pass those as `expectedRevision` and `expectedInstance`
+to the corresponding apply tool. Each apply is one atomic batch of at most 500 operations; after a
+`revision-conflict`, read again and review the changes before retrying.
+
+`interface_signals_apply` accepts `signal.upsert`, `signal.remove` and `container.replace` for one
+interface. `bridges_apply` accepts `mirror.upsert/remove` and `mapping.upsert/remove`. Both require
+CONNECT's **MCP server → Allow write access** switch (`McpAllowWrite`). The read tools remain
+available with that switch off. This configuration permission is separate from an interface's
+**Allow web to PLC** switch, which controls runtime writes to the controller.
+
+**Address ownership (plan-589).** Keep the exact symbolic name in `name`; store the controller
+address only in CONNECT's `protocolAddress`. Match discovery `symbolKey` exactly and copy its
+`protocolAddress`, not its display label. Comments describe meaning; do not put addresses into
+comments, model metadata or GLB fields. Use `addressMode: "fillEmpty"` to preserve existing
+addresses. Case and quote variants are suggestions to review, never automatic matches.
+
+The viewer's **Fill addresses from controller** and **Import address table** dialogs provide
+previews. There are no `signal.fillAddresses` or `signal.importAddressTable` commands; automation
+uses the CONNECT configuration tools with the corresponding signal operations.
+
 ## Tool ownership: which server serves what
 
 Exactly one MCP host owns each tool family. There is no overlap:
 
 | Host | Owns | Tool prefix |
 |------|------|-------------|
-| **realvirtual CONNECT** (C#, `http://localhost:5100/mcp`) | the `web_*` browser tools **and** the CONNECT gateway tools (`signal_list`, `signal_read`, `interfaces_status`, `health`) | `mcp__realvirtual-CONNECT__…` |
+| **realvirtual CONNECT** (C#, `http://localhost:5100/mcp`) | the `web_*` browser tools **and** native gateway tools: runtime signals/status plus `interface_signal_list`, `interface_signals_apply`, `bridge_list`, `bridges_apply` | `mcp__realvirtual-CONNECT__…` |
 | **Unity MCP server** (Python, `unity_mcp_server.py`) | the 80+ Unity Editor tools (scene, prefabs, play mode, recompile) | `mcp__UnityMCP__…` |
 
 CONNECT is the default transport for `web_*`: it is same-origin with the delivered HMI,
 needs neither Node nor Vite on the customer machine, and is the only path that works for a
 static WebViewer delivery.
+
+The `/webviewer` socket is **CONNECT infrastructure**, separate from **AI control**. When
+CONNECT serves the page (marker cookie or same-origin `/health` with CONNECT's signature,
+including the dev proxy), the channel stays connected with AI on or off. SolidCraft sync,
+server log relay and owner/standby status use it without AI. The switch in *Settings ▸ AI*
+only permits AI agents / MCP clients to control this tab. CONNECT publishes browser tools only
+for an AI-on owner and also enforces the switch on calls, including local MCP calls.
 
 The Python server still carries a historic `web_*` proxy on port 18712. It is **not** the
 intended path, and since MCP package 1.1.2 it no longer starts by default: it needs the opt-in
@@ -75,10 +137,12 @@ The connection is a three-link chain. Only the middle link differs between the t
 - The **Node bridge** is instead launched by Claude as a stdio child process (from
   `.mcp.json` / the Claude Desktop config) and hosts its own WebSocket server.
 - Either way the **browser** connects as a WebSocket client to `/webviewer`.
-- The browser **owns the tools**: on connect it sends a `discover` message with the
-  `web_*` tool schemas (generated from `@McpTool` decorators in
-  `src/plugins/mcp-bridge-plugin.ts`) plus the `webviewer.mcp.md` instructions. The
-  server registers them as MCP tools and forwards every tool call to the browser.
+- The browser **owns the tools**: on connect it sends `discover` with `ai` and the `web_*`
+  tool schemas (generated from `@McpTool` decorators in `src/plugins/mcp-bridge-plugin.ts`)
+  plus the `webviewer.mcp.md` instructions. With AI off it announces `tools: []`, `ai: false`;
+  `viewer_status` also carries `ai`. CONNECT publishes only the AI-on owner's catalog.
+  The browser refuses every non-internal call with `AI_DISABLED:`, including calls by name,
+  aliases and `web_ping`.
 
 Because the browser defines the tools, neither server needs tool knowledge — both are
 generic relays. A tool added to `McpBridgePlugin` appears automatically after a reconnect.
@@ -145,10 +209,12 @@ CONNECT is possible but out of scope and at your own risk.
    }
    ```
 
-3. **Restart the client**, then enable **AI Bridge** in the WebViewer (toggle in the panel).
-   Leave **CONNECT** selected under *Connect to*. This also works against the Vite dev
-   server on 5173 — the default already targets 5100, and `?mcpPort=5100` pins it
-   explicitly. On a **hosted** page (the demo on `web.realvirtual.io`, a customer site) the
+3. **Restart the client**, then switch on **AI control** in the WebViewer (*Settings ▸ AI*)
+   and accept the one-time consent dialog. Leave **Port** at its CONNECT default (5100).
+   A dev page served through CONNECT's proxy
+   talks to the CONNECT that serves it (same-origin `/health` probe) — a worktree CONNECT on
+   another port included, no `?mcpPort=` needed. A bare Vite page (no CONNECT behind its
+   origin) targets 5100; `?mcpPort=<port>` pins any port explicitly. On a **hosted** page (the demo on `web.realvirtual.io`, a customer site) the
    bridge connects to `ws://localhost:5100/webviewer` by itself; CONNECT asks once in its tray
    whether that site may — see *Hosted page → local CONNECT (pairing)* below.
 
@@ -177,14 +243,22 @@ Stated plainly, because a half-described boundary is worse than a named one:
 - **The write gate** (`McpAllowWrite`, plus the per-tool `readOnlyHint`) prevents *accidental*
   mutation by an agent. It does not defend against a manipulated browser — the browser decides
   what a tool actually does, and could offer mutating behaviour under a read-only name.
-- **Timeouts do not guarantee "not executed".** When a call exceeds its `timeoutMs`, CONNECT
-  reports the browser call id together with `outcome: unknown` and does **not** retry. The work
-  may well have completed in the browser. There is deliberately **no idempotency key and no
-  cancellation acknowledgement**: a client that retries on its own can therefore trigger a
-  mutation twice (a CAD import running twice, for example). Treat a timed-out writing tool as
-  "state unknown" and verify before repeating it.
-- **A late result never reaches the MCP client.** After a `tools/call` error the protocol has no
-  way back. Late results land in a bounded, TTL-limited audit and in the browser log only.
+- **A timeout is `running: true`, not an error (plan-626).** When a call exceeds its
+  `timeoutMs`, CONNECT answers `{running: true, callId, message: "Still running. Do not resend.
+  Call web_call_pending {callId}."}` and keeps following the call for the asking MCP session.
+  `web_call_pending {callId}` reports `running`, `done` (with the result), `error`, `expired` or
+  `cancelled`; `{callId, cancel: true}` stops following it — the browser may still execute it, and
+  a result arriving afterwards only lands in the audit. CONNECT keeps at most 64 followed calls and
+  32 MiB of results, each for 5 minutes; a session that ends or a tab change expires them. There is
+  still **no retry and no idempotency key**: resending a running writing call can execute it twice.
+  The Node bridge fallback has no `web_call_pending` and still answers a timeout with
+  `outcome: unknown`.
+- **Tool classes and the call policy (plan-626).** Every tool has a class — `read`, `edit`, `sim`,
+  `signal`, `save`, `destructive` or `file` — derived in `src/plugins/mcp-bridge/rv-mcp-tool-class.ts`
+  and generated into CONNECT's `McpToolClassAllowlist.cs` (`npm run gen:mcp-docs`). The class is
+  never announced by the browser. CONNECT hands it to the session's call policy before it routes
+  the call (native and `web_*` alike); the default policy allows everything and leaves the gates
+  above unchanged, a chat session can register one that denies or asks.
 - **DNS rebinding against `/webviewer` remains possible without a configured `ApiKey`.** The
   same-origin rule cannot close it, because CONNECT is meant to serve remote HMIs under arbitrary
   host names — during a rebind the attacker's Origin and Host agree. The effective countermeasure
@@ -202,15 +276,17 @@ proxy, `X-Forwarded-For` is honoured only when the proxy address is listed in `T
 ### Hosted page → local CONNECT (pairing)
 
 A page that CONNECT did not serve — the demo on `https://web.realvirtual.io`, a customer's own
-site — has no `/webviewer` of its own. The bridge recognises that case and connects to the
-CONNECT on **this** machine instead:
+site — has no `/webviewer` of its own. When AI control or an explicit connection action needs
+the channel, the bridge connects to CONNECT on **this** machine instead:
 
 - **Target.** Not served by CONNECT (no `rv_connect_origin` marker cookie, and the page's own
   `/health` does not answer like CONNECT), not a loopback page, not the Vite dev server →
   `ws://localhost:<port>/webviewer`, port from the panel (default 5100). No URL parameter is
   needed; the **Target** row in the panel shows the exact address. The `/health` check is
-  same-origin, runs once, and only after you switch the bridge on — a visit alone never touches
-  localhost.
+  same-origin and runs once even with AI off, without a Local-Network-Access prompt. A hosted
+  page, bare Vite server or foreign loopback port does not open a channel automatically: it
+  needs AI control on or `acquireChannel(holder)` from a user action such as SolidCraft Connect.
+  `releaseChannel(holder)` closes it when neither AI nor another holder needs it.
 - **Pairing.** CONNECT does not know the site yet, so it accepts the WebSocket, closes it with
   `4401 pairing-pending` and shows a prompt in its **tray**: the site's origin and what it may
   do (*control the 3D viewer for your AI assistant and send it content*). There is no default
@@ -284,37 +360,35 @@ deprecated, and switching in either direction is a single move.
    }
    ```
 
-3. **Point the browser at it** — *Connect to ▸ Node · Desktop* (18714) or *Node · Code*
-   (18715) in the AI Bridge panel, or open realvirtual with `?mcpPort=18714`.
+3. **Point the browser at it** — set **Port** to 18714 (Node · Desktop) or 18715 (Node · Code)
+   in *Settings ▸ AI*, or open realvirtual with `?mcpPort=18714`; switch on **AI control**.
 
 > `claude mcp add|remove --scope project` rewrites `.mcp.json` from `mcpServers` alone and
 > silently drops `_disabledMcpServers` and `_ownership`. Restore both by hand after using it.
 
 ## The AI Bridge panel
 
-Open it from the **AI Bridge** button in the activity bar, or *Settings ▸ AI*. The
-status section shows the **full chain** — not just the WebSocket link, but whether a
-live AI client is actually attached and what it is doing.
+Open it from the activity bar, or *Settings ▸ AI*. The panel separates the **CONNECT channel**
+from **AI control**. The channel section is outside the consent gate, so its state, target,
+failure cause and **Retry Now** remain visible without accepting AI access.
 
-The button is always offered, whether or not a bridge is connected — a deploy can still
-remove it through the activity-bar feature matrix. On mobile the activity bar has no room
-for it, so *Settings ▸ AI* is the only entry there.
+The activity-bar entry is always offered unless removed through the feature matrix. On mobile,
+use *Settings ▸ AI*. Before **AI control** is switched on, a one-time consent dialog explains
+access to the scene, PLC signals (including writes) and simulation. Consent is stored per device
+as a scope version under `rv-ai-bridge-consent`; widening the scope asks again. Opening or using
+the CONNECT channel does not grant consent.
 
-Two things happen before the panel appears:
+The AI prompt panel (private builds, plan-2041) stores two per-device keys
+(`rv-storage-keys.ts`): `rv-ai-prompt-backend` (preferred local CLI backend) and
+`rv-ai-prompt-sessions` (workspace-partitioned resume metadata of prompt sessions).
 
-- **No CONNECT answered.** CONNECT hosts the MCP server, so without it there is nothing to
-  configure. The click answers with a short note and the CONNECT download (stable, plus beta
-  when one exists) instead of an empty panel.
-- **First open on this device.** A one-time dialog states what a connected assistant may
-  reach — the full scene, every PLC signal including writes, and the simulation — and how far
-  that reaches: usable on this machine without any configuration, answerable from another
-  machine only with a valid `ApiKey`. *Got it* and *Configure…* both record the
-  acknowledgement and open the panel; *Not now* (or Escape) leaves without agreeing to
-  anything. The acknowledgement is stored per device under the key `rv-ai-bridge-consent`,
-  and it stores the accepted **scope version**, so widening what the bridge may reach asks
-  once more. It is never granted implicitly.
+The switch keeps the existing localStorage `rv-ai-bridge` format (`enabled` and port);
+`rv-ai-bridge.enabled` now governs AI control only. On an open channel, toggling sends fresh
+`discover` and `viewer_status` frames immediately, without reconnecting. A call already running
+when AI is switched off ends normally. Only the UI switch enables AI in product code; the
+launcher script writes storage directly. SolidCraft Connect no longer switches AI on.
 
-![The AI Bridge panel: full-chain status, port presets, server controls and the live tool list](docs/images/screenshot-ai-bridge-panel.png)
+![The AI Bridge panel: channel status, AI control and the live tool list](docs/images/screenshot-ai-bridge-panel.png)
 
 ### Status rows
 
@@ -322,20 +396,25 @@ Two things happen before the panel appears:
 
 | Row | Meaning |
 |-----|---------|
-| **Browser → Bridge** | The browser↔bridge link: *Connected* (the bridge sent its first status), *Reconnecting*, *Disconnected*, *Disabled* — or the concrete cause (e.g. *Waiting for approval*, *CONNECT not reachable*) with a hint below the rows; see *Hosted page → local CONNECT (pairing)*. |
+| **CONNECT channel** | *Connected*, *Connecting*, *Not connected*, or reconnect/failure details with a hint and **Retry Now**; independent of AI consent and the AI switch. |
+| **Why** | *served by CONNECT*, *opened for AI control*, or *opened for a connection (e.g. SolidCraft)*. |
 | **Target** | The WebSocket address the bridge connects to (never with the key), e.g. `ws://localhost:5100/webviewer`. |
+| **AI control** | Whether AI agents / MCP clients may control this tab. The AI section sits below the channel section. |
+| **This tab** | Owner/standby status; a new connection stays pending until CONNECT has its first announcement. |
 | **AI client** | The MCP host attached to the bridge, e.g. `claude-code`. This is the real proof an assistant is connected — a connected WebSocket alone does not mean a live AI is present. |
 | **Last AI activity** | Time since the assistant's last request (a tool call or tool list), e.g. *just now* / *2s ago*. *idle* when nothing has happened yet. |
-| **Tools** | Number of `web_*` tools registered from the browser. |
+| **Tools** | Number of announced `web_*` tools, or **0 (AI off)**. |
 | **Port** | The port the browser is connected to. |
 | **Bridge** | Bridge process identity: `pid · :port · uptime`. Disambiguates duplicate bridges and shows how long it has been running. |
 
 ### Controls
 
-- **Connect to** — one-click switch between **CONNECT** (5100, the default), **Node · Desktop**
-  (18714) and **Node · Code** (18715). The **Port** field sets any custom port; picking
-  CONNECT's default port also restores same-origin resolution, so an HMI served by a remote
+- **AI control** — allow AI agents / MCP clients to control the tab, after consent. It does
+  not disable a channel needed by CONNECT or a connection such as SolidCraft.
+- **Port** — CONNECT defaults to 5100; the Node fallbacks use 18714 (Desktop) / 18715 (Code).
+  Setting CONNECT's default port restores same-origin resolution, so an HMI served by a remote
   CONNECT keeps using its own origin instead of `localhost`.
+- **Show AI clicks** — on by default, per device (`rv-mcp-ai-clicks`): animate AI button clicks; turn off for fast agent runs. Also available in the AI prompt toolbar.
 - **Follow agent** — on by default, per device (`rv-mcp-follow-agent`): the camera flies to
   what the assistant changes while you are not using the view. See *Follow agent* below.
 - **Pause / Resume** — stop or resume accepting browser connections.
@@ -344,14 +423,52 @@ Two things happen before the panel appears:
 - **Registered Tools** — the live list of `web_*` tools the assistant can call.
 - **Server Log** — log lines streamed from the bridge (bind, connect, discover, …).
 
+### AI prompt panel
+
+When CONNECT reports at least one local AI backend as available, the **AI Bridge** entry in the
+activity bar opens a floating **AI** panel. Clicking the entry again closes the panel; the entry
+stays highlighted while either AI control is connected or the panel is open. Enable
+*Details › MCP server › Allow prompt window* in the CONNECT tray first. CONNECT asks for
+confirmation because the panel runs the selected signed-in CLI with the permissions and
+configuration of that local installation. If the prompt service is unavailable, the entry keeps
+its normal route to *Settings › AI*. The gear in the panel title bar opens that settings page.
+
+The backend selector lists only available installations: **Claude Code**, **Codex**, or both.
+Changing backend starts a new session. **New session**, `/clear`, and `/new` also clear the current
+session locally; any other slash command, such as `/weblayout`, is passed unchanged to the selected
+CLI. The **Recent** menu lists up to 20 sessions from the current CONNECT workspace. Choosing one
+resumes it and shows a `Continuing session from <time> — <title>` notice; the old transcript is not
+reconstructed.
+
+The selection chip above the input follows the live Viewer selection (`◎ Cell/Cylinder` or
+`◎ 3 selected`). Its **×** omits that selection from the next prompt only. Sent user entries retain
+their selection snapshot even if the Viewer selection changes later. Tool-result images appear as
+thumbnails in their tool row; click a thumbnail to open the full image in a dialog.
+
+The global search dropdown adds **Ask AI agent: "<query>"** above node results whenever the prompt
+backend is available, including when the query has no node matches. It opens the panel and submits
+the query. The existing **Ask AI** documentation search remains a separate action.
+
+A run can be started or cancelled through the command registry as well as through the visible controls:
+
+```text
+web_execute("ai.prompt", {"prompt":"Inspect the active document and kinematize the selected part."})
+web_execute("ai.cancel", {})
+```
+
+Tutorial storyboards can use `[data-rv-ai="panel"]`, `[data-rv-ai="input"]`,
+`[data-rv-ai="send"]`, `[data-rv-ai="cancel"]`, `[data-rv-ai="selection"]`,
+`[data-rv-ai="backend"]` and `[data-rv-ai="settings"]`. The panel exposes its run state as
+`data-rv-ai-state="idle|running|error"`; the recording target `ai-prompt` provides the keys
+`input`, `send`, `cancel`, `selection`, `backend` and `settings` for pointer actions.
+
 ## AI activity indicator
 
-The **AI Bridge button** itself carries the connection: its icon stands in the
-**accent color** for as long as the bridge is connected, and stays neutral when it is
-off or still reconnecting. Its tooltip names the state — *off*, *connecting…* or
-*connected (N tools)*, with the running operation appended while one is in flight.
+The activity-bar entry is titled **AI control — off** or **AI control — on (N tools)**.
+Its icon uses the **accent color** only when the channel is connected **and** AI control is on.
+The AI activity overlay and agent-eye badge are also shown only with AI control on.
 
-While the assistant performs an action, a pill in the accent color appears next to
+While AI control is on and the assistant performs an action, a pill in the accent color appears next to
 the AI Bridge button (over the 3D scene) showing the current operation, e.g.
 `AI · Drive list`. It auto-clears a few seconds after the last action.
 
@@ -359,41 +476,53 @@ the AI Bridge button (over the 3D scene) showing the current operation, e.g.
 
 The accent color follows the theme, so custom branding recolors it automatically.
 
+**Agent cursor (plan-626).** Every *writing* call marks what it touches — the nodes named in its
+arguments and the ones its result creates (the placement `layout.place` just made, a node
+`editor.createEmpty` added) — in the hover colour, steady, for the call and 1.5 s after it. Tools
+outside the editor feedback table also ask the follow-agent policy whether to move the camera.
+The last 50 writing calls (tool, class, targets, ok) stay in `agent-cursor-store.ts` for the chat
+panel.
+
 ## Tools overview
 
 The `web_*` tools fall into these groups (full reference in
 [`webviewer.mcp.md`](webviewer.mcp.md)):
 
-- **Inspect** — `web_status`, `web_drive_list`, `web_signal_list`, `web_sensor_list`,
-  `web_transport_status`, `web_logic_flow`, `web_node_find`, `web_node_tree`,
+Dotted names (`drive.jog`, `editor.setField`, `layout.place`, …) are registry commands, run with
+`web_execute` / `web_batch`. Their command-bound alias tools (`web_drive_jog`, …) still answer
+`tools/call` but are not in tools/list since 2026-10-21 (plan-641); emergency switch: viewer URL
+`?mcpAliases=1` or `localStorage['rv-mcp-list-aliases']='1'`, Node bridge `RV_MCP_LIST_ALIASES=1`.
+
+- **Inspect** — `web_status`, `web_query("drive.list", {})`, `web_signal_list`, `web_query("sensor.list", {})`,
+  `web_query("transport.status", {})`, `web_query("logic.flow", {})`, `web_node_find`, `web_node_tree`,
   `web_component_get`, `web_component_get_all`, `web_component_list`, `web_logs`.
-- **Control** — `web_signal_set_bool`, `web_signal_set_float`, `web_drive_jog`,
-  `web_drive_stop`, `web_drive_speed_override`, `web_sim_play_pause`, `web_sim_reset`,
-  `web_view_source_markers`.
+- **Control** — `signal.setBool`, `signal.setFloat`, `drive.jog`,
+  `drive.stop`, `sim.speedOverride`, `sim.playPause`, `sim.reset`,
+  `web_execute("view.sourceMarkers", {visible:true})`.
 - **Screenshot** — `web_screenshot`, `web_screenshot_burst`,
   `web_screenshot_analyze` (see below).
-- **Authoring** (Layout Planner) — `web_mode_set`, `web_catalog_list`,
-  `web_catalog_describe`, `web_layout_place`, `web_layout_move`, `web_layout_remove`,
-  `web_layout_list`, `web_layout_snap_list`, `web_layout_snap_suggest`,
-  `web_layout_snap_attach`, `web_component_set`, `web_document_new`, `web_document_save`,
-  `web_layout_export`, `web_document_list`, `web_document_open`.
+- **Authoring** (Layout Planner) — `web_execute("workspace.setMode", {mode:"planner"})`, `web_query("library.catalogList", {})`,
+  `web_query("library.catalogDescribe", {catalogId})`, `layout.place`, `layout.move`, `layout.remove`,
+  `web_query("layout.list", {})`, `web_query("layout.snapList", {id})`, `web_query("layout.snapSuggest", {targetId})`,
+  `layout.snapAttach`, `web_execute("component.setFields", {path, type, props})`, `web_execute("document.create", {name})`, `web_document_save`,
+  `web_query("layout.export", {})`, `web_document_list`, `web_document_open`.
   *(2026-08-19 rework: asset = document = model — one concept, one `web_document_*`
   family. The old `web_scene_*`, `web_model_*` and `web_library_*` names are retired;
   the parts catalogue is `web_catalog_*`, and the planner-snapshot export is
-  `web_layout_export`.)*
-- **Signal binding** (plan-425) — `web_signal_bindings_list`, `web_signal_sources_list`
-  (read-only) and `web_signal_bind`, `web_signal_unbind` (write). See *Autobinding a PLC*
+  `web_layout_export` (now `layout.export` via `web_query`).)*
+- **Signal binding** (plan-425) — `web_query("signal.bindingsList", {})`, `web_query("signal.sourcesList", {})`
+  (read-only) and `signal.bind`, `signal.unbind` (write). See *Autobinding a PLC*
   below.
-- **Node knowledge** (plan-394) — `web_knowledge_get`, `web_knowledge_list` (read-only) and
-  `web_knowledge_set` (write): one overwritable Markdown note per scene node, stored in the
+- **Node knowledge** (plan-394) — `web_query("knowledge.get", {path})`, `web_query("knowledge.list", {})` (read-only) and
+  `knowledge.set` (write): one overwritable Markdown note per scene node, stored in the
   GLB, so what one session works out is available to the next. See *Node knowledge (agent
   memory)* below.
-- **Help** — `web_help(topic)` serves the deep workflow guides
+- **Help** — `web_help(topic)` serves the deep workflow guides, including `scripting` for component scripts,
   (`src/plugins/mcp-bridge/help/*.md`) on demand; the always-loaded server
   instructions stay a compact map.
 - **Orient** (plan-707) — `web_describe` answers "where am I, what is blocked, what next"
   in one read-only call. See *Orientation and effect verification* below.
-- **Link out** (plan-437) — `web_link_compose` is the counterpart to every tool that OPENS
+- **Link out** (plan-437) — `web_query("link.compose", {})` is the counterpart to every tool that OPENS
   something: it hands back a URL. Called with no arguments it snapshots the current state
   (document or model, the *live* active mode, the model option) into a link that reproduces
   it; called with `model`/`glb`/`doc`/`scene`/`mode`/`option` it validates each against the
@@ -403,7 +532,7 @@ The `web_*` tools fall into these groups (full reference in
   never created), and composes from a strict allowlist — the current address bar is never
   copied, so `devkey`/`sharetoken` cannot leak into a link that gets mailed or bookmarked.
 - **Perceive & navigate** (all modes) — `web_node_bounds`,
-  `web_view_isolate`, `web_camera_get`,
+  `web_execute("view.isolate", {paths})`, `web_camera_get`,
   `web_camera_set`, `web_camera_focus`, `web_camera_orbit`, `web_camera_fly`,
   `web_view_sweep`, `web_view_ortho`, `web_select`, `web_selection_get`, `web_select_similar`. Since plan-740
   these drive the AGENT's own camera body, not the viewport (see *The agent eye* below).
@@ -465,6 +594,16 @@ Before Phase 3 the first two of those returned a *viewport* frame under WebGPU; 
 do, which is the intended trade: a refusal an agent can act on beats a picture from a camera it
 did not choose.
 
+### Show AI clicks (plan-2210)
+
+Turn off **Show AI clicks** in *Settings ▸ AI* or with the finger icon beside
+*New session* in the AI prompt toolbar for fast agent runs. Both controls share
+the per-device preference `rv-mcp-ai-clicks` (default on). Agents can call
+`view.aiClicks {on:false}` through `web_execute`; omit `on` to toggle. The command
+returns `{on}`. Off skips hover/press dwell, the 80 ms panel beat and waiting for
+Inspector rows. Selection, Inspector opening and field reveal, panel opening,
+Follow agent and result afterglow remain active. A running click finishes normally.
+
 ### Follow agent — the viewport follows the agent's EDITS (plan-520)
 
 The agent eye keeps the human viewport out of the agent's way. *Follow agent* is the one
@@ -472,16 +611,16 @@ deliberate bridge in the other direction, and it is limited to **writes**: when 
 node, the operator's camera flies to that node so the change happens in view.
 
 **Which tools.** The node-addressing write tools of the MCP feedback table
-(`EDITOR_FEEDBACK` in `rv-mcp-editor-feedback.ts`, column `follow`): `web_component_set`,
-`web_editor_set_field`, the transform verbs (`transform`, `zero_position`, `rotate90`,
+(`EDITOR_FEEDBACK` in `rv-mcp-editor-feedback.ts`, column `follow`): `web_execute("component.setFields", {path, type, props})`,
+`editor.setField`, the transform verbs (`transform`, `zero_position`, `rotate90`,
 `to_ground`, `pivot`, `reparent`), `add_component` / `remove_component`, the 11
-`web_editor_mechanism_*` tools, `assign_material`, and the runtime `web_drive_jog` /
-`web_drive_stop` (the drive is resolved by name and selected as well). Arg-addressed targets are
+`web_editor_mechanism_*` tools, `assign_material`, and the runtime `drive.jog` /
+`drive.stop` (the drive is resolved by name and selected as well). Arg-addressed targets are
 followed BEFORE the write (`follow: 'pre'`); targets that only exist or are only known after it —
 `create_empty`, `rename`, `create_kinematic`, `assign_to_kinematic`, `kinematize`, `import_glb`,
 `import_cad` — follow AFTER it (`'post'`). Never followed: read tools, `web_camera_*` and every
-other perception tool (they stay with the agent eye), `web_editor_delete` (the target is gone),
-`web_editor_set_visible` (it may be hidden), `web_signal_set_*` (a signal is not a place).
+other perception tool (they stay with the agent eye), `editor.delete` (the target is gone),
+`editor.setVisible` (it may be hidden), `web_signal_set_*` (a signal is not a place).
 
 **When the camera moves** (`decideFollow`, `rv-mcp-follow-policy.ts`, in this order):
 
@@ -581,24 +720,88 @@ like the sweep.
   channels — `beauty`, a flat-coloured `idmask` segmentation with white crease edges
   over the identity colours and a Set-of-Mark sidecar, and `xray`),
   never touching the user's viewport or selection.
-- **Asset Editor** — the `web_editor_*` family: lifecycle (`open`/`close`/`status`/
-  `undo`/`redo`/`save`/`import_glb`/`import_cad`), transform + pivot + structure +
-  component + signal + material primitives, the compounds `web_editor_kinematize` /
-  `web_editor_materialize` (one undo step each), and `web_editor_verify_drive`
+- **Robot IK** (`McpRobotTools`) — `web_query("ik.robot.list", {})`,
+  `web_query("ik.robot.chain", {path})`, `web_query("ik.robot.state", {path})` and
+  `web_query("ik.robot.verifyFk", {path})` are the web pendants of Unity's
+  `ik_get_chain` / `ik_get_state` / `ik_verify_fk`, all read-only and all answering at
+  every solver tier (what the tier cannot do is said in a sentence, never shown as an
+  empty result). `ik.robot.verifyFk` is the measuring instrument: it runs forward kinematics over
+  the DERIVED JOINT CHAIN — the one the viewer really solves and replays with, not the OPW
+  model — and answers `positionErrorMm`, `orientationErrorDeg` and `toolLengthM`, so a TCP
+  the bake dropped or a pose expressed in the wrong frame is a number instead of a wrong
+  robot. `web_query("ik.robot.rigDiagnose", {path})` and `web_robot_rig_from_library` build a rig: the first derives chain,
+  wrist type and OPW parameters from a node tree and reports them without writing (it
+  works on a robot that has no `RobotIK` at all — the normal case for an imported robot;
+  the shipped library CRX comes rigged since 2026-10-25, with a rig written by this same
+  derivation and a demo `IKPath` `Robotpath` you switch on with `StartPath`), the second writes the whole component in one call
+  and reads it back off the live scene before reporting `ok`. Every derived OPW value
+  carries its provenance and a confidence verdict, and `WristType` is measured rather than
+  defaulted. `RobotIK` / `IKPath` / `IKTarget` are deliberately not `authorable`: a rig is
+  a transaction of six ordered references and seven measured constants, each wrong on its
+  own, so there is no "Add Component ▸ RobotIK" and this family is the way in.
+  The second half of the family authors the PROGRAM: `_path_create` puts an `IKPath` on a
+  new node **under** the robot (that nesting IS the robot reference — a path node outside
+  the robot resolves no axes), `_target_add` / `_target_set` / `_target_remove` /
+  `_target_reorder` maintain the ordered waypoints, `web_query("ik.path.inspect", {pathPath})` prints them with the
+  index the other tools take, and `_solve_target` lists every reachable joint
+  configuration, applies one and drives the robot onto it. Two properties are the point of
+  this half. **A pose and its joint angles are written together or not at all:** an
+  unreachable pose creates and moves nothing, and with `allowUnreachable` the waypoint is
+  stored or moved with an EMPTY `AxisPos` — never with the angles of another pose. The
+  gizmo keeps the same rule since plan-773 Phase 4: a drag into an unreachable pose
+  persists the transform and EMPTIES the `AxisPos`, so the waypoint is visibly replay-less
+  instead of silently carrying the previous pose's angles. Both routes share the two
+  writes (`writeLiveAxisPos` / `reportTargetReplayAngles` in `rv-ik-authoring.ts`) —
+  `AxisPos` is a raw extras field that no `setField` executor puts back on the live
+  instance, so that assignment belongs next to every `AxisPos` write.
+  **And unreachability is visible:** the answer carries the reason as a
+  sentence plus, where one applies, the matching `robot-ik-*` code, and an angle-less
+  waypoint gets the existing `robot-ik-target-no-angles` entry in the Problems panel — the
+  six codes of plan-772 are the vocabulary, and no seventh spelling was invented.
+  **Joint limits are a hard gate on the selection** (plan-772 Phase 5): the analytic
+  solvers are given no limits, so `reachable` only means the geometry closes. A
+  configuration whose drive limits refuse it in every 360° representation is therefore
+  dropped BEFORE a selection happens, in the gizmo, in the LIN replay and here, and the
+  answer says what it dropped (`limitRejectedSolutions`, `limitRejectedAxes`,
+  `limitNote`). "Outside the joint limits" is its own refusal sentence, distinct from
+  "outside the workspace". The limit of that: it is a rejection, not a search — when EVERY
+  reachable configuration violates a limit the pose stays unreachable, even though a
+  limit-aware solver might have found an admissible one. Closing that would mean handing
+  the limits to the solver (an ABI change in the Rust crate), which is deliberately out of
+  scope. These
+  seven tools write into the planner's document (node ops in the scene op log) and refuse
+  inside the asset editor, which has its own document and its own route.
+  All SEVEN writes of the family (`_rig_from_library` included) are **views of `ik.*`
+  commands** — `ik.robot.rig`, `ik.path.create`, `ik.target.add` / `.set` / `.remove` /
+  `.reorder` / `.solve`, declared in `rv-mcp-robot-tools.ts`. The wire args are the command
+  args, so `web_execute(command="ik.target.add", args={…})` and `web_batch` do exactly what
+  the tool does; being bound also takes them OUT of `tools/list` (they still answer
+  `tools/call`), which is why the robot domain lists six read tools and not thirteen. One
+  caveat to know: the commands are `macro: true`, but the macro recorder books lines into
+  the macro book of the document open in the editor, and this family works in the planner's document — so a
+  path authored over MCP is not recorded yet. Extending the recorder to the planner's document
+  is its own piece of work.
+- **Asset Editor** — session tools (`web_editor_open` / `web_editor_close` /
+  `web_editor_status` / `web_editor_save`) and registry commands, including
+  `web_execute("editor.importGlb", {relPath})` / `web_execute("editor.importCad", {relPath})`,
+  undo/redo, transform + pivot + structure +
+  component + signal + material primitives, the compounds `web_execute("editor.kinematize", {paths, groupName, direction})` /
+  `editor.materialize` (one undo step each), and `web_editor_verify_drive`
   (pose-sweep montage with exact restore). Every tool calls the same action functions
   the Quick Edit / Materials panel buttons call, against the op-logged AssetDocument —
   agent edits are undoable and reflected live in the UI.
 - **Document lifecycle** (plan-713, unified 2026-08-19) — `web_document_list` is THE one
   list: every GLB document the project owns, with name, path, `section`, size and mtime
   (`withNodeCount=true` adds a node count read from the GLB header alone), plus the
-  read-only built-in and published sources. Do not confuse it with `web_catalog_list`,
+  read-only built-in and published sources. Do not confuse it with `web_query("library.catalogList", {})`,
   which is the placeable planner *catalogue*.
-  `web_document_update(action=delete|rename, relPath, newName?)` manages the saved files;
-  it is the one tool announced with `destructiveHint`, refuses anything outside
-  `library/Custom/` and refuses the file of the document currently open in the editor. A
+  `web_execute("document.delete", {relPath})`, `web_execute("document.rename", {relPath, newName})`
+  and `web_execute("document.move", {relPath, toFolder})` manage saved files.
+  Delete is classified as destructive; all three require a writable project and refuse
+  the file of the document currently open in the editor. A
   delete moves the bytes to `.trash/`; a rename is copy-then-delete and says so in its
-  result. `web_editor_project_files(dir?, glob?)` browses the whole project, and answers
-  with the same `projectOpen:false` shape as `web_editor_project_info` when nothing is open.
+  result. `web_query("editor.projectFiles", {dir, glob})` browses the whole project, and answers
+  with the same `projectOpen:false` shape as `web_query("editor.projectInfo", {})` when nothing is open.
   Both save tools (`web_editor_save`, `web_document_save`) report `saveVerb` — `save`,
   `save-into-project` (the write COPIES and changes the document's identity) or `blocked`
   with a reason — the same verb the save card shows.
@@ -630,7 +833,7 @@ round trip and adds the two fields that make it actionable:
   "runtime": { "connectionState": "Connected", "simRunning": false,
                "modelUrl": null, "driveCount": 6, "signalCount": 18 },
   "blocked": [{ "family": "web_layout_*",
-                "reason": "Needs planner mode — call web_mode_set(\"planner\")" }],
+                "reason": "Needs planner mode — call web_execute(\"workspace.setMode\", {mode:\"planner\"})" }],
   "next": "Verify the authored motion with web_editor_verify_drive before web_editor_save",
   "guide": "web_help(\"editor\")"
 }
@@ -681,7 +884,7 @@ Not every write is probed, and the gaps are decisions: `web_camera_*`, `web_view
 `web_select*` and `web_node_bounds` are classified as writes because a watching operator
 sees the view jump, but they persist nothing, so a delta over a camera matrix would be
 noise charged to the token budget. `web_editor_verify_drive` and
-`web_editor_mechanism_jog` are transient by design.
+`mechanism.jog` are transient by design.
 
 ### The generated tool reference
 
@@ -703,7 +906,7 @@ Tool discoverability rules — linted by `tests/rv-mcp-tool-conventions.test.ts`
 - **Names**: `web_<domain>_<action>`, snake_case (auto-derived from the camelCase
   method name). Approved domains: node, component, view, camera, select(ion),
   screenshot, drive, signal, sensor, sim, transport, logic, mode, layout, library,
-  scene, editor, des, plc — extend the whitelist AND the domain table in
+  robot, scene, editor, des, plc — extend the whitelist AND the domain table in
   `webviewer.mcp.md` deliberately. Root-level tools (`web_status`, `web_logs`,
   `web_errors`, `web_help`) are the fixed exceptions.
 - **Descriptions**: verb-first keyword sentence, then when-to-use (point to the
@@ -738,6 +941,40 @@ bridge ignores the hints and long tools (e.g. `web_editor_verify_drive`,
 `web_screenshot_burst`) time out early. CONNECT embeds `webviewer.mcp.md` at build time,
 so changing that file requires a CONNECT rebuild.
 
+### Internal bridge tools and control frames (plan-621)
+
+The CONNECT channel carries two generic mechanisms besides the announced `web_*` catalog.
+Both live in `McpBridgePlugin`, work with **AI control off**, and know nothing about any
+particular feature:
+
+- **Internal tools** (`registerInternalTool(name, handler)` / `unregisterInternalTool`) answer
+  `call` frames like any tool but are **never** part of `discover`, the tool count or
+  `mcpToolNames`, so no agent ever sees them. `web_*` names are refused (that namespace is the
+  catalog). They are answered directly — no command binding, no choreography, no AI-activity
+  label — because a server-side service feeds them, not an assistant. CONNECT's MCP proxy only
+  forwards announced `web_*` tools, so an internal tool is reachable from CONNECT's own services
+  alone (`McpServerSetup` refuses it as an unknown tool, also when a browser announces it). A
+  string return is sent as is, anything else as JSON, a throw becomes the call's `error`.
+- **Control frames** (`sendControl(action, fields)`) send `{type:'control', action, ...fields}`
+  from the browser to the bridge server; `fields` cannot override `type` or `action`, and nothing
+  is sent (return `false`) while the socket is closed. CONNECT routes on the part of `action`
+  before the first dot (`WebViewerBridge.RegisterControlHandler`); only the bridge owner reaches
+  a handler, together with the owner generation the frame arrived under.
+
+The first user is the SolidCraft live sync (private `src/plugins/solidcraft-sync/`, CONNECT
+`Protocols/SolidCraft/`): the browser steers it with `solidcraft.connect | resync | disconnect`
+control frames, CONNECT delivers every sync step through the internal tool `rv_solidcraft_apply`
+via `CallBrowserAsync` with `BrowserCallPurpose.Internal` and reads back `applied` / `deferred` /
+`resync`. The user action acquires the channel with `acquireChannel(holder)` and releases it with
+`releaseChannel(holder)` when finished; it never enables AI. Agents need AI control on to use the
+announced commands `solidcraft.connect` / `.resync` / `.disconnect` (via `web_execute`), which
+send those frames — never through the internal tool.
+
+If an AI-on tab owns the channel, an AI-off tab remains standby and its control frames go nowhere.
+SolidCraft Connect there reports “another tab owns the CONNECT channel — use that tab or close it”.
+Every CONNECT-served tab now holds a socket; CONNECT admits at most 8 (`MaxConnections`), then
+closes new connections with `4431 bridge-full`.
+
 ### web_screenshot — what the HUMAN sees
 
 `web_screenshot` returns an image of the operator's viewport: their camera, their canvas
@@ -769,7 +1006,7 @@ The loop is three calls:
    slot signal's **comment**.
 2. **`web_signal_sources_list`** — every signal the connected interfaces offer, with
    direction, data type, provider and again the **comment**.
-3. **`web_signal_bind`** per matched pair.
+3. **`signal.bind`** per matched pair.
 
 The comments are the load-bearing part. They come from Unity's `Signal.Comment`, travel in
 the GLB, and are usually the only place a tag's *meaning* is written down — a symbol name
@@ -810,7 +1047,7 @@ thing its name claims. Three tools let it keep that:
 
 | Tool | Purpose |
 |------|---------|
-| `web_knowledge_set(path, markdown, author?, confidence?)` | Store or replace the note on one node. Overwrites; never appends. Empty/whitespace deletes it. |
+| `knowledge.set(path, markdown, author?, confidence?)` | Store or replace the note on one node. Overwrites; never appends. Empty/whitespace deletes it. |
 | `web_knowledge_get(path)` | The note as raw Markdown plus `updatedAt` / `author` / `confidence`. |
 | `web_knowledge_list(query?, limit?)` | Every annotated node, newest first, with excerpts. Full-text `query` over note text and node path. |
 
@@ -826,14 +1063,14 @@ carries the usual `NodeKnowledge` type chip, so an annotated node is findable wi
 `web_knowledge_list`.
 
 **Nothing in that section is editable — by design.** There is no field, no save button and
-no delete button. Writing a note stays exclusively `web_knowledge_set`, which is what keeps
+no delete button. Writing a note stays exclusively `knowledge.set`, which is what keeps
 one authorship convention (and the `confidence` discipline below) instead of two. The four
 provenance fields do not appear as rows at all; they are in the header.
 
 Read-only in the UI does **not** mean the fields are write-protected in the data model, and
 it deliberately must not: the inspector's read-only flag (`readonly: true` in the schema) is
 the same predicate the overlay write guard uses, so setting it would make
-`web_knowledge_set` fail on every field it writes. See plan-431 §2.1 and the warning comment
+`knowledge.set` fail on every field it writes. See plan-431 §2.1 and the warning comment
 in `rv-node-knowledge.ts`.
 
 `confidence` (`observed` | `inferred` | `unverified`) is the part worth insisting on. A
@@ -882,7 +1119,7 @@ alarm being pushed out of the prompt by one.
 
 - **A Unity re-export of the model DROPS every note.** There is no Unity `WebKnowledge`
   component, by decision, so Unity does not carry the entry and rewrites the GLB without it.
-  The same holds for a document description (`DocumentInfo`, `web_document_info_set`):
+  The same holds for a document description (`DocumentInfo`, `document.infoSet`):
   Unity does not author it, and re-exporting the model from Unity loses it.
 - **A Unity re-import LOGS ONE CONSOLE ERROR PER ANNOTATED NODE.**
   `GLBComponentDeserializer` cannot resolve the `NodeKnowledge` type and calls
@@ -1053,7 +1290,7 @@ queue stays the source of truth; a failed write is reported and the task stays q
   few seconds. CONNECT behaves differently: it refuses to start on an occupied port rather
   than drifting (see *Ports*).
 
-- **Wrong assistant is driving the browser.** Use **Connect to** in the AI Bridge
+- **Wrong assistant is driving the browser.** Use **Port** in the AI Bridge
   panel to point the browser at the intended host (CONNECT / Node · Desktop / Node · Code).
 
 - **Every call times out after 15 s, but CONNECT is healthy.** The classic symptom is
@@ -1125,9 +1362,9 @@ queue stays the source of truth; a failed write is reported and the task stays q
   rather than raising a dialog no agent can answer. The
   switch happens **in place**, so the bridge connection, the MCP session and the editor
   document all survive it. Do **not** navigate to `?project=<slug>`: that reloads into a new
-  tab which immediately takes bridge ownership (`_active` is last-writer-wins and force-closes
-  the previous socket), costing the editor document and several seconds of boot during which
-  every call fails. `web_project_open` refuses when there is unsaved work unless `force=true`,
+  tab, costing the editor document and several seconds of boot before it can receive calls.
+  CONNECT chooses among announced tabs, preferring AI-on tabs; opening a tab alone does not
+  guarantee ownership. `web_project_open` refuses when there is unsaved work unless `force=true`,
   because the underlying switch would otherwise raise a modal dialog no agent can answer.
 
 ## Ask AI in the global search
@@ -1178,7 +1415,7 @@ live machine state:
   the included node; removing it re-runs the question without context. An
   expandable *Context sent* line shows exactly what travelled with the request.
 - **Node knowledge.** If an earlier session left a note on the selected node
-  (`web_knowledge_set`), it rides along as its own block after the alarm lines —
+  (`knowledge.set`), it rides along as its own block after the alarm lines —
   line-prefixed and capped at 600 characters, so the manual, the live state and what an
   agent previously worked out all reach the model together. Notes are **not** inherited
   from ancestors and are **not** included for unselected query hits: a root-level note
@@ -1194,7 +1431,7 @@ live machine state:
   capped at 400 characters. Its budget is taken off the total — the node block
   shrinks, the machine status never does — so the context stays within 2600
   characters. With a project open the text comes from the project's row of the open
-  document, so a change made from the dashboard or with `web_document_info_set` is in
+  document, so a change made from the dashboard or with `document.infoSet` is in
   the next question without a reload; without a project (a share link) it is read
   from the loaded file. No description → the request is byte-identical to before.
 - **Query→part matching (no selection needed).** Even without a selection, the

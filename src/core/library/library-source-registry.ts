@@ -63,9 +63,25 @@ export interface LibrarySource {
   loaded: boolean;
   needsPermission?: boolean;
   error?: string | null;
+  /**
+   * Resolver-only source: it still answers {@link getEntry} / {@link resolveAsset}
+   * (so placements made from it keep resolving after a reload), but browsing UIs
+   * — the library panel, the Projects dashboard, the agent catalog listing —
+   * do not show it. Used by a source whose service is currently unreachable,
+   * where a visible-but-dead tab would only be noise. Absent = shown.
+   */
+  hidden?: boolean;
   listEntries(): LibraryCatalogEntry[];
-  /** `null` for an unknown id — never throws (§9.5). */
+  /** `null` for an unknown id — never throws (§9.5). Canonical ids only. */
   getEntry(assetId: string): LibraryCatalogEntry | null;
+  /**
+   * The entry a LEGACY id answers to (plan-778 F5: `RvDocumentEntry.aliases`),
+   * or null. A SEPARATE lookup on purpose: only the unqualified legacy pass
+   * (`findLegacyOrigin`) asks it, and only after every source's canonical ids
+   * were asked — an alias never shadows another library's canonical id.
+   * `resolveAsset` accepts an alias too. Optional; absent = no aliases.
+   */
+  getAliasEntry?(alias: string): LibraryCatalogEntry | null;
   resolveAsset(assetId: string, purpose: ResolvePurpose): Promise<ResolvedAsset>;
   refresh?(): Promise<void>;
   remove?(): Promise<void>;
@@ -129,6 +145,11 @@ export function listLibrarySources(): RegisteredLibrarySource[] {
   return out;
 }
 
+/** The sources a browsing UI shows: {@link listLibrarySources} minus `hidden` ones. */
+export function listBrowsableLibrarySources(): RegisteredLibrarySource[] {
+  return listLibrarySources().filter(s => s.source.hidden !== true);
+}
+
 /** Lookup by the identity PAIR. `null` when either half is unknown. */
 export function getLibrarySource(providerId: string, sourceId: string): LibrarySource | null {
   const entry = providers.get(providerId);
@@ -144,6 +165,49 @@ export function subscribeLibrarySources(listener: () => void): () => void {
 /** Version counter — NOT an object. See the file header. */
 export function getLibrarySourcesSnapshot(): number {
   return version;
+}
+
+/**
+ * A source that is still fetching its listing: not loaded, no error, and not
+ * parked behind a permission prompt (that one waits for a click, not a fetch).
+ */
+export function isLibrarySourcePending(source: LibrarySource): boolean {
+  return !source.loaded && !source.error && source.needsPermission !== true;
+}
+
+/** True while at least one registered source is still loading its listing. */
+export function hasPendingLibrarySources(): boolean {
+  return listLibrarySources().some(({ source }) => isLibrarySourcePending(source));
+}
+
+/**
+ * Resolve once no registered source is still loading, or after `timeoutMs`.
+ *
+ * A project's `libraries[]` are subscribed when the project becomes active, but
+ * the catalog fetch behind each one lands later. An asset-id lookup made in
+ * that window — a dashboard card composing a planner scene right after the
+ * switch — misses every entry and falls back to the stored `path`, which for
+ * the bundled demo names a file that does not exist next to the document
+ * (2026-10-25: `/demo-realvirtual/library/…` 404s). Never rejects: a slow
+ * catalog only costs the timeout, after which the caller resolves with what it
+ * has.
+ */
+export function whenLibrarySourcesSettled(timeoutMs = 10_000): Promise<void> {
+  if (!hasPendingLibrarySources()) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    let done = false;
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      unsubscribe();
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    const unsubscribe = subscribeLibrarySources(() => {
+      if (!hasPendingLibrarySources()) finish();
+    });
+  });
 }
 
 /**

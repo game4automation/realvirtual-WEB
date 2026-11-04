@@ -126,7 +126,7 @@ export function refusalSentence(reason: string, path: string): string {
   switch (reason) {
     case 'not-found': return `Nothing in the project tree at "${path}" — check web_project_tree.`;
     case 'read-only': return 'This project (or this row) is read-only.';
-    case 'system': return `"${path}" is a reserved system row (settings/connect/rag/thumbnails/.trash) and cannot be restructured.`;
+    case 'system': return `"${path}" is a reserved system row (settings/connect/rag/.thumbnails/.trash) and cannot be restructured.`;
     case 'cross-root': return 'Catalog rows cannot be restructured — only the project root is writable.';
     case 'into-itself': return 'A folder cannot be moved into itself or its own subtree.';
     case 'not-a-folder': return 'The destination is not a folder.';
@@ -166,7 +166,11 @@ export function mcpTreeMoveIO(store: ProjectStore): TreeMoveIO | null {
     },
     deleteBytes: relPath => backend.deleteDocument(relPath),
     readManifest: async () => store.getProject(),
-    writeManifest: next => store.replaceManifest(next),
+    writeManifest: async next => {
+      // Commit through backend writers too, before rescan can read a stale manifest.
+      const written = await store.applyManifestDelta(() => next);
+      if (!written) throw new Error('The project manifest could not be written.');
+    },
     readDocsIndex: async () => {
       const blob = await readBytes(DOCS_INDEX_FILE);
       if (!blob) return null;

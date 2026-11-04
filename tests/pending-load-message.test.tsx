@@ -52,7 +52,7 @@ describe('plan-371 — PendingLoadMessage', () => {
     // filled afterwards is announced reliably.
     expect(screen.getByRole('status')).toBeTruthy();
     expect(screen.getByRole('alert')).toBeTruthy();
-    expect(screen.queryByText(/Assets werden geladen/)).toBeNull();
+    expect(screen.queryByText(/Loading assets/)).toBeNull();
   });
 
   it('announces a loading placement politely, with no progress bar', () => {
@@ -65,7 +65,7 @@ describe('plan-371 — PendingLoadMessage', () => {
 
     const polite = screen.getByRole('status');
     expect(polite.getAttribute('aria-live')).toBe('polite');
-    expect(polite.textContent).toContain('Lade Roboter-Zelle A');
+    expect(polite.textContent).toContain('Loading Roboter-Zelle A');
     // Explicit product decision: GLTF load progress is not trustworthy enough
     // to render as a determinate bar (three.js #15584 / #14256).
     expect(polite.querySelector('[role="progressbar"][aria-valuenow]')).toBeNull();
@@ -85,10 +85,10 @@ describe('plan-371 — PendingLoadMessage', () => {
     expect(assertive.getAttribute('aria-live')).toBe('assertive');
     expect(assertive.textContent).toContain('Foerderer-3');
 
-    fireEvent.click(screen.getByRole('button', { name: /wiederholen/i }));
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }));
     expect(retryPendingPlacement).toHaveBeenCalledWith('p1');
 
-    fireEvent.click(screen.getByRole('button', { name: /entfernen/i }));
+    fireEvent.click(screen.getByRole('button', { name: /remove/i }));
     expect(removePlacementById).toHaveBeenCalledWith('p1');
   });
 
@@ -108,7 +108,7 @@ describe('plan-371 — PendingLoadMessage', () => {
     expect(screen.getByRole('status').textContent).toContain('Belt C');
     // Only the broken one gets buttons — the other two need no decision.
     expect(screen.getByRole('alert').textContent).toContain('Belt B');
-    expect(screen.getAllByRole('button', { name: /wiederholen/i })).toHaveLength(1);
+    expect(screen.getAllByRole('button', { name: /retry/i })).toHaveLength(1);
   });
 
   it('never serializes its state: setPendingPlacements is a no-op when unchanged', () => {

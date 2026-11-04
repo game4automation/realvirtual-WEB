@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../../rv-safe-storage';
+
 /**
  * ProjectFolderContents — the right half of the project window (Lauf 13).
  *
@@ -35,6 +37,7 @@ import {
 import { PROJECTS_CARD_SIZE_KEY } from '../rv-storage-keys';
 import { DocumentInfoTooltip } from './DocumentInfoTooltip';
 import { DocumentModeChip } from './DocumentModeChip';
+import { LABEL_CHIP_ON_PREVIEW_BG } from '../shared-sx';
 import type { DocumentInfo } from '../../project/rv-document-info';
 import type { DocumentClassification } from '../../project/rv-document-classification';
 
@@ -46,7 +49,7 @@ const DEFAULT_CARD = 112;
 /** The stored size, clamped — a hand-edited or stale value must not break the grid. */
 function readCardSize(): number {
   try {
-    const raw = Number(localStorage.getItem(PROJECTS_CARD_SIZE_KEY));
+    const raw = Number(readLocalStorage(PROJECTS_CARD_SIZE_KEY));
     if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_CARD;
     return Math.min(MAX_CARD, Math.max(MIN_CARD, Math.round(raw)));
   } catch {
@@ -317,7 +320,7 @@ export function ProjectFolderContents({
   // get lost.
   const changeSize = useCallback((value: number) => {
     setCardSize(value);
-    try { localStorage.setItem(PROJECTS_CARD_SIZE_KEY, String(value)); } catch { /* private mode */ }
+    try { writeLocalStorage(PROJECTS_CARD_SIZE_KEY, String(value)); } catch { /* private mode */ }
   }, []);
 
   return (
@@ -367,7 +370,7 @@ export function ProjectFolderContents({
             overflow: 'auto',
             p: 1.5,
             display: 'grid',
-            gridTemplateColumns: `repeat(auto-fill, minmax(${cardSize}px, 1fr))`,
+            gridTemplateColumns: `repeat(auto-fill, minmax(min(100%, ${compactLayout ? Math.max(160, cardSize) : cardSize}px), 1fr))`,
             gap: 1.5,
             alignContent: 'start',
           }}
@@ -392,6 +395,7 @@ export function ProjectFolderContents({
               info={card.documentInfo}
               classification={card.classification}
               touch={touchInput}
+              cardLayout={compactLayout}
             >
               <Box
                 role="listitem"
@@ -404,18 +408,31 @@ export function ProjectFolderContents({
                 onDragEnd={compactLayout ? undefined : card.onDragEnd}
                 sx={{ minWidth: 0, position: 'relative' }}
               >
-                <ProjectCard card={card} touchInput={touchInput} />
-                {/* Over the preview's top-right corner, where it reads as a
-                    property of the document and costs the label nothing.
-                    Inert to the pointer: the card's own clicks pass through. */}
-                {modeLabel && (
+                {/* Wide cards: the mode chip sits in the preview's top-left
+                    corner, the Bundled chip (same look) bottom-left (plan-776
+                    follow-up). Compact rows: under the card, where a narrow
+                    column has room. */}
+                <ProjectCard
+                  card={card}
+                  touchInput={touchInput}
+                  cornerBadge={modeLabel && !compactLayout ? (
+                    <DocumentModeChip
+                      mode={card.openMode}
+                      modeLabel={modeLabel}
+                      testId={`card-mode-${card.key}`}
+                      sx={{ bgcolor: LABEL_CHIP_ON_PREVIEW_BG }}
+                    />
+                  ) : undefined}
+                />
+                {modeLabel && compactLayout && (
                   <DocumentModeChip
                     mode={card.openMode}
                     modeLabel={modeLabel}
                     testId={`card-mode-${card.key}`}
                     sx={{
-                      position: 'absolute', top: 6, right: 6, pointerEvents: 'none',
-                      bgcolor: 'rgba(0,0,0,0.55)',
+                      mt: 0.5, width: 'fit-content', maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis',
+                      pointerEvents: 'none',
+                      bgcolor: LABEL_CHIP_ON_PREVIEW_BG,
                     }}
                   />
                 )}
@@ -475,10 +492,10 @@ export function ProjectFolderContents({
         <Tooltip title="Card size" placement="top">
           <Slider
             size="small"
-            min={MIN_CARD}
+            min={compactLayout ? 160 : MIN_CARD}
             max={MAX_CARD}
             step={8}
-            value={cardSize}
+            value={compactLayout ? Math.max(160, cardSize) : cardSize}
             aria-label="Card size"
             onChange={(_, v) => changeSize(Array.isArray(v) ? v[0]! : v)}
             sx={{

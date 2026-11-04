@@ -382,10 +382,10 @@ describe('a manifest that stayed behind (plan-413 F10)', () => {
   it('an asset document ending in .json is NOT a legacy scene', async () => {
     root.seedText('project.json', JSON.stringify({
       ...manifest(),
-      library: [{ path: 'library/catalog.json' }],
+      library: [{ path: 'library/belt.glb' }],
     }));
     const read = (await readManifest(asDirHandle(root)))!;
-    expect(read.project.documents!.map(d => d.path)).toEqual(['library/catalog.json']);
+    expect(read.project.documents!.map(d => d.path)).toEqual(['library/belt.glb']);
   });
 });
 

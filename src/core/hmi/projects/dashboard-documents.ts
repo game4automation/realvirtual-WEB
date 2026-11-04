@@ -29,6 +29,52 @@
 import type { TieredDocumentEntry } from '../../project/rv-project-tiers';
 import { DEFAULT_DOCUMENT_FOLDER } from '../../project/rv-document-ops';
 import { readDocumentRef, normalizeRefPath, type DocumentRefField } from '../../project/rv-project-refs';
+import type { LibraryCatalogEntry } from '../../library/library-types';
+
+// ─── The card's picture (plan-776 F9) ───────────────────────────────────
+
+/** What one grid row says about the card it becomes — the data half of the mapping. */
+export interface DocumentCardRowInput {
+  /** Project-relative path of the row (its tree node). */
+  path: string;
+  /** Display name of the tree node. */
+  name: string;
+  /** The manifest row behind it, when the row is a project document. */
+  doc?: { id?: unknown; thumbnail?: unknown } | null;
+  /** The catalog entry behind it, when the row is a catalog asset. */
+  catalogEntry?: LibraryCatalogEntry | null;
+}
+
+/** The catalog entry a card draws, and the saved-thumbnail pointer it resolves. */
+export interface DocumentCardPicture {
+  entry: LibraryCatalogEntry;
+  /**
+   * The row's `thumbnail` pointer, resolved by the card through the project
+   * backend (`useThumbnailUrl`). Null = the card shows its type placeholder.
+   */
+  thumbnailPointer: string | null;
+}
+
+/**
+ * The entry + thumbnail pointer of one dashboard card (plan-776 F9).
+ *
+ * Lifted out of `ProjectsDashboardHost` so it is a rule with a test
+ * (`tests/dashboard-documents-thumbnail.test.ts`). The whole contract is what
+ * is NOT here: no render loader, no cache key, no version — a card shows the
+ * picture a save wrote, or the placeholder. A catalog asset brings its own
+ * `thumbnailUrl` (the catalog's resolved `thumbnail`); a project document
+ * names its sidecar by pointer.
+ */
+export function documentCardPicture(input: DocumentCardRowInput): DocumentCardPicture {
+  if (input.catalogEntry) return { entry: input.catalogEntry, thumbnailPointer: null };
+  // A project document is not a catalog entry and never will be; the card only
+  // reads `name`/`thumbnailUrl`/`category` off it, so the honest thing is a
+  // minimal stand-in rather than a fake catalog row.
+  const entry: LibraryCatalogEntry = { id: input.path, name: input.name, category: 'custom' };
+  const raw = input.doc?.thumbnail;
+  const pointer = typeof raw === 'string' && raw.trim() !== '' ? raw.trim() : null;
+  return { entry, thumbnailPointer: pointer };
+}
 
 /** One row of the "pick documents" list a create-from dialog renders. */
 export interface DocumentPickOption {
@@ -206,8 +252,7 @@ export function documentsUsingRef(
 
 /**
  * What the host keeps per document out of one `statDocuments()` pass: the
- * mtime that versions the card thumbnails, and the size the detail pane
- * prints. Both optional — a browser-backed blob has no reliable mtime and a
+ * mtime and the size the detail pane prints. Both optional — a browser-backed blob has no reliable mtime and a
  * backend that cannot size a body reports none.
  */
 export interface DocumentStatEntry {

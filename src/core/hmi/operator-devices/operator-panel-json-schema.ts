@@ -34,7 +34,7 @@ const signal = (description: string) => ({ type: 'string', description });
 export const OPERATOR_PANEL_JSON_SCHEMA = {
   $schema: 'http://json-schema.org/draft-07/schema#',
   title: 'Operator panel',
-  description: 'A station operator panel as data: buttons, selectors, E-stops, a stack light, chips and a status strip.',
+  description: 'A station operator panel as data: buttons, selectors, E-stops, setpoint sliders, numeric readouts, a stack light, chips and a status strip.',
   type: 'object',
   definitions: {
     condition: {
@@ -107,6 +107,44 @@ export const OPERATOR_PANEL_JSON_SCHEMA = {
         ...cellProps,
       },
     },
+    slider: {
+      description: 'A setpoint slider: the panel\'s analog INPUT. Writes a number to its signal, live while dragged.',
+      type: 'object',
+      properties: {
+        label: { type: 'string', description: 'Accessible name, e.g. "Walk speed".' },
+        caption: { type: 'string', description: 'Caption below the slider; defaults to `label`.' },
+        signal: signal('The input it writes (a float signal).'),
+        min: { type: 'number', description: 'Lower end of the range.' },
+        max: { type: 'number', description: 'Upper end of the range; must be greater than min.' },
+        step: { type: 'number', exclusiveMinimum: 0, description: 'Step of the dial. Default 1.' },
+        unit: { type: 'string', description: 'Unit shown with the live value, e.g. "m/s".' },
+        decimals: { type: 'integer', minimum: 0, description: 'Decimals of the live value. Default 0.' },
+        span: { type: 'integer', minimum: 1, description: 'Columns the device spans. Default 1.' },
+        ...cellProps,
+      },
+    },
+    readout: {
+      description: 'A numeric readout (digital panel meter): the panel\'s analog OUTPUT. Reads a signal and shows its value.',
+      type: 'object',
+      properties: {
+        label: { type: 'string', description: 'Accessible name and legend, e.g. "Distance".' },
+        signal: signal('The output it reads (a single value). Use either this or `signals`.'),
+        signals: {
+          type: 'array', minItems: 2, maxItems: 4,
+          description: 'A vector of outputs shown as one instrument (2 to 4). Use either this or `signal`.',
+          items: signal('One component of the vector.'),
+        },
+        componentLabels: {
+          type: 'array', minItems: 2, maxItems: 4, items: { type: 'string' },
+          description: 'Component captions for `signals`, e.g. ["X","Y","Z"]. One per signal.',
+        },
+        unit: { type: 'string', description: 'Unit shown after the value, e.g. "m".' },
+        decimals: { type: 'integer', minimum: 0, description: 'Decimals. Default 0.' },
+        scale: { type: 'number', description: 'The raw value is multiplied by this before display (m to mm: 1000). Default 1.' },
+        span: { type: 'integer', minimum: 1, description: 'Columns the device spans. Default 1.' },
+        ...cellProps,
+      },
+    },
     towerSegment: {
       description: 'A stack-light segment, top to bottom.',
       type: 'object',
@@ -127,6 +165,14 @@ export const OPERATOR_PANEL_JSON_SCHEMA = {
         tone: { enum: [...CHIP_TONES], description: 'Chip tone.' },
       },
     },
+    keyLegendRow: {
+      description: 'One row of the keyboard legend: the keys, and what they do.',
+      type: 'object',
+      properties: {
+        key: { type: 'string', description: 'The keys, e.g. "W / S". A "/" draws each key as its own cap.' },
+        text: { type: 'string', description: 'What they do, e.g. "Away from / toward the camera".' },
+      },
+    },
     status: {
       description: 'One rule of the status strip; the first whose `when` holds wins, a rule without `when` always holds.',
       type: 'object',
@@ -145,16 +191,33 @@ export const OPERATOR_PANEL_JSON_SCHEMA = {
     id: { type: 'string', description: 'Plugin id, window panelId and visibility id.' },
     title: { type: 'string', description: 'Window title.' },
     width: { type: 'number', description: 'Window width in px. Default 300.' },
+    resizable: { type: 'boolean', description: 'Let the operator resize the window. Default false (a control box is as big as its plate).' },
+    height: { type: 'number', exclusiveMinimum: 0, description: 'Window height in px when resizable; ignored otherwise. Default 420.' },
     position: {
       type: 'object', description: 'Initial window position in px.',
       properties: { x: { type: 'number' }, y: { type: 'number' } },
+    },
+    density: {
+      type: 'string', enum: ['comfortable', 'compact'],
+      description: 'How tightly the plate is packed. Default comfortable. compact tightens gaps, the status strip and the readout windows for a plate that sits next to the machine it operates; controls keep their size.',
     },
     columns: { type: 'integer', minimum: 1, description: 'Grid columns (equal widths). Default 3.' },
     buttons: { type: 'array', description: 'Push buttons.', items: { $ref: '#/definitions/button' } },
     selectors: { type: 'array', description: 'Selector switches.', items: { $ref: '#/definitions/selector' } },
     estops: { type: 'array', description: 'Emergency stops.', items: { $ref: '#/definitions/estop' } },
+    sliders: { type: 'array', description: 'Setpoint sliders (analog inputs).', items: { $ref: '#/definitions/slider' } },
+    readouts: { type: 'array', description: 'Numeric readouts (analog outputs).', items: { $ref: '#/definitions/readout' } },
     stackLight: { type: 'array', description: 'Top to bottom, as the tower shows them.', items: { $ref: '#/definitions/towerSegment' } },
     chips: { type: 'array', description: 'Title-bar chips.', items: { $ref: '#/definitions/chip' } },
+    keyLegend: {
+      type: 'object',
+      description: 'The keyboard legend, drawn under the devices: which keys operate the machine and what each one does. Omit it on a panel operated by pointer alone.',
+      properties: {
+        title: { type: 'string', description: 'Heading of the card, e.g. "Keyboard — hold".' },
+        keys: { type: 'array', minItems: 1, description: 'The rows, in reading order.', items: { $ref: '#/definitions/keyLegendRow' } },
+        note: { type: 'string', description: 'One line of prose under the rows, for what a key/effect table cannot say.' },
+      },
+    },
     status: { type: 'array', description: 'Status strip rules, first match wins.', items: { $ref: '#/definitions/status' } },
     restart: {
       type: 'object', description: 'The restart sequence the status steps refer to.',

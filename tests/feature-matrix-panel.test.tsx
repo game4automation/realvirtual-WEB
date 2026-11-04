@@ -93,10 +93,10 @@ describe('FeatureMatrixPlugin settings panel', () => {
     harness.addPlugin({ id: 'internal-active' }, 'internal');
     render(<FeatureMatrixPanel viewer={harness.viewer} />);
 
-    expect(screen.getByRole('button', { name: 'PROJECT Gruppe (2)' }).getAttribute('aria-expanded')).toBe('true');
-    expect(screen.getByRole('button', { name: 'INTERNAL Gruppe (1)' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'PROJECT group (2)' }).getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByRole('button', { name: 'INTERNAL group (1)' })).toBeTruthy();
 
-    const projectGroup = screen.getByRole('button', { name: 'PROJECT Gruppe (2)' });
+    const projectGroup = screen.getByRole('button', { name: 'PROJECT group (2)' });
     projectGroup.focus();
     await userEvent.keyboard('{Enter}');
     expect(projectGroup.getAttribute('aria-expanded')).toBe('false');
@@ -104,18 +104,18 @@ describe('FeatureMatrixPlugin settings panel', () => {
 
     fireEvent.mouseDown(screen.getByRole('combobox', { name: 'Origin' }));
     fireEvent.click(await screen.findByRole('option', { name: 'internal' }));
-    expect(await screen.findByRole('button', { name: 'INTERNAL Gruppe (1)' })).toBeTruthy();
-    expect(screen.queryByRole('button', { name: /PROJECT Gruppe/ })).toBeNull();
+    expect(await screen.findByRole('button', { name: 'INTERNAL group (1)' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /PROJECT group/ })).toBeNull();
 
     fireEvent.mouseDown(screen.getByRole('combobox', { name: 'Origin' }));
     fireEvent.click(await screen.findByRole('option', { name: 'project' }));
-    expect((await screen.findByRole('button', { name: 'PROJECT Gruppe (2)' })).getAttribute('aria-expanded')).toBe('false');
+    expect((await screen.findByRole('button', { name: 'PROJECT group (2)' })).getAttribute('aria-expanded')).toBe('false');
 
     fireEvent.click(screen.getByRole('checkbox', { name: 'Show active plugins only' }));
-    expect(await screen.findByRole('button', { name: 'PROJECT Gruppe (1)' })).toBeTruthy();
+    expect(await screen.findByRole('button', { name: 'PROJECT group (1)' })).toBeTruthy();
     expect(screen.queryByText('project-inactive')).toBeNull();
 
-    const filteredGroup = screen.getByRole('button', { name: 'PROJECT Gruppe (1)' });
+    const filteredGroup = screen.getByRole('button', { name: 'PROJECT group (1)' });
     filteredGroup.focus();
     await userEvent.keyboard(' ');
     expect(filteredGroup.getAttribute('aria-expanded')).toBe('true');
@@ -131,7 +131,7 @@ describe('FeatureMatrixPlugin settings panel', () => {
     fireEvent.mouseDown(screen.getByRole('combobox', { name: 'Origin' }));
     fireEvent.click(await screen.findByRole('option', { name: 'project' }));
     fireEvent.click(screen.getByRole('checkbox', { name: 'Show active plugins only' }));
-    fireEvent.click(screen.getByRole('button', { name: 'PROJECT Gruppe (1)' }));
+    fireEvent.click(screen.getByRole('button', { name: 'PROJECT group (1)' }));
 
     await waitFor(() => {
       expect(JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}')).toEqual({
@@ -145,7 +145,7 @@ describe('FeatureMatrixPlugin settings panel', () => {
     const remounted = render(<FeatureMatrixPanel viewer={harness.viewer} />);
     expect(screen.getByRole('combobox', { name: 'Origin' }).textContent).toContain('project');
     expect((screen.getByRole('checkbox', { name: 'Show active plugins only' }) as HTMLInputElement).checked).toBe(true);
-    expect(screen.getByRole('button', { name: 'PROJECT Gruppe (1)' }).getAttribute('aria-expanded')).toBe('false');
+    expect(screen.getByRole('button', { name: 'PROJECT group (1)' }).getAttribute('aria-expanded')).toBe('false');
     remounted.unmount();
 
     localStorage.setItem(STORAGE_KEY, '{not-json');
@@ -164,16 +164,16 @@ describe('FeatureMatrixPlugin settings panel', () => {
 
     // plan-435: the legend now has to be honest about the retroactive teardown —
     // the slots are unregistered, not merely inert, and the choice is persisted.
-    expect(screen.getByText(/Ein\/Aus = active \(lifecycle \+ UI-Slots\)/)).toBeTruthy();
-    expect(screen.getByText(/UI-Slots abgemeldet, Wirkung zurückgebaut/)).toBeTruthy();
+    expect(screen.getByText(/On\/Off = active \(lifecycle \+ UI slots\)/)).toBeTruthy();
+    expect(screen.getByText(/UI slots unregistered, effect removed/)).toBeTruthy();
     expect(document.querySelectorAll('table[aria-label]')).toHaveLength(1);
     expect(screen.getByRole('columnheader', { name: 'Tier Info' })).toBeTruthy();
-    expect(screen.getByLabelText('Ein/Aus User-Intention').getAttribute('tabindex')).toBe('0');
+    expect(screen.getByLabelText('On/Off user intent').getAttribute('tabindex')).toBe('0');
     expect(screen.getAllByLabelText('core, always')[0].getAttribute('tabindex')).toBe('0');
     expect(screen.getByLabelText('Protected').getAttribute('tabindex')).toBe('0');
 
     const toggle = within(screen.getByText('project-tool').closest('tr')!).getByRole('switch', {
-      name: 'project-tool ausschalten',
+      name: 'project-tool switch off',
     });
     expect(toggle.getAttribute('aria-label')).toContain('project-tool');
     const reset = screen.getByRole('button', { name: 'Reset' }) as HTMLButtonElement;
@@ -183,7 +183,7 @@ describe('FeatureMatrixPlugin settings panel', () => {
     fireEvent.click(reset);
     await waitFor(() => expect(reset.disabled).toBe(true));
     expect((within(screen.getByText('project-tool').closest('tr')!).getByRole('switch', {
-      name: 'project-tool ausschalten',
+      name: 'project-tool switch off',
     }) as HTMLInputElement).checked).toBe(true);
 
     rendered.rerender(<FeatureMatrixPanel viewer={harness.viewer} />);

@@ -51,7 +51,50 @@ describe.skipIf(!hasDist)('bundle chunking (plan-271 9.8)', () => {
     const tslChunks = files.filter((f) => {
       const code = readFileSync(join(assetsDir, f), 'utf8');
       return TSL_MARKERS.some((m) => code.includes(m));
-    }, 60_000); // reads every emitted chunk of dist/ — I/O-bound, ~16 s on a dev machine
+    });
     expect(tslChunks.length, 'at least one async chunk carries the TSL code').toBeGreaterThan(0);
+  }, 60_000); // reads every emitted chunk of dist/ — I/O-bound, ~16 s on a dev machine
+});
+
+/**
+ * Test 9.8 (plan-762): the path-tracer scene data (`PathtracerBVHComputeData`
+ * of three-gpu-pathtracer, the ray traced mode's and the cinematic capture's
+ * BVH layout) must never reach the entry chunk — it is loaded only through the
+ * private adapters' dynamic imports. Checked ONLY when `dist/` stems from a
+ * private build (a community build does not contain the tracer at all, so
+ * "not in the entry" would hold vacuously and "somewhere else" would fail).
+ *
+ * The class name itself is mangled by the minifier; the storage-buffer name
+ * the class sets (`setName('bvh_materials')`) is a string literal and
+ * survives, so it is the second marker. `PathtracerBVHComputeData` stays in
+ * the list for unminified builds.
+ */
+const TRACER_MARKERS = ['PathtracerBVHComputeData', 'bvh_materials'];
+
+/** Chunk-file prefixes only a private build emits (the private feature adapters). */
+const PRIVATE_CHUNK_RE = /^(rv-cinematic-renderer|cinematic-render\.register|raytraced-render\.register|rv-raytraced-backend)-/;
+
+const privateDist = hasDist && readdirSync(assetsDir).some((f) => PRIVATE_CHUNK_RE.test(f));
+
+describe.skipIf(!privateDist)('bundle chunking — tracer data (plan-762 9.8, private dist only)', () => {
+  it('keeps the tracer scene data out of the entry chunk', () => {
+    const html = readFileSync(join(root, 'dist', 'index.html'), 'utf8');
+    const entries = [...html.matchAll(/src="\.?\/?assets\/(index-[^"]+\.js)"/g)].map((m) => m[1]);
+    expect(entries.length).toBeGreaterThan(0);
+    for (const entry of entries) {
+      const code = readFileSync(join(assetsDir, entry), 'utf8');
+      for (const marker of TRACER_MARKERS) {
+        expect(code.includes(marker), `entry chunk ${entry} must not contain "${marker}"`).toBe(false);
+      }
+    }
+  });
+
+  it('ships the tracer scene data in a private async chunk', () => {
+    const files = readdirSync(assetsDir).filter((f) => PRIVATE_CHUNK_RE.test(f) && f.endsWith('.js'));
+    const carriers = files.filter((f) => {
+      const code = readFileSync(join(assetsDir, f), 'utf8');
+      return TRACER_MARKERS.some((m) => code.includes(m));
+    });
+    expect(carriers.length, 'a private async chunk carries the tracer data').toBeGreaterThan(0);
   });
 });

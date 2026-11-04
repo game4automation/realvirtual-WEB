@@ -153,8 +153,12 @@ function opOfKind(kind: RvOpKind): RvPrimitiveOp {
       return make({ nodePath: 'Asset/Box', parts: [] });
     case 'mergeMesh':
       return make({ nodePath: 'Asset/Box', sourcePaths: ['Asset/Frame'] });
+    case 'replaceNodeGeometry':
+      return make({ nodePath: 'Asset/Box', sha256: 'b', quality: 'source', converter: 'solidcraft', prevSha256: 'a' });
     case 'setNodeVisible':
       return make({ nodePath: 'Asset/Box', visible: false, prev: true });
+    case 'cloneNode':
+      return make({ sourcePath: 'Asset/Box', nodePath: 'Asset/Box_1' });
     case 'composite':
       return make({ label: 'c', ops: [] });
   }
@@ -222,7 +226,9 @@ describe('A -- _bakeCurrent (scene-store.ts:2885)', () => {
     // missing, and nothing asset-side gets through.
     const uncovered = RV_OP_KINDS.filter((k) => k !== 'composite' && !covered.includes(k));
     expect(uncovered.every((k) => RV_OP_ORIGIN[k] === 'asset')).toBe(true);
-    expect(uncovered).toHaveLength(11);
+    // 12 since plan-621 added `replaceNodeGeometry` to the asset lineage,
+    // 13 since plan-641 added `cloneNode`.
+    expect(uncovered).toHaveLength(13);
   });
 
   it('MESSUNG A2: a prefix NUMBER lies about a mixed log -- createNode is claimed as contained', () => {

@@ -16,23 +16,24 @@
  * placement root above it and answers `{ kind: 'referenced', referenceNodePath:
  * <that root>, nodeId: <the node's NodeId in the referenced file> }` — the
  * identical shape a composed frame's node has, so the existing writers route
- * it: `AssetOverrides.byNodeId` (components) / `trsByNodeId` (moves) on the
+ * it: `AssetOverrides.byAddress` (components, key `#<id>` — plan-769) on the
  * placement node the file holds (`applyRoutedOverrides`), or — for a placement
  * added THIS session, which has no gltf node yet — into the placement extras
  * the bake writes (`placementPatches`). `applyOverrides` reads both back on
  * the next load.
  *
- * (4b): a node under a NESTED placement (a reference node inside a placed
- * asset) resolves to an owner that is itself referenced — the file being
- * written has nowhere to record it, and the referenced asset is what the user
- * ruled out writing into. The bake refuses BY NAME, with the way out, exactly
- * as it did for nested frames: `ReferencedFileWriteError` for a component
- * edit, `UnwritableTransformError` for a move. Nothing is dropped quietly.
+ * (4b, plan-769 Phase 4b / F13): a node under a NESTED placement (a reference
+ * node inside a placed asset) climbs to the OUTERMOST placement the file holds
+ * and is addressed through the nested reference: `<cellRef>#<slide>` in that
+ * placement's `byAddress`. The plan-757 refusal for component values is gone;
+ * the referenced asset is still never written. A MOVE inside placed content is refused at every depth since plan-769
+ * (D11/F14, `NestedTransformRefusedError` = `nested-transform-refused`): only
+ * component values are overridable there. Nothing is dropped quietly.
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Object3D } from 'three';
 import {
-  bakeIntoGlb, makeRegistryBakeResolver, ReferencedFileWriteError, UnwritableTransformError, type BakeResolver,
+  bakeIntoGlb, makeRegistryBakeResolver, NestedTransformRefusedError, ReferencedFileWriteError, UnwritableTransformError, type BakeResolver,
 } from '../src/core/hmi/scene/rv-scene-glb-bake';
 import { materialise } from '../src/core/hmi/scene/rv-scene-edits';
 import type { RvOp } from '../src/core/ops/rv-unified-ops';
@@ -114,7 +115,7 @@ describe('4a — an edit inside a top-level placement the file holds routes to A
     expect(getNodeId(slide), 'the instance node carries the template NodeId').toBe(SLIDE_NODE_ID);
     const slidePath = registry.getPathForNode(slide)!;
     const cellPath = registry.getPathForNode(findByName(h.viewer.currentModelRoot!, 'Cell_1')!)!;
-    expect(resolver.locate(slidePath)).toEqual({ kind: 'referenced', referenceNodePath: cellPath, nodeId: SLIDE_NODE_ID, sourceKey: 'cat:cell' });
+    expect(resolver.locate(slidePath)).toEqual({ kind: 'referenced', referenceNodePath: cellPath, nodeId: SLIDE_NODE_ID, sourceKey: 'cat:cell', address: `#${SLIDE_NODE_ID}` });
     // The placement root itself is a node of the file being written.
     expect(resolver.locate(cellPath)).toMatchObject({ kind: 'root' });
     // A node that has no NodeId cannot be addressed inside the referenced file — unresolved, as before.
@@ -122,7 +123,7 @@ describe('4a — an edit inside a top-level placement the file holds routes to A
     void bodyless;
   });
 
-  it('component edit: TargetSpeed 200 → 500 on Layout/Cell_1/Slide → byNodeId on Cell_1 → after the reload the drive runs at 500', async () => {
+  it('component edit: TargetSpeed 200 → 500 on Layout/Cell_1/Slide → byAddress on Cell_1 → after the reload the drive runs at 500', async () => {
     const docBytes = await layoutBytes('Cell_1', 'plc-cell', await innerDataUrl());
     const { h } = await load(docBytes);
     const registry = h.viewer.registry!;
@@ -132,12 +133,12 @@ describe('4a — an edit inside a top-level placement the file holds routes to A
       makeRegistryBakeResolver(registry, []), { expectedNames: registry.getGltfNodeNames() });
     expect(baked.path).toBe('fast');
     expect(baked.referenceOverrides).toBe(1);
-    expect(overridesOnNode(baked.glb, 'Cell_1')).toEqual({ byNodeId: { [SLIDE_NODE_ID]: { Drive: { TargetSpeed: 500 } } } });
+    expect(overridesOnNode(baked.glb, 'Cell_1')).toEqual({ byAddress: { [`#${SLIDE_NODE_ID}`]: { Drive: { TargetSpeed: 500 } } } });
 
-    // Reload the written file: the reader (`applyOverrides.byNodeId`) finds the node in the fresh instance.
+    // Reload the written file: the reader (`applyOverrides`, `byAddress`) finds the node in the fresh instance.
     const reloaded = await load(baked.glb, 'doc-2.glb');
     const cell = findByName(reloaded.h.viewer.currentModelRoot!, 'Cell_1')!;
-    expect(getAssetOverrides(cell)).toEqual({ byNodeId: { [SLIDE_NODE_ID]: { Drive: { TargetSpeed: 500 } } } });
+    expect(getAssetOverrides(cell)).toEqual({ byAddress: { [`#${SLIDE_NODE_ID}`]: { Drive: { TargetSpeed: 500 } } } });
     const slide = findByName(cell, 'Slide')!;
     expect((slide.userData.realvirtual as Record<string, Record<string, unknown>>).Drive.TargetSpeed).toBe(500);
     const x0 = slide.position.x;
@@ -146,28 +147,31 @@ describe('4a — an edit inside a top-level placement the file holds routes to A
     expect(Math.abs(slide.position.x - x0)).toBeGreaterThan(0.4);
   });
 
-  it('TRS edit: a moved Slide → trsByNodeId on Cell_1 → after the reload the node sits where it was put', async () => {
+  it('TRS edit: a moved Slide inside the placement is refused by name (plan-769 nested-transform-refused) — nothing is written', async () => {
     const docBytes = await layoutBytes('Cell_1', 'plc-cell', await innerDataUrl());
     const { h } = await load(docBytes);
     const registry = h.viewer.registry!;
     const slidePath = registry.getPathForNode(findByName(h.viewer.currentModelRoot!, 'Slide')!)!;
+    const cellPath = registry.getPathForNode(findByName(h.viewer.currentModelRoot!, 'Cell_1')!)!;
 
-    const baked = await bakeIntoGlb(docBytes.slice(0), materialise([moveOp(slidePath, [0.7, 0.9, 0.1])]),
-      makeRegistryBakeResolver(registry, []), { expectedNames: registry.getGltfNodeNames() });
-    expect(baked.referenceTransforms).toBe(1);
-    // `applyRoutedTransformOverrides` keeps `byNodeId` as the (empty) primary block beside the sibling.
-    expect(overridesOnNode(baked.glb, 'Cell_1')).toEqual({ byNodeId: {}, trsByNodeId: { [SLIDE_NODE_ID]: { position: [0.7, 0.9, 0.1], quaternion: [0, 0, 0, 1] } } });
-
-    const reloaded = await load(baked.glb, 'doc-3.glb');
-    const slide = findByName(reloaded.h.viewer.currentModelRoot!, 'Slide')!;
-    expect(slide.position.toArray().map((n) => +n.toFixed(6))).toEqual([0.7, 0.9, 0.1]);
+    let error: unknown;
+    try {
+      await bakeIntoGlb(docBytes.slice(0), materialise([moveOp(slidePath, [0.7, 0.9, 0.1])]),
+        makeRegistryBakeResolver(registry, []), { expectedNames: registry.getGltfNodeNames() });
+    } catch (e) { error = e; }
+    expect(error).toBeInstanceOf(NestedTransformRefusedError);
+    expect((error as NestedTransformRefusedError).code).toBe('nested-transform-refused');
+    expect((error as NestedTransformRefusedError).paths).toEqual([slidePath]);
+    expect((error as NestedTransformRefusedError).owners).toEqual([cellPath]);
+    expect((error as Error).message).toContain(slidePath);
+    expect((error as Error).message).toContain('inside a placement');
   });
 });
 
 // ─── 4a — a placement added THIS session (no gltf node yet) ─────────────
 
 describe('4a — an edit inside a LIVE placement (added this session) goes into the placement extras the bake writes', () => {
-  it('component + TRS edits land as AssetOverrides in the new placement node; the reload applies them', async () => {
+  it('a component edit lands as byAddress in the new placement node and the reload applies it; a TRS edit there is refused by name', async () => {
     const inner = await innerDataUrl();
     // The live placement, as `placeComponent` records it (glbUrl = the data url; a blob: url would be dropped on write).
     const placement = {
@@ -187,16 +191,27 @@ describe('4a — an edit inside a LIVE placement (added this session) goes into 
     const empty = new Group();
     empty.name = 'Layout';
     const base = await objectToGlb(empty);
+
+    // plan-769 F14: the move inside the live placement is refused — with the component edit beside it, nothing is written.
+    let error: unknown;
+    try {
+      await bakeIntoGlb(base.slice(0), materialise([
+        op({ kind: 'addPlacement', placement }),
+        setField('Layout/Cell_1/Slide', 'Drive', 'TargetSpeed', 500, 200),
+        moveOp('Layout/Cell_1/Slide', [0.7, 0.9, 0.1]),
+      ]), resolver, {});
+    } catch (e) { error = e; }
+    expect(error).toBeInstanceOf(NestedTransformRefusedError);
+    expect((error as NestedTransformRefusedError).paths).toEqual(['Layout/Cell_1/Slide']);
+
     const baked = await bakeIntoGlb(base, materialise([
       op({ kind: 'addPlacement', placement }),
       setField('Layout/Cell_1/Slide', 'Drive', 'TargetSpeed', 500, 200),
-      moveOp('Layout/Cell_1/Slide', [0.7, 0.9, 0.1]),
     ]), resolver, {});
     expect(baked.path).toBe('full');
     expect(baked.placements).toBe(1);
     expect(overridesOnNode(baked.glb, 'Cell_1')).toEqual({
-      byNodeId: { [SLIDE_NODE_ID]: { Drive: { TargetSpeed: 500 } } },
-      trsByNodeId: { [SLIDE_NODE_ID]: { position: [0.7, 0.9, 0.1], quaternion: [0, 0, 0, 1] } },
+      byAddress: { [`#${SLIDE_NODE_ID}`]: { Drive: { TargetSpeed: 500 } } },
     });
     const node = jsonNodes(baked.glb).find((n) => n.name === 'Cell_1') as { extras: { realvirtual: Record<string, unknown> } };
     expect((node.extras.realvirtual.AssetReference as { path?: string }).path).toBe(inner);
@@ -206,13 +221,12 @@ describe('4a — an edit inside a LIVE placement (added this session) goes into 
     expect(reloaded.h.viewer.bakeRegistry.instanceOf(cell)).not.toBeNull();
     const slide = findByName(cell, 'Slide')!;
     expect((slide.userData.realvirtual as Record<string, Record<string, unknown>>).Drive.TargetSpeed).toBe(500);
-    expect(slide.position.toArray().map((n) => +n.toFixed(6))).toEqual([0.7, 0.9, 0.1]);
   });
 });
 
 // ─── 4b — edits under a NESTED placement are refused by name ────────────
 
-describe('4b — an edit under a NESTED reference node is refused by name, with the way out (nothing goes quietly)', () => {
+describe('4b — an edit under a NESTED reference node goes to the OUTER placement as a nested address (plan-769 F13)', () => {
   async function nestedWorld() {
     const inner = await innerDataUrl();
     const outer = await outerDataUrl(inner);
@@ -232,30 +246,34 @@ describe('4b — an edit under a NESTED reference node is refused by name, with 
     };
   }
 
-  it('locate(): the node resolves to the nested root, the nested root to the top-level placement — an owner that is not in this file', async () => {
+  it('locate(): the node AND the nested root both resolve to the top-level placement, addressed through the nested reference', async () => {
     const w = await nestedWorld();
-    expect(w.resolver.locate(w.slidePath)).toEqual({ kind: 'referenced', referenceNodePath: w.nestedPath, nodeId: SLIDE_NODE_ID, sourceKey: 'cat:cell' });
-    expect(w.resolver.locate(w.nestedPath)).toEqual({ kind: 'referenced', referenceNodePath: w.machinePath, nodeId: CELL_REF_NODE_ID, sourceKey: 'cat:cell' });
+    expect(w.resolver.locate(w.slidePath)).toMatchObject({
+      kind: 'referenced', referenceNodePath: w.machinePath, nodeId: SLIDE_NODE_ID, address: `${CELL_REF_NODE_ID}#${SLIDE_NODE_ID}`,
+    });
+    expect(w.resolver.locate(w.nestedPath)).toMatchObject({
+      kind: 'referenced', referenceNodePath: w.machinePath, nodeId: CELL_REF_NODE_ID, address: `#${CELL_REF_NODE_ID}`,
+    });
     expect(w.resolver.locate(w.machinePath)).toMatchObject({ kind: 'root' });
     expect(w.resolver.livePlacementIdOf!(w.nestedPath), 'a nested root is no planner record').toBeNull();
     expect(w.resolver.livePlacementIdOf!(w.machinePath)).toBe('plc-machine');
   });
 
-  it('component edit → ReferencedFileWriteError naming the node and "Open the referenced asset"', async () => {
+  it('component edit → byAddress["<cellRef>#<slide>"] on Machine_1; the reload applies it to the nested Slide', async () => {
     const w = await nestedWorld();
-    let error: unknown;
-    try {
-      await bakeIntoGlb(w.docBytes.slice(0), materialise([setField(w.slidePath, 'Drive', 'TargetSpeed', 500, 200)]), w.resolver, {
-        expectedNames: w.registry.getGltfNodeNames(),
-      });
-    } catch (e) { error = e; }
-    expect(error).toBeInstanceOf(ReferencedFileWriteError);
-    expect((error as ReferencedFileWriteError).paths).toEqual([w.slidePath]);
-    expect((error as Error).message).toContain(w.slidePath);
-    expect((error as Error).message).toContain('Open the referenced asset');
+    const baked = await bakeIntoGlb(w.docBytes.slice(0), materialise([setField(w.slidePath, 'Drive', 'TargetSpeed', 500, 200)]), w.resolver, {
+      expectedNames: w.registry.getGltfNodeNames(),
+    });
+    expect(baked.referenceOverrides).toBe(1);
+    expect(overridesOnNode(baked.glb, 'Machine_1')).toEqual({
+      byAddress: { [`${CELL_REF_NODE_ID}#${SLIDE_NODE_ID}`]: { Drive: { TargetSpeed: 500 } } },
+    });
+    const reloaded = await load(baked.glb, 'doc-nested.glb');
+    const slide = findByName(findByName(reloaded.h.viewer.currentModelRoot!, 'Cell_1')!, 'Slide')!;
+    expect((slide.userData.realvirtual as Record<string, Record<string, unknown>>).Drive.TargetSpeed).toBe(500);
   });
 
-  it('TRS edit → UnwritableTransformError naming the node and "Open the referenced asset"', async () => {
+  it('TRS edit → NestedTransformRefusedError (an UnwritableTransformError) naming the node and the way out', async () => {
     const w = await nestedWorld();
     let error: unknown;
     try {
@@ -264,10 +282,12 @@ describe('4b — an edit under a NESTED reference node is refused by name, with 
       });
     } catch (e) { error = e; }
     expect(error).toBeInstanceOf(UnwritableTransformError);
+    expect(error).toBeInstanceOf(NestedTransformRefusedError);
     expect((error as UnwritableTransformError).paths).toEqual([w.slidePath]);
     expect((error as UnwritableTransformError).unknown).toEqual([]);
+    expect((error as NestedTransformRefusedError).owners).toEqual([w.machinePath]);
     expect((error as Error).message).toContain(w.slidePath);
-    expect((error as Error).message).toContain('Open the referenced asset');
+    expect((error as Error).message).toContain('open the referenced asset');
   });
 
   it('the nested reference node itself is never touched: it lives in the outer asset, and an unrelated save leaves the top-level node byte-identical', async () => {

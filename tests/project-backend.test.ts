@@ -324,7 +324,9 @@ describe('FolderBackend', () => {
     library.seedText('catalog.json', '{}');                        // not an asset
     library.seedDir('Custom').seedText('gripper.glb', 'GLB');
     library.seedDir('PalletHandling').seedText('Pallet.glb', 'GLB');
-    library.seedDir('.thumbnails').seedText('Pallet.png', 'PNG');  // sidecar
+    const thumbs = library.seedDir('.thumbnails');
+    thumbs.seedText('Pallet.png', 'PNG');                          // legacy sidecar
+    thumbs.seedText('pallet.1a2b3c4d.webp', 'WEBP');               // plan-776 sidecar
     root.seedDir('models').seedText('press.glb', 'GLB');           // a model, not library
     const b = new FolderBackend(asDirHandle(root), { writable: true });
 
@@ -426,20 +428,22 @@ describe('contract', () => {
   });
 });
 
-// Libraries are explicit-only: no boot path reads the deploy catalog on its
+// Libraries are explicit-only: no boot path reads the deploy's library on its
 // own. The listing returns exactly what a deployed manifest declares under
-// `library/` — a deploy that declares nothing has no library, even when a
-// `library/catalog.json` sits on the deploy root.
+// `library/` — a deploy that declares nothing has no library, even when the
+// app-level realvirtual library (`library/project.json`, plan-778 — formerly
+// library `catalog.json`) sits on the deploy root.
 describe('BundledBackend library', () => {
   const catalog = {
-    entries: [
-      { id: 'a', name: 'Roll Conveyor 1m', glbUrl: 'PalletHandling/RollConveyor-1m.glb' },
-      { id: 'b', name: 'Turntable', glbUrl: 'PalletHandling/Turntable.glb' },
+    id: 'prj_realvirtual_library', name: 'realvirtual Library', schemaVersion: 2,
+    documents: [
+      { id: 'a', name: 'Roll Conveyor 1m', path: 'PalletHandling/RollConveyor-1m.glb' },
+      { id: 'b', name: 'Turntable', path: 'PalletHandling/Turntable.glb' },
     ],
   };
 
-  it('never reads the deploy catalog implicitly — undeclared means empty', async () => {
-    const b = new BundledBackend({ fetchImpl: fakeFetch({ 'library/catalog.json': catalog }) });
+  it('never reads the deploy library implicitly — undeclared means empty', async () => {
+    const b = new BundledBackend({ fetchImpl: fakeFetch({ 'library/project.json': catalog }) });
     expect(await listIn(b, 'library')).toEqual([]);
   });
 
@@ -455,7 +459,7 @@ describe('BundledBackend library', () => {
           schemaVersion: 1, id: 'prj_x', name: 'X',
           library: [{ path: 'library/only-this.glb' }],
         },
-        'library/catalog.json': catalog,
+        'library/project.json': catalog,
       }),
     });
     expect((await listIn(b, 'library')).map(e => e.path)).toEqual(['library/only-this.glb']);

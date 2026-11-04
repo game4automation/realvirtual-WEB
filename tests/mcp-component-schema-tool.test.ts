@@ -25,9 +25,12 @@ import {
   registerComponentSchema,
 } from '../src/core/engine/rv-component-registry';
 import {
+  NOTES_MARKER,
+  RULES_MARKER,
   describeComponentType,
   isDriveExtension,
   listComponentTypes,
+  parseSpecRules,
   type ComponentSchemaInfo,
   type ComponentTypeSummary,
 } from '../src/core/engine/rv-component-schema-info';
@@ -64,7 +67,21 @@ const mentions = (lines: string[], ...needles: string[]) =>
 
 // Types without an rv-odt `$def` carry no description (F4: empty string).
 // `WebLabel` (plan-529) is WEB-only with an inline schema, like NodeKnowledge.
-const INLINE_TYPES_WITHOUT_DESCRIPTION = new Set(['NodeKnowledge', 'WebLabel', FIXTURE]);
+// plan-522: the web-only maintenance procedure schemas (rv-maintenance-components.ts).
+const INLINE_TYPES_WITHOUT_DESCRIPTION = new Set([
+  'NodeKnowledge', 'WebLabel', FIXTURE,
+  'LogicStep_MaintenanceProcedure', 'LogicStep_MaintenanceStep', 'LogicStep_AnimateTransform',
+  'LogicStep_SetTransparency', 'LogicStep_Effect', 'LogicStep_Arrow', 'LogicStep_MaintenanceTrigger',
+  // plan-664 Phase 2: the ray sensor family is WEB-only (no Unity counterpart,
+  // hence no rv-ODT `$def` — see spec-loading.test.ts), so the same empty
+  // description applies. The field-level documentation of these three lives in
+  // their source files; a description here needs the rv-ODT entry the Unity
+  // components will bring.
+  'Rangefinder', 'LaserScanner', 'RayTarget',
+  // plan-559 Phase 3: the fleet scene layer is WEB-only (inline schemas in
+  // src/core/fleet/scene/fleet-components.ts, see spec-loading.test.ts).
+  'Fleet', 'TransferStation', 'Charger', 'WaitPoint', 'ForkliftProfile', 'BatteryProfile',
+]);
 
 describe('web_component_schema — list (F1, F7)', () => {
   it('lists every authorable type, each with a description unless it is an inline type', async () => {
@@ -88,7 +105,7 @@ describe('web_component_schema — list (F1, F7)', () => {
   it('Kinematic is listed as NOT authorable, with the tool that creates it', async () => {
     const { t } = tool();
     const kin = (await list(t)).find((s) => s.type === 'Kinematic');
-    expect(kin).toMatchObject({ authorable: false, createVia: 'web_editor_kinematize' });
+    expect(kin).toMatchObject({ authorable: false, createVia: 'editor.kinematize' });
   });
 
   it('the list call never loads the specification (lazy chunk)', async () => {
@@ -148,7 +165,7 @@ describe('web_component_schema — detail (F2, F5, F6)', () => {
 
   it('Kinematic: Parent is a plain string without refType; a rule explains the string path', async () => {
     const info = await detail(tool().t, 'Kinematic');
-    expect(info).toMatchObject({ authorable: false, createVia: 'web_editor_kinematize' });
+    expect(info).toMatchObject({ authorable: false, createVia: 'editor.kinematize' });
     const parent = fieldOf(info, 'Parent')!;
     expect(parent.type).toBe('string');
     expect(parent.refType).toBeUndefined();
@@ -227,5 +244,54 @@ describe('web_component_schema — production wiring', () => {
     expect(inst).toBeInstanceOf(McpComponentSchemaTool);
     const info = await detail(inst, 'Drive_Cylinder');
     expect(info.rules.length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * plan-2047 §9.1b — the consumer-level proof that a letter-suffixed Section-7
+ * subnumber (`#### 7a.11b TransportGuided`) reaches the agent.
+ *
+ * This is deliberately NOT a regex unit test: what a heading grammar accepts
+ * says nothing about what `web_component_schema` hands out. Before the fix
+ * `parseSpecRules` dropped the whole section, so an agent following the tool's
+ * own "Read before editor.addComponent" got NO authoring rules for
+ * `TransportGuided` and no warning either (the `rules unavailable` warning only
+ * covers a specification that could not be loaded at all).
+ */
+describe('web_component_schema — letter-suffixed spec subnumbers (plan-2047)', () => {
+  it('describeComponentType("TransportGuided") carries its authoring rules', () => {
+    const info = describeComponentType('TransportGuided', specText);
+    expect(info, 'TransportGuided is not describable').not.toBeNull();
+    expect(info!.rules.length, 'TransportGuided has no authoring rule').toBeGreaterThan(0);
+    // Semantic anchor, so a rule block that loses its meaning fails here:
+    // the guide starts at the origin along +X and takes its speed from the Drive.
+    expect(mentions(info!.rules, 'Drive', 'speed')).toBe(true);
+  });
+
+  it('the tool answers non-empty rules for TransportGuided, without a warning', async () => {
+    const res = JSON.parse(await tool().t.webComponentSchema('TransportGuided')) as
+      ComponentSchemaInfo & { warning?: string };
+    expect(res.warning).toBeUndefined();
+    expect(res.rules.length).toBeGreaterThan(0);
+  });
+
+  it('every letter-suffixed Section-7 heading resolves to its type name', () => {
+    // Derived from the specification itself, not from a hand-kept list: every
+    // `#### 7x.N<letter>` heading must be understood by the parser's grammar.
+    const suffixed = [...specText.matchAll(/^#### (7[a-g]\.\d+[a-z]) (\S+)[ \t]*$/gm)]
+      .map((m) => ({ sub: m[1], type: m[2] }));
+    expect(suffixed.length, 'the spec has no letter-suffixed subnumber any more').toBeGreaterThanOrEqual(3);
+    expect(suffixed.map((s) => s.sub)).toEqual(expect.arrayContaining(['7a.11b', '7a.71b', '7a.38b']));
+    // The grammar is checked where it bites: a section that carries a marker
+    // must appear in the parser's map. (A section WITHOUT a rules/notes block is
+    // legitimately absent — per the parser contract there is no empty block.)
+    const parsed = parseSpecRules(specText);
+    const sections = specText.split(/^(?=#### 7[a-g]\.)/m);
+    for (const { sub, type } of suffixed) {
+      const body = sections.find((s) => s.startsWith(`#### ${sub} `));
+      expect(body, `section ${sub} not found`).toBeTruthy();
+      if (!body!.includes(RULES_MARKER) && !body!.includes(NOTES_MARKER)) continue;
+      expect(parsed.has(type), `parser dropped the block under ${sub} ${type}`).toBe(true);
+    }
   });
 });

@@ -41,6 +41,8 @@ export interface CreateSdkComponentOptions {
 
 /** A loaded (or failed-and-disabled) script component. */
 export interface SdkComponent {
+  /** Original source for the DES binding gate. */
+  readonly source?: string;
   /** The underlying guest context (poison/disable state, retained handlers). */
   readonly ctx: RVScriptContext;
   /** The host bridge (subscription hygiene, `__rvHostCall` dispatch). */
@@ -83,7 +85,12 @@ export function createSdkComponent(
   bridge.setDisableHook((reason) => ctx.disable(reason));
   ctx.exposeFunction('__rvHostCall', bridge.hostCall);
   bridge.setNotifier((subId, args) => {
-    const r = ctx.callHandler('__cb', subId, args);
+    // plan-2212 Phase 4b (C): the callback runs at the scheduler's current time;
+    // passing it spares the guest a host call for `self.now` (sink arrivals).
+    let now: number | undefined;
+    try { now = env.scheduler.now; } catch { now = undefined; }
+    const r = ctx.callHandler('__cb', subId, args, now);
+    if (!r.ok) ctx.callHandler('__rv.dispatch.clear');
     if (!r.ok && r.error
       && r.error.name !== 'ContextDisabledError' && r.error.name !== 'ContextDisposedError') {
       console.warn(`[sdk:${env.path}] guest callback failed:`, r.error.message);
@@ -125,6 +132,7 @@ export function createSdkComponent(
   let disposed = false;
   return {
     ctx,
+    source: code,
     bridge,
     get ok(): boolean {
       return error === null;
@@ -219,4 +227,4 @@ export {
 } from './rv-sdk-math';
 export { generateSdkDts, SDK_MINIMAL_LIB_DTS } from './rv-sdk-dts';
 export { RVScriptComponentAdapter, type ScriptComponentAdapterOptions } from './rv-script-component-adapter';
-export { lintDesSafety, type DesLintDiagnostic, type DesLintOptions } from './rv-des-lint';
+export { loadDesAstCheck, lintDesSafety, type DesLintDiagnostic, type DesLintOptions } from './rv-des-lint';

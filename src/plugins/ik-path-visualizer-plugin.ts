@@ -28,11 +28,18 @@ import type { GizmoHandle } from '../core/engine/rv-gizmo-manager';
 import type { RVRobotIK } from '../core/engine/rv-robot-ik';
 import type { RVIKPath } from '../core/engine/rv-ik-path';
 import type { RVIKTarget } from '../core/engine/rv-ik-target';
-import { ikSolverRegistry, targetPoseInBase, type OpwParams, type CobotSolveOpts } from '../core/engine/rv-ik-solver';
+import { ikSolverRegistry, solveFrameFor, targetPoseInBase, type OpwParams, type CobotSolveOpts } from '../core/engine/rv-ik-solver';
 import { ikEditStore } from '../core/hmi/ik-edit-store';
 
 const MARKER_COLOR = 0xce93d8;      // IKTarget badge lavender (reachable)
 const UNREACHABLE_COLOR = 0xff4d4d; // red — pose has no IK solution
+/**
+ * Grey — reachability is UNKNOWN: no solver, no usable OPW parameters, or a
+ * cobot whose joint chain could not be derived. Neither lavender nor red would
+ * be true here, and the old optimistic default (`fill(true)`) claimed every
+ * waypoint was reachable precisely on the rigs where nothing had been checked.
+ */
+const UNKNOWN_COLOR = 0x9e9e9e;
 const MARKER_SIZE = 0.28;
 const MARKER_OPACITY = 0.95;
 const LABEL_SIZE = 0.6;
@@ -46,6 +53,20 @@ const INTERP_RGB: Record<string, [number, number, number]> = {
 };
 const DEFAULT_RGB: [number, number, number] = INTERP_RGB.PointToPoint;
 
+/**
+ * What a waypoint marker is allowed to say. `'unknown'` is a first-class state,
+ * not a placeholder: a reachability question that was never put to the right
+ * solver has no answer, and showing one would be a lie in whichever direction
+ * the default happened to point.
+ */
+export type ReachState = 'reachable' | 'unreachable' | 'unknown';
+
+const REACH_COLOR: Record<ReachState, number> = {
+  reachable: MARKER_COLOR,
+  unreachable: UNREACHABLE_COLOR,
+  unknown: UNKNOWN_COLOR,
+};
+
 interface PathVisual {
   line: LineSegments;
   markers: GizmoHandle[];           // one sphere per target (index-aligned with targets)
@@ -54,7 +75,7 @@ interface PathVisual {
   targetNodes: Object3D[];
   robot: RVRobotIK;
   params: OpwParams | null;
-  reach: boolean[];                 // last reachability per target (avoids redundant recolor)
+  reach: ReachState[];              // last reachability per target (avoids redundant recolor)
   lastMat: Float32Array;            // cached target matrixWorld (N*16) for dirty-checking
   lastInterp: string[];             // cached interpolation per target
 }
@@ -250,7 +271,9 @@ export class IKPathVisualizerPlugin implements RVViewerPlugin {
     targets.forEach((t, i) => {
       markers.push(viewer.gizmoManager.create(t.node, {
         shape: 'sphere',
-        color: MARKER_COLOR,
+        // Starts UNKNOWN and is recoloured by the updateReachability() call at
+        // the end of this method — nothing is claimed before it was checked.
+        color: UNKNOWN_COLOR,
         opacity: MARKER_OPACITY,
         size: MARKER_SIZE,
         attachToNode: true,
@@ -287,7 +310,7 @@ export class IKPathVisualizerPlugin implements RVViewerPlugin {
 
     const visual: PathVisual = {
       line, markers, labels, targets, targetNodes, robot, params,
-      reach: new Array(targets.length).fill(true),
+      reach: new Array<ReachState>(targets.length).fill('unknown'),
       lastMat: new Float32Array(targets.length * 16),
       lastInterp: new Array(targets.length).fill(''),
     };
@@ -321,37 +344,57 @@ export class IKPathVisualizerPlugin implements RVViewerPlugin {
     // No computeBoundingSphere: the line has frustumCulled = false and isn't raycast.
   }
 
-  /** Recolor markers whose reachability flipped (only when a solver + params exist). */
+  /**
+   * Recolor the markers whose reachability changed.
+   *
+   * Without OPW parameters or without a solver nothing CAN be checked, so every
+   * marker goes to `'unknown'` — it used to return here and leave the whole path
+   * at the optimistic `fill(true)` default, i.e. permanently green on exactly
+   * the robots where no check had ever run.
+   */
   private updateReachability(visual: PathVisual): void {
     const { params, robot } = visual;
-    if (!params || !ikSolverRegistry.available) return;
+    const unchecked = !params || !ikSolverRegistry.available;
     for (let i = 0; i < visual.targetNodes.length; i++) {
-      const ok = this.isReachable(robot, params, visual.targetNodes[i]);
-      if (ok === visual.reach[i]) continue;
-      visual.reach[i] = ok;
-      visual.markers[i]?.update({ color: ok ? MARKER_COLOR : UNREACHABLE_COLOR });
+      const state = unchecked ? 'unknown' : this.reachStateOf(robot, params!, visual.targetNodes[i]);
+      if (state === visual.reach[i]) continue;
+      visual.reach[i] = state;
+      visual.markers[i]?.update({ color: REACH_COLOR[state] });
     }
   }
 
-  /** True if the target pose (relative to the robot base) has any IK solution.
-   *  Wrist-type routing (plan-233 Phase 2): NonSpherical robots check via the
-   *  numerical Cobot solver (no warm start — cold, deterministic); spherical
-   *  wrists — and any fallback (no chain / no pro solver) — via Pieper. */
-  private isReachable(robot: RVRobotIK, params: OpwParams, targetNode: Object3D): boolean {
-    targetPoseInBase(robot.node.matrixWorld, targetNode.matrixWorld, this._p3, this._q4);
-    if (robot.WristType === 'NonSpherical' && ikSolverRegistry.canSolveCobot) {
+  /**
+   * Whether the target pose (relative to the robot base) has an IK solution.
+   *
+   * Wrist-type routing (plan-233 Phase 2): NonSpherical robots check via the
+   * numerical Cobot solver (no warm start — cold, deterministic), spherical
+   * wrists via Pieper.
+   *
+   * A cobot WITHOUT the Cobot solver or without a derivable joint chain returns
+   * `'unknown'`. It used to fall through to Pieper, which answers for a
+   * spherical wrist the robot does not have: the markers then showed confident
+   * red and green from the wrong kinematic model. No answer is the honest one.
+   */
+  private reachStateOf(robot: RVRobotIK, params: OpwParams, targetNode: Object3D): ReachState {
+    // The frame follows the solver this check will use (plan-772 F5) — the
+    // cobot reads the chain frame, Pieper the Unity frame.
+    targetPoseInBase(robot.node.matrixWorld, targetNode.matrixWorld, this._p3, this._q4,
+      solveFrameFor(robot.WristType, robot.getJointChain()));
+    if (robot.WristType === 'NonSpherical') {
+      if (!ikSolverRegistry.canSolveCobot) return 'unknown';
       const chain = robot.getJointChain();
-      if (chain) {
-        this._cobotOpts.opw = params;
-        this._cobotOpts.warmStart = undefined;
-        const sols = ikSolverRegistry.solveCobot(chain, this._p3, this._q4, this._cobotOpts);
-        if (sols) return sols.some((s) => s.reachable);
-      }
+      if (!chain) return 'unknown';
+      this._cobotOpts.opw = params;
+      this._cobotOpts.warmStart = undefined;
+      const sols = ikSolverRegistry.solveCobot(chain, this._p3, this._q4, this._cobotOpts);
+      if (!sols) return 'unknown';
+      return sols.some((s) => s.reachable) ? 'reachable' : 'unreachable';
     }
     // NOTE: solvePieper returns the full 8-branch set with per-branch reachable
     // flags — a bare truthiness check would ALWAYS pass once a solver is loaded.
     const sols = ikSolverRegistry.solvePieper(params, this._p3, this._q4);
-    return !!sols && sols.some((s) => s.reachable);
+    if (!sols) return 'unknown';
+    return sols.some((s) => s.reachable) ? 'reachable' : 'unreachable';
   }
 
   private disposeVisual(visual: PathVisual): void {

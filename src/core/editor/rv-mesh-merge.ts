@@ -344,6 +344,48 @@ export interface MergeClassification {
   candidates: MergeCandidate[];
   /** Set when the merge must not be offered at all. */
   ineligibleReason: string | null;
+  /**
+   * plan-675: buckets with a TEXTURED material in which only some sources carry
+   * `uv`. The merge still runs (missing `uv` is reconstructable), but the
+   * synthesised zeros make those parts sample one texel — a flat colour. The
+   * caller reports them; `editor.generateUVs` on the listed meshes fixes it.
+   */
+  uvGaps: MergeUVGap[];
+}
+
+/** One bucket whose textured material meets sources with and without `uv` (plan-675). */
+export interface MergeUVGap {
+  bucketKey: string;
+  materialName: string;
+  /** Meshes of the bucket without `uv`. */
+  missing: Mesh[];
+  /** Sources in the bucket. */
+  total: number;
+}
+
+const MATERIAL_MAP_SLOTS = ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'aoMap', 'emissiveMap', 'alphaMap'] as const;
+
+/** True when the material samples any texture through UV channel 0. */
+export function materialHasTextureMap(material: Material | null | undefined): boolean {
+  if (!material) return false;
+  const m = material as unknown as Record<string, unknown>;
+  return MATERIAL_MAP_SLOTS.some((slot) => !!m[slot]);
+}
+
+/** Buckets whose textured material meets sources with AND without `uv` (see {@link MergeClassification.uvGaps}). */
+export function findUVGaps(zones: readonly MergeZone[]): MergeUVGap[] {
+  const gaps: MergeUVGap[] = [];
+  for (const zone of zones) {
+    for (const bucket of zone.buckets) {
+      if (!materialHasTextureMap(bucket.material)) continue;
+      const missing = bucket.candidates
+        .filter((c) => !(c.mesh.geometry as BufferGeometry).getAttribute('uv'))
+        .map((c) => c.mesh);
+      if (missing.length === 0 || missing.length === bucket.candidates.length) continue;
+      gaps.push({ bucketKey: bucket.key, materialName: bucket.material.name || 'Material', missing, total: bucket.candidates.length });
+    }
+  }
+  return gaps;
 }
 
 /** Node paths inside a classification are resolved by the caller, not here. */
@@ -445,7 +487,7 @@ export function classifySubtree(root: Object3D, pathOf: NodePathFn): MergeClassi
     else if (candidates.length < 2) ineligibleReason = MERGE_REASON_TOO_FEW;
   }
 
-  return { root, zones, kept, candidates, ineligibleReason };
+  return { root, zones, kept, candidates, ineligibleReason, uvGaps: findUVGaps(zones) };
 }
 
 // ─── Transform bake ─────────────────────────────────────────────────────

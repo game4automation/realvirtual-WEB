@@ -129,6 +129,18 @@ describe('reconcile → problems', () => {
     expect(missing?.detail).toContain('Cell.Orphan');
   });
 
+  it('an interface the model couples to nothing (another project) gets no missing-in-plc warning', () => {
+    const foreign = { ...IFACE, id: 'mqtt-other', signals: [
+      { name: 'Other.A', type: 'PLCOutputBool', protocolAddress: 'x', record: false },
+    ] } as unknown as ConnectInterface;
+    const report = reconcileSignals(MODEL, foreign);
+    expect(report.counts['missing-in-plc']).toBe(2); // the report itself stays complete …
+    reportSignalReconcileProblems(report, creatablePlcOnly(report).map((e) => e.name));
+    const ids = getProblems().filter((p) => p.code === SIGNAL_RECONCILE_CODE).map((p) => p.id);
+    expect(ids).not.toContain(signalReconcileProblemId('mqtt-other', 'missing-in-plc')); // … the panel stays quiet
+    expect(ids).toContain(signalReconcileProblemId('mqtt-other', 'plc-only'));
+  });
+
   it('offers the creation command as the action, with only the creatable names', () => {
     const report = reconcileSignals(MODEL, IFACE, { addressRule: { signals: 'required' } } as never);
     reportSignalReconcileProblems(report, creatablePlcOnly(report).map((e) => e.name));

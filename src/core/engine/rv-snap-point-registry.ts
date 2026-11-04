@@ -4,7 +4,7 @@
 /**
  * Snap-Point Registry — indexed lookup of all snap points discovered in the
  * scene. A snap point is an empty Object3D whose name matches the
- * Snap-<DIR>-<TYPEID> naming convention (see snap-name-parser.ts).
+ * Snap-<DIR>-<TYPEID> naming convention (see core/connect/snap-name-parser.ts).
  *
  * The registry is the single source of truth for runtime snap state:
  *   - Indexed by typeId for fast compatibility lookup
@@ -16,8 +16,10 @@
  */
 
 import type { Object3D } from 'three';
-import type { SnapDirection, SnapDirectionCode, SnapFlow } from '../../plugins/snap-point/snap-name-parser';
-import { flowsCompatible } from '../../plugins/snap-point/snap-name-parser';
+// The snap vocabulary lives in the connection core (plan-633 F2) — the engine
+// no longer reaches into the plugin folder for it.
+import type { SnapDirection, SnapDirectionCode, SnapFlow } from '../connect/snap-name-parser';
+import { flowsCompatible } from '../connect/snap-name-parser';
 
 /** Opaque placement id (matches PlacedComponent.id from rv-layout-store). */
 export type PlacedComponentId = string;
@@ -64,10 +66,25 @@ export class SnapPointRegistry {
    *  to avoid the previous O(n × deg) full registry traversal. */
   private readonly _byOwnerRoot = new Map<Object3D, SnapPoint[]>();
   private readonly _all: SnapPoint[] = [];
+  private _version = 0;
+
+  /**
+   * Mutation counter (plan-644): raised by every mutator that changes the snap
+   * set or a snap's connection state — `register`, `unregister`,
+   * `unregisterUnder`, `markOccupied`, `markFree`, `pair`, `clear`. Readers
+   * never raise it. Caches keyed on a registry (e.g. the DES port cache in
+   * `material-flow-self.ts`) compare it together with the registry IDENTITY;
+   * the fields `occupied` / `occupiedBy` / `pairedSnapId` must therefore only
+   * be written through these mutators.
+   */
+  get version(): number {
+    return this._version;
+  }
 
   /** Register a snap point. Idempotent on id. */
   register(sp: SnapPoint): void {
     if (this._byId.has(sp.id)) return;
+    this._version++;
     this._byId.set(sp.id, sp);
     this._all.push(sp);
     const bucket = this._byTypeId.get(sp.typeId);
@@ -82,6 +99,7 @@ export class SnapPointRegistry {
   unregister(id: string): void {
     const sp = this._byId.get(id);
     if (!sp) return;
+    this._version++;
     // Free the partner's pairing reference before deleting this end.
     if (sp.pairedSnapId) {
       const other = this._byId.get(sp.pairedSnapId);
@@ -122,6 +140,8 @@ export class SnapPointRegistry {
         victims.push(sp.id);
       }
     }
+    if (victims.length === 0) return;
+    this._version++;
     for (const id of victims) this.unregister(id);
   }
 
@@ -200,6 +220,7 @@ export class SnapPointRegistry {
   markOccupied(id: string, by: PlacedComponentId): void {
     const sp = this._byId.get(id);
     if (!sp) return;
+    this._version++;
     sp.occupied = true;
     sp.occupiedBy = by;
   }
@@ -207,6 +228,7 @@ export class SnapPointRegistry {
   markFree(id: string): void {
     const sp = this._byId.get(id);
     if (!sp) return;
+    this._version++;
     // Free both ends symmetrically. When one end of a pair is freed the
     // partner is, by definition, no longer occupied either — its
     // `occupiedBy` referred to the asset on THIS side. Without this the
@@ -232,12 +254,14 @@ export class SnapPointRegistry {
     const a = this._byId.get(idA);
     const b = this._byId.get(idB);
     if (!a || !b || a === b) return;
+    this._version++;
     a.pairedSnapId = b.id;
     b.pairedSnapId = a.id;
   }
 
   /** Drop everything (e.g. on model unload). */
   clear(): void {
+    this._version++;
     this._byId.clear();
     this._byTypeId.clear();
     this._byOwnerRoot.clear();

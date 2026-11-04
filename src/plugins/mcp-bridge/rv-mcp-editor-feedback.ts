@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage } from '../../core/rv-safe-storage';
+
 /**
  * rv-mcp-editor-feedback — visual feedback for the web_editor_* MCP tools.
  *
@@ -28,6 +30,7 @@
  * lazy _load()).
  */
 
+import { getAiClicks } from '../../core/hmi/ai-click-choreography-store';
 import { Box3, Vector3 } from 'three';
 import type { Object3D } from 'three';
 import type { RVViewer } from '../../core/rv-viewer';
@@ -36,7 +39,7 @@ import {
   getStoredKinematicsPanelWidth,
   getStoredMaterialsPanelWidth,
 } from '../../core/hmi/layout-constants';
-import { simulateButtonClick } from '@rv-private/plugins/asset-editor/button-sim-store';
+import { simulateButtonClick } from '@rv-private/plugins/asset-editor/shared/button-sim-store';
 import { expandMechanismRow } from '../../core/hmi/mechanism-command-descriptors';
 import { inspectorFieldKey, requestInspectorFieldReveal } from '../../core/hmi/inspector-field-touch';
 import { touchAfterglow } from '../../core/hmi/button-sim-state';
@@ -89,7 +92,10 @@ interface FeedbackSpec {
 
 function defaultPaths(args: Rec): string[] {
   if (typeof args['path'] === 'string' && args['path']) return [args['path'] as string];
-  if (typeof args['paths'] === 'string') return parsePathsParam(args['paths'] as string);
+  if (typeof args['paths'] === 'string' || Array.isArray(args['paths'])) {
+    // A broken JSON list is the TOOL's error to report; feedback just shows nothing.
+    try { return parsePathsParam(args['paths'] as string | unknown[]); } catch { return []; }
+  }
   return [];
 }
 
@@ -343,7 +349,7 @@ async function revealInspectorField(viewer: RVViewer, target: FieldTarget): Prom
   if (!editor) return null;
 
   const snap = editor.getSnapshot();
-  const detached = localStorage.getItem('rv-inspector-detached') === 'true';
+  const detached = readLocalStorage('rv-inspector-detached') === 'true';
   const onScreen = snap.showInspector && snap.selectedNodePath === target.path && (detached || snap.panelOpen);
   if (!onScreen) {
     // Docked inspector needs the hierarchy: selectAndReveal opens it and
@@ -354,6 +360,7 @@ async function revealInspectorField(viewer: RVViewer, target: FieldTarget): Prom
 
   const field = target.fields[0];
   requestInspectorFieldReveal(target.path, target.componentType, field);
+  if (!getAiClicks()) return null;
   const key = inspectorFieldKey(target.path, target.componentType, field);
   const selector = `[data-rv-button-id="${CSS.escape(key)}"]`;
   const until = Date.now() + FIELD_REVEAL_WAIT_MS;
@@ -414,8 +421,8 @@ export async function prepareEditorChoreography(
       if (target) expandMechanismRow(target);
     }
 
-    // Field writes: open the inspector on the field; an unbound tool
-    // (web_component_set) presses the first field's row itself.
+    // Field writes: open the inspector on the field. component.setFields has
+    // no buttonKey and presses the first field's row through its tombstone key.
     let id = buttonKey;
     if (spec.field) {
       const target = spec.field(args);
@@ -424,7 +431,7 @@ export async function prepareEditorChoreography(
       id = id ?? rowKey;
     }
     {
-      if (id) {
+      if (id && getAiClicks()) {
         // A HIDDEN tab has no one watching this, and Chrome clamps setTimeout
         // there to >=1 s (up to 60 s once heavily throttled) — so the 80 ms
         // "beat" below silently becomes the reason the whole tool call blows
@@ -452,7 +459,7 @@ export async function prepareEditorChoreography(
  */
 export async function prepareCommandChoreography(buttonKey: string): Promise<void> {
   try {
-    if (!buttonKey) return;
+    if (!getAiClicks() || !buttonKey) return;
     if (typeof document !== 'undefined' && document.hidden) return;
     await simulateButtonClick(buttonKey);
   } catch {
@@ -497,9 +504,8 @@ export function applyEditorFeedback(
     // feedback runs post-only (result-addressed paths).
     ensurePanelOpen(viewer, spec);
 
-    // Afterglow on the written Inspector rows. A BOUND field write
-    // (web_editor_set_field) already gets it from the command listener; an
-    // unbound one (web_component_set) glows every field it applied.
+    // editor.setField gets its afterglow from the command listener;
+    // component.setFields glows every applied field through its tombstone key.
     if (spec.field && tool === 'web_component_set') {
       const target = spec.field(args);
       const applied = result['applied'];

@@ -42,7 +42,7 @@
  * and is documented in `doc-ai-integration.md` as a precondition.
  */
 
-import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
+import { McpTool } from '../../core/engine/rv-mcp-tools';
 import { getPromptTaskStore } from '../../core/hmi/prompt-task-store';
 
 /**
@@ -54,12 +54,8 @@ export class McpPromptTools {
   // The descriptions below are terse on purpose: the discover payload has a
   // pinned ceiling (tests/rv-mcp-delegate-split.test.ts) and the plan refuses
   // to raise it for this feature. The long version lives in doc-ai-integration.md.
-  @McpTool(
-    'List prompt tasks queued on nodes in the viewer.',
-    { readOnly: true },
-  )
-  async webPromptList(
-    @McpParam('includeClaimed', 'Also list claimed', 'boolean', false)
+  /** Read-only command body; preserves the original JSON value contract. */
+  async queryPromptList(
     includeClaimed?: boolean,
   ): Promise<string> {
     return getPromptTaskStore().listSerialized(includeClaimed === true);

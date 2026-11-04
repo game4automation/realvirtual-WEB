@@ -68,7 +68,7 @@ import {
 import { documentsOf } from '../../project/rv-project-documents';
 import {
   sceneGlbRelPathFor,
-  type RvProjectSceneEntry,
+  type RvDocumentEntry,
 } from '../../project/rv-project-types';
 import type { ProjectBackend } from '../../project/backends/project-backend';
 
@@ -137,10 +137,9 @@ function ownerBackendFor(sceneId: string): ProjectBackend | null {
  * so the scene-shaped filter this used to run through could only ever lose the
  * row. It lost every browser one, whose path is its bare id.
  */
-function projectEntry(sceneId: string): RvProjectSceneEntry | null {
+function projectEntry(sceneId: string): RvDocumentEntry | null {
   const project = getProjectStore().getProject();
-  return (documentsOf(project).find((e) => e?.id === sceneId) ?? null) as
-    RvProjectSceneEntry | null;
+  return documentsOf(project).find((e) => e?.id === sceneId) ?? null;
 }
 
 // ─── Read ───────────────────────────────────────────────────────────────
@@ -219,7 +218,7 @@ export async function writeSceneGlbBody(write: SceneGlbWrite): Promise<SceneGlbW
 
   if (backend) {
     const existing = projectEntry(write.sceneId);
-    const meta: RvProjectSceneEntry = {
+    const meta: RvDocumentEntry = {
       ...(existing ?? {}),
       id: write.sceneId,
       name: write.name,

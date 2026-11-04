@@ -1,0 +1,56 @@
+{
+  "plan": 659,
+  "phase": 3,
+  "measured": "2026-10-23",
+  "fixedDt": 0.016666666666666666,
+  "gravityTorqueNm": 1.4715,
+  "hold": {
+    "kp": 20,
+    "kv": 1,
+    "forcerangeNm": 5,
+    "setpointDeg": 0,
+    "actualDeg": 4.204193449446179,
+    "trackingErrorDeg": -4.204193449446179,
+    "predictedErrorDeg": 4.215536977675032,
+    "torqueNm": -1.4675403616722709,
+    "saturated": false,
+    "subStepsPerTick": 9
+  },
+  "ramp": {
+    "rateDegPerS": 60,
+    "maxTrackingErrorDeg": 8.059025839023235,
+    "endSetpointDeg": 180,
+    "endActualDeg": 171.00549609913742,
+    "endTorqueNm": 1.8077512709699874
+  },
+  "saturation": {
+    "setpointDeg": 0,
+    "strong": {
+      "forcerangeNm": 5,
+      "actualDeg": 4.204193449446179,
+      "errorDeg": -4.204193449446179,
+      "torqueNm": -1.4675403616722709,
+      "saturated": false
+    },
+    "weak": {
+      "forcerangeNm": 0.5,
+      "actualDeg": 70.13596052320274,
+      "errorDeg": -70.13596052320274,
+      "torqueNm": -0.5,
+      "saturated": true
+    },
+    "predictedDroopDeg": 70.13596052320348
+  },
+  "signalAndDisconnect": {
+    "setpointDeg": -60,
+    "liveActualDeg": -57.750563329282684,
+    "liveErrorDeg": -2.2494366707173157,
+    "liveTorqueNm": -0.7852015243823267,
+    "signalActualDeg": -57.750563329282684,
+    "signalTorqueNm": -0.7852015243823267,
+    "afterDisconnectActualDeg": -57.750563329282684,
+    "afterDisconnectSetpointDeg": -60,
+    "driftDeg": 0,
+    "holding": true
+  }
+}

@@ -24,6 +24,7 @@ import {
   SHARED_REPO,
   assertCustomerInvariants,
   customerRemoteUrl,
+  deliversDiagnosis,
   isSharedForgejo,
   listCustomers,
   loadCustomer,
@@ -657,5 +658,21 @@ describe('customer register — fixture hygiene', () => {
     const root = fixture({ mauser: MAUSER }, { presets: ['mauser3dhmi'] });
     expect(existsSync(join(fixturePresetsRoot(root), 'mauser3dhmi.diagnosis.json'))).toBe(true);
     expect(fixturePresetsRoot(root).startsWith(tmpdir())).toBe(true);
+  });
+});
+
+// plan-679 Phase 2: the register's `support` decides the diagnosis package; there is no second field.
+describe('deliversDiagnosis', () => {
+  it('managed -> true, basic -> false, projectless/shared -> false', () => {
+    expect(deliversDiagnosis({ support: 'managed', delivery: { projects: ['mauser3dhmi'] } })).toBe(true);
+    expect(deliversDiagnosis({ support: 'basic', delivery: { projects: ['wmyb'] } })).toBe(false);
+    expect(deliversDiagnosis({ support: 'managed', delivery: { projects: [] } })).toBe(false);
+    expect(deliversDiagnosis({
+      support: 'managed', delivery: { projects: ['x'] }, forgejo: { org: SHARED_ORG, repo: SHARED_REPO },
+    })).toBe(false);
+    // The delivery-config shape (projects at the top level) answers the same.
+    expect(deliversDiagnosis({ support: 'managed', projects: ['mauser3dhmi'] })).toBe(true);
+    expect(deliversDiagnosis({ support: 'managed', projects: ['x'], sharedRepo: true })).toBe(false);
+    expect(deliversDiagnosis(null)).toBe(false);
   });
 });

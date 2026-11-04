@@ -27,6 +27,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { nodeRegistryDouble } from './fixtures/node-registry-double';
 
 // Phase 3: a save BAKES and writes the result as a document file. The bytes are
 // irrelevant to every case in this file, and baking for real would need a live
@@ -87,7 +88,7 @@ function makeViewer(): FakeViewer {
   const v: FakeViewer = {
     // The bake needs a registry to resolve names against; mocked bake, real
     // guard (`_bakeCurrent` returns null without one).
-    registry: { getGltfNodeNames: () => [], getGltfNodeIndex: () => -1 },
+    registry: nodeRegistryDouble(),
     currentModelRoot: null,
     lastLoadResult: null,
     loadScenes: [],

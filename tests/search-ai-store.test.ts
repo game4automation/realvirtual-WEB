@@ -198,9 +198,9 @@ describe('search-ai-store', () => {
     expect(getSearchAiSnapshot().status).toBe('empty');
   });
 
-  it('CONNECT\'s literal "Nicht in der Dokumentation gefunden." remedy is "empty"', async () => {
+  it('CONNECT\'s literal "Not found in the documentation." remedy is "empty"', async () => {
     register({
-      diagnose: async () => ({ cause: '', remedy: 'Nicht in der Dokumentation gefunden.', sources: [] }),
+      diagnose: async () => ({ cause: '', remedy: 'Not found in the documentation.', sources: [] }),
     });
     runAiSearch('x');
     await flush();

@@ -2,22 +2,18 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * PlannerToolbarButtons — Left-vertical-toolbar entries for the layout planner.
+ * PlannerToolbarButtons — floating left-toolbar entries (`button-group` slot)
+ * for layout authoring (planner and DES, `AUTHORING_TOOL_RULE`).
  *
- * Three button-group slot components, all rendered only while the planner
- * panel is open (i.e. planner mode is active):
- *
- *   - `PlannerGridButton`          — opens a popover with the snap master
- *                                    switch plus translation-step (mm) and
- *                                    rotation-step (°) numeric editors.
- *   - `PlannerDropToSurfaceButton` — toggles "drop newly-placed / dragged
- *                                    objects to the surface below" mode.
- *   - `PlannerDeleteButton`        — removes ALL currently selected layout
- *                                    instances. Disabled when the selection
- *                                    is empty. Shares its remove-path with
- *                                    the Delete / Backspace shortcut so a
- *                                    single SceneStore composite op rolls
- *                                    them all back on Ctrl+Z.
+ *   - `PlannerSnapFlyout`        — ONE menu button (plan-2010) for the four snap
+ *                                  switches: Grid snap, Drop to surface, Magnetic
+ *                                  snap, Chain mode; plus rows that open the
+ *                                  grid / magnetic settings popovers.
+ *   - `PlannerUndoButton` / `PlannerRedoButton` / `PlannerDeleteButton` — the
+ *                                  editing block; Delete removes ALL selected
+ *                                  layout instances through the same path as the
+ *                                  Delete / Backspace shortcut (one SceneStore op).
+ *   - `PlannerVanishMUsButton`, `PlannerLibraryButton`, `PlannerDocModeButton`.
  *
  * These were previously in the planner side-panel footer; moving them to
  * the left toolbar frees vertical space in the panel and keeps frequently-
@@ -37,6 +33,7 @@ import {
 } from '@mui/material';
 import {
   Adjust,
+  AlignHorizontalLeft,
   AutoDelete,
   BorderOuter,
   DeleteOutline,
@@ -56,7 +53,7 @@ import {
 import { useViewer } from '../../hooks/use-viewer';
 import { useSelection } from '../../hooks/use-selection';
 import { useVanishMUs } from '../../core/hmi/visual-settings-store';
-import { useToolButtonInteraction } from '../../hooks/use-tool-button-interaction';
+import { ToolFlyout, ToolFlyoutDivider, ToolFlyoutRow } from '../../core/hmi/ToolFlyout';
 import { getSceneStore } from '../../core/hmi/scene/scene-store-singleton';
 import { LAYOUT_PANEL_WIDTH } from '../../core/hmi/layout-constants';
 import type { SceneSnapshot } from '../../core/hmi/scene/scene-store';
@@ -66,6 +63,7 @@ import type { LayoutPlannerPlugin } from './index';
 import type { LayoutSnapshot } from './rv-layout-store';
 import { aiTouchSx, useCommandView } from '../../core/hmi/rv-command-view';
 import { getAiTouchMs } from '../../core/hmi/button-sim-state';
+import { alignClose, alignOpen, getAlignSnapshot, subscribeAlign } from './align/align-state';
 
 /**
  * plan-499: sx for a planner IconButton that is a command view — the simulated
@@ -123,14 +121,17 @@ export function clampNumber(raw: string, min: number, max: number): number | nul
   return Math.min(max, Math.max(min, n));
 }
 
-// ─── Grid / snap settings popover ─────────────────────────────────────────
+// ─── Grid snap settings popover ───────────────────────────────────────────
 
-export function PlannerGridButton() {
+interface SettingsPopoverProps {
+  /** Where the popover opens: the snap flyout trigger. */
+  anchorEl: HTMLElement | null;
+  onClose: () => void;
+}
+
+/** The grid-snap settings (translation / rotation step), opened from the snap flyout. */
+export function GridSnapSettingsPopover({ anchorEl, onClose }: SettingsPopoverProps) {
   const { plugin, snapshot } = usePlannerToolbarState();
-  // Click toggles grid snap; right-click / press-and-hold opens the settings popover.
-  const { anchorEl, closeMenu, buttonProps } = useToolButtonInteraction({
-    onToggle: () => plugin?.toggleGrid(),
-  });
 
   // Local "draft" state so users can type freely without each keystroke
   // committing to the store (which would drive a viewer redraw).
@@ -177,146 +178,268 @@ export function PlannerGridButton() {
   };
 
   return (
-    <>
-      <Tooltip
-        title={enabled
-          ? `Snap on: ${sizeMm > 0 ? `${sizeMm} mm` : 'translation off'} / ${rotDeg}° — right-click for settings`
-          : 'Snap off — click to enable, right-click for settings'}
-        placement="right"
-      >
-        <IconButton
-          size="small"
-          {...buttonProps}
-          sx={{
-            p: 0.75,
-            color: enabled ? 'primary.main' : 'text.disabled',
-          }}
-          aria-label="Toggle grid snap"
-        >
-          <GridOn sx={{ fontSize: 18 }} />
-        </IconButton>
-      </Tooltip>
-      <Popover
-        anchorEl={anchorEl}
-        open={!!anchorEl}
-        onClose={closeMenu}
-        anchorOrigin={{ vertical: 'center', horizontal: 'right' }}
-        transformOrigin={{ vertical: 'center', horizontal: 'left' }}
-        slotProps={{ paper: { sx: { ml: 1, width: 250, p: 0 } } }}
-      >
-        {/* Header row — title (the tool button itself is the on/off toggle) */}
-        <Box
-          sx={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 1,
-            px: 2,
-            py: 1.25,
-          }}
-        >
-          <GridOn sx={{ fontSize: 18, color: enabled ? 'primary.main' : 'text.disabled' }} />
-          <Typography
-            variant="subtitle2"
-            sx={{ fontSize: 13, fontWeight: 600, flex: 1 }}
-          >
-            Snap to grid
-          </Typography>
-        </Box>
+    <Popover
+      anchorEl={anchorEl}
+      open={!!anchorEl}
+      onClose={onClose}
+      anchorOrigin={{ vertical: 'center', horizontal: 'right' }}
+      transformOrigin={{ vertical: 'center', horizontal: 'left' }}
+      slotProps={{ paper: { sx: { ml: 1, width: 250, p: 0 }, 'data-testid': 'snap-grid-settings' } as never }}
+    >
+      {/* Header row — title (the Grid snap row of the flyout is the on/off toggle) */}
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, px: 2, py: 1.25 }}>
+        <GridOn sx={{ fontSize: 18, color: enabled ? 'primary.main' : 'text.disabled' }} />
+        <Typography variant="subtitle2" sx={{ fontSize: 13, fontWeight: 600, flex: 1 }}>
+          Snap to grid
+        </Typography>
+      </Box>
 
-        <Divider />
+      <Divider />
 
-        {/* Body — one-line rows (no section captions); fades when snap is off
-            but stays interactive so the user can pre-set values then enable. */}
-        <Stack
-          spacing={0.5}
-          sx={{
-            px: 2,
-            py: 1.5,
-            opacity: enabled ? 1 : 0.55,
-            transition: 'opacity 120ms ease',
-          }}
-        >
-          <DragNumberField
-            label="Translation"
-            icon={<Straighten sx={{ fontSize: 16 }} />}
-            unit="mm"
-            value={transDraft}
-            onValueChange={setTransDraft}
-            onCommit={commitTranslation}
-            min={MIN_TRANSLATION_MM}
-            max={MAX_TRANSLATION_MM}
-            step={1}
-            ariaLabel="Translation"
-          />
-          <DragNumberField
-            label="Rotation"
-            icon={<Rotate90DegreesCcw sx={{ fontSize: 16 }} />}
-            unit="°"
-            value={rotDraft}
-            onValueChange={setRotDraft}
-            onCommit={commitRotation}
-            min={MIN_ROTATION_DEG}
-            max={MAX_ROTATION_DEG}
-            step={0.1}
-            ariaLabel="Rotation"
-          />
-        </Stack>
-      </Popover>
-    </>
+      {/* Body — one-line rows (no section captions); fades when snap is off
+          but stays interactive so the user can pre-set values then enable. */}
+      <Stack
+        spacing={0.5}
+        sx={{ px: 2, py: 1.5, opacity: enabled ? 1 : 0.55, transition: 'opacity 120ms ease' }}
+      >
+        <DragNumberField
+          label="Translation"
+          icon={<Straighten sx={{ fontSize: 16 }} />}
+          unit="mm"
+          value={transDraft}
+          onValueChange={setTransDraft}
+          onCommit={commitTranslation}
+          min={MIN_TRANSLATION_MM}
+          max={MAX_TRANSLATION_MM}
+          step={1}
+          ariaLabel="Translation"
+        />
+        <DragNumberField
+          label="Rotation"
+          icon={<Rotate90DegreesCcw sx={{ fontSize: 16 }} />}
+          unit="°"
+          value={rotDraft}
+          onValueChange={setRotDraft}
+          onCommit={commitRotation}
+          min={MIN_ROTATION_DEG}
+          max={MAX_ROTATION_DEG}
+          step={0.1}
+          ariaLabel="Rotation"
+        />
+      </Stack>
+    </Popover>
   );
 }
 
-// ─── Drop-to-surface button ──────────────────────────────────────────────
+// ─── Magnetic-snap settings popover ──────────────────────────────────────
 
-export function PlannerDropToSurfaceButton() {
-  const { plugin, snapshot } = usePlannerToolbarState();
-  if (!plugin || !snapshot) return null;
-
-  const on = snapshot.dropToSurface;
-  return (
-    <Tooltip title={on ? 'Drop to surface: ON' : 'Drop to surface: OFF'} placement="right">
-      <IconButton
-        size="small"
-        onClick={() => plugin.store.setDropToSurface(!on)}
-        sx={{
-          p: 0.75,
-          color: on ? 'primary.main' : 'text.disabled',
-        }}
-        aria-label="Toggle drop to surface"
-      >
-        <VerticalAlignBottom sx={{ fontSize: 18 }} />
-      </IconButton>
-    </Tooltip>
-  );
-}
-
-// ─── Chain-mode button ───────────────────────────────────────────────────
+// Snap-distance bounds — keep the tolerance physically meaningful.
+const MIN_BBOX_TOL_MM = 1;
+const MAX_BBOX_TOL_MM = 1000;
+// Max auto-measure distance bounds for the neighbor-distance overlay.
+const MIN_NEIGHBOR_MAX_MM = 100;
+const MAX_NEIGHBOR_MAX_MM = 100_000;
 
 /**
- * Toolbar button — toggles chain mode: when on, assets connected via snap
- * points follow the dragged asset so a whole snapped line moves together.
- * Moved out of the magnetic-snap popover; it is independent of magnetic snap
- * (the snap-point plugin reads `store.chainModeEnabled` on its own).
+ * The magnetic-snap settings: Mid / Side reference-point toggles, neighbor
+ * distances and the snap distance (tolerance) in millimetres. Magnetic snap
+ * aligns the bounding-box edges (Side) and centres (Mid) of a dragged object to
+ * placed objects within the tolerance. Hold Alt during drag to temporarily
+ * suppress.
+ *
+ * Independent of grid snap — both can be active. Bbox snap takes priority
+ * within its tolerance; grid is the fallback quantizer. Opened from the snap flyout.
  */
-export function PlannerChainModeButton() {
+export function MagneticSnapSettingsPopover({ anchorEl, onClose }: SettingsPopoverProps) {
   const { plugin, snapshot } = usePlannerToolbarState();
+  const [tolDraft, setTolDraft] = useState<string>('');
+  const [maxDistDraft, setMaxDistDraft] = useState<string>('');
+
+  useEffect(() => {
+    if (!snapshot) return;
+    setTolDraft(String(snapshot.bboxSnapToleranceMm));
+    setMaxDistDraft(String(snapshot.neighborDistanceMaxMm));
+  }, [snapshot?.bboxSnapToleranceMm, snapshot?.neighborDistanceMaxMm, anchorEl]);
+
   if (!plugin || !snapshot) return null;
 
-  const on = snapshot.chainModeEnabled;
+  const enabled = snapshot.bboxSnapEnabled;
+  const mid = snapshot.bboxSnapMid;
+  const side = snapshot.bboxSnapSide;
+  const showDistance = snapshot.showNeighborDistances;
+  const tolMm = snapshot.bboxSnapToleranceMm;
+  const maxDistMm = snapshot.neighborDistanceMaxMm;
+
+  const commitTolerance = () => {
+    const n = clampNumber(tolDraft, MIN_BBOX_TOL_MM, MAX_BBOX_TOL_MM);
+    if (n === null) {
+      setTolDraft(String(tolMm));
+      return;
+    }
+    plugin.store.setBboxSnapToleranceMm(n);
+    setTolDraft(String(n));
+    if (!enabled) plugin.store.setBboxSnap(true); // typing implies "I want snap on"
+  };
+
+  const commitMaxDist = () => {
+    const n = clampNumber(maxDistDraft, MIN_NEIGHBOR_MAX_MM, MAX_NEIGHBOR_MAX_MM);
+    if (n === null) {
+      setMaxDistDraft(String(maxDistMm));
+      return;
+    }
+    plugin.store.setNeighborDistanceMaxMm(n);
+    setMaxDistDraft(String(n));
+  };
+
   return (
-    <Tooltip title={on ? 'Chain mode: ON' : 'Chain mode: OFF'} placement="right">
-      <IconButton
-        size="small"
-        onClick={() => plugin.store.setChainMode(!on)}
-        sx={{
-          p: 0.75,
-          color: on ? 'primary.main' : 'text.disabled',
-        }}
-        aria-label="Toggle chain mode"
+    <Popover
+      anchorEl={anchorEl}
+      open={!!anchorEl}
+      onClose={onClose}
+      anchorOrigin={{ vertical: 'center', horizontal: 'right' }}
+      transformOrigin={{ vertical: 'center', horizontal: 'left' }}
+      slotProps={{ paper: { sx: { ml: 1, width: 250, p: 0 }, 'data-testid': 'snap-magnetic-settings' } as never }}
+    >
+      {/* Header — title (the Magnetic snap row of the flyout is the on/off toggle) */}
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, px: 2, py: 1.25 }}>
+        <JoinInner sx={{ fontSize: 18, color: enabled ? 'primary.main' : 'text.disabled' }} />
+        <Typography variant="subtitle2" sx={{ fontSize: 13, fontWeight: 600, flex: 1 }}>
+          Magnetic snap
+        </Typography>
+      </Box>
+
+      <Divider />
+
+      {/* Body — one uniform list of single-line rows (toggles + numeric), no
+          section captions. Fades when snap is off but stays interactive. */}
+      <Stack
+        spacing={0.5}
+        sx={{ px: 2, py: 1.5, opacity: enabled ? 1 : 0.55, transition: 'opacity 120ms ease' }}
       >
-        <LinkIcon sx={{ fontSize: 18 }} />
-      </IconButton>
-    </Tooltip>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <Adjust sx={{ fontSize: 16, color: 'text.secondary' }} />
+          <Typography sx={{ fontSize: 12, flex: 1 }}>Mid</Typography>
+          <Switch size="small" checked={mid} onChange={() => plugin.store.setBboxSnapMid(!mid)} />
+        </Box>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <BorderOuter sx={{ fontSize: 16, color: 'text.secondary' }} />
+          <Typography sx={{ fontSize: 12, flex: 1 }}>Side</Typography>
+          <Switch size="small" checked={side} onChange={() => plugin.store.setBboxSnapSide(!side)} />
+        </Box>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <Tag sx={{ fontSize: 16, color: 'text.secondary' }} />
+          <Typography sx={{ fontSize: 12, flex: 1 }}>Neighbor distances</Typography>
+          <Switch
+            size="small"
+            checked={showDistance}
+            onChange={() => plugin.store.setShowNeighborDistances(!showDistance)}
+          />
+        </Box>
+
+        <DragNumberField
+          label="Snap distance"
+          icon={<SettingsEthernet sx={{ fontSize: 16 }} />}
+          unit="mm"
+          value={tolDraft}
+          onValueChange={setTolDraft}
+          onCommit={commitTolerance}
+          min={MIN_BBOX_TOL_MM}
+          max={MAX_BBOX_TOL_MM}
+          step={1}
+          ariaLabel="Snap distance"
+        />
+        <DragNumberField
+          label="Max measure"
+          icon={<Straighten sx={{ fontSize: 16 }} />}
+          unit="mm"
+          value={maxDistDraft}
+          onValueChange={setMaxDistDraft}
+          onCommit={commitMaxDist}
+          min={MIN_NEIGHBOR_MAX_MM}
+          max={MAX_NEIGHBOR_MAX_MM}
+          step={50}
+          ariaLabel="Max measure distance"
+        />
+      </Stack>
+    </Popover>
+  );
+}
+
+// ─── Snap flyout ──────────────────────────────────────────────────────────
+
+/**
+ * Toolbar menu button (plan-2010) — ONE trigger for the four layout-snap
+ * switches that used to be four toolbar icons: Grid snap, Drop to surface,
+ * Magnetic snap and Chain mode, as checkbox rows with their current state,
+ * plus two rows that open the grid / magnetic settings popovers at the trigger.
+ * The trigger is coloured while at least one switch is on; its tooltip names
+ * the active ones. Chain mode moves assets connected via snap points together
+ * with the dragged one (independent of magnetic snap: the snap-point plugin
+ * reads `store.chainModeEnabled` itself).
+ */
+export function PlannerSnapFlyout() {
+  const { plugin, snapshot } = usePlannerToolbarState();
+  const [settings, setSettings] = useState<{ kind: 'grid' | 'magnetic'; anchor: HTMLElement } | null>(null);
+  if (!plugin || !snapshot) return null;
+
+  const grid = snapshot.gridEnabled;
+  const drop = snapshot.dropToSurface;
+  const magnetic = snapshot.bboxSnapEnabled;
+  const chain = snapshot.chainModeEnabled;
+  const activeNames = [
+    grid && 'grid', drop && 'drop', magnetic && 'magnetic', chain && 'chain',
+  ].filter(Boolean) as string[];
+  const title = activeNames.length > 0 ? `Snap — ${activeNames.join(', ')} on` : 'Snap — all off';
+  const gridDescription = `${snapshot.gridSizeMm > 0 ? `${snapshot.gridSizeMm} mm` : 'translation off'} / ${snapshot.rotationSnapDeg}°`;
+
+  return (
+    <>
+      <ToolFlyout
+        title={title}
+        menuLabel="Snap"
+        icon={<GridOn />}
+        active={activeNames.length > 0}
+        testId="planner-snap-flyout"
+      >
+        <ToolFlyoutRow
+          kind="checkbox" label="Grid snap" icon={<GridOn />} checked={grid}
+          description={gridDescription} testId="snap-row-grid"
+          onSelect={() => plugin.toggleGrid()}
+        />
+        <ToolFlyoutRow
+          kind="checkbox" label="Drop to surface" icon={<VerticalAlignBottom />} checked={drop}
+          testId="snap-row-drop"
+          onSelect={() => plugin.store.setDropToSurface(!drop)}
+        />
+        <ToolFlyoutRow
+          kind="checkbox" label="Magnetic snap" icon={<JoinInner />} checked={magnetic}
+          description={`${snapshot.bboxSnapToleranceMm} mm`} testId="snap-row-magnetic"
+          onSelect={() => plugin.store.setBboxSnap(!magnetic)}
+        />
+        <ToolFlyoutRow
+          kind="checkbox" label="Chain mode" icon={<LinkIcon />} checked={chain}
+          testId="snap-row-chain"
+          onSelect={() => plugin.store.setChainMode(!chain)}
+        />
+        <ToolFlyoutDivider />
+        <ToolFlyoutRow
+          label="Grid snap settings…" testId="snap-row-grid-settings"
+          onSelect={(anchor) => setSettings({ kind: 'grid', anchor })}
+        />
+        <ToolFlyoutRow
+          label="Magnetic snap settings…" testId="snap-row-magnetic-settings"
+          onSelect={(anchor) => setSettings({ kind: 'magnetic', anchor })}
+        />
+      </ToolFlyout>
+      <GridSnapSettingsPopover
+        anchorEl={settings?.kind === 'grid' ? settings.anchor : null}
+        onClose={() => setSettings(null)}
+      />
+      <MagneticSnapSettingsPopover
+        anchorEl={settings?.kind === 'magnetic' ? settings.anchor : null}
+        onClose={() => setSettings(null)}
+      />
+    </>
   );
 }
 
@@ -344,6 +467,40 @@ export function PlannerVanishMUsButton() {
         aria-label="Toggle vanish MUs at end of line"
       >
         <AutoDelete sx={{ fontSize: 18 }} />
+      </IconButton>
+    </Tooltip>
+  );
+}
+
+// ─── Align tool button (plan-779) ────────────────────────────────────────
+
+/**
+ * Toolbar button — opens / closes the Align tool (corner of placement A onto
+ * a corner of any geometry B). The tool's runtime and panel load on the first
+ * open; this button only imports the tiny state store.
+ */
+export function PlannerAlignButton() {
+  const viewer = useViewer();
+  const open = useSyncExternalStore(subscribeAlign, () => getAlignSnapshot().open);
+
+  const onClick = () => {
+    if (open) { alignClose(); return; }
+    void import('./align/align-pick').then((m) => {
+      m.ensureAlignRuntime(viewer);
+      alignOpen();
+    });
+  };
+
+  return (
+    <Tooltip title={open ? 'Close Align tool' : 'Align: corner of A onto corner of B'} placement="right">
+      <IconButton
+        size="small"
+        onClick={onClick}
+        sx={{ p: 0.75, color: open ? 'primary.main' : 'text.secondary' }}
+        aria-label="Toggle Align tool"
+        aria-pressed={open}
+      >
+        <AlignHorizontalLeft sx={{ fontSize: 18 }} />
       </IconButton>
     </Tooltip>
   );
@@ -525,175 +682,3 @@ function HistoryButton({ kind }: { kind: 'undo' | 'redo' }) {
 export function PlannerUndoButton() { return <HistoryButton kind="undo" />; }
 export function PlannerRedoButton() { return <HistoryButton kind="redo" />; }
 
-// ─── Magnetic-snap settings popover ──────────────────────────────────────
-
-// Snap-distance bounds — keep the tolerance physically meaningful.
-const MIN_BBOX_TOL_MM = 1;
-const MAX_BBOX_TOL_MM = 1000;
-// Max auto-measure distance bounds for the neighbor-distance overlay.
-const MIN_NEIGHBOR_MAX_MM = 100;
-const MAX_NEIGHBOR_MAX_MM = 100_000;
-
-/**
- * Toolbar button — opens a popover with the magnetic-snap master switch,
- * Mid / Side reference-point toggles, and the snap-distance (tolerance)
- * in millimetres. Magnetic snap aligns dragged objects' bounding-box
- * edges (Side) and centres (Mid) to placed objects within the tolerance.
- * Hold Alt during drag to temporarily suppress.
- *
- * Independent of grid snap — both can be active. Bbox snap takes priority
- * within its tolerance; grid is the fallback quantizer.
- */
-export function PlannerSnapButton() {
-  const { plugin, snapshot } = usePlannerToolbarState();
-  // Click toggles magnetic snap; right-click / press-and-hold opens the settings popover.
-  const { anchorEl, closeMenu, buttonProps } = useToolButtonInteraction({
-    onToggle: () => plugin?.store.setBboxSnap(!snapshot?.bboxSnapEnabled),
-  });
-  const [tolDraft, setTolDraft] = useState<string>('');
-  const [maxDistDraft, setMaxDistDraft] = useState<string>('');
-
-  useEffect(() => {
-    if (!snapshot) return;
-    setTolDraft(String(snapshot.bboxSnapToleranceMm));
-    setMaxDistDraft(String(snapshot.neighborDistanceMaxMm));
-  }, [snapshot?.bboxSnapToleranceMm, snapshot?.neighborDistanceMaxMm, anchorEl]);
-
-  if (!plugin || !snapshot) return null;
-
-  const enabled = snapshot.bboxSnapEnabled;
-  const mid = snapshot.bboxSnapMid;
-  const side = snapshot.bboxSnapSide;
-  const showDistance = snapshot.showNeighborDistances;
-  const tolMm = snapshot.bboxSnapToleranceMm;
-  const maxDistMm = snapshot.neighborDistanceMaxMm;
-
-  const commitTolerance = () => {
-    const n = clampNumber(tolDraft, MIN_BBOX_TOL_MM, MAX_BBOX_TOL_MM);
-    if (n === null) {
-      setTolDraft(String(tolMm));
-      return;
-    }
-    plugin.store.setBboxSnapToleranceMm(n);
-    setTolDraft(String(n));
-    if (!enabled) plugin.store.setBboxSnap(true); // typing implies "I want snap on"
-  };
-
-  const commitMaxDist = () => {
-    const n = clampNumber(maxDistDraft, MIN_NEIGHBOR_MAX_MM, MAX_NEIGHBOR_MAX_MM);
-    if (n === null) {
-      setMaxDistDraft(String(maxDistMm));
-      return;
-    }
-    plugin.store.setNeighborDistanceMaxMm(n);
-    setMaxDistDraft(String(n));
-  };
-
-  return (
-    <>
-      <Tooltip
-        title={enabled
-          ? `Magnetic snap on: ${tolMm} mm — right-click for settings`
-          : 'Magnetic snap off — click to enable, right-click for settings'}
-        placement="right"
-      >
-        <IconButton
-          size="small"
-          {...buttonProps}
-          sx={{
-            p: 0.75,
-            color: enabled ? 'primary.main' : 'text.disabled',
-          }}
-          aria-label="Toggle magnetic snap"
-        >
-          <JoinInner sx={{ fontSize: 18 }} />
-        </IconButton>
-      </Tooltip>
-      <Popover
-        anchorEl={anchorEl}
-        open={!!anchorEl}
-        onClose={closeMenu}
-        anchorOrigin={{ vertical: 'center', horizontal: 'right' }}
-        transformOrigin={{ vertical: 'center', horizontal: 'left' }}
-        slotProps={{ paper: { sx: { ml: 1, width: 250, p: 0 } } }}
-      >
-        {/* Header — title (the tool button itself is the on/off toggle) */}
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, px: 2, py: 1.25 }}>
-          <JoinInner sx={{ fontSize: 18, color: enabled ? 'primary.main' : 'text.disabled' }} />
-          <Typography variant="subtitle2" sx={{ fontSize: 13, fontWeight: 600, flex: 1 }}>
-            Magnetic snap
-          </Typography>
-        </Box>
-
-        <Divider />
-
-        {/* Body — fades when master switch is off but stays interactive so the
-            user can pre-configure and then enable. */}
-        {/* Body — one uniform list of single-line rows (toggles + numeric),
-            no section captions. Fades when snap is off but stays interactive. */}
-        <Stack
-          spacing={0.5}
-          sx={{
-            px: 2,
-            py: 1.5,
-            opacity: enabled ? 1 : 0.55,
-            transition: 'opacity 120ms ease',
-          }}
-        >
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-            <Adjust sx={{ fontSize: 16, color: 'text.secondary' }} />
-            <Typography sx={{ fontSize: 12, flex: 1 }}>Mid</Typography>
-            <Switch
-              size="small"
-              checked={mid}
-              onChange={() => plugin.store.setBboxSnapMid(!mid)}
-            />
-          </Box>
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-            <BorderOuter sx={{ fontSize: 16, color: 'text.secondary' }} />
-            <Typography sx={{ fontSize: 12, flex: 1 }}>Side</Typography>
-            <Switch
-              size="small"
-              checked={side}
-              onChange={() => plugin.store.setBboxSnapSide(!side)}
-            />
-          </Box>
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-            <Tag sx={{ fontSize: 16, color: 'text.secondary' }} />
-            <Typography sx={{ fontSize: 12, flex: 1 }}>Neighbor distances</Typography>
-            <Switch
-              size="small"
-              checked={showDistance}
-              onChange={() => plugin.store.setShowNeighborDistances(!showDistance)}
-            />
-          </Box>
-
-          <DragNumberField
-            label="Snap distance"
-            icon={<SettingsEthernet sx={{ fontSize: 16 }} />}
-            unit="mm"
-            value={tolDraft}
-            onValueChange={setTolDraft}
-            onCommit={commitTolerance}
-            min={MIN_BBOX_TOL_MM}
-            max={MAX_BBOX_TOL_MM}
-            step={1}
-            ariaLabel="Snap distance"
-          />
-          <DragNumberField
-            label="Max measure"
-            icon={<Straighten sx={{ fontSize: 16 }} />}
-            unit="mm"
-            value={maxDistDraft}
-            onValueChange={setMaxDistDraft}
-            onCommit={commitMaxDist}
-            min={MIN_NEIGHBOR_MAX_MM}
-            max={MAX_NEIGHBOR_MAX_MM}
-            step={50}
-            ariaLabel="Max measure distance"
-          />
-        </Stack>
-      </Popover>
-    </>
-  );
-}

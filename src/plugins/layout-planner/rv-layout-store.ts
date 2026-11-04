@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../../core/rv-safe-storage';
+
 /**
  * LayoutStore — State management for the Layout Planner plugin.
  *
@@ -14,7 +16,8 @@ import {
   setSignalLinkModeExplicit,
   subscribeSignalLinkMode,
 } from '../signal-bind/signal-link-mode-store';
-import type { RvReferenceBounds } from '../../core/engine/rv-asset-reference';
+import { hasStoredSignalMappingConverter, storedSignalMappingsOf } from '../../core/engine/rv-signal-mapping-address';
+import type { AssetOverrides, RvReferenceBounds } from '../../core/engine/rv-asset-reference';
 
 // ─── Re-exports: the library layer moved to core/library (plan-372 §2.6.1) ──
 //
@@ -53,6 +56,16 @@ export interface SignalMapping {
   kind?: 'mapped-signal' | 'direct-property' | 'direct-feedback';
   /** Root-relative component-node path. Missing only on legacy mappings. */
   componentPath?: string;
+  /**
+   * plan-769 F15 / F19 — the ADDRESS form of `componentPath`, relative to the
+   * bind target (`"#<id>"`, `"<b>#<id>"`). READ ONLY until Phase 3: no writer
+   * produces it yet; a mapping that carries it and no `componentPath` is
+   * migrated ON READ, in memory (the binding manager derives the slot's path from
+   * the address) — nothing is written back (F17).
+   */
+  componentAddress?: string;
+  /** plan-769 F15 — the address of an INTERNAL source (`sourceKind: 'internal'`); read only until Phase 3, the name in `signal` binds. */
+  sourceAddress?: string;
   /** Component standard-signal slot, e.g. "Forward", "Flow.Run", "IsOccupied". */
   slot: string;
   /**
@@ -124,6 +137,15 @@ export interface PlacedComponent {
   id: string;
   catalogId: string;
   glbUrl: string;
+  /**
+   * The library qualifier (plan-778 F4): a placement made from a library
+   * project stores `providerId: 'library-projects'` + `sourceId` (the library's
+   * project id) — read off the entry by `entryOriginOf` — and its `glbUrl` stays
+   * empty, so the bake writes the `AssetReference` WITHOUT a `path`. A legacy
+   * placement keeps whatever form it was written with (never upgraded on save).
+   */
+  providerId?: string;
+  sourceId?: string;
   label: string;
   position: [number, number, number];
   rotation: [number, number, number];
@@ -145,6 +167,14 @@ export interface PlacedComponent {
    * the file may be gone, which is the case the field exists for.
    */
   bounds?: RvReferenceBounds;
+  /**
+   * plan-650 Phase 5: the parametric part of this placement's `AssetOverrides`
+   * (`byAddress['#<family NodeId>'].ParametricComponent.Values`, plan-769), kept in the record
+   * so a restore / undo / redo rebuilds the SAME variant (`resolveBaked` gets
+   * it). In-session state: the file persists the values through the routed
+   * `setField` of the family node (`AssetOverrides` on the reference node).
+   */
+  assetOverrides?: AssetOverrides;
 }
 
 export interface LayoutFile {
@@ -209,14 +239,15 @@ export interface LayoutSnapshot {
    *  meaningful while `plannerSignalLinking` is enabled on the viewer. */
   signalLinkMode: boolean;
   placementMode: string | null; // catalogEntry id for tap-to-place
-  /** Entry ids whose preview thumbnail is currently being auto-generated.
-   *  Cards render a spinner while their id is present. */
-  thumbnailPending: ReadonlySet<string>;
   /** Placements whose geometry is still loading or has failed (plan-371).
    *  Drives the HMI status line. RUNTIME ONLY — never serialized: a pending
    *  placement's `PlacedComponent` already carries its `glbUrl` and is
    *  byte-identical to a finished one. */
   pendingPlacements: readonly PendingPlacementInfo[];
+  /** Catalog entry ids whose asset is being decoded + baked for placement
+   *  right now (hover prefetch or a cold drag). Drives the "preparing" state of
+   *  the library card. RUNTIME ONLY — never serialized. */
+  preparingEntryIds: readonly string[];
 }
 
 /** One row of the pending-load status line. */
@@ -270,7 +301,10 @@ export function serializeLayout(
     createdAt: new Date().toISOString(),
     catalogUrls,
     gridSizeMm,
-    components,
+    // plan-769 F15: a stored layout names mapped components by address.
+    components: hasStoredSignalMappingConverter()
+      ? components.map((c) => (c.signalMappings?.length ? { ...c, signalMappings: storedSignalMappingsOf(c) } : c))
+      : components,
   };
 }
 
@@ -367,6 +401,8 @@ export class LayoutStore {
   private _snapshot: LayoutSnapshot;
   /** plan-371 pending placements. Runtime only — see `setPendingPlacements`. */
   private _pendingPlacements: PendingPlacementInfo[] = [];
+  /** Entry ids whose asset is preparing. Runtime only — see `setPreparingEntries`. */
+  private _preparingEntryIds: string[] = [];
 
   constructor(library?: LibraryStoreClass) {
     // Lazily required so `rv-layout-store` stays importable in tests that never
@@ -375,47 +411,47 @@ export class LayoutStore {
 
     // Restore grid settings from localStorage
     try {
-      const ge = localStorage.getItem(LS_KEY_GRID_ENABLED);
+      const ge = readLocalStorage(LS_KEY_GRID_ENABLED);
       if (ge !== null) this._gridEnabled = ge === 'true';
-      const gs = localStorage.getItem(LS_KEY_GRID_SIZE);
+      const gs = readLocalStorage(LS_KEY_GRID_SIZE);
       if (gs !== null) {
         const n = Number(gs);
         if (!Number.isNaN(n) && n >= 0) this._gridSizeMm = n; // 0 = translation snap off
       }
-      const rs = localStorage.getItem(LS_KEY_ROTATION_SNAP);
+      const rs = readLocalStorage(LS_KEY_ROTATION_SNAP);
       if (rs !== null) {
         const n = Number(rs);
         if (!Number.isNaN(n) && n > 0) this._rotationSnapDeg = n;
       }
-      const dts = localStorage.getItem(LS_KEY_DROP_TO_SURFACE);
+      const dts = readLocalStorage(LS_KEY_DROP_TO_SURFACE);
       if (dts !== null) this._dropToSurface = dts === 'true';
-      const bs = localStorage.getItem(LS_KEY_BBOX_SNAP);
+      const bs = readLocalStorage(LS_KEY_BBOX_SNAP);
       if (bs !== null) this._bboxSnapEnabled = bs === 'true';
-      const bsm = localStorage.getItem(LS_KEY_BBOX_SNAP_MID);
+      const bsm = readLocalStorage(LS_KEY_BBOX_SNAP_MID);
       if (bsm !== null) this._bboxSnapMid = bsm === 'true';
-      const bss = localStorage.getItem(LS_KEY_BBOX_SNAP_SIDE);
+      const bss = readLocalStorage(LS_KEY_BBOX_SNAP_SIDE);
       if (bss !== null) this._bboxSnapSide = bss === 'true';
-      const bst = localStorage.getItem(LS_KEY_BBOX_SNAP_TOL);
+      const bst = readLocalStorage(LS_KEY_BBOX_SNAP_TOL);
       if (bst !== null) {
         const n = Number(bst);
         if (Number.isFinite(n) && n >= MIN_BBOX_SNAP_TOLERANCE_MM && n <= MAX_BBOX_SNAP_TOLERANCE_MM) {
           this._bboxSnapToleranceMm = n;
         }
       }
-      const snd = localStorage.getItem(LS_KEY_SHOW_NEIGHBOR_DIST);
+      const snd = readLocalStorage(LS_KEY_SHOW_NEIGHBOR_DIST);
       if (snd !== null) this._showNeighborDistances = snd === 'true';
-      const ndm = localStorage.getItem(LS_KEY_NEIGHBOR_DIST_MAX);
+      const ndm = readLocalStorage(LS_KEY_NEIGHBOR_DIST_MAX);
       if (ndm !== null) {
         const n = Number(ndm);
         if (Number.isFinite(n) && n >= MIN_NEIGHBOR_DIST_MAX_MM && n <= MAX_NEIGHBOR_DIST_MAX_MM) {
           this._neighborDistanceMaxMm = n;
         }
       }
-      const spm = localStorage.getItem(LS_KEY_SNAPPOINT_MAGNET);
+      const spm = readLocalStorage(LS_KEY_SNAPPOINT_MAGNET);
       if (spm !== null) this._snapPointMagnetEnabled = spm === 'true';
-      const cm = localStorage.getItem(LS_KEY_CHAIN_MODE);
+      const cm = readLocalStorage(LS_KEY_CHAIN_MODE);
       if (cm !== null) this._chainModeEnabled = cm === 'true';
-      const dm = localStorage.getItem(LS_KEY_DOC_MODE);
+      const dm = readLocalStorage(LS_KEY_DOC_MODE);
       if (dm !== null) this._docMode = dm === 'true';
     } catch { /* ignore */ }
 
@@ -465,16 +501,6 @@ export class LayoutStore {
     this._library.addCatalogDirect(key, catalog);
   }
 
-  /** Update the thumbnail URL for a specific catalog entry. */
-  setEntryThumbnail(entryId: string, thumbnailUrl: string): void {
-    this._library.setEntryThumbnail(entryId, thumbnailUrl);
-  }
-
-  /** Mark/unmark an entry as having its preview auto-generated. */
-  setThumbnailPending(entryId: string, pending: boolean): void {
-    this._library.setThumbnailPending(entryId, pending);
-  }
-
   removeCatalog(url: string): void {
     this._library.removeCatalog(url);
   }
@@ -498,6 +524,18 @@ export class LayoutStore {
   setPendingPlacements(list: readonly PendingPlacementInfo[]): void {
     if (samePendingPlacements(this._pendingPlacements, list)) return;
     this._pendingPlacements = list.map((p) => ({ ...p }));
+    this._notify();
+  }
+
+  /**
+   * Replace the set of library entries whose asset is being prepared for
+   * placement (decode + bake). Pure in-memory state like `setPendingPlacements`,
+   * with the same equality guard.
+   */
+  setPreparingEntries(ids: readonly string[]): void {
+    const cur = this._preparingEntryIds;
+    if (cur.length === ids.length && cur.every((id, i) => id === ids[i])) return;
+    this._preparingEntryIds = [...ids];
     this._notify();
   }
 
@@ -555,6 +593,40 @@ export class LayoutStore {
     this._notify();
   }
 
+  /** plan-650: replace the parametric overrides of a placed component (undefined = none). */
+  updateAssetOverrides(id: string, assetOverrides: AssetOverrides | undefined): void {
+    this._placed = this._placed.map(c => {
+      if (c.id !== id) return c;
+      const next = { ...c };
+      if (assetOverrides) next.assetOverrides = assetOverrides; else delete next.assetOverrides;
+      return next;
+    });
+    this._notify();
+  }
+
+  /**
+   * Re-point every placement of one catalog id at another (plan-660 A): an
+   * importer that has saved the asset as a project document hands the
+   * placements over to that document, so the next save references the
+   * project's own (editable) file instead of the remote source. Identity
+   * migration, not an edit: no undo step, geometry untouched. Returns the
+   * number of placements changed.
+   */
+  rebindCatalogId(fromCatalogId: string, toCatalogId: string): number {
+    if (!fromCatalogId || !toCatalogId || fromCatalogId === toCatalogId) return 0;
+    let changed = 0;
+    this._placed = this._placed.map((c) => {
+      if (c.catalogId !== fromCatalogId) return c;
+      changed++;
+      // plan-778: the new target is a document of the OPEN project — a library
+      // qualifier the old id carried would now name the wrong place.
+      const { providerId: _providerId, sourceId: _sourceId, ...rest } = c;
+      return { ...rest, catalogId: toCatalogId };
+    });
+    if (changed > 0) this._notify();
+    return changed;
+  }
+
   updateGlbUrl(id: string, glbUrl: string): void {
     this._placed = this._placed.map(c =>
       c.id === id ? { ...c, glbUrl } : c,
@@ -585,69 +657,69 @@ export class LayoutStore {
 
   setGridEnabled(enabled: boolean): void {
     this._gridEnabled = enabled;
-    try { localStorage.setItem(LS_KEY_GRID_ENABLED, String(enabled)); } catch { /* ignore */ }
+    try { writeLocalStorage(LS_KEY_GRID_ENABLED, String(enabled)); } catch { /* ignore */ }
     this._notify();
   }
 
   setDropToSurface(enabled: boolean): void {
     this._dropToSurface = enabled;
-    try { localStorage.setItem(LS_KEY_DROP_TO_SURFACE, String(enabled)); } catch { /* ignore */ }
+    try { writeLocalStorage(LS_KEY_DROP_TO_SURFACE, String(enabled)); } catch { /* ignore */ }
     this._notify();
   }
 
   /** Toggle magnetic snap to other layout objects. Persisted to localStorage. */
   setBboxSnap(enabled: boolean): void {
     this._bboxSnapEnabled = enabled;
-    try { localStorage.setItem(LS_KEY_BBOX_SNAP, String(enabled)); } catch { /* ignore */ }
+    try { writeLocalStorage(LS_KEY_BBOX_SNAP, String(enabled)); } catch { /* ignore */ }
     this._notify();
   }
 
   /** Toggle whether bbox centres count as snap references. Persisted. */
   setBboxSnapMid(enabled: boolean): void {
     this._bboxSnapMid = enabled;
-    try { localStorage.setItem(LS_KEY_BBOX_SNAP_MID, String(enabled)); } catch { /* ignore */ }
+    try { writeLocalStorage(LS_KEY_BBOX_SNAP_MID, String(enabled)); } catch { /* ignore */ }
     this._notify();
   }
 
   /** Toggle whether bbox edges (min/max) count as snap references. Persisted. */
   setBboxSnapSide(enabled: boolean): void {
     this._bboxSnapSide = enabled;
-    try { localStorage.setItem(LS_KEY_BBOX_SNAP_SIDE, String(enabled)); } catch { /* ignore */ }
+    try { writeLocalStorage(LS_KEY_BBOX_SNAP_SIDE, String(enabled)); } catch { /* ignore */ }
     this._notify();
   }
 
   /** Set magnetic-snap tolerance in millimetres. Persisted to localStorage. */
   setBboxSnapToleranceMm(mm: number): void {
     this._bboxSnapToleranceMm = mm;
-    try { localStorage.setItem(LS_KEY_BBOX_SNAP_TOL, String(mm)); } catch { /* ignore */ }
+    try { writeLocalStorage(LS_KEY_BBOX_SNAP_TOL, String(mm)); } catch { /* ignore */ }
     this._notify();
   }
 
   /** Toggle the 4-direction neighbor-distance overlay during drag. */
   setShowNeighborDistances(enabled: boolean): void {
     this._showNeighborDistances = enabled;
-    try { localStorage.setItem(LS_KEY_SHOW_NEIGHBOR_DIST, String(enabled)); } catch { /* ignore */ }
+    try { writeLocalStorage(LS_KEY_SHOW_NEIGHBOR_DIST, String(enabled)); } catch { /* ignore */ }
     this._notify();
   }
 
   /** Set the maximum auto-measure distance in millimetres. */
   setNeighborDistanceMaxMm(mm: number): void {
     this._neighborDistanceMaxMm = mm;
-    try { localStorage.setItem(LS_KEY_NEIGHBOR_DIST_MAX, String(mm)); } catch { /* ignore */ }
+    try { writeLocalStorage(LS_KEY_NEIGHBOR_DIST_MAX, String(mm)); } catch { /* ignore */ }
     this._notify();
   }
 
   /** Toggle drag-time magnetic snap between matching snap points. */
   setSnapPointMagnet(enabled: boolean): void {
     this._snapPointMagnetEnabled = enabled;
-    try { localStorage.setItem(LS_KEY_SNAPPOINT_MAGNET, String(enabled)); } catch { /* ignore */ }
+    try { writeLocalStorage(LS_KEY_SNAPPOINT_MAGNET, String(enabled)); } catch { /* ignore */ }
     this._notify();
   }
 
   /** Toggle chain mode: when on, connected assets follow during drag. */
   setChainMode(enabled: boolean): void {
     this._chainModeEnabled = enabled;
-    try { localStorage.setItem(LS_KEY_CHAIN_MODE, String(enabled)); } catch { /* ignore */ }
+    try { writeLocalStorage(LS_KEY_CHAIN_MODE, String(enabled)); } catch { /* ignore */ }
     this._notify();
   }
 
@@ -655,7 +727,7 @@ export class LayoutStore {
    *  hover/selection while the planner is active. */
   setDocMode(enabled: boolean): void {
     this._docMode = enabled;
-    try { localStorage.setItem(LS_KEY_DOC_MODE, String(enabled)); } catch { /* ignore */ }
+    try { writeLocalStorage(LS_KEY_DOC_MODE, String(enabled)); } catch { /* ignore */ }
     this._notify();
   }
 
@@ -667,14 +739,14 @@ export class LayoutStore {
 
   setGridSize(mm: number): void {
     this._gridSizeMm = Math.max(0, mm); // 0 = translation snap off (grid not drawn)
-    try { localStorage.setItem(LS_KEY_GRID_SIZE, String(this._gridSizeMm)); } catch { /* ignore */ }
+    try { writeLocalStorage(LS_KEY_GRID_SIZE, String(this._gridSizeMm)); } catch { /* ignore */ }
     this._notify();
   }
 
   /** Set the rotation snap step in degrees. Persisted to localStorage. */
   setRotationSnapDeg(deg: number): void {
     this._rotationSnapDeg = deg;
-    try { localStorage.setItem(LS_KEY_ROTATION_SNAP, String(deg)); } catch { /* ignore */ }
+    try { writeLocalStorage(LS_KEY_ROTATION_SNAP, String(deg)); } catch { /* ignore */ }
     this._notify();
   }
 
@@ -694,7 +766,7 @@ export class LayoutStore {
         this._library.catalogUrls,
         this._gridSizeMm,
       );
-      localStorage.setItem(LS_KEY_AUTOSAVE, JSON.stringify(layout));
+      writeLocalStorage(LS_KEY_AUTOSAVE, JSON.stringify(layout));
     } catch {
       // QuotaExceededError — silently ignore
     }
@@ -702,7 +774,7 @@ export class LayoutStore {
 
   loadAutoSave(): void {
     try {
-      const json = localStorage.getItem(LS_KEY_AUTOSAVE);
+      const json = readLocalStorage(LS_KEY_AUTOSAVE);
       if (!json) return;
       const layout = deserializeLayout(json);
       this._placed = layout.components;
@@ -757,7 +829,6 @@ export class LayoutStore {
       catalogUrls: lib.catalogUrls,
       catalogErrors: lib.catalogErrors,
       activeTabUrl: lib.activeTabUrl,
-      thumbnailPending: lib.thumbnailPending,
       placed: this._placed,
       selectedId: this._selectedId,
       mode: this._mode,
@@ -777,6 +848,7 @@ export class LayoutStore {
       signalLinkMode: getSignalLinkModeSnapshot().explicit,
       placementMode: this._placementMode,
       pendingPlacements: this._pendingPlacements,
+      preparingEntryIds: this._preparingEntryIds,
     };
   }
 

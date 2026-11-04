@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -70,10 +71,12 @@ describe('customer source tier gate', () => {
     for (const feature of [
       'diagnostics', 'step-import', 'jt-import', 'fbx-import', 'ik-solver',
       // Since the default flip these adapters carry no rule at all and inherit `commercial`.
-      'kinematic-mechanism', 'machining', 'des', 'plc', 'physics', 'feature-matrix',
+      'kinematic-mechanism', 'machining', 'plc', 'physics', 'feature-matrix',
     ]) {
       expect(source).toContain(`features/${feature}.register`);
     }
+    // plan-680 §9.10: DES ships with the core in every tier; no private adapter is generated.
+    expect(source).not.toContain('features/des.register');
     // Restricted and unassigned: the two per-customer features stay out of a delivery
     // whose `restrictedFeatures` list is empty.
     expect(source).not.toContain('features/agents.register');

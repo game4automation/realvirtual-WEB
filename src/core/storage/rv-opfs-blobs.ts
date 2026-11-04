@@ -12,8 +12,8 @@
  *
  * ## Content addressing is not decoration
  *
- * A project manifest already carries `sha256` on every asset entry
- * (`RvProjectAssetEntry`). Keying the store by that hash means the same GLB
+ * A project manifest already carries `sha256` on every document row
+ * (`RvDocumentEntry`). Keying the store by that hash means the same GLB
  * referenced from three projects is stored once, a re-save of unchanged bytes
  * is a no-op, and a corrupted half-write can be detected rather than served.
  * It also removes the question "what is this file called" from a medium that

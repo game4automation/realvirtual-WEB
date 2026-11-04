@@ -26,6 +26,7 @@ import {
   type ImportResultItem,
 } from '../../core/import/rv-import-provider';
 import { importObject } from '../../core/import/rv-import-object';
+import { ensureFeatureIfDeclared } from '../../core/rv-feature-loader';
 
 /** The slice of AssetEditorPlugin the editor sink needs (avoids a hard import). */
 type AssetEditorLike = RVViewerPlugin & {
@@ -54,6 +55,9 @@ export interface StartImportOptions {
   isEditor: boolean;
   /** Planner sink only: auto-align the placed object to the floor. */
   alignToFloor: boolean;
+  /** Planner sink only: place the result as a locked reference underlay
+   *  (plan-741, DXF hall floor plans). Default: false. */
+  locked?: boolean;
 }
 
 // ─── Store state ─────────────────────────────────────────────────────────
@@ -170,11 +174,16 @@ export function startImportJob(
         }
         if (opts.isEditor) {
           // Editor mode edits ONE asset and has no scene — always an addition.
+          // plan-652: the Editor may be an on-demand feature - activate it first.
+          await ensureFeatureIfDeclared(viewer, 'asset-editor', 'command:import');
           const assetEditor = viewer.getPlugin<AssetEditorLike>('asset-editor');
           if (!assetEditor) throw new Error('[import] Editor mode requires the asset-editor plugin.');
           await assetEditor.importItems(result.ok);
         } else {
-          const outcome = await importObject(viewer, result.ok, { skipAutoAlign: !opts.alignToFloor });
+          const outcome = await importObject(viewer, result.ok, {
+            skipAutoAlign: !opts.alignToFloor,
+            locked: opts.locked ?? false,
+          });
           warnings.push(...outcome.warnings);
         }
       } else if (errors.length === 0) {

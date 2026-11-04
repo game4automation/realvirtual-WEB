@@ -73,7 +73,10 @@ describe('requireHostedPassword', () => {
     const probe = await probeFor('richtig-2027', FRAG, SALT);
     const pending = requireHostedPassword({ encryption: { enabled: true, probe } });
     const field = await input();
-    expect(root()?.textContent).toMatch(/password protected/i);
+    expect(root()?.textContent).toMatch(/realvirtual Digital Twin/);
+    expect(root()?.textContent).toMatch(/encrypted and password protected/i);
+    expect(root()?.textContent).not.toMatch(/HMI/);
+    expect(document.title).toBe('realvirtual Digital Twin');
     expect(getSessionKey(SALT)).toBeNull();
 
     fireEvent.change(field, { target: { value: 'falsch' } });

@@ -19,6 +19,13 @@
  */
 
 import { describe, it, expect, beforeAll } from 'vitest';
+import BUDGETS from './bundle-budgets.json';
+import ODT_DESCRIPTIONS from '../schema/v1/rv-odt.descriptions.json';
+import connectSharedSource from '../src/core/hmi/connect-panel-shared.tsx?raw';
+import connectHostSource from '../src/core/hmi/ConnectPanelHost.tsx?raw';
+
+/** Every absolute bundle budget in this repo, with its provenance (plan-779). */
+const BUDGET_PINS = BUDGETS.pins;
 
 /** Lazy raw loaders for the emitted artifacts, keyed by path. */
 const distFiles = import.meta.glob('../dist/**/*.{html,js}', {
@@ -353,8 +360,60 @@ const distFiles = import.meta.glob('../dist/**/*.{html,js}', {
  *    +270_603 B since 2026-09-26; T3/T4/T6/T8/T10 are green, so it is not a
  *    splitting regression. Decision to raise rather than trim: Thomas, 2026-10-05.
  *    Not attributed per feature this time. The levers named in (F) are unchanged.
+ *
+ * H) 2026-10-22 — re-pinned to 4_866_000 for plan-652 Phase 4 (feature branch
+ *    feature/plan-652-lazy-feature-plugins, checked-in `npm run build`): 4_770_820 bytes,
+ *    ~2.0 % headroom as before. The growth over (G) is the main-line growth since
+ *    2026-10-05 (plan-641/646/649/650 and others; the generated demo entry grew
+ *    5834 -> 6068 KB on main over the same span). plan-652 itself moved the editor body
+ *    and DES out of the boot set (new T4b) - the lever named in (F), `register-des-runner`,
+ *    is gone from the entry. Decision to re-pin rather than trim: orchestrator / overnight
+ *    mode 2026-10-22 (plan-652 Phase 4 roadmap item).
+ *
+ *    **This pin was already violated when it was written, and that is now on the record.**
+ *    fedb6670 sits on the feature branch. The path-network planner UI was merged to main at
+ *    00:48 on 22.10 (bf533461), 2 h 20 min BEFORE fedb6670 was written at 03:08, and
+ *    `git merge-base --is-ancestor bf533461 fedb6670` says no — the measured tree did not
+ *    contain it, so ~54 kB of entry that already sat on the trunk were missing from the
+ *    measurement. The paragraph above even noticed the trunk had grown ("the generated demo
+ *    entry grew 5834 -> 6068 KB on main over the same span") and pinned the branch number
+ *    anyway. The lesson had been written down HERE, in this very comment block, on 08.08.2026:
+ *    *"Never add two branch-local absolute measurements again; measure both against their
+ *    merge-base."* Ten weeks later it was broken at the same spot, which is the proof that a
+ *    documented convention is not a guard.
+ *
+ * I) 2026-10-25 (plan-779) — the number did NOT move. What changed is where it lives and what
+ *    checks it:
+ *      · the value and its provenance are a record in `tests/bundle-budgets.json`
+ *        (pin `entry-chunk`): budget, the measurement it came from, the commit, the date, and
+ *        whether that commit sat on the merge target;
+ *      · `tests/bundle-budget-provenance.node.test.ts` asserts that record — among other things
+ *        it runs `git merge-base --is-ancestor <pin commit> main`, so a pin taken on a feature
+ *        branch is REFUSED by a test instead of being regretted in a comment ten weeks later.
+ *        It is red today, by exactly the (H) defect above, and it clears when the entry is
+ *        re-pinned from a build of main.
+ *    THE CONVENTION, now enforced rather than documented: an absolute budget is pinned ONLY
+ *    from a build of the merge target, and whoever changes one names the commit the number came
+ *    from. The prose history stays here; the machine-readable half lives in the JSON.
+ *    Not changed on purpose: the entry measures 5_180_528 B on main today, 314_528 B over this
+ *    budget — re-measured for this entry on two independent paths (`stat` and `TextEncoder`,
+ *    bit-identical). There is no single leak: the attribution behind that total (four eager
+ *    features, +26_919 B of `rv-odt.json`, ~137_014 B of diffuse growth in existing boot
+ *    modules) is the 25.10.2026 source-map analysis, not re-derived here.
+ *    T5 was therefore RED (until J): whether those features belong in the
+ *    boot path is Thomas's decision, and raising a guard to silence it is what (A)-(H) already
+ *    did eight times.
+ *
+ * J) 2026-10-26 — Thomas's decision: raise. Re-pinned from an internal `npm run build` of MAIN
+ *    (fd44db27, Private 2bec630): 5_262_656 bytes (stat == TextEncoder), budget 5_368_000,
+ *    ~2.0 % headroom as before; `onMergeTarget: true`, so the (H) defect is cleared too. The
+ *    four eager features named in (I) stay in the boot path by that decision. Growth since the
+ *    25.10 measurement (+82_128 B) is the same diffuse trunk growth the eager-source ratchet saw:
+ *    path-network editing, maintenance triggers (plan-522 7a), movement authority, fleet scene
+ *    schemas. Levers to bring the number DOWN: lazy-load the maintenance trigger host and the
+ *    path-network editing UI (see the eager-source-graph note in bundle-budgets.json).
  */
-const ENTRY_BUDGET_BYTES = 4_425_000;
+const ENTRY_BUDGET_BYTES = BUDGET_PINS['entry-chunk'].budgetBytes;
 
 /**
  * The entry chunk's size in BYTES, which is what the budget above is named in.
@@ -373,25 +432,65 @@ function entryByteLength(): number {
  *  identifier alone is not proof, because the entry legitimately still names the
  *  panel in its `lazy(() => import(...))` call and Vite's dep manifest. */
 const SPLIT_PANELS = [
-  { name: 'DESExperimentMatrixPanel', marker: 'des-matrix-panel' },
+  { name: 'ConnectPanel', marker: 'Max sub-commands (Sum Command mode)' },
+  // plan-2211: the Experiment Matrix belongs to the commercial `des-experiments` feature. Its
+  // chunk exists only in a build with the private sibling (none in the community build) and is
+  // imported dynamically by the feature body (`backend/ui.tsx`), never by the entry.
+  { name: 'DESExperimentMatrixPanel', marker: 'des-matrix-panel', importer: 'feature', privateOnly: true },
   // Was 'Edit Connection' until plan-702 removed the Edit-Connection dialog
   // along with the rest of the panel's library management. 'Generating
-  // preview…' sits in ThumbnailCard, well outside anything 702 touched, and
-  // is repo-wide unique.
-  { name: 'LayoutLibraryPanel', marker: 'Generating preview…' },
+  // preview…' sat in ThumbnailCard until plan-776 (1616dfb6) moved thumbnail
+  // generation to save time and dropped that label. 'Asset Manager not
+  // available on mobile' is the panel's own mobile notice and repo-wide unique.
+  { name: 'LayoutLibraryPanel', marker: 'Asset Manager not available on mobile' },
   { name: 'VisualTab', marker: null },
   { name: 'DevToolsTab', marker: null },
   { name: 'GroupsTab', marker: null },
 ] as const;
 
 /**
+ * plan-652: the on-demand feature bodies. Their chunk is named after the body module
+ * (`features/<id>.body.ts`) and reached only from the feature's stub, never from the
+ * entry. `marker` is a literal of the implementation (editor plugin / DES runner).
+ * `core: true` (plan-680: DES) — the feature is part of the AGPL core, so EVERY build
+ * must carry its body chunk; a missing chunk fails instead of being skipped. A private
+ * feature is skipped when its stub chunk is absent (community build).
+ */
+const FEATURE_BODIES = [
+  { name: 'asset-editor.body', marker: 'editor arena build failed', core: false },
+  // Was 'DES snapshots of scenes with AGVs' until plan-2058 F07 reworded the runner's error
+  // (that text now survives only in a source comment, which the minifier strips). The new
+  // literal is the thrown message in des-runner.ts snapshot(); des-runner is reached only
+  // via the lazy register-des-runner chunk that des.body imports.
+  // plan-2059 phase 3a replaced that throw with _snapshotFailure(); its Problems-panel title is the
+  // new literal that lives only in des-runner.ts (reached via register-des-runner).
+  // plan-2061 P4 x snapshot-messages: the Problems titles moved to core/sdk/rv-des-snapshot-messages (entry);
+  // the thrown id-missing message is now a literal that lives only in des-runner.ts.
+  { name: 'des.body', marker: 'des-rng-id-missing: Script', core: true },
+  // plan-2211: the commercial experiment manager body (registers the window opener whose
+  // error text lives only in its `backend/ui.tsx`); absent in a community build.
+  { name: 'des-experiments.body', marker: 'Experiment Matrix could not be loaded. Click to retry.', core: false },
+] as const;
+
+/**
  * Deliberate NON-targets, fixed here so a future "optimisation" that lazies them
  * has to argue with a test instead of slipping through:
- *  - ConnectPanel stays mounted by decision (its user state must survive close),
- *  - layout-planner and rv-extras-editor are plugin entry points in `main.ts`,
- *    not panels — lazying them would reorder plugin boot.
+ * ConnectPanel is lazy since plan-2035; hasLoaded || wanted preserves its state.
+ * Layout Planner loads as its own chunk BEFORE the viewer since plan-2037,
+ * preserving its position in the plugin chain.
+ *  - rv-extras-editor is a plugin entry point in `main.ts`, not a panel —
+ *    lazying it would reorder plugin boot.
  */
-const NON_TARGETS = ['ConnectPanel', 'layout-planner', 'rv-extras-editor'] as const;
+const NON_TARGETS = ['rv-extras-editor'] as const;
+
+it('CONNECT shared helpers and host do not statically import the lazy implementation', () => {
+  for (const source of [connectSharedSource, connectHostSource]) {
+    expect(source).not.toMatch(/\bfrom\s*['"]\.\/ConnectPanel['"]/);
+    expect(source).not.toMatch(/\bimport\s*['"]\.\/ConnectPanel['"]/);
+  }
+  expect(connectSharedSource).not.toMatch(/import\s*\(\s*['"]\.\/ConnectPanel['"]/);
+  expect(connectHostSource).toContain("import('./ConnectPanel')");
+});
 
 let indexHtml = '';
 let entryPath = '';
@@ -449,19 +548,48 @@ describe('bundle splitting — react-pdf', () => {
 });
 
 describe('bundle splitting — panel chunks', () => {
-  it('T3 each split panel has its own emitted chunk, reached only by dynamic import', () => {
-    for (const { name } of SPLIT_PANELS) {
+  it('T3 each split panel has its own emitted chunk, reached only by dynamic import', async () => {
+    // plan-2037: LayoutLibraryPanelHost lives in the layout-planner chunk now, so the
+    // lazy import() of LayoutLibraryPanel is emitted there instead of in the entry.
+    let plannerText = '';
+    for (const name of assetNames) {
+      if (name === entryPath) continue;
+      const text = await distFiles[distKey(`/dist/assets/${name}`)!]();
+      if (text.includes('[LayoutPlanner] _loadCatalogs failed:')) plannerText = text;
+    }
+    for (const panel of SPLIT_PANELS) {
+      const { name } = panel;
       const chunk = assetNames.find((n) => n.startsWith(`${name}-`));
+      if (!chunk && 'privateOnly' in panel && !assetNames.some((n) => n.startsWith('des-experiments.register-'))) continue;
       expect(chunk, `expected a dedicated chunk for ${name}, got: ${assetNames.join(', ')}`).toBeTruthy();
-      // The entry must reach it through `import("./<chunk>")`, never `from"..."`.
-      expect(entryText).toContain(`import("./${chunk}")`);
+      if ('importer' in panel && panel.importer === 'feature') {
+        // A feature chunk (not the entry) reaches it through `import("./<chunk>")`.
+        let reached = false;
+        for (const asset of assetNames) {
+          if (asset === entryPath || asset === chunk) continue;
+          const text = await distFiles[distKey(`/dist/assets/${asset}`)!]();
+          expect(text, `${asset} imports ${chunk} statically`).not.toContain(`from"./${chunk}"`);
+          if (text.includes(`import("./${chunk}")`)) reached = true;
+        }
+        expect(reached, `no chunk imports ${chunk} dynamically`).toBe(true);
+        expect(entryText).not.toContain(`import("./${chunk}")`);
+        expect(entryText).not.toContain(`from"./${chunk}"`);
+        continue;
+      }
+      // The importer must reach it through `import("./<chunk>")`, never `from"..."`.
+      const importerText = name === 'LayoutLibraryPanel' ? plannerText : entryText;
+      expect(importerText).toContain(`import("./${chunk}")`);
+      expect(importerText).not.toContain(`from"./${chunk}"`);
       expect(entryText).not.toContain(`from"./${chunk}"`);
     }
-  });
+  }, 120_000);
 
   it('T4 the split panels\' implementations are gone from the entry chunk', async () => {
-    for (const { name, marker } of SPLIT_PANELS) {
+    for (const panel of SPLIT_PANELS) {
+      const { name, marker } = panel;
       if (!marker) continue;
+      if ('privateOnly' in panel && !assetNames.some((n) => n.startsWith(`${name}-`))
+        && !assetNames.some((n) => n.startsWith('des-experiments.register-'))) continue; // community build
       const chunkName = assetNames.find((n) => n.startsWith(`${name}-`))!;
       const chunkText = await distFiles[distKey(`/dist/assets/${chunkName}`)!]();
       // The marker proves WHERE the implementation ended up — present in the
@@ -471,8 +599,52 @@ describe('bundle splitting — panel chunks', () => {
     }
   });
 
+  it('T4b the on-demand feature bodies (plan-652) are own chunks, never imported by the entry', async () => {
+    for (const { name, marker, core } of FEATURE_BODIES) {
+      // A community build ships no private features: no stub chunk, nothing to check.
+      // A core feature (DES, plan-680) has no skip: its body chunk must always exist.
+      const stub = name.replace(/\.body$/, '.register');
+      if (!core && !assetNames.some((n) => n.startsWith(`${stub}-`))) continue;
+      const chunk = assetNames.find((n) => n.startsWith(`${name}-`));
+      expect(chunk, `expected a dedicated chunk for ${name}, got: ${assetNames.join(', ')}`).toBeTruthy();
+      // STATIC import only: since plan-680 the DES stub is core code inlined into the entry,
+      // so the entry legitimately names the body chunk in its dynamic import() / mapDeps.
+      const staticRefs = [...entryText.matchAll(/(?:\bfrom\s*|\bimport\s*)"\.\/([^"]+\.js)"/g)].map((m) => m[1]);
+      expect(staticRefs, `the entry imports ${chunk} statically`).not.toContain(chunk);
+      expect(entryText, `${name}'s implementation is in the entry`).not.toContain(marker);
+      let found = false;
+      for (const asset of assetNames) {
+        if (asset === entryPath) continue;
+        if ((await distFiles[distKey(`/dist/assets/${asset}`)!]()).includes(marker)) { found = true; break; }
+      }
+      expect(found, `marker of ${name} not found in any chunk — stale marker?`).toBe(true);
+    }
+  });
+
   it('T5 the entry chunk stays inside its size budget', () => {
     expect(entryByteLength()).toBeLessThan(ENTRY_BUDGET_BYTES);
+  });
+
+  /**
+   * T5b (release 6.6.0) — the FULL rv-odt.json (structure + every `description`) must not be
+   * eager. 5be8c9e3 split it: the entry carries `rv-odt.structure.json`, the descriptions are
+   * the lazy `rv-odt.descriptions.json` chunk (`ensureDescriptions()`). c1f2392e broke that with
+   * one `import rvOdt from '.../rv-odt.json'` (DropDetection defaults), +222_511 B in the entry,
+   * and only T5's size number noticed. This names the cause: no description string may be in
+   * the entry. Markers come from the generated descriptions map itself (so they never go
+   * stale): every description long enough to be unambiguous and spelled in characters the
+   * minifier emits verbatim (no quotes, backslashes or non-ASCII that could be re-escaped).
+   */
+  it('T5b no rv-odt description string is in the entry (the full rv-odt.json stays lazy)', () => {
+    const markers = Object.values(ODT_DESCRIPTIONS as Record<string, unknown>).filter(
+      (v): v is string => typeof v === 'string' && v.length >= 80 && /^[A-Za-z0-9 .,()\-:;/]+$/.test(v),
+    );
+    expect(markers.length, 'too few description markers — did rv-odt.descriptions.json change shape?')
+      .toBeGreaterThan(50);
+    const inEntry = markers.filter((m) => entryText.includes(m));
+    expect(inEntry.length, `rv-odt descriptions in the entry, e.g. "${inEntry[0]?.slice(0, 80)}…" — `
+      + 'something imports schema/v1/rv-odt.json eagerly; import rv-odt.structure.json instead')
+      .toBe(0);
   });
 
   it('T6 the deliberate non-targets are still in the entry', () => {
@@ -503,7 +675,8 @@ describe('bundle splitting — panel chunks', () => {
  *   1. The documentation renderer is test-only and reaches NO shipped chunk.
  *   2. The probes stay small and self-contained — they must not be the thing
  *      that pulls the asset-editor plugin into the startup path.
- *   3. The existing entry budget still holds, which bounds the whole feature.
+ *   3. (Was "the entry budget still holds". That was T5's assertion copied under a
+ *      second name; deleted 25.10.2026, see the note at the end of this block.)
  */
 describe('bundle cost — plan-707 self-describing MCP tooling', () => {
   /**
@@ -563,10 +736,14 @@ describe('bundle cost — plan-707 self-describing MCP tooling', () => {
     ).toBe(true);
   }, SCAN_TIMEOUT_MS);
 
-  it('T9 the entry budget still holds with the feature in', () => {
-    // The whole feature is bounded by the number the file already defends.
-    expect(entryByteLength()).toBeLessThan(ENTRY_BUDGET_BYTES);
-  });
+  // T9 WAS "the entry budget still holds with the feature in" and was deleted on 25.10.2026
+  // (plan-779 D4). It asserted `entryByteLength() < ENTRY_BUDGET_BYTES` — character for
+  // character what T5 asserts, and nothing about this feature: its name claimed a
+  // feature-specific bound, its body had no feature in it. The effect was an amplifier, not a
+  // signal: one entry over budget produced three red ticks (T5, T9, T11), which reads like
+  // three problems and hides that there is one. The budget is T5's, once. Anything a feature
+  // owes beyond it has to be asserted about the FEATURE (T7/T8 do that here) — do not
+  // re-add a bare budget check under a feature's name.
 });
 
 /**
@@ -609,9 +786,10 @@ describe('bundle splitting — plan-498 FMU model-description reader', () => {
     expect(entryText).not.toContain(`import"./${home}"`);
   }, SCAN_TIMEOUT_MS);
 
-  it('T11 the entry budget still holds with the Fmu component in', () => {
-    expect(entryByteLength()).toBeLessThan(ENTRY_BUDGET_BYTES);
-  });
+  // T11 ("the entry budget still holds with the Fmu component in") was deleted on 25.10.2026
+  // for the same reason as T9 — see the note at the end of the plan-707 block. It was the
+  // third copy of T5's assertion; what this plan actually needs guarded about the FMU reader
+  // is T10, which names the reader.
 });
 
 /**
@@ -660,4 +838,67 @@ describe('bundle splitting — plan-517 component-schema specification chunk', (
     const preloaded = [...indexHtml.matchAll(/rel="modulepreload"[^>]*href="([^"]+)"/g)].map((m) => m[1]);
     for (const href of preloaded) expect(href).not.toContain(home);
   }, SCAN_TIMEOUT_MS);
+});
+
+/**
+ * plan-764 "Lazy-Apply-Dialog" (2026-10-16) — the two dialogs of a non-GLB
+ * export provider (export-mode choice, "Apply … extras" preview) live in
+ * `DocumentFileExportDialogs.tsx`, which the document card reaches only
+ * through `import()` when one of them is about to open. Their text must not
+ * be in the entry, and nothing may import the module statically or preload it.
+ *
+ * Markers: result / preview literals that exist only in that module.
+ */
+describe('bundle splitting — plan-764 document file-export dialogs', () => {
+  const MARKERS = ['lose their realvirtual data', 'open the document to see it', 'exported without geometry'];
+
+  it('T13 the dialogs are their own chunk, reached only by dynamic import, never in the entry', async () => {
+    for (const marker of MARKERS) {
+      expect(entryText, `"${marker}" landed in the entry chunk`).not.toContain(marker);
+    }
+    const chunk = assetNames.find((n) => n.startsWith('DocumentFileExportDialogs-'));
+    expect(chunk, `expected a dedicated DocumentFileExportDialogs chunk, got: ${assetNames.join(', ')}`).toBeTruthy();
+    const chunkText = await distFiles[distKey(`/dist/assets/${chunk}`)!]();
+    for (const marker of MARKERS) expect(chunkText, `${marker} not in ${chunk}`).toContain(marker);
+    expect(entryText).not.toContain(`from"./${chunk}"`);
+    expect(entryText).not.toContain(`import"./${chunk}"`);
+    const preloaded = [...indexHtml.matchAll(/rel="modulepreload"[^>]*href="([^"]+)"/g)].map((m) => m[1]);
+    for (const href of preloaded) expect(href).not.toContain(chunk!);
+  });
+});
+
+
+describe('bundle splitting - plan-2037 layout planner', () => {
+  it('keeps the planner index in its own dynamically imported chunk outside the entry', async () => {
+    // Unique to plugins/layout-planner/index.ts; survives minification.
+    const marker = '[LayoutPlanner] _loadCatalogs failed:';
+    expect(entryText).not.toContain(marker);
+    const homes: string[] = [];
+    for (const name of assetNames) {
+      if (name === entryPath) continue;
+      const text = await distFiles[distKey(`/dist/assets/${name}`)!]();
+      if (text.includes(marker)) homes.push(name);
+    }
+    expect(homes, 'expected exactly one chunk containing the planner index').toHaveLength(1);
+    const chunk = homes[0];
+    expect(entryText).toContain(`import("./${chunk}")`);
+    expect(entryText).not.toContain(`from"./${chunk}"`);
+    expect(entryText).not.toContain(`import"./${chunk}"`);
+  }, 120_000);
+});
+
+describe('bundle splitting - plan-2036 path network interaction', () => {
+  it('keeps the interaction implementation in a dynamic chunk outside the entry', async () => {
+    const chunk = assetNames.find(name => name.startsWith('path-network-interaction-'));
+    expect(chunk, 'expected a dedicated path-network-interaction chunk').toBeTruthy();
+    const marker = 'click layout: the block was not placed';
+    const chunkText = await distFiles[distKey(`/dist/assets/${chunk}`)!]();
+    expect(chunkText).toContain(marker);
+    expect(entryText).not.toContain(marker);
+    expect(entryText).toContain(`import("./${chunk}")`);
+    expect(entryText).not.toContain(`from"./${chunk}"`);
+    expect(entryText).not.toContain(`import"./${chunk}"`);
+    const preloaded = [...indexHtml.matchAll(/rel="modulepreload"[^>]*href="([^"]+)"/g)].map(m => m[1]);
+    for (const href of preloaded) expect(href).not.toContain(chunk!);
+  });
 });

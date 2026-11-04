@@ -1,0 +1,120 @@
+{
+  "$note": [
+    "Machine-readable pin records for every ABSOLUTE bundle budget in this repo (plan-779).",
+    "",
+    "One file, because the three guards that defend the startup path had drifted apart:",
+    "`bundle-splitting.test.ts` pinned the dist entry, `scripts/test-bundle-guard.mjs`",
+    "printed the demo entry WITHOUT any budget at all, and `bundle-eager-imports.node.test.ts`",
+    "walked the eager source graph without ever summing it. The prose history of the dist",
+    "entry stays where it is (the ENTRY_BUDGET_BYTES comment in bundle-splitting.test.ts) —",
+    "only the numbers and their PROVENANCE live here, so that one test can check all of them.",
+    "",
+    "THE RULE, learned twice the hard way (08.08.2026 and again 22.10.2026):",
+    "an absolute budget is pinned ONLY from a build of the MERGE TARGET. A number measured on",
+    "a feature branch is a number measured on a tree the trunk does not have: on 22.10.2026 the",
+    "dist entry was pinned at 4_866_000 from fedb6670 (feature/plan-652-lazy-feature-plugins),",
+    "2 h 20 min AFTER the path-network planner UI had been merged to main — `git merge-base",
+    "--is-ancestor bf533461 fedb6670` says no, so ~54 kB that already sat on the trunk were",
+    "missing from the measurement. The budget was over on the day it was written.",
+    "",
+    "WHOEVER CHANGES A NUMBER HERE fills in `measuredAt` truthfully: the commit the measurement",
+    "was taken at, and whether that commit sits on the merge target. The commit is not decoration",
+    "— `bundle-budget-provenance.node.test.ts` runs `git merge-base --is-ancestor` on it and fails",
+    "when the answer is no. That is the convention standing in the way instead of being documented."
+  ],
+  "mergeTarget": "main",
+  "pins": {
+    "entry-chunk": {
+      "what": "dist/ entry chunk (the bundle every visitor downloads), real UTF-8 bytes",
+      "guard": "tests/bundle-splitting.test.ts — T5, via ENTRY_BUDGET_BYTES",
+      "budgetBytes": 5368000,
+      "measuredBytes": 5262656,
+      "measuredAt": {
+        "commit": "fd44db27",
+        "date": "2026-10-26",
+        "onMergeTarget": true,
+        "how": "internal `npm run build` on main at fd44db27 (Private 2bec630); entry index-*.js stat == TextEncoder (5_262_656 B)"
+      },
+      "note": [
+        "Thomas 2026-10-26: raise. Re-pinned from a build of main, ~2.0 % headroom as in (A)-(H).",
+        "What grew since the 22.10 pin (4_770_820 B, feature branch): the four deliberately eager",
+        "features of the 25.10 analysis (path-network planner UI 83_288, maintenance guide 37_787,",
+        "planning registry 22_085, four smaller 13_683), rv-odt.json +26_919, diffuse growth in boot",
+        "modules, and since 25.10 (5_180_528 B) another +82_128 B: path-network editing, maintenance",
+        "triggers (plan-522 7a), movement authority, fleet scene schemas (plan-559 P3).",
+        "Levers to bring it DOWN are unchanged: see the eager-source-graph note and bundle-splitting (J)."
+      ]
+    },
+    "demo-entry-chunk": {
+      "what": "entry chunk of the GENERATED demo build (DEMO_PROFILE staging under rv-tmp, never dist/), bytes on disk",
+      "guard": "scripts/test-bundle-guard.mjs — `npm run test:bundle-guard`",
+      "budgetBytes": 5200000,
+      "measuredBytes": 5199564,
+      "measuredAt": {
+        "commit": "5aa96959",
+        "date": "2026-11-04",
+        "onMergeTarget": true,
+        "how": "Re-pinned 2026-11-04 by Weg A (plan-2215, Stereo/DisplayWall/Flystick to commercial beta) on orchestrator instruction: `test-bundle-guard --mode enforce` on origin/main 5aa96959 + Private 0902cd4 measured demo entry 5_198_886 B (main itself 38_430 B over the old budget); Weg A on top (2908e60d / Private 403edef, three dynamic useFeature lines) measured 5_199_564 B (+678 B). Attribution: +89_524 B since the pin at 1b2d0a88 across the 480 commits 1b2d0a88..5aa96959, not bisected; 5aa96959 itself had already removed ~222 KB (DropDetection pulled rv-odt.json into the entry). Budget = measured rounded up to the next 1_000 B (orchestrator rule for this re-pin). Previous pin: Re-pinned in nightmode round 16 on integ/r16 (measured on origin/main 1b2d0a88 + the plan-2059 Phase 8 branch 3a54bc66; pin sha = the origin/main base, the measured merge is not itself on main yet): +4_779 B over the old budget, cause = the phase, budget = measured + 1 %; to be confirmed by Thomas/orchestrator. Previous pin: Re-pinned by Thomas 2026-11-02Re-pinned by Thomas 2026-11-02, +0,12 %, Ursache nicht gesucht: `test-bundle-guard --mode enforce` on integ/r5 (main 0fb5657b + flake-test fixes only) measured demo entry 5_054_043 B on disk, 5_956 B over the old budget 5_048_087; budget = measured + 1 %. Previous pin 4_998_106 B at a6f45133 (2026-10-30). Earlier: `test-bundle-guard --mode enforce` on main at a6f45133 (detached worktree, tree clean): demo entry 4_998_106 B on disk — main had grown 51_786 B since fd03b6bb and was already 2_322 B over the old budget. plan-2011 Phase 1 adds 3_656 B on top (stats registry, hub store, hub button in the boot set; the window is a lazy chunk): 5_001_762 B. Budget = measured + 1 % (orchestrator rule). Previous pin 4_946_320 B at fd03b6bb (plan-2037). Older: 5_082_899 B at 48fca3c1 (plan-2036), 5_124_025 B at ddaa8b22 (plan-2035), 5_298_998 B at 881a66eb (2026-10-29)"
+      },
+      "note": [
+        "New with plan-779. Until then this guard printed the demo entry's size and exited OK —",
+        "it had no size budget at all and would have been green at 10 MB, which is worse than no",
+        "guard because it looks like a check. 2.1 % headroom, the same margin the dist entry's",
+        "history uses. This is a DIFFERENT artifact from `entry-chunk` (filtered demo tree, demo",
+        "env) and the two numbers must not be copied between each other."
+      ]
+    },
+    "eager-source-graph": {
+      "what": "sum of all source files statically reachable from src/main.ts (type-only and import() excluded), bytes with CRLF counted as LF (checkout-independent)",
+      "guard": "tests/bundle-eager-imports.node.test.ts — the eager-source ratchet",
+      "budgetBytes": 16157000,
+      "measuredBytes": 16156633,
+      "measuredAt": {
+        "commit": "1d12ea29",
+        "date": "2026-11-04",
+        "onMergeTarget": true,
+        "how": "plan-778 nested library references on origin/main 1d12ea29 (build-free walk of 1137 files, LF-normalised): 16_156_633 B = main ~16_154_9xx B + ~1.7 KB eager (library-origin qualifyInLibrary: a reference inside a library document is that library's document; rv-placement-instancer: asset key -> library map and the nested re-address). Budget = measured rounded up to the next 1_000 B. Previous pin: 16154366 B at 86b89126: Re-pinned 2026-11-04 before the 6.6.0 release window (orchestrator instruction): build-free walk on origin/main 86b89126 + Private a140b0e: 16_154_366 B = previous pin 16_153_142 B at bea6d263 + 1_224 B; of that +538 B Weg A (plan-2215 Stereo/DisplayWall/Flystick to commercial beta, 33490c3a/a140b0e: three dynamic useFeature lines + tier comment), the rest (+686 B) from the other 15 commits bea6d263..86b89126, not bisected. Budget = measured rounded up to the next 1_000 B. Previous pin: plan-778 residual fixes merged onto origin/main bea6d263 (build-free walk of 1137 files, LF-normalised): 16_153_142 B = main 16_152_476 B (pinned at 9a86f6e5) + 666 B eager from plan-778 residuals (library-origin findWhenQualifiedSourceSettled/findQualifiedOriginSettled +561 - the ONE find-wait-find of review C8; rv-placement-instancer overridesOf hook +136 - parametric restore after library loss; rv-glb-compose +26; rv-glb-reference-resolver -57). Budget = measured rounded up to the next 1_000 B. Previous pin: 16_152_476 B at 9a86f6e5: plan-2208b on main 9a86f6e5: build-free walk of 1137 files, LF-normalised bytes: 16_152_476 B (+6_038 B over 16_146_438 B at 19ae71b4). plan-2208b ~+5.4 KB eager by design (des.seed/des.checkpoint descriptors + helpers: des-manager-node.ts +3_908 - seed persistence with read-back and lease/target/document/kernel rechecks after Codex r2/r3, des-run-settings-store.ts +570, rv-command-registry.ts +384 commercial des.checkpoint prefix, des-run-commands.ts +328 descriptors, DESControllerToolbar.tsx +189; the command impl stays lazy); fc 74915b03 scene-buttons +97 B; remainder ~+0.6 KB from other commits since 19ae71b4. Budget = measured rounded up to the next 1_000 B. Orchestrator decision 2026-11-04. Previous pin: 16_146_438 B at 19ae71b4: plan-2227 P2: SignalConnector + conversion lazy, -40_908 B (-52_016 B lazy: rv-signal-connector.ts 38_943 + rv-signal-conversion.ts 13_073; +11_108 B eager: rv-signal-connector-inspector-entry 2_890, rv-signal-connector-link 1_634, editor-command-descriptors +1_479, rv-signal-convert-core 1_469, rv-property-inspector +1_467, signal-connector.register 790, InlineSignalSlots +467, rv-viewer +446, rv-component-section +422, rv-scene-loader +59, rv-connect-signal -15). Build-free walk of 1137 files on the plan-2227 P2 merge of origin/main 19ae71b4, LF-normalised bytes: 16_146_438 B (origin/main 19ae71b4 alone: 16_187_346 B, equal to the previous measurement). Budget = measured rounded up to the next 1_000 B. Orchestrator decision 2026-11-04 (lower the pin in the P2 merge). Previous pin: 16_187_346 B at 8ca5c951: build-free walk of 1135 files on origin/main 8ca5c951 (plan-2215 P7 on main), LF-normalised bytes; +78_318 B over the previous measurement 16_109_028 B at 3678461b, attributed per first-parent commit (merges from their merge-base; script reproduces both anchors exactly; Private contributes 0 B): plan-2227 Phase 1 SignalConnector +54_397 B (4b305176 +45_709: rv-signal-connector.ts 30.5 KB + rv-signal-conversion.ts 13.1 KB enter via the side-effect import in rv-scene-loader.ts and rv-connect-signal.ts; d282bec2 +4_376; 2ed3b113 +4_312) - DELIBERATELY EAGER for now, the lazy rework follows in plan-2227 P2/P3 and then lowers this pin; plan-903 drop detection +9_273 B (fedaa6b0 merge +7_166, 35de9bb2 +933, 0d3c034b +1_174); plan-2228 SEW MOVI-C UDP +5_451 B (190bbfff; the P3/P4 merge f1db0ad4 measured net 0 on top of it - connect-store is eager by design); settings tab order f55f3541 +2_966 B; clipping leak fixes bb4f0edd/358bb40a +1_374 B; DES memo fix aaa1ac28 +441 B; plan-2215 P7 8ca5c951 +4_416 B (clickFromHit +1_488, ray-driven MU drag +2_335 - an import() split would make the drag start async inside the render-time pointer pass, SpaceMouse core registration in main.ts +593 - the plugin itself is a dynamic import). Budget = measured rounded up to the next 1_000 B. Orchestrator decision 2026-11-04 (one re-pin so the DES release is not blocked). Previous pin: 16_109_028 B at 3678461b: build-free walk of 1132 files on origin/main 3678461b, LF-normalised bytes (CRLF counted as one byte; measured 16_109_028 B, identical in a CRLF worktree checkout, a pure-LF git-archive of the commit and - at 58adb518 - the canonical tree). The measurement switched from raw on-disk bytes to LF-normalised bytes because on-disk bytes depend on the checkout (CRLF worktrees measured +2_234 B over the canonical tree for the same commit); this is a change of unit, not a size reduction: the same tree is 16_480_300 B raw in a worktree, 16_109_028 B LF-normalised. Growth since the last pin = plan-2219 +1_681 B (rv-physics-constants +802, rv-physics-zone +378, rv-physics-registry +300, rv-extras-validator +201; ~75 % doc comments, eager by design); budget = measured rounded up to the next 1_000 B. Orchestrator decision. Previous pin (raw on-disk unit): 16_476_006 B at 54827d42 (2026-11-03). Older: build-free walk of 1132 files on origin/main 54827d42; +9_461 B over the previous measurement 16_466_545 B at 1aa36565 (budget +9_006 B over): diffuse growth, no single leak - plan-2215 P5 wall.* descriptors/plugin-types, rv-viewer wall changes, DES reset fix/variant.set, mcp-bridge/main.ts edits; user-timing guard already lazy; budget = measured rounded up to the next 1_000 B. Orchestrator decision, precedent plan-778. Previous pin: 16_466_545 B at 1aa36565 (2026-11-03). Older: plan-778 after merging origin/main 1aa36565 into the feature branch (merge 5eb0643f): build-free walk of 1132 files; +15_545 B over the previous budget 16_451_000, cause = the sum of two sides that each fit alone: origin/main's 47 commits since the merge-base (+~15.5 KB, plan-779/2011/2211 et al., main alone 16_357_097 B) and plan-778 libraries-as-projects (+~109 KB eager vs the merge-base, already accepted in the earlier pins); budget = measured rounded up to the next 1_000 B. Orchestrator decision, precedent plan-778 review fixes / plan-630. Previous pin: 16_450_993 B at da90f4d4 (2026-11-03). Older pin: plan-778 review fixes, build-free walk of the eager graph on the plan-778 worktree; pin sha = da90f4d4, the merge-base with origin/main (the measured tree is not itself on main yet, as for demo-entry-chunk); +1_358 B over the old budget 16_449_635, cause = plan-778 library-as-projects review fixes (production library base URL, loader graph publish order, read-failure re-probe, Problems announcement seq, write-grant keys), ~1.4 KB that must be eager; budget = measured + 7 B. Orchestrator decision, precedent plan-630. Previous pin: 16_294_834 B at 53bd1b8b (2026-10-27), build-free walk of 1078 files on main 9408cae8 + plan-630 Phase 8"
+      },
+      "note": [
+        "Re-pinned 2026-11-04 by plan-778 nested library references (~+1.7 KB eager): references inside a library document resolve in that library, not in the open project.",
+        "Re-pinned 2026-11-04 by plan-778 residual fixes (+666 B eager): the shared qualified find-wait-find helper (review C8) and the parametric-restore hook.",
+        "Re-pinned 2026-11-04 by plan-2208b (+6_038 B): plan-2208b des.seed/des.checkpoint ~+5.4 KB (seed persistence safety in des-manager-node +3.9 KB), 74915b03 scene-buttons +97 B, ~+0.6 KB other commits since 19ae71b4. Eager by design.",
+        "Lowered 2026-11-04 by plan-2227 P2 (-40_908 B): the SignalConnector, its conversion kernel, network, commands and inspector section load on demand (feature signal-connector, component:SignalConnector before the bake); ConnectSignal keeps only rv-signal-convert-core eager.",
+        "Re-pinned 2026-11-04 (second time, +78_318 B since 3678461b): plan-2227 SignalConnector +54_397 B (deliberately eager until plan-2227 P2/P3 makes it lazy - then lower this pin), plan-903 drop detection +9_273 B, plan-2228 SEW UDP +5_451 B, plan-2215 P7 +4_416 B, settings tab order +2_966 B, clipping fixes +1_374 B, DES memo +441 B. Orchestrator decision.",
+        "Re-pinned 2026-11-04: measurement switched to LF-normalised bytes (checkout-independent; CRLF worktrees measured +2_234 B over the canonical tree), plus plan-2219 +1_681 B (physics constants/zone/registry/validator, ~75 % doc comments, eager by design). Unit change: the old raw budget 16_477_000 B corresponds to ~16_108_000 B LF-normalised.",
+        "Re-pinned 2026-11-03 (+9_006 B over the budget): diffuse growth from plan-2215 P5 wall.*, DES reset fix/variant.set and mcp-bridge/main.ts edits; guard module already lazy.",
+        "Re-pinned 2026-11-03 by plan-778 after merging origin/main (+15_545 B over the budget): two sides that each fit alone, summed at the merge.",
+        "Re-pinned 2026-11-03 by plan-778 (+1_358 B over the budget): library-as-projects review fixes, eager by nature.",
+        "Re-pinned 2026-10-27 by plan-630 Phase 8 (+177_078 B since aac12a4a; ratchet tripped by ~+27 kB on top of a",
+        "main that had grown to ~10 kB below the old budget): the Phase-8 share that MUST be on the load path is the",
+        "selection[] reader (rv-planning-component-selection, read with every document), the inspector field-row action",
+        "hook (rv-field-row-actions, the inspector is eager), the component-owner API of the planning plugin and the",
+        "registry/kernel seams (planningReconfig table, SimDesControl.reconfigureFromExtras, PlanningParamDef.initial).",
+        "Made lazy on purpose (~42 kB): the component owner, the schema derivation, the synchronous SHA-256 key and the",
+        "one writer (component-params-owner.ts + rv-planning-component-params.ts behind import()). Tolerance kept at",
+        "0.95 % above the measurement.",
+        "Re-pinned 2026-10-26 (+270_909 B since 5559c8e4, ratchet tripped by +116_780 B): diffuse growth,",
+        "no single leak. Biggest movers: path-network interaction/ui-model/ops (+~85 kB, already eager),",
+        "maintenance trigger host + eval (+42 kB, new in the eager core MaintenancePlugin, plan-522 7a),",
+        "movement authority (+16 kB), fleet scene schemas (+10.6 kB, schema registration must be eager,",
+        "plan-559 P3), runtime-warmup-store + sim-speed DES warning (+8 kB). Lazy candidates for later:",
+        "the maintenance trigger host (only models with triggers need it) and the path-network editing UI.",
+        "Tolerance 150_153 B (0.95 %) above the measurement, which is ONE median day of trunk",
+        "growth, not a noise band. The honest reason, measured rather than assumed: the eager",
+        "graph on main grew from 14_068_445 B (2026-10-13) to 15_874_627 B (2026-10-25) — twelve",
+        "daily first-parent deltas of 226 / 1_972 / 41_010 / 53_891 / 56_002 / 99_517 / 144_547 /",
+        "197_847 / 210_009 / 214_180 / 312_794 / 474_187 B, median ~122 kB. The four eager clusters",
+        "this guard has to catch are +221_407, +363_333, +93_287 and +153_530 B — i.e. the SMALLEST",
+        "of them is smaller than an ordinary day on this trunk. No single absolute threshold can",
+        "therefore both pass a normal week and fail every cluster; a tight one is the only variant",
+        "that guards anything, so this one is tight and WILL trip every few days. Each trip is real",
+        "growth of the startup path and the cheapest moment to decide lazy-vs-eager. If that cadence",
+        "is unwanted, the fix is a per-change guard (eager delta against the merge-base, which needs",
+        "no build either), NOT a bigger number — see the report for plan-779.",
+        "Cross-machine note: the walk measures the WORKTREE, so a checkout with different EOL",
+        "settings reads ~28 kB differently (measured: git-archive tree vs this worktree). That is",
+        "inside the tolerance, but it is the reason the tolerance cannot be a few kB."
+      ]
+    }
+  }
+}

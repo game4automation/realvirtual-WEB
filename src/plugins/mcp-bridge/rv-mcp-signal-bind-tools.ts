@@ -43,7 +43,17 @@
  */
 
 import type { RVViewer } from '../../core/rv-viewer';
-import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
+import { valueOrThrowToolJson } from '../../core/hmi/rv-command-context';
+import {
+  commandRegistry,
+  type CommandDescriptor,
+  type CommandImpl,
+  type CommandRegistry,
+} from '../../core/hmi/rv-command-registry';
+
+/** Command ids of the slot binding writes (aliases `web_signal_bind` / `web_signal_unbind`, plan-641 Nachtrag). */
+export const SIGNAL_BIND_COMMAND = 'signal.bind';
+export const SIGNAL_UNBIND_COMMAND = 'signal.unbind';
 import { getActiveEditTarget } from '../../core/hmi/rv-edit-target';
 import { collectBindingInventory, mergeAppliedMappings } from '../signal-bind/binding-inventory';
 import { emitSignalBindingApplied } from '../signal-bind/binding-applied-pulse';
@@ -59,6 +69,8 @@ import {
 import { slotRejectReason, dropRejectText, plcKindOf } from '../signal-bind/drop-accept';
 import type { PickerSignal } from '../../core/hmi/rv-signal-slot-row';
 import type { SignalMapping } from '../layout-planner/rv-layout-store';
+import { componentAddressOf } from '../../core/engine/rv-signal-mapping-address';
+import { relativeComponentPath } from '../../core/engine/rv-binding-slot-resolver';
 
 /** A located slot, plus the target and persistence it belongs to. */
 interface ResolvedSlot {
@@ -75,12 +87,31 @@ interface ResolvedSlot {
   };
 }
 
+/** plan-769 F15: each listed slot row gains the `componentAddress` of its component node. */
+function withComponentAddresses<T extends { targetId: string; componentPath: string }>(viewer: RVViewer, rows: T[]): Array<T & { componentAddress?: string }> {
+  const registry = viewer.registry;
+  if (!registry) return rows;
+  const roots = new Map(enumerateAllBindableTargets(viewer).map((t) => [t.id, t.node as import('three').Object3D]));
+  return rows.map((row) => {
+    const root = roots.get(row.targetId);
+    if (!root) return row;
+    const path = row.componentPath;
+    const rootPath = registry.getPathForNode(root);
+    const node = path === '.' || path === '' ? root : registry.getNode(rootPath ? `${rootPath}/${path}` : path);
+    const componentAddress = node ? componentAddressOf(registry, root, node) : null;
+    return componentAddress ? { ...row, componentAddress } : row;
+  });
+}
+
 function err(message: string, extra?: Record<string, unknown>): string {
   return JSON.stringify({ error: message, ...extra });
 }
 
 export class McpSignalBindTools {
-  constructor(private readonly getViewer: () => RVViewer | undefined) {}
+  constructor(private readonly getViewer: () => RVViewer | undefined) {
+    // plan-641 Nachtrag: the bound bind / unbind tools need their commands before discover.
+    ensureSignalBindCommandsRegistered();
+  }
 
   private get viewer(): RVViewer | undefined { return this.getViewer(); }
 
@@ -104,10 +135,17 @@ export class McpSignalBindTools {
       ?? targets.find((t) => (t.target.label ?? t.node.name) === targetRef);
     if (!entry) {
       return err(`Target "${targetRef}" not found`, {
-        hint: 'Use web_signal_bindings_list for valid targetId values.',
+        hint: 'Use web_query("signal.bindingsList", {}) for valid targetId values.',
       });
     }
 
+    // plan-769 F15 (9.18): the component may be named by its PATH (what the list prints)
+    // or by its ADDRESS (`componentAddress` of the list, what a file stores).
+    if (componentPath !== undefined && componentPath.includes('#') && viewer.registry) {
+      const bindRoot = entry.node as import('three').Object3D;
+      const node = viewer.registry.resolveAddressIn(bindRoot, componentPath);
+      if (node) componentPath = relativeComponentPath(bindRoot, node, viewer.registry);
+    }
     const slots = manager.getElementSlots(entry.id, entry.node)
       .filter((s) => s.slot === slotName);
     const usable = slots.filter((s) => s.kind !== 'unavailable');
@@ -124,7 +162,7 @@ export class McpSignalBindTools {
       }
       return err(`Slot "${slotName}" not found on target "${entry.id}"`, {
         componentPath,
-        hint: 'Use web_signal_bindings_list for valid componentPath + slot pairs.',
+        hint: 'Use web_query("signal.bindingsList", {}) for valid componentPath + slot pairs.',
       });
     }
     if (matches.length > 1) {
@@ -167,11 +205,11 @@ export class McpSignalBindTools {
       : 'No active edit target, so a node binding cannot be saved.';
   }
 
-  @McpTool('List every bindable signal slot in the scene with its canonical identity (targetId, componentPath, slot), current external signal, liveness and comment — plus saved links that no longer resolve, with a repair candidate where one is unambiguous. Start here before binding.', { readOnly: true })
-  async webSignalBindingsList(
-    @McpParam('filter', 'Only rows whose target, component path or slot contains this substring (case-insensitive).', 'string', false) filter?: string,
-    @McpParam('boundOnly', 'Only slots that already carry an external signal.', 'boolean', false) boundOnly?: boolean,
-    @McpParam('limit', 'Maximum rows returned (default 300).', 'number', false) limit?: number,
+  /** Read-only command body (plan-2007). */
+  async querySignalBindingsList(
+    filter?: string,
+    boundOnly?: boolean,
+    limit?: number,
   ): Promise<string> {
     const viewer = this.viewer;
     if (!viewer) return err('No viewer available');
@@ -189,7 +227,8 @@ export class McpSignalBindTools {
       matched: matched.length,
       returned: Math.min(matched.length, max),
       truncated: matched.length > max,
-      slots: matched.slice(0, max),
+      // plan-769 F15: the path as before, plus the address a saved file stores for it.
+      slots: withComponentAddresses(viewer, matched.slice(0, max)),
       // Orphans ride along rather than getting their own tool (user's shrink of
       // the surface, 2026-08-10): a model that has just listed the bindings has
       // the broken ones in the same answer and needs no second round trip.
@@ -197,10 +236,10 @@ export class McpSignalBindTools {
     });
   }
 
-  @McpTool('List signals available as binding sources: live realvirtual CONNECT signals from every connected interface plus internal model signals, each with direction, data type, provider and comment. Use with web_signal_bindings_list to match external names to slots.', { readOnly: true })
-  async webSignalSourcesList(
-    @McpParam('filter', 'Only signals whose name or comment contains this substring (case-insensitive).', 'string', false) filter?: string,
-    @McpParam('limit', 'Maximum signals returned (default 300).', 'number', false) limit?: number,
+  /** Read-only command body (plan-2007). */
+  async querySignalSourcesList(
+    filter?: string,
+    limit?: number,
   ): Promise<string> {
     const store = this.viewer?.signalStore;
     if (!store) return err('No signal store available');
@@ -242,13 +281,8 @@ export class McpSignalBindTools {
     });
   }
 
-  @McpTool('Bind an external CONNECT signal (or an internal model signal) to one component slot, identified by targetId plus componentPath plus slot. Validates type and direction exactly as a manual drag does, checks the link can be saved before changing anything, and persists it. Unbind with web_signal_unbind.', { readOnly: false })
-  async webSignalBind(
-    @McpParam('targetId', 'Target id from web_signal_bindings_list (node path or placement id).') targetId: string,
-    @McpParam('componentPath', 'Component path of the slot — required whenever a target has the same slot name more than once.') componentPath: string,
-    @McpParam('slot', 'Slot name, e.g. "Forward".') slot: string,
-    @McpParam('signal', 'Signal name to bind, from web_signal_sources_list.') signal: string,
-  ): Promise<string> {
+  /** The bind itself — the body of `signal.bind`. JSON, `{error}` on refusal. */
+  async bindSlot(targetId: string, componentPath: string, slot: string, signal: string): Promise<string> {
     const viewer = this.viewer;
     const manager = viewer?.signalBindingManager;
     const store = viewer?.signalStore;
@@ -259,7 +293,7 @@ export class McpSignalBindTools {
 
     if (store.get(signal) === undefined) {
       return err(`Signal "${signal}" not found`, {
-        hint: 'Use web_signal_sources_list for bindable signal names.',
+        hint: 'Use web_query("signal.sourcesList", {}) for bindable signal names.',
       });
     }
     const providers = store.getSignalProviders(signal);
@@ -351,12 +385,8 @@ export class McpSignalBindTools {
     });
   }
 
-  @McpTool('Remove the external signal from one component slot, identified by targetId plus componentPath plus slot. Checks the change can be saved before making it. The slot returns to local simulation.', { readOnly: false })
-  async webSignalUnbind(
-    @McpParam('targetId', 'Target id from web_signal_bindings_list (node path or placement id).') targetId: string,
-    @McpParam('componentPath', 'Component path of the slot — required whenever a target has the same slot name more than once.') componentPath: string,
-    @McpParam('slot', 'Slot name, e.g. "Forward".') slot: string,
-  ): Promise<string> {
+  /** The unbind itself — the body of `signal.unbind`. JSON, `{error}` on refusal. */
+  async unbindSlot(targetId: string, componentPath: string, slot: string): Promise<string> {
     const viewer = this.viewer;
     const manager = viewer?.signalBindingManager;
     if (!viewer || !manager) return err('No signal binding manager available');
@@ -389,4 +419,141 @@ export class McpSignalBindTools {
         m.slot === resolved.slot.slot && m.componentPath === resolved.slot.componentPath),
     });
   }
+}
+
+// ─── plan-641 Nachtrag 2026-10-21: `signal.bind` / `signal.unbind` ───────
+
+interface SlotArgs {
+  readonly targetId: string;
+  readonly componentPath: string;
+  readonly slot: string;
+}
+interface BindArgs extends SlotArgs { readonly signal: string }
+
+const trimmed = (v: unknown): string => String(v ?? '').trim();
+const slotRefusal = (a: SlotArgs | undefined): string | null =>
+  !trimmed(a?.targetId) ? 'targetId is required' : !trimmed(a?.slot) ? 'slot is required' : null;
+
+const signalBind: CommandImpl<BindArgs, Record<string, unknown>> = {
+  enabled: (_ctx, a) => {
+    const r = slotRefusal(a) ?? (!trimmed(a?.signal) ? 'signal is required' : null);
+    return r ? { reason: r } : true;
+  },
+  run: async (ctx, a) => valueOrThrowToolJson(
+    await new McpSignalBindTools(() => ctx.viewer).bindSlot(a.targetId, a.componentPath, a.slot, a.signal),
+  ),
+  // M4: explicit, trimmed values — the slot is addressed by args only, never by selection.
+  resolveArgs: (_ctx, a) => ({
+    targetId: trimmed(a?.targetId), componentPath: String(a?.componentPath ?? ''), slot: trimmed(a?.slot), signal: trimmed(a?.signal),
+  }),
+};
+
+const signalUnbind: CommandImpl<SlotArgs, Record<string, unknown>> = {
+  enabled: (_ctx, a) => {
+    const r = slotRefusal(a);
+    return r ? { reason: r } : true;
+  },
+  run: async (ctx, a) => valueOrThrowToolJson(
+    await new McpSignalBindTools(() => ctx.viewer).unbindSlot(a.targetId, a.componentPath, a.slot),
+  ),
+  resolveArgs: (_ctx, a) => ({ targetId: trimmed(a?.targetId), componentPath: String(a?.componentPath ?? ''), slot: trimmed(a?.slot) }),
+};
+
+const slotParams = [
+  { name: 'targetId', type: 'string', required: true },
+  { name: 'componentPath', type: 'string', required: true },
+  { name: 'slot', type: 'string', required: true },
+];
+
+/** Build the two binding commands (testable seam: no registry side effect). */
+export function createSignalBindCommandDescriptors(): CommandDescriptor<never, unknown>[] {
+  const bind: CommandDescriptor<BindArgs, Record<string, unknown>> = {
+    id: SIGNAL_BIND_COMMAND,
+    label: 'Bind signal',
+    undoLabel: 'Bind signal',
+    readOnly: false,
+    macro: true,
+    scope: 'none',
+    available: true,
+    unavailableReason: 'Not available',
+    mcp: { tool: 'web_signal_bind', params: [...slotParams, { name: 'signal', type: 'string', required: true }] },
+    argsSchema: { targetId: 'string', componentPath: 'string', slot: 'string', signal: 'string' },
+    eagerImpl: signalBind,
+    impl: () => Promise.resolve(signalBind),
+  };
+  const unbind: CommandDescriptor<SlotArgs, Record<string, unknown>> = {
+    id: SIGNAL_UNBIND_COMMAND,
+    label: 'Unbind signal',
+    undoLabel: 'Unbind signal',
+    readOnly: false,
+    macro: true,
+    scope: 'none',
+    available: true,
+    unavailableReason: 'Not available',
+    mcp: { tool: 'web_signal_unbind', params: slotParams },
+    argsSchema: { targetId: 'string', componentPath: 'string', slot: 'string' },
+    eagerImpl: signalUnbind,
+    impl: () => Promise.resolve(signalUnbind),
+  };
+  return [bind, unbind,
+    {
+      id: 'signal.bindingsList', label: 'signal.bindingsList', readOnly: true, scope: 'none',
+      available: true, unavailableReason: 'Not available',
+      argsSchema: { filter: 'string', boundOnly: 'boolean', limit: 'number' },
+      impl: async () => {
+        const impl: CommandImpl<{ filter?: string; boundOnly?: boolean; limit?: number }, unknown> = {
+          enabled: () => true,
+          run: async (ctx, a) => JSON.parse(await new McpSignalBindTools(() => ctx.viewer).querySignalBindingsList(a?.filter, a?.boundOnly, a?.limit)),
+        };
+        return impl;
+      },
+    },
+    {
+      id: 'signal.sourcesList', label: 'signal.sourcesList', readOnly: true, scope: 'none',
+      available: true, unavailableReason: 'Not available',
+      argsSchema: { filter: 'string', limit: 'number' },
+      impl: async () => {
+        const impl: CommandImpl<{ filter?: string; limit?: number }, unknown> = {
+          enabled: () => true,
+          run: async (ctx, a) => JSON.parse(await new McpSignalBindTools(() => ctx.viewer).querySignalSourcesList(a?.filter, a?.limit)),
+        };
+        return impl;
+      },
+    },
+    {
+      id: 'signal.reconcile', label: 'signal.reconcile', readOnly: true, scope: 'none',
+      available: true, unavailableReason: 'Not available',
+      argsSchema: { interfaceId: 'string' },
+      impl: async () => {
+        const { querySignalReconcile } = await import('./rv-mcp-signal-automap-tools');
+        const impl: CommandImpl<{ interfaceId?: string }, unknown> = {
+          enabled: () => true,
+          run: async (ctx, a) => JSON.parse(await querySignalReconcile(ctx.viewer, a?.interfaceId)),
+        };
+        return impl;
+      },
+    },
+    {
+      id: 'signal.usage', label: 'signal.usage', readOnly: true, scope: 'none',
+      available: true, unavailableReason: 'Not available',
+      argsSchema: { name: 'string' },
+      impl: async () => {
+        const { querySignalUsage } = await import('./rv-mcp-signal-usage-tools');
+        const impl: CommandImpl<{ name?: string }, unknown> = {
+          enabled: () => true,
+          run: async (ctx, a) => JSON.parse(await querySignalUsage(ctx.viewer, a?.name ?? '')),
+        };
+        return impl;
+      },
+    },
+  ] as unknown as CommandDescriptor<never, unknown>[];
+}
+
+const registeredSignalBind = new WeakSet<CommandRegistry>();
+
+/** Idempotent eager registration of the binding commands. */
+export function ensureSignalBindCommandsRegistered(registry: CommandRegistry = commandRegistry): void {
+  if (registeredSignalBind.has(registry)) return;
+  registeredSignalBind.add(registry);
+  for (const d of createSignalBindCommandDescriptors()) registry.register(d);
 }

@@ -29,6 +29,7 @@ import {
   knownProjectKeys,
   assertNoSecrets,
   secretContentViolation,
+  secretScanParts,
   containsHighEntropyFragment,
   isAllowedSecretSchemaPath,
   isCredentialPropertyName,
@@ -76,6 +77,13 @@ describe('secret file names', () => {
     expect(isSecretPath('a/b/.env.local')).toBe(true);
     expect(isSecretPath('.env.d/config')).toBe(true);
     expect(isSecretPath('models/machine.glb')).toBe(false);
+  });
+
+  it('refuses the confidential .contracts folder at any depth', () => {
+    expect(isSecretPath('.contracts/README.md')).toBe(true);
+    expect(isSecretPath('projects/Toray/.contracts/offer.pdf')).toBe(true);
+    expect(hostedDeployDenyReason('.contracts/offer.pdf')).toBe('secret');
+    expect(isSecretPath('docs/contracts/overview.md')).toBe(false);
   });
 });
 
@@ -226,6 +234,146 @@ describe('secretContentViolation', () => {
     const random = 'A7bK9mQ2xR4tY6wL1zN8vC3hJ5sF0pT1uV2';
     expect(containsHighEntropyFragment(`prefix_${random.slice(0, 30)}`)).toBe(true);
     expect(containsHighEntropyFragment(`prefix_${random.slice(0, 29)}`)).toBe(false);
+  });
+});
+
+/**
+ * plan-679 Phase 1 — the scanner reads JS-family sources through the TypeScript parser.
+ *
+ * The quote pairer treated every apostrophe as a literal start, comments included: two of them in
+ * two comments of `runtime-stage-export.ts` made one "literal" over code, and the entropy check
+ * refused every 6.5.0 delivery (f482cba4 reworded the comments). The fixture below is that file in
+ * its ORIGINAL wording.
+ *
+ * Every secret here is assembled at runtime so this test file never carries one as a literal.
+ */
+describe('comment-aware secret scan (plan-679)', () => {
+  // A 35-character dense identifier: harmless in code, a "high-entropy literal" once a quote
+  // pairer reads it as part of a string.
+  const CODE_RUN = 'computeSegmentBoundsForChunkIndex42';
+  const SECRET = ['Zq8', 'Lm3Xv9', 'Rt2Wb7Nk4', 'Ps6Hd1Gf5Jc0Yu'].join('');
+  const GHP = ['ghp', '_', 'abcdefghijklmnopqrstuvwxyz01'].join('');
+  const NO_PARSER = { loadTypeScript: () => null };
+  const lines = (...parts: string[]) => parts.join('\n');
+  const regression = readFileSync(resolve(__dirname, 'fixtures/secret-scan/runtime-stage-export.f482cba4.ts.txt'), 'utf8');
+
+  it('the f482cba4 file in its original wording is clean', () => {
+    expect(secretContentViolation('src/plugins/usd-live-link/runtime-stage-export.ts', '.ts', regression)).toBeNull();
+  });
+
+  it('without the parser the JS family falls back to the old reader (and its false positive)', () => {
+    const fallbacks: string[] = [];
+    const parts = secretScanParts(regression, 'src/x.ts', '.ts', { ...NO_PARSER, onFallback: (m: string) => fallbacks.push(m) });
+    expect(parts.parser).toBe('fallback');
+    expect(fallbacks).toHaveLength(1);
+    expect(secretContentViolation('src/x.ts', '.ts', regression, NO_PARSER)).toMatch(/High-entropy/);
+  });
+
+  it('apostrophes in line and block comments open no literal', () => {
+    const source = lines(
+      `// the drive's position`,
+      `const ${CODE_RUN} = 1;`,
+      `/* it's here ... don't */`,
+      `const b = ${CODE_RUN} + 1; // last tick's value`,
+    );
+    expect(secretContentViolation('src/a.ts', '.ts', source, NO_PARSER)).toMatch(/High-entropy/);
+    expect(secretContentViolation('src/a.ts', '.ts', source)).toBeNull();
+  });
+
+  it('a URL with // inside a string is a literal, not a comment', () => {
+    const source = lines(`const u = "https://x.y/a//b"; const s = 'it';`, `const ${CODE_RUN} = s;`);
+    const parts = secretScanParts(source, 'src/a.ts', '.ts');
+    expect(parts.literals).toEqual(['https://x.y/a//b', 'it']);
+    expect(parts.prose).toEqual([]);
+    expect(secretContentViolation('src/a.ts', '.ts', source)).toBeNull();
+  });
+
+  it('reads JSX text as prose and JSX attributes as literals', () => {
+    const clean = lines(
+      `export const A = () => <p>Don't touch, it's hot</p>;`,
+      `const ${CODE_RUN} = 2;`,
+      `export const B = () => <Foo title="it's" />;`,
+    );
+    expect(secretContentViolation('src/a.tsx', '.tsx', clean)).toBeNull();
+    expect(secretContentViolation('src/a.tsx', '.tsx', `export const C = () => <Foo token="${SECRET}" />;`)).toMatch(/High-entropy/);
+  });
+
+  it('reads nested templates correctly', () => {
+    const source = 'const t = `${a ? \'x\' : `y${b}`}`;';
+    const parts = secretScanParts(source, 'src/a.ts', '.ts');
+    expect(parts.literals).toEqual(expect.arrayContaining(['x', 'y', '']));
+    expect(parts.prose).toEqual([]);
+  });
+
+  it('a regex literal is no literal start for the quote inside it', () => {
+    const source = lines(
+      `const q = /['"]/g;`,
+      `function f(x: boolean, y: string) { if (x) /a'b/.test(y); return /a'b/; }`,
+      `const ${CODE_RUN} = 3; // it's fine`,
+    );
+    expect(secretContentViolation('src/a.ts', '.ts', source)).toBeNull();
+  });
+
+  it('a division followed by an apostrophe comment stays clean', () => {
+    const source = lines(`const r = a / b / c; // the result's unit`, `const ${CODE_RUN} = r; // it's mm`);
+    expect(secretContentViolation('src/a.ts', '.ts', source)).toBeNull();
+  });
+
+  it('still reports a real secret after JSX, regex and template constructs', () => {
+    for (const [ext, prefix] of [
+      ['.tsx', `const A = () => <p>Don't</p>;`],
+      ['.ts', `const q = /['"]/g; if (q) /a'b/.test('x');`],
+      ['.ts', 'const t = `${a ? \'x\' : `y${b}`}`;'],
+    ] as const) {
+      expect(secretContentViolation(`src/a${ext}`, ext, lines(prefix, `const k = '${SECRET}';`)), prefix).toMatch(/High-entropy/);
+    }
+  });
+
+  it('a known token format in a comment or JSX text is still a leak', () => {
+    expect(secretContentViolation('src/a.ts', '.ts', `// key: ${GHP}\nexport const x = 1;`)).toMatch(/Token-like/);
+    expect(secretContentViolation('src/a.tsx', '.tsx', `export const A = () => <p>${GHP}</p>;`)).toMatch(/Token-like/);
+    // ...but entropy alone in prose is not judged (that is the false positive being fixed).
+    expect(secretContentViolation('src/a.ts', '.ts', `// ${SECRET}\nexport const x = 1;`)).toBeNull();
+  });
+
+  it('a high-entropy string literal is still reported', () => {
+    expect(secretContentViolation('src/a.ts', '.ts', `export const k = "${SECRET}";`)).toMatch(/High-entropy/);
+  });
+
+  it('a file with a syntax error still has its secret reported', () => {
+    expect(secretContentViolation('src/a.ts', '.ts', `export const k = "${SECRET}";\nfunction ( {{ broken`)).toMatch(/High-entropy/);
+  });
+
+  it('text files: a word-internal apostrophe opens no literal, a quoted token still does', () => {
+    expect(secretContentViolation('docs/a.md', '.md', lines(`We don't ship ${CODE_RUN} here,`, `it's internal.`))).toBeNull();
+    expect(secretContentViolation('docs/a.md', '.md', `Paste '${SECRET}' here.`)).toMatch(/High-entropy/);
+  });
+
+  it('the delivery guard refuses to scan without the parser instead of falling back', async () => {
+    const { assertWorkspaceGuards } = await import('../scripts/_workspace-lib.mjs');
+    mkdirSync(join(root, 'src'), { recursive: true });
+    writeFileSync(join(root, 'src', 'a.ts'), 'export const a = 1;\n');
+    expect(() => assertWorkspaceGuards(root, NO_PARSER)).toThrow(/TypeScript parser/);
+    expect(() => assertWorkspaceGuards(root)).not.toThrow();
+  });
+
+  it('assertNoSecrets (incoming trees) falls back with one warning', () => {
+    mkdirSync(join(root, 'src'), { recursive: true });
+    writeFileSync(join(root, 'src', 'a.ts'), 'export const a = 1;\n');
+    writeFileSync(join(root, 'src', 'b.ts'), 'export const b = 2;\n');
+    const warnings: string[] = [];
+    expect(() => assertNoSecrets(root, { ...NO_PARSER, warn: (m: string) => warnings.push(m) })).not.toThrow();
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/Falling back/);
+  });
+
+  it('a staged tree without node_modules is read with the parser of the executing checkout', () => {
+    // `root` is a temp dir outside the repository: no node_modules anywhere above it.
+    mkdirSync(join(root, 'src'), { recursive: true });
+    writeFileSync(join(root, 'src', 'stage.ts'), regression);
+    const warnings: string[] = [];
+    expect(() => assertNoSecrets(root, { warn: (m: string) => warnings.push(m) })).not.toThrow();
+    expect(warnings).toEqual([]);
   });
 });
 

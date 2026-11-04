@@ -38,7 +38,7 @@ export interface AssetDraft {
    *
    * Records written before the merge stay readable without conversion: every
    * asset-lineage kind is byte-identical across it (the single reshaped kind,
-   * the scene transform, cannot occur in an asset document). That is why this
+   * the scene transform, cannot occur in the editor's document). That is why this
    * declaration could change from `AssetOp[]` to `RvOp[]` with no migration and
    * no read-side branch — including for entries already sitting on the shelf,
    * which is what `tests/draft-single-writer.test.ts` pins.
@@ -171,6 +171,20 @@ export type AssetDraftBase =
       path?: string;
       /** Display name for the breadcrumb chip and dialog copy. */
       label: string;
+    }
+  /**
+   * A document of LIBRARY project B opened from project A (plan-778 Phase 5):
+   * saved into B through B's backend, never into A — A may hold the same id.
+   * Identity = `libraryProjectId` + `documentId`; `path` is B-relative; drafts
+   * are keyed by B's project id.
+   */
+  | {
+      kind: 'libraryDocument';
+      libraryProjectId: string;
+      documentId: string;
+      path: string;
+      name: string;
+      libraryLabel?: string;
     };
 
 // ─── Reading what an older build wrote (plan-716 §2.6) ──────────────────
@@ -192,6 +206,7 @@ export type AssetDraftBase =
  * in localStorage — written by the build the user is upgrading FROM.
  */
 export type LegacyAssetDraftBase =
+  // Persisted shape — do not rename (plan-777 P1): drafts on disk carry it.
   | { kind: 'sceneDocument'; sceneId: string; sceneName: string }
   | { kind: 'projectDocument'; relPath: string; name: string }
   | { kind: 'libraryGlb'; fileName: string; relPath: string };
@@ -308,6 +323,7 @@ export function isLegacyAssetBase(value: unknown): value is LegacyAssetDraftBase
   const base = value as Record<string, unknown>;
   const str = (k: string): boolean => typeof base[k] === 'string' && base[k] !== '';
   switch (base['kind']) {
+    // Persisted shape — do not rename (plan-777 P1).
     case 'sceneDocument':   return str('sceneId') && typeof base['sceneName'] === 'string';
     case 'projectDocument': return str('relPath') && typeof base['name'] === 'string';
     case 'libraryGlb':      return str('relPath') && str('fileName');

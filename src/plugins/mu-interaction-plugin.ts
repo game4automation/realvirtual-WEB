@@ -81,7 +81,7 @@ export const REASON_DES = 'Not available while the DES kernel runs the simulatio
 export const REASON_MULTIUSER = 'Not available in a multiuser client session — the server owns the carriers';
 export const REASON_NO_TRANSPORT = 'No transport simulation loaded';
 export const muNotFound = (id: number): string =>
-  `No carrier with id ${id} — ids come from web_transport_status (mus[].id)`;
+  `No carrier with id ${id} — ids come from web_query("transport.status", {}) (mus[].id)`;
 
 /**
  * The shared guard of every manipulation (SOL #10): the Commissioning
@@ -134,7 +134,7 @@ const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFi
 function liveCarrier(ctx: CommandContext, id: unknown): AnyMU | string {
   const guard = muManipulationGuard(ctx.viewer);
   if (guard) return guard;
-  if (!finite(id)) return 'id is required (a number from web_transport_status mus[].id)';
+  if (!finite(id)) return 'id is required (a number from web_query("transport.status", {}) mus[].id)';
   const mu = resolveCarrierById(ctx.viewer.transportManager as RVTransportManager, id);
   if (!mu) return muNotFound(id);
   if (mu.isInstanced) return REASON_POOLED;
@@ -297,8 +297,13 @@ interface PendingPress {
   readonly additive: boolean;
 }
 
+/** `pointerId` of a ray drag — never compared with a pointer event (`source` is checked first). */
+const RAY_POINTER_ID = -1;
+
 interface ActiveDrag {
   readonly session: MuDragSession;
+  /** Who drives the gesture: a pointer (mouse/touch) or a ray (flystick, plan-2215 Phase 7). */
+  readonly source: 'pointer' | 'ray';
   readonly pointerId: number;
   readonly model: Object3D | null;
   readonly planes: Mesh[];
@@ -512,6 +517,14 @@ export class MuInteractionPlugin implements RVViewerPlugin {
   };
 
   private readonly onPointerMove = (e: PointerEvent): void => {
+    // plan-2215 2.6: a render strategy took over — the press and a running drag are dropped
+    // (the press itself is refused there already: `raycastForRVNodeDetailed` finds nothing).
+    if (this.viewer?.pointerPickBlocked) {
+      this.press = null;
+      // A ray drag (flystick) is not a pointer gesture and keeps running.
+      if (this.drag?.source === 'pointer') this.abortDrag();
+      return;
+    }
     const press = this.press;
     if (press && !this.drag && e.pointerId === press.pointerId) {
       const dx = e.clientX - press.x;
@@ -523,7 +536,7 @@ export class MuInteractionPlugin implements RVViewerPlugin {
       return;
     }
     const drag = this.drag;
-    if (!drag || e.pointerId !== drag.pointerId) return;
+    if (!drag || drag.source !== 'pointer' || e.pointerId !== drag.pointerId) return;
     e.stopImmediatePropagation();
     e.preventDefault();
     this.updateDrag(e);
@@ -542,7 +555,7 @@ export class MuInteractionPlugin implements RVViewerPlugin {
       return;
     }
     const drag = this.drag;
-    if (!drag || e.pointerId !== drag.pointerId || e.button !== 0) return;
+    if (!drag || drag.source !== 'pointer' || e.pointerId !== drag.pointerId || e.button !== 0) return;
     e.stopImmediatePropagation();
     e.preventDefault();
     this.finishDrag(e);
@@ -550,11 +563,11 @@ export class MuInteractionPlugin implements RVViewerPlugin {
 
   private readonly onPointerCancel = (e: PointerEvent): void => {
     if (this.press?.pointerId === e.pointerId) this.press = null;
-    if (this.drag?.pointerId === e.pointerId) this.abortDrag();
+    if (this.drag?.source === 'pointer' && this.drag.pointerId === e.pointerId) this.abortDrag();
   };
 
   private readonly onLostCapture = (e: PointerEvent): void => {
-    if (this.drag?.pointerId === e.pointerId) this.abortDrag();
+    if (this.drag?.source === 'pointer' && this.drag.pointerId === e.pointerId) this.abortDrag();
   };
 
   /**
@@ -562,13 +575,34 @@ export class MuInteractionPlugin implements RVViewerPlugin {
    * nothing changed — by the guard and by the engine (held, physics, gone).
    */
   startDrag(mu: RVMovingUnit, e: { clientX: number; clientY: number; pointerId: number }): boolean {
+    if (!this.beginDrag(mu, 'pointer', e.pointerId, e)) return false;
+    this.updateDrag(e);
+    return true;
+  }
+
+  /**
+   * Take `mu` with a world-space ray (plan-2215 Phase 7, flystick): the same
+   * gesture as {@link startDrag} — guard, engine session, drop planes, preview —
+   * with the ray instead of a screen position. Hints appear at the canvas corner.
+   */
+  startDragFromRay(mu: RVMovingUnit, origin: Vector3, direction: Vector3): boolean {
+    if (!this.beginDrag(mu, 'ray', RAY_POINTER_ID, null)) return false;
+    this.updateDragFromRay(origin, direction);
+    return true;
+  }
+
+  private beginDrag(
+    mu: RVMovingUnit, source: 'pointer' | 'ray', pointerId: number,
+    hintAt: { clientX: number; clientY: number } | null,
+  ): boolean {
     const viewer = this.viewer;
     const tm = viewer?.transportManager;
-    if (!viewer || !tm) return false;
+    // One gesture at a time: a second would leak the first session.
+    if (!viewer || !tm || this.drag) return false;
     const guard = muManipulationGuard(viewer);
-    if (guard) { this.showHint(e, guard); return false; }
+    if (guard) { this.hint(hintAt, guard); return false; }
     const session = beginUserDrag(tm, mu, viewer.collisionManager ?? null);
-    if ('ok' in session) { this.showHint(e, session.reason); return false; }
+    if ('ok' in session) { this.hint(hintAt, session.reason); return false; }
 
     // One drop plane per surface, built once per gesture (raycast candidates only).
     const planes: Mesh[] = [];
@@ -579,7 +613,8 @@ export class MuInteractionPlugin implements RVViewerPlugin {
     mu.updateAABB();
     const drag: ActiveDrag = {
       session,
-      pointerId: e.pointerId,
+      source,
+      pointerId,
       model: viewer.currentModelRoot ?? null,
       planes,
       grabPlane: new Plane(new Vector3(0, 1, 0), -mu.aabb.min.y),
@@ -593,19 +628,18 @@ export class MuInteractionPlugin implements RVViewerPlugin {
     const canvas = viewer.renderer?.domElement;
     if (canvas) {
       canvas.style.cursor = 'grabbing';
-      try { canvas.setPointerCapture(e.pointerId); } catch { /* synthetic pointer */ }
+      if (source === 'pointer') {
+        try { canvas.setPointerCapture(pointerId); } catch { /* synthetic pointer */ }
+      }
     }
     this.ensureOutline(viewer);
-    this.updateDrag(e);
     return true;
   }
 
-  /** Pointer moved during a drag: ray → drop plane (or the grab height) → preview. */
+  /** Pointer moved during a drag: screen position → ray → {@link dragAlongRay}. */
   updateDrag(e: { clientX: number; clientY: number }): void {
     const viewer = this.viewer;
-    const drag = this.drag;
-    const tm = viewer?.transportManager;
-    if (!viewer || !drag || !tm) return;
+    if (!viewer || !this.drag) return;
     const canvas = viewer.renderer?.domElement;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
@@ -613,6 +647,23 @@ export class MuInteractionPlugin implements RVViewerPlugin {
     const h = rect.height || 1;
     this.ndc.set(((e.clientX - rect.left) / w) * 2 - 1, -((e.clientY - rect.top) / h) * 2 + 1);
     this.raycaster.setFromCamera(this.ndc, viewer.camera);
+    this.dragAlongRay(this.raycaster.ray.origin, this.raycaster.ray.direction, e);
+  }
+
+  /** A world-space ray moved during a drag (plan-2215 Phase 7) — same step as {@link updateDrag}. */
+  updateDragFromRay(origin: Vector3, direction: Vector3): void {
+    this.dragAlongRay(origin, direction, null);
+  }
+
+  /** The ONE drag step of both inputs: ray → drop plane (or the grab height) → preview. */
+  private dragAlongRay(
+    origin: Vector3, direction: Vector3, hintAt: { clientX: number; clientY: number } | null,
+  ): void {
+    const viewer = this.viewer;
+    const drag = this.drag;
+    const tm = viewer?.transportManager;
+    if (!viewer || !drag || !tm) return;
+    this.raycaster.set(origin, direction);
     this.hits.length = 0;
     this.raycaster.intersectObjects(drag.planes, false, this.hits);
     let surface: RVTransportSurface | null = null;
@@ -629,12 +680,15 @@ export class MuInteractionPlugin implements RVViewerPlugin {
     drag.valid = check.ok;
     this.updateOutline(drag.session.mu, check.ok);
     if (check.ok) this.hideHint();
-    else if (check.reason) this.showHint(e, check.reason);
+    else if (check.reason) this.hint(hintAt, check.reason);
     viewer.markRenderDirty?.();
   }
 
-  /** Release: commit through the engine (re-checked), or put the carrier back. */
-  finishDrag(e: { clientX: number; clientY: number }): void {
+  /**
+   * Release: commit through the engine (re-checked), or put the carrier back.
+   * Without a screen position (ray drag, plan-2215 Phase 7) hints appear at the canvas corner.
+   */
+  finishDrag(e?: { clientX: number; clientY: number }): void {
     const viewer = this.viewer;
     const drag = this.drag;
     const tm = viewer?.transportManager;
@@ -645,10 +699,10 @@ export class MuInteractionPlugin implements RVViewerPlugin {
       ?? ((viewer.currentModelRoot ?? null) !== drag.model ? REASON_GONE : null);
     if (guard || !drag.valid) {
       cancelUserDrag(tm, drag.session, collision);
-      if (guard) this.showHint(e, guard);
+      if (guard) this.hint(e ?? null, guard);
     } else {
       const r = commitUserDrag(tm, drag.session, drag.point, drag.surface, collision);
-      if (!r.ok) this.showHint(e, r.reason);
+      if (!r.ok) this.hint(e ?? null, r.reason);
       else this.hideHint();
     }
     this.endDrag();
@@ -673,7 +727,9 @@ export class MuInteractionPlugin implements RVViewerPlugin {
     const canvas = viewer.renderer?.domElement;
     if (canvas) {
       canvas.style.cursor = '';
-      try { canvas.releasePointerCapture(drag.pointerId); } catch { /* not captured */ }
+      if (drag.source === 'pointer') {
+        try { canvas.releasePointerCapture(drag.pointerId); } catch { /* not captured */ }
+      }
     }
     if (this.outline) this.outline.removeFromParent();
     viewer.markRenderDirty?.();
@@ -716,6 +772,12 @@ export class MuInteractionPlugin implements RVViewerPlugin {
   /** The text of the hint currently shown (tests, diagnostics); null when hidden. */
   get hintText(): string | null {
     return this.hintEl && this.hintEl.style.display !== 'none' ? this.hintEl.textContent : null;
+  }
+
+  /** A hint at the pointer, or at the canvas corner for a ray (no screen position). */
+  private hint(at: { clientX: number; clientY: number } | null, text: string): void {
+    if (at) this.showHint(at, text);
+    else this.showHintAtCanvas(text);
   }
 
   private showHintAtCanvas(text: string): void {

@@ -14,10 +14,10 @@
 
 | Model | runs | load ms | nav→ready ms | fps | frame ms | scene calls | scene tris | heap MiB | scene nodes | chunk meshes |
 |---|---|---|---|---|---|---|---|---|---|---|
-| mauser | 1 | 115 | 46555 | 10.0 | 100.0 | 10714 | 7473340 | 1340.8 | 41870 | 10737 |
+| the large CAD line | 1 | 115 | 46555 | 10.0 | 100.0 | 10714 | 7473340 | 1340.8 | 41870 | 10737 |
 
 ## G1 — Phase-0 removal report
 
 | Model | nodes | survivors | removed | removed meshes | merged survivor meshes | releasable geometries | instanced tris | tag-only chunk boundaries | unresolved refs | unresolved claims | G1 violations | ms |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| mauser | 70203 | 30898 | 39305 | 27649 | 11789 | 9603 | 0 | 1 | 46 | 1 | 0 | 846.9 |
+| the large CAD line | 70203 | 30898 | 39305 | 27649 | 11789 | 9603 | 0 | 1 | 46 | 1 | 0 | 846.9 |

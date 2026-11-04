@@ -30,9 +30,17 @@ import type { PlacementsProgress, PlacementsSettledInfo } from './rv-placement-i
 /** Counts loads in flight; `whenIdle()` resolves when none is. */
 export class SceneLoadGate {
   private _inFlight = 0;
+  private _failed = 0;
   private _waiters: Array<() => void> = [];
 
   get loading(): boolean { return this._inFlight > 0; }
+
+  /**
+   * Tracked loads that rejected (failed or superseded), monotonic. A consumer
+   * that waited for the scene compares it before and after to tell a completed
+   * load from one that ended in an error (plan-633 path-topology check).
+   */
+  get failedLoads(): number { return this._failed; }
 
   /** Track one load (`loadModel` / `loadScene`). Returns `p` unchanged. */
   track<T>(p: Promise<T>): Promise<T> {
@@ -43,7 +51,7 @@ export class SceneLoadGate {
       this._waiters = [];
       for (const w of waiters) w();
     };
-    p.then(done, done);
+    p.then(done, () => { this._failed++; done(); });
     return p;
   }
 
@@ -100,7 +108,7 @@ export async function awaitSceneReady(
   const report: SceneReadyReport = { ready: ready && pending === 0, placements: { total, materialized, pending, missing } };
   if (!report.ready) {
     report.hint = `${pending} of ${total} placed references are still materializing — nodes, signals and `
-      + 'web_layout_list are incomplete until then. Re-read web_status (placements.pending) before relying on them.';
+      + 'web_query("layout.list", {}) are incomplete until then. Re-read web_status (placements.pending) before relying on them.';
   }
   return report;
 }

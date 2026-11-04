@@ -3,10 +3,21 @@
 
 /**
  * SelectorSwitch — a two-position selector as on a control box (plan-542 F3),
- * drawn flat: a 36 px knob (or key cylinder) whose pointer turns to −45° / +45°,
- * the two position marks above it at the pointer's two end positions (like the
- * engraving of a switch plate, F11), the caption in a legend box below and an
- * optional lamp ring.
+ * drawn flat: a knob (or key cylinder) whose pointer turns to −45° / +45°, the
+ * two position marks engraved at the pointer's two end positions — up-left
+ * and up-right of the knob, like on a cam switch plate — the caption in a
+ * legend box below and an optional lamp ring.
+ *
+ * Layout (the panel's grid contract, shared with the push button): the face
+ * — ring, plate gap, bezel — has exactly the push button's footprint
+ * ({@link BUTTON_OUTER}) and the legend box is two lines high, so a selector
+ * and a button in one row put their faces on one centre line and their
+ * legends on one baseline. The marks live in a band ABOVE the face; the panel
+ * aligns the devices of a row at the bottom, so the band never pushes a face
+ * down. Each mark is centred on its end angle and grows only outwards; it
+ * never comes closer than {@link MARK_GAP} to the knob's axis and never leaves
+ * its cell. A lit ring is a border + box-shadow of the same reserved box: a
+ * lamp or a turn changes nothing that is laid out.
  *
  * It latches: clicking the knob turns it to the other position, clicking a
  * mark selects that position, ArrowLeft / ArrowRight do the same from the
@@ -19,14 +30,22 @@ import { useRef, type KeyboardEvent } from 'react';
 import { Box } from '@mui/material';
 import { ACCENT, FS, IEC_BEZEL, IEC_CAP, INK_HIGH, INK_MID } from '../shared-sx';
 import { LEGEND_LINE, LegendBox } from './LegendBox';
+import { BUTTON_OUTER, CAP_SIZE } from './IlluminatedPushButton';
 import { lampRing, lampWords, usePrefersReducedMotion, type LampState } from './PilotLamp';
 
-export const KNOB_SIZE = 36;
+/** Knob diameter: the same 22 mm device as a push button cap. */
+export const KNOB_SIZE = CAP_SIZE;
 const RING_WIDTH = 3;
-const RING_GAP = 2;
-const OUTER = KNOB_SIZE + 2 * (RING_WIDTH + RING_GAP);
-/** The marks sit above the knob's shoulders; the knob's top rises between them. */
-const MARK_OVERLAP = 8;
+/** The face incl. lamp ring — identical to a push button's. */
+const OUTER = BUTTON_OUTER;
+/** Height of the mark band above the face; the marks reach a little into the face's corners. */
+export const MARK_BAND = 10;
+/** Closest a mark's inner edge comes to the knob's axis, in px. */
+export const MARK_GAP = 5;
+/** Least distance between a mark and its cell's edge, in px — the neighbour's marks stay farther away than the own pair. */
+const MARK_EDGE = 3;
+/** Farthest a mark's centre sits from the knob's axis (the 45° point just outside the ring), in px. */
+const MARK_REACH = 26;
 
 export interface SelectorPosition {
   id: string;
@@ -57,6 +76,7 @@ export function SelectorSwitch({
   const index = positions.findIndex((p) => p.id === value);
   const angle = index === 0 ? -45 : index === 1 ? 45 : 0;
   const ring = lamp ? lampRing(lamp, RING_WIDTH, reduced) : null;
+  const unmatched = index < 0 && !disabled;
 
   const select = (i: number) => {
     if (disabled) return;
@@ -74,6 +94,13 @@ export function SelectorSwitch({
 
   const mark = (i: number) => {
     const checked = i === index;
+    const left = i === 0;
+    // The mark's box runs from the cell edge (less MARK_EDGE, or MARK_REACH * 2
+    // - MARK_GAP from the axis, whichever is nearer) to MARK_GAP from the axis; the text
+    // is centred in it. A short mark therefore sits on its end angle, a long
+    // one grows outwards only — and both marks mirror each other.
+    const outer = `max(${MARK_EDGE}px, calc(50% - ${2 * MARK_REACH - MARK_GAP}px))`;
+    const inner = `calc(50% + ${MARK_GAP}px)`;
     return (
       <Box
         component="span"
@@ -87,14 +114,21 @@ export function SelectorSwitch({
         onKeyDown={(e: KeyboardEvent) => {
           if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); select(i); }
         }}
+        data-mark={left ? 'left' : 'right'}
         sx={{
-          justifySelf: i === 0 ? 'start' : 'end',
-          px: 0.25,
-          minWidth: 20,
-          textAlign: 'center',
-          fontSize: FS.label,
+          position: 'absolute',
+          top: 0,
+          height: LEGEND_LINE,
+          ...(left ? { left: outer, right: inner } : { left: inner, right: outer }),
+          display: 'flex',
+          justifyContent: 'center',
+          // A size under the legend's, like the engraving of a switch plate —
+          // and so that two marks fit above a knob in a narrow column.
+          fontSize: FS.micro,
           lineHeight: `${LEGEND_LINE}px`,
-          fontWeight: checked ? 700 : 500,
+          // One weight for both: the set position is told by brightness, so
+          // switching never re-flows the marks.
+          fontWeight: 600,
           letterSpacing: '0.02em',
           textTransform: 'uppercase',
           whiteSpace: 'nowrap',
@@ -103,10 +137,11 @@ export function SelectorSwitch({
           cursor: disabled ? 'not-allowed' : 'pointer',
           borderRadius: '2px',
           userSelect: 'none',
+          zIndex: 1,
           '&:focus-visible': { outline: `2px solid ${ACCENT}`, outlineOffset: '1px' },
         }}
       >
-        {positions[i].legend}
+        <Box component="span" data-part="mark-text">{positions[i].legend}</Box>
       </Box>
     );
   };
@@ -120,70 +155,76 @@ export function SelectorSwitch({
       onKeyDown={onKeyDown}
       sx={{
         width: '100%',
-        display: 'grid',
-        gridTemplateColumns: '1fr 1fr',
-        justifyItems: 'center',
-        // No row gap: the caption sits right under the ring, the marks overlap
-        // the knob's shoulders (plan-543 — two stacked switches stay inside 400 px).
-        rowGap: 0,
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        // The same 2 px between face and legend as a push button.
+        gap: '2px',
         opacity: disabled ? 0.4 : 1,
       }}
     >
-      {mark(0)}
-      {mark(1)}
       <Box
-        aria-hidden
-        data-part="ring"
-        data-lamp={ring?.look ?? 'none'}
-        data-ring={ring?.stroke ?? 'none'}
-        data-glow={ring?.glowing ? 'true' : 'false'}
-        style={ring?.style}
-        onClick={() => select(index === 0 ? 1 : 0)}
-        sx={{
-          gridColumn: '1 / -1',
-          mt: `${-MARK_OVERLAP}px`,
-          boxSizing: 'border-box',
-          width: OUTER,
-          height: OUTER,
-          borderRadius: '50%',
-          display: 'grid',
-          placeItems: 'center',
-          cursor: disabled ? 'not-allowed' : 'pointer',
-          ...(ring ? {} : { border: `${RING_WIDTH}px solid transparent` }),
-        }}
+        data-part="face"
+        sx={{ position: 'relative', width: '100%', display: 'flex', justifyContent: 'center', pt: `${MARK_BAND}px` }}
       >
+        {mark(0)}
+        {mark(1)}
         <Box
-          data-part="knob"
-          data-angle={angle}
+          aria-hidden
+          data-part="ring"
+          data-lamp={ring?.look ?? 'none'}
+          data-ring={ring?.stroke ?? 'none'}
+          data-glow={ring?.glowing ? 'true' : 'false'}
+          style={ring?.style}
+          onClick={() => select(index === 0 ? 1 : 0)}
           sx={{
             boxSizing: 'border-box',
-            width: KNOB_SIZE,
-            height: KNOB_SIZE,
+            width: OUTER,
+            height: OUTER,
+            flex: '0 0 auto',
             borderRadius: '50%',
-            bgcolor: IEC_CAP.black,
-            border: `2px solid ${IEC_BEZEL}`,
             display: 'grid',
             placeItems: 'center',
-            transform: `rotate(${angle}deg)`,
-            transition: reduced ? 'none' : 'transform 150ms ease-out',
+            cursor: disabled ? 'not-allowed' : 'pointer',
+            ...(ring ? {} : { border: `${RING_WIDTH}px solid transparent` }),
           }}
         >
-          {variant === 'knob' ? (
-            // The grip bar across the knob; the dot at its top end is the pointer.
-            <Box sx={{ width: 8, height: 28, borderRadius: '3px', bgcolor: IEC_CAP.white, position: 'relative' }}>
-              <Box sx={{ position: 'absolute', top: 3, left: 2, width: 4, height: 4, borderRadius: '50%', bgcolor: IEC_CAP.black }} />
-            </Box>
-          ) : (
-            // The keyway of a key switch: a narrow slot with the key's bow on top.
-            <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-              <Box sx={{ width: 10, height: 6, borderRadius: '3px 3px 1px 1px', bgcolor: IEC_BEZEL }} />
-              <Box sx={{ width: 3, height: 16, bgcolor: IEC_BEZEL }} />
-            </Box>
-          )}
+          <Box
+            data-part="knob"
+            data-angle={angle}
+            sx={{
+              boxSizing: 'border-box',
+              width: KNOB_SIZE,
+              height: KNOB_SIZE,
+              borderRadius: '50%',
+              bgcolor: IEC_CAP.black,
+              border: `2px solid ${IEC_BEZEL}`,
+              display: 'grid',
+              placeItems: 'center',
+              transform: `rotate(${angle}deg)`,
+              transition: reduced ? 'none' : 'transform 150ms ease-out',
+            }}
+          >
+            {variant === 'knob' ? (
+              // The grip bar across the knob; the dot at its top end is the pointer.
+              <Box sx={{ width: 8, height: 30, borderRadius: '3px', bgcolor: IEC_CAP.white, position: 'relative' }}>
+                <Box sx={{ position: 'absolute', top: 3, left: 2, width: 4, height: 4, borderRadius: '50%', bgcolor: IEC_CAP.black }} />
+              </Box>
+            ) : (
+              // The keyway of a key switch: a narrow slot with the key's bow on top.
+              <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                <Box sx={{ width: 10, height: 6, borderRadius: '3px 3px 1px 1px', bgcolor: IEC_BEZEL }} />
+                <Box sx={{ width: 3, height: 18, bgcolor: IEC_BEZEL }} />
+              </Box>
+            )}
+          </Box>
         </Box>
       </Box>
-      <Box sx={{ gridColumn: '1 / -1', width: '100%' }} aria-hidden>
-        <LegendBox tone={INK_MID}>{index < 0 ? `${caption ?? label} · no position` : caption ?? label}</LegendBox>
+      <Box sx={{ width: '100%' }} aria-hidden>
+        {/* "no position" only on a LIVE switch whose signal matches neither
+            position — a disabled panel has no reading at all, and the long
+            legend would not fit two lines of a narrow cell. */}
+        <LegendBox lines={2} tone={unmatched ? INK_MID : undefined}>{unmatched ? `${caption ?? label} · no position` : caption ?? label}</LegendBox>
       </Box>
     </Box>
   );

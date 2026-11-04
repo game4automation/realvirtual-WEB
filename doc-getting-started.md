@@ -86,7 +86,7 @@ publishing pipeline; Community self-hosting uses the local build above.
 
 | Symptom | Check |
 |---|---|
-| Model file exists but no document appears | Register it in `documents[]` or import through the app; no folder auto-discovery |
+| Model file exists but no document appears | Register it in `documents[]` or import through the app; an open project does not auto-discover files (only **Add** on a plain folder scans it once for `.glb` files, see doc-projects.md) |
 | Folder buttons are missing | Use Chrome/Edge in a secure context such as localhost or HTTPS |
 | Model/manifest request fails | Network panel: exact path and case, HTTP status, JSON content and CORS |
 | Project opens but custom code does not | `scriptRef`, compiled `.js` sibling, project code consent, browser console |

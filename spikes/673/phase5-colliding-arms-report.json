@@ -1,0 +1,987 @@
+{
+  "plan": 673,
+  "phase": 5,
+  "subject": "frame cost with colliding arm hulls (the Phase-4b obligation)",
+  "generatedAt": "2026-10-24T19:10:50.617Z",
+  "node": "v24.18.0",
+  "platform": "win32-x64",
+  "gateReference": {
+    "p95MsPerFrame": 1.2150000000001455,
+    "budgetMsPerFrame": 2,
+    "armFlags": "contype=\"0\" conaffinity=\"0\""
+  },
+  "machineFrameFlags": "contype=\"1\" conaffinity=\"3\"",
+  "inert": [
+    {
+      "mode": "inert",
+      "scenario": "free",
+      "roundSegments": 12,
+      "nconMean": 11.846223021582734,
+      "nconMax": 14,
+      "nefcMax": 77,
+      "solverIterMean": 2.0179856115107913,
+      "solverIterMax": 5,
+      "msPerFrameP50": 0.3428000000000111,
+      "msPerFrameP95": 0.4181000000000381,
+      "msPerFrameMax": 0.638499999999965,
+      "msPerStepFrom60": 0.03722961623467945,
+      "realTimeFactor": 53.75394721953676,
+      "partSlipInJawsMm": -38.17480978543333,
+      "hubTravelRefusedMm": -0.9252502933748408,
+      "boardSlideMm": 1.9768453540799747e-7,
+      "maxFollowingErrorDeg": 0.06640216799422555,
+      "maxSaturationFraction": 0,
+      "partBelowBoardTop": false
+    },
+    {
+      "mode": "inert",
+      "scenario": "fits",
+      "roundSegments": 12,
+      "nconMean": 14.367805755395683,
+      "nconMax": 22,
+      "nefcMax": 105,
+      "solverIterMean": 2.1843525179856114,
+      "solverIterMax": 6,
+      "msPerFrameP50": 0.4239000000000033,
+      "msPerFrameP95": 0.5394999999998618,
+      "msPerFrameMax": 0.7747000000000526,
+      "msPerStepFrom60": 0.047699035563592514,
+      "realTimeFactor": 41.93079573748302,
+      "partSlipInJawsMm": -5.405629714309985,
+      "hubTravelRefusedMm": -0.9511928184696254,
+      "boardSlideMm": 0.055240216591153656,
+      "maxFollowingErrorDeg": 0.07072927506429508,
+      "maxSaturationFraction": 0,
+      "partBelowBoardTop": true
+    },
+    {
+      "mode": "inert",
+      "scenario": "wrong-rotation",
+      "roundSegments": 12,
+      "nconMean": 15.409172661870503,
+      "nconMax": 47,
+      "nefcMax": 205,
+      "solverIterMean": 1.360611510791367,
+      "solverIterMax": 6,
+      "msPerFrameP50": 0.3704999999999927,
+      "msPerFrameP95": 0.8677000000000135,
+      "msPerFrameMax": 2.4121000000000095,
+      "msPerStepFrom60": 0.04691148282097646,
+      "realTimeFactor": 42.64800617372536,
+      "partSlipInJawsMm": 20.005074171830994,
+      "hubTravelRefusedMm": -1.022563615646399,
+      "boardSlideMm": 0.6081864582341074,
+      "maxFollowingErrorDeg": 0.07448006822147328,
+      "maxSaturationFraction": 0,
+      "partBelowBoardTop": false
+    },
+    {
+      "mode": "inert",
+      "scenario": "wrong-shape",
+      "roundSegments": 12,
+      "nconMean": 44.88309352517986,
+      "nconMax": 56,
+      "nefcMax": 241,
+      "solverIterMean": 1.4118705035971224,
+      "solverIterMax": 5,
+      "msPerFrameP50": 1.0934000000002015,
+      "msPerFrameP95": 1.307700000000068,
+      "msPerFrameMax": 2.862600000000157,
+      "msPerStepFrom60": 0.10657383966244742,
+      "realTimeFactor": 18.74970059071869,
+      "partSlipInJawsMm": 20.31871484734348,
+      "hubTravelRefusedMm": -1.4641653912855281,
+      "boardSlideMm": 0.7983446919783244,
+      "maxFollowingErrorDeg": 0.08022965799624121,
+      "maxSaturationFraction": 0,
+      "partBelowBoardTop": false
+    },
+    {
+      "mode": "inert",
+      "scenario": "skew-push",
+      "roundSegments": 12,
+      "nconMean": 23.60251798561151,
+      "nconMax": 35,
+      "nefcMax": 167,
+      "solverIterMean": 3.697841726618705,
+      "solverIterMax": 7,
+      "msPerFrameP50": 0.9175000000000182,
+      "msPerFrameP95": 1.0902000000000953,
+      "msPerFrameMax": 1.4375,
+      "msPerStepFrom60": 0.09103878842676327,
+      "realTimeFactor": 21.941363023800676,
+      "partSlipInJawsMm": 16.749684120549993,
+      "hubTravelRefusedMm": 2.2309480442680543,
+      "boardSlideMm": 0.3374902240149957,
+      "maxFollowingErrorDeg": 0.8701335110792744,
+      "maxSaturationFraction": 0.7068345323741008,
+      "partBelowBoardTop": false
+    }
+  ],
+  "inertWorst": {
+    "scenario": "wrong-shape",
+    "p95MsPerFrame": 1.307700000000068
+  },
+  "colliding": [
+    {
+      "mode": "colliding",
+      "scenario": "free",
+      "roundSegments": 12,
+      "nconMean": 11.821043165467627,
+      "nconMax": 13,
+      "nefcMax": 53,
+      "solverIterMean": 2.0107913669064748,
+      "solverIterMax": 6,
+      "msPerFrameP50": 0.44679999999971187,
+      "msPerFrameP95": 0.5505999999995765,
+      "msPerFrameMax": 0.9454999999998108,
+      "msPerStepFrom60": 0.05108222824994972,
+      "realTimeFactor": 39.15613823369794,
+      "partSlipInJawsMm": 149.93376598552624,
+      "hubTravelRefusedMm": -0.8825932784251866,
+      "boardSlideMm": 0.00003439569581362226,
+      "maxFollowingErrorDeg": 0.06398417905648095,
+      "maxSaturationFraction": 0,
+      "partBelowBoardTop": true
+    },
+    {
+      "mode": "colliding",
+      "scenario": "fits",
+      "roundSegments": 12,
+      "nconMean": 42.035071942446045,
+      "nconMax": 52,
+      "nefcMax": 209,
+      "solverIterMean": 3.8120503597122304,
+      "solverIterMax": 10,
+      "msPerFrameP50": 1.2524999999995998,
+      "msPerFrameP95": 2.024399999999332,
+      "msPerFrameMax": 3.4859999999998763,
+      "msPerStepFrom60": 0.1492380751456703,
+      "realTimeFactor": 13.413868410755722,
+      "partSlipInJawsMm": 62.74492724407252,
+      "hubTravelRefusedMm": 35.200473862720074,
+      "boardSlideMm": 52.990591603565946,
+      "maxFollowingErrorDeg": 19.156283237735803,
+      "maxSaturationFraction": 0.8696043165467626,
+      "partBelowBoardTop": false
+    },
+    {
+      "mode": "colliding",
+      "scenario": "wrong-rotation",
+      "roundSegments": 12,
+      "nconMean": 30.82913669064748,
+      "nconMax": 36,
+      "nefcMax": 146,
+      "solverIterMean": 1.295863309352518,
+      "solverIterMax": 6,
+      "msPerFrameP50": 0.8164999999999054,
+      "msPerFrameP95": 0.9176000000006752,
+      "msPerFrameMax": 1.2161999999998443,
+      "msPerStepFrom60": 0.0857369700622861,
+      "realTimeFactor": 23.31853267200421,
+      "partSlipInJawsMm": 61.824588087397835,
+      "hubTravelRefusedMm": 36.04089382703364,
+      "boardSlideMm": 31.322802485673144,
+      "maxFollowingErrorDeg": 14.365736495098124,
+      "maxSaturationFraction": 0.8588129496402878,
+      "partBelowBoardTop": false
+    },
+    {
+      "mode": "colliding",
+      "scenario": "wrong-shape",
+      "roundSegments": 12,
+      "nconMean": 38.45773381294964,
+      "nconMax": 78,
+      "nefcMax": 313,
+      "solverIterMean": 3.20773381294964,
+      "solverIterMax": 8,
+      "msPerFrameP50": 1.0296000000007552,
+      "msPerFrameP95": 1.6639000000004671,
+      "msPerFrameMax": 2.3222999999998137,
+      "msPerStepFrom60": 0.120276823387582,
+      "realTimeFactor": 16.62375383146356,
+      "partSlipInJawsMm": 61.591723385584395,
+      "hubTravelRefusedMm": 35.7200226581586,
+      "boardSlideMm": 36.43296330865782,
+      "maxFollowingErrorDeg": 13.4590742759884,
+      "maxSaturationFraction": 0.8669064748201439,
+      "partBelowBoardTop": false
+    },
+    {
+      "mode": "colliding",
+      "scenario": "skew-push",
+      "roundSegments": 12,
+      "nconMean": 15.81205035971223,
+      "nconMax": 20,
+      "nefcMax": 81,
+      "solverIterMean": 1.810251798561151,
+      "solverIterMax": 7,
+      "msPerFrameP50": 0.5299999999988358,
+      "msPerFrameP95": 0.6752999999989697,
+      "msPerFrameMax": 0.9235999999982596,
+      "msPerStepFrom60": 0.05857160940325504,
+      "realTimeFactor": 34.13526165702111,
+      "partSlipInJawsMm": 74.94575497661826,
+      "hubTravelRefusedMm": 23.947026259584277,
+      "boardSlideMm": 77.88217209369168,
+      "maxFollowingErrorDeg": 21.032930937835705,
+      "maxSaturationFraction": 0.8615107913669064,
+      "partBelowBoardTop": true
+    }
+  ],
+  "collidingWorst": {
+    "scenario": "fits",
+    "p95MsPerFrame": 2.024399999999332
+  },
+  "armCollisionFactor": 1.548061481990691,
+  "collidingHexagon": [
+    {
+      "mode": "colliding",
+      "scenario": "free",
+      "roundSegments": 6,
+      "nconMean": 11.821043165467627,
+      "nconMax": 13,
+      "nefcMax": 53,
+      "solverIterMean": 2.0107913669064748,
+      "solverIterMax": 6,
+      "msPerFrameP50": 0.3909000000003289,
+      "msPerFrameP95": 0.4807999999993626,
+      "msPerFrameMax": 0.8083000000005995,
+      "msPerStepFrom60": 0.043737020293349756,
+      "realTimeFactor": 45.71362743805051,
+      "partSlipInJawsMm": 149.93376598552624,
+      "hubTravelRefusedMm": -0.8825932784251866,
+      "boardSlideMm": 0.00003439569581362226,
+      "maxFollowingErrorDeg": 0.06398417905648095,
+      "maxSaturationFraction": 0,
+      "partBelowBoardTop": true
+    },
+    {
+      "mode": "colliding",
+      "scenario": "fits",
+      "roundSegments": 6,
+      "nconMean": 42.035071942446045,
+      "nconMax": 52,
+      "nefcMax": 209,
+      "solverIterMean": 3.8120503597122304,
+      "solverIterMax": 10,
+      "msPerFrameP50": 1.3931000000011409,
+      "msPerFrameP95": 2.5377000000007683,
+      "msPerFrameMax": 4.193999999999505,
+      "msPerStepFrom60": 0.16721833433795566,
+      "realTimeFactor": 11.973156422763292,
+      "partSlipInJawsMm": 62.74492724407252,
+      "hubTravelRefusedMm": 35.200473862720074,
+      "boardSlideMm": 52.990591603565946,
+      "maxFollowingErrorDeg": 19.156283237735803,
+      "maxSaturationFraction": 0.8696043165467626,
+      "partBelowBoardTop": false
+    },
+    {
+      "mode": "colliding",
+      "scenario": "wrong-rotation",
+      "roundSegments": 6,
+      "nconMean": 30.82913669064748,
+      "nconMax": 36,
+      "nefcMax": 146,
+      "solverIterMean": 1.295863309352518,
+      "solverIterMax": 6,
+      "msPerFrameP50": 0.8497999999999593,
+      "msPerFrameP95": 0.9596999999994296,
+      "msPerFrameMax": 1.57970000000023,
+      "msPerStepFrom60": 0.09013088205746439,
+      "realTimeFactor": 22.177480387622456,
+      "partSlipInJawsMm": 61.824588087397835,
+      "hubTravelRefusedMm": 36.04089382703364,
+      "boardSlideMm": 31.322802485673144,
+      "maxFollowingErrorDeg": 14.365736495098124,
+      "maxSaturationFraction": 0.8588129496402878,
+      "partBelowBoardTop": false
+    },
+    {
+      "mode": "colliding",
+      "scenario": "wrong-shape",
+      "roundSegments": 6,
+      "nconMean": 30.276978417266186,
+      "nconMax": 56,
+      "nefcMax": 225,
+      "solverIterMean": 2.987410071942446,
+      "solverIterMax": 9,
+      "msPerFrameP50": 0.8986000000004424,
+      "msPerFrameP95": 1.3229999999985012,
+      "msPerFrameMax": 2.000799999999799,
+      "msPerStepFrom60": 0.10526440626883737,
+      "realTimeFactor": 19.01058100422823,
+      "partSlipInJawsMm": 61.62270352156333,
+      "hubTravelRefusedMm": 35.68745962450755,
+      "boardSlideMm": 35.92331082260242,
+      "maxFollowingErrorDeg": 13.753262958975435,
+      "maxSaturationFraction": 0.8660071942446043,
+      "partBelowBoardTop": false
+    },
+    {
+      "mode": "colliding",
+      "scenario": "skew-push",
+      "roundSegments": 6,
+      "nconMean": 15.81205035971223,
+      "nconMax": 20,
+      "nefcMax": 81,
+      "solverIterMean": 1.810251798561151,
+      "solverIterMax": 7,
+      "msPerFrameP50": 0.572200000000521,
+      "msPerFrameP95": 0.693199999999706,
+      "msPerFrameMax": 0.9377000000004045,
+      "msPerStepFrom60": 0.06329849306811358,
+      "realTimeFactor": 31.586599637796507,
+      "partSlipInJawsMm": 74.94575497661826,
+      "hubTravelRefusedMm": 23.947026259584277,
+      "boardSlideMm": 77.88217209369168,
+      "maxFollowingErrorDeg": 21.032930937835705,
+      "maxSaturationFraction": 0.8615107913669064,
+      "partBelowBoardTop": true
+    }
+  ],
+  "collidingHexagonWorst": {
+    "scenario": "fits",
+    "p95MsPerFrame": 2.5377000000007683
+  },
+  "hexagonLeverFactor": 0.7977302281588522,
+  "orderFair": {
+    "A inert/12": {
+      "worstP95MsPerFrame": 1.7711999999955879,
+      "worstScenario": "skew-push",
+      "verdict": "PASS",
+      "headroomFactor": 1.129177958449064,
+      "perScenario": {
+        "fits": {
+          "p95": [
+            0.5300000000006548,
+            0.5446000000010827,
+            0.5388000000020838
+          ],
+          "ncon": [
+            14.367805755395683,
+            14.367805755395683,
+            14.367805755395683
+          ],
+          "feDeg": [
+            0.07072927506429508,
+            0.07072927506429508,
+            0.07072927506429508
+          ],
+          "sat": [
+            0,
+            0,
+            0
+          ],
+          "inserted": [
+            true,
+            true,
+            true
+          ],
+          "slipMm": [
+            -5.405629714309985,
+            -5.405629714309985,
+            -5.405629714309985
+          ]
+        },
+        "wrong-shape": {
+          "p95": [
+            1.252599999999802,
+            1.2628999999978987,
+            1.2763000000049942
+          ],
+          "ncon": [
+            44.88309352517986,
+            44.88309352517986,
+            44.88309352517986
+          ],
+          "feDeg": [
+            0.08022965799624121,
+            0.08022965799624121,
+            0.08022965799624121
+          ],
+          "sat": [
+            0,
+            0,
+            0
+          ],
+          "inserted": [
+            false,
+            false,
+            false
+          ],
+          "slipMm": [
+            20.31871484734348,
+            20.31871484734348,
+            20.31871484734348
+          ]
+        },
+        "skew-push": {
+          "p95": [
+            1.0562000000008993,
+            0.9953999999997905,
+            1.7711999999955879
+          ],
+          "ncon": [
+            23.60251798561151,
+            23.60251798561151,
+            23.60251798561151
+          ],
+          "feDeg": [
+            0.8701335110792744,
+            0.8701335110792744,
+            0.8701335110792744
+          ],
+          "sat": [
+            0.7068345323741008,
+            0.7068345323741008,
+            0.7068345323741008
+          ],
+          "inserted": [
+            false,
+            false,
+            false
+          ],
+          "slipMm": [
+            16.749684120549993,
+            16.749684120549993,
+            16.749684120549993
+          ]
+        }
+      }
+    },
+    "B colliding/12": {
+      "worstP95MsPerFrame": 4.77889999999752,
+      "worstScenario": "fits",
+      "verdict": "FAIL",
+      "headroomFactor": 0.41850635083409105,
+      "perScenario": {
+        "fits": {
+          "p95": [
+            1.8024999999979627,
+            1.9087999999974272,
+            4.77889999999752
+          ],
+          "ncon": [
+            42.035071942446045,
+            42.035071942446045,
+            42.035071942446045
+          ],
+          "feDeg": [
+            19.156283237735803,
+            19.156283237735803,
+            19.156283237735803
+          ],
+          "sat": [
+            0.8696043165467626,
+            0.8696043165467626,
+            0.8696043165467626
+          ],
+          "inserted": [
+            false,
+            false,
+            false
+          ],
+          "slipMm": [
+            62.74492724407252,
+            62.74492724407252,
+            62.74492724407252
+          ]
+        },
+        "wrong-shape": {
+          "p95": [
+            1.6147000000019034,
+            2.237600000000384,
+            3.4292999999961467
+          ],
+          "ncon": [
+            38.45773381294964,
+            38.45773381294964,
+            38.45773381294964
+          ],
+          "feDeg": [
+            13.4590742759884,
+            13.4590742759884,
+            13.4590742759884
+          ],
+          "sat": [
+            0.8669064748201439,
+            0.8669064748201439,
+            0.8669064748201439
+          ],
+          "inserted": [
+            false,
+            false,
+            false
+          ],
+          "slipMm": [
+            61.591723385584395,
+            61.591723385584395,
+            61.591723385584395
+          ]
+        },
+        "skew-push": {
+          "p95": [
+            0.6552000000010594,
+            0.7039999999979045,
+            0.9205999999976484
+          ],
+          "ncon": [
+            15.81205035971223,
+            15.81205035971223,
+            15.81205035971223
+          ],
+          "feDeg": [
+            21.032930937835705,
+            21.032930937835705,
+            21.032930937835705
+          ],
+          "sat": [
+            0.8615107913669064,
+            0.8615107913669064,
+            0.8615107913669064
+          ],
+          "inserted": [
+            true,
+            true,
+            true
+          ],
+          "slipMm": [
+            74.94575497661826,
+            74.94575497661826,
+            74.94575497661826
+          ]
+        }
+      }
+    },
+    "C colliding/6": {
+      "worstP95MsPerFrame": 4.313399999999092,
+      "worstScenario": "fits",
+      "verdict": "FAIL",
+      "headroomFactor": 0.4636713497473967,
+      "perScenario": {
+        "fits": {
+          "p95": [
+            1.8631999999997788,
+            1.8456999999980326,
+            4.313399999999092
+          ],
+          "ncon": [
+            42.035071942446045,
+            42.035071942446045,
+            42.035071942446045
+          ],
+          "feDeg": [
+            19.156283237735803,
+            19.156283237735803,
+            19.156283237735803
+          ],
+          "sat": [
+            0.8696043165467626,
+            0.8696043165467626,
+            0.8696043165467626
+          ],
+          "inserted": [
+            false,
+            false,
+            false
+          ],
+          "slipMm": [
+            62.74492724407252,
+            62.74492724407252,
+            62.74492724407252
+          ]
+        },
+        "wrong-shape": {
+          "p95": [
+            1.2220000000015716,
+            1.2361000000018976,
+            3.569000000003143
+          ],
+          "ncon": [
+            30.276978417266186,
+            30.276978417266186,
+            30.276978417266186
+          ],
+          "feDeg": [
+            13.753262958975435,
+            13.753262958975435,
+            13.753262958975435
+          ],
+          "sat": [
+            0.8660071942446043,
+            0.8660071942446043,
+            0.8660071942446043
+          ],
+          "inserted": [
+            false,
+            false,
+            false
+          ],
+          "slipMm": [
+            61.62270352156333,
+            61.62270352156333,
+            61.62270352156333
+          ]
+        },
+        "skew-push": {
+          "p95": [
+            0.7318999999988591,
+            0.7164000000047963,
+            1.8643000000010943
+          ],
+          "ncon": [
+            15.81205035971223,
+            15.81205035971223,
+            15.81205035971223
+          ],
+          "feDeg": [
+            21.032930937835705,
+            21.032930937835705,
+            21.032930937835705
+          ],
+          "sat": [
+            0.8615107913669064,
+            0.8615107913669064,
+            0.8615107913669064
+          ],
+          "inserted": [
+            true,
+            true,
+            true
+          ],
+          "slipMm": [
+            74.94575497661826,
+            74.94575497661826,
+            74.94575497661826
+          ]
+        }
+      }
+    },
+    "D noself/6": {
+      "worstP95MsPerFrame": 3.670799999999872,
+      "worstScenario": "fits",
+      "verdict": "FAIL",
+      "headroomFactor": 0.5448403617740192,
+      "perScenario": {
+        "fits": {
+          "p95": [
+            1.7059000000008382,
+            2.023800000002666,
+            3.670799999999872
+          ],
+          "ncon": [
+            41.023381294964025,
+            41.023381294964025,
+            41.023381294964025
+          ],
+          "feDeg": [
+            19.178385860956972,
+            19.178385860956972,
+            19.178385860956972
+          ],
+          "sat": [
+            0.8696043165467626,
+            0.8696043165467626,
+            0.8696043165467626
+          ],
+          "inserted": [
+            false,
+            false,
+            false
+          ],
+          "slipMm": [
+            62.72416630556855,
+            62.72416630556855,
+            62.72416630556855
+          ]
+        },
+        "wrong-shape": {
+          "p95": [
+            1.4385999999976775,
+            1.6563000000023749,
+            2.0817000000024564
+          ],
+          "ncon": [
+            31.39118705035971,
+            31.39118705035971,
+            31.39118705035971
+          ],
+          "feDeg": [
+            16.675524387418,
+            16.675524387418,
+            16.675524387418
+          ],
+          "sat": [
+            0.8687050359712231,
+            0.8687050359712231,
+            0.8687050359712231
+          ],
+          "inserted": [
+            false,
+            false,
+            false
+          ],
+          "slipMm": [
+            61.88836322356584,
+            61.88836322356584,
+            61.88836322356584
+          ]
+        },
+        "skew-push": {
+          "p95": [
+            0.8460000000013679,
+            0.577899999996589,
+            1.0711000000010245
+          ],
+          "ncon": [
+            14.774280575539569,
+            14.774280575539569,
+            14.774280575539569
+          ],
+          "feDeg": [
+            21.030563504942297,
+            21.030563504942297,
+            21.030563504942297
+          ],
+          "sat": [
+            0.8606115107913669,
+            0.8606115107913669,
+            0.8606115107913669
+          ],
+          "inserted": [
+            true,
+            true,
+            true
+          ],
+          "slipMm": [
+            74.90788724939125,
+            74.90788724939125,
+            74.90788724939125
+          ]
+        }
+      }
+    },
+    "E excluded/12": {
+      "worstP95MsPerFrame": 0.858299999992596,
+      "worstScenario": "fits",
+      "verdict": "PASS",
+      "headroomFactor": 2.330187580120299,
+      "perScenario": {
+        "fits": {
+          "p95": [
+            0.6136000000005879,
+            0.5930000000007567,
+            0.858299999992596
+          ],
+          "ncon": [
+            14.305755395683454,
+            14.305755395683454,
+            14.305755395683454
+          ],
+          "feDeg": [
+            18.042393752234826,
+            18.042393752234826,
+            18.042393752234826
+          ],
+          "sat": [
+            0.7688848920863309,
+            0.7688848920863309,
+            0.7688848920863309
+          ],
+          "inserted": [
+            false,
+            false,
+            false
+          ],
+          "slipMm": [
+            -5.039258201833818,
+            -5.039258201833818,
+            -5.039258201833818
+          ]
+        },
+        "wrong-shape": {
+          "p95": [
+            0.7703000000001339,
+            0.5868000000045868,
+            0.8334000000031665
+          ],
+          "ncon": [
+            13.81294964028777,
+            13.81294964028777,
+            13.81294964028777
+          ],
+          "feDeg": [
+            13.780445651133142,
+            13.780445651133142,
+            13.780445651133142
+          ],
+          "sat": [
+            0.7670863309352518,
+            0.7670863309352518,
+            0.7670863309352518
+          ],
+          "inserted": [
+            false,
+            false,
+            false
+          ],
+          "slipMm": [
+            -9.032150023653102,
+            -9.032150023653102,
+            -9.032150023653102
+          ]
+        },
+        "skew-push": {
+          "p95": [
+            0.6651000000019849,
+            0.6347999999998137,
+            0.856999999989057
+          ],
+          "ncon": [
+            16.91187050359712,
+            16.91187050359712,
+            16.91187050359712
+          ],
+          "feDeg": [
+            9.147070694939057,
+            9.147070694939057,
+            9.147070694939057
+          ],
+          "sat": [
+            0.7733812949640287,
+            0.7733812949640287,
+            0.7733812949640287
+          ],
+          "inserted": [
+            false,
+            false,
+            false
+          ],
+          "slipMm": [
+            -4.674398330853216,
+            -4.674398330853216,
+            -4.674398330853216
+          ]
+        }
+      }
+    },
+    "E excluded/6": {
+      "worstP95MsPerFrame": 1.5394000000087544,
+      "worstScenario": "skew-push",
+      "verdict": "PASS",
+      "headroomFactor": 1.299207483427716,
+      "perScenario": {
+        "fits": {
+          "p95": [
+            0.6317000000017288,
+            0.575699999993958,
+            1.0386999999900581
+          ],
+          "ncon": [
+            14.305755395683454,
+            14.305755395683454,
+            14.305755395683454
+          ],
+          "feDeg": [
+            18.042393752234826,
+            18.042393752234826,
+            18.042393752234826
+          ],
+          "sat": [
+            0.7688848920863309,
+            0.7688848920863309,
+            0.7688848920863309
+          ],
+          "inserted": [
+            false,
+            false,
+            false
+          ],
+          "slipMm": [
+            -5.039258201833818,
+            -5.039258201833818,
+            -5.039258201833818
+          ]
+        },
+        "wrong-shape": {
+          "p95": [
+            0.5671999999976833,
+            0.5501000000003842,
+            1.1052999999956228
+          ],
+          "ncon": [
+            13.776079136690647,
+            13.776079136690647,
+            13.776079136690647
+          ],
+          "feDeg": [
+            13.780318632760812,
+            13.780318632760812,
+            13.780318632760812
+          ],
+          "sat": [
+            0.7670863309352518,
+            0.7670863309352518,
+            0.7670863309352518
+          ],
+          "inserted": [
+            false,
+            false,
+            false
+          ],
+          "slipMm": [
+            -9.030147474069752,
+            -9.030147474069752,
+            -9.030147474069752
+          ]
+        },
+        "skew-push": {
+          "p95": [
+            0.6366999999991094,
+            0.6633999999976368,
+            1.5394000000087544
+          ],
+          "ncon": [
+            16.91187050359712,
+            16.91187050359712,
+            16.91187050359712
+          ],
+          "feDeg": [
+            9.147070694939057,
+            9.147070694939057,
+            9.147070694939057
+          ],
+          "sat": [
+            0.7733812949640287,
+            0.7733812949640287,
+            0.7733812949640287
+          ],
+          "inserted": [
+            false,
+            false,
+            false
+          ],
+          "slipMm": [
+            -4.674398330853216,
+            -4.674398330853216,
+            -4.674398330853216
+          ]
+        }
+      }
+    }
+  },
+  "orderFairSummary": {
+    "armCollisionFactor": 2.698114272814716,
+    "hexagonLeverFactor": 1.1079195066533423,
+    "selfCollisionFactor": 1.17505720823778,
+    "excludedWorstP95": {
+      "seg12": 0.858299999992596,
+      "seg6": 1.5394000000087544
+    },
+    "verdictForTheDemo": "PASS",
+    "budgetMsPerFrame": 2,
+    "note": "Worst of three isolated runs per (config, scenario), repeat index as the OUTER loop so every config sits at every position in the process. This is the number to quote."
+  }
+}

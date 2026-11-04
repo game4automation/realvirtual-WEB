@@ -1,0 +1,13 @@
+# Test files excluded from a sharded suite run — read by `scripts/test-shard-plan.mjs`
+# (plan-900 F5). One glob per line against the spec key (the path relative to the vitest root);
+# `**` matches any depth, `*` stays inside one path segment, a trailing `/` is a prefix.
+#
+# THIS LIST IS EMPTY ON PURPOSE, and empty is the only acceptable steady state: it exists so that
+# a file which does not run has to be written down somewhere VISIBLE instead of living in a
+# command line in someone's shell history. Every entry needs a reason and an owner next to it.
+#
+# History: the plan-687 acceptance runs had to exclude five files that hung before their first
+# test (library-snap-index, editor-save-shortcut, editor-save-authored-names,
+# in-place-test-session, load-model-race). plan-900 phase 3 found the cause — `vi.mock` with
+# `importOriginal` on a module inside a static import cycle — and phase 4 removed the cycle edge,
+# so all five run again and the list went back to empty on 2026-10-27.

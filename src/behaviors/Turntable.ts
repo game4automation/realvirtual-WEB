@@ -19,8 +19,10 @@
  * so `signalNamespace: 'Flow'`. Full authoring guide: doc-behavior-modelling.md
  */
 
+import { captureTurntable, restoreRidingMUs, restoreTurntable, validateTurntable } from './_shared/turntable-snapshot';
 import { Vector3, Quaternion } from 'three';
 import type { Object3D } from 'three';
+import { physics2dRegistry } from '../core/engine/rv-physics2d-registry';
 import { defineLibraryComponent, type RV } from './_shared/behavior-kit';
 import { classifyConnections, listOwnSnaps, type PortConnection } from './_shared/snap-graph-helpers';
 import { alignToInputAngle, dispatchToOutputAngle, calibrateBeltNeutralAngle } from './_shared/turntable-angle-math';
@@ -57,7 +59,7 @@ type State =
   | 'discharge_clearing'
   | 'returning_in';
 
-interface TurntableLocal {
+export interface TurntableLocal {
   rotaryNode: Object3D | null;
   sensorNode: Object3D | null;
   beltNode: Object3D | null;
@@ -76,15 +78,15 @@ interface TurntableLocal {
   refreshTimer: number;
   emptyFor: number;
 
-  // Round-robin cursors: the port id last served, so the next pick rotates on.
-  lastInputPort: string | null;
-  lastOutputPort: string | null;
+  // Round-robin cursors: index in the ordered input/output list.
+  lastInputPort: number | null;
+  lastOutputPort: number | null;
 
   _dir: Vector3;
   _quat: Quaternion;
 }
 
-type TurntableSelf = RV.Self<TurntableLocal, typeof SIGNALS>;
+export type TurntableSelf = RV.Self<TurntableLocal, typeof SIGNALS>;
 
 // ── Viewer access (one place for the structural casts) ───────────────────────
 
@@ -231,11 +233,11 @@ function tryReceive(self: TurntableSelf): void {
 
   const all = inputs(l);
   const ready = all.filter(c => self.signals.get(flowOccupiedRootSignal(c.ownerRoot.name)) === true);
-  const waiting = pickRoundRobin(ready, all, c => c.snap.id, l.lastInputPort);
+  const waiting = pickRoundRobin(ready, all, c => c.snap.id, l.lastInputPort == null ? null : inputs(l)[l.lastInputPort]?.snap.id ?? null);
   if (!waiting) return;
 
   l.selectedInputPort = waiting.snap.id;
-  l.lastInputPort = waiting.snap.id;
+  l.lastInputPort = inputs(l).indexOf(waiting);
   const target = alignToInputAngle(l.driveAxis, l.beltNeutralAngle, waiting.snap.object3D, l.lastCommandedAngle);
   setBelt(l, false);
   l.drive!.moveTo(target);
@@ -247,10 +249,10 @@ function tryDispatch(self: TurntableSelf): void {
   const l = self.local;
   if (!self.sig.Run.get()) { setBelt(l, false); enter(self, 'holding'); return; }
 
-  const chosen = pickRoundRobin(freeOutputs(self), outputs(l), c => c.snap.id, l.lastOutputPort);
+  const chosen = pickRoundRobin(freeOutputs(self), outputs(l), c => c.snap.id, l.lastOutputPort == null ? null : outputs(l)[l.lastOutputPort]?.snap.id ?? null);
   if (!chosen) { setBelt(l, false); enter(self, 'holding'); return; }
 
-  l.lastOutputPort = chosen.snap.id;
+  l.lastOutputPort = outputs(l).indexOf(chosen);
   const target = dispatchToOutputAngle(l.driveAxis, l.beltNeutralAngle, chosen.snap.object3D, l.lastCommandedAngle);
   setBelt(l, false);
   l.drive!.moveTo(target);
@@ -311,6 +313,7 @@ function resetTurntable(self: TurntableSelf): void {
   self.prop['alignedPort'] = null;
   self.prop['selectedOutput'] = null;
   self.prop['heldMU'] = null;
+  self.prop['heldMUGen'] = null;
   self.prop['driveTarget'] = 0;
   self.sig.PartCount.set(0);
   enter(self, 'idle');
@@ -377,7 +380,7 @@ function rideOnToCentre(self: TurntableSelf, mu: RV.MU): void {
     // fixed 0.15 s here changed event times vs. the visual path (KPI drift).
     const centre = nodeWorldXYZ(rotary);
     const aligned = self.prop['alignedPort'];
-    const inPort = self.inputs().find(p => p.id === aligned) ?? self.inputs()[0];
+    const inPort = self.inputs()[aligned as number] ?? self.inputs()[0];
     const snap = inPort?.snapNode;
     if (!snap) {
       // Distance-fallback port without a snap: no deterministic entry point
@@ -416,6 +419,8 @@ function rideOffToOutput(self: TurntableSelf, mu: RV.MU, outNode: Object3D | nul
   const from = node ? nodeWorldXYZ(node) : nodeWorldXYZ(self.local.rotaryNode);
   const scene = viewerOf(self).scene;
   if (node && scene) scene.attach(node);
+  // A headless rider restored with a pending rotary parent leaves the disc here as well.
+  if (!node && mu) delete (mu as { restoredVisualParent?: Object3D }).restoredVisualParent;
   const tgt = nodeWorldXYZ(outNode);
   let dx = tgt[0] - from[0], dz = tgt[2] - from[2];
   const d = Math.hypot(dx, dz);
@@ -459,7 +464,7 @@ function desRotateTo(self: TurntableSelf, targetAngle: number, next: State, mu: 
 
 /** Round-robin over the OUTPUT ports, restricted to the currently free ones. */
 function desSelectOutput(self: TurntableSelf): RV.Port | null {
-  return pickRoundRobin(self.freeOutputs(), self.outputs(), p => p.id, self.local.lastOutputPort);
+  return pickRoundRobin(self.freeOutputs(), self.outputs(), p => p.id, self.local.lastOutputPort == null ? null : self.outputs()[self.local.lastOutputPort]?.id ?? null);
 }
 
 /** Dispatch angle that aligns the disc to a chosen OUTPUT. Uses this turntable's
@@ -567,6 +572,7 @@ const def = {
     self.prop['alignedPort'] = null;
     self.prop['selectedOutput'] = null;
     self.prop['heldMU'] = null;
+    self.prop['heldMUGen'] = null;
     self.prop['driveTarget'] = l.lastCommandedAngle;
     self.setState('idle');
     self.statState('Empty');
@@ -586,6 +592,7 @@ const def = {
   continuous: {
     setup(self: TurntableSelf): void {
       const l = self.local;
+      if (l.beltNode) physics2dRegistry.bindMotion(l.beltNode, l.rotaryNode!);
       l.drive = self.attachDrive(l.rotaryNode!);
       l.belt = l.beltNode ? self.attachBelt(l.beltNode) : null;
 
@@ -667,6 +674,12 @@ const def = {
   },
 
   des: {
+    validateSnapshot: validateTurntable,
+    onSnapshot(self: TurntableSelf): unknown { return captureTurntable(self.local, self.mus); },
+    onRestore(self: TurntableSelf, state: unknown): void {
+      restoreTurntable(self.local, state);
+      restoreRidingMUs(self.local, self.mus, viewerOf(self).scene, state);
+    },
     // The ride-on/ride-off hooks sample the MU's LIVE world position at event
     // time (rideOnToCentre/rideOffToOutput) — keep the per-event-time tween
     // settle active while a turntable instance exists (plan-262 Phase 2).
@@ -676,7 +689,7 @@ const def = {
     canAccept(self: TurntableSelf, _mu: RV.MU, port?: RV.Port): boolean {
       if (self.currentLoad >= maxCapacity(self)) return false;
       if (self.state !== 'idle') return false;
-      if (port && self.prop['alignedPort'] != null && port.id !== self.prop['alignedPort']) return false;
+      if (port && self.prop['alignedPort'] != null && self.inputs().findIndex(p => p.id === port.id) !== self.prop['alignedPort']) return false;
       return true;
     },
     // Align-on-accept (identical to continuous): FIRST rotate the disc to the input
@@ -684,7 +697,7 @@ const def = {
     // straight regardless of where the previous discharge left the disc.
     onAccept(self: TurntableSelf, mu: RV.MU, port?: RV.Port): boolean {
       if (!self.local.beltCalibrated) calibrateBelt(self); // lazy retry if setup couldn't resolve the surface
-      self.prop['alignedPort'] = port?.id ?? null;
+      self.prop['alignedPort'] = port ? self.inputs().findIndex(p => p.id === port.id) : null;
       const align = desInputAlignAngle(self);
       if (align == null) rideOnToCentre(self, mu);          // no input snap — ride on at the current angle
       else desRotateTo(self, align, 'aligning_in', mu);
@@ -699,16 +712,17 @@ const def = {
     onArrival(self: TurntableSelf, mu: RV.MU): void {
       if (self.state === 'receiving') {
         const out = desSelectOutput(self);
-        if (!out) { self.prop['heldMU'] = mu.id; enter(self, 'holding'); return; }
-        self.prop['selectedOutput'] = out.id;
-        self.local.lastOutputPort = out.id;
+        if (!out) { self.prop['heldMU'] = mu.id; self.prop['heldMUGen'] = mu.generation ?? 0; enter(self, 'holding'); return; }
+        self.prop['selectedOutput'] = self.outputs().findIndex(p => p.id === out.id);
+        self.local.lastOutputPort = self.outputs().findIndex(p => p.id === out.id);
         desRotateTo(self, dispatchAngleFor(self, out), 'rotating_out', mu);
       } else if (self.state === 'discharging') {
-        const outId = self.prop['selectedOutput'] as string | null;
-        const out = outId != null ? self.outputs().find(p => p.id === outId) : undefined;
+        const outId = self.prop['selectedOutput'] as number | null;
+        const out = outId != null ? self.outputs()[outId] : undefined;
         self.transfer(mu, out);
         self.prop['selectedOutput'] = null;
         self.prop['heldMU'] = null;
+        self.prop['heldMUGen'] = null;
         // Tail gate: the leading edge is at the output but the tail is still on the
         // disc — do NOT rotate yet. Wait one part-length (2·bug) / downstream speed,
         // so the disc never frees early (canAccept rejects meanwhile).
@@ -728,8 +742,8 @@ const def = {
       if (self.state === 'returning_in') { enter(self, 'idle'); return; }       // returned empty → ready
       // Dispatch rotation done — the part sits at the rotated centre (spun with the
       // disc). Release it and ride it out to the discharge edge; onArrival hands off.
-      const outId = self.prop['selectedOutput'] as string | null;
-      const out = outId != null ? self.outputs().find(p => p.id === outId) : undefined;
+      const outId = self.prop['selectedOutput'] as number | null;
+      const out = outId != null ? self.outputs()[outId] : undefined;
       enter(self, 'discharging');
       rideOffToOutput(self, mu, out?.snapNode ?? out?.ownerRoot);
     },
@@ -740,9 +754,10 @@ const def = {
       if (heldId == null) return;
       const out = desSelectOutput(self);
       if (!out) return; // still blocked — wait for the next ready signal
-      const held = self.mus.find(m => m.id === heldId) ?? null;
-      self.prop['selectedOutput'] = out.id;
-      self.local.lastOutputPort = out.id;
+      const heldGen = self.prop['heldMUGen'] as number | null;
+      const held = self.mus.find(m => m.id === heldId && (m.generation ?? 0) === heldGen) ?? null;
+      self.prop['selectedOutput'] = self.outputs().findIndex(p => p.id === out.id);
+      self.local.lastOutputPort = self.outputs().findIndex(p => p.id === out.id);
       desRotateTo(self, dispatchAngleFor(self, out), 'rotating_out', held);
     },
   },

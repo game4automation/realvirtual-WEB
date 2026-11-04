@@ -24,6 +24,10 @@
  * selection's, the statics gates, two joint components on one node.
  */
 
+import { setAiClicks } from '../src/core/hmi/ai-click-choreography-store';
+beforeEach(() => setAiClicks(true));
+afterEach(() => setAiClicks(true));
+import { bridgeExecuteValue } from './helpers/execute-value';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Box3, BoxGeometry, Group, Mesh, MeshStandardMaterial, Object3D, PerspectiveCamera, Scene } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
@@ -36,6 +40,10 @@ import { __clearDraftStoresForTests } from '../src/core/ops/rv-document-drafts';
 import { commandRegistry } from '../src/core/hmi/rv-command-registry';
 import { setAppConfig } from '../src/core/rv-app-config';
 import { RENDER_MODE_LOCKED } from '../src/core/hmi/render-mode-controller';
+import {
+  getRaytracedBackend, registerRaytracedBackend, RAYTRACED_UNAVAILABLE_MESSAGE,
+} from '../src/core/engine/rv-raytraced-hook';
+import { fakeRaytracedBackendFactory } from './helpers/fake-render-viewer';
 import { loadVisualSettings, saveVisualSettings } from '../src/core/hmi/visual-settings-store';
 import {
   listShippedPresets, loadPublishedPresets, matchPreset, type VisualPreset,
@@ -44,6 +52,7 @@ import {
   LOGIC_STEP_NEEDS_CONTAINER,
   NEEDS_SIGNAL_OBJECT,
   NEEDS_TARGET,
+  NEEDS_TARGET_OBJECT,
   SIGNAL_ALREADY_TYPE,
   SIGNAL_EDITABLE_FIELDS,
   SIGNAL_NAME_READONLY,
@@ -120,6 +129,13 @@ function makeEnv(): Env {
     renderMode: 'default',
     wireframe: false,
     wireframeActive: false,
+    // plan-762: the render-mode gate. A plain field the tests flip; the
+    // context is read LIVE like the real getter.
+    rendererKind: 'webgpu-gl',
+    hasCompute: false,
+    get renderModeContext() {
+      return { hasCompute: (this as { hasCompute: boolean }).hasCompute, backendRegistered: getRaytracedBackend() !== null };
+    },
     // plan-591: the quality axis `view.visualPreset` reads and writes.
     // `antialiasActive` is a renderer fact (`web_status` reports it, the reload
     // hint derives from it) and `applyVisualSettings` is where a preset lands —
@@ -154,6 +170,8 @@ function makeEnv(): Env {
   setActiveAssetContext({ viewer, doc });
 
   const plugin = new McpBridgePlugin();
+  // plan-668: the test transport stands for a tab with AI control on.
+  (plugin as unknown as { _aiEnabled: boolean })._aiEnabled = true;
   (plugin as unknown as { viewer: RVViewer }).viewer = viewer;
   (plugin as unknown as { _dispatcher: ReturnType<typeof buildMultiDispatcher> })._dispatcher =
     buildMultiDispatcher(plugin.mcpToolInstances);
@@ -223,11 +241,11 @@ afterEach(() => {
 // ─── 1:1 binding ────────────────────────────────────────────────────────
 
 describe('bound tool through _handleCall', () => {
-  it('the dispatcher entry carries the binding (metadata, not on the wire)', () => {
+  it('the retired alias no longer carries a command binding', () => {
     const entry = (env.plugin as unknown as {
       _dispatcher: Map<string, { command?: unknown }>;
     })._dispatcher.get('web_editor_to_ground');
-    expect(entry?.command).toBe('editor.toGround');
+    expect(entry?.command).toBeUndefined();
   });
 
   it('success: ONE execute (origin mcp), result as before, hover → pressed → afterglow, label in the pill', async () => {
@@ -239,14 +257,15 @@ describe('bound tool through _handleCall', () => {
     const shown = new Set<string>();
     const poll = setInterval(() => { const a = getAiActivity(); if (a) shown.add(a); }, 10);
     const phases = await watchPhases('qe.to-ground', async () => {
-      res = await env.call('web_editor_to_ground', { path: env.boxPath });
+      res = await bridgeExecuteValue(env.call, 'editor.toGround', { path: env.boxPath });
     });
     clearInterval(poll);
 
     expect(spy).toHaveBeenCalledTimes(1);
     expect(spy.mock.calls[0][0]).toBe('editor.toGround');
     expect(spy.mock.calls[0][1]).toEqual({ path: env.boxPath });
-    expect(spy.mock.calls[0][2]).toMatchObject({ origin: 'mcp', buttonKey: 'qe.to-ground' });
+    expect(spy.mock.calls[0][2]).toMatchObject({ origin: 'mcp' });
+    expect(commandRegistry.buttonKeyOf(spy.mock.calls[0][0], spy.mock.calls[0][1])).toBe('qe.to-ground');
     expect([...shown]).toContain('To Ground');
 
     if (__RV_HAS_PRIVATE__) {
@@ -267,7 +286,7 @@ describe('bound tool through _handleCall', () => {
     const minBefore = worldMinY(env.box);
     let res: Record<string, unknown> = {};
     const phases = await watchPhases('qe.to-ground', async () => {
-      res = await env.call('web_editor_to_ground', { path: '' });
+      res = await bridgeExecuteValue(env.call, 'editor.toGround', { path: '' });
     });
 
     expect(spy).toHaveBeenCalledTimes(1);
@@ -283,7 +302,7 @@ describe('bound tool through _handleCall', () => {
 
   it('guard text is unchanged outside the editor (private) / unavailable first (community)', async () => {
     (env.viewer.modes as unknown as { activeMode: string }).activeMode = 'planner';
-    const res = await env.call('web_editor_to_ground', { path: env.boxPath });
+    const res = await bridgeExecuteValue(env.call, 'editor.toGround', { path: env.boxPath });
     expect(res).toEqual({ error: __RV_HAS_PRIVATE__ ? ERR_NOT_EDITOR : ERR_EDITOR_UNAVAILABLE });
   });
 
@@ -297,7 +316,7 @@ describe('bound tool through _handleCall', () => {
     const swap = setTimeout(() => setActiveAssetContext({ viewer: env.viewer, doc: docB }), 120);
     let res: Record<string, unknown> = {};
     const phases = await watchPhases('qe.to-ground', async () => {
-      res = await env.call('web_editor_to_ground', { path: env.boxPath });
+      res = await bridgeExecuteValue(env.call, 'editor.toGround', { path: env.boxPath });
     });
     clearTimeout(swap);
     try {
@@ -319,25 +338,53 @@ describe('bound tool through _handleCall', () => {
 describe('multiplexer binding through _handleCall', () => {
   it('mode=bottom dispatches editor.pivotToBottom on qe.pivot-bottom', async () => {
     const spy = vi.spyOn(commandRegistry, 'execute');
-    const res = await env.call('web_editor_pivot', { path: env.boxPath, mode: 'BOTTOM' });
+    const res = await bridgeExecuteValue(env.call, 'editor.pivotToBottom', { path: env.boxPath });
     expect(spy).toHaveBeenCalledTimes(1);
     expect(spy.mock.calls[0][0]).toBe('editor.pivotToBottom');
     expect(spy.mock.calls[0][1]).toEqual({ path: env.boxPath });
-    expect(spy.mock.calls[0][2]).toMatchObject({ origin: 'mcp', buttonKey: 'qe.pivot-bottom' });
+    expect(spy.mock.calls[0][2]).toMatchObject({ origin: 'mcp' });
+    expect(commandRegistry.buttonKeyOf(spy.mock.calls[0][0], spy.mock.calls[0][1])).toBe('qe.pivot-bottom');
     if (__RV_HAS_PRIVATE__) {
-      expect(res).toMatchObject({ ok: true, path: env.boxPath, mode: 'bottom' });
+      expect(res).toMatchObject({ ok: true, path: env.boxPath });
       expect(Array.isArray(res['pivotWorld'])).toBe(true);
     } else {
       expect(res).toEqual({ error: ERR_EDITOR_UNAVAILABLE });
     }
   }, 15000);
 
-  it('object_center without targetPath refuses without a dispatch; an unknown mode too', async () => {
+  it('pivotToObjectCenter without targetPath refuses without mutation', async () => {
+    const opsBefore = env.doc.ops.length;
+    const positionBefore = env.box.position.clone();
+    mountButton('qe.pivot-to-object');
+    const phases = await watchPhases('qe.pivot-to-object', async () => {
+      const res = await env.call('web_execute', {
+        command: 'editor.pivotToObjectCenter', args: JSON.stringify({ path: env.boxPath }),
+      });
+      expect(res).toMatchObject({
+        ok: false, error: __RV_HAS_PRIVATE__ ? NEEDS_TARGET_OBJECT : ERR_EDITOR_UNAVAILABLE,
+      });
+    });
+    expect(env.doc.ops.length).toBe(opsBefore);
+    expect(env.box.position.equals(positionBefore)).toBe(true);
+    // plan-2007 Phase 6 (known difference, logged in the plan): the old multiplexer binding refused
+    // a missing targetPath BEFORE any choreography; the command's enabled() deliberately allows it
+    // (the Quick Edit button is enabled before a target is picked) and run() refuses — so the
+    // per-command choreography may press the button once. Nothing is written either way.
+    expect(phases.every((p) => p === 'hover' || p === 'pressed')).toBe(true);
+  });
+
+  it('the pivot tombstone lists all four commands even for an unknown mode, without dispatch', async () => {
     const spy = vi.spyOn(commandRegistry, 'execute');
-    expect(await env.call('web_editor_pivot', { path: env.boxPath, mode: 'object_center' }))
-      .toEqual({ error: 'object_center needs targetPath' });
-    expect(await env.call('web_editor_pivot', { path: env.boxPath, mode: 'sideways' }))
-      .toEqual({ error: 'mode must be bottom | object_center | group_center | align_y_up' });
+    const n = env.sent.length;
+    await (env.plugin as unknown as { _handleMessage: (raw: string) => Promise<void> })._handleMessage(JSON.stringify({
+      type: 'call', id: 1, tool: 'web_editor_pivot', arguments: { path: env.boxPath, mode: 'sideways' },
+    }));
+    const frame = JSON.parse(env.sent[n]);
+    expect(frame.result).toBeUndefined();
+    expect(frame.error).toBeTypeOf('string');
+    expect(JSON.parse(frame.error)).toMatchObject({
+      error: 'MOVED', movedTo: ['editor.pivotToBottom', 'editor.pivotToObjectCenter', 'editor.centerKinematicToGroup', 'editor.alignYUp'],
+    });
     expect(spy).not.toHaveBeenCalled();
   });
 });
@@ -347,11 +394,11 @@ describe('multiplexer binding through _handleCall', () => {
 describe('result fields stay what the tools answered before', () => {
   it('create_empty → path, rename → new path, delete → deleted count', async () => {
     if (!__RV_HAS_PRIVATE__) return;
-    const created = await env.call('web_editor_create_empty', { name: 'Rig' });
+    const created = await bridgeExecuteValue(env.call, 'editor.createEmpty', { name: 'Rig' });
     expect(created).toMatchObject({ ok: true, path: 'Asset/Rig' });
-    const renamed = await env.call('web_editor_rename', { path: 'Asset/Rig', name: 'Frame' });
+    const renamed = await bridgeExecuteValue(env.call, 'editor.rename', { path: 'Asset/Rig', name: 'Frame' });
     expect(renamed).toMatchObject({ ok: true, path: 'Asset/Frame' }); // + plan-707 `verified`
-    const deleted = await env.call('web_editor_delete', { paths: 'Asset/Frame' });
+    const deleted = await bridgeExecuteValue(env.call, 'editor.delete', { paths: 'Asset/Frame' });
     expect(deleted).toMatchObject({ ok: true, deleted: 1 });
   }, 15000);
 });
@@ -361,22 +408,22 @@ describe('result fields stay what the tools answered before', () => {
 describe('signals and logic steps: the Quick Edit rules are the tool rules', () => {
   it('add / convert / flip a signal; a Drive parent is refused with the button text', async () => {
     if (!__RV_HAS_PRIVATE__) {
-      expect(await env.call('web_editor_add_signal', { parentPath: env.boxPath, sigType: 'PLCOutputBool' }))
+      expect(await bridgeExecuteValue(env.call, 'editor.addSignal', { parentPath: env.boxPath, sigType: 'PLCOutputBool' }))
         .toEqual({ error: ERR_EDITOR_UNAVAILABLE });
       return;
     }
-    const added = await env.call('web_editor_add_signal', { parentPath: env.boxPath, sigType: 'PLCOutputBool', name: 'Start' });
+    const added = await bridgeExecuteValue(env.call, 'editor.addSignal', { parentPath: env.boxPath, sigType: 'PLCOutputBool', name: 'Start' });
     expect(added).toMatchObject({ ok: true, path: 'Asset/Box/Start' });
     const sig = env.viewer.registry!.getNode('Asset/Box/Start')!;
     expect(Object.keys(sig.userData['realvirtual'] as object)).toContain('PLCOutputBool');
 
-    expect(await env.call('web_editor_convert_signal', { path: 'Asset/Box/Start', target: 'Int' }))
+    expect(await bridgeExecuteValue(env.call, 'editor.convertSignal', { path: 'Asset/Box/Start', target: 'Int' }))
       .toMatchObject({ ok: true, path: 'Asset/Box/Start' });
-    expect(await env.call('web_editor_convert_signal', { path: 'Asset/Box/Start', target: 'Int' }))
+    expect(await bridgeExecuteValue(env.call, 'editor.convertSignal', { path: 'Asset/Box/Start', target: 'Int' }))
       .toEqual({ error: SIGNAL_ALREADY_TYPE });
-    expect(await env.call('web_editor_toggle_signal_direction', { path: env.boxPath }))
+    expect(await bridgeExecuteValue(env.call, 'editor.toggleSignalDirection', { path: env.boxPath }))
       .toEqual({ error: NEEDS_SIGNAL_OBJECT });
-    expect(await env.call('web_editor_toggle_signal_direction', { path: 'Asset/Box/Start' }))
+    expect(await bridgeExecuteValue(env.call, 'editor.toggleSignalDirection', { path: 'Asset/Box/Start' }))
       .toMatchObject({ ok: true });
     expect(Object.keys(env.viewer.registry!.getNode('Asset/Box/Start')!.userData['realvirtual'] as object))
       .toContain('PLCInputInt');
@@ -384,7 +431,7 @@ describe('signals and logic steps: the Quick Edit rules are the tool rules', () 
     env.doc.addComponent(env.boxPath, 'Drive', {});
     await env.doc.whenIdle();
     const ops = env.doc.ops.length;
-    expect(await env.call('web_editor_add_signal', { parentPath: env.boxPath, sigType: 'PLCInputBool' }))
+    expect(await bridgeExecuteValue(env.call, 'editor.addSignal', { parentPath: env.boxPath, sigType: 'PLCInputBool' }))
       .toEqual({ error: SIGNAL_NEEDS_PLAIN_PARENT });
     expect(env.doc.ops.length).toBe(ops);
   }, 15000);
@@ -399,36 +446,36 @@ describe('signals and logic steps: the Quick Edit rules are the tool rules', () 
    */
   it('signalSetField writes Comment / OriginDataType / Type and REFUSES Name', async () => {
     if (!__RV_HAS_PRIVATE__) {
-      expect(await env.call('web_editor_signal_set_field', { path: env.boxPath, field: 'Comment', value: 'x' }))
+      expect(await bridgeExecuteValue(env.call, 'editor.signalSetField', { path: env.boxPath, field: 'Comment', value: 'x' }))
         .toEqual({ error: ERR_EDITOR_UNAVAILABLE });
       return;
     }
-    await env.call('web_editor_add_signal', { parentPath: env.boxPath, sigType: 'PLCOutputBool', name: 'Lamp' });
+    await bridgeExecuteValue(env.call, 'editor.addSignal', { parentPath: env.boxPath, sigType: 'PLCOutputBool', name: 'Lamp' });
     const path = 'Asset/Box/Lamp';
     const extrasOf = () => (env.viewer.registry!.getNode(path)!
       .userData['realvirtual'] as Record<string, Record<string, unknown>>);
 
-    expect(await env.call('web_editor_signal_set_field', { path, field: 'Comment', value: 'Signal lamp' }))
+    expect(await bridgeExecuteValue(env.call, 'editor.signalSetField', { path, field: 'Comment', value: 'Signal lamp' }))
       .toMatchObject({ ok: true, path, field: 'Comment' });
     expect(extrasOf()['PLCOutputBool']['Comment']).toBe('Signal lamp');
 
-    expect(await env.call('web_editor_signal_set_field', { path, field: 'OriginDataType', value: 'BOOL' }))
+    expect(await bridgeExecuteValue(env.call, 'editor.signalSetField', { path, field: 'OriginDataType', value: 'BOOL' }))
       .toMatchObject({ ok: true, field: 'OriginDataType' });
     expect(extrasOf()['PLCOutputBool']['OriginDataType']).toBe('BOOL');
 
     // Type routes through the existing convert + flip operations.
-    expect(await env.call('web_editor_signal_set_field', { path, field: 'Type', value: 'PLCInputFloat' }))
+    expect(await bridgeExecuteValue(env.call, 'editor.signalSetField', { path, field: 'Type', value: 'PLCInputFloat' }))
       .toMatchObject({ ok: true, field: 'Type' });
     expect(Object.keys(extrasOf())).toContain('PLCInputFloat');
 
     // The refusals — and NOTHING is written for either.
     const ops = env.doc.ops.length;
-    expect(await env.call('web_editor_signal_set_field', { path, field: 'Name', value: 'Lamp2' }))
+    expect(await bridgeExecuteValue(env.call, 'editor.signalSetField', { path, field: 'Name', value: 'Lamp2' }))
       .toEqual({ error: SIGNAL_NAME_READONLY });
-    const unknown = await env.call('web_editor_signal_set_field', { path, field: 'Nope', value: 'x' });
+    const unknown = await bridgeExecuteValue(env.call, 'editor.signalSetField', { path, field: 'Nope', value: 'x' });
     expect(unknown['error']).toContain(SIGNAL_EDITABLE_FIELDS.join(' | '));
     expect(unknown['fields']).toEqual([...SIGNAL_EDITABLE_FIELDS]);
-    expect(await env.call('web_editor_signal_set_field', { path: env.boxPath, field: 'Comment', value: 'x' }))
+    expect(await bridgeExecuteValue(env.call, 'editor.signalSetField', { path: env.boxPath, field: 'Comment', value: 'x' }))
       .toEqual({ error: NEEDS_SIGNAL_OBJECT });
     expect(env.doc.ops.length).toBe(ops);
     expect(extrasOf()['PLCInputFloat']['Name']).toBe('Lamp');
@@ -442,23 +489,23 @@ describe('signals and logic steps: the Quick Edit rules are the tool rules', () 
    */
   it('signalSetBinding refuses without a CONNECT connection', async () => {
     if (!__RV_HAS_PRIVATE__) return;
-    expect(await env.call('web_editor_signal_set_binding', { name: 'Lamp', interfaceId: 's7-1' }))
+    expect(await bridgeExecuteValue(env.call, 'editor.signalSetBinding', { name: 'Lamp', interfaceId: 's7-1' }))
       .toEqual({ error: PLC_BINDING_NEEDS_CONNECT });
-    expect(await env.call('web_editor_signal_set_binding', { name: '', interfaceId: 's7-1' }))
+    expect(await bridgeExecuteValue(env.call, 'editor.signalSetBinding', { name: '', interfaceId: 's7-1' }))
       .toEqual({ error: 'name is required (the model signal name)' });
   }, 15000);
 
   it('logic steps: palette steps only inside a container, the starter only on a plain object, unknown type → palette', async () => {
     if (!__RV_HAS_PRIVATE__) return;
-    const unknown = await env.call('web_editor_add_logic_step', { path: env.boxPath, stepType: 'LogicStep_Nope' });
+    const unknown = await bridgeExecuteValue(env.call, 'editor.addLogicStep', { path: env.boxPath, stepType: 'LogicStep_Nope' });
     expect(unknown['error']).toBe('Unknown stepType "LogicStep_Nope"');
     expect(Array.isArray(unknown['palette'])).toBe(true);
-    expect(await env.call('web_editor_add_logic_step', { path: env.boxPath, stepType: 'LogicStep_Delay' }))
+    expect(await bridgeExecuteValue(env.call, 'editor.addLogicStep', { path: env.boxPath, stepType: 'LogicStep_Delay' }))
       .toEqual({ error: LOGIC_STEP_NEEDS_CONTAINER });
-    expect(await env.call('web_editor_add_logic_step', { path: env.boxPath, stepType: 'LogicStep_SerialContainer' }))
+    expect(await bridgeExecuteValue(env.call, 'editor.addLogicStep', { path: env.boxPath, stepType: 'LogicStep_SerialContainer' }))
       .toMatchObject({ ok: true });
     // Inside the container (the node itself now is one) the palette is open.
-    expect(await env.call('web_editor_add_logic_step', { path: env.boxPath, stepType: 'LogicStep_Delay' }))
+    expect(await bridgeExecuteValue(env.call, 'editor.addLogicStep', { path: env.boxPath, stepType: 'LogicStep_Delay' }))
       .toMatchObject({ ok: true });
   }, 15000);
 });
@@ -558,11 +605,12 @@ describe('plan-504 — mechanism bound tools through _handleCall', () => {
       const spy = vi.spyOn(commandRegistry, 'execute');
       let res: Record<string, unknown> = {};
       const phases = await watchPhases(bodyRowKey('Asset/L1'), async () => {
-        res = await env.call('web_editor_mechanism_add_body', { path: 'Asset/L1' });
+        res = await bridgeExecuteValue(env.call, 'mechanism.addBody', { path: 'Asset/L1' });
       });
       expect(spy).toHaveBeenCalledTimes(1);
       expect(spy.mock.calls[0][0]).toBe('mechanism.addBody');
-      expect(spy.mock.calls[0][2]).toMatchObject({ origin: 'mcp', buttonKey: 'mech.body-row:Asset/L1' });
+      expect(spy.mock.calls[0][2]).toMatchObject({ origin: 'mcp' });
+    expect(commandRegistry.buttonKeyOf(spy.mock.calls[0][0], spy.mock.calls[0][1])).toBe('mech.body-row:Asset/L1');
       if (!__RV_HAS_PRIVATE__) {
         expect(res).toEqual({ error: ERR_EDITOR_UNAVAILABLE });
         expect(phases).toEqual([]);
@@ -582,7 +630,7 @@ describe('plan-504 — mechanism bound tools through _handleCall', () => {
   it('world-anchored side A: pickJson + assignBody:false keeps Body A absent; the default assigns the picked part; one undo step each', async () => {
     if (!__RV_HAS_PRIVATE__) return;
     const pickJson = JSON.stringify({ nodePath: 'Asset/L2', worldPosition: [0.1, 0.2, 0], worldNormal: [0, 0, 1] });
-    const kept = await env.call('web_editor_mechanism_set_anchor_snap', {
+    const kept = await bridgeExecuteValue(env.call, 'mechanism.setAnchorSnap', {
       path: 'Asset/J', componentType: 'KinematicJoint', side: 'A', pickJson, assignBody: false,
     });
     expect(kept).toMatchObject({ ok: true, side: 'A', candidate: null, body: null });
@@ -591,7 +639,7 @@ describe('plan-504 — mechanism bound tools through _handleCall', () => {
     expect(rv('Asset/J')['KinematicJoint']['AnchorA']).toBeDefined();
     const opsAfterKeep = env.doc.getSnapshot().opCount;
 
-    const assigned = await env.call('web_editor_mechanism_set_anchor_snap', {
+    const assigned = await bridgeExecuteValue(env.call, 'mechanism.setAnchorSnap', {
       path: 'Asset/J', componentType: 'KinematicJoint', side: 'A', pickJson,
     });
     expect(assigned).toMatchObject({ ok: true, body: 'Asset/L2' });
@@ -611,22 +659,22 @@ describe('plan-504 — mechanism bound tools through _handleCall', () => {
     if (!__RV_HAS_PRIVATE__) return;
     env.viewer.selectionManager.select('Asset/Base'); // has a body
     const ops = env.doc.getSnapshot().opCount;
-    const res = await env.call('web_editor_mechanism_set_mass', { path: 'Asset/L2', massKg: '2' });
+    const res = await bridgeExecuteValue(env.call, 'mechanism.setMass', { path: 'Asset/L2', massKg: '2' });
     expect(res['error']).toBe(NEEDS_BODY);
     expect(env.doc.getSnapshot().opCount).toBe(ops);
-    const ok = await env.call('web_editor_mechanism_set_mass', { path: 'Asset/Base', massKg: '2', comJson: '{"x":0,"y":5,"z":0}' });
+    const ok = await bridgeExecuteValue(env.call, 'mechanism.setMass', { path: 'Asset/Base', massKg: '2', comJson: '{"x":0,"y":5,"z":0}' });
     expect(ok).toMatchObject({ ok: true, path: 'Asset/Base', applied: ['massOverride', 'comOverride'] });
   }, 15000);
 
   it('statics: no body → NEEDS_ALL_BODIES, a body without a valid mass → NEEDS_VALID_MASS (no choreography); an invalid solve → STATICS_INVALID', async () => {
     mountButton(staticsKey('Asset'));
     if (!__RV_HAS_PRIVATE__) {
-      expect(await env.call('web_editor_mechanism_statics', { mechanismPath: 'Asset' })).toEqual({ error: ERR_EDITOR_UNAVAILABLE });
+      expect(await bridgeExecuteValue(env.call, 'mechanism.statics', { mechanismPath: 'Asset' })).toEqual({ error: ERR_EDITOR_UNAVAILABLE });
       return;
     }
     let res: Record<string, unknown> = {};
     let phases = await watchPhases(staticsKey('Asset'), async () => {
-      res = await env.call('web_editor_mechanism_statics', { mechanismPath: 'Asset' });
+      res = await bridgeExecuteValue(env.call, 'mechanism.statics', { mechanismPath: 'Asset' });
     });
     expect(res['error']).toBe(NEEDS_ALL_BODIES);
     expect(phases).toEqual([]);
@@ -634,7 +682,7 @@ describe('plan-504 — mechanism bound tools through _handleCall', () => {
     // Every link has a body now, one of them without a usable mass (source `none`).
     linkOverride = [{}, { hasBody: true, hasMass: false, massSource: 'none' }, { hasBody: true, hasMass: true }];
     phases = await watchPhases(staticsKey('Asset'), async () => {
-      res = await env.call('web_editor_mechanism_statics', { mechanismPath: 'Asset' });
+      res = await bridgeExecuteValue(env.call, 'mechanism.statics', { mechanismPath: 'Asset' });
     });
     expect(res['error']).toBe(NEEDS_VALID_MASS);
     expect(phases).toEqual([]);
@@ -645,7 +693,7 @@ describe('plan-504 — mechanism bound tools through _handleCall', () => {
       redundant: false, channels: [], joints: [],
     } as unknown as MechanismForcesSnapshot;
     phases = await watchPhases(staticsKey('Asset'), async () => {
-      res = await env.call('web_editor_mechanism_statics', { mechanismPath: 'Asset' });
+      res = await bridgeExecuteValue(env.call, 'mechanism.statics', { mechanismPath: 'Asset' });
     });
     expect(res).toMatchObject({ error: STATICS_INVALID, status: 2 });
     expect(phases).not.toContain('afterglow'); // a failed run never glows
@@ -656,7 +704,7 @@ describe('plan-504 — mechanism bound tools through _handleCall', () => {
     const k1 = 'mech.limits-apply:Asset/J#KinematicJoint_1';
     mountButton(k0);
     mountButton(k1);
-    const res = await env.call('web_editor_mechanism_set_limits', {
+    const res = await bridgeExecuteValue(env.call, 'mechanism.setLimits', {
       path: 'Asset/J', componentType: 'KinematicJoint_1', useLimits: true, lower: -10, upper: 10,
     });
     if (!__RV_HAS_PRIVATE__) {
@@ -672,7 +720,7 @@ describe('plan-504 — mechanism bound tools through _handleCall', () => {
 
     // The same rule the Apply button shows: lower >= upper is LIMITS_ORDER, nothing written.
     const ops = env.doc.getSnapshot().opCount;
-    expect(await env.call('web_editor_mechanism_set_limits', {
+    expect(await bridgeExecuteValue(env.call, 'mechanism.setLimits', {
       path: 'Asset/J', componentType: 'KinematicJoint', useLimits: true, lower: 10, upper: 10,
     })).toMatchObject({ error: LIMITS_ORDER });
     expect(env.doc.getSnapshot().opCount).toBe(ops);
@@ -680,24 +728,25 @@ describe('plan-504 — mechanism bound tools through _handleCall', () => {
 
   it('jog without componentType drives the FIRST joint key and targets its row key', async () => {
     const spy = vi.spyOn(commandRegistry, 'execute');
-    const res = await env.call('web_editor_mechanism_jog', { path: 'Asset/J', value: 12 });
-    expect(spy.mock.calls[0][2]).toMatchObject({ origin: 'mcp', buttonKey: 'mech.jog:Asset/J#KinematicJoint' });
+    const res = await bridgeExecuteValue(env.call, 'mechanism.jog', { path: 'Asset/J', value: 12 });
+    expect(spy.mock.calls[0][2]).toMatchObject({ origin: 'mcp' });
+    expect(commandRegistry.buttonKeyOf(spy.mock.calls[0][0], spy.mock.calls[0][1])).toBe('mech.jog:Asset/J#KinematicJoint');
     if (!__RV_HAS_PRIVATE__) {
       expect(res).toEqual({ error: ERR_EDITOR_UNAVAILABLE });
       return;
     }
     expect(res).toEqual({ ok: true, path: 'Asset/J', value: 12, converged: true, residualError: 0 });
     expect(mech.jogCalls).toEqual([{ path: 'Asset/J', componentType: undefined }]);
-    await env.call('web_editor_mechanism_jog', { path: 'Asset/J', value: 5, componentType: 'KinematicJoint_1' });
+    await bridgeExecuteValue(env.call, 'mechanism.jog', { path: 'Asset/J', value: 5, componentType: 'KinematicJoint_1' });
     expect(mech.jogCalls[1]).toEqual({ path: 'Asset/J', componentType: 'KinematicJoint_1' });
   }, 15000);
 
   it('assign_drive: a node without a Drive is refused with the picker\'s rule; a Drive node is written', async () => {
     if (!__RV_HAS_PRIVATE__) return;
-    expect(await env.call('web_editor_mechanism_assign_drive', {
+    expect(await bridgeExecuteValue(env.call, 'mechanism.assignDrive', {
       path: 'Asset/J', componentType: 'KinematicJoint', drivePath: 'Asset/L1',
     })).toMatchObject({ error: NEEDS_DRIVE_NODE });
-    expect(await env.call('web_editor_mechanism_assign_drive', {
+    expect(await bridgeExecuteValue(env.call, 'mechanism.assignDrive', {
       path: 'Asset/J', componentType: 'KinematicJoint', drivePath: 'Asset/Motor',
     })).toMatchObject({ ok: true, path: 'Asset/J', componentType: 'KinematicJoint', drive: 'Asset/Motor' });
   }, 15000);
@@ -713,18 +762,19 @@ describe('web_view_render_mode through _handleCall (plan-761)', () => {
     const spy = vi.spyOn(commandRegistry, 'execute');
     let res: Record<string, unknown> = {};
     const phases = await watchPhases('view.renderMode:simple', async () => {
-      res = await env.call('web_view_render_mode', { mode: 'simple' });
+      res = await bridgeExecuteValue(env.call, 'view.renderMode', { mode: 'simple' });
     });
     expect(spy).toHaveBeenCalledTimes(1);
     expect(spy.mock.calls[0].slice(0, 2)).toEqual(['view.renderMode', { mode: 'simple' }]);
-    expect(spy.mock.calls[0][2]).toMatchObject({ origin: 'mcp', buttonKey: 'view.renderMode:simple' });
+    expect(spy.mock.calls[0][2]).toMatchObject({ origin: 'mcp' });
+    expect(commandRegistry.buttonKeyOf(spy.mock.calls[0][0], spy.mock.calls[0][1])).toBe('view.renderMode:simple');
     expect(res).toEqual({ ok: true, renderMode: 'simple', wireframe: false });
     expect(phases).toEqual(['hover', 'pressed', 'afterglow']);
     // The viewer carries the new mode and the store persisted it (the Visual tab reads it back).
     expect(env.viewer.renderMode).toBe('simple');
     expect(loadVisualSettings().renderMode).toBe('simple');
     // web_status: the VALUE, not just the property.
-    const status = await env.call('web_status', {});
+    const status = await env.call('web_status', { detail: 'render' });
     expect(status).toMatchObject({ renderMode: 'simple', wireframe: false });
   }, 15000);
 
@@ -733,10 +783,10 @@ describe('web_view_render_mode through _handleCall (plan-761)', () => {
     const spy = vi.spyOn(commandRegistry, 'execute');
     let res: Record<string, unknown> = {};
     const phases = await watchPhases('view.renderMode:wireframe', async () => {
-      res = await env.call('web_view_render_mode', { mode: 'wireframe' });
+      res = await bridgeExecuteValue(env.call, 'view.renderMode', { mode: 'wireframe' });
     });
     expect(spy).toHaveBeenCalledTimes(1);
-    expect(res).toEqual({ error: 'mode must be one of simple|default|toon' });
+    expect(res).toEqual({ error: 'mode must be one of simple|default|toon|raytraced' });
     expect(phases).toEqual([]); // the preflight refused: no choreography
     expect(env.viewer.renderMode).toBe('default');
   }, 15000);
@@ -744,16 +794,76 @@ describe('web_view_render_mode through _handleCall (plan-761)', () => {
   it('a locked deployment (lockSettings) refuses with the lock reason — the tooltip text, nothing changes', async () => {
     setAppConfig({ lockSettings: true });
     const spy = vi.spyOn(commandRegistry, 'execute');
-    const res = await env.call('web_view_render_mode', { mode: 'toon' });
+    const res = await bridgeExecuteValue(env.call, 'view.renderMode', { mode: 'toon' });
     expect(spy).toHaveBeenCalledTimes(1);
     expect(res).toEqual({ error: RENDER_MODE_LOCKED });
     expect(commandRegistry.enabled('view.renderMode', { mode: 'toon' }, env.viewer)).toEqual({ reason: RENDER_MODE_LOCKED });
     expect(env.viewer.renderMode).toBe('default');
     // lockedTabs: ['visual'] is the same lock for this command.
     setAppConfig({ lockedTabs: ['visual'] });
-    expect(await env.call('web_view_render_mode', { mode: 'toon' })).toEqual({ error: RENDER_MODE_LOCKED });
+    expect(await bridgeExecuteValue(env.call, 'view.renderMode', { mode: 'toon' })).toEqual({ error: RENDER_MODE_LOCKED });
     expect(env.viewer.renderMode).toBe('default');
   }, 15000);
+
+  // ── plan-762 F15 / §9.14: raytraced under the registry gate ──
+  describe('raytraced (plan-762)', () => {
+    const setCompute = (on: boolean): void => {
+      (env.viewer as unknown as { hasCompute: boolean }).hasCompute = on;
+    };
+    afterEach(() => { registerRaytracedBackend(null); setCompute(false); });
+
+    it('without compute: { ok:false, reason } naming the WebGPU backend, nothing changes', async () => {
+      registerRaytracedBackend(fakeRaytracedBackendFactory);
+      const res = await bridgeExecuteValue(env.call, 'view.renderMode', { mode: 'raytraced' });
+      expect(res).toMatchObject({ error: 'Ray traced needs the WebGPU backend' });
+      expect(res['error']).toBe('Ray traced needs the WebGPU backend');
+      expect(env.viewer.renderMode).toBe('default');
+    }, 15000);
+
+    it('with compute but no backend: { ok:false, reason: RAYTRACED_UNAVAILABLE_MESSAGE }', async () => {
+      setCompute(true);
+      const res = await bridgeExecuteValue(env.call, 'view.renderMode', { mode: 'raytraced' });
+      expect(res).toMatchObject({ error: RAYTRACED_UNAVAILABLE_MESSAGE });
+      expect(env.viewer.renderMode).toBe('default');
+    }, 15000);
+
+    it('with compute AND a backend: switches like any other mode', async () => {
+      setCompute(true);
+      registerRaytracedBackend(fakeRaytracedBackendFactory);
+      const res = await bridgeExecuteValue(env.call, 'view.renderMode', { mode: 'raytraced' });
+      expect(res).toEqual({ ok: true, renderMode: 'raytraced', wireframe: false });
+      expect(env.viewer.renderMode).toBe('raytraced');
+    }, 15000);
+
+    it('a locked deployment keeps the plain lock refusal for raytraced', async () => {
+      setAppConfig({ lockSettings: true });
+      expect(await bridgeExecuteValue(env.call, 'view.renderMode', { mode: 'raytraced' })).toEqual({ error: RENDER_MODE_LOCKED });
+    }, 15000);
+
+    it('web_status carries rendererKind and hasCompute', async () => {
+      expect(await env.call('web_status', { detail: 'render' })).toMatchObject({ rendererKind: 'webgpu-gl', hasCompute: false });
+      setCompute(true);
+      expect(await env.call('web_status', { detail: 'render' })).toMatchObject({ hasCompute: true });
+    }, 15000);
+
+    it('web_status.raytraced: active:false without a backend, the viewer stats with one (F12)', async () => {
+      const idle = (await env.call('web_status', { detail: 'render' }))['raytraced'];
+      expect(idle).toMatchObject({
+        active: false, ready: false, phase: 'idle', historyFrames: 0, targetSamples: 256, pixelBudget: 0.25, lastError: null,
+      });
+      const live = {
+        active: true, ready: true, epoch: 3, bvhBuildMs: 7100, lastUpdateMs: 2, kernelMs: 24, triangles: 1_892_839,
+        instances: 546, historyFrames: 12.5, targetSamples: 256, pixelBudget: 0.25, bounces: 1, cap: null,
+        lastError: null, phase: 'ready',
+      };
+      Object.defineProperty(env.viewer, 'raytracedStats', { value: live, configurable: true });
+      try {
+        expect((await env.call('web_status', { detail: 'render' }))['raytraced']).toEqual(live);
+      } finally {
+        delete (env.viewer as unknown as { raytracedStats?: unknown }).raytracedStats;
+      }
+    }, 15000);
+  });
 });
 
 // ─── plan-591: web_view_visual_preset (view.visualPreset) + web_status ───
@@ -782,12 +892,13 @@ describe('web_view_visual_preset through _handleCall (plan-591)', () => {
     const spy = vi.spyOn(commandRegistry, 'execute');
     let res: Record<string, unknown> = {};
     const phases = await watchPhases('view.visualPreset:Fast', async () => {
-      res = await env.call('web_view_visual_preset', { name: 'Fast' });
+      res = await bridgeExecuteValue(env.call, 'view.visualPreset', { name: 'Fast' });
     });
     expect(spy).toHaveBeenCalledTimes(1);
     expect(spy.mock.calls[0][0]).toBe('view.visualPreset');
     expect(spy.mock.calls[0][1]).toMatchObject({ name: 'Fast' });
-    expect(spy.mock.calls[0][2]).toMatchObject({ origin: 'mcp', buttonKey: 'view.visualPreset:Fast' });
+    expect(spy.mock.calls[0][2]).toMatchObject({ origin: 'mcp' });
+    expect(commandRegistry.buttonKeyOf(spy.mock.calls[0][0], spy.mock.calls[0][1])).toBe('view.visualPreset:Fast');
     expect(res).toMatchObject({ ok: true, name: 'Fast', source: 'shipped' });
     expect(res).toHaveProperty('antialiasNeedsReload');
     // The hover/press pre-choreography lives in the private sibling
@@ -799,20 +910,20 @@ describe('web_view_visual_preset through _handleCall (plan-591)', () => {
     expect(matchPreset(listShippedPresets())).toBe('Fast');
 
     // F7 + F14: both new status fields, by VALUE.
-    const status = await env.call('web_status', {});
+    const status = await env.call('web_status', { detail: 'render' });
     expect(status).toMatchObject({ visualPreset: 'Fast' });
     expect(status['antialiasActive']).toBe(env.viewer.antialiasActive);
   }, 20000);
 
   it('web_status reports visualPreset null on "Custom"', async () => {
-    await env.call('web_view_visual_preset', { name: 'Default' });
+    await bridgeExecuteValue(env.call, 'view.visualPreset', { name: 'Default' });
     saveVisualSettings({ ...loadVisualSettings(), shadowRadius: 4 });
-    expect(await env.call('web_status', {})).toMatchObject({ visualPreset: null });
+    expect(await env.call('web_status', { detail: 'render' })).toMatchObject({ visualPreset: null });
   }, 20000);
 
   it('an unknown name is refused with the rule text, and nothing is applied', async () => {
     const before = JSON.stringify(loadVisualSettings());
-    const res = await env.call('web_view_visual_preset', { name: 'Nope' });
+    const res = await bridgeExecuteValue(env.call, 'view.visualPreset', { name: 'Nope' });
     expect(res['error']).toMatch(/name must be one of/);
     expect(res['error']).toMatch(/Default/);
     expect(JSON.stringify(loadVisualSettings())).toBe(before);
@@ -820,10 +931,10 @@ describe('web_view_visual_preset through _handleCall (plan-591)', () => {
 
   it('a locked deployment refuses with the SAME reason as the render mode', async () => {
     setAppConfig({ lockSettings: true });
-    expect(await env.call('web_view_visual_preset', { name: 'Default' }))
+    expect(await bridgeExecuteValue(env.call, 'view.visualPreset', { name: 'Default' }))
       .toEqual({ error: RENDER_MODE_LOCKED });
     setAppConfig({ lockedTabs: ['visual'] });
-    expect(await env.call('web_view_visual_preset', { name: 'Default' }))
+    expect(await bridgeExecuteValue(env.call, 'view.visualPreset', { name: 'Default' }))
       .toEqual({ error: RENDER_MODE_LOCKED });
   }, 20000);
 
@@ -833,12 +944,42 @@ describe('web_view_visual_preset through _handleCall (plan-591)', () => {
       settings: { maxDpr: 0.5 } as unknown as VisualPreset['settings'],
     });
     // Reachable through the generic path …
-    expect(await env.call('web_view_visual_preset', { name: 'MyOwn', source: 'any' }))
+    expect(await bridgeExecuteValue(env.call, 'view.visualPreset', { name: 'MyOwn', source: 'any' }))
       .toMatchObject({ ok: true, name: 'MyOwn', source: 'local' });
     // … and refused for the fixed rows, with the refusal derived from the
     // SHIPPED list — `enabled()` and `run()` check the very same set.
-    const res = await env.call('web_view_visual_preset', { name: 'MyOwn', source: 'shipped' });
+    const res = await bridgeExecuteValue(env.call, 'view.visualPreset', { name: 'MyOwn', source: 'shipped' });
     expect(res['error']).toMatch(/name must be one of/);
     expect(res['error']).not.toMatch(/MyOwn/);
   }, 20000);
 });
+
+
+it('a batch can disable AI clicks before its next command without advancing timers', async () => {
+  const { setAiClicks, getAiClicks } = await import('../src/core/hmi/ai-click-choreography-store');
+  vi.useFakeTimers();
+  try {
+    const result = await env.call('web_batch', { steps: [
+      { command: 'view.aiClicks', args: { on: false } },
+      { command: 'editor.toGround', args: { path: env.boxPath } },
+    ] });
+    expect(getAiClicks()).toBe(false);
+    expect(result).not.toHaveProperty('error');
+    expect(getButtonSimPhase('qe.to-ground')).not.toBe('hover');
+    expect(getButtonSimPhase('qe.to-ground')).not.toBe('pressed');
+    if (__RV_HAS_PRIVATE__) expect(worldMinY(env.box)).toBeCloseTo(0, 5);
+  } finally { setAiClicks(true); vi.useRealTimers(); }
+});
+
+it('a batch can enable AI clicks before the next command hover', async () => {
+  const { setAiClicks, getAiClicks } = await import('../src/core/hmi/ai-click-choreography-store');
+  setAiClicks(false);
+  try {
+    const phases = await watchPhases('qe.to-ground', () => env.call('web_batch', { steps: [
+      { command: 'view.aiClicks', args: { on: true } },
+      { command: 'editor.toGround', args: { path: env.boxPath } },
+    ] }));
+    expect(getAiClicks()).toBe(true);
+    if (__RV_HAS_PRIVATE__) expect(phases).toContain('hover');
+  } finally { setAiClicks(true); }
+}, 15000);

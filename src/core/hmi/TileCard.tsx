@@ -6,6 +6,7 @@ import { Paper, Box, Typography, IconButton } from '@mui/material';
 import { Warning, Build, Speed, Sensors, OpenInNew, Info, CheckCircle } from '@mui/icons-material';
 import { useViewer } from '../../hooks/use-viewer';
 import { SEVERITY_COLORS, pulseSeverityOutline, type MessageSeverity } from './severity-pulse';
+import { DIVIDER, FIELD_BORDER, FIELD_BORDER_HOVER, FS, ICON_SIZE, INK_HIGH, INK_MID, PANEL_SURFACE } from './shared-sx';
 
 const iconMap: Record<string, React.ReactElement> = {
   warning: <Warning />,
@@ -62,33 +63,36 @@ export function TileCard({ title, subtitle, severity, icon, timestamp, component
 
   return (
     <Paper
-      elevation={4}
+      elevation={0}
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
       onClick={handleClick}
       sx={{
         p: 1.5,
-        borderLeft: `3px solid ${color}`,
+        bgcolor: `${PANEL_SURFACE} !important`,
+        border: `1px solid ${FIELD_BORDER}`,
+        borderRadius: 1,
+        boxShadow: 'none',
         cursor: (componentPath || onAction) ? 'pointer' : 'default',
         pointerEvents: 'auto',
-        '&:hover': { bgcolor: 'rgba(255,255,255,0.04)' },
-        transition: 'background-color 0.15s',
+        '&:hover': (componentPath || onAction) ? { borderColor: FIELD_BORDER_HOVER } : undefined,
+        transition: 'border-color 120ms ease',
       }}
     >
       <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1 }}>
-        <Box sx={{ color, mt: 0.25 }}>
+        <Box sx={{ color, mt: 0.25, display: 'flex', flexShrink: 0, '& .MuiSvgIcon-root': { fontSize: ICON_SIZE.lg } }}>
           {iconMap[icon] || <Speed />}
         </Box>
         <Box sx={{ flex: 1, minWidth: 0 }}>
-          <Typography variant="body2" sx={{ fontWeight: 600, lineHeight: 1.3 }}>
+          <Typography variant="body2" sx={{ color: INK_HIGH, fontSize: FS.body, fontWeight: 600, lineHeight: 1.4 }}>
             {title}
           </Typography>
-          <Typography variant="caption" component="div" sx={{ color: 'text.secondary', mt: 0.25 }}>
+          <Typography variant="caption" component="div" sx={{ color: INK_MID, fontSize: FS.body, lineHeight: 1.5, mt: 0.5, overflowWrap: 'anywhere' }}>
             {subtitle}
           </Typography>
         </Box>
         <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 0.5 }}>
-          <Typography variant="caption" sx={{ color: 'text.secondary', whiteSpace: 'nowrap' }}>
+          <Typography variant="caption" sx={{ color: INK_MID, fontSize: FS.label, fontVariantNumeric: 'tabular-nums', lineHeight: 1.5, whiteSpace: 'nowrap' }}>
             {timestamp}
           </Typography>
           <Box sx={{ display: 'flex', gap: 0.25 }}>
@@ -99,7 +103,11 @@ export function TileCard({ title, subtitle, severity, icon, timestamp, component
         </Box>
       </Box>
       {actions && (
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, mt: 1 }}>
+        <Box sx={{
+          display: 'flex', alignItems: 'center', gap: 0.75, mt: 1, pt: 1,
+          borderTop: `1px solid ${DIVIDER}`,
+          '& .MuiButton-root': { fontSize: FS.label, textTransform: 'none', fontWeight: 500, boxShadow: 'none' },
+        }}>
           {actions}
         </Box>
       )}

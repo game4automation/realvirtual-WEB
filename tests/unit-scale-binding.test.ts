@@ -14,6 +14,7 @@
  * v1 boundary (placements, no document).
  */
 
+import { executeDelegateValue } from './helpers/execute-value';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { unitRig, type UnitRig } from './helpers/unit-scale-rig';
 import { getProblems, resetProblemsForTests } from '../src/core/hmi/problems-store';
@@ -536,9 +537,9 @@ describe('MCP web_signal_bind', () => {
     const { McpSignalBindTools } = await import('../src/plugins/mcp-bridge/rv-mcp-signal-bind-tools');
     const r = fp();
     r.signal('Ball.h', 'PLCOutputFloat', 'm');
-    const viewer = Object.assign(r.viewer, { behaviors: { getActiveBinds: () => [] } });
+    const viewer = Object.assign(r.viewer, { behaviors: { getActiveBinds: () => [] }, modes: { activeMode: 'hmi' } });
     const tools = new McpSignalBindTools(() => viewer);
-    const answer = JSON.parse(await tools.webSignalBind(r.nodePath, '.', 'Position', 'Ball.h')) as Record<string, unknown>;
+    const answer = JSON.parse(await executeDelegateValue(tools, 'signal.bind', { targetId: r.nodePath, componentPath: '.', slot: 'Position', signal: 'Ball.h' })) as Record<string, unknown>;
     expect(answer.error).toBeUndefined();
     expect(answer.persisted).toBe(true);
     expect(answer.unitScale).toEqual({ field: 'Scale', factor: 1000, from: 'm', to: 'mm' });

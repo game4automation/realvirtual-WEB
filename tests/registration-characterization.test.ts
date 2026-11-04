@@ -40,6 +40,10 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import providerSource from '../src/core/library/project-library-provider.ts?raw';
+import projectsProviderSource from '../src/core/library/library-projects-provider.ts?raw';
+import entriesSource from '../src/core/library/project-library-entries.ts?raw';
+import libraryStoreSource from '../src/core/library/library-store.ts?raw';
+import globalProviderSource from '../src/core/library/global-library-provider.ts?raw';
 import dashboardSource from '../src/core/hmi/projects/ProjectsDashboardHost.tsx?raw';
 import { FakeDir, asDirHandle } from './helpers/fake-fs-handles';
 import { FolderBackend } from '../src/core/project/backends/folder-backend';
@@ -459,9 +463,27 @@ describe('plan-717 §2.6 baseline — collections go into library.json and come 
     // that is the better outcome: the loop is closed through the manifest ROW
     // (§2.6), so the provider reads `doc.collections` and the sidecar stays a
     // migration input the catalog layer never learns about.
-    expect(providerSource).not.toContain('library-sidecar');
-    expect(providerSource).not.toContain('resolveAssetMeta');
-    expect(providerSource).toContain('doc.collections');
+    // RE-PINNED after plan-778 P1 (3c7d289c): the row → entry mapping moved out of
+    // the provider into `project-library-entries.ts`, which both catalog providers
+    // (open project, library projects) build on. The boundary is the same, it just
+    // spans several modules now: none of the catalog paths may touch the sidecar
+    // (the two providers, the shared entries module, the scan fallback's
+    // library-store and the global catalog provider - Codex review 2026-11-04),
+    // the shared entries module reads the row's collections, and both providers
+    // get their entries from it rather than from a copy of their own.
+    for (const [name, source] of [
+      ['project-library-provider', providerSource],
+      ['library-projects-provider', projectsProviderSource],
+      ['project-library-entries', entriesSource],
+      ['library-store', libraryStoreSource],
+      ['global-library-provider', globalProviderSource],
+    ] as const) {
+      expect(source, name).not.toContain('library-sidecar');
+      expect(source, name).not.toContain('resolveAssetMeta');
+    }
+    expect(entriesSource).toContain('doc.collections');
+    expect(providerSource).toContain("from './project-library-entries'");
+    expect(projectsProviderSource).toContain("from './project-library-entries'");
   });
 
   it('RE-PINNED in Phase 3: the dashboard writes collections through the STORE only', () => {
@@ -504,7 +526,15 @@ describe('plan-717 §2.7 baseline — the two paths that create bytes without a 
     // `dashboard-documents.test.ts`, R1-T9).
     expect(dashboardSource).not.toContain('createEmptyAsset');
     expect(dashboardSource).not.toContain('sceneStore.createEmpty()');
-    expect(dashboardSource).toContain('createDocument(store, newDocumentNameFor(folder), { folder })');
+    // Re-pinned after ba269119 (2026-10-20, "new document asks for its name
+    // first"): the click decides the folder and proposes the default name in
+    // the prompt; the ONE create call runs on confirm with the folder carried
+    // by the prompt and the name the user confirmed.
+    expect(dashboardSource).toContain(
+      "setAssetDialog({ kind: 'newDocument', relPath: folder, value: newDocumentNameFor(folder) });");
+    expect(dashboardSource).toContain('if (name) createNamedDocument(relPath, name);');
+    expect(dashboardSource).toContain('const created = await createDocument(store, name, { folder });');
+    expect(dashboardSource.match(/createNamedDocument\(/g)).toHaveLength(1);
   });
 
   it('RE-PINNED in Phase 4: applyTreeMove REFUSES a scanned file with no row', async () => {

@@ -68,8 +68,8 @@ import { documentsOf } from './rv-project-documents';
 import {
   sceneFileNameOfPath,
   sceneGlbRelPathFor,
+  type RvDocumentEntry,
   type RvProject,
-  type RvProjectSceneEntry,
 } from './rv-project-types';
 
 /** Coalescing window for folder writes. */
@@ -302,7 +302,7 @@ export class RVProjectFolderWriter {
     this._settingsDirty = false;
 
     const readSceneFn = this._host.readScene ?? readScene;
-    const upserts: RvProjectSceneEntry[] = [];
+    const upserts: RvDocumentEntry[] = [];
     const removeSceneIds: string[] = [];
     const problems: string[] = [];
 
@@ -439,11 +439,10 @@ export class RVProjectFolderWriter {
     return { ok: true };
   }
 
-  private _manifestEntry(id: string): RvProjectSceneEntry | undefined {
+  private _manifestEntry(id: string): RvDocumentEntry | undefined {
     // By ID over the one list (plan-744 F3) — unique, so a section filter
     // could only lose the row.
-    return documentsOf(this._host.getManifest()).find(e => e.id === id) as
-      unknown as RvProjectSceneEntry | undefined;
+    return documentsOf(this._host.getManifest()).find(e => e.id === id);
   }
 
   /**
@@ -477,9 +476,9 @@ export class RVProjectFolderWriter {
 export function sceneEntryOf(
   scene: RvScene,
   relPath: string,
-  previous?: RvProjectSceneEntry,
-): RvProjectSceneEntry {
-  const known: RvProjectSceneEntry = {
+  previous?: RvDocumentEntry,
+): RvDocumentEntry {
+  const known: RvDocumentEntry = {
     id: scene.id,
     name: scene.name,
     path: relPath,

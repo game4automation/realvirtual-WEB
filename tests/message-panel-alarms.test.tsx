@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, render, screen } from '@testing-library/react';
 import { ThemeProvider } from '@mui/material/styles';

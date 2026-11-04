@@ -91,6 +91,17 @@ export interface ProjectsListProps {
   onRemove: (id: string) => void;
   onRenameProject: (id: string) => void;
   onDeleteProject: (id: string) => void;
+  /**
+   * "Regenerate thumbnails" (plan-776 #20) — dispatches the registry command
+   * `project.regenerateThumbnails`. Absent: the menu item is not offered.
+   */
+  onRegenerateThumbnails?: (id: string) => void;
+  /**
+   * The command's availability for a row, asked when the menu opens: `true`,
+   * or the ONE reason the item is disabled (its tooltip, e.g. a read-only
+   * project). Absent means enabled.
+   */
+  regenerateThumbnailsState?: (id: string) => true | { reason: string };
 }
 
 /**
@@ -227,6 +238,8 @@ export function ProjectsList({
   onRemove,
   onRenameProject,
   onDeleteProject,
+  onRegenerateThumbnails,
+  regenerateThumbnailsState,
 }: ProjectsListProps) {
   // Kiosk builds get neither the picker nor the rows — the project they were
   // given is already open, and this screen would only offer ways to leave it.
@@ -315,6 +328,10 @@ export function ProjectsList({
                         onRemove={() => onRemove(row.id)}
                         onRename={() => onRenameProject(row.id)}
                         onDelete={() => onDeleteProject(row.id)}
+                        onRegenerateThumbnails={onRegenerateThumbnails
+                          ? () => onRegenerateThumbnails(row.id)
+                          : undefined}
+                        regenerateThumbnailsState={() => regenerateThumbnailsState?.(row.id) ?? true}
                       />
                     ))}
                   </Stack>
@@ -351,6 +368,8 @@ function ProjectRow({
   onRemove,
   onRename,
   onDelete,
+  onRegenerateThumbnails,
+  regenerateThumbnailsState,
 }: {
   row: ProjectListRow;
   active: boolean;
@@ -359,13 +378,21 @@ function ProjectRow({
   onRemove: () => void;
   onRename: () => void;
   onDelete: () => void;
+  onRegenerateThumbnails?: () => void;
+  regenerateThumbnailsState: () => true | { reason: string };
 }) {
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
   // Remove has no button of its own any more, so the kebab has to exist
   // wherever it is offered. Keyed on `canManage` alone the menu would vanish
   // from a row that may only be unlinked, taking the verb with it.
   const canRemove = !!row.canUnlink;
-  const hasMenu = !!row.canManage || canRemove;
+  // Regenerate thumbnails is offered on EVERY row (plan-776 #20) — on a
+  // read-only one disabled, with the reason as its tooltip, so the bundled
+  // demo says why it cannot instead of hiding the verb.
+  const hasMenu = !!row.canManage || canRemove || !!onRegenerateThumbnails;
+  // Asked when the menu is open, so the answer is the one of this moment.
+  const regenerateState = menuAnchor && onRegenerateThumbnails ? regenerateThumbnailsState() : true;
+  const regenerateReason = regenerateState === true ? null : regenerateState.reason;
   const state = row.state ?? 'ready';
   const missing = state === 'missing';
   const backendBadge = row.hint ? BACKEND_BADGE[row.hint] : undefined;
@@ -545,6 +572,29 @@ function ProjectRow({
             >
               Rename…
             </MenuItem>
+          )}
+          {/* Re-renders every document's picture (plan-776 #20). A refusing
+              item keeps its hover — NOT MUI's `disabled`, which sets
+              `pointer-events: none` and would swallow the tooltip that says
+              why (the same rule as `ActionMenuRow`). */}
+          {onRegenerateThumbnails && (
+            <Tooltip title={regenerateReason ?? ''} placement="left" disableInteractive>
+              <MenuItem
+                aria-disabled={regenerateReason ? 'true' : undefined}
+                onClick={() => {
+                  if (regenerateReason) return;
+                  setMenuAnchor(null);
+                  onRegenerateThumbnails();
+                }}
+                data-testid={`project-regenerate-thumbnails-${row.id}`}
+                sx={{
+                  fontSize: 13,
+                  ...(regenerateReason ? { color: 'text.disabled', cursor: 'default' } : {}),
+                }}
+              >
+                Regenerate thumbnails
+              </MenuItem>
+            </Tooltip>
           )}
           {/* Forgets the link and nothing else. It sits ABOVE Delete and
               without its colour because the two read alike and are not:

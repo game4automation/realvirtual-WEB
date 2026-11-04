@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage, getSessionStorage } from '../rv-safe-storage';
+
 /**
  * prompt-task-store — the browser-side prompt queue of plan-486.
  *
@@ -513,18 +515,18 @@ function probeStorage(storage: PromptStorageLike): boolean {
 function defaultLocal(): PromptStorageLike | null {
   try {
     const probe = '__rv_prompt_probe__';
-    localStorage.setItem(probe, '1');
-    localStorage.removeItem(probe);
-    return localStorage;
+    getLocalStorage()!.setItem(probe, '1');
+    getLocalStorage()!.removeItem(probe);
+    return getLocalStorage()!;
   } catch { return null; }
 }
 
 function defaultSession(): PromptStorageLike | null {
   try {
     const probe = '__rv_prompt_probe__';
-    sessionStorage.setItem(probe, '1');
-    sessionStorage.removeItem(probe);
-    return sessionStorage;
+    getSessionStorage()!.setItem(probe, '1');
+    getSessionStorage()!.removeItem(probe);
+    return getSessionStorage()!;
   } catch { return null; }
 }
 

@@ -1,0 +1,255 @@
+{
+  "startedAt": "2026-10-23T19:11:47.031Z",
+  "url": "http://localhost:5659/spikes/659/demo.html",
+  "simSecondsRequested": 60,
+  "vx": 0.25,
+  "lazyLoad": {
+    "wasmRequestsBeforeActivation": [],
+    "passed": true,
+    "wasmRequestsAfterActivation": [
+      "http://localhost:5659/node_modules/@mujoco/mujoco/mujoco.wasm?import&url",
+      "http://localhost:5659/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm?import&url",
+      "http://localhost:5659/node_modules/@mujoco/mujoco/mujoco.wasm",
+      "http://localhost:5659/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm"
+    ],
+    "jsepRequested": false
+  },
+  "jointsBound": [
+    {
+      "name": "left_hip_yaw",
+      "node": "yaw2roll"
+    },
+    {
+      "name": "left_hip_roll",
+      "node": "hip_l"
+    },
+    {
+      "name": "left_hip_pitch",
+      "node": "upper_leg_left"
+    },
+    {
+      "name": "left_knee",
+      "node": "leg"
+    },
+    {
+      "name": "left_ankle",
+      "node": "ankle_left"
+    },
+    {
+      "name": "neck_pitch",
+      "node": "neck"
+    },
+    {
+      "name": "head_pitch",
+      "node": "neck_pitch"
+    },
+    {
+      "name": "head_yaw",
+      "node": "yaw_roll_motion"
+    },
+    {
+      "name": "head_roll",
+      "node": "jaw_soft"
+    },
+    {
+      "name": "right_hip_yaw",
+      "node": "bearing_roll"
+    },
+    {
+      "name": "right_hip_roll",
+      "node": "hip_l_2"
+    },
+    {
+      "name": "right_hip_pitch",
+      "node": "upper_leg_right"
+    },
+    {
+      "name": "right_knee",
+      "node": "leg_2"
+    },
+    {
+      "name": "right_ankle",
+      "node": "ankle_right"
+    }
+  ],
+  "activationMs": 378,
+  "wasmTransfer": [
+    {
+      "url": "http://localhost:5659/node_modules/@mujoco/mujoco/mujoco.wasm?import&url",
+      "transferSize": 728,
+      "encodedBodySize": 428,
+      "decodedBodySize": 428,
+      "durationMs": 1
+    },
+    {
+      "url": "http://localhost:5659/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm?import&url",
+      "transferSize": 850,
+      "encodedBodySize": 550,
+      "decodedBodySize": 550,
+      "durationMs": 1
+    },
+    {
+      "url": "http://localhost:5659/node_modules/@mujoco/mujoco/mujoco.wasm",
+      "transferSize": 10117877,
+      "encodedBodySize": 10117577,
+      "decodedBodySize": 10117577,
+      "durationMs": 24
+    },
+    {
+      "url": "http://localhost:5659/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm",
+      "transferSize": 13480278,
+      "encodedBodySize": 13479978,
+      "decodedBodySize": 13479978,
+      "durationMs": 59
+    }
+  ],
+  "parity": {
+    "fixtures": 5,
+    "maxObsDelta": 1.1920928955078125e-7,
+    "maxActionDelta": 1.1920928955078125e-7,
+    "maxCtrlDelta": 1.1920928955078125e-7,
+    "perFixture": [
+      {
+        "step": 0,
+        "obs": 0,
+        "action": 1.0151416063308716e-7,
+        "ctrl": 1.1548399925231934e-7
+      },
+      {
+        "step": 1,
+        "obs": 1.1920928955078125e-7,
+        "action": 8.940696716308594e-8,
+        "ctrl": 9.266659617424011e-8
+      },
+      {
+        "step": 10,
+        "obs": 5.960464477539063e-8,
+        "action": 8.940696716308594e-8,
+        "ctrl": 1.043081283569336e-7
+      },
+      {
+        "step": 50,
+        "obs": 4.656612873077393e-10,
+        "action": 1.1920928955078125e-7,
+        "ctrl": 1.1920928955078125e-7
+      },
+      {
+        "step": 150,
+        "obs": 1.1920928955078125e-7,
+        "action": 1.1920928955078125e-7,
+        "ctrl": 1.1920928955078125e-7
+      }
+    ],
+    "ortChain": "onnxruntime-web/wasm 1.27.0",
+    "nodeChainReference": {
+      "obs": 1.192e-7,
+      "action": 0
+    }
+  },
+  "run": {
+    "status": "running",
+    "error": null,
+    "simTimeS": 60.360000000003836,
+    "wallClockS": 60.57929999999702,
+    "realTimeFactor": 0.9963799515677271,
+    "policySteps": 3018,
+    "droppedSimTimeS": 0,
+    "policyStalls": 0,
+    "nonFiniteActions": 0,
+    "staleResults": 0,
+    "backlogS": 0.003999999999993585,
+    "policyLatencyMs": {
+      "samples": 1024,
+      "median": 0.10000000149011612,
+      "p95": 1,
+      "max": 2.5
+    },
+    "frameCostMs": {
+      "samples": 914,
+      "median": 1.8000000044703484,
+      "p95": 3.100000001490116,
+      "max": 7.199999995529652
+    },
+    "costPerSimSecondMs": 29.348906561621803,
+    "costPer60HzFrameMs": 0.48914844269369673,
+    "totalBusyMs": 1771.5000000596046,
+    "frameIntervalMs": {
+      "median": 66.69999999999709,
+      "p95": 83.40000000000146
+    },
+    "fps": 15.000937558597535,
+    "loadMs": {
+      "glb": 41.70000000298023,
+      "libs": 4.5,
+      "world": 360.20000000298023,
+      "policies": 0
+    },
+    "wasmUrls": {
+      "mujoco": "/node_modules/@mujoco/mujoco/mujoco.wasm",
+      "ort": "/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm"
+    },
+    "duck": {
+      "base": [
+        -1.0101950855244097,
+        3.3299389349000803,
+        0.11728111785849414
+      ],
+      "baseHeightM": 0.11728111785849414,
+      "baseHeightMinM": 0.11366963174460493,
+      "distanceM": 3.479797037325762,
+      "displacementXM": -1.0101950855244097,
+      "projectedGravityZ": -0.9995585083961487,
+      "controlSteps": 3018,
+      "simTimeS": 60.36,
+      "activePolicy": "walking",
+      "fallen": false,
+      "fallCount": 0,
+      "recoveries": 0,
+      "finite": true,
+      "contacts": 2,
+      "commandVx": 0.25,
+      "commandVy": 0,
+      "commandYaw": 0
+    },
+    "mirror": {
+      "joints": 14,
+      "skipped": 0
+    }
+  },
+  "screenshot": "E:\\rv-worktrees\\659-webviewer-mujoco-humanoid-spike\\realvirtual-WebViewer~\\spikes\\659\\phase2-screenshot.png",
+  "screenshotCloseup": "E:\\rv-worktrees\\659-webviewer-mujoco-humanoid-spike\\realvirtual-WebViewer~\\spikes\\659\\phase2-screenshot-closeup.png",
+  "recovery": {
+    "base": [
+      0.19904037529931698,
+      0.13256522749321745,
+      0.11779248952440491
+    ],
+    "baseHeightM": 0.11779248952440491,
+    "baseHeightMinM": 0.04625659974470935,
+    "distanceM": 0.23914558440335343,
+    "displacementXM": 0.19904037529931698,
+    "projectedGravityZ": -0.9999234676361084,
+    "controlSteps": 259,
+    "simTimeS": 5.18,
+    "activePolicy": "walking",
+    "fallen": false,
+    "fallCount": 1,
+    "recoveries": 1,
+    "finite": true,
+    "contacts": 2,
+    "commandVx": 0.25,
+    "commandVy": 0,
+    "commandYaw": 0,
+    "recovered": true
+  },
+  "failOff": {
+    "fpsBefore": 25.159667118250578,
+    "fpsAfter": 40.65040650406573,
+    "status": "failed",
+    "error": "Error: injected WASM trap (fail-off test)",
+    "passed": true
+  },
+  "consoleErrors": [],
+  "ok": true,
+  "finishedAt": "2026-10-23T19:12:57.274Z"
+}

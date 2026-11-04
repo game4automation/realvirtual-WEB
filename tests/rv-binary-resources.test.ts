@@ -189,15 +189,20 @@ const rawSources = import.meta.glob('../src/**/*.{ts,tsx}', {
  *    into the viewer. The FMU packages that re-export would drop are taken
  *    from the source bytes and appended again (`embedFmuBufferViews`,
  *    `tests/rv-scene-glb-bake-fmu.test.ts`).
+ *  - `runtime-stage-export.ts` — `USDZExporter.parseAsync` (plan-637 USD live
+ *    link), a WRITE: it serialises the running scene to `.usdz` bytes for Kit
+ *    and parses no GLB.
  */
-const ALLOWED = new Set(['rv-binary-resources.ts', 'rv-import-object.ts', 'rv-scene-glb-bake.ts']);
+const ALLOWED = new Set([
+  'rv-binary-resources.ts', 'rv-import-object.ts', 'rv-scene-glb-bake.ts', 'runtime-stage-export.ts',
+]);
 
 describe('plan-498 lint — every GLB load goes through parseGlbCollectingResources', () => {
   it('the scan is real', () => {
     expect(Object.keys(rawSources).length).toBeGreaterThan(200);
   });
 
-  it('no parseAsync( in src/ outside the wrapper (and the two named writers)', () => {
+  it('no parseAsync( in src/ outside the wrapper (and the named writers)', () => {
     const offenders: string[] = [];
     for (const [path, raw] of Object.entries(rawSources)) {
       const text = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');

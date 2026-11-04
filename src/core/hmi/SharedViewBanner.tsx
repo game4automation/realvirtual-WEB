@@ -40,7 +40,7 @@ export function SharedViewBanner() {
         px: 2,
         py: 0.75,
         bgcolor: 'rgba(21,101,192,0.95)',
-        borderRadius: 2,
+        borderRadius: 1,
         boxShadow: '0 4px 16px rgba(0,0,0,0.4)',
         backdropFilter: 'blur(calc(8px * var(--rv-ui-blur-scale, 1)))',
       }}>

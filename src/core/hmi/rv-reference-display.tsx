@@ -30,6 +30,7 @@ import {
   getSensorRefColor,
 } from './rv-inspector-helpers';
 import { SignalBadge, type SignalDirection } from './rv-signal-badge';
+import { storedReferenceLabel, storedReferenceValue } from '../engine/rv-node-path-rewrite.mjs';
 
 // ── navigateToRef ────────────────────────────────────────────────────────
 
@@ -53,16 +54,36 @@ function resolveReferenceForDisplay(viewer: RVViewer | null, path: string, owner
   return node ? registry.getPathForNode(node) : null;
 }
 
+/** The path a stored reference shows: its path, an address's target path, or its label. */
+function displayPathOf(
+  viewer: RVViewer | null,
+  value: { path?: string; address?: string; unresolvedPath?: string },
+  ownerPath?: string,
+): string {
+  if (typeof value.path === 'string') return value.path;
+  const registry = viewer?.registry;
+  const owner = registry && ownerPath ? registry.getNode(ownerPath) : null;
+  const stored = storedReferenceValue(value);
+  if (registry && owner && stored !== null) {
+    const r = registry.readStoredRef(owner, stored);
+    if (r.status === 'resolved') return registry.getPathForNode(r.node) ?? storedReferenceLabel(value) ?? '';
+  }
+  return storedReferenceLabel(value) ?? '';
+}
+
 // ── ReferenceDisplay ─────────────────────────────────────────────────────
 
 /** Display a ComponentReference — single badge, clickable to navigate. */
-export function ReferenceDisplay({ value, viewer, signalStore, ownerPath }: {
-  value: { type: string; path: string; componentType: string };
+export function ReferenceDisplay({ value: stored, viewer, signalStore, ownerPath }: {
+  value: { type: string; path?: string; address?: string; unresolvedPath?: string; componentType: string };
   viewer: RVViewer | null;
   signalStore: SignalStore | null;
   /** Registry path of the node carrying the reference — scoped resolution (plan-757 F7). */
   ownerPath?: string;
 }) {
+  // plan-769 § 2.7: an address-form reference shows its TARGET's registry path (the
+  // file stores `{ address }`); a kept `unresolvedPath` shows the path it was written as.
+  const value = { ...stored, path: displayPathOf(viewer, stored, ownerPath) };
   const isLinked = resolveReferenceForDisplay(viewer, value.path, ownerPath) !== null;
   const shortName = value.path.split('/').pop() ?? value.path;
   const shortType = value.componentType?.split('.').pop() ?? '';

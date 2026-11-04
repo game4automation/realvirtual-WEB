@@ -13,6 +13,7 @@
  *  - an unknown asset / a signal no instance carries → an error, nothing written;
  *  - `placementsStatus().survival` sums the removal reports of the placed assets.
  */
+import { executeDelegateValue } from './helpers/execute-value';
 import { describe, it, expect, afterEach } from 'vitest';
 import { McpRuntimeTools } from '../src/plugins/mcp-bridge/rv-mcp-runtime-tools';
 import { placementsStatus } from '../src/plugins/mcp-bridge/rv-mcp-scene-ready';
@@ -38,7 +39,7 @@ describe('web_signal_set_* fan-out to every placed instance of an asset (F12)', 
     for (const p of paths) expect(store.getByPath(p)).toBe(55);
 
     // By the asset's root name.
-    const byRoot = JSON.parse(await tools.webSignalSetFloat('MachineSpeed', 77, 'Arburg')) as Record<string, unknown>;
+    const byRoot = JSON.parse(await executeDelegateValue(tools, 'signal.setFloat', { name: 'MachineSpeed', value: 77, asset: 'Arburg' })) as Record<string, unknown>;
     expect(byRoot.error).toBeUndefined();
     expect(byRoot.name).toBe('MachineSpeed');
     expect(byRoot.value).toBe(77);
@@ -52,27 +53,27 @@ describe('web_signal_set_* fan-out to every placed instance of an asset (F12)', 
 
     // By the reference's assetId (`cat:parity-N`) and by the blob url's file stem.
     const assetId = (placed[0].assetRoot.userData.realvirtual as { AssetReference: { assetId: string } }).AssetReference.assetId;
-    const byId = JSON.parse(await tools.webSignalSetFloat('MachineSpeed', 78, assetId)) as Record<string, unknown>;
+    const byId = JSON.parse(await executeDelegateValue(tools, 'signal.setFloat', { name: 'MachineSpeed', value: 78, asset: assetId })) as Record<string, unknown>;
     expect(byId.instances).toBe(2);
     for (const p of paths) expect(store.getByPath(p)).toBe(78);
-    const byKey = JSON.parse(await tools.webSignalSetFloat('MachineSpeed', 79, placed[0].baked!.assetId)) as Record<string, unknown>;
+    const byKey = JSON.parse(await executeDelegateValue(tools, 'signal.setFloat', { name: 'MachineSpeed', value: 79, asset: placed[0].baked!.assetId })) as Record<string, unknown>;
     expect(byKey.instances).toBe(2);
     for (const p of paths) expect(store.getByPath(p)).toBe(79);
 
     // The bool tool takes the same fan-out; a bool value onto a float signal is
     // the store's business — here only the addressing is under test.
-    const bool = JSON.parse(await tools.webSignalSetBool('MachineSpeed', true, 'Arburg')) as Record<string, unknown>;
+    const bool = JSON.parse(await executeDelegateValue(tools, 'signal.setBool', { name: 'MachineSpeed', value: true, asset: 'Arburg' })) as Record<string, unknown>;
     expect(bool.instances).toBe(2);
 
     // Unknown asset / unknown signal: an error, nothing written.
-    const noAsset = JSON.parse(await tools.webSignalSetFloat('MachineSpeed', 1, 'Krauss')) as Record<string, unknown>;
+    const noAsset = JSON.parse(await executeDelegateValue(tools, 'signal.setFloat', { name: 'MachineSpeed', value: 1, asset: 'Krauss' })) as Record<string, unknown>;
     expect(String(noAsset.error)).toContain('Krauss');
-    const noSignal = JSON.parse(await tools.webSignalSetFloat('NoSuchSignal', 1, 'Arburg')) as Record<string, unknown>;
+    const noSignal = JSON.parse(await executeDelegateValue(tools, 'signal.setFloat', { name: 'NoSuchSignal', value: 1, asset: 'Arburg' })) as Record<string, unknown>;
     expect(String(noSignal.error)).toContain('NoSuchSignal');
     expect((noSignal.instances as string[]).length).toBe(2);
 
     // Without `asset` the tool behaves exactly as before (result fields unchanged).
-    const single = JSON.parse(await tools.webSignalSetFloat('MachineSpeed', 5)) as Record<string, unknown>;
+    const single = JSON.parse(await executeDelegateValue(tools, 'signal.setFloat', { name: 'MachineSpeed', value: 5 })) as Record<string, unknown>;
     expect(Object.keys(single).sort()).toEqual(['name', 'previous', 'value']);
 
     // web_status.placements.survival: one distinct asset behind the two instances.
@@ -114,13 +115,13 @@ describe('nested instances are instances — the fan-out and the placement count
 
     // The path is the address (D9): every INSTANCE of the inner asset, nested or not.
     const tools = new McpRuntimeTools(() => viewer);
-    const res = JSON.parse(await tools.webSignalSetFloat('Speed', 7, `cat:${SIGNAL_INNER_URL.split('/').pop()}`)) as Record<string, unknown>;
+    const res = JSON.parse(await executeDelegateValue(tools, 'signal.setFloat', { name: 'Speed', value: 7, asset: `cat:${SIGNAL_INNER_URL.split('/').pop()}` })) as Record<string, unknown>;
     expect(res.error).toBeUndefined();
     expect(res.instances).toBe(4);
     expect((res.written as Array<{ path: string }>).map((w) => w.path).sort()).toEqual([...paths].sort());
     for (const p of paths) expect(store.getByPath(p)).toBe(7);
     // The OUTER asset carries no `Speed` of its own: addressed by the outer asset, the signal is missing in both.
-    const outer = JSON.parse(await tools.webSignalSetFloat('Speed', 8, 'SignalMachine')) as Record<string, unknown>;
+    const outer = JSON.parse(await executeDelegateValue(tools, 'signal.setFloat', { name: 'Speed', value: 8, asset: 'SignalMachine' })) as Record<string, unknown>;
     expect(String(outer.error)).toContain('Speed');
     expect((outer.instances as string[]).length).toBe(2);
 

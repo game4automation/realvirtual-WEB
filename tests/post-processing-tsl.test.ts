@@ -24,6 +24,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import {
   AmbientLight,
+  BoxGeometry,
   Color,
   Mesh,
   MeshBasicMaterial,
@@ -249,5 +250,260 @@ describe('TSL node post-processing (plan-271 Phase 3)', () => {
     expect(pp.useTslPost, 'AO must engage the TSL post path').toBe(true);
     viewer.aoMode = 'off';
     expect(pp.useTslPost).toBe(false);
+  }, VIEWER_TEST_TIMEOUT);
+
+  it('overlay layers are composited inside the pipeline over the graded frame', async () => {
+    handle = await createTestViewer('webgpu-gl');
+    const { viewer } = handle;
+
+    await preloadTslMaterials(createMaterialContext(viewer.rendererKind, viewer.hasCompute));
+    const tsl = getTslMaterials();
+    expect(tsl).not.toBeNull();
+
+    // Red plane (scene) + a green overlay quad on its own layer in the upper
+    // left corner, excluded from the camera like the viewer does for its
+    // overlay layers. The overlay material matches the viewer's overlay
+    // contract (depthTest off).
+    const OVERLAY_LAYER = 5;
+    const { scene, camera } = buildTestScene();
+    camera.layers.disable(OVERLAY_LAYER);
+    const overlay = new Mesh(
+      new PlaneGeometry(0.6, 0.6),
+      new MeshBasicMaterial({ color: 0x00ff00, depthTest: false }),
+    );
+    overlay.position.set(-0.6, 0.6, 1);
+    overlay.layers.set(OVERLAY_LAYER);
+    scene.add(overlay);
+
+    const rt = new WebGLRenderTarget(RT_SIZE, RT_SIZE);
+    const without = new tsl!.TslPostPipeline(viewer.renderer);
+    const withOverlay = new tsl!.TslPostPipeline(viewer.renderer, { overlayLayerMask: 1 << OVERLAY_LAYER });
+    try {
+      expect(without.compositesOverlayLayers).toBe(false);
+      expect(withOverlay.compositesOverlayLayers).toBe(true);
+
+      // Without an overlay pass the camera exclusion hides the quad.
+      const plain = await renderPipelineTo(viewer, without, rt, scene, camera);
+      const plainCorner = pixelAt(plain, 8, 56); // readback is bottom-up → y 56 ≙ top rows
+      expect(plainCorner[1], `overlay layer must stay hidden without the pass, got rgb(${plainCorner})`).toBeLessThan(60);
+
+      // With the overlay pass the quad is composited on top ...
+      const composed = await renderPipelineTo(viewer, withOverlay, rt, scene, camera);
+      const corner = pixelAt(composed, 8, 56);
+      expect(corner[1], `overlay quad must be composited green, got rgb(${corner})`).toBeGreaterThan(150);
+      expect(corner[0], `overlay must cover the frame, got rgb(${corner})`).toBeLessThan(60);
+
+      // ... and the rest of the frame is untouched: the red plane stays red
+      // and the scene background was NOT painted over it by the overlay pass.
+      const centre = pixelAt(composed, 32, 32);
+      const plainCentre = pixelAt(plain, 32, 32);
+      expect(centre[0], `plane must stay red under the overlay pass, got rgb(${centre})`).toBeGreaterThan(80);
+      expect(Math.abs(centre[0] - plainCentre[0]) + Math.abs(centre[1] - plainCentre[1]) + Math.abs(centre[2] - plainCentre[2]),
+        `frame outside the overlay must match the plain pipeline, got rgb(${centre}) vs rgb(${plainCentre})`).toBeLessThan(12);
+      // The background pixel restores the scene background after the pass.
+      expect(scene.background, 'overlay pass must restore scene.background').not.toBeNull();
+    } finally {
+      without.dispose();
+      withOverlay.dispose();
+      rt.dispose();
+    }
+  }, VIEWER_TEST_TIMEOUT);
+
+  // ── plan-763: bloom, status channel + pulse, toon edges ───────────────
+
+  it('bloom bleeds beyond a bright plane, lives in the graph only while enabled (one rebuild per toggle)', async () => {
+    handle = await createTestViewer('webgpu-gl');
+    const { viewer } = handle;
+    await preloadTslMaterials(createMaterialContext(viewer.rendererKind, viewer.hasCompute));
+    const tsl = getTslMaterials();
+    expect(tsl).not.toBeNull();
+
+    // A white plane on a dark background: bloom must lift the background
+    // pixels right outside the plane.
+    const { scene, camera, mesh } = buildTestScene();
+    (mesh.material as MeshBasicMaterial).color.setHex(0xffffff);
+    const pipeline = new tsl!.TslPostPipeline(viewer.renderer);
+    const rt = new WebGLRenderTarget(RT_SIZE, RT_SIZE);
+    try {
+      const base = await renderPipelineTo(viewer, pipeline, rt, scene, camera);
+      const builds0 = pipeline.buildCount;
+      const outside0 = pixelAt(base, 6, 32); // left of the plane (plane spans ~17..46 px)
+      expect(outside0[0], `background should be dark without bloom, got ${outside0}`).toBeLessThan(40);
+
+      pipeline.setBloom(true, 2.0, 0.6, 0);
+      const bloomed = await renderPipelineTo(viewer, pipeline, rt, scene, camera);
+      expect(pipeline.buildCount, 'enabling bloom rebuilds the graph once').toBe(builds0 + 1);
+      const outside1 = pixelAt(bloomed, 6, 32);
+      expect(outside1[0] - outside0[0], `bloom must brighten the pixel next to the plane, got ${outside0} → ${outside1}`).toBeGreaterThan(10);
+
+      // Parameter changes are live uniforms — no rebuild.
+      pipeline.setBloom(true, 0.5, 0.6, 0);
+      await renderPipelineTo(viewer, pipeline, rt, scene, camera);
+      expect(pipeline.buildCount, 'a strength change must not rebuild').toBe(builds0 + 1);
+
+      // Disabling takes the node OUT of the graph and restores the base frame.
+      pipeline.setBloom(false, 0.5, 0.6, 0);
+      const off = await renderPipelineTo(viewer, pipeline, rt, scene, camera);
+      expect(pipeline.buildCount, 'disabling bloom rebuilds once').toBe(builds0 + 2);
+      expect(countDifferingPixels(base, off)).toBeLessThan(5);
+      expect(pipeline.anyEffectActive).toBe(false);
+    } finally {
+      rt.dispose();
+      pipeline.dispose();
+    }
+  }, VIEWER_TEST_TIMEOUT);
+
+  it('status channel outlines with the configured colour and its pulse factor scales the edge', async () => {
+    handle = await createTestViewer('webgpu-gl');
+    const { viewer } = handle;
+    await preloadTslMaterials(createMaterialContext(viewer.rendererKind, viewer.hasCompute));
+    const tsl = getTslMaterials();
+    expect(tsl).not.toBeNull();
+
+    const { scene, camera, mesh } = buildTestScene();
+    (mesh.material as MeshBasicMaterial).color.setHex(0x404040);
+    // Fixed clock: the pulse cosine is evaluated at t = 0 → factor 1.
+    const pipeline = new tsl!.TslPostPipeline(viewer.renderer, { now: () => 0 });
+    const rt = new WebGLRenderTarget(RT_SIZE, RT_SIZE);
+    try {
+      const base = await renderPipelineTo(viewer, pipeline, rt, scene, camera);
+      pipeline.setOutlineStyle('status', {
+        visibleEdgeColor: 0xff0000, hiddenEdgeColor: 0x330000, edgeStrength: 8, edgeThickness: 3, edgeGlow: 0, pulsePeriod: 0,
+      });
+      pipeline.setOutlined('status', [mesh]);
+      expect(pipeline.anyEffectActive).toBe(true);
+      const builds = pipeline.buildCount;
+      const outlined = await renderPipelineTo(viewer, pipeline, rt, scene, camera);
+      let reddish = 0;
+      for (let i = 0; i < outlined.length; i += 4) {
+        if (outlined[i] > outlined[i + 1] + 40 && outlined[i] > outlined[i + 2] + 40) reddish++;
+      }
+      expect(reddish, 'status outline pixels should show the red edge colour').toBeGreaterThan(5);
+
+      // Pulse factor 0 removes the edge without touching the graph.
+      pipeline.setOutlinePulse('status', 0);
+      const pulsedOut = await renderPipelineTo(viewer, pipeline, rt, scene, camera);
+      expect(pipeline.buildCount, 'the pulse is a uniform, never a rebuild').toBe(builds);
+      expect(countDifferingPixels(base, pulsedOut)).toBeLessThan(5);
+
+      // A pulse period hands the factor to the clock: at t = 0 the cosine is 1
+      // and the edge is back at full strength.
+      pipeline.setOutlineStyle('status', { pulsePeriod: 0.6 });
+      const pulsedIn = await renderPipelineTo(viewer, pipeline, rt, scene, camera);
+      expect(countDifferingPixels(base, pulsedIn)).toBeGreaterThan(10);
+    } finally {
+      rt.dispose();
+      pipeline.dispose();
+    }
+  }, VIEWER_TEST_TIMEOUT);
+
+  it('toon edges draw a silhouette from the MRT normal + depth, with AO off and MSAA requested', async () => {
+    handle = await createTestViewer('webgpu-gl');
+    const { viewer } = handle;
+    await preloadTslMaterials(createMaterialContext(viewer.rendererKind, viewer.hasCompute));
+    const tsl = getTslMaterials();
+    expect(tsl).not.toBeNull();
+
+    // A cube in front of a same-coloured plane: no colour edge, only a
+    // depth/normal edge where the cube's silhouette meets the plane.
+    const { scene, camera } = buildTestScene();
+    const cube = new Mesh(new BoxGeometry(0.5, 0.5, 0.5), new MeshBasicMaterial({ color: 0xff0000 }));
+    cube.position.set(0, 0, 1);
+    cube.rotation.set(0.4, 0.6, 0);
+    scene.add(cube);
+    // samples 4 + edges + bloom + AO off: the one combination where MSAA and
+    // the depth read of the edge node meet — it must build and render.
+    const pipeline = new tsl!.TslPostPipeline(viewer.renderer, { samples: 4 });
+    const rt = new WebGLRenderTarget(RT_SIZE, RT_SIZE);
+    try {
+      const base = await renderPipelineTo(viewer, pipeline, rt, scene, camera);
+      const builds0 = pipeline.buildCount;
+
+      pipeline.setToonEdges(true, 1, 1.5, 0.05, 0x0000ff, 100);
+      pipeline.setBloom(true, 0.3, 0.2, 0.9);
+      const edged = await renderPipelineTo(viewer, pipeline, rt, scene, camera);
+      expect(pipeline.buildCount, 'edges + bloom enabled together build once').toBe(builds0 + 1);
+      let bluish = 0;
+      for (let i = 0; i < edged.length; i += 4) {
+        if (edged[i + 2] > edged[i] + 40 && edged[i + 2] > edged[i + 1] + 40) bluish++;
+      }
+      expect(bluish, 'edge pixels should show the blue line colour at the cube silhouette').toBeGreaterThan(5);
+
+      pipeline.setToonEdges(false, 1, 1.5, 0.05, 0x0000ff, 100);
+      pipeline.setBloom(false, 0.3, 0.2, 0.9);
+      const off = await renderPipelineTo(viewer, pipeline, rt, scene, camera);
+      expect(pipeline.buildCount, 'disabling both rebuilds once').toBe(builds0 + 2);
+      expect(countDifferingPixels(base, off)).toBeLessThan(5);
+    } finally {
+      rt.dispose();
+      pipeline.dispose();
+    }
+  }, VIEWER_TEST_TIMEOUT);
+
+  it('FXAA stands in for MSAA only while AO / edges force a single-sample scene pass', async () => {
+    handle = await createTestViewer('webgpu-gl');
+    const { viewer } = handle;
+    await preloadTslMaterials(createMaterialContext(viewer.rendererKind, viewer.hasCompute));
+    const tsl = getTslMaterials();
+    expect(tsl).not.toBeNull();
+
+    // A tilted flat-red cube on a dark background: every silhouette pixel is
+    // either red, background, or — only with some antialiasing — a blend.
+    const { scene, camera, mesh } = buildTestScene();
+    mesh.visible = false;
+    const cube = new Mesh(new BoxGeometry(0.9, 0.9, 0.9), new MeshBasicMaterial({ color: 0xff0000 }));
+    cube.rotation.set(0.5, 0.7, 0.3);
+    scene.add(cube);
+    const blendedPixels = (buf: Uint8Array): number => {
+      let n = 0;
+      for (let i = 0; i < buf.length; i += 4) {
+        const r = buf[i], g = buf[i + 1], b = buf[i + 2];
+        const background = Math.max(r, g, b) < 40;
+        const red = r > 150 && g < 80 && b < 80;
+        if (!background && !red) n++;
+      }
+      return n;
+    };
+    // Edges enabled with amount 0 draw nothing but force the single-sample
+    // pass — the cleanest way to take MSAA away without changing the picture.
+    const edgesOnButInvisible = (p: TslPostPipeline): void => p.setToonEdges(true, 0, 1, 0.05, 0x000000, 100);
+
+    const aliased = new tsl!.TslPostPipeline(viewer.renderer, { samples: 4, postAntialias: 'none' });
+    const auto = new tsl!.TslPostPipeline(viewer.renderer, { samples: 4 });
+    const noAA = new tsl!.TslPostPipeline(viewer.renderer, { samples: 0 });
+    const rt = new WebGLRenderTarget(RT_SIZE, RT_SIZE);
+    try {
+      // MSAA live → no FXAA in the graph.
+      await renderPipelineTo(viewer, auto, rt, scene, camera);
+      expect(auto.postAntialiasActive, 'MSAA live: FXAA stays out of the graph').toBe(false);
+
+      edgesOnButInvisible(aliased);
+      edgesOnButInvisible(auto);
+      edgesOnButInvisible(noAA);
+      const hard = await renderPipelineTo(viewer, aliased, rt, scene, camera);
+      const soft = await renderPipelineTo(viewer, auto, rt, scene, camera);
+      const plain = await renderPipelineTo(viewer, noAA, rt, scene, camera);
+      expect(aliased.postAntialiasActive, 'postAntialias none: no FXAA').toBe(false);
+      expect(auto.postAntialiasActive, 'samples 4 + single-sample pass: FXAA built').toBe(true);
+      expect(noAA.postAntialiasActive, 'samples 0: nothing to stand in for').toBe(false);
+      expect(auto.passes.some((p) => p.bucket === 'post'), 'FXAA node instrumented as post').toBe(true);
+      // The harness GPU does not multisample measurably and the FXAA texture
+      // is sized to the renderer's drawing buffer, not to this 64 px target
+      // (the quad is minified into it), so the pixel claims stay modest: FXAA
+      // changes the frame along the silhouette and never blends less.
+      expect(countDifferingPixels(soft, hard), 'FXAA changes silhouette pixels').toBeGreaterThan(5);
+      expect(blendedPixels(soft), 'FXAA never blends less than the hard frame').toBeGreaterThanOrEqual(blendedPixels(hard));
+      expect(countDifferingPixels(hard, plain), 'postAntialias none equals an unantialiased pipeline').toBeLessThan(5);
+
+      // Edges off again → MSAA is back and FXAA leaves the graph.
+      auto.setToonEdges(false, 0, 1, 0.05, 0x000000, 100);
+      await renderPipelineTo(viewer, auto, rt, scene, camera);
+      expect(auto.postAntialiasActive).toBe(false);
+    } finally {
+      rt.dispose();
+      aliased.dispose();
+      auto.dispose();
+      noAA.dispose();
+    }
   }, VIEWER_TEST_TIMEOUT);
 });

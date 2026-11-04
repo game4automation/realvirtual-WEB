@@ -589,6 +589,8 @@ describe('real Rapier WASM — conveyor origin reset (skips when not installed)'
     try {
       await provider.init();
     } catch {
+      // A missing/unloadable Rapier is a FAILURE whenever the private tree is present (vite define).
+      if (typeof __RV_PHYSICS_REQUIRE_WASM__ !== 'undefined' && __RV_PHYSICS_REQUIRE_WASM__) throw new Error('@dimforge/rapier3d-compat is not usable');
       console.warn('[physics] @dimforge/rapier3d-compat not installed (out-of-band) — skipping');
       return null;
     }

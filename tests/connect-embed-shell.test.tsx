@@ -6,6 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { ThemeProvider } from '@mui/material/styles';
 import { App } from '../src/core/hmi/App';
+import { resetConnectPanelReadinessForTests } from '../src/core/hmi/connect-panel-readiness';
+import { _resetConnectStore } from '../src/core/hmi/connect-store';
 import appSource from '../src/core/hmi/App.tsx?raw';
 import connectEmbedActionsSource from '../src/plugins/connect-embed/connect-embed-actions.ts?raw';
 import { getProjectStore } from '../src/core/project/project-store';
@@ -126,15 +128,27 @@ vi.mock('../src/core/hmi/ViewportFrame', () => ({
 
 vi.mock('../src/core/hmi/TopBar', () => ({ TopBar: () => <div data-testid="full-hmi-top-bar" /> }));
 vi.mock('../src/core/hmi/TitleBar', () => ({ TitleBar: () => <div /> }));
-vi.mock('../src/core/hmi/KpiBar', () => ({ KpiBar: () => <div /> }));
+vi.mock('../src/core/hmi/KpiBar', () => ({
+  KpiBar: () => <div />,
+  KPI_BAR_DEFAULT_RULE: { hiddenIn: [] },
+}));
 vi.mock('../src/core/hmi/MessagePanel', () => ({ MessagePanel: () => <div /> }));
 vi.mock('../src/core/hmi/BottomBar', () => ({ BottomBar: () => <div /> }));
-vi.mock('../src/core/hmi/ConnectPanel', () => ({
-  ConnectPanel: () => <div data-testid="connect-panel" />,
-  // ActivityBar reaches ConnectPanel through AiBridgeGate for the reusable
-  // download affordance; a mock without it fails the whole module import.
-  ConnectDownloadLinks: () => <div data-testid="connect-download-links" />,
-}));
+const connectChunk = vi.hoisted(() => {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  let request!: () => void;
+  const requested = new Promise<void>((done) => { request = done; });
+  return { promise, resolve, requested, request };
+});
+vi.mock('../src/core/hmi/ConnectPanel', async () => {
+  connectChunk.request();
+  await connectChunk.promise;
+  return {
+    ConnectPanel: () => <div data-testid="connect-panel" />,
+    ConnectDownloadLinks: () => <div data-testid="connect-download-links" />,
+  };
+});
 vi.mock('../src/core/hmi/tooltip/TooltipLayer', () => ({ TooltipLayer: () => <div /> }));
 vi.mock('../src/core/hmi/AnchoredPopover', () => ({ AnchoredPopover: () => <div /> }));
 vi.mock('../src/core/hmi/MobileSelectionSheet', () => ({ MobileSelectionSheet: () => <div /> }));
@@ -266,6 +280,8 @@ function renderDemoControls() {
 
 describe('CONNECT embedded minimal shell', () => {
   beforeEach(() => {
+    _resetConnectStore();
+    resetConnectPanelReadinessForTests();
     localStorage.setItem('rv-welcome-dismissed', '1');
     localStorage.removeItem(CONNECT_EMBED_SIGNAL_HINT_SEEN_KEY);
     const config = { ui: { initialContexts: ['connect-embed'] }, sourceUrl: 'https://example.invalid/source' };
@@ -274,8 +290,35 @@ describe('CONNECT embedded minimal shell', () => {
   });
 
   afterEach(() => {
+    connectChunk.resolve(); // idempotent; never leave the controlled import pending
     cleanup();
+    resetConnectPanelReadinessForTests();
     vi.restoreAllMocks();
+  });
+
+  // Must precede any App render that opens CONNECT: the resolved import is cached.
+  it('opens CONNECT in the real embed shell after a delayed implementation import', async () => {
+    const viewer = createActivityBarViewer();
+    viewer.leftPanelManager.open('connect', 360);
+    render(<RVViewerProvider value={viewer as never}><App /></RVViewerProvider>);
+    try {
+      // Controlled signal: observe the request separately from releasing the import.
+      // Bounded, so a missing request rejects into the finally block below (releases the import)
+      // instead of hanging until the test timeout, which would skip the cleanup.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([connectChunk.requested, new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('CONNECT import was never requested')), 5000);
+        })]);
+      } finally { clearTimeout(timer); }
+      expect(screen.queryByTestId('connect-panel')).toBeNull();
+      expect(screen.getByTestId('lazy-panel-loading')).toBeInTheDocument();
+      await act(async () => { connectChunk.resolve(); });
+      expect(await screen.findByTestId('connect-panel')).toBeInTheDocument();
+      expect(screen.queryByTestId('lazy-panel-loading')).toBeNull();
+    } finally {
+      connectChunk.resolve();
+    }
   });
 
   it('renders the CTA without normal HMI chrome in the structural App branch', () => {
@@ -284,7 +327,7 @@ describe('CONNECT embedded minimal shell', () => {
     const minimalStart = appSource.indexOf('function ConnectEmbedMinimalShell()');
     const minimalEnd = appSource.indexOf('interface FullHmiShellProps', minimalStart);
     const minimalBranch = appSource.slice(minimalStart, minimalEnd);
-    expect(minimalBranch).toContain('<ConnectPanel />');
+    expect(minimalBranch).toContain('<ConnectPanelHost />');
     expect(minimalBranch).toContain('<ConnectEmbedGate />');
     expect(minimalBranch).toContain('<ActivityBar entryAllowlist={CONNECT_EMBED_ACTIVITY_BAR_ALLOWLIST} />');
     for (const chrome of ['<TopBar', '<KpiBar', '<BottomBar', '<SharedViewBanner']) {

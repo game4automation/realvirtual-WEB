@@ -17,10 +17,8 @@
  * they need its store and its cloud extension.
  */
 
-import {
-  listLibrarySources,
-  type RegisteredLibrarySource,
-} from './library-source-registry';
+import type { RegisteredLibrarySource } from './library-source-registry';
+import { findLegacyOrigin, type QualifierLike } from './library-origin';
 
 /**
  * Prefix of a project-document catalog id (`project:<path>`, minted by
@@ -34,26 +32,19 @@ export const PROJECT_PLACEMENT_PREFIX = 'project:';
  *
  * It is a SEARCH rather than a parameter threaded through every signature
  * because the planner's real drag channel is an in-memory entry reference
- * (`setDragEntry`), which carries no provenance. The pattern is lifted verbatim
- * from `rv-glb-reference-resolver.resolveThroughLibrary`: iterate the sources,
- * ask each one for the id, take the first that answers.
+ * (`setDragEntry`), which carries no provenance. Since plan-778 it is the LEGACY
+ * search of `library-origin.ts` (`findLegacyOrigin`): canonical ids over every
+ * source in registry order first, then aliases; `hint` is a stored pre-778
+ * qualifier (asked first, never required). A QUALIFIED reference never comes
+ * here — `findQualifiedOrigin` answers it strictly.
  *
  * Never throws — one broken provider must not take the lookup with it.
  */
-export function findRegistryOrigin(assetId: string): RegisteredLibrarySource | null {
-  if (!assetId) return null;
-  let sources: RegisteredLibrarySource[];
-  try {
-    sources = listLibrarySources();
-  } catch {
-    return null;
-  }
-  for (const registered of sources) {
-    try {
-      if (registered.source.getEntry(assetId) !== null) return registered;
-    } catch { /* a source that throws on lookup simply does not own the id */ }
-  }
-  return null;
+export function findRegistryOrigin(assetId: string, hint?: QualifierLike | null): RegisteredLibrarySource | null {
+  // plan-778 F5: the ONE legacy search (`library-origin.ts`) — canonical ids
+  // over every source first, then aliases; a qualified reference never comes
+  // here (`findQualifiedOrigin`).
+  return findLegacyOrigin(assetId, hint);
 }
 
 /**

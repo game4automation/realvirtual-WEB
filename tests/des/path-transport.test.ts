@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { testAddressRegistry } from '../helpers/test-address-registry';
+
+import { componentState, tweenState } from './snapshot-test-utils';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { Object3D, Vector3 } from 'three';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
-import { MaterialFlowAdapter } from '@rv-private/plugins/des/material-flow-adapter';
-import { PathTransport } from '@rv-private/plugins/des/material-flow/PathTransport';
-import { Processing } from '@rv-private/plugins/des/material-flow/Processing';
-import { _resetDesHookCache } from '@rv-private/plugins/des/des-hook-adapter';
-import { resetDESMUCounter, type DESMU } from '@rv-private/plugins/des/rv-des-mu';
+import { DESRunner } from '@rv/plugins/des/des-runner';
+import { MaterialFlowAdapter } from '@rv/plugins/des/material-flow-adapter';
+import { PathTransport } from '@rv/plugins/des/material-flow/PathTransport';
+import { Processing } from '@rv/plugins/des/material-flow/Processing';
+import { _resetDesHookCache } from '@rv/plugins/des/des-hook-adapter';
+import { resetDESMUCounter, type DESMU } from '@rv/plugins/des/rv-des-mu';
 import { RVMovingUnit } from '../../src/core/engine/rv-mu';
 import { getDefaultPathNetwork } from '../../src/core/engine/rv-path-network';
 import {
@@ -79,7 +82,7 @@ function testHost(): BindContextHost {
     on: (event, callback) => events.on(event, callback as never),
     contextMenu: new ContextMenuStore(),
     drives: [] as never,
-    registry: null,
+    registry: null, desAddresses: testAddressRegistry(),
     getPlugin: () => undefined,
   };
 }
@@ -116,7 +119,7 @@ function bind(
     })(),
   });
   Object.assign(self.prop, config);
-  adapter = runner.addInstance(def, self, node);
+  adapter = runner.addInstance(def, self, node, undefined, { desId: node.name + '@' + def.type });
   return { def, self, adapter, node };
 }
 
@@ -214,11 +217,9 @@ describe('PathTransport', () => {
     expect(Object.keys(PathTransport.schema).sort()).toEqual(['capacity', 'speed']);
     const state = line({ speed: 1000, capacity: 1 }, 5);
     const mu = accept(state);
-    const snapshot = JSON.parse(state.runner.snapshotJson()) as {
-      tweens: Array<Record<string, unknown>>;
-    };
+    const snapshot = state.runner.fullSnapshot();
     expect(state.transport.self.prop.travelTime).toBe(5);
-    expect(snapshot.tweens).toEqual([expect.objectContaining({
+    expect(tweenState(snapshot)).toEqual([expect.objectContaining({
       kind: 'path', pathRef: state.pathId, muId: mu.id, fromS: 0, toS: 5, t0: 0, t1: 5,
     })]);
 
@@ -265,10 +266,8 @@ describe('PathTransport', () => {
 
     state.transport.adapter.setFailure(true);
     expect(state.runner.getTweenRegistry().activeCount).toBe(0);
-    const snapshot = JSON.parse(state.runner.snapshotJson()) as {
-      components: Record<string, { frozen?: Array<{ remaining: number; tween?: { pathRef?: string } }> }>;
-    };
-    const frozen = snapshot.components.PathTransport.frozen ?? [];
+    const snapshot = state.runner.fullSnapshot();
+    const frozen = componentState(snapshot, 'PathTransport').frozen ?? [];
     expect(frozen).toHaveLength(2);
     expect(frozen.map((entry) => entry.remaining).sort((a, b) => a - b)).toEqual([7, 9]);
     expect(frozen.every((entry) => entry.tween?.pathRef === state.pathId)).toBe(true);

@@ -39,8 +39,9 @@ import {
 } from '../../core/engine/rv-placement-integrate';
 import { stampPlacementMarkers, type PlacementInstancer } from '../../core/engine/rv-placement-instancer';
 import { syncSignalSubtree } from '../../core/engine/rv-signal-editor-sync';
-import { releasePlacedGroups } from '../../core/engine/rv-placement-integrate';
-import { attachDriveDatasheets } from '../../behaviors/_shared/aas-link';
+import { disposePlacedRoot } from '../../core/engine/rv-placement-integrate';
+import { adoptPlacementIdentity } from '../../core/engine/rv-subtree-instantiate';
+import { visitReferences } from '../../core/engine/rv-node-path-rewrite.mjs';
 import { currentAasLoadGeneration, resolveAasSubtree } from '../aas-resolution';
 import { getActiveAasSource } from '../../core/aas/rv-aas-source';
 import type { SnapPoint, SnapPointRegistry } from '../../core/engine/rv-snap-point-registry';
@@ -243,6 +244,21 @@ export type PlacementRegistrationMode = 'light' | 'full';
 export type PlacementNaming = 'assign' | 'keep';
 
 /** Options for {@link addPlacedToScene}. */
+/**
+ * The `userData.realvirtual.LayoutObject` marker every placement path writes.
+ *
+ * The ONE place `Locked` is decided. Before plan-741 seven call sites hard-coded
+ * `Locked: false`, which made a locked placement impossible to express. `locked`
+ * defaults to `false`, so every existing caller keeps its exact previous payload.
+ */
+export function makeLayoutObject(
+  label: string,
+  catalogId: string,
+  locked = false,
+): { Label: string; CatalogId: string; Locked: boolean } {
+  return { Label: label, CatalogId: catalogId, Locked: locked };
+}
+
 export interface AddPlacedOptions {
   /** See {@link PlacementNaming}. Default `'assign'`. */
   naming?: PlacementNaming;
@@ -266,6 +282,10 @@ export interface AddPlacedOptions {
    *  {@link PlacementRegistrationMode}. Only the layout planner's pending
    *  placeholder passes `'light'`. */
   mode?: PlacementRegistrationMode;
+  /** Place the object as a LOCKED layout instance (`LayoutObject.Locked`), so
+   *  transform/delete actions skip it. Used by reference underlays such as an
+   *  imported DXF hall floor plan (plan-741). Default: false. */
+  locked?: boolean;
 }
 
 /**
@@ -335,14 +355,12 @@ export function assertPlacementNameKept(
 
 /**
  * The planner's `afterNamingScan` hook of the core registration
- * (`integratePlacedContent`): placed library items load outside the main scene
- * loader, so attach the SEW gearmotor AAS to their motor geometry (DriveMesh /
- * DriveRotate / DriveRolls) here, and classify the fresh links straight away —
- * AasLinkPlugin is a model plugin and is NOT loaded while the planner is open,
- * so the placed motors would otherwise stay 'pending' (plan-373 F2b).
+ * (`integratePlacedContent`): classify the AAS links of a placed library item
+ * straight away — AasLinkPlugin is a model plugin and is NOT loaded while the
+ * planner is open, so its links would otherwise stay 'pending' (plan-373 F2b).
+ * Links come only from authored data; nothing is attached by node name.
  */
-function _attachPlacedDatasheets(deps: SceneMutationDeps, clone: Object3D): void {
-  attachDriveDatasheets(clone);
+function _resolvePlacedAas(clone: Object3D): void {
   // plan-596: the same active source as every other AAS surface (project aasx/
   // over the deploy-wide directory), not a base path of its own.
   void resolveAasSubtree(clone, getActiveAasSource(), currentAasLoadGeneration());
@@ -394,8 +412,9 @@ export function adoptPlacedNode(
   id: string,
   label: string,
   catalogId: string,
+  opts?: Pick<AddPlacedOptions, 'locked'>,
 ): void {
-  stampPlacementMarkers(node, id, label, catalogId);
+  stampPlacementMarkers(node, id, label, catalogId, opts?.locked);
   node.traverse((child) => { child.userData._layoutObject = true; });
   // `_originalName` is what RVSource's self-template detection compares
   // against; the placement path captures it before its rename, and an adopted
@@ -451,7 +470,7 @@ export function prepPlacedVisual(
   id: string,
   label: string,
   catalogId: string,
-  opts?: Pick<AddPlacedOptions, 'skipAutoAlign'>,
+  opts?: Pick<AddPlacedOptions, 'skipAutoAlign' | 'locked'>,
 ): void {
   // A BAKED placement arrives MATERIALISED (`PlacementInstancer.materialize`:
   // markers, shadow flags, pivot, overrides, render mode — the one order every
@@ -459,9 +478,14 @@ export function prepPlacedVisual(
   // Virtual / DES nodes and the pending placeholder are not instances of an
   // asset and get their whole visual prep here.
   const materialized = !!placementInstanceOf(deps, clone);
+  if (materialized && opts?.locked) {
+    // The instancer stamps an unlocked marker; a locked placement (plan-741,
+    // e.g. a DXF floor plan underlay) flips it here.
+    stampPlacementMarkers(clone, id, label, catalogId, true);
+  }
   if (!materialized) {
     // Mark layout metadata — ADD alongside existing rv-extras, don't overwrite
-    stampPlacementMarkers(clone, id, label, catalogId);
+    stampPlacementMarkers(clone, id, label, catalogId, opts?.locked);
     clone.traverse((child) => { child.userData._layoutObject = true; });
     // Cast/receive shadows using the same opaque-vs-transparent policy as the
     // static GLB scene (processMeshes) so placed library objects match it.
@@ -483,6 +507,9 @@ export function prepPlacedVisual(
   } else {
     deps.getLayoutRoot().add(clone); // fallback if no model loaded
   }
+  // A live drop was materialised DETACHED: record its nesting under the model
+  // root's placement now (plan-774 — highlight / bounds of the enclosing one).
+  deps.getBakeRegistry?.()?.relinkSubtree(clone);
 
   // Capture the original GLB root name BEFORE the rename (in registerPlaced).
   // RVSource's self-template detection compares the authored `ThisObjectAsMU`
@@ -633,11 +660,18 @@ export function integrateSubtree(
   // F5), the drive list — NO whole-scene BVH rebuild (plan-745 Phase 2c) —
   // placed behaviors and LogicSteps. Phase marks are unchanged.
   const viewer = deps.getViewer();
+  // plan-769 Phase 2 (F11/F12): a planner placement's identity IS its record id —
+  // the id the planner save writes as the reference node's `NodeId`
+  // (`placementExtras`), stable across undo/redo of a removal (the record comes
+  // back with it) and NEW for a duplicate / paste (`_clonePlacement` mints one).
+  // Runtime key only (F17); an authored NodeId (a placement the file holds) wins,
+  // and a root its document already registered keeps the identity it has there.
+  if (!viewer?.registry?.getAddressForNode?.(clone)) adoptPlacementIdentity(clone, id);
   let result: ProcessExtrasResult | null = null;
   if (full && viewer && canIntegratePlacedContent(viewer)) {
     result = integratePlacedContent(viewer, clone, {
       mark: (phase) => prof.mark(phase),
-      afterNamingScan: (root) => _attachPlacedDatasheets(deps, root),
+      afterNamingScan: (root) => _resolvePlacedAas(root),
     });
   } else {
     // LIGHT mode (pending placeholder), or a viewer that isn't fully wired:
@@ -646,7 +680,7 @@ export function integrateSubtree(
     // signal/drive/component side effects.
     if (full) {
       applyNamingScanToPlaced(clone);
-      _attachPlacedDatasheets(deps, clone);
+      _resolvePlacedAas(clone);
     }
     prof.mark('namingScan');
     if (viewer?.registry) {
@@ -901,7 +935,7 @@ export function addSplatPlacedToScene(
   container.userData._layoutId = id;
   container.userData._isSplat = true;
   container.userData._splatUrl = splatUrl;
-  container.userData.realvirtual = { LayoutObject: { Label: label, CatalogId: catalogId, Locked: false } };
+  container.userData.realvirtual = { LayoutObject: makeLayoutObject(label, catalogId) };
   container.name = label;
 
   deps.objectMap.set(id, container);
@@ -913,6 +947,10 @@ export function addSplatPlacedToScene(
     const path = NodeRegistry.computeNodePath(container);
     viewer.registry.registerNode(path, container);
   }
+  // plan-769 Phase 2: like every placement, its identity is its record id —
+  // indexed in the document it was placed into (none when parked outside it).
+  adoptPlacementIdentity(container, id);
+  viewer?.registry?.registerNodeIdInParentDocument?.(container);
 }
 
 /**
@@ -1009,6 +1047,7 @@ export function placeAtSnapPoint(
   const modelRoot = deps.getModelRoot();
   const targetParent = modelRoot ?? deps.getLayoutRoot();
   targetParent.attach(clone);
+  deps.getBakeRegistry?.()?.relinkSubtree(clone); // see addPlacedToScene (plan-774)
 
   // Capture original GLB root name before rename (see addPlacedToScene).
   clone.userData._originalName ??= clone.name;
@@ -1106,115 +1145,25 @@ export function removePlacedFromScene(deps: SceneMutationDeps, id: string): void
   if (gizmo) gizmo.detach();
 
   const viewer = deps.getViewer();
+  let rootPathBeforeUnregister: string | null = null;
 
-  // Planner Signal Linking: dispose this element's relays + live-control state
-  // (mirrors the transport/raycast cleanup below). No-op when feature is off.
-  viewer?.signalBindingManager?.unbindAll(id);
-
-  // Dispose any behavior bound to this placed object (mirrors dispatchPlaced).
-  viewer?.behaviors?.disposeObject(obj);
-
-  // Drop the object's LogicStep roots from the engine (mirrors mergePlacedLogic).
-  viewer?.logicEngine?.removeSubtree(obj);
-
-  // Unregister auxiliary raycast targets we added in addPlacedToScene.
-  if (viewer?.raycastManager) {
-    const rm = viewer.raycastManager;
-    obj.traverse((node) => {
-      if ((node as Mesh).isMesh) rm.removeAuxRaycastTarget(node);
-    });
-  }
-
-  // Capture the root path BEFORE unregistration so the overlay purge below
-  // can find sub-path overlay entries to clean up.
-  const rootPathBeforeUnregister = viewer?.registry?.getPathForNode(obj) ?? null;
-
-  // plan-757 Phase 1b: the placement's nodes leave the viewer-wide group
-  // registry (`integratePlacedContent` merged them in — a group is a NAME,
-  // global to the viewer; `syncSubtreeGroups` walks the WHOLE subtree, nested
-  // content included), and every per-placement listener is told the content
-  // is gone (WebComponent instances, clip tools).
-  //
-  // plan-757 Phase 2 (F4): a nested placement (a reference node inside the
-  // placed asset that became an instance of its own) announced itself with its
-  // OWN `layout-content-added`, so it leaves with its own
-  // `layout-content-removed` — innermost first, the outer root last — and its
-  // own behaviour binds are disposed like the outer root's. Listeners that
-  // clean per subtree (the WebComponent plugin) see the nested roots first and
-  // the outer root as a no-op.
-  const nestedRoots = deps.getBakeRegistry?.()?.instanceRootsUnder(obj).filter((r) => r !== obj) ?? [];
-  if (viewer) {
-    releasePlacedGroups(viewer, obj);
-    for (const nested of nestedRoots) {
-      viewer.behaviors?.disposeObject(nested);
-      viewer.emit?.('layout-content-removed', { root: nested, path: viewer.registry?.getPathForNode(nested) ?? null });
+  // The release of the instance (plan-681 §2.3: the instancer's own books
+  // follow — `placements.release`, which releases the bake registry subtree
+  // too; the bake registry alone only for duck-typed deps without it).
+  const release = (o: Object3D): void => {
+    const placements = deps.getPlacements?.();
+    if (placements) placements.release(o);
+    else deps.getBakeRegistry?.()?.releaseSubtree(o);
+  };
+  const detach = (o: Object3D): void => {
+    // Splat placements: dispose via the splat plugin (handles GPU cleanup)
+    if (o.userData._isSplat && viewer) {
+      const splatPlugin = viewer.getPlugin?.('gaussian-splat') as
+        GaussianSplatPluginApi | undefined;
+      if (splatPlugin) splatPlugin.disposeSplat(o as Group);
+      else if (o.parent) o.parent.remove(o);
+      return;
     }
-    viewer.emit?.('layout-content-removed', { root: obj, path: rootPathBeforeUnregister });
-  }
-
-  // Unregister subtree from NodeRegistry and collect removed paths
-  if (viewer?.registry) {
-    const disposedComponents = disposeComponentsInSubtree(viewer.registry, obj);
-    const removedPaths = viewer.registry.unregisterSubtree(obj);
-
-    // plan-589: the placement's PLC signals leave the SignalStore. The sync
-    // derives "not live" from the registry, so it has to run AFTER
-    // `unregisterSubtree` — and it needs the node objects, which is why `obj`
-    // is still in hand here. Before this, removing a placement left every one
-    // of its signals registered on a dead path, and a later placement of the
-    // same asset collided with the corpse.
-    try {
-      syncSignalSubtree(viewer, obj);
-    } catch (e) {
-      console.warn('[layout-planner] signal release failed for the removed placement:', e);
-    }
-
-    // Filter removed drives out of viewer.drives
-    if (viewer.drives.length > 0 && removedPaths.size > 0) {
-      viewer.drives = viewer.drives.filter(d => {
-        const dPath = viewer.registry!.getPathForNode(d.node);
-        // If path is null, the node was already unregistered → it's a removed drive
-        return dPath !== null;
-      });
-      // The removed drives' chunk meshes leave with the placement root's
-      // release (BakeRegistry) — nothing else to retire.
-    }
-
-    // Filter removed components from transport manager
-    if (viewer.transportManager && removedPaths.size > 0) {
-      const tm = viewer.transportManager;
-      const isRemoved = (component: { node: Object3D }) => {
-        const p = NodeRegistry.computeNodePath(component.node);
-        return removedPaths.has(p);
-      };
-      tm.sensors = tm.sensors.filter(s => !isRemoved(s));
-      tm.surfaces = tm.surfaces.filter(s => !isRemoved(s));
-      // Dispose removed sources so their ghost materials are freed.
-      for (const s of tm.sources) {
-        if (isRemoved(s) && !disposedComponents.has(s)) s.dispose?.();
-      }
-      tm.sources = tm.sources.filter(s => !isRemoved(s));
-      tm.sinks = tm.sinks.filter(s => !isRemoved(s));
-      tm.grips = tm.grips.filter(s => !isRemoved(s));
-      tm.gripTargets = tm.gripTargets.filter(s => !isRemoved(s));
-      // Surfaces changed — invalidate the spatial index + dead-end adjacency
-      // cache (plan-240 F4). The array reassignment above is also caught by
-      // the manager's per-tick reference guard; this makes it explicit.
-      tm.notifyTopologyChanged?.();
-    }
-  }
-
-  // Splat placements: dispose via the splat plugin (handles GPU cleanup)
-  if (obj.userData._isSplat && viewer) {
-    const splatPlugin = viewer.getPlugin?.('gaussian-splat') as
-      GaussianSplatPluginApi | undefined;
-    if (splatPlugin) {
-      splatPlugin.disposeSplat(obj as Group);
-    } else {
-      // Fallback: remove from scene directly
-      if (obj.parent) obj.parent.remove(obj);
-    }
-  } else {
     // Pending placeholder (plan-371): its wireframe geometry, line materials,
     // billboard material and thumbnail texture belong to the placement ALONE —
     // nothing shares them, and nothing else would ever free them.
@@ -1226,21 +1175,33 @@ export function removePlacedFromScene(deps: SceneMutationDeps, id: string): void
     //
     // ⛔ `disposePlaceholderNode`, NOT `disposeSubtree` — the placeholder's
     // Sprite carries three.js' module-wide singleton geometry.
-    if (obj.userData._rvPendingPlaceholder) {
-      disposePlaceholderNode(obj as Group);
-    }
-
+    if (o.userData._rvPendingPlaceholder) disposePlaceholderNode(o as Group);
     // Remove from scene — do NOT dispose geometry/materials here because
     // clones share BufferGeometry/Material references with the ModelCache
     // master. Disposing them would corrupt the cache and all other clones.
-    // GPU cleanup happens in ModelCache.dispose() when the plugin unloads.
-    if (obj.parent) obj.parent.remove(obj);
+    if (o.parent) o.parent.remove(o);
     // A baked instance (plan-753 F11): highlight proxies leave first (the
-    // registry's release listeners), then the refcount drops — the asset
-    // disposes its chunks only at 0 on a retired asset, never here. The ONE
-    // release (plan-757 Phase 2, F4): the nested instances under the root go
-    // with it, innermost first.
-    deps.getBakeRegistry?.()?.releaseSubtree(obj);
+    // registry's release listeners), then the refcount drops. The ONE release
+    // (plan-757 Phase 2, F4): the nested instances under the root go with it,
+    // innermost first.
+    release(o);
+  };
+
+  if (viewer) {
+    // plan-681 §2.3: the core clean-up — signal links, behaviours, LogicEngine,
+    // raycast targets, groups, `layout-content-removed` per instance root
+    // (innermost first), components, registry, SignalStore, drive / IK /
+    // transport lists — lives in ONE place the planner shares with a
+    // structural rebuild (`disposePlacedRoot`). The planner keeps its own parts:
+    // gizmo, splat / placeholder, snaps, overlays, object map.
+    disposePlacedRoot(viewer, obj, {
+      bindingId: id,
+      bakeRegistry: deps.getBakeRegistry?.() ?? null,
+      detach,
+      onRootPath: (p) => { rootPathBeforeUnregister = p; },
+    });
+  } else {
+    detach(obj);
   }
 
   // Unregister snap-points carried by the removed subtree and free the
@@ -1274,4 +1235,67 @@ export function removePlacedFromScene(deps: SceneMutationDeps, id: string): void
   deps.idByObject.delete(obj);
   prof.mark('teardown');
   prof.end({ requestedBvhRebuild });
+}
+
+// ─── plan-769 Phase 2 (D9): the overrides of a duplicated placement ──────
+
+/** One field edit a placement copy inherits (a scene `setField` / `unsetField` payload). */
+export type CopiedOverrideEdit =
+  | { kind: 'setField'; nodePath: string; componentType: string; fieldName: string; value: unknown; prev: unknown }
+  | { kind: 'unsetField'; nodePath: string; componentType: string; fieldName: string; prev: unknown };
+
+/**
+ * The field edits a COPY of a placement inherits (plan-769 F11, D9 — Unity Ctrl+D):
+ * every overlay entry of the source placement (`fromRoot` itself and its content,
+ * keyed by runtime path in the scene op log) re-addressed under `toRoot`. A stored
+ * reference in a copied value that points INTO the source placement follows the copy
+ * (its `fromRoot` prefix becomes `toRoot`); one pointing elsewhere stays. A content
+ * node the copy does not have (yet — a nested placement still materialising) is
+ * skipped. `prev` is the copy's current value (the template's), so undo restores it.
+ * Pure — the caller applies the edits as ops.
+ */
+export function planCopiedOverrides(
+  overlayNodes: Readonly<Record<string, Record<string, Record<string, unknown>>>>,
+  fromRoot: string,
+  toRoot: string,
+  nodeAt: (path: string) => Object3D | null,
+): CopiedOverrideEdit[] {
+  if (!fromRoot || !toRoot || fromRoot === toRoot) return [];
+  const prefix = `${fromRoot}/`;
+  const follow = (path: string): string | null =>
+    path === fromRoot ? toRoot : path.startsWith(prefix) ? toRoot + path.slice(fromRoot.length) : null;
+  const out: CopiedOverrideEdit[] = [];
+  for (const [path, components] of Object.entries(overlayNodes)) {
+    const target = follow(path);
+    if (target === null) continue;
+    const node = nodeAt(target);
+    if (!node) continue;
+    const rv = (node.userData?.realvirtual ?? {}) as Record<string, Record<string, unknown> | undefined>;
+    for (const [componentType, fields] of Object.entries(components ?? {})) {
+      for (const [fieldName, value] of Object.entries(fields ?? {})) {
+        const current = rv[componentType]?.[fieldName];
+        const prev = current === undefined ? undefined : structuredCloneJson(current);
+        if (value === null) {
+          if (current !== undefined) out.push({ kind: 'unsetField', nodePath: target, componentType, fieldName, prev });
+          continue;
+        }
+        const next = structuredCloneJson(value);
+        const bag: Record<string, Record<string, unknown>> = { [componentType]: { [fieldName]: next } };
+        visitReferences(bag, (ref) => {
+          if (ref.kind === 'name' || !ref.path) return;
+          const moved = follow(ref.path);
+          if (moved === null) return;
+          if (ref.kind === 'ref' || ref.record) ref.set({ ...(ref.value as Record<string, unknown>), path: moved });
+          else ref.set(moved);
+        });
+        out.push({ kind: 'setField', nodePath: target, componentType, fieldName, value: bag[componentType]![fieldName], prev });
+      }
+    }
+  }
+  return out;
+}
+
+/** JSON deep copy (overlay values are JSON by contract). */
+function structuredCloneJson<T>(v: T): T {
+  return v === undefined ? v : JSON.parse(JSON.stringify(v)) as T;
 }

@@ -139,6 +139,17 @@ describe('layout-planner/scene-mutations', () => {
       expect(h.modelRoot.children).toContain(clone);
     });
 
+    test('re-links the bake nesting of the clone AFTER parenting it (plan-774)', () => {
+      const h = makeHarness();
+      const clone = makeClone('belt');
+      const parents: (Object3D | null)[] = [];
+      const relinkSubtree = vi.fn((node: Object3D) => { parents.push(node.parent); });
+      h.deps.getBakeRegistry = () => ({ instanceOf: () => null, relinkSubtree }) as never;
+      addPlacedToScene(h.deps, clone, 'id-1', 'Belt', 'cat:belt');
+      expect(relinkSubtree).toHaveBeenCalledWith(clone);
+      expect(parents[0]).toBe(h.modelRoot);
+    });
+
     test('falls back to layoutRoot when no model root is available', () => {
       const h = makeHarness({ withModelRoot: false });
       const clone = makeClone('belt');

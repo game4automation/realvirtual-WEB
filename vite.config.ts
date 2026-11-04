@@ -11,9 +11,15 @@ import { join, resolve, dirname } from 'node:path';
 import { constants as osConstants, hostname, setPriority } from 'node:os';
 import { parsePrivateAssetUrl, resolvePrivateAsset } from './scripts/_rv-private-assets.mjs';
 import { cinematicAssetsPlugin } from './scripts/_rv-cinematic-assets.mjs';
+import { livesyncExtensionPlugin } from './scripts/_rv-livesync-extension.mjs';
 // @ts-expect-error — plain JS Node module, no type declarations by design (scripts/lib).
 import { assetNotFoundGuard } from './scripts/lib/rv-fs.mjs';
 import { createThirdPartyNotices, defaultPolicySpecs, noticesTierFromEnv } from './scripts/vite-plugin-third-party-notices.mjs';
+import { agplAttributionEnabled, agplAttributionPlugin, demoNoticeEnabled, termsGateMode } from './scripts/lib/rv-agpl-attribution.mjs';
+import { testLockProgressPlugin } from './scripts/test-progress-reporter.mjs';
+import { featuresJsonPlugin } from './scripts/vite-plugin-features-json.mjs';
+import { rvFeatureChunksPlugin } from './scripts/gen-feature-chunks.mjs';
+import { devGoldenMiddleware } from './scripts/lib/rv-dev-golden.mjs';
 
 // ─── Private content detection ──────────────────────────────────────────
 const PRIVATE_ROOT_CANDIDATES = [
@@ -25,6 +31,40 @@ const PRIVATE_ROOT = PRIVATE_ROOT_CANDIDATES.find((candidate) => existsSync(reso
 const PRIVATE_DIR = resolve(PRIVATE_ROOT, 'src');
 const HAS_PRIVATE = existsSync(PRIVATE_DIR) && !process.env.VITE_PUBLIC_BUILD;
 console.log(`[rv-build] ${HAS_PRIVATE ? 'Private' : 'Public'} build${process.env.VITE_PUBLIC_BUILD ? ' (forced public via VITE_PUBLIC_BUILD)' : ''}`);
+// plan-680 §2.3 — repo skew is refused, not bridged: DES lives in the core, and a private
+// tree that still carries its own copy would declare the feature a second time (the later
+// `features.define` silently wins). The staged delivery build runs this same config.
+if (HAS_PRIVATE) {
+  const stale = [resolve(PRIVATE_DIR, 'plugins/des'), resolve(PRIVATE_DIR, 'features/des.register.ts')]
+    .filter((p) => existsSync(p));
+  if (stale.length > 0) {
+    throw new Error('repo skew: DES lives in the core since plan-680 — update realvirtual-WebViewer-Private~ '
+      + `(stale: ${stale.join(', ')})`);
+  }
+}
+// NF3: refuse incompatible experiment backend/core pairs before bundling.
+if (existsSync(resolve(PRIVATE_DIR, 'plugins/des-experiments'))) {
+  const versionFile = resolve(PRIVATE_DIR, 'plugins/des-experiments/seam-version.ts');
+  const expected = existsSync(versionFile)
+    ? readFileSync(versionFile, 'utf-8').match(/EXPECTED_SEAM_VERSION\s*=\s*(\d+)/)?.[1] : undefined;
+  const actual = readFileSync(resolve(__dirname, 'src/plugins/des/des-experiment-seam.ts'), 'utf-8')
+    .match(/DES_EXPERIMENT_SEAM_VERSION\s*=\s*(\d+)/)?.[1];
+  if (!expected || expected !== actual) throw new Error(`repo skew: DES experiment seam ${actual}, private expects ${expected ?? 'missing version'}`);
+}
+// plan-679 Phase 9 (D10/D14): the AGPL notice belongs to pure AGPL/community builds only — derived
+// from the build stage (private code compiled in or not), never from a variable anyone can set.
+// RV_COMMERCIAL keeps steering installability only.
+const AGPL_ATTRIBUTION = agplAttributionEnabled({ hasPrivate: HAS_PRIVATE });
+// The public demo's "for evaluation" notice (#rv-demo-notice): private tree AND the explicit flag
+// the demo build mode sets (RV_DEMO_NOTICE=1, never inherited). See rv-agpl-attribution.mjs.
+// Belt and braces against an inherited variable: only a production build (never the dev server)
+// and never a VITE_PRIVATE_BUILD (customer/private deploys) can carry it.
+function demoNoticeFor(command: 'build' | 'serve'): boolean {
+  return demoNoticeEnabled({
+    hasPrivate: HAS_PRIVATE,
+    demoFlag: process.env.RV_DEMO_NOTICE === '1' && command === 'build' && !process.env.VITE_PRIVATE_BUILD,
+  });
+}
 // The generated list of tests that cannot resolve without the private sibling — see the
 // `test.exclude` block far below for what it is for. Read here, lazily and defensively, because
 // this config is ALSO loaded by the staged public build: stageFilteredSourceTree
@@ -260,6 +300,24 @@ function testRunnerPlugin() {
   };
 }
 
+/**
+ * Vite plugin: `POST /__api/dev/golden` — the dev toolbar's "Save snapshot"
+ * (plan-615 F4). Writes a state golden below `e2e/__goldens__/` only; path
+ * checks and the overwrite guard live in `scripts/lib/rv-dev-golden.mjs`.
+ * Serve only — no build carries the route.
+ */
+function devGoldenPlugin() {
+  return {
+    name: 'rv-dev-golden',
+    apply: 'serve' as const,
+    configureServer(server: { middlewares: { use: Function } }) {
+      // The repo directory, not the server root: `e2e/` lives next to this file
+      // whatever directory Vite was started from.
+      server.middlewares.use(devGoldenMiddleware(__dirname));
+    },
+  };
+}
+
 /** Vite plugin: debug API — bidirectional bridge between browser and Claude Code.
  *
  * READ:  Browser pushes state snapshots via POST, Claude Code reads via GET.
@@ -396,63 +454,6 @@ function debugApiPlugin() {
         }
 
         next();
-      });
-    },
-  };
-}
-
-/**
- * Vite plugin: Save library thumbnails to disk.
- * POST /api/library-thumbnail with { catalogId, dataUrl }
- * Writes PNG next to the GLB in public/library/ — the one library root
- * (`LIBRARY_PREFIX`, `public/library/catalog.json`). It used to write into
- * `public/models/library/`, which was the pre-plan-716 nesting and has not been
- * the library path since; thumbnails landed beside nothing.
- */
-function thumbnailSavePlugin() {
-  function readBody(req: { on: Function }): Promise<string> {
-    return new Promise((resolve) => {
-      let body = '';
-      req.on('data', (chunk: string) => { body += chunk; });
-      req.on('end', () => resolve(body));
-    });
-  }
-
-  return {
-    name: 'rv-thumbnail-save',
-    apply: 'serve' as const,
-    configureServer(server: { config: { root: string }; middlewares: { use: Function } }) {
-      server.middlewares.use(async (req: { url?: string; method?: string; on: Function }, res: any, next: Function) => {
-        if (req.url !== '/api/library-thumbnail' || req.method !== 'POST') return next();
-
-        try {
-          const body = JSON.parse(await readBody(req));
-          const { catalogId, dataUrl } = body as { catalogId: string; dataUrl: string };
-          if (!catalogId || !dataUrl) {
-            res.writeHead(400);
-            res.end(JSON.stringify({ error: 'Missing catalogId or dataUrl' }));
-            return;
-          }
-
-          // Convert data URL to buffer
-          const base64 = dataUrl.replace(/^data:image\/png;base64,/, '');
-          const buffer = Buffer.from(base64, 'base64');
-
-          // Save next to GLB: use catalogId as filename stem
-          const filename = catalogId.replace(/[^a-zA-Z0-9_-]/g, '_') + '.png';
-          const outDir = join(server.config.root, 'public/library');
-          mkdirSync(outDir, { recursive: true });
-          const outPath = join(outDir, filename);
-          writeFileSync(outPath, buffer);
-
-          const url = `library/${filename}`;
-          console.log(`[rv-thumbnail] Saved ${outPath}`);
-          res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify({ url }));
-        } catch (e) {
-          res.writeHead(500);
-          res.end(JSON.stringify({ error: String(e) }));
-        }
       });
     },
   };
@@ -673,7 +674,14 @@ function privateModelsPlugin() {
             // Auto-generate AASX index.json on the fly. `listProjectFiles`
             // composes a directory path from `project`, so the one-segment rule
             // has to hold here too — this branch answers before the resolver.
-            if (assetPath === 'aasx/index.json'
+            // plan-682 RR5: only when the project ships NO index of its own. The
+            // generated one keys entries by FILE NAME, the client looks them up
+            // by AAS id — serving it over a real (id-keyed) index made every
+            // link of a private project resolve to `unknown-id` in dev.
+            const shippedIndex = assetPath === 'aasx/index.json'
+              ? resolvePrivateAsset(PRIVATE_PROJECTS_DIR, project, assetPath)
+              : null;
+            if (assetPath === 'aasx/index.json' && !(shippedIndex && existsSync(shippedIndex.path))
               && project !== '.' && project !== '..' && !/[\\/]/.test(project)) {
               const aasxFiles = listProjectFiles(project, 'aasx', '.aasx');
               const index: Record<string, { file: string; idShort: string }> = {};
@@ -978,21 +986,36 @@ export default defineConfig(({ command }) => ({
     privateModelsPlugin(),
     assetNotFoundGuardPlugin(),
     react(),
+    // plan-652: dist/feature-chunks.json — files + bytes per feature adapter/body chunk.
+    rvFeatureChunksPlugin(),
     // VitePWA disabled – no service worker, always fresh content
     versionLabelPlugin(),
     devServerIdentityPlugin(),
     testRunnerPlugin(),
     debugApiPlugin(),
-    thumbnailSavePlugin(),
+    devGoldenPlugin(),
     presetSavePlugin(),
     dracoDecoderPlugin(),
     stripImpeccableLivePlugin(),
     stripInstallManifestPlugin(),
+    // plan-679 Phase 9: removes watermark, noscript source link and JSON-LD licence unless this is
+    // a pure AGPL build. No `apply`: the dev server a customer workspace runs gets the same HTML.
+    agplAttributionPlugin(AGPL_ATTRIBUTION, { demoNotice: demoNoticeFor(command) }),
     // Before the notices plugin: its generateBundle must already see the emitted occt/ files.
     occtLooseFiles.plugin(),
     // Same rule for the cinematic denoiser weights (oidn/*.tza, plan-550).
     cinematicAssets(),
+    // The Isaac Sim extension download (downloads/realvirtual-livesync-<version>.zip, plan-637
+    // Phase 6): define __RV_LIVESYNC_EXT__, dev middleware, build emit.
+    livesyncExtensionPlugin(__dirname),
+    // dist/features.json from generated/features.json, only when it exists (plan-646 Phase 2).
+    featuresJsonPlugin(__dirname),
     thirdPartyNotices.plugin(),
+    // Vitest only (configureVitest hook): startup progress for the test lock wrapper + the
+    // [test-skips] line, appended to whatever reporters config/CLI chose; under vitest its
+    // configureServer hook also watches the deps optimizer for the [test-deps] line
+    // (RV_TEST_STRICT_DEPS). No build or dev-server effect.
+    testLockProgressPlugin(),
   ].filter(Boolean),
   // Worker builds are a SEPARATE Rollup pass that does NOT inherit the main `plugins`.
   // The STEP-import worker (`step-import-worker.ts`) lives in the private sibling folder and
@@ -1031,18 +1054,46 @@ export default defineConfig(({ command }) => ({
       ...(HAS_PRIVATE ? {
         'react/jsx-runtime': resolve(__dirname, 'node_modules/react/jsx-runtime.js'),
         'react/jsx-dev-runtime': resolve(__dirname, 'node_modules/react/jsx-dev-runtime.js'),
+        // plan-661: box2d3-wasm (PRIVATE dependency) exports only `.` and `./utils/*`, and its
+        // `entry.mjs` picks the threaded `deluxe` build inside every Worker. The private loader
+        // (src/physics2d/box2d-loader.ts) imports the two flavour files directly instead.
+        'rv-box2d3-compat': resolve(PRIVATE_ROOT, 'node_modules/box2d3-wasm/build/dist/es/compat/Box2D.compat.mjs'),
+        'rv-box2d3-deluxe': resolve(PRIVATE_ROOT, 'node_modules/box2d3-wasm/build/dist/es/deluxe/Box2D.deluxe.mjs'),
+        // Rapier is a normal PRIVATE dependency (Private~/package.json). THIS entry is the single
+        // source of truth for where it resolves from (the loader, the physics tests and the PROD
+        // build all use the bare name): at the project root the name would hit the transitive
+        // @types/three copy (Rapier 0.12) or nothing, so map it to the private copy (0.19.x: package
+        // root, 0.20+: dist/). tests/rapier-version-guard.node.test.ts pins this entry. If the
+        // private package is not installed there is NO entry, and the import fails loudly.
+        ...((() => {
+          const dir = resolve(PRIVATE_ROOT, 'node_modules/@dimforge/rapier3d-compat');
+          const file = ['rapier.mjs', 'dist/rapier.mjs'].map((f) => resolve(dir, f)).find((f) => existsSync(f));
+          return file ? { '@dimforge/rapier3d-compat': file } : {};
+        })()),
       } : {}),
     },
   },
   define: {
+    __RV_TERMS_GATE__: JSON.stringify(termsGateMode({
+      command,
+      hasPrivate: HAS_PRIVATE,
+      demoFlag: process.env.RV_DEMO_NOTICE === '1',
+      privateBuild: !!process.env.VITE_PRIVATE_BUILD,
+      customerWorkspace: existsSync(resolve(__dirname, '..', 'delivery-manifest.json')),
+      isTest: !!process.env.VITEST,
+    })),
     __RV_HAS_PRIVATE__: JSON.stringify(HAS_PRIVATE),
-    // plan-467 F15 test gate: with RV_PHYSICS_REQUIRE_WASM=1 the real-WASM
-    // physics suites must NOT skip when @dimforge/rapier3d-compat (out-of-band)
-    // is missing — a skip there would hide exactly the cases the plan cares
-    // about. A `define` rather than an env var because the suites run in
-    // browser mode, where only VITE_-prefixed env vars would be visible.
-    // Statically `false` in every build, so nothing survives into a bundle.
-    __RV_PHYSICS_REQUIRE_WASM__: JSON.stringify(process.env.RV_PHYSICS_REQUIRE_WASM === '1'),
+    // plan-467 F15 test gate, default ON: the real-WASM physics suites must NOT skip when
+    // @dimforge/rapier3d-compat cannot be loaded - a skip there hides exactly the cases the plan
+    // cares about (and hid the whole Rapier 0.20 breakage). Required whenever the private tree is
+    // present; the only explicit environment skip is a run without it (RV_NO_PRIVATE=1 /
+    // VITE_PUBLIC_BUILD), or RV_PHYSICS_REQUIRE_WASM=0 for a deliberate local opt-out.
+    // A `define` rather than an env var because the suites run in browser mode, where only
+    // VITE_-prefixed env vars would be visible. Statically replaced; nothing survives into a bundle.
+    __RV_PHYSICS_REQUIRE_WASM__: JSON.stringify(
+      process.env.RV_PHYSICS_REQUIRE_WASM === '1' ||
+        (HAS_PRIVATE && process.env.RV_NO_PRIVATE !== '1' && process.env.RV_PHYSICS_REQUIRE_WASM !== '0'),
+    ),
     // plan-501 SOL R2 #3 — same gate for the kinematic mechanism solver: with
     // RV_SOLVER_REQUIRE_WASM=1 a missing rv_kinematic_solver.wasm is a FAILURE in
     // the solver suites (tests/helpers/require-solver.ts), not a quiet skip. A
@@ -1052,14 +1103,27 @@ export default defineConfig(({ command }) => ({
     // measurement run only with RV_PLAN501_ACCEPTANCE=1 — red until Simon's numeric reference
     // arrives (plan-501 open:), load-dependent for the measurement. Statically false in every build.
     __RV_PLAN501_ACCEPTANCE__: JSON.stringify(process.env.RV_PLAN501_ACCEPTANCE === '1'),
+    // plan-612 Phase 6: long-run knobs of the PalletYard soak tests (browser mode, hence a define):
+    // RV_SOAK_DAYS=7 runs the FastForward soak for a week, RV_SOAK_ANIMATED_SEC=3600 the Animated
+    // run for an hour. 0 = the test default. Statically 0 in every build.
+    __RV_SOAK_DAYS__: JSON.stringify(Number(process.env.RV_SOAK_DAYS) || 0),
+    __RV_SOAK_ANIMATED_SEC__: JSON.stringify(Number(process.env.RV_SOAK_ANIMATED_SEC) || 0),
     __RV_EMBED__: 'false',
     __RV_COMMERCIAL__: JSON.stringify(!!process.env.RV_COMMERCIAL),
+    // plan-679 Phase 9: true exactly in a pure AGPL/community build (no private tree).
+    __RV_AGPL_ATTRIBUTION__: JSON.stringify(AGPL_ATTRIBUTION),
     // Internal/dev-only features (DES, IK solver, STEP import, layout cloud, …).
     // Dev server (and vitest, which runs in serve mode) always ON; production
     // builds only with RV_INTERNAL=1. Customer deploys (stagePrivateProject /
     // deploy:private) never set it, so Rollup eliminates the gated dynamic
     // import in internal code paths and its chunks never reach the bundle.
     __RV_INTERNAL__: JSON.stringify(command === 'serve' || !!process.env.RV_INTERNAL),
+    // plan-646 F14: the welcome window of the public demo. True only when bunny-deploy builds
+    // `--demo` for the effective target path `demo` — runBuild() then sets RV_DEMO_WELCOME
+    // explicitly to '1' or '0' for every staged build, never inheriting it. Default false, so
+    // the gated dynamic import in the private demo-welcome adapter is dead code everywhere else
+    // and Rollup emits no chunk for the window.
+    __RV_DEMO_WELCOME__: JSON.stringify(process.env.RV_DEMO_WELCOME === '1'),
     __RV_VERSION__: JSON.stringify(RV_VERSION),
     __RV_WEB_BUILD__: JSON.stringify(RV_WEB_BUILD),
     __RV_COMMIT__: JSON.stringify(RV_COMMIT),
@@ -1095,8 +1159,28 @@ export default defineConfig(({ command }) => ({
     // instances, and the second instance re-runs its component registration
     // against a core that already has them → uncaught "axisPointer
     // CartesianAxisPointer exists". Pinning keeps a single echarts instance.
+    // A dependency still missing here shows up in every vitest run as the
+    // `[test-deps] undeclared dependency discovered mid-run: <dep>` line
+    // (scripts/test-progress-reporter.mjs; RV_TEST_STRICT_DEPS=fail makes it red).
     include: [
+      // MUI and emotion MUST be pinned, for the same reason echarts is pinned
+      // below: they have to land in ONE optimizer run. When the dependency scan
+      // is incomplete — a single unresolvable import anywhere in the graph
+      // aborts it, including one from the private tree — Vite discovers them
+      // lazily instead and can end up with TWO @emotion/react instances
+      // ("You are loading @emotion/react when it is already loaded"). The
+      // ThemeProvider then writes into one instance's ThemeContext while every
+      // styled component reads the other's, so all of MUI silently falls back
+      // to its DEFAULT LIGHT theme: white Paper surfaces and, because the
+      // default theme also carries fontSize 14 instead of 13 and no Inter,
+      // a visibly shifted layout. Pinning keeps a single instance regardless.
+      '@mui/material',
+      '@mui/material/styles',
+      '@mui/icons-material',
+      '@emotion/react',
+      '@emotion/styled',
       'read-excel-file',
+      'meshoptimizer',
       'monaco-editor/esm/vs/editor/editor.api',
       // The PUBLIC Monaco loaders (script editor, JSON field editor — plan-555)
       // import the package ROOT (it carries the TS / JSON language services);
@@ -1118,9 +1202,68 @@ export default defineConfig(({ command }) => ({
       // imports these; discovering one mid-session re-optimizes and RELOADS the page — in the
       // middle of a recording (seen with Pass.js in the first CLI smoke).
       'three-mesh-bvh/webgpu',
+      // plan-767 run 4 (private, lazy): the ray traced TLAS worker builds with three-mesh-bvh's own
+      // buildPackedTree — first discovered on the first TLAS rebuild, i.e. mid-simulation.
+      'three-mesh-bvh/src/core/build/buildTree.js',
       'three/webgpu',
       'three/tsl',
       'three/examples/jsm/postprocessing/Pass.js',
+      // Teams SDK, lazily imported in src/main.ts — its first discovery mid-run re-optimized and
+      // reloaded the page ("Vite unexpectedly reloaded a test", plan-602 acceptance 2026-10-15, plan-569).
+      '@microsoft/teams-js',
+      // Named only by the vi.mock() in tests/rv-fpv-plugin.test.ts — discovered mid-run in the full
+      // browser suite (2026-10-16: "new dependencies optimized" → "optimized dependencies changed.
+      // reloading"). Same class of fix as teams-js above.
+      'three/addons/controls/PointerLockControls.js',
+      // plan-764 (@rv-private, lazy): the USD export imports USDZExporter, the USD import provider
+      // imports USDLoader (USDZLoader above is no longer the specifier it imports). Unlisted, each
+      // re-optimized mid-run — red under RV_TEST_STRICT_DEPS=fail (full suite 2026-10-16).
+      'three/examples/jsm/exporters/USDZExporter.js',
+      'three/examples/jsm/loaders/USDLoader.js',
+      // Browser-vitest CHILDREN of node tests (tests/des/_child-vitest.ts) keep their generated test file
+      // under node_modules/.<name>/, which Vite's dependency scan skips - so on a cold optimizer cache the
+      // whole app graph was discovered lazily, after the first test ("[test-deps] 39 mid-run
+      // re-optimizations" -> exit 1 although every test passed). Pinned here, a cold child
+      // pre-bundles them before its first test. Same remedy as every entry above.
+      '@mui/icons-material/AccountTree',
+      '@mui/icons-material/Add',
+      '@mui/icons-material/ArrowDownward',
+      '@mui/icons-material/ArrowForward',
+      '@mui/icons-material/ArrowUpward',
+      '@mui/icons-material/Bolt',
+      '@mui/icons-material/Check',
+      '@mui/icons-material/ChevronLeft',
+      '@mui/icons-material/ChevronRight',
+      '@mui/icons-material/Close',
+      '@mui/icons-material/ContentCopy',
+      '@mui/icons-material/DragIndicator',
+      '@mui/icons-material/ErrorOutline',
+      '@mui/icons-material/ExpandMore',
+      '@mui/icons-material/FileUploadOutlined',
+      '@mui/icons-material/GridViewOutlined',
+      '@mui/icons-material/HourglassEmpty',
+      '@mui/icons-material/InfoOutlined',
+      '@mui/icons-material/Link',
+      '@mui/icons-material/LinkOff',
+      '@mui/icons-material/Public',
+      '@mui/icons-material/PushPin',
+      '@mui/icons-material/Remove',
+      '@mui/icons-material/Search',
+      '@mui/icons-material/SettingsInputComponent',
+      '@mui/icons-material/SlideshowOutlined',
+      '@mui/icons-material/Speed',
+      '@mui/icons-material/TouchApp',
+      '@mui/icons-material/ViewQuiltOutlined',
+      '@mui/icons-material/WarningAmber',
+      '@mui/utils',
+      'fuse.js',
+      'mqtt',
+      'react-dom/client',
+      'three/addons/lines/Line2.js',
+      'three/addons/lines/LineGeometry.js',
+      'three/addons/lines/LineMaterial.js',
+      'three/addons/lines/LineSegments2.js',
+      'three/addons/lines/LineSegmentsGeometry.js',
     ],
     // three-mesh-bvh/worker (lazily imported by rv-bvh-build-port.ts) MUST be
     // excluded, not included: pre-bundling relocates the module to
@@ -1132,23 +1275,29 @@ export default defineConfig(({ command }) => ({
     // module from node_modules source so import.meta.url resolves correctly,
     // AND avoids the mid-session reload just the same (excluded deps are
     // never optimized, so their discovery cannot trigger a re-bundle).
-    // @dimforge/rapier3d-compat (plan-276) is an OUT-OF-BAND dependency (not
-    // in package.json — Omniverse pattern §2.8): the private Rapier loader
-    // contains a PROD-only literal dynamic import that the dev optimizer
-    // would otherwise discover and re-bundle on every physics test run
-    // (esbuild "build was canceled" churn). In dev/vitest the loader uses the
-    // /node_modules URL import, so the package must never be optimized.
+    // @dimforge/rapier3d-compat (plan-276): the private Rapier loader's literal dynamic import
+    // (aliased to the Private~ copy, see resolve.alias) would otherwise be discovered by the dev
+    // optimizer and re-bundled on every physics test run (esbuild "build was canceled" churn),
+    // so the package must never be optimized.
     // three-gpu-pathtracer / oidn-web (plan-550) live in the PRIVATE package's node_modules and
     // are imported lazily by the cinematic renderer: discovering them mid-session would re-optimize
     // and RELOAD the page — in the middle of a cinematic recording. Excluded, they are served as
     // the plain ESM they ship as; their own `three` / `three-mesh-bvh` imports resolve to the
     // main project's copies (privateResolverPlugin).
     // @petamoriken/float16 is oidn-web's only dependency and lives next to it (private node_modules).
-    exclude: ['three-mesh-bvh/worker', '@dimforge/rapier3d-compat', 'three-gpu-pathtracer', 'oidn-web', '@petamoriken/float16'],
+    // box2d3-wasm (plan-661) is a lazy private WASM dependency: never pre-bundled (its glue resolves
+    // the .wasm via `new URL(..., import.meta.url)`, which pre-bundling would break).
+    exclude: ['three-mesh-bvh/worker', '@dimforge/rapier3d-compat', 'three-gpu-pathtracer', 'oidn-web', '@petamoriken/float16', 'box2d3-wasm', 'rv-box2d3-compat', 'rv-box2d3-deluxe'],
   },
   server: {
     host: true,
-    open: true,
+    // Open the browser only for a person running `npm run dev`. A dev server started by an agent
+    // (Claude Code sets CLAUDECODE=1 in its shells) or by CI must never open the user's default
+    // browser: on 2026-10-22 an agent's worktree server opened Chrome, whose GPU process grew to
+    // 7 GB and starved the machine. RV_VITE_OPEN=1 forces it on, RV_VITE_OPEN=0 forces it off.
+    open: process.env.RV_VITE_OPEN
+      ? process.env.RV_VITE_OPEN === '1'
+      : !process.env.CLAUDECODE && !process.env.CI,
     https: !!process.env.HTTPS,
     // Only present when CONNECT started this server (see RV_HMR_CLIENT_PORT above). Spreading an
     // empty object keeps the shipped default — no `hmr` key at all, client follows window.location —
@@ -1180,8 +1329,20 @@ export default defineConfig(({ command }) => ({
       },
     },
     watch: {
-      usePolling: true,
-      interval: 100,
+      // Native fs events, NOT polling. `usePolling: true, interval: 100` stat'ed
+      // every watched file ten times a second and kept an idle dev server at
+      // 0.2-0.5 cores in a bare checkout and 1-2 cores in a full one (private
+      // repo, dist*, .runtime) — measured 2026-10-26: polling 18-47 %, native
+      // ~4 % of one core, HMR on src/ unchanged. Re-enable polling locally only
+      // for a filesystem without change events (WSL /mnt, network share) via
+      // CHOKIDAR_USEPOLLING=1.
+      usePolling: false,
+      // `atomic` MUST stay off. chokidar enables it by default whenever it does
+      // not poll, and in atomic mode it ignores every path ending in `~` (vim
+      // backup files) — which is this project's own root, `realvirtual-WebViewer~`.
+      // With it on the watcher saw nothing under the root: no HMR, and a reload
+      // kept serving the stale transform (2026-10-30, Vincent's machine).
+      atomic: false,
       // A folder-backed PROJECT can live inside the checkout during
       // development — asset-editor saves write files there and must NOT trigger
       // a dev-server full reload. (The `LocalFolderTest/` entry that used to
@@ -1190,7 +1351,13 @@ export default defineConfig(({ command }) => ({
       // nesting and a dev checkout can still hold that scratch folder (Custom/,
       // imports/, .thumbnails/ — all gitignored). Un-ignoring it would make an
       // old local folder start triggering full reloads.
-      ignored: ['**/public/library/**', '**/public/models/library/**'],
+      // Build outputs (dist/, dist-*/) and runtime/smoke scratch (.runtime/,
+      // .smoke/) are written by builds and CONNECT, never imported by the dev
+      // server — watching them only costs CPU and fires reloads mid-build.
+      ignored: [
+        '**/public/library/**', '**/public/models/library/**',
+        '**/dist/**', '**/dist-*/**', '**/.runtime/**', '**/.smoke/**',
+      ],
     },
   },
   build: {
@@ -1214,6 +1381,11 @@ export default defineConfig(({ command }) => ({
     // in tests/mechanism-tier.node.test.ts search `.js` and `.map`, and the JS
     // alone keeps them non-vacuous.
     sourcemap: process.env.RV_SOURCEMAP === '1' ? 'hidden' : false,
+    // The /dev build profile (RV_DEV_FAST_BUILD=1, set only by `bunny-deploy --dev-fast` → runBuild
+    // devFast, i.e. only for the watcher's /dev deploys): no gzip-size report — Vite would gzip
+    // every emitted chunk just to print a column nobody reads in a deploy log. Every other build
+    // (/demo, customer deliveries, local `npm run build`) is unchanged.
+    reportCompressedSize: process.env.RV_DEV_FAST_BUILD !== '1',
     rollupOptions: {
       output: {
         // `/*!` + `@license` marks this as a LEGAL comment. Without those two
@@ -1243,6 +1415,11 @@ export default defineConfig(({ command }) => ({
     // cores but one), so the machine stays usable during a full run.
     // RV_TEST_MAX_WORKERS overrides it — a count (`4`) or a share (`100%`).
     maxWorkers: process.env.RV_TEST_MAX_WORKERS || '75%',
+    // plan-606: machine-wide test lock. Under `npm test` the wrapper
+    // (scripts/with-test-lock.mjs) holds it and the guard only checks; a direct
+    // `npx vitest run` takes it here. ROOT ONLY — never in a project, never via
+    // `extends: true`.
+    globalSetup: ['./tests/global-lock-guard.ts'],
     // Tests for private-only subsystems (the CAD importers: STEP, JT, USD, Onshape)
     // live in the private sibling so the public mirror does not carry the shape of
     // modules it cannot build. The glob matches nothing in a public-only checkout.
@@ -1264,6 +1441,9 @@ export default defineConfig(({ command }) => ({
       // `node:crypto` import fails them all ("externalized for browser
       // compatibility"). They run, and pass, under `npm run test:node`.
       '../realvirtual-WebViewer-Private~/tests/**/*.node.test.ts',
+      // WebGPU quarantine fixtures (plan-602 F9): run only as vitest children of
+      // tests/quarantine.node.test.ts, in Node — never in the browser suite.
+      'tests/fixtures/quarantine/**',
       ...privateDependentTestExcludes(),
     ],
     browser: {

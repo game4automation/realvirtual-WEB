@@ -42,7 +42,7 @@ import { bakeIntoGlb } from '../hmi/scene/rv-scene-glb-bake';
 import { materialise } from '../hmi/scene/rv-scene-edits';
 import type { ProjectBackend } from './backends/project-backend';
 import { isEmptyClassification, type DocumentClassification } from './rv-document-classification';
-import type { RvDocumentEntry, RvProjectSceneEntry } from './rv-project-types';
+import type { RvDocumentEntry } from './rv-project-types';
 import type { SceneRevision } from './rv-scene-record';
 
 /** A resolver that locates nothing — there are no node edits to place. */
@@ -110,7 +110,7 @@ export async function writeDocumentClassification(
       meta: {
         ...doc,
         ...(next ? { classification: next } : { classification: undefined }),
-      } as RvProjectSceneEntry,
+      } satisfies RvDocumentEntry,
     },
     baked.glb,
     // The revision of what was just read: whoever replaced it in the meantime

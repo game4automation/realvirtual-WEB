@@ -108,6 +108,10 @@ function makeMockSelf(opts: {
     transfer: (mu: MU, from?: Port) => { transfers.push({ mu, from }); },
     spawn: (): MU => ({ id: ++muId, prop: {} }),
     downstreamCanAccept: () => opts.canAccept ?? true,
+    // plan-638: without a pose backend the source always takes the standard
+    // transfer — the same default a real self gives (material-flow-self.ts).
+    poseReadiness: () => ({ state: 'fallback', reason: 'no-backend' }),
+    transferAtPose: () => ({ ok: false, reason: 'no-pose' }),
     mus: [],
     currentLoad: 0,
     contextMenu: () => { /* no-op */ },

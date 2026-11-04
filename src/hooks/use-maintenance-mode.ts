@@ -23,12 +23,25 @@ const IDLE_STATE: MaintenanceState = {
   currentStep: 0,
   stepResults: [],
   isCameraAnimating: false,
+  isLive: false,
+  renderModeLocked: false,
 };
+
+/**
+ * The plugin's state at mount time. A component that mounts AFTER the guide
+ * started (the MessagePanel swaps to the MaintenancePanel on the very event
+ * that starts it) would otherwise sit in IDLE until the next change and render
+ * nothing — the dialog never appeared (plan-522 Phase 5 finding).
+ */
+function initialState(viewer: ReturnType<typeof useViewer>): MaintenanceState {
+  const plugin = viewer.getPlugin?.('maintenance') as { getState?(): MaintenanceState } | undefined;
+  return plugin?.getState?.() ?? IDLE_STATE;
+}
 
 /** Subscribe to maintenance-mode-changed events. Returns current state. */
 export function useMaintenanceMode(): MaintenanceState {
   const viewer = useViewer();
-  const [state, setState] = useState<MaintenanceState>(IDLE_STATE);
+  const [state, setState] = useState<MaintenanceState>(() => initialState(viewer));
 
   useEffect(() => {
     const off = viewer.on('maintenance-mode-changed' as string, (data: unknown) => {
@@ -39,6 +52,8 @@ export function useMaintenanceMode(): MaintenanceState {
         currentStep: number;
         stepResults: StepResult[];
         isCameraAnimating: boolean;
+        isLive?: boolean;
+        renderModeLocked?: boolean;
       };
       setState({
         mode: d.mode,
@@ -46,6 +61,8 @@ export function useMaintenanceMode(): MaintenanceState {
         currentStep: d.currentStep,
         stepResults: d.stepResults,
         isCameraAnimating: d.isCameraAnimating,
+        isLive: d.isLive ?? false,
+        renderModeLocked: d.renderModeLocked ?? false,
       });
     });
     return off;

@@ -30,14 +30,35 @@ export function isAllowedSecretSchemaPath(relativePath: string, propertyPath: Ar
 export function collectJsonStringValues(
   value: unknown, relativePath: string, propertyPath?: Array<string | number>, values?: string[],
 ): string[];
-export function secretScanValues(text: string, relativePath: string, extension: string): string[];
+/** plan-679 Phase 1: how the scanner reads one file. */
+export interface SecretScanOptions {
+  /** Test injection: returns the `typescript` module, or `null` when it is not installed. */
+  loadTypeScript?: () => unknown;
+  /** Throw instead of falling back when the parser is missing (delivery path). */
+  requireParser?: boolean;
+  /** Called on every fallback read of a JS-family file. */
+  onFallback?: (message: string) => void;
+}
+export interface SecretScanParts {
+  literals: string[];
+  prose: string[];
+  parser: 'typescript' | 'fallback' | 'none';
+}
+export const PARSED_SOURCE_EXTENSIONS: Set<string>;
+export function loadTypeScriptFromGuardModule(): unknown;
+export function splitSourceLiteralsAndProse(ts: unknown, text: string, extension: string): { literals: string[]; prose: string[] };
+export function secretScanParts(text: string, relativePath: string, extension: string, options?: SecretScanOptions): SecretScanParts;
+export function secretScanValues(text: string, relativePath: string, extension: string, options?: SecretScanOptions): string[];
 export function containsHighEntropyFragment(value: string): boolean;
 export function isHttpUrlLiteral(value: string): boolean;
 export function isTestFile(relativePath: string): boolean;
-export function secretContentViolation(relLower: string, extension: string, text: string): string | null;
+export function secretContentViolation(relLower: string, extension: string, text: string, options?: SecretScanOptions): string | null;
 export const CONNECT_LICENSE_KEY_PATTERN: RegExp;
 export function looksLikeSecretValue(value: unknown): boolean;
-export function assertNoSecrets(root: string, options?: { skipDirs?: string[] }): void;
+export function assertNoSecrets(
+  root: string,
+  options?: { skipDirs?: string[]; loadTypeScript?: () => unknown; warn?: (message: string) => void },
+): void;
 
 export type ProjectKind = 'customer' | 'demo' | 'internal';
 export const PROJECT_KINDS: readonly ProjectKind[];

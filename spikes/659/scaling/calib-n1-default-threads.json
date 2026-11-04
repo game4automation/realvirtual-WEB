@@ -1,0 +1,135 @@
+{
+  "plan": 659,
+  "what": "parallel Microduck scaling (processes)",
+  "generatedAt": "2026-10-22T19:26:45.884Z",
+  "config": {
+    "ns": [
+      1
+    ],
+    "reps": 3,
+    "episodes": 32,
+    "steps": 1500,
+    "pin": "0",
+    "latency": "1"
+  },
+  "node": "v24.18.0",
+  "runs": [
+    {
+      "n": 1,
+      "windowS": 9.1775717,
+      "simSecondsTotal": 960,
+      "aggregateThroughput": 104.60283301300714,
+      "perWorkerThroughputMean": 105.05453019537495,
+      "workerWindowMinS": 9.1381114,
+      "workerWindowMaxS": 9.1381114,
+      "stragglerSpreadPct": 0,
+      "falls": 0,
+      "allWorkersSameDisplacement": true,
+      "displacementXFirst": 3.291281750448731,
+      "loadMsMax": 1065.6132,
+      "warmMsMax": 147.1685,
+      "latencyMedianMs": 0.0397000000002663,
+      "latencyP95Ms": 0.12489999999888823,
+      "rep": 1,
+      "baselineLoad": {
+        "meanPct": 12.77,
+        "minPct": 8,
+        "maxPct": 42,
+        "samples": [
+          10,
+          9,
+          11,
+          11,
+          8,
+          12,
+          8,
+          16,
+          12,
+          11,
+          8,
+          8,
+          42
+        ],
+        "seconds": 13
+      }
+    },
+    {
+      "n": 1,
+      "windowS": 11.0747672,
+      "simSecondsTotal": 960,
+      "aggregateThroughput": 86.68353769097737,
+      "perWorkerThroughputMean": 87.2016674266837,
+      "workerWindowMinS": 11.0089638,
+      "workerWindowMaxS": 11.0089638,
+      "stragglerSpreadPct": 0,
+      "falls": 0,
+      "allWorkersSameDisplacement": true,
+      "displacementXFirst": 3.291281750448731,
+      "loadMsMax": 1148.3183000000001,
+      "warmMsMax": 247.50419999999986,
+      "latencyMedianMs": 0.04539999999997235,
+      "latencyP95Ms": 0.16009999999914726,
+      "rep": 2,
+      "baselineLoad": {
+        "meanPct": 32.54,
+        "minPct": 14,
+        "maxPct": 54,
+        "samples": [
+          22,
+          39,
+          49,
+          39,
+          24,
+          20,
+          14,
+          34,
+          15,
+          41,
+          46,
+          26,
+          54
+        ],
+        "seconds": 13
+      }
+    },
+    {
+      "n": 1,
+      "windowS": 8.0859729,
+      "simSecondsTotal": 960,
+      "aggregateThroughput": 118.72411791041249,
+      "perWorkerThroughputMean": 119.191634882748,
+      "workerWindowMinS": 8.054256500000001,
+      "workerWindowMaxS": 8.054256500000001,
+      "stragglerSpreadPct": 0,
+      "falls": 0,
+      "allWorkersSameDisplacement": true,
+      "displacementXFirst": 3.291281750448731,
+      "loadMsMax": 877.2359,
+      "warmMsMax": 132.54899999999998,
+      "latencyMedianMs": 0.03390000000035798,
+      "latencyP95Ms": 0.09530000000040673,
+      "rep": 3,
+      "baselineLoad": {
+        "meanPct": 18.62,
+        "minPct": 3,
+        "maxPct": 38,
+        "samples": [
+          27,
+          25,
+          37,
+          38,
+          15,
+          18,
+          18,
+          16,
+          12,
+          3,
+          13,
+          14,
+          6
+        ],
+        "seconds": 13
+      }
+    }
+  ]
+}

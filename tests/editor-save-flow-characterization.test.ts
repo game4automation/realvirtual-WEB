@@ -21,9 +21,11 @@
  *
  *  1. a named document saves without asking anything, and "Save as…" is the
  *     only thing that prompts;
- *  2. a save writes **two** blobs — the GLB and its preview, keyed by the
- *     document ID under `<project>/.thumbnails/` (plan-744 F5) — and the
- *     thumbnail failing does not fail it;
+ *  2. a save writes **two** blobs — the GLB and its preview, a 512 px WebP
+ *     keyed by the document ID and its content hash under
+ *     `<project>/.thumbnails/` (plan-744 F5, plan-776 F1) — points the row at
+ *     the preview, and the thumbnail failing does not fail it (it removes the
+ *     pointer instead);
  *  3. live-preview holders get to restore before the tree is cloned;
  *  4. after a successful save the document is re-based onto the identity it
  *     now has.
@@ -36,13 +38,21 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 const h = vi.hoisted(() => ({
-  thumbnail: 'data:image/png;base64,iVBORw0KGgo=' as string | null,
+  /** Whether the (mocked) renderer produces a picture — false = nothing renderable. */
+  thumbnail: true,
+  /** The manifest rows the (mocked) project store answers with. */
+  rows: [] as Array<{ id: string; path: string; name: string; thumbnail?: string }>,
+  pointers: [] as Array<[string, string | null]>,
 }));
 
 vi.mock('../src/core/project/project-store', () => ({
   getProjectStore: () => ({
     getBackend: () => backend,
-    getProject: () => ({ id: 'prj_characterisation' }),
+    getProject: () => ({ id: 'prj_characterisation', documents: h.rows }),
+    async setDocumentThumbnail(id: string, pointer: string | null) {
+      h.pointers.push([id, pointer]);
+      h.rows = h.rows.map((r) => (r.id === id ? { ...r, thumbnail: pointer ?? undefined } : r));
+    },
   }),
 }));
 // Keep every real export and override only isSupported: a hand-listed mock went stale the
@@ -53,15 +63,29 @@ vi.mock('../src/core/engine/rv-local-filesystem', async (importOriginal) => ({
 }));
 vi.mock('../src/core/editor/rv-asset-glb-export', () => ({
   exportAssetGlb: async () => new TextEncoder().encode('GLB').buffer,
+  isRuntimeHelperNode: () => false,
 }));
+// The renderer is the one mocked layer: the write helper, the encoder and the
+// sidecar naming below it are real (plan-776).
 vi.mock('../src/core/thumbnails/thumbnail-renderer', () => ({
+  isRenderableBounds: () => true,
   ThumbnailRenderer: class {
-    render(): string | null { return h.thumbnail; }
+    async render(): Promise<HTMLCanvasElement | null> {
+      if (!h.thumbnail) return null;
+      const canvas = document.createElement('canvas');
+      canvas.width = 512;
+      canvas.height = 512;
+      const ctx = canvas.getContext('2d')!;
+      ctx.fillStyle = '#c03030';
+      ctx.fillRect(200, 200, 112, 112);
+      return canvas;
+    }
     dispose(): void {}
   },
 }));
 
 const writes: string[] = [];
+const written = new Map<string, Uint8Array>();
 const backend = {
   kind: 'browser' as const,
   id: 'fake',
@@ -69,10 +93,13 @@ const backend = {
   isActive: true,
   // plan-736 moved the writer to the document API; both the GLB and the
   // thumbnail PNG arrive here, which is what point 2 above is about.
-  async writeDocument(ref: string | { path: string }) {
-    writes.push(typeof ref === 'string' ? ref : ref.path);
+  async writeDocument(ref: string | { path: string }, bytes: Uint8Array) {
+    const path = typeof ref === 'string' ? ref : ref.path;
+    writes.push(path);
+    written.set(path, bytes);
     return { revision: 'rev' };
   },
+  async deleteDocument() {},
   // Nothing is stored, so every save is a first save of its path.
   async readDocument() { return null; },
   async readDocumentUrl() { return null; },
@@ -92,7 +119,7 @@ import { SharePlugin } from '../src/core/share/share-plugin';
 import hierarchyBrowserSource from '../src/core/hmi/rv-hierarchy-browser.tsx?raw';
 import type { AssetBase } from '../src/core/editor/rv-asset-document';
 import { libraryDocumentBase } from '../src/core/editor/active-asset-store';
-import { thumbnailSidecarPath } from '../src/core/library/library-types';
+import { encodeThumbnailId } from '../src/core/library/library-types';
 
 /** Answer the next save dialog of `kind`; returns an unsubscribe. */
 function autoAnswer(kind: string, answer: unknown): () => void {
@@ -166,7 +193,15 @@ function context(name: string) {
 
 beforeEach(() => {
   writes.length = 0;
-  h.thumbnail = 'data:image/png;base64,iVBORw0KGgo=';
+  written.clear();
+  h.thumbnail = true;
+  h.pointers = [];
+  // Every Custom-library document the tests save has its manifest row, under
+  // the id `libraryDocumentBase` derives from its path.
+  h.rows = ['Gripper', 'Belt', 'Belt v2'].map((name) => {
+    const base = libraryDocumentBase(`Custom/${name}.glb`) as { documentId: string; path: string };
+    return { id: base.documentId, path: base.path, name };
+  });
 });
 
 describe('editor save flow — the name prompt', () => {
@@ -220,29 +255,30 @@ describe('editor save flow — the name prompt', () => {
 });
 
 describe('editor save flow — what reaches the project', () => {
-  it('writes the GLB and a preview keyed by the document ID', async () => {
+  it('writes the GLB, a 512 px WebP keyed by id + hash, and points the row at it', async () => {
     const { ctx, doc } = context('Belt');
     await saveAssetAs(ctx, 'Belt');
-    // plan-744 F5: the preview no longer mirrors the asset's PATH under
-    // `library/.thumbnails/`. That convention lost the picture on every move
-    // or rename — the key WAS the location — and only existed for
-    // `library/**`, so a model or a scene had no persisted preview at all.
-    // The id is frozen at birth (plan-717), so the sidecar survives both.
+    // plan-744 F5: keyed by the document ID (frozen at birth), not the path.
+    // plan-776 F1: plus 8 hex chars of the image hash and the real extension.
     const documentId = (doc.base as { documentId: string }).documentId;
-    expect(writes).toEqual([
-      'library/Custom/Belt.glb',
-      thumbnailSidecarPath(documentId),
-    ]);
-    expect(writes[1]!.startsWith('.thumbnails/')).toBe(true);
+    expect(writes).toHaveLength(2);
+    expect(writes[0]).toBe('library/Custom/Belt.glb');
+    const pattern = new RegExp(`^\\.thumbnails/${encodeThumbnailId(documentId)}\\.[0-9a-f]{8}\\.webp$`);
+    expect(writes[1]).toMatch(pattern);
+    // The row now names exactly that file (plan-776 F4).
+    expect(h.pointers).toEqual([[documentId, writes[1]]]);
+    const bitmap = await createImageBitmap(new Blob([written.get(writes[1]!)! as BlobPart], { type: 'image/webp' }));
+    expect([bitmap.width, bitmap.height]).toEqual([512, 512]);
   });
 
-  it('a missing thumbnail does not fail the save', async () => {
-    h.thumbnail = null;                       // WebGPU: no classic renderer
+  it('a missing thumbnail does not fail the save and writes no pointer', async () => {
+    h.thumbnail = false;                      // nothing renderable
     const { ctx, saved } = context('Belt');
     const outcome = await saveAssetAs(ctx, 'Belt');
     expect(outcome.kind).toBe('saved');
     expect(writes).toEqual(['library/Custom/Belt.glb']);
     expect(saved).toHaveLength(1);
+    expect(h.pointers).toEqual([]);           // the row had none — nothing to remove
   });
 
   it('lets live-preview holders restore before the tree is cloned', async () => {

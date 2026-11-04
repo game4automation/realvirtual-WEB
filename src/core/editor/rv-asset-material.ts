@@ -22,28 +22,43 @@
  *     material — which is both what the renderer wants and what keeps the
  *     exported GLB from carrying 400 identical material definitions.
  *
- * Editor-mode only. See doc-render-picking.md §1.1: editor mode loads with
- * `preserveHierarchy: true`, so no uber bake and no BatchTable exist and a plain
- * `mesh.material = …` both renders and survives the GLB export. In batched modes
- * the same assignment is a silent no-op (sources render at `layers.mask = 0`).
+ * Editor-mode only. See contract-bake-picking.md §1.1: editor mode loads with
+ * `preserveHierarchy: true`, so no bake exists and a plain `mesh.material = …`
+ * survives the GLB export. What the editor DRAWS is its arenas (plan-766,
+ * §2.5; the sources render at `layers.mask = 0`): the assignment reaches the
+ * screen through the `setMaterial` op, whose apply listener re-colours or
+ * re-buckets the mesh's arena instance. A material write outside that op would
+ * stay invisible until `viewer.editorArena.reconcile()`.
  */
 
-import { Object3D, Mesh, Material, MeshStandardMaterial, Color, DoubleSide, TextureLoader, RepeatWrapping, SRGBColorSpace, Texture } from 'three';
+import { Object3D, Mesh, Material, MeshStandardMaterial, Color, DoubleSide, TextureLoader, RepeatWrapping, SRGBColorSpace, NoColorSpace, Texture } from 'three';
 import type { MaterialValue } from './rv-asset-ops';
 import { NodeRegistry } from '../engine/rv-node-registry';
+import { isOwnedContent } from '../engine/rv-reference-scope';
 
-/** Runtime helpers (gizmos, overlays, sensor viz) never take a user material. */
+/**
+ * Runtime helpers (gizmos, overlays, sensor viz) never take a user material.
+ *
+ * Decided by explicit metadata, not by a leading `_`: CAD and Unity exports
+ * carry legitimate part names like `_CADpart`, and treating them as helpers
+ * silently left them unpainted. The `__` prefix stays a helper marker because
+ * it is the reserved runtime-object convention (`__rvTransformGizmo`,
+ * `__muPool_…`, `__statusOutlineProxy_…`) that many overlays rely on without
+ * setting a flag.
+ */
 function isRuntimeHelper(node: Object3D): boolean {
-  return node.name.startsWith('_') || node.userData?._rvGizmo === true;
+  const ud = node.userData;
+  if (ud?._rvGizmo === true || ud?._rvGizmoOverlay === true || ud?._rvSynthetic === true) return true;
+  return node.name.startsWith('__');
 }
 
 /**
  * Every mesh at or under `node`, skipping runtime-helper subtrees.
  *
- * Multi-material meshes are excluded: their `geometry.groups` map face ranges to
- * array slots, so collapsing them onto one preset would silently discard the
- * per-group assignment. They stay untouched and are reported to the caller by
- * their absence from the result.
+ * Multi-material meshes are included: the executor paints every slot of the
+ * array with the preset, so `geometry.groups` keep their face ranges and the
+ * whole mesh changes. (They used to be skipped, which left them unpainted
+ * without anyone being told.)
  */
 export function collectPaintableMeshes(node: Object3D): Mesh[] {
   const out: Mesh[] = [];
@@ -51,11 +66,70 @@ export function collectPaintableMeshes(node: Object3D): Mesh[] {
     if (isRuntimeHelper(child)) return;
     const mesh = child as Mesh;
     if (!(mesh as { isMesh?: boolean }).isMesh) return;
-    if (Array.isArray(mesh.material)) return;
-    if (!mesh.material) return;
+    const mat = mesh.material;
+    if (!mat || (Array.isArray(mat) && mat.length === 0)) return;
     out.push(mesh);
   });
   return out;
+}
+
+/** Why a requested path contributed no mesh to a material assignment. */
+export type MaterialSkipReason =
+  /** The path resolves to nothing in the scene. */
+  | 'unresolved'
+  /** The node (or everything under it) is placed reference content — baked, owned by another file. */
+  | 'placed-reference'
+  /** The node exists but carries no paintable mesh at or under it. */
+  | 'no-mesh';
+
+/** The meshes a material assignment will paint, plus every requested path that yields none. */
+export interface MaterialAssignmentPlan {
+  /** Requested paths that contribute at least one mesh — the op's `nodePaths`. */
+  nodePaths: string[];
+  /** Deduped meshes to paint with their registry paths. */
+  targets: Array<{ mesh: Mesh; path: string }>;
+  /** Requested paths that contribute nothing, with the reason. */
+  skipped: Array<{ path: string; reason: MaterialSkipReason }>;
+}
+
+/**
+ * Plan a material assignment over `nodePaths`: which meshes it paints and
+ * which requested paths it cannot reach (and why).
+ *
+ * Placed reference content is excluded mesh by mesh: an `AssetOverrides` patch
+ * carries components, not materials, so painting it from this document is not
+ * expressible (the reference guard refuses the whole op). Excluding it here
+ * keeps one placed part in a selection from sinking the rest of the assignment.
+ */
+export function planMaterialAssignment(
+  registry: NodeRegistry,
+  nodePaths: string[],
+): MaterialAssignmentPlan {
+  const seen = new Set<Mesh>();
+  const plan: MaterialAssignmentPlan = { nodePaths: [], targets: [], skipped: [] };
+  for (const nodePath of nodePaths) {
+    const node = registry.getNode(nodePath);
+    if (!node) { plan.skipped.push({ path: nodePath, reason: 'unresolved' }); continue; }
+    if (!isOwnedContent(node)) { plan.skipped.push({ path: nodePath, reason: 'placed-reference' }); continue; }
+    const all = collectPaintableMeshes(node);
+    const owned = all.filter((mesh) => isOwnedContent(mesh));
+    if (owned.length === 0) {
+      plan.skipped.push({ path: nodePath, reason: all.length > 0 ? 'placed-reference' : 'no-mesh' });
+      continue;
+    }
+    plan.nodePaths.push(nodePath);
+    for (const mesh of owned) {
+      if (seen.has(mesh)) continue;
+      seen.add(mesh);
+      plan.targets.push({ mesh, path: NodeRegistry.computeNodePath(mesh) });
+    }
+  }
+  return plan;
+}
+
+/** The one material of a mesh as a value — `null` for a material array (exact undo goes through the executor stash). */
+function meshMaterialToValue(mesh: Mesh): MaterialValue | null {
+  return Array.isArray(mesh.material) ? null : materialToValue(mesh.material);
 }
 
 /**
@@ -97,25 +171,101 @@ export function captureMaterialPrev(
 ): Array<{ meshPath: string; material: MaterialValue | null }> {
   return expandSelectionToMeshes(registry, nodePaths).map(({ mesh, path }) => ({
     meshPath: path,
-    material: materialToValue(mesh.material as Material),
+    material: meshMaterialToValue(mesh),
   }));
 }
+
+/** {@link captureMaterialPrev} over an already-built {@link planMaterialAssignment}. */
+export function materialPrevOfPlan(
+  plan: MaterialAssignmentPlan,
+): Array<{ meshPath: string; material: MaterialValue | null }> {
+  return plan.targets.map(({ mesh, path }) => ({ meshPath: path, material: meshMaterialToValue(mesh) }));
+}
+
+/** Material extras key of a preset assignment (plan-675; written by GLTFExporter as `extras`). */
+export const RV_MATERIAL_PRESET_KEY = 'rvMaterialPreset';
+
+/** What a preset assignment leaves in `material.userData.rvMaterialPreset` (and thus the GLB). */
+export interface MaterialPresetExtras {
+  presetId: string;
+  textureScaleU?: number;
+  textureScaleV?: number;
+  spin?: 'roller';
+}
+
+/** Looks a preset up by id — registered by the asset editor's preset library (plan-675). */
+export type MaterialPresetResolver = (presetId: string) => MaterialValue | null;
+let presetResolver: MaterialPresetResolver | null = null;
+
+/**
+ * Register the preset library that rehydrates a reloaded material from its
+ * `rvMaterialPreset.presetId` (the textures are embedded in the GLB, but their
+ * identity — the data URL a value compares by — is not: glTF keeps no texture
+ * extras).
+ */
+export function registerMaterialPresetResolver(resolver: MaterialPresetResolver | null): void {
+  presetResolver = resolver;
+}
+
+/** The preset extras of a material, if it carries any. */
+export function materialPresetExtras(mat: Material | null | undefined): MaterialPresetExtras | null {
+  const raw = (mat?.userData as Record<string, unknown> | undefined)?.[RV_MATERIAL_PRESET_KEY] as MaterialPresetExtras | undefined;
+  return raw && typeof raw === 'object' && (typeof raw.presetId === 'string' || raw.spin) ? raw : null;
+}
+
+/** Preset ids of roller-mantle presets authored for cylindrical UVs start with this. */
+export const MANTLE_PRESET_PREFIX = 'tex-roller-';
+
+/** The roller-mantle presets are authored for cylindrical UVs (u = revolutions). */
+function isMantlePreset(v: MaterialValue): boolean {
+  return v.spin === 'roller' || (v.presetId?.startsWith(MANTLE_PRESET_PREFIX) ?? false);
+}
+
+/**
+ * Texture repeat of a value: planar/box UVs are metres, so a scale of "metres
+ * per tile" becomes `1 / scale` tiles per UV unit; a mantle's u counts
+ * revolutions, so "tiles per revolution" IS the repeat. V is metres either way.
+ */
+export function textureRepeatOf(v: MaterialValue): [number, number] {
+  const su = v.textureScaleU ?? 1;
+  const sv = v.textureScaleV ?? 1;
+  const u = isMantlePreset(v) ? su : 1 / (su > 0 ? su : 1);
+  return [u, 1 / (sv > 0 ? sv : 1)];
+}
+
+const PRESET_MAP_SLOTS = ['map', 'roughnessMap', 'metalnessMap', 'normalMap'] as const;
 
 /** True when a standard material can be represented by an editor preset. */
 function isPlainStandard(mat: Material): mat is MeshStandardMaterial {
   const m = mat as MeshStandardMaterial;
   if (!(m as { isMeshStandardMaterial?: boolean }).isMeshStandardMaterial) return false;
-  return (!m.map || typeof m.map.userData?.rvPresetTexture === 'string') && !m.normalMap && !m.roughnessMap && !m.metalnessMap
-    && !m.aoMap && !m.emissiveMap && !m.alphaMap && !m.lightMap;
+  if (m.aoMap || m.emissiveMap || m.alphaMap || m.lightMap) return false;
+  // A preset assignment the library can rehydrate stands for itself, maps and all.
+  const extras = materialPresetExtras(m);
+  if (extras?.presetId && presetResolver?.(extras.presetId)) return true;
+  // Otherwise every map must be a known preset map (identity by data URL).
+  for (const slot of PRESET_MAP_SLOTS) {
+    const t = m[slot];
+    if (t && typeof t.userData?.rvPresetTexture !== 'string') return false;
+  }
+  return true;
 }
 
 /**
  * Losslessly describe a material as a `MaterialValue`, or `null` when it carries
- * data the value type cannot hold (textures, non-standard material types).
+ * data the value type cannot hold (foreign textures, non-standard material types).
  */
 export function materialToValue(mat: Material | null | undefined): MaterialValue | null {
   if (!mat || !isPlainStandard(mat)) return null;
   const emissive = mat.emissive ? `#${mat.emissive.getHexString()}` : '#000000';
+  const extras = materialPresetExtras(mat);
+  // plan-675: a reloaded preset material gets its map identities back from the library.
+  const preset = extras?.presetId ? presetResolver?.(extras.presetId) ?? null : null;
+  const texId = (t: Texture | null | undefined): string | undefined =>
+    (t && typeof t.userData?.rvPresetTexture === 'string') ? t.userData.rvPresetTexture as string : undefined;
+  const texture = texId(mat.map) ?? (mat.map ? preset?.texture : undefined);
+  const ormTexture = texId(mat.roughnessMap) ?? (mat.roughnessMap ? preset?.ormTexture : undefined);
+  const normalTexture = texId(mat.normalMap) ?? (mat.normalMap ? preset?.normalTexture : undefined);
   return {
     name: mat.name || 'Material',
     color: `#${mat.color.getHexString()}`,
@@ -123,7 +273,13 @@ export function materialToValue(mat: Material | null | undefined): MaterialValue
     roughness: mat.roughness,
     opacity: mat.opacity,
     transparent: mat.transparent,
-    ...(mat.map ? { texture: mat.map.userData.rvPresetTexture as string } : {}),
+    ...(texture ? { texture } : {}),
+    ...(ormTexture ? { ormTexture } : {}),
+    ...(normalTexture ? { normalTexture } : {}),
+    ...(extras?.presetId ? { presetId: extras.presetId } : {}),
+    ...(extras?.textureScaleU !== undefined ? { textureScaleU: extras.textureScaleU } : {}),
+    ...(extras?.textureScaleV !== undefined ? { textureScaleV: extras.textureScaleV } : {}),
+    ...(extras?.spin ? { spin: extras.spin } : {}),
     ...(emissive !== '#000000'
       ? { emissive, emissiveIntensity: mat.emissiveIntensity }
       : {}),
@@ -133,11 +289,19 @@ export function materialToValue(mat: Material | null | undefined): MaterialValue
 /** Stable identity for a `MaterialValue` — the cache key and equality test. */
 export function materialValueKey(v: MaterialValue): string {
   const q = (n: number) => String(Math.round(n * 1000));
-  return [
+  const parts = [
     v.color, q(v.metalness), q(v.roughness), q(v.opacity),
     v.transparent ? '1' : '0', v.emissive ?? '-', q(v.emissiveIntensity ?? 1),
     v.texture ?? '',
-  ].join('|');
+  ];
+  // plan-675 fields only when present — every key of a pre-675 value stays byte-identical.
+  if (v.ormTexture || v.normalTexture || v.presetId || v.textureScaleU !== undefined
+    || v.textureScaleV !== undefined || v.spin) {
+    parts.push(v.ormTexture ?? '', v.normalTexture ?? '', v.presetId ?? '',
+      v.textureScaleU !== undefined ? q(v.textureScaleU) : '', v.textureScaleV !== undefined ? q(v.textureScaleV) : '',
+      v.spin ?? '');
+  }
+  return parts.join('|');
 }
 
 /**
@@ -157,15 +321,60 @@ export async function waitForMaterialTextures(root: Object3D): Promise<void> {
     const mesh = node as Mesh;
     if (!mesh.isMesh) return;
     for (const mat of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) {
-      const map = (mat as MeshStandardMaterial).map;
-      const ready = map && TEXTURE_READY.get(map);
-      if (ready) pending.add(ready);
+      const m = mat as MeshStandardMaterial;
+      for (const slot of PRESET_MAP_SLOTS) {
+        const t = m?.[slot];
+        const ready = t && TEXTURE_READY.get(t);
+        if (ready) pending.add(ready);
+      }
     }
   });
   await Promise.all(pending);
 }
 
 const CACHE = new Map<string, MeshStandardMaterial>();
+
+/**
+ * One decoded image per data URL (plan-675): materials that use the same preset
+ * map in different colours or scales get CLONES of one base texture — own
+ * sampler / repeat, shared `source`, so one GPU upload.
+ */
+interface BaseTexture { tex: Texture; ready: Promise<void>; clones: Set<Texture> }
+const BASE_TEXTURES = new Map<string, BaseTexture>();
+
+function baseTexture(url: string): BaseTexture {
+  const hit = BASE_TEXTURES.get(url);
+  if (hit) return hit;
+  let resolve!: () => void;
+  let reject!: (error: unknown) => void;
+  const ready = new Promise<void>((ok, fail) => { resolve = ok; reject = fail; });
+  // Rendering may precede export; retain failures without an unhandled rejection.
+  void ready.catch(() => {});
+  const entry: BaseTexture = { tex: null as unknown as Texture, ready, clones: new Set() };
+  entry.tex = new TextureLoader().load(url, () => {
+    // A clone made before the image arrived shares the source but not the
+    // texture version — bump each so the renderer uploads it.
+    for (const c of entry.clones) c.needsUpdate = true;
+    resolve();
+  }, undefined, reject);
+  BASE_TEXTURES.set(url, entry);
+  return entry;
+}
+
+/** A material-owned map for `url`: shared image, own colour space / wrap / repeat. */
+function presetMap(url: string, srgb: boolean, repeat: [number, number]): Texture {
+  const base = baseTexture(url);
+  const t = base.tex.clone();
+  base.clones.add(t);
+  t.flipY = false;
+  t.colorSpace = srgb ? SRGBColorSpace : NoColorSpace;
+  t.wrapS = t.wrapT = RepeatWrapping;
+  t.repeat.set(repeat[0], repeat[1]);
+  t.userData.rvPresetTexture = url;
+  if (base.tex.image) t.needsUpdate = true;
+  TEXTURE_READY.set(t, base.ready);
+  return t;
+}
 
 /**
  * Get-or-create the shared material for a value.
@@ -192,18 +401,24 @@ export function materialForValue(v: MaterialValue): MeshStandardMaterial {
     mat.emissive = new Color(v.emissive);
     mat.emissiveIntensity = v.emissiveIntensity ?? 1;
   }
-  if (v.texture) {
-    let resolve!: () => void;
-    let reject!: (error: unknown) => void;
-    const ready = new Promise<void>((ok, fail) => { resolve = ok; reject = fail; });
-    // Rendering may precede export; retain failures without an unhandled rejection.
-    void ready.catch(() => {});
-    mat.map = new TextureLoader().load(v.texture, () => resolve(), undefined, reject);
-    TEXTURE_READY.set(mat.map, ready);
-    mat.map.flipY = false;
-    mat.map.colorSpace = SRGBColorSpace;
-    mat.map.wrapS = mat.map.wrapT = RepeatWrapping;
-    mat.map.userData.rvPresetTexture = v.texture;
+  const repeat = textureRepeatOf(v);
+  if (v.texture) mat.map = presetMap(v.texture, true, repeat);
+  if (v.ormTexture) {
+    // glTF metallicRoughness layout: ONE texture in both slots (G / B); the
+    // exporter writes it once.
+    const orm = presetMap(v.ormTexture, false, repeat);
+    mat.roughnessMap = orm;
+    mat.metalnessMap = orm;
+  }
+  if (v.normalTexture) mat.normalMap = presetMap(v.normalTexture, false, repeat);
+  if (v.presetId || v.spin) {
+    const extras: MaterialPresetExtras = {
+      presetId: v.presetId ?? '',
+      ...(v.textureScaleU !== undefined ? { textureScaleU: v.textureScaleU } : {}),
+      ...(v.textureScaleV !== undefined ? { textureScaleV: v.textureScaleV } : {}),
+      ...(v.spin ? { spin: v.spin } : {}),
+    };
+    mat.userData[RV_MATERIAL_PRESET_KEY] = extras;
   }
   // Painted parts are usually CAD solids seen from outside, but transparent
   // presets (glass, guards) read as paper-thin without back faces.
@@ -230,7 +445,7 @@ export function indexMeshPathsByMaterialValue(root: Object3D | null): Map<string
   const index = new Map<string, string[]>();
   if (!root) return index;
   for (const { mesh, path } of collectPaintableMeshesWithPaths(root)) {
-    const value = materialToValue(mesh.material as Material);
+    const value = meshMaterialToValue(mesh);
     if (!value) continue;
     const key = materialValueKey(value);
     const bucket = index.get(key);
@@ -240,19 +455,30 @@ export function indexMeshPathsByMaterialValue(root: Object3D | null): Map<string
   return index;
 }
 
-/** Paintable meshes under `root` paired with their registry paths. */
+/**
+ * Paintable meshes of `root`'s OWNED content paired with their registry paths.
+ * plan-774 F9: a placed reference is baked and cannot be painted from this
+ * document (the guard refuses `setMaterial` there), so its chunks are no
+ * candidates of a preset's "Select".
+ */
 function collectPaintableMeshesWithPaths(root: Object3D): Array<{ mesh: Mesh; path: string }> {
-  return collectPaintableMeshes(root).map((mesh) => ({
-    mesh,
-    path: NodeRegistry.computeNodePath(mesh),
-  }));
+  return collectPaintableMeshes(root)
+    .filter((mesh) => isOwnedContent(mesh, root))
+    .map((mesh) => ({
+      mesh,
+      path: NodeRegistry.computeNodePath(mesh),
+    }));
 }
 
 /** Release every cached material. Call on viewer teardown. */
 export function disposeMaterialCache(): void {
   for (const mat of CACHE.values()) {
     mat.map?.dispose();
+    mat.normalMap?.dispose();
+    mat.roughnessMap?.dispose();
     mat.dispose();
   }
   CACHE.clear();
+  for (const b of BASE_TEXTURES.values()) b.tex.dispose();
+  BASE_TEXTURES.clear();
 }

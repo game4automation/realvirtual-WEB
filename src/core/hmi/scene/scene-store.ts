@@ -31,6 +31,8 @@ import { debug } from '../../engine/rv-debug'; // TEMP open-perf instrumentation
 import type { FlattenSizeEstimate } from '../../engine/rv-glb-flatten';
 import type { RVViewerPlugin } from '../../rv-plugin';
 import type { DocumentClassification } from '../../project/rv-document-classification';
+import { macrosForEmbed } from '../../editor/rv-macro-store';
+import { finishDocumentSave } from '../../editor/rv-finish-document-save';
 import type {
   RvScene, SceneBase, BuiltinSceneEntry,
 } from './rv-scene-types';
@@ -68,6 +70,9 @@ import {
   COALESCE_WINDOW_MS, materialise, editsBeyondAuthoredTree,
 } from './rv-scene-edits';
 import { RvDocument, type RvDocumentCore, type RvHistoryInterceptor } from '../../ops/rv-document';
+import {
+  runLeaseBlocker, getVariantsSavePayload, isVariantsDirty, markVariantsSaved, type SavePayload,
+} from '../rv-run-lease';
 import { RvUnifiedExecutor } from '../../ops/rv-unified-executors';
 import type { RvOp, RvScenePrimitiveOp } from '../../ops/rv-unified-ops';
 import { normalizePersistedSceneOps } from '../../ops/rv-unified-ops';
@@ -78,6 +83,7 @@ import {
 } from './rv-scene-storage';
 import {
   clearDocumentDraft,
+  forgetSessionDraftsOf,
   loadDocumentDraft,
   sharedDocumentFrame,
   type RvDraftBytesCache,
@@ -94,6 +100,15 @@ import {
   documentBase, sameDocumentBase, sceneDocumentBase, setOpenDocumentBase,
 } from '../../editor/active-asset-store';
 import type { AssetBase } from '../../editor/rv-asset-document';
+// The lock vocabulary only (plan-527, ported for plan-764) — a leaf module, so
+// this edge pulls none of the editor document's executor graph into the scene
+// store.
+import {
+  DocumentLockedError,
+  documentLockedMessage,
+  type DocumentLockOwner,
+  type DocumentLockToken,
+} from '../../editor/rv-document-lock';
 // NOT a static import: info-overlay-store is a React/@mui surface, and a static
 // edge from here would pull @mui/material into the embed library build, which
 // plan-326 AP1 guards against ("no React/MUI anywhere in the output"). Loaded
@@ -119,6 +134,7 @@ import {
 // plan-513 — the document's last-used mode, written by the same funnel for the
 // same reason. IndexedDB, best-effort, never awaited by an open.
 import { recordDocumentMode } from '../../project/rv-document-mode-store';
+import { allowedModesOf } from '../../project/rv-document-mode';
 import {
   isBytesSourceUrl,
   projectAssetRelPath,
@@ -141,6 +157,7 @@ import type { RvDocumentEntry } from '../../project/rv-project-types';
 import { isSupported as isFileSystemAccessSupported } from '../../engine/rv-local-filesystem';
 import { saveStartPos } from '../camera-startpos-store';
 import { deriveModelKey } from '../../engine/rv-model-key';
+import { structuralDerivedRefusal, StructuralDerivedLockedError } from '../../engine/rv-structural-derived';
 
 // ─── Snapshot ───────────────────────────────────────────────────────────
 
@@ -160,7 +177,13 @@ export interface SceneSnapshot extends RvDocumentCore {
    *  current op log; structurally compared against `saved` for dirty. */
   draft: RvScene | null;
   isDraft: boolean;
+  /** Op-log dirty OR {@link draftBacked}: what the card, the exit guard and "Discard changes" read. */
   dirty: boolean;
+  /**
+   * The open document was resumed from its autosave draft, i.e. it carries
+   * local changes that are not in its file — even with an empty op log.
+   */
+  draftBacked: boolean;
   /** Read-only built-in SOURCES, mirrored from `viewer.availableModels`. */
   builtins: BuiltinSceneEntry[];
   /**
@@ -175,7 +198,7 @@ export interface SceneSnapshot extends RvDocumentCore {
 }
 
 /**
- * What a scene save actually did (plan-710 F5).
+ * What a planner save actually did (plan-710 F5).
  *
  * `save()` used to answer `void`, which meant its two silent outcomes — the
  * clean no-op and the §2.2.1-1 discard when the save target moved mid-write —
@@ -268,7 +291,14 @@ function describeStructuralEdits(edits: MaterialisedEdits): string[] {
   const n = (count: number, one: string, many: string) => `${count} ${count === 1 ? one : many}`;
   if (edits.placements.length) out.push(n(edits.placements.length, 'planner placement', 'planner placements'));
   if (edits.addedNodes.length) out.push(n(edits.addedNodes.length, 'added node', 'added nodes'));
+  const removed = edits.removedNodes?.length ?? 0;
+  if (removed) out.push(n(removed, 'removed node', 'removed nodes'));
   if (edits.nodeTransforms.length) out.push(n(edits.nodeTransforms.length, 'moved node', 'moved nodes'));
+  // plan-769 Phase 7: moves / removals of placements the file already holds.
+  const movedPlacements = edits.baselinePlacementTransforms?.size ?? 0;
+  if (movedPlacements) out.push(n(movedPlacements, 'moved placement', 'moved placements'));
+  const removedPlacements = edits.removedPlacementIds?.length ?? 0;
+  if (removedPlacements) out.push(n(removedPlacements, 'removed placement', 'removed placements'));
   if (edits.connections.length) out.push(n(edits.connections.length, 'connection', 'connections'));
   if (edits.connectionTypes.length) out.push(n(edits.connectionTypes.length, 'connection type', 'connection types'));
   return out;
@@ -387,24 +417,55 @@ interface WorkspaceSnapshotState {
   saved: RvScene | null;
 }
 
-// ─── Store ──────────────────────────────────────────────────────────────
+/// ─── Store ──────────────────────────────────────────────────────────────
 
+export type DocumentExperimentSyncHook = (viewer: RVViewer, docId: string, action: 'open' | 'save', valid: () => boolean) => Promise<void>;
+let documentExperimentSyncHook: DocumentExperimentSyncHook | null = null;
+const experimentSyncStores = new Set<SceneStore>();
+export async function setDocumentExperimentSyncHook(hook: DocumentExperimentSyncHook | null): Promise<void> {
+ documentExperimentSyncHook = hook;
+ if (hook) await Promise.all([...experimentSyncStores].map(store => store.syncOpenDocumentExperiments()));
+}
+
+/**
+ * The PLANNER's session on a document — not a document kind (plan-777 #6).
+ *
+ * There is one kind of document (plan-716): one GLB, one `project.json` row.
+ * This store is what the planner holds while one is open: the op log against
+ * the document's base bytes, the draft slots, the save that bakes them, and the
+ * identity it publishes. Its twin is `AssetDocument`, the EDITOR's session on
+ * a document. The class name is historical and kept on purpose; "Scene" here
+ * is the 3D scene the planner shows, never a second kind of file.
+ */
 export class SceneStore {
   private readonly _viewer: RVViewer;
 
   // Workspace
   /**
-   * Which behaviour layer over {@link RvDocument} this is (plan-710 F5).
+   * Which behaviour layer over {@link RvDocument} this is (plan-710 F5) —
+   * `'planner'`. An `AssetDocument` carries no tag and is the editor's side; the
+   * same pair is spelled `'planner'`/`'editor'` in `SaveSubject` (plan-777 F8 —
+   * it was `'scene'`/`'asset'`, which named two document kinds that do not exist).
    *
    * The discriminant `saveDocument()` routes on. A field rather than an
    * `instanceof`: the one save path lives in `core/editor` and must not import
    * this module back, and a compile-time tag beats duck-typing a method name.
    */
-  readonly lineage = 'scene';
+  readonly lineage = 'planner';
 
   private _workspace: WorkspaceShell | null = null;
   private _settings: SceneEditsSettings = { ...DEFAULT_SETTINGS };
   private _saved: RvScene | null = null;
+  /**
+   * The open DOCUMENT was resumed from its draft slot (`draft/<documentId>`),
+   * so what is on screen holds changes its file does not. The resume bakes
+   * those changes into the base and installs an EMPTY op log, which left the
+   * document clean by every op-based measure: no "Unsaved", no exit guard, no
+   * "Discard changes" — and on a read-only project a draft that can never be
+   * saved came back silently on every open. Folded into `snapshot.dirty`;
+   * cleared by the next open and by a save that writes the file.
+   */
+  private _draftBacked = false;
 
   /**
    * The ONE op-log document (plan-703 Phase 1/3), in `'scene'` mode.
@@ -521,6 +582,28 @@ export class SceneStore {
    */
   private readonly _slotRevisions = new Map<string, string>();
   /**
+   * The document's FILE is being replaced from outside (plan-527, ported for
+   * plan-764 — `rv-document-replace`) — see {@link tryLockForReplace}.
+   *
+   * The scene lineage's counterpart of `AssetDocument`'s `'replace'` lock, with
+   * the same token shape and the same `DocumentLockedError`: while it is held,
+   * every mutation entry of this store (edit, undo, redo, save, save as,
+   * discard, settings-into-model, stale-draft restore) is refused, because
+   * whatever it did would land on the version that is about to be swapped for
+   * the new bytes.
+   *
+   * `documentId` is the document that was open when the lock was taken (LOP
+   * #180): {@link reloadOpenDocumentForReplace} reloads only that one.
+   */
+  private _replaceLock: {
+    token: symbol;
+    generation: number;
+    startedAt: number;
+    documentId: string | null;
+  } | null = null;
+  /** Monotonic, never reset — a stale token can never release a later lock. */
+  private _replaceGeneration = 0;
+  /**
    * The autosave write currently running, so a Restore can wait for it rather
    * than swap a slot a write is about to move (plan-546 AC 14).
    */
@@ -535,6 +618,7 @@ export class SceneStore {
 
   constructor(viewer: RVViewer) {
     this._viewer = viewer;
+    experimentSyncStores.add(this);
     this._doc = new RvDocument({
       id: 'scene',
       name: '',
@@ -544,8 +628,11 @@ export class SceneStore {
       // that one hook, and it fires at exactly the same cadence — once per
       // committed change, never inside a transaction or a rollback.
       onChanged: () => { this._afterOpsChanged(); },
-      // Ops queued just before a load are stale by the time they run.
-      canApply: () => !this._loading,
+      // Ops queued just before a load are stale by the time they run — and so
+      // are ops that slipped onto the queue while the document's file was being
+      // replaced from outside (plan-527): the entry points refuse those loudly,
+      // this is the floor for anything that reached `document` directly.
+      canApply: () => !this._loading && this._replaceLock === null,
       // plan-710 F7 — the scene's half of the page unload guard's question.
       // The timer IS the answer here: a scheduled bake that has not run is the
       // only way a non-transient scene loses work to a reload — plus, since
@@ -554,6 +641,16 @@ export class SceneStore {
       // allowed to be armed.
       hasUnpersistedWork: () => this._draftAutosaveTimer !== null || this._projectionDeferredWrite,
     });
+    // plan-681 §2.2: what a structural rebuild derived (the PalletYard at another
+    // size) is transient and never saved — an authoring op on it, or a
+    // structural op on an ancestor carrying it, is refused BEFORE it applies
+    // (`structural-derived-locked`). Undo / redo of such an entry likewise.
+    const locate = (path: string) => viewer.registry?.getNode(path) ?? null;
+    this._doc.addOpGuard((op) => {
+      const refusal = structuralDerivedRefusal(op, locate);
+      return refusal ? new StructuralDerivedLockedError(refusal) : null;
+    });
+    this._doc.addHistoryGuard((op) => structuralDerivedRefusal(op, locate) === null);
     this._refreshBuiltins();
     this._snapshot = this._buildSnapshot();
   }
@@ -566,6 +663,19 @@ export class SceneStore {
    */
   get document(): RvDocument { return this._doc; }
 
+  /**
+   * The living document, for the editor's draft filter (plan-616 §2.4).
+   *
+   * A plain READ, and that is why it exists beside
+   * {@link beginProjectionHandover}: the handover suspends this store's
+   * autosave and arms the shared-frame cleanup, so it may only run once the
+   * editor has decided to bind — while this is asked BEFORE that decision, to
+   * learn which draft records a bound editor of this document wrote in this
+   * session. Always the same object as {@link document}; named for the
+   * question it answers.
+   */
+  livingDocument(): RvDocument | null { return this._doc; }
+
   /** The op log — what gets persisted into `RvScene`. */
   private get _ops(): readonly RvOp[] { return this._doc.ops; }
 
@@ -577,6 +687,11 @@ export class SceneStore {
    * would apply each a second time.
    */
   private _installOps(ops: readonly RvOp[], baseline: readonly RvOp[]): void {
+    // The document OBJECT survives every open (it is readonly here), but the
+    // history it held does not: what a bound editor wrote before this point is
+    // no longer on screen, so its drafts are crash drafts again and must be
+    // offered back (plan-616 F4, the "scene rebuilt" case).
+    forgetSessionDraftsOf(this._doc);
     this._doc.restoreHistory({
       ops: normalizePersistedSceneOps(ops),
       redoOps: [],
@@ -601,6 +716,9 @@ export class SceneStore {
     this._refreshBuiltins();
     this._notify();
   }
+
+  /** A lazy document extension changed state that contributes to this snapshot. */
+  refreshExternalState(): void { this._notify(); }
 
   /**
    * Boot path: a GLB was loaded directly via loadModelWithProgress (e.g.
@@ -710,6 +828,15 @@ export class SceneStore {
        * as before.
        */
       modeDecidedByCaller?: boolean;
+      /**
+       * plan-776 #20 — a BACKGROUND open (Regenerate thumbnails): the document
+       * is loaded exactly as every open loads it (same funnel, placements
+       * materialised), but it leaves no trace of a user open — no address-bar
+       * change, no row mode applied, no resume pair, no recents entry. The run
+       * opens every document of a project and re-opens the previous one at the
+       * end; without this the recents ring would list the whole project.
+       */
+      background?: boolean;
     } = {},
   ): Promise<void> {
     const row = await this._documentRowOrAdopt(documentId);
@@ -719,14 +846,28 @@ export class SceneStore {
     await this._loadIntoWorkspace(makeDraftScene(base, name), null, {
       document: { id: row.id, path: row.path },
     });
+    if (opts.background) {
+      this._publishDocumentIdentity();
+      this._notify();
+      return;
+    }
     if (opts.updateUrl !== false) updateUrlDocumentParam(row.id);
     // The row's preferred workspace mode (plan-731 2e). It used to be a property
     // of a catalogue ENTRY and was applied by `openPublishedExample`; it is a
     // property of the manifest ROW now, so it is applied here — the one place
     // every document is opened. Absent on all but the demo's example rows, and a
     // no-op when absent, so nothing else changes behaviour.
+    //
+    // The row's mode RESTRICTION (`documents[].modes`) was installed by the
+    // load's first `_notify` (see `_syncModeRestriction`); here the workspace
+    // leaves a mode the document forbids, for the default (`mode`) or the first
+    // allowed one. A caller that decided the mode itself (the open chain) has
+    // already checked its target against the row and switches afterwards.
     if (!opts.modeDecidedByCaller) {
       this._applyMode(typeof row.mode === 'string' ? row.mode : undefined);
+      // Awaited: the resume pair and the recents below record the mode the
+      // document is actually used in, which may first have to load (plan-652).
+      await this._enforceModeRestriction();
     }
     // AFTER the load, never inside it: `_loadIntoWorkspace`'s own
     // `setOpenDocumentBase` block is a pinned characterisation surface
@@ -771,6 +912,7 @@ export class SceneStore {
     // document is actually used in. It still sets no mode itself (plan-703
     // decision 24) — it only reads the live one, or the intent of the open
     // that is running (`withOpenIntentMode`).
+    await this._syncDocumentExperiments(row.id, 'open');
     this._recordRecentDocument(row.id, name, row.path);
     this._notify();
   }
@@ -909,15 +1051,17 @@ export class SceneStore {
   /**
    * {@link _documentRow}, with one recovery for a file that is on disk but has
    * no manifest row yet: a GLB copied into an OPEN folder project through the
-   * file explorer (field finding wmyb 2026-09-02). Its card shows a DERIVED
+   * file explorer (customer field finding 2026-09-02). Its card shows a DERIVED
    * row whose id is path-minted (`stableDocumentId`), and the adopt verb mints
    * the same id — so one rescan, which runs the adopt and writes the row,
    * makes the very id that just missed resolve. Without this, the open falls
    * through to the identity-less legacy path and the later save fails its
    * "expected it to be new" precondition against the document's own file.
    *
-   * Cheap on a genuine miss: `rescanDocuments()` is single-flighted, skips
-   * bundled backends, and writes nothing when there is nothing to adopt.
+   * Cheap on a genuine miss: `rescanDocuments()` is single-flighted with a
+   * dirty re-run (plan-777 P7) — a call arriving mid-scan waits for the
+   * follow-up scan, which lists the file this lookup is after — skips bundled
+   * backends, and writes nothing when there is nothing to adopt.
    */
   private async _documentRowOrAdopt(idOrScn: string): Promise<RvDocumentEntry | null> {
     const row = this._documentRow(idOrScn);
@@ -1174,7 +1318,7 @@ export class SceneStore {
    * scene: `builtinModel`), so `_resolveOpenPlan` compared the pre-save base
    * against a post-save identity, `sameDocumentBase` answered false, and the
    * editor opened the raw base model as a SECOND document — the bind branch was
-   * unreachable for every scene saved in this session (e2e
+   * unreachable for every document saved in this session (e2e
    * `shared-document-continuity.spec.ts` skipped on exactly this).
    *
    * Only ever an upgrade, never a clear: when the save produced no identity
@@ -1380,7 +1524,7 @@ export class SceneStore {
    * Drop the shared document's op draft once the document is clean.
    *
    * The record's WRITER is the editor facade, and it is gone by the time a
-   * scene save makes the document clean — so without this the one truth would
+   * planner save makes the document clean — so without this the one truth would
    * outlive the work it describes and come back at the next open as unsaved
    * changes that were saved. Best-effort and fire-and-forget, exactly like
    * every other draft write: a net that fails to clear is a nuisance, a save
@@ -1470,6 +1614,39 @@ export class SceneStore {
    *    `rvproject:` resolution as every other document.
    */
 
+  /**
+   * Install the open document's mode restriction (`documents[].modes`) on the
+   * mode manager, or lift it when the workspace holds no document / one without
+   * `modes`. Runs on every `_notify`, so every path that changes the workspace's
+   * document — open, transient source, new empty, save-as — keeps it current
+   * without each having to remember it; `setRestriction` is idempotent.
+   */
+  private _syncModeRestriction(): void {
+    const modes = this._viewer?.modes;
+    if (!modes || typeof modes.setRestriction !== 'function') return;
+    const documentId = this._workspace?.documentId ?? null;
+    const row = documentId ? this._documentRow(documentId) : null;
+    const allowed = allowedModesOf(row);
+    modes.setRestriction(allowed && row
+      ? { allowed, defaultMode: typeof row.mode === 'string' && row.mode ? row.mode : null, owner: row.id }
+      : null);
+  }
+
+  /**
+   * Leave a mode the open document forbids (see `ModeManager.enforceRestriction`).
+   * A failed switch is logged, never thrown: the document is open, and the
+   * restriction still refuses every forbidden switch that follows.
+   */
+  private async _enforceModeRestriction(): Promise<void> {
+    try {
+      const ok = await this._viewer.modes?.enforceRestriction?.();
+      if (ok === false) {
+        console.warn(`[SceneStore] could not leave mode '${this._viewer.modes?.activeMode}' `
+          + 'that the open document does not allow');
+      }
+    } catch { /* mode system unavailable (e.g. tests) — ignore */ }
+  }
+
   /** Switch workspace mode if the id is a registered mode. No-op when absent. */
   private _applyMode(mode?: string): void {
     if (!mode) return;
@@ -1477,6 +1654,18 @@ export class SceneStore {
       if (this._viewer.modes.has(mode)) this._viewer.modes.setMode(mode);
       else console.warn(`[SceneStore] example declares unknown mode '${mode}' — not applied`);
     } catch { /* mode system unavailable (e.g. tests) — ignore */ }
+  }
+
+  /**
+   * A transient scratch workspace: blank, unsaved, and NO document minted.
+   * The MCP `web_document_open("empty")` path — an agent clearing the viewport
+   * must not leave an "Untitled N.glb" + manifest row behind on every call.
+   * The first explicit save turns it into a document (`_resolveSaveTarget`).
+   * Discards the prior empty draft, like `newEmpty`.
+   */
+  async openScratch(): Promise<void> {
+    clearDraft({ kind: 'empty' });
+    return this._openEmptyDraft();
   }
 
   /**
@@ -1538,7 +1727,27 @@ export class SceneStore {
     await (await sceneGlbIo()).dropSceneGlbBody(`draft/${created.documentId}`).catch(() => {});
     this._slotRevisions.delete(`draft/${created.documentId}`);
     clearSceneDraft(created.documentId);
+    // No post-save step here (plan-777 P8): this seam is shared with "New",
+    // which writes no bytes and is not a save. `saveAs` — the one caller that
+    // passes bytes — runs `finishDocumentSave` itself once the copy's identity,
+    // URL and recent-document entry are final.
     return created;
+  }
+
+  /**
+   * The one post-save step for a planner save (plan-777 F5): thumbnail of the
+   * open document → `document-saved` → background rescan. The scene store owns
+   * the viewer, `savePlannerDocument` only a facade.
+   */
+  private _finishSave(documentId: string | null, relPath: string): Promise<{ thumbnail: string | null }> {
+    const store = getProjectStore();
+    return finishDocumentSave({
+      viewer: this._viewer,
+      store,
+      backend: store.getBackend(),
+      documentId,
+      relPath,
+    });
   }
 
   /**
@@ -1590,7 +1799,16 @@ export class SceneStore {
   private async _loadIntoWorkspace(
     scene: RvScene,
     saved: RvScene | null,
-    opts: { transient?: boolean; document?: { id: string; path: string } } = {},
+    opts: {
+      transient?: boolean;
+      document?: { id: string; path: string };
+      /**
+       * plan-527 — a reload of the SAME document (a replace from outside): the
+       * document's camera preset is neither applied nor persisted; the caller
+       * restores the camera it captured before the load.
+       */
+      keepCamera?: boolean;
+    } = {},
   ): Promise<void> {
     this._cancelAutosave();
     this._loading = true;
@@ -1621,6 +1839,7 @@ export class SceneStore {
     //                    the user explicitly saves or discards.
     this._installOps(scene.edits.ops, saved ? saved.edits.ops : []);
     this._saved = saved;
+    this._draftBacked = false;
     this._notify();
     // Surface a centered loading overlay during scene/GLB swaps. The base
     // GLB parse + scene rebuild blocks the main thread for a few seconds
@@ -1646,6 +1865,7 @@ export class SceneStore {
       perfRecoveryMs = performance.now() - perfT0; // TEMP open-perf
       const resolved = await this._resolveLoad(scene, opts.transient === true);
       perfResolveMs = performance.now() - perfT0 - perfRecoveryMs; // TEMP open-perf
+      this._draftBacked = resolved.draftBacked === true;
       let toLoad = resolved.scene;
       if (resolved.fromGlb) {
         // The body already contains every op — every op the STAMP accounts for,
@@ -1687,7 +1907,7 @@ export class SceneStore {
       // `saveStartPos` writes localStorage, and a link somebody mailed must not
       // change what the visitor's own models look like on open (F7).
       if (resolved.fromGlb || resolved.adopt || opts.transient) {
-        this._adoptFromLoadedGlb({ persistCamera: opts.transient !== true });
+        this._adoptFromLoadedGlb({ persistCamera: opts.transient !== true && opts.keepCamera !== true });
       }
       // A transient workspace does not own the active-scene pointer. Writing it
       // here — even as `null`, which is what `saved` is on this path — is the
@@ -1772,6 +1992,7 @@ export class SceneStore {
       // a document with set-aside drafts reports the notice, any other open
       // clears it. Never throws, so it cannot mask the load's own error.
       await this._reportStaleDraftNotice(opts.document?.id, opts.transient === true);
+      await this._reportDraftRestoredNotice();
     }
   }
 
@@ -1818,7 +2039,15 @@ export class SceneStore {
   private async _resolveLoad(
     scene: RvScene,
     transient = false,
-  ): Promise<{ scene: RvScene; fromGlb: boolean; identityUrl?: string; data?: ArrayBuffer; adopt?: boolean }> {
+  ): Promise<{
+    scene: RvScene;
+    fromGlb: boolean;
+    identityUrl?: string;
+    data?: ArrayBuffer;
+    adopt?: boolean;
+    /** A DOCUMENT resumed from its own draft slot: local changes the file does not hold. */
+    draftBacked?: boolean;
+  }> {
     const slots = this._bodySlots();
     // The base URL the workspace was opened from, kept for the return below.
     // The resolved base is a blob: object URL — bytes, not identity — and every
@@ -1871,6 +2100,9 @@ export class SceneStore {
         },
         fromGlb: true,
         identityUrl,
+        // Only a document's own draft: the edits are baked into this body and
+        // the op log is empty, so without the flag nothing would call it dirty.
+        ...(documentId && slot === slots.draft ? { draftBacked: true } : {}),
       };
     }
 
@@ -2081,6 +2313,43 @@ export class SceneStore {
   }
 
   /**
+   * Report — or clear — the "local changes not in the file" notice after an
+   * open. Shown only where the draft can never be saved into the file (a
+   * read-only project backend): on a writable project the resumed draft is the
+   * routine autosave carry-over and "Unsaved" on the card says enough.
+   */
+  private async _reportDraftRestoredNotice(): Promise<void> {
+    try {
+      const live = await import('./rv-scene-live-sync');
+      const documentId = this._workspace?.documentId;
+      const readOnly = getProjectStore().getBackend()?.writable === false;
+      if (!this._draftBacked || !documentId || !readOnly) {
+        live.clearDraftRestoredNotice();
+        return;
+      }
+      live.reportDraftRestored(documentId, this._workspace?.name || documentId);
+    } catch {
+      // A notice that cannot be shown loses nothing: the card still says "Unsaved".
+    }
+  }
+
+  /** The open document no longer differs from its file by a resumed draft. */
+  private _clearDraftBacked(): void {
+    if (!this._draftBacked) return;
+    this._draftBacked = false;
+    void import('./rv-scene-live-sync').then((live) => live.clearDraftRestoredNotice()).catch(() => {});
+  }
+
+  /**
+   * Drop the resumed draft of `documentId` and reload its file — "Discard" on
+   * the draft-restored notice. A no-op when another document is open by now.
+   */
+  async discardRestoredDraft(documentId: string): Promise<void> {
+    if (this._workspace?.documentId !== documentId) return;
+    await this.discard();
+  }
+
+  /**
    * Can this store write drafts right now? The rule the autosave follows, and
    * the one the stale-draft notice uses to offer Restore (plan-546).
    */
@@ -2101,6 +2370,10 @@ export class SceneStore {
    *          underneath — in which case nothing was touched).
    */
   async restoreStaleDraft(documentId: string): Promise<boolean> {
+    // Not on the plan-527 branch (plan-546 came later): a restore moves a draft
+    // into `draft/<id>` and reopens — exactly what a replace's reload drops and
+    // replaces, so the two must not interleave.
+    this._refuseWhileReplacing('Restoring a set-aside draft');
     const io = await sceneGlbIo();
     const entries = io.listSetAsideBodies(documentId);
     const newest = entries[0];
@@ -2170,6 +2443,16 @@ export class SceneStore {
   }
 
   /**
+   * Write a pending debounced autosave now. A document switch cancels the
+   * timer (`_loadIntoWorkspace`), so a caller that leaves a document it wants
+   * to come back to — the reference navigation's Back — flushes first, or the
+   * last two seconds of edits are not in the draft that Back resumes.
+   */
+  flushAutosave(): Promise<void> {
+    return this._flushAutosave();
+  }
+
+  /**
    * Run a pending debounced autosave NOW and wait for any write in flight.
    * The work is kept, never dropped — the difference to `_cancelAutosave`.
    */
@@ -2179,7 +2462,7 @@ export class SceneStore {
       this._draftAutosaveTimer = null;
       const ws = this._workspace;
       if (ws && !ws.transient && !this._projectionSuspended
-        && (this.canUndo() || this.canRedo() || !this._saved)) {
+        && (this.canUndo() || this.canRedo() || !this._saved || isVariantsDirty())) {
         await this._autosaveBody();
       }
     }
@@ -2345,7 +2628,7 @@ export class SceneStore {
         ensureAttached?: (viewer: unknown) => void;
       }>('layout-planner');
       // Attach FIRST: `adoptPlacements` bails out silently when the planner has
-      // never been attached, and a GLB-scene document opened straight from a
+      // never been attached, and a GLB document opened straight from a
       // boot (`?doc=…&mode=planner`) reaches here before anything else attached
       // it — loadScene only calls ensureAttached for op-based placements and
       // empty bases, not for placements already baked into the tree
@@ -2367,13 +2650,36 @@ export class SceneStore {
    * Save the current draft (creates a new id on first save, else overwrites).
    *
    * Runs ON the op queue (plan-709 §2.2.1-2). It did not, and the reason it
-   * got away with it was accidental: until this plan a scene save only ever ran
+   * got away with it was accidental: until this plan a planner save only ever ran
    * from the project exit dialog, which had already sequenced everything before
    * it. A Save button the user can press at any moment removes that accident,
    * so the guarantees are stated instead of inherited — see {@link _save}.
    */
   async save(): Promise<SceneSaveVerdict> {
-    return this._doc.runExclusive(() => this._save());
+    this._refuseWhileReplacing('Saving the scene');
+    return this._doc.runExclusive(() => {
+      // Re-asked ON the queue: a replace takes its lock from inside the queue,
+      // so a save queued just before it would otherwise run after it.
+      this._refuseWhileReplacing('Saving the scene');
+      return this._save();
+    });
+  }
+
+  async syncOpenDocumentExperiments(): Promise<void> {
+    const id = this._workspace?.documentId;
+    if (id) await this._syncDocumentExperiments(id, 'open');
+  }
+
+  /** Experiment IO is best effort, including when the document itself has no changes. */
+  private async _syncDocumentExperiments(docId: string, action: 'open' | 'save'): Promise<void> {
+    try {
+      const generation = this._replaceGeneration;
+      await documentExperimentSyncHook?.(this._viewer, docId, action, () => generation === this._replaceGeneration && this._workspace?.documentId === docId);
+    } catch (error) {
+      const { reportProblem } = await import('../problems-store');
+      reportProblem({ id: `experiment-project-${action}:${docId}`, code: `experiment-project-${action}`,
+        severity: 'warning', title: 'Experiment project sync failed', detail: `${docId}: ${String(error)}` });
+    }
   }
 
   private async _save(): Promise<SceneSaveVerdict> {
@@ -2382,7 +2688,10 @@ export class SceneStore {
     // this, pressing Save twice on an untouched draft minted a second scene id
     // and a second catalogue row for the same content, purely because the
     // button was pressed again.
-    if (this._saved && !this._workspace.transient && !this._doc.dirty) return 'no-op';
+    if (this._saved && !this._workspace.transient && !this._doc.dirty && !this._draftBacked && !isVariantsDirty()) {
+      if (this._workspace.documentId) await this._syncDocumentExperiments(this._workspace.documentId, 'save');
+      return 'no-op';
+    }
 
     // ── The alt-session weiche (plan-716 §2.4, R2-S4b) ───────────────────
     //
@@ -2572,7 +2881,8 @@ export class SceneStore {
     // the authored tree instead.
     const projected = this._projectionSuspended;
     const baseBytesAtStart = this._baseBytes?.bytes ?? null;
-    const bytes = projected ? await this._bakeAuthoredTree() : await this._bakeCurrent();
+    const variants = getVariantsSavePayload();
+    const bytes = projected ? await this._bakeAuthoredTree(variants) : await this._bakeCurrent(variants);
     if (!bytes) {
       console.error('[scene-store] the document could not be baked — nothing was written.');
       return 'no-op';
@@ -2670,6 +2980,9 @@ export class SceneStore {
     this._saved = saved;
     this._publishDocumentIdentity();
     this._doc.markSaved({ floor: floorAtBakeStart });
+    markVariantsSaved(variants);
+    // The file now holds what the resumed draft carried.
+    this._clearDraftBacked();
 
     // Same conditional as the deleted row save: ops that arrived mid-bake are
     // NOT in the file, and the draft is the only place they still exist.
@@ -2706,8 +3019,12 @@ export class SceneStore {
     // normalisation `openDocument` performs, applied to the save that MADE this
     // workspace a document (plan-716 §2.4/F5).
     updateUrlDocumentParam(target.entryId);
-    void store.rescanDocuments();
+    // The one post-save step (plan-777 P8): identity, current scene and URL are
+    // final, the row exists (a planned document's row was committed above).
+    // Thumbnail → `document-saved` → background rescan, before `_notify()`.
+    await this._finishSave(target.entryId, target.relPath);
     this._notify();
+    await this._syncDocumentExperiments(target.entryId, 'save');
     return 'saved';
   }
 
@@ -2764,7 +3081,7 @@ export class SceneStore {
    *    read (`sceneGlbBodyRevision`);
    *  - and when neither exists the write stays UNCONDITIONAL. Never `null`:
    *    "expect nothing to be stored" would be a guaranteed false conflict for
-   *    every scene saved by a build older than its manifest revisions.
+   *    every document saved by a build older than its manifest revisions.
    *
    * A genuine conflict is therefore reported to the caller instead of
    * overwriting somebody's work; every other failure keeps the previous
@@ -2800,6 +3117,40 @@ export class SceneStore {
       console.error('[scene-store] could not write the scene body:', e);
       return null;
     }
+  }
+
+  // ─── Export context facts (plan-764) ────────────────────────────────
+
+  /**
+   * What a non-GLB export provider may know about the open document, read
+   * synchronously (the document card asks while it renders its menu).
+   *
+   *  - `documentId` / `documentPath` — the workspace's manifest row, null for
+   *    an unsaved or transient workspace;
+   *  - `revision` — the revision of the document FILE this session last saw
+   *    (the CAS basis of the one save), null when it was never read;
+   *  - `hasUsdPrimPaths` — the base bytes carry `rvUsdPrimPath` stamps from a
+   *    USD import. Read off the authored base bytes, not the live tree: the bake
+   *    drops unclaimed nodes, and the stamps sit on exactly those. Edits cannot
+   *    add or remove a stamp (only the USD import writes one), so the base bytes
+   *    answer for the edited document too.
+   */
+  documentExportFacts(): {
+    documentId: string | null;
+    documentPath: string | null;
+    revision: string | null;
+    hasUsdPrimPaths: boolean;
+  } {
+    const ws = this._workspace;
+    const documentPath = ws && !ws.transient ? (ws.documentPath ?? null) : null;
+    return {
+      documentId: ws && !ws.transient ? (ws.documentId ?? null) : null,
+      documentPath,
+      revision: documentPath
+        ? (this._expectedRevisionOf(SceneStore._docRevisionKey(documentPath)) ?? null)
+        : null,
+      hasUsdPrimPaths: this._baseBytes ? glbJsonMentions(this._baseBytes.bytes, '"rvUsdPrimPath"') : false,
+    };
   }
 
   // ─── Flat export (plan-397 phase 8, F8) ─────────────────────────────
@@ -2870,7 +3221,18 @@ export class SceneStore {
       // file has the same shape as the document it came from.
       // `sceneMirroringLoad` BORROWS the children; it never re-parents, so the
       // live scene is untouched by this call.
-      return new Uint8Array(await objectToGlb(sceneMirroringLoad(root)));
+      const glb = await objectToGlb(sceneMirroringLoad(root));
+      // plan-769 Phase 3b: the live tree goes out without the editor sanitizer — the
+      // runtime keys are folded (authored names, seeded ids) and dropped, and the file
+      // is written ID-only like every other save (ids, addresses, `idVersion`).
+      const [{ parseGlbChunks, rebuildGlbWithJson }, { promoteRuntimeKeysInJson, stampJsonIdentity }] = await Promise.all([
+        import('../../persistence/rv-glb-chunks'),
+        import('../../engine/rv-json-identity'),
+      ]);
+      const chunks = parseGlbChunks(glb);
+      promoteRuntimeKeysInJson(chunks.json);
+      stampJsonIdentity(chunks.json);
+      return rebuildGlbWithJson(chunks);
     } finally {
       // Always — an export that threw must not leave the live scene claiming
       // its references are already inlined, nor rendering without the
@@ -2882,7 +3244,7 @@ export class SceneStore {
   }
 
   /** Bake the current edit state onto the base bytes and return the result. */
-  private async _bakeCurrent(): Promise<Uint8Array | null> {
+  private async _bakeCurrent(variants: SavePayload | undefined = getVariantsSavePayload()): Promise<Uint8Array | null> {
     const perfT0 = performance.now(); // TEMP open-perf instrumentation
     const source = await this._ensureBaseBytes();
     const registry = this._viewer.registry;
@@ -2903,6 +3265,9 @@ export class SceneStore {
         expectedNames: registry.getGltfNodeNames(),
         settings: { ...this._settings },
         clearCameraWhenUnset: true,
+        // plan-641 M5: the document's macros (undefined = keep what the bytes hold).
+        macros: macrosForEmbed(this._doc),
+        variants,
       },
     );
     // TEMP open-perf instrumentation
@@ -2931,7 +3296,7 @@ export class SceneStore {
    * Throws rather than falling back to `_bakeCurrent`: that fallback is a save
    * that reports success and leaves the editor's work out of the file.
    */
-  private async _bakeAuthoredTree(): Promise<Uint8Array | null> {
+  private async _bakeAuthoredTree(variants: SavePayload | undefined = getVariantsSavePayload()): Promise<Uint8Array | null> {
     const source = this._authoredSource;
     if (!source) {
       throw new Error(
@@ -2950,6 +3315,8 @@ export class SceneStore {
       {
         settings: { ...this._settings },
         clearCameraWhenUnset: true,
+        macros: macrosForEmbed(this._doc),
+        variants,
       },
     );
     for (const warning of result.warnings) console.warn('[scene-store]', warning);
@@ -2958,7 +3325,11 @@ export class SceneStore {
 
   /** Save under a new name — always creates a new id. */
   async saveAs(name: string): Promise<string> {
-    return this._doc.runExclusive(() => this._saveAs(name));
+    this._refuseWhileReplacing('Save as');
+    return this._doc.runExclusive(() => {
+      this._refuseWhileReplacing('Save as');
+      return this._saveAs(name);
+    });
   }
 
   private async _saveAs(name: string): Promise<string> {
@@ -2987,7 +3358,8 @@ export class SceneStore {
     // Same writer choice and same base-bytes rule as `_saveIntoDocument`.
     const projected = this._projectionSuspended;
     const baseBytesAtStart = this._baseBytes?.bytes ?? null;
-    const bytes = projected ? await this._bakeAuthoredTree() : await this._bakeCurrent();
+    const variants = getVariantsSavePayload();
+    const bytes = projected ? await this._bakeAuthoredTree(variants) : await this._bakeCurrent(variants);
     if (!bytes) throw new Error('The document could not be saved under a new name.');
 
     if (
@@ -3043,6 +3415,9 @@ export class SceneStore {
     this._saved = saved;
     this._publishDocumentIdentity();
     this._doc.markSaved({ floor: floorAtBakeStart });
+    markVariantsSaved(variants);
+    // The file now holds what the resumed draft carried.
+    this._clearDraftBacked();
     // See the in-place save for the conditional-cleanup rationale: ops that
     // arrived mid-bake are not in the copy, so their draft must survive.
     if (this._doc.opCount === floorAtBakeStart) {
@@ -3057,13 +3432,17 @@ export class SceneStore {
     // will come back to (plan-478 R3-6). The source keeps its own, older ring
     // entry — a "save as" is a fork, not a move, and both files are real.
     this._recordRecentDocument(created.documentId, name, created.relPath);
-    void store.rescanDocuments();
+    // The one post-save step (plan-777 P8) — the same point as an in-place
+    // save: identity → current scene → URL → recent entry, then this, then
+    // `_notify()`. Not inside `_createDocument`, which "New" shares.
+    await this._finishSave(created.documentId, created.relPath);
     this._notify();
     return created.documentId;
   }
 
   /** Revert to the last-saved state (or to bare base for fresh drafts). */
   async discard(): Promise<void> {
+    this._refuseWhileReplacing('Discarding changes');
     // plan-546 AC 6 — the slot the autosave actually writes. For a DOCUMENT
     // that is `draft/<documentId>`, which neither spelling below names: without
     // it "Discard changes" reopened the document and resumed the very draft it
@@ -3356,6 +3735,8 @@ export class SceneStore {
     // `undo` / `redo` all queue here — draining first and then working outside
     // would let an edit land mid-flight, be visibly applied, and then be erased
     // by the empty op log this method installs at the end.
+    const refused = this._replaceRefusal('Saving settings into the model');
+    if (refused) return Promise.reject(refused);
     return this._enqueueResult(() => this._saveSettingsIntoModel(name));
   }
 
@@ -3463,6 +3844,12 @@ export class SceneStore {
       const label = fileName.replace(/\.glb$/i, '');
       await this.openBuiltin(projectAssetUrl(relPath), label);
       writtenPath = null; // adopted — the file is the scene's base now, never roll it back
+      // A create-only new document: its picture is the model that just loaded
+      // from it (plan-776 F3). Rendered once the placements have settled. The id
+      // is not known here — `finishDocumentSave` resolves the row by path and
+      // announces with its id, or skips the announce when there is none yet.
+      await (this._viewer as { whenSceneReady?: () => Promise<void> }).whenSceneReady?.();
+      await this._finishSave(null, relPath);
       // The old base's autosave snapshot still holds the ops we just wrote in;
       // left alone it would re-apply them on top of the new model next time
       // that base is opened.
@@ -3516,18 +3903,210 @@ export class SceneStore {
    * log; the composite is committed by `endTransaction`.
    */
   applyOp(op: RvScenePrimitiveOp): Promise<void> {
+    if (runLeaseBlocker()) return Promise.reject(new Error('experiment-running'));
+    const refused = this._replaceRefusal('Applying an edit');
+    if (refused) return Promise.reject(refused);
     return this._doc.applyOp(op);
   }
 
   /** Undo the last op (down to the baseline floor). */
   undo(): Promise<void> {
+    if (runLeaseBlocker()) return Promise.reject(new Error('experiment-running'));
+    const refused = this._replaceRefusal('Undo');
+    if (refused) return Promise.reject(refused);
     return this._doc.undo();
   }
 
   /** Redo the most-recently undone op. */
   redo(): Promise<void> {
+    if (runLeaseBlocker()) return Promise.reject(new Error('experiment-running'));
+    const refused = this._replaceRefusal('Redo');
+    if (refused) return Promise.reject(refused);
     return this._doc.redo();
   }
+
+  // ─── Replace from outside (plan-527, ported for plan-764) ────────────────────────────────
+
+  /** What holds the document for a replace, or null. */
+  get replaceLockOwner(): DocumentLockOwner | null {
+    return this._replaceLock ? { kind: 'replace', startedAt: this._replaceLock.startedAt } : null;
+  }
+
+  /**
+   * Take the document for a replace from outside (`rv-document-replace`), or fail — never wait for a
+   * second replace.
+   *
+   * Acquired ON the op queue (the scene write serialisation `save()` uses), so
+   * a save, a settings write or an op already queued finishes first, and
+   * everything queued after it finds the lock and is refused. The long work of
+   * a replace (fetch, parse, write, reload) runs OUTSIDE the queue on purpose:
+   * the reload itself goes through `_loadIntoWorkspace`, which must not wait
+   * for a queue the replace is holding.
+   *
+   * Deliberately NOT refused under the lock (assessed in the plan-764 port, an
+   * open point for plan-764, not an oversight): `discardStaleDraft` (touches
+   * only set-aside drafts, never the open document), `setHistoryInterceptor`
+   * (configuration), `begin/end/abortTransaction` (`applyOp` is refused and
+   * `canApply` is the floor). Also NOT refused, as on the plan-527 branch:
+   * switching documents mid-replace (`openDocument` / `openScene` /
+   * `newEmpty`). The lock remembers the document that was open when it was
+   * taken, and {@link reloadOpenDocumentForReplace} refuses to reload any other
+   * one (LOP #180, user decision 2026-10-16): after such a switch the replaced
+   * file stays written, the newly opened document and its draft stay as they
+   * are, and the replace reports `document-switched`.
+   *
+   * @returns the token for {@link unlockReplace}, or null when a replace
+   *   already holds the document.
+   */
+  tryLockForReplace(): Promise<DocumentLockToken | null> {
+    return this._doc.runExclusive(async () => {
+      if (this._replaceLock) return null;
+      const generation = ++this._replaceGeneration;
+      const token = Symbol(`rv-scene-replace:${generation}`);
+      this._cancelAutosave();
+      this._replaceLock = {
+        token, generation, startedAt: Date.now(), documentId: this._workspace?.documentId ?? null,
+      };
+      this._notify();
+      return { kind: 'replace' as const, token, generation };
+    });
+  }
+
+  /** Release the replace lock — only for the token that holds it (else a warned no-op). */
+  unlockReplace(token: DocumentLockToken | null | undefined): void {
+    const held = this._replaceLock;
+    if (!held) return;
+    if (!token || token.token !== held.token || token.generation !== held.generation) {
+      console.warn('[scene-store] unlockReplace ignored — the token does not hold the replace lock.');
+      return;
+    }
+    this._replaceLock = null;
+    this._notify();
+  }
+
+  /** Does `token` hold the replace lock right now? */
+  holdsReplaceLock(token: DocumentLockToken | null | undefined): boolean {
+    const held = this._replaceLock;
+    return !!held && !!token && token.token === held.token && token.generation === held.generation;
+  }
+
+  /**
+   * Does a draft exist for `documentId` — whether or not it is the open one?
+   *
+   * The F10 check of plan-527 step 3: a body draft slot (`draft/<id>`, what the
+   * autosave writes and `_resolveLoad` prefers over the file on the next open),
+   * or — for the open document — a debounced draft write of unsaved work that
+   * has not run yet.
+   * Pushed bytes must never silently win over work that is sitting in a draft.
+   * A slot that cannot be read is answered as "a draft exists" — the refusal is
+   * the safe direction.
+   */
+  async hasDocumentDraft(documentId: string): Promise<boolean> {
+    if (!documentId) return false;
+    // A scheduled write counts only while there is work in it: after a save the
+    // timer is still armed, but its job is to DROP the draft of a clean document.
+    if (this._workspace?.documentId === documentId && this._draftAutosaveTimer !== null && this._doc.dirty) {
+      return true;
+    }
+    try {
+      const io = await sceneGlbIo();
+      const slot = `draft/${documentId}`;
+      if (io.sceneGlbBodyRevision) return (await io.sceneGlbBodyRevision(slot)) !== null;
+      return (await io.readSceneGlbBody(slot)) !== null;
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * Reload the open document from its (just replaced) file, keeping the
+   * camera — the open-document half of a replace from outside (plan-527 F4).
+   *
+   * Only for the holder of the replace lock. The pushed bytes are a new clean
+   * starting point, so the draft is dropped and the undo history starts empty
+   * (`_loadIntoWorkspace` installs an empty log for a fresh draft scene); the
+   * document's camera preset is neither applied nor persisted — the camera the
+   * user had before the push is put back after the load AND again once the
+   * placements have settled (their arrival may refit the view).
+   *
+   * LOP #180: when the open document is not the one the lock was taken on (the
+   * user switched documents while the replace ran), nothing is reloaded and no
+   * draft is touched — the answer is `'document-switched'`.
+   */
+  async reloadOpenDocumentForReplace(token: DocumentLockToken): Promise<'reloaded' | 'document-switched'> {
+    if (!this.holdsReplaceLock(token)) {
+      throw new Error('reloadOpenDocumentForReplace needs the replace lock.');
+    }
+    const ws = this._workspace;
+    const documentId = ws?.documentId;
+    if ((documentId ?? null) !== this._replaceLock!.documentId) return 'document-switched';
+    if (!ws || !documentId) throw new Error('No document is open.');
+    const row = this._documentRow(documentId);
+    const path = row?.path ?? ws.documentPath;
+    if (!path) throw new Error(`Document ${documentId} has no file path.`);
+    const name = ws.name || row?.name || documentId;
+    const camera = this._captureCamera();
+
+    this._cancelAutosave();
+    const slot = `draft/${documentId}`;
+    await (await sceneGlbIo()).dropSceneGlbBody(slot).catch(() => {});
+    this._slotRevisions.delete(slot);
+    clearSceneDraft(documentId);
+    // The base bytes are the PREVIOUS file; the next bake must read the new one.
+    this._baseBytes = null;
+
+    const base: SceneBase = { kind: 'builtin', url: projectAssetUrl(path), label: name };
+    await this._loadIntoWorkspace(makeDraftScene(base, name), null, {
+      document: { id: documentId, path },
+      keepCamera: true,
+    });
+    this._restoreCamera(camera);
+    try {
+      await (this._viewer as { whenSceneReady?: () => Promise<void> }).whenSceneReady?.();
+    } catch { /* never rejects by contract — and a camera restore is no reason to fail */ }
+    this._restoreCamera(camera);
+    this._notify();
+    return 'reloaded';
+  }
+
+  /** The refusal a mutation gets while a replace holds the document, or null. */
+  private _replaceRefusal(what: string): DocumentLockedError | null {
+    const owner = this.replaceLockOwner;
+    return owner ? new DocumentLockedError(owner, documentLockedMessage(owner, what)) : null;
+  }
+
+  private _refuseWhileReplacing(what: string): void {
+    const refused = this._replaceRefusal(what);
+    if (refused) throw refused;
+  }
+
+  private _captureCamera(): { position: [number, number, number]; target: [number, number, number] } | null {
+    const v = this._viewer as unknown as {
+      camera?: { position?: { x: number; y: number; z: number } };
+      controls?: { target?: { x: number; y: number; z: number } };
+    };
+    const p = v.camera?.position;
+    const t = v.controls?.target;
+    if (!p || !t) return null;
+    return { position: [p.x, p.y, p.z], target: [t.x, t.y, t.z] };
+  }
+
+  private _restoreCamera(state: ReturnType<SceneStore['_captureCamera']>): void {
+    if (!state) return;
+    const v = this._viewer as unknown as {
+      cancelCameraAnimation?: () => void;
+      camera?: { position?: { set(x: number, y: number, z: number): unknown } };
+      controls?: { target?: { set(x: number, y: number, z: number): unknown }; update?: () => void };
+      markRenderDirty?: () => void;
+    };
+    // A preset tween or a fit started by the load would keep moving the camera.
+    v.cancelCameraAnimation?.();
+    v.camera?.position?.set(...state.position);
+    v.controls?.target?.set(...state.target);
+    v.controls?.update?.();
+    v.markRenderDirty?.();
+  }
+
 
   /**
    * Route undo/redo of journaled entries (`meta.journalId`, plan-590 signal
@@ -3619,7 +4198,7 @@ export class SceneStore {
       this._draftAutosaveTimer = null;
       if (!this._workspace) return;
       const saved = this._saved;
-      if (this.canUndo() || this.canRedo() || !saved) {
+      if (this.canUndo() || this.canRedo() || !saved || isVariantsDirty()) {
         // There's edit content beyond baseline OR we're a fresh draft —
         // persist for tab-close survival. Since phase 6 this is a GLB body in
         // OPFS / the project folder, not an op log in localStorage: the write
@@ -3655,6 +4234,7 @@ export class SceneStore {
    * back on its own.
    */
   dispose(): void {
+    experimentSyncStores.delete(this);
     this._cancelAutosave();
     if (this._bodyObjectUrl) {
       URL.revokeObjectURL(this._bodyObjectUrl);
@@ -3723,6 +4303,8 @@ export class SceneStore {
         expectedNames: registry.getGltfNodeNames(),
         settings: { ...this._settings },
         clearCameraWhenUnset: true,
+        // plan-641 M5: the document's macros (undefined = keep what the bytes hold).
+        macros: macrosForEmbed(this._doc),
       },
     );
     for (const warning of result.warnings) console.warn('[scene-store]', warning);
@@ -3885,6 +4467,9 @@ export class SceneStore {
     return {
       // dirty / canUndo / canRedo, derived once in the document layer.
       ...this._doc.core,
+      // A resumed document draft is unsaved work even with an empty log.
+      dirty: this._doc.core.dirty || this._draftBacked || isVariantsDirty(),
+      draftBacked: this._draftBacked,
       saved: this._saved,
       draft,
       isDraft,
@@ -3904,6 +4489,7 @@ export class SceneStore {
   }
 
   private _notify(): void {
+    this._syncModeRestriction();
     this._snapshot = this._buildSnapshot();
     for (const l of this._listeners) l();
   }
@@ -3945,6 +4531,33 @@ function shellFor(scene: RvScene, revision: string): RvScene {
 /** Normalise a possibly-view-backed buffer to a standalone ArrayBuffer. */
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+/** Memo of {@link glbJsonMentions}, per buffer and needle — base bytes are immutable once set. */
+const _glbJsonMentionsMemo = new WeakMap<ArrayBuffer, Map<string, boolean>>();
+
+/**
+ * Does the JSON chunk of a GLB contain `needle` verbatim? A cheap text probe
+ * (no JSON.parse), memoised per buffer: the document card asks on every render.
+ */
+function glbJsonMentions(bytes: ArrayBuffer, needle: string): boolean {
+  let memo = _glbJsonMentionsMemo.get(bytes);
+  const hit = memo?.get(needle);
+  if (hit !== undefined) return hit;
+  let found = false;
+  try {
+    const view = new DataView(bytes);
+    const isGlb = bytes.byteLength >= 20 && view.getUint32(0, true) === 0x46546c67;
+    const json = isGlb
+      ? new Uint8Array(bytes, 20, Math.min(view.getUint32(12, true), bytes.byteLength - 20))
+      : new Uint8Array(bytes);
+    found = new TextDecoder().decode(json).includes(needle);
+  } catch {
+    found = false;
+  }
+  if (!memo) { memo = new Map(); _glbJsonMentionsMemo.set(bytes, memo); }
+  memo.set(needle, found);
+  return found;
 }
 
 function freshShell(base: SceneBase, name: string): WorkspaceShell {

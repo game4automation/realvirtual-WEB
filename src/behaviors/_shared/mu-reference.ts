@@ -24,12 +24,22 @@
  * oriented along it), the world-AABB extent along it is the part's real length there.
  */
 
-import { Box3, Vector3 } from 'three';
-import type { Object3D } from 'three';
+import { Box3, Matrix4, Quaternion, Vector3 } from 'three';
+import type { Mesh, Object3D } from 'three';
 import type { MU } from '../../core/material-flow/material-flow-self';
+import { spawnCloneScale } from '../../core/engine/rv-mu';
+
+const _cloneScale = new Vector3();
 
 const _box = new Box3();
 const _size = new Vector3();
+const _meshBox = new Box3();
+const _invTemplate = new Matrix4();
+const _space = new Matrix4();
+const _scaleOnly = new Matrix4();
+const _meshToSpace = new Matrix4();
+const _origin = new Vector3();
+const _identityQuat = new Quaternion();
 
 /** The MU's mutable travel state: a ground-plane unit `forward` + a cached world-
  *  bounds size (computed once; geometry is constant). */
@@ -90,6 +100,50 @@ export function measureMuVisualBugSize(node: Object3D): [number, number, number]
   _box.expandByObject(node);
   node.quaternion.copy(q);
   node.updateWorldMatrix(true, true);
+  if (_box.isEmpty()) return null;
+  _box.getSize(_size);
+  return [_size.x, _size.y, _size.z];
+}
+
+/** Subtrees a spawned clone never carries (`RVSource._buildRealClone` strips them). */
+function isStrippedFromClone(ud: Record<string, unknown> | undefined): boolean {
+  return !!(ud?._isSourceGhost || ud?._isGhostOverlay || ud?._isSourcePreview);
+}
+
+/**
+ * The size `measureMuVisualBugSize` would return for a clone of `template`
+ * spawned under `spawnParent` — measured WITHOUT spawning (plan-638, spike
+ * result). The clone hangs under `spawnParent`, carries `spawnCloneScale` (the
+ * template's world scale relative to the spawn parent, plan-655 F10) and is measured with its quaternion reset, so the measurement space is
+ * `P · S(template.scale) · rel` (P = world matrix of the spawn parent, rel =
+ * mesh relative to the template). Ghost / overlay / preview subtrees are
+ * skipped (the clone strips them). Each mesh contributes its transformed
+ * `geometry.boundingBox`, the same non-precise rule as `Box3.expandByObject`.
+ * Read-only: nothing is cloned, added or counted. `null` without geometry.
+ */
+export function templateSizeOf(template: Object3D, spawnParent: Object3D): [number, number, number] | null {
+  template.updateWorldMatrix(true, true);
+  spawnParent.updateWorldMatrix(true, false);
+  _invTemplate.copy(template.matrixWorld).invert();
+  // plan-655 F10: the clone's scale is the template's WORLD scale relative to
+  // the spawn parent — the same `spawnCloneScale` rule `RVSource.spawn` uses.
+  _scaleOnly.compose(_origin, _identityQuat, spawnCloneScale(template, spawnParent, _cloneScale));
+  _space.multiplyMatrices(spawnParent.matrixWorld, _scaleOnly);
+  _box.makeEmpty();
+  const walk = (o: Object3D): void => {
+    if (o !== template && isStrippedFromClone(o.userData)) return;
+    const g = (o as Mesh).geometry;
+    if (g) {
+      if (!g.boundingBox) g.computeBoundingBox();
+      if (g.boundingBox) {
+        _meshToSpace.multiplyMatrices(_invTemplate, o.matrixWorld).premultiply(_space);
+        _meshBox.copy(g.boundingBox).applyMatrix4(_meshToSpace);
+        _box.union(_meshBox);
+      }
+    }
+    for (const c of o.children) walk(c);
+  };
+  walk(template);
   if (_box.isEmpty()) return null;
   _box.getSize(_size);
   return [_size.x, _size.y, _size.z];

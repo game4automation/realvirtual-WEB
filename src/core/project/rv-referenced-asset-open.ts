@@ -34,7 +34,11 @@
  */
 
 import type { RvProject } from './rv-project-types';
-import { findDocumentById } from './rv-asset-identity';
+import { findDocumentById, findDocumentByPath } from './rv-asset-identity';
+import { isQualifiedRef } from '../library/library-origin';
+
+/** `PROJECT_PLACEMENT_PREFIX` of `core/library/rv-placement-source.ts`, kept local so this module stays pure. */
+const PROJECT_ASSET_PREFIX = 'project:';
 
 /** The reference fields this module needs — a structural subset of `AssetReference`. */
 export interface ReferencedAssetLocator {
@@ -45,7 +49,14 @@ export interface ReferencedAssetLocator {
   path?: string;
 }
 
+
 export type ReferencedAssetPlan =
+  /**
+   * A document of LIBRARY PROJECT `libraryProjectId` (plan-778 Phase 5): opened
+   * as a `libraryDocument` — B's own row, saved into B only through Edit in
+   * library, never into the open project.
+   */
+  | { via: 'library'; libraryProjectId: string; documentId: string }
   /** Resolve through a registered library source. */
   | { via: 'catalog'; providerId: string; sourceId: string; assetId: string }
   /** Read this project-relative path. */
@@ -92,6 +103,9 @@ export function planReferencedAssetOpen(
   project: RvProject | null | undefined,
   ownerPath: string | null,
 ): ReferencedAssetPlan {
+  if (isQualifiedRef(ref) && ref.sourceId) {
+    return { via: 'library', libraryProjectId: ref.sourceId, documentId: ref.assetId };
+  }
   if (ref.providerId && ref.sourceId) {
     return {
       via: 'catalog',
@@ -103,6 +117,14 @@ export function planReferencedAssetOpen(
 
   const row = ref.assetId ? findDocumentById(project, ref.assetId) : null;
   if (row?.path) return { via: 'manifest', assetId: ref.assetId, relPath: row.path };
+
+  // A placement dragged in from the project library names its asset by the
+  // catalog id `project:<project-relative path>` (`PROJECT_PLACEMENT_PREFIX`)
+  // and carries no `path` — the same mapping `referencedDocumentId` applies.
+  if (ref.assetId?.startsWith(PROJECT_ASSET_PREFIX)) {
+    const byPath = findDocumentByPath(project, ref.assetId.slice(PROJECT_ASSET_PREFIX.length));
+    if (byPath?.path) return { via: 'manifest', assetId: byPath.id, relPath: byPath.path };
+  }
 
   if (ref.path) {
     const relPath = resolveReferencePath(ownerPath, ref.path);

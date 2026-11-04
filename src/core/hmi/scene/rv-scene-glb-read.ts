@@ -60,6 +60,7 @@ import type {
   PlacedComponent,
   SignalMapping,
 } from '../../../plugins/layout-planner/rv-layout-store';
+import { isQualifiedRef } from '../../library/library-origin';
 
 const RAD_TO_DEG = 180 / Math.PI;
 
@@ -115,11 +116,18 @@ function placementOf(node: Object3D): PlacedComponent | null {
   const reference = getAssetReference(node);
 
   const euler = node.rotation;
+  // plan-778 F4: the qualifier travels into the record (a splat's in its meta);
+  // a qualified reference's stored `path`, if any, is ignored.
+  const providerId = reference?.providerId ?? meta.providerId;
+  const sourceId = reference?.sourceId ?? meta.sourceId;
+  const qualified = isQualifiedRef({ providerId, sourceId });
   const placement: PlacedComponent = {
     id,
     // A splat carries no AssetReference, so its catalog identity is in the meta.
     catalogId: reference?.assetId || meta.catalogId || '',
-    glbUrl: reference?.path ?? '',
+    glbUrl: qualified ? '' : (reference?.path ?? ''),
+    ...(providerId ? { providerId } : {}),
+    ...(sourceId ? { sourceId } : {}),
     label: node.name,
     position: [node.position.x, node.position.y, node.position.z],
     rotation: [euler.x * RAD_TO_DEG, euler.y * RAD_TO_DEG, euler.z * RAD_TO_DEG],

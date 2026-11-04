@@ -39,10 +39,12 @@ function makeFixture() {
 
   const order: string[] = [];
   const fakeViewer = {
+    _structuralEditHolds: () => false, // plan-681: resetSimulation asks whether a structural transaction withholds it
     _simTime: 12,
     drives: [] as { reset(): void }[],
     chainManager: { resetAll() {} },
     ribbonManager: { resetAll() {} },
+    blockageWatch: { reset() {} }, // plan-2038: resetSimulation clears the blockage watch
     transportManager: { reset() {} },
     logicEngine: engine as RVLogicEngine | null,
     _kernel: null,

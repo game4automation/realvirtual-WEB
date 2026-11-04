@@ -23,8 +23,8 @@
 
 import type { Object3D } from 'three';
 import type { RVViewer } from '../../core/rv-viewer';
-import type { BoxSelectRegistryLike, BoxSelectMuEntry, ClientRect } from './box-select-hit';
-import { computeBoxSelectPaths, combineSelection } from './box-select-hit';
+import type { BoxSelectHitProvider, BoxSelectRegistryLike, BoxSelectMuEntry, ClientRect } from './box-select-hit';
+import { computeBoxSelectPaths, combineSelection, createBoxSelectQuery } from './box-select-hit';
 
 const MIN_RECT_SIDE_PX = 4;
 
@@ -76,6 +76,11 @@ export interface BoxSelectControllerDeps {
   getActive: () => boolean;
   /** Spawned-MU entries to include in the marquee (`{ node, path }`), or null. */
   getMuMap: () => Iterable<BoxSelectMuEntry> | null;
+  /**
+   * plan-628 8.11a (E57): further selection holders (path blocks) the same
+   * marquee feeds on a selection commit — read fresh on every release.
+   */
+  getHitProviders?: () => Iterable<BoxSelectHitProvider>;
 }
 
 export class BoxSelectController {
@@ -249,6 +254,14 @@ export class BoxSelectController {
       if (!this.deps.onCommit?.(marquee, mods)) {
         const current = this.deps.viewer.selectionManager.getSnapshot().selectedPaths;
         this.deps.viewer.selectionManager.selectPaths(combineSelection(current, marquee, mods));
+        // plan-628 8.11a: the same rectangle and modifiers for the other holders.
+        const providers = this.deps.getHitProviders?.();
+        if (providers) {
+          const query = createBoxSelectQuery(this.deps.viewer.camera, this.deps.canvas, rect);
+          for (const p of providers) {
+            try { p.commit(query, mods); } catch (err) { console.warn('[BoxSelect] hit provider failed:', err); }
+          }
+        }
       }
     }
     // sufficientDrag === false: a tiny click on empty canvas. Leave selection

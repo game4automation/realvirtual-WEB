@@ -72,6 +72,22 @@ export interface ViewerVisualState {
 }
 
 /**
+ * Node renderers (plan-767 run 4): call BEFORE the directional shadow map changes size. three r185
+ * resizes the ShadowNode-owned map lazily (ShadowNode.renderShadow → RenderTarget.setSize, which
+ * destroys and re-creates its GPU textures), but render objects not drawn in that frame keep
+ * bindings to the destroyed depth texture — e.g. Shaded's (2048) while Toon renders its shadows at
+ * 1024: back in Shaded every submit fails ("Destroyed texture ShadowDepthTexture used in a submit")
+ * and the canvas stays empty. Dropping the cached render contexts makes every render object — and
+ * its bindings — be re-created on next use (node builder states and pipelines stay cached). Only
+ * when a map exists and really changes size; the map itself is never disposed here (plan-763).
+ */
+export function invalidateNodeShadowBindings(renderer: unknown, light: DirectionalLight, size: number): void {
+  const map = light.shadow.map;
+  if (!map || (map.width === size && map.height === size)) return;
+  (renderer as { _renderContexts?: { dispose?: () => void } })._renderContexts?.dispose?.();
+}
+
+/**
  * VisualSettingsManager handles lighting, tone mapping, shadows,
  * environment maps, and rendering quality settings.
  */
@@ -84,6 +100,8 @@ export class VisualSettingsManager {
    *  ambient look. Decoupled from the `environment` capability (Shaded mode). */
   private _unlitReflectionsEnabled = false;
   private _unlitReflectionsIntensity = 0.3;
+  /** Node renderers in Toon: the user's shadow radius while radius 0 stands in for BasicShadowMap. */
+  private _savedShadowRadius: number | null = null;
 
   constructor(state: ViewerVisualState) {
     this.state = state;
@@ -154,8 +172,16 @@ export class VisualSettingsManager {
     this.state.renderer.shadowMap.enabled = effective;
     // Toon mode uses hard-edged shadows (BasicShadowMap) for the stylized look;
     // all other modes use soft PCF.
-    if (effective) this.state.renderer.shadowMap.type = this.caps.toon ? BasicShadowMap : PCFShadowMap;
-    this.state.dirLight.castShadow = effective;
+    if (effective) this.applyShadowType(this.caps.toon);
+    // Node renderers (webgpu / webgpu-gl, plan-767 run 4): once on, castShadow is never cleared again —
+    // `renderer.shadowMap.enabled` alone gates the shadow graph (ShadowNode.setup / setupShadow return
+    // early, and it is part of every render object's cache key). Clearing castShadow while the light
+    // stays in the scene makes three's AnalyticLightNode.setup DISPOSE the shared ShadowNode
+    // (shadowMap = null); switching back restores the old cache key, NodeManager reuses the cached
+    // builder state that still holds the disposed node, and every frame throws in
+    // ShadowNode.updateShadow → grey canvas (Ray traced → Shaded, shadows off → on).
+    if (!this.state.isWebGPU) this.state.dirLight.castShadow = effective;
+    else if (effective) this.state.dirLight.castShadow = true;
     if (effective) this.state._shadowsDirty = true;
     // Toggling shadows must force a re-render so the user sees the change
     // immediately — render-on-demand would otherwise skip the frame and
@@ -175,8 +201,12 @@ export class VisualSettingsManager {
   }
   set shadowQuality(v: ShadowQuality) {
     const res = SHADOW_RES[v];
+    if (this.state.isWebGPU) invalidateNodeShadowBindings(this.state.renderer, this.state.dirLight, res);
     this.state.dirLight.shadow.mapSize.set(res, res);
-    if (this.state.dirLight.shadow.map) {
+    // Never dispose the map on a WebGPURenderer: its ShadowNode owns it and
+    // resizes it itself; a disposed map is a destroyed texture it keeps
+    // binding (grey canvas, plan-763). See RVViewer._setShadowMapSize.
+    if (this.state.dirLight.shadow.map && !this.state.isWebGPU) {
       this.state.dirLight.shadow.map.dispose();
       this.state.dirLight.shadow.map = null as unknown as typeof this.state.dirLight.shadow.map;
     }
@@ -189,8 +219,9 @@ export class VisualSettingsManager {
   }
 
   set shadowMapSize(size: number) {
+    if (this.state.isWebGPU) invalidateNodeShadowBindings(this.state.renderer, this.state.dirLight, size);
     this.state.dirLight.shadow.mapSize.set(size, size);
-    if (this.state.dirLight.shadow.map) {
+    if (this.state.dirLight.shadow.map && !this.state.isWebGPU) { // see shadowQuality
       this.state.dirLight.shadow.map.dispose();
       this.state.dirLight.shadow.map = null as unknown as typeof this.state.dirLight.shadow.map;
     }
@@ -200,7 +231,9 @@ export class VisualSettingsManager {
   }
 
   set shadowRadius(radius: number) {
-    this.state.dirLight.shadow.radius = radius;
+    // node renderers in Toon: radius 0 is in effect (applyShadowType) — keep the value for later
+    if (this._savedShadowRadius !== null) this._savedShadowRadius = radius;
+    else this.state.dirLight.shadow.radius = radius;
     this.state._shadowsDirty = true;
     this.state._renderDirty = true;
   }
@@ -290,9 +323,11 @@ export class VisualSettingsManager {
     // `shadowEnabled` while the previous mode's caps are still active, so the
     // type must be re-evaluated once the new mode is in effect.
     if (this.state.renderer.shadowMap.enabled) {
-      this.state.renderer.shadowMap.type = caps.toon ? BasicShadowMap : PCFShadowMap;
+      this.applyShadowType(caps.toon);
       this.state._shadowsDirty = true;
       this.state._renderDirty = true;
+    } else if (this.state.isWebGPU) {
+      this.applyShadowType(caps.toon); // radius bookkeeping only — the type never changes there
     }
 
     // Environment (HDRI image-based lighting).
@@ -326,6 +361,32 @@ export class VisualSettingsManager {
     this.recompileMaterials();
   }
 
+  /**
+   * Shadow edge style per mode: hard for Toon, soft PCF otherwise. WebGL switches the shadow map
+   * type (BasicShadowMap ↔ PCFShadowMap). Node renderers (plan-767 run 4) keep ONE type: the type
+   * is part of every render object's cache key and the light's ShadowNode is shared — a type change
+   * resets that node and destroys its depth texture, while the builder states cached under the
+   * other type still bind it (Toon with shadows → Shaded: "Destroyed texture ShadowDepthTexture used
+   * in a submit", empty canvas). Toon's hard edge is PCF with radius 0 there — a uniform, no rebuild.
+   */
+  private applyShadowType(toon: boolean): void {
+    const { renderer, dirLight } = this.state;
+    if (!this.state.isWebGPU) {
+      renderer.shadowMap.type = toon ? BasicShadowMap : PCFShadowMap;
+      return;
+    }
+    renderer.shadowMap.type = PCFShadowMap;
+    if (toon) {
+      if (this._savedShadowRadius === null) {
+        this._savedShadowRadius = dirLight.shadow.radius;
+        dirLight.shadow.radius = 0;
+      }
+    } else if (this._savedShadowRadius !== null) {
+      dirLight.shadow.radius = this._savedShadowRadius;
+      this._savedShadowRadius = null;
+    }
+  }
+
   recompileMaterials(root: Object3D = this.state.scene): void {
     root.traverse((node) => {
       const mesh = node as { material?: { needsUpdate?: boolean } };
@@ -333,10 +394,16 @@ export class VisualSettingsManager {
     });
   }
 
+  /** URL of the raw equirect HDR the IBL is built from — THE source the ray
+   *  traced backend samples too (plan-762 F13), so both look at one sky. */
+  get environmentHdrUrl(): string {
+    return `${import.meta.env.BASE_URL}${DEFAULT_ENVIRONMENT_HDR}`;
+  }
+
   async loadEnvMap(): Promise<void> {
     if (this._envMapTexture) return;
     const loader = new RGBELoader();
-    const hdrTexture = await loader.loadAsync(`${import.meta.env.BASE_URL}${DEFAULT_ENVIRONMENT_HDR}`);
+    const hdrTexture = await loader.loadAsync(this.environmentHdrUrl);
 
     // WebGPU path (plan-271): the classic PMREMGenerator is WebGL-only, but
     // three/webgpu ships its own — use the async variant (waits for backend

@@ -8,7 +8,7 @@
  * `instantiate(baked, root)` turns one baked library asset into a placement:
  *
  *   PlacementRoot {LayoutObject}
- *   ├─ static chunk Mesh        geometry / BVH / nodes[] SHARED with every instance
+ *   ├─ static chunk Mesh        geometry / pick structure SHARED with every instance
  *   ├─ Drive-A (logic node)  ── mover chunk Mesh (shared geometry, owner frame)
  *   ├─ Sensor (logic node)   ── keep: Ray Mesh (clone, own material)
  *   ├─ SeqCycle {LogicStep_…}   survivor without a registered capability
@@ -44,15 +44,17 @@ import { registerMaterialIndex } from './rv-pre-bake';
 import { Box3, Group, Mesh, MeshBasicMaterial, Object3D, type Material } from 'three';
 import type { BakedAsset, BakedChunk } from './rv-bake-chunk';
 import type { SignatureState } from '../persistence/rv-sig-verify';
-import { pickModeOf } from './rv-component-registry';
+import { getCapabilities, pickModeOf } from './rv-component-registry';
 import { getNodeId } from './rv-node-id';
+import { identityIdOf } from './rv-decode-identity';
 import {
-  applyAssetOverrides, getAssetReference, getPlacementMeta,
+  applyResolvedOverrideSets, getAssetOverrides, getAssetReference, getPlacementMeta, migrateLegacyOverridePaths,
+  readAssetOverridesRecord, recordOverridePathMigration, resolveAssetOverrides, setAssetOverrides,
   type ApplyOverridesResult, type AssetOverrides, type OverrideResolvers,
 } from './rv-asset-reference';
 import { NodeRegistry } from './rv-node-registry';
 import { resolveReferencePath, scopeOf } from './rv-reference-resolver';
-import { reportOverrideOrphaned } from '../hmi/problems-store';
+import { reportOverrideOrphaned, reportOverrideTransformsDropped } from '../hmi/problems-store';
 import { classifyShadows } from './rv-mesh-classifier';
 import { isPickableMesh } from './rv-pick-utils';
 import { isSegmentOnly, nodeTableBytes, pickStructureBytes, segmentBoxUnion, segmentRange, type ChunkRange } from './rv-pick-structure';
@@ -80,7 +82,7 @@ export interface PlacementInstance {
    * asset-relative path → instance node. The place step registers them
    * prefixed with the root's registry path; `release()` empties the list.
    */
-  aliases: Array<{ path: string; node: Object3D }>;
+  aliases: Array<{ path: string; node: Object3D; subtree?: true }>;
   /**
    * The weakest signature verdict on the nesting chain ABOVE this instance
    * (plan-757 Phase 2, F7): ABSENT for a document-level placement (no chain —
@@ -116,11 +118,10 @@ export interface PlacementInstance {
 }
 
 export interface InstantiateOptions {
-  /** Saved `AssetOverrides` of the placement (plan-753 Phase 3, I3/I7):
-   *  `byNodeId` patches are applied to LOGIC nodes only — a patch whose
-   *  target has no template is dropped with a warning (Decision 1);
-   *  `trsByNodeId` transforms are applied to the instance node of a forced
-   *  chunk split (see `BakeOptions.forceSplit`). */
+  /** Saved `AssetOverrides` of the placement (plan-753 Phase 3, I3; plan-769):
+   *  `byAddress` patches are applied to LOGIC nodes only — a patch whose
+   *  target has no template is reported as an orphan (Decision 1). Component
+   *  values only: `trsByNodeId` was removed (F14). */
   overrides?: AssetOverrides | null;
 }
 
@@ -137,9 +138,14 @@ export interface ChunkHighlightTarget {
 
 /** The narrow seam the highlight manager reads (no dependency on the class). */
 export interface ChunkHighlightSource {
-  /** Chunk targets of `node` inside a baked placement, or null when `node`
-   *  is neither a placement root nor a logic node of one. */
+  /** Chunk targets of `node`'s subtree — its own placement's chunks plus every
+   *  live placement nested below it — or null when there are none and `node`
+   *  is no placement root. */
   chunkTargetsOf(node: Object3D): ChunkHighlightTarget[] | null;
+  /** The placement root `node` belongs to (root itself included), or null
+   *  when `node` lies outside every placement (optional: a test source may
+   *  omit it). */
+  placementOf?(node: Object3D): Object3D | null;
   /** Subscribe to instance release (fires BEFORE the refcount drops). */
   onRelease(listener: (instance: PlacementInstance) => void): () => void;
 }
@@ -245,6 +251,19 @@ export class BakeRegistry implements ChunkHighlightSource {
   private readonly _wholeChunkIndex = new WeakMap<BakedAsset, WholeChunkIndex>();
   private readonly _releaseListeners = new Set<(instance: PlacementInstance) => void>();
   /**
+   * Nesting of live instances (plan-774): instance → the instances whose
+   * nearest enclosing instance it is, and the reverse pointer (`null` = top
+   * level, also held in {@link _topLevel}). Linked when an instance registers
+   * — a nested placement is materialised INSIDE its parent's clone, so its
+   * root's parent chain already reaches the parent root then — re-linked by
+   * {@link relinkSubtree} after a host moves a materialised root (live drop,
+   * pivot, editor re-parent) and unlinked on release. What lets {@link _visitChunkTargets} reach the chunks of the
+   * placements below a node without walking the scene.
+   */
+  private readonly _nestedOf = new WeakMap<PlacementInstance, Set<PlacementInstance>>();
+  private readonly _enclosingOf = new WeakMap<PlacementInstance, PlacementInstance | null>();
+  private readonly _topLevel = new Set<PlacementInstance>();
+  /**
    * Instance node → TEMPLATE node (plan-756 step 1d). Filled at instantiate
    * time, which is what replaced the linear scans over `nodeOf` that
    * `chunkTargetsOf` and `findChunkMesh` used to run per highlight.
@@ -263,8 +282,12 @@ export class BakeRegistry implements ChunkHighlightSource {
   instantiate(baked: BakedAsset, root: Object3D, opts?: InstantiateOptions): PlacementInstance {
     if (baked.disposed) throw new Error('[rv-bake-registry] instantiate() on a disposed asset ' + baked.assetId);
     const master = baked.template;
+    // Live instances already under `root` (the nearest ones) become nested in
+    // this one (scanned BEFORE the clone is built — a fresh root has nothing to scan).
+    const adopt = this._nearestUnder(root);
     const nodeOf = new Map<Object3D, Object3D>();
     nodeOf.set(master, root);
+    carryRootComponents(master, root);
     const keepTemplates = new Set<Object3D>();
     for (const k of baked.keep) keepTemplates.add(k.mesh);
 
@@ -334,10 +357,10 @@ export class BakeRegistry implements ChunkHighlightSource {
 
     // plan-757 D4: the asset's alias table, resolved to this instance's nodes
     // (a chunk mesh under a renamed node is aliased too, like on the main model).
-    const aliases: Array<{ path: string; node: Object3D }> = [];
+    const aliases: Array<{ path: string; node: Object3D; subtree?: true }> = [];
     for (const a of baked.aliases) {
       const node = nodeOf.get(a.template) ?? meshOfTemplateChunk.get(a.template);
-      if (node) aliases.push({ path: a.path, node });
+      if (node) aliases.push(a.subtree ? { path: a.path, node, subtree: true } : { path: a.path, node });
     }
 
     const instance: PlacementInstance = { root, baked, chunks, keep, logicNodes, nodeOf, chunkOf, aliases, released: false, identity: false };
@@ -352,7 +375,9 @@ export class BakeRegistry implements ChunkHighlightSource {
     this._byRoot.set(root, instance);
     for (const m of chunks) this._byMesh.set(m, instance);
     for (const m of keep) this._byMesh.set(m, instance);
+    this._wholeChunkIndexOf(baked); // Prepare the geometry visitor before fixed updates.
     this._instances.add(instance);
+    this._link(instance, adopt);
     this._invalidatePickMeshes();
     root.updateMatrixWorld(true);
     return instance;
@@ -361,21 +386,31 @@ export class BakeRegistry implements ChunkHighlightSource {
   /**
    * Apply saved `AssetOverrides` to an existing instance — the deferred-reload
    * path (plan-753) instantiates first, pivot-normalises the content, and only
-   * THEN applies the overrides: a `trsByNodeId` transform was recorded in the
-   * pivoted frame the live tree has, so applying it before the pivot shift
-   * would move the part by the pivot offset. Same routine `instantiate` runs
-   * for `opts.overrides`.
+   * THEN applies the overrides. Same routine `instantiate` runs for `opts.overrides`.
    *
    * plan-757 F9: ONE application path with placement semantics —
    * {@link applyAssetOverrides}, the function composition uses — over resolvers
-   * that address THIS instance: `byNodeId` through the template's NodeIds,
-   * `byPath` through the ONE resolver (`rv-reference-resolver.ts`: the path as
-   * written relative to the asset, then root-stripped), `trsByNodeId` through
-   * the forced chunk split. Every orphan lands in the Problems panel
-   * (`override-orphaned`); nothing is dropped with a console line.
+   * that address THIS instance: `byAddress` (`#<id>`) through the template's
+   * identity ids, the legacy `byPath` through the ONE resolver
+   * (`rv-reference-resolver.ts`: the path as written relative to the asset, then
+   * root-stripped) and migrated to its address (plan-769 9.22). Every orphan lands
+   * in the Problems panel (`override-orphaned`); an old file's part moves are
+   * reported (`override-transforms-dropped`, F14); nothing is dropped with a console line.
    */
   applyOverrides(instance: PlacementInstance, overrides: AssetOverrides): ApplyOverridesResult {
-    return applyOverrides(instance, overrides);
+    return applyOverrideLayersTo(instance, [{ overrides, depth: 0, own: true }])[0]!;
+  }
+
+  /**
+   * plan-769 Phase 4b (F13) — apply SEVERAL override sets to one instance: its own
+   * record and the overrides outer placements route into its occurrence. Each set is
+   * resolved against this instance, then all hits go through `applyOverrideLayers`
+   * together — the outer file (smaller `depth`) wins, whatever order the sets come in.
+   * A nested address no set's target holds comes back in `nested` (per set) for the
+   * caller to route one occurrence further down.
+   */
+  applyOverrideLayers(instance: PlacementInstance, layers: readonly InstanceOverrideLayer[]): ApplyOverridesResult[] {
+    return applyOverrideLayersTo(instance, layers);
   }
 
   /**
@@ -397,6 +432,7 @@ export class BakeRegistry implements ChunkHighlightSource {
       throw new Error('[rv-bake-registry] the template of ' + baked.assetId + ' is already placed');
     }
     const root = baked.template;
+    const adopt = this._nearestUnder(root);
     const nodeOf = new Map<Object3D, Object3D>();
     // Identity for EVERY template node (plan-757 D2 — the same set a cloned
     // instance maps), then the explicit entries the pick path reads.
@@ -424,7 +460,9 @@ export class BakeRegistry implements ChunkHighlightSource {
       chunkOf.set(mesh, chunk);
     }
     for (const node of baked.nodeTable.nodes) nodeOf.set(node, node);
-    const aliases = baked.aliases.map((a) => ({ path: a.path, node: a.template }));
+    const aliases = baked.aliases.map((a) => (a.subtree
+      ? { path: a.path, node: a.template, subtree: true as const }
+      : { path: a.path, node: a.template }));
     const instance: PlacementInstance = {
       root, baked, chunks, keep, logicNodes, nodeOf, chunkOf, aliases, released: false, identity: true,
     };
@@ -433,7 +471,9 @@ export class BakeRegistry implements ChunkHighlightSource {
     this._byRoot.set(root, instance);
     for (const m of chunks) this._byMesh.set(m, instance);
     for (const m of keep) this._byMesh.set(m, instance);
+    this._wholeChunkIndexOf(baked);
     this._instances.add(instance);
+    this._link(instance, adopt);
     this._invalidatePickMeshes();
     root.updateMatrixWorld(true);
     return instance;
@@ -480,6 +520,7 @@ export class BakeRegistry implements ChunkHighlightSource {
     }
     this._byRoot.delete(instance.root);
     this._instances.delete(instance);
+    this._unlink(instance);
     this._invalidatePickMeshes();
     instance.baked.release();
   }
@@ -521,6 +562,32 @@ export class BakeRegistry implements ChunkHighlightSource {
   /** Release every live instance (bulk teardown). */
   releaseAll(): void {
     for (const inst of [...this._instances]) this.release(inst);
+  }
+
+  /**
+   * Re-record the nesting of the instances under `node` after `node` was
+   * added, attached or re-parented (plan-774). Nesting is linked when an
+   * instance registers, but a planner live drop is materialised DETACHED and
+   * hung under the model root afterwards, and the multi-select pivot and the
+   * editor's re-parent move materialised roots around — without this call
+   * {@link chunkTargetsOf} of the new (or old) enclosing placement would miss
+   * (or keep) them.
+   *
+   * Cheap: when `node` is an instance root only that instance is re-pointed;
+   * otherwise the walk visits `node`'s subtree down to the first instance roots
+   * (never into one) — the nesting INSIDE a moved instance moved with it and
+   * stays valid. A no-op when nothing is live.
+   */
+  relinkSubtree(node: Object3D): void {
+    if (this._instances.size === 0) return;
+    const self = this._byRoot.get(node);
+    if (self) {
+      this._setEnclosing(self, this._enclosingInstanceOf(node));
+      return;
+    }
+    const nearest = this._nearestUnder(node);
+    if (!nearest) return;
+    for (const inst of nearest) this._setEnclosing(inst, this._enclosingInstanceOf(inst.root));
   }
 
   // ─── Lookup ────────────────────────────────────────────────────────
@@ -649,9 +716,9 @@ export class BakeRegistry implements ChunkHighlightSource {
         if (range) out.push({ mesh, range });
       },
     );
-    if (kind === 'none') return null;
     // A placement ROOT answers with its chunk list as it is (even an empty one);
-    // a node inside a placement with nothing of its own answers `null`.
+    // any other node with nothing below it answers `null` — "not baked
+    // content, collect real meshes" for a node outside every placement.
     if (kind === 'root') return out;
     return out.length > 0 ? out : null;
   }
@@ -698,16 +765,35 @@ export class BakeRegistry implements ChunkHighlightSource {
     return added;
   }
 
+  /** Visit live chunk geometry without creating target arrays or ranges.
+   * Callbacks are synchronous; segment indices are inclusive. */
+  visitChunkGeometry(
+    node: Object3D,
+    onWhole: (mesh: Mesh) => void,
+    onRange: (mesh: Mesh, chunk: BakedChunk, first: number, last: number) => void,
+  ): void {
+    this._visitChunkTargets(node, onWhole, onRange);
+  }
+
   /**
    * The ONE walk from a node to the chunk geometry of its subtree — shared by
    * {@link chunkTargetsOf} (highlight ranges) and {@link chunkBoundsOf} (bounds),
    * so the two can never disagree about which chunks a node owns.
    *
-   * Returns `'none'` when `node` belongs to no live baked placement at all (what
-   * `chunkTargetsOf` reports as `null`), `'root'` when it IS a placement root and
-   * `'node'` for a node inside one. `onWhole` is called for a whole chunk mesh,
-   * `onRange` with the segment interval of the node's subtree inside a chunk that
-   * some OTHER node bounds.
+   * Returns `'none'` when `node` belongs to no live baked placement at all,
+   * `'root'` when it IS a placement root and `'node'` for a node inside one.
+   * `onWhole` is called for a whole chunk mesh, `onRange` with the segment
+   * interval of the node's subtree inside a chunk that some OTHER node bounds.
+   *
+   * plan-774: the subtree includes the live placements NESTED below `node` —
+   * a reference node inside a placed asset is an instance of its own, and an
+   * asset made only of references (`mhm` → `fufu` → `empty`…) has no chunk
+   * of its own at all. Every nested instance under `node` contributes ALL of
+   * its chunks (and its own nested ones) whole. A node outside every placement
+   * (an unbaked document node above placed references) reaches the top-level
+   * instances below it the same way, still reported as `'none'`. Cost: the
+   * nested instances of `node`'s placement, one parent walk each — or, for a
+   * node outside every placement, the top-level instances.
    */
   private _visitChunkTargets(
     node: Object3D,
@@ -716,27 +802,38 @@ export class BakeRegistry implements ChunkHighlightSource {
   ): 'none' | 'root' | 'node' {
     const whole = this._byRoot.get(node);
     if (whole) {
-      for (const m of whole.chunks) onWhole(m);
+      this._visitWholeInstance(whole, onWhole);
       return 'root';
     }
     const root = this.placementOf(node);
-    if (!root) return 'none';
+    if (!root) {
+      if (node.children.length > 0) {
+        for (const top of this._topLevel) {
+          if (isStrictAncestor(node, top.root, null)) this._visitWholeInstance(top, onWhole);
+        }
+      }
+      return 'none';
+    }
     const inst = this._byRoot.get(root)!;
+    const nested = this._nestedOf.get(inst);
+    if (nested && node.children.length > 0) {
+      for (const child of nested) {
+        if (isStrictAncestor(node, child.root, root)) this._visitWholeInstance(child, onWhole);
+      }
+    }
     const template = inst.identity ? node : this._templateOf.get(node);
-    if (!template) return 'none';
+    if (!template) return 'node';
 
     const table = inst.baked.nodeTable;
     const meshes = this._meshOfChunk.get(inst);
-    if (!meshes) return 'none';
+    if (!meshes) return 'node';
 
     // Partition objects (and boundaries reached without an ordinal) own whole chunks.
     const wholeOwned = this._wholeChunkIndexOf(inst.baked).get(template);
-    const wholeSeen = new Set<BakedChunk>();
     if (wholeOwned) {
       for (const chunk of wholeOwned) {
         const mesh = meshes.get(chunk);
         if (!mesh) continue;
-        wholeSeen.add(chunk);
         onWhole(mesh);
       }
     }
@@ -746,7 +843,7 @@ export class BakeRegistry implements ChunkHighlightSource {
       const end = table.subtreeEnd[ordinal];
       for (let r = table.rowStart[ordinal]; r < table.rowStart[ordinal + 1]; r++) {
         const chunk = table.chunks[table.rowChunk[r]];
-        if (chunk === undefined || wholeSeen.has(chunk)) continue;
+        if (chunk === undefined || wholeOwned?.includes(chunk)) continue;
         const mesh = meshes.get(chunk);
         if (!mesh) continue;
         // A chunk whose boundary lies inside the subtree belongs to it whole.
@@ -860,6 +957,90 @@ export class BakeRegistry implements ChunkHighlightSource {
     this._meshOfChunk.set(instance, meshes);
   }
 
+  /** Every chunk of `inst` and, recursively, of every instance nested in it
+   *  (nesting depth is bounded by the instancer's reference depth, 16). */
+  private _visitWholeInstance(inst: PlacementInstance, onWhole: (mesh: Mesh) => void): void {
+    for (const m of inst.chunks) onWhole(m);
+    const nested = this._nestedOf.get(inst);
+    if (!nested) return;
+    for (const child of nested) this._visitWholeInstance(child, onWhole);
+  }
+
+  /** The NEAREST instances strictly under `node` (`node` itself excluded) —
+   *  the walk does not descend into an instance root, so an instance nested in
+   *  another one is not returned. Before `node` registers this is what it
+   *  adopts: whatever registered first below it (a host that places the outer
+   *  asset last, or the order outer → leaf → middle), whichever instance held
+   *  it until then. Walks only while some instance is live. */
+  private _nearestUnder(node: Object3D): PlacementInstance[] | null {
+    if (this._instances.size === 0) return null;
+    let out: PlacementInstance[] | null = null;
+    const walk = (n: Object3D): void => {
+      for (const child of n.children) {
+        const inst = this._byRoot.get(child);
+        if (inst) (out ??= []).push(inst);
+        else walk(child);
+      }
+    };
+    walk(node);
+    return out;
+  }
+
+  /** The live instance whose root is the nearest STRICT ancestor of `root`. */
+  private _enclosingInstanceOf(root: Object3D): PlacementInstance | null {
+    const outerRoot = root.parent ? this.placementOf(root.parent) : null;
+    return outerRoot ? this._byRoot.get(outerRoot) ?? null : null;
+  }
+
+  /** Point `instance` at `outer` (`null` = top level), out of wherever it was. */
+  private _setEnclosing(instance: PlacementInstance, outer: PlacementInstance | null): void {
+    const linked = this._enclosingOf.has(instance);
+    const prev = this._enclosingOf.get(instance) ?? null;
+    if (linked && prev === outer) return;
+    if (prev) this._nestedOf.get(prev)?.delete(instance);
+    else this._topLevel.delete(instance);
+    this._enclosingOf.set(instance, outer);
+    if (outer) this._nestedSetOf(outer).add(instance);
+    else this._topLevel.add(instance);
+  }
+
+  /** Record `instance` under its nearest enclosing instance (or as top level)
+   *  and adopt the nearest instances `adopt` below it. */
+  private _link(instance: PlacementInstance, adopt: PlacementInstance[] | null): void {
+    this._setEnclosing(instance, this._enclosingInstanceOf(instance.root));
+    if (!adopt) return;
+    for (const a of adopt) this._setEnclosing(a, instance);
+  }
+
+  /** Drop `instance` from the nesting; what was nested in it goes to ITS
+   *  nearest enclosing instance in the scene graph as it is now — the outer one
+   *  while the released clone stays attached, the top level when the release
+   *  detached it (a lone `release()`; `releaseSubtree` releases the nested ones
+   *  first). Call after `instance.root` left `_byRoot`. */
+  private _unlink(instance: PlacementInstance): void {
+    const outer = this._enclosingOf.get(instance);
+    if (outer) this._nestedOf.get(outer)?.delete(instance);
+    this._topLevel.delete(instance);
+    this._enclosingOf.delete(instance);
+    const nested = this._nestedOf.get(instance);
+    this._nestedOf.delete(instance);
+    if (!nested) return;
+    for (const child of nested) {
+      // `child` still points at the released instance — re-point it from scratch.
+      this._enclosingOf.delete(child);
+      this._setEnclosing(child, this._enclosingInstanceOf(child.root));
+    }
+  }
+
+  private _nestedSetOf(instance: PlacementInstance): Set<PlacementInstance> {
+    let set = this._nestedOf.get(instance);
+    if (!set) {
+      set = new Set();
+      this._nestedOf.set(instance, set);
+    }
+    return set;
+  }
+
   /** template → the chunks it owns WHOLE: a mover boundary (never the asset
    *  root, which is the placement itself) and a plan-755 partition object. */
   private _wholeChunkIndexOf(baked: BakedAsset): WholeChunkIndex {
@@ -877,6 +1058,61 @@ export class BakeRegistry implements ChunkHighlightSource {
     this._wholeChunkIndex.set(baked, index);
     return index;
   }
+}
+
+/** True when `ancestor` lies on `node`'s parent chain (`node` itself excluded),
+ *  walking no further than `stop` (exclusive; `null` = the scene top). */
+function isStrictAncestor(ancestor: Object3D, node: Object3D, stop: Object3D | null): boolean {
+  for (let c = node.parent; c && c !== stop; c = c.parent) {
+    if (c === ancestor) return true;
+  }
+  return false;
+}
+
+/**
+ * Copy the asset root's components that declare `carriesToPlacementRoot` onto
+ * the placement root (JSON clone). The asset root is mapped onto `root`, which
+ * keeps its own extras (the placement stamps); without this a robot rig on the
+ * asset root exists when the file is opened and vanishes when it is placed.
+ * A key the placement root already carries wins — the document's own block.
+ *
+ * plan-774 review fix E1: the copy is RUNTIME state, not content of the file
+ * that holds the reference node. The carried keys are recorded on the root
+ * ({@link RV_CARRIED_ROOT_KEYS_KEY}) so the editor's save can take them off
+ * again (`dropRuntimePlacementStamps`) — otherwise the parent document would
+ * store the asset's rig and, on reopen, that stale copy would shadow the
+ * asset's real one (the "document's own block wins" rule above). A key is only
+ * ever carried when the root did NOT author it, so the file's own state for
+ * every recorded key is "absent". A key carried by an earlier instantiate of
+ * the same root is refreshed (it is ours, not the document's).
+ */
+function carryRootComponents(master: Object3D, root: Object3D): void {
+  const src = master.userData?.realvirtual as Record<string, unknown> | undefined;
+  if (!src || typeof src !== 'object') return;
+  let dst = root.userData.realvirtual as Record<string, unknown> | undefined;
+  const previous = carriedRootKeysOf(root);
+  const carried = new Set(previous);
+  for (const [key, value] of Object.entries(src)) {
+    if (!getCapabilities(key).carriesToPlacementRoot) continue;
+    if (!dst || typeof dst !== 'object') dst = root.userData.realvirtual = {};
+    if (key in dst && !previous.includes(key)) continue;
+    dst[key] = JSON.parse(JSON.stringify(value));
+    carried.add(key);
+  }
+  if (carried.size > 0) root.userData[RV_CARRIED_ROOT_KEYS_KEY] = [...carried];
+}
+
+/**
+ * plan-774 review fix E1: runtime key (leading `_`, never exported) on a
+ * placement root — the `userData.realvirtual` keys {@link carryRootComponents}
+ * copied from the asset root (absent in the file that holds the root).
+ */
+export const RV_CARRIED_ROOT_KEYS_KEY = '_rvCarriedRootKeys';
+
+/** The component keys the bake registry carried onto `root` (empty when none). */
+export function carriedRootKeysOf(root: Object3D): string[] {
+  const keys = root.userData?.[RV_CARRIED_ROOT_KEYS_KEY];
+  return Array.isArray(keys) ? keys.filter((k): k is string => typeof k === 'string') : [];
 }
 
 /** A plain node with the template's name, transform, visibility and (JSON-
@@ -914,32 +1150,52 @@ function disposeOwnMaterial(mesh: Mesh): void {
 }
 
 /**
- * The {@link OverrideResolvers} of ONE placement instance (plan-757 F9):
+ * The {@link OverrideResolvers} of ONE placement instance (plan-757 F9, plan-769 4b):
  *
- *  - `byNodeId` — the template's NodeIds, mapped to this instance's nodes. A
- *    NodeId without a template is a CAD leaf the bake merged away (plan-753
- *    Decision 1) — an orphan, reported.
- *  - `byPath` — the ONE resolver over a lookup of this instance's own nodes:
- *    the path as written, relative to the asset root (`Mount/Kine`), then with
- *    the asset's or the reference node's name stripped (`Arburg/Kine`); the
- *    asset's alias table (renamed + re-parented spellings) is part of the
- *    lookup, so an override written against the authoring hierarchy still
- *    finds its node. Built lazily — most placements carry no `byPath`.
- *
- * `trsByNodeId` goes through `byNodeId`: a transform needs the instance node
- * of the forced split, and only a NodeId can name one (`applyAssetOverrides`).
+ *  - `byAddress` — `#<id>` over the template's IDENTITY ids (authored NodeId, else
+ *    the decode seed), mapped to this instance's nodes; the TEMPLATE ROOT is in the
+ *    map too (`#<rootId>` = the placement root). An id without a template is a CAD
+ *    leaf the bake merged away (plan-753 Decision 1) — an orphan, reported. An id
+ *    that names two nodes is `ambiguous` — reported, never "first wins". A nested
+ *    address (`<b>#<id>`) is content of another occurrence and answers null here:
+ *    the instancer routes it (F13).
+ *  - `byPath` — the ONE resolver over a lookup of this instance's own nodes (it
+ *    stops at nested reference nodes — their content is another occurrence): the
+ *    path as written, relative to the asset root (`Mount/Kine`), then with the
+ *    asset's or the reference node's name stripped (`Arburg/Kine`); the asset's
+ *    alias table is part of the lookup. Built lazily — most placements carry none.
  */
 function instanceResolvers(inst: PlacementInstance): OverrideResolvers {
   const byId = new Map<string, Object3D>();
+  const ambiguous = new Set<string>();
   for (const [template, node] of inst.nodeOf) {
-    if (template === inst.baked.template) continue;
-    const id = getNodeId(template);
-    if (id && !byId.has(id)) byId.set(id, node);
+    const target = template === inst.baked.template ? inst.root : node;
+    const id = identityIdOf(template);
+    if (!id) continue;
+    const prior = byId.get(id);
+    if (prior && prior !== target) ambiguous.add(id);
+    else byId.set(id, target);
   }
+  if (!inst.nodeOf.has(inst.baked.template)) {
+    const rootId = identityIdOf(inst.baked.template);
+    if (rootId && !byId.has(rootId)) byId.set(rootId, inst.root);
+  }
+  const idOfInstance = new Map<Object3D, string>();
+  for (const [id, node] of byId) if (!ambiguous.has(id)) idOfInstance.set(node, id);
   let lookup: NodeRegistry | null = null;
   const scope = scopeOf(inst.root, '', [inst.baked.template.name]);
+  const local = (address: string): string | null => (address.lastIndexOf('#') === 0 ? address.slice(1) : null);
   return {
-    byNodeId: (id) => byId.get(id) ?? null,
+    byAddress: (address) => {
+      const id = local(address);
+      if (!id || ambiguous.has(id)) return null;
+      return byId.get(id) ?? null;
+    },
+    isAmbiguous: (address) => { const id = local(address); return !!id && ambiguous.has(id); },
+    addressOf: (node) => {
+      const id = idOfInstance.get(node);
+      return id ? `#${id}` : null;
+    },
     byPath: (relativePath) => {
       if (!lookup) {
         lookup = new NodeRegistry();
@@ -949,58 +1205,83 @@ function instanceResolvers(inst: PlacementInstance): OverrideResolvers {
             if (child.userData?.[RV_BAKE_CHUNK_KEY] === true) continue;
             const path = prefix ? `${prefix}/${child.name}` : child.name;
             index.registerNode(path, child);
+            const ref = getAssetReference(child);
+            if (ref && ref.embedded !== true) continue;
             walk(child, path);
           }
         };
         walk(inst.root, '');
-        for (const a of inst.aliases) if (a.path !== '') index.registerAlias(a.path, a.node);
+        for (const a of inst.aliases) {
+          if (a.path === '') continue;
+          index.registerAlias(a.path, a.node);
+          if (a.subtree) index.registerPrefixAlias(a.path, a.node);
+        }
       }
       return resolveReferencePath(lookup, relativePath, scope).node;
     },
   };
 }
 
-/**
- * Apply saved overrides to an instance — see {@link BakeRegistry.applyOverrides}.
- * One implementation with composition (`applyAssetOverrides`); orphans are
- * reported to the Problems panel, keyed by the placement node, the addressing
- * and the key, so a re-apply replaces rather than appends.
- */
-function applyOverrides(inst: PlacementInstance, overrides: AssetOverrides): ApplyOverridesResult {
-  const root = inst.root;
-  const nodePath = NodeRegistry.computeNodePath(root) || root.name;
-  const assetId = getAssetReference(root)?.assetId || getPlacementMeta(root)?.catalogId || inst.baked.assetId;
-  const resolvers = instanceResolvers(inst);
-  const result = applyAssetOverrides(overrides, resolvers, {
-    occurrence: getNodeId(root) ?? nodePath,
-    assetId,
-  });
-  for (const o of result.orphaned) {
-    // plan-757 Phase 2b: a path that leads INTO a reference node of this
-    // instance (a nested placement, materialised later and never routed into
-    // from here — F6) orphans for a reason the user can act on; say which node.
-    const nested = o.addressing === 'path' ? nestedReferenceOnPath(o.key, resolvers) : null;
-    reportOverrideOrphaned({
-      nodePath, label: root.name, assetId,
-      addressing: o.addressing, key: o.key, componentTypes: o.componentTypes,
-      ...(nested ? { reason: 'nested-reference' as const, nestedReferencePath: nested } : {}),
-    });
-  }
-  return result;
+/** One override set competing on an instance — see {@link BakeRegistry.applyOverrideLayers}. */
+export interface InstanceOverrideLayer {
+  overrides: AssetOverrides;
+  /** Depth of the file that holds the record (0 = the document); the outer (smaller) wins. */
+  depth: number;
+  /** The placement's OWN record: migrated in place on its root (9.22), part moves reported (F14). */
+  own?: boolean;
+  /**
+   * The reference node that STORES the set when it is not this instance's root — an
+   * outer placement's override routed into this nested occurrence (F13). Problem
+   * ids and labels name that node and the key as it wrote it.
+   */
+  source?: { nodePath: string; label: string; assetId: string; occurrence: string; key: string };
 }
 
 /**
- * The longest prefix of `relativePath` that resolves to a REFERENCE node of
- * the instance (a nested placement root), as written — or null when no prefix
- * lands on one. Walked from the longest prefix down, so `Cell_1/Slide` with a
- * reference `Cell_1` reports `Cell_1`.
+ * Apply override sets to an instance — see {@link BakeRegistry.applyOverrideLayers}.
+ * Resolution per set, precedence across the sets through `applyOverrideLayers`
+ * (one precedence point, `applyResolvedOverrideSets`); orphans are reported to the
+ * Problems panel keyed by the storing node, the addressing and the key, so a
+ * re-apply replaces rather than appends.
  */
-function nestedReferenceOnPath(relativePath: string, resolvers: OverrideResolvers): string | null {
-  const segments = relativePath.split('/').filter(Boolean);
-  for (let n = segments.length - 1; n >= 1; n--) {
-    const prefix = segments.slice(0, n).join('/');
-    const node = resolvers.byPath(prefix);
-    if (node && getAssetReference(node)) return prefix;
-  }
-  return null;
+function applyOverrideLayersTo(inst: PlacementInstance, layers: readonly InstanceOverrideLayer[]): ApplyOverridesResult[] {
+  const root = inst.root;
+  const nodePath = NodeRegistry.computeNodePath(root) || root.name;
+  const assetId = getAssetReference(root)?.assetId || getPlacementMeta(root)?.catalogId || inst.baked.assetId;
+  const occurrence = getNodeId(root) ?? nodePath;
+  const resolvers = instanceResolvers(inst);
+  const resolved = layers.map((layer) => resolveAssetOverrides(
+    // plan-769: whatever form the caller holds (a node's extras, an older layout
+    // record with `byNodeId` / `byPath` / `trsByNodeId`) is read the one way.
+    readAssetOverridesRecord(layer.overrides) ?? { byAddress: {} },
+    resolvers,
+    { occurrence: layer.source?.occurrence ?? occurrence, assetId: layer.source?.assetId ?? assetId },
+  ));
+  const applied = applyResolvedOverrideSets(resolved.map((r, i) => ({ hits: r.hits, depth: layers[i]!.depth })));
+  return resolved.map((r, i) => {
+    const layer = layers[i]!;
+    const where = layer.source ?? { nodePath, label: root.name, assetId };
+    for (const o of r.orphaned) {
+      reportOverrideOrphaned({
+        nodePath: where.nodePath, label: where.label, assetId: where.assetId,
+        addressing: o.addressing, key: layer.source?.key ?? o.key, componentTypes: o.componentTypes,
+        ...(o.reason ? { reason: o.reason } : {}),
+      });
+    }
+    if (layer.own) {
+      // 9.22: the placement node holds the 769 form from now on — a legacy `byPath` that
+      // resolved is its address, `byNodeId` / `trsByNodeId` are gone — so the next save
+      // writes `byAddress` only. Unresolved paths stay (orphans are never dropped).
+      const own = getAssetOverrides(root);
+      if (own) setAssetOverrides(root, migrateLegacyOverridePaths(own, r.migratedPaths));
+      recordOverridePathMigration(root, r.migratedPaths);
+      if (r.droppedTransforms > 0) {
+        reportOverrideTransformsDropped({ nodePath, label: root.name, assetId, count: r.droppedTransforms });
+      }
+    }
+    const { hits: _hits, ...rest } = r;
+    void _hits;
+    return { applied: applied[i]!, ...rest };
+  });
 }
+

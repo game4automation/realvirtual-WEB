@@ -51,7 +51,7 @@ import {
   openConnectInterfaceEdit,
 } from './connect-commands';
 import { commandRegistry } from './rv-command-registry';
-import { interfaceEndpointLabel, interfaceTypeLabel } from './ConnectPanel';
+import { interfaceEndpointLabel, interfaceTypeLabel } from './connect-panel-shared';
 import { ISA_AMBER } from './isa-colors';
 import { FS, INK_HIGH, INK_MID } from './shared-sx';
 

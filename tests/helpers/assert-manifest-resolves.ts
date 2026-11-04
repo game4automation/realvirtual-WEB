@@ -30,6 +30,8 @@
  *    `settings.defaultModel` matches nothing boots to an empty viewport.
  * 5. A declared `settingsPath` names a file that is there too (F5) — a sidecar
  *    that did not travel is a demo that comes up unconfigured.
+ * 6. A declared `experiments` archive is there too — the viewer of a read-only
+ *    deploy fetches exactly the declared ones, so a missing one is a 404.
  *
  * ## Signature
  *
@@ -123,6 +125,17 @@ export function assertManifestResolves(rootDir: string): ResolvedManifest {
           + 'the demo would come up unconfigured.');
       }
       sidecars.push(declared);
+    }
+    // A declared experiment archive is what a read-only viewer fetches for this
+    // document; declared without bytes, it is again a 404 only the visitor meets.
+    const experiments = typeof doc.experiments === 'string' ? doc.experiments : '';
+    if (experiments) {
+      const archive = within(rootDir, experiments);
+      if (!archive) fail(rootDir, `experiments "${experiments}" escapes the delivery root.`);
+      if (!fileExists(archive)) {
+        fail(rootDir, `experiments "${experiments}" (document "${doc.path}") did not travel — `
+          + 'the viewer would request it and meet a 404.');
+      }
     }
   }
 

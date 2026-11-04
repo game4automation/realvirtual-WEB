@@ -51,7 +51,7 @@ function makeProvider(overrides: Partial<CadImportProvider> & { id: string }): C
 interface FakePlacement {
   entry: LibraryCatalogEntry;
   position: [number, number, number];
-  opts?: { skipAutoAlign?: boolean };
+  opts?: { skipAutoAlign?: boolean; locked?: boolean };
 }
 
 function makeFakePlanner(): ImportPlannerLike & { placements: FakePlacement[] } {
@@ -225,6 +225,22 @@ describe('importObject (additive sink)', () => {
 
     await importObject(viewer, { kind: 'catalog', entries: [ENTRY] });
     expect(planner.placements[1].opts).toBeUndefined();
+  });
+
+  it('forwards locked to placeComponent, alone and alongside skipAutoAlign (plan-741 Phase 0)', async () => {
+    const planner = makeFakePlanner();
+    const { viewer } = makeFakeViewer(planner);
+
+    await importObject(viewer, { kind: 'catalog', entries: [ENTRY] }, { locked: true });
+    expect(planner.placements[0].opts).toEqual({ locked: true });
+
+    await importObject(viewer, { kind: 'catalog', entries: [ENTRY] }, { skipAutoAlign: true, locked: true });
+    expect(planner.placements[1].opts).toEqual({ skipAutoAlign: true, locked: true });
+
+    // A false flag must not appear at all — the placement payload stays
+    // byte-identical to the pre-plan-741 default.
+    await importObject(viewer, { kind: 'catalog', entries: [ENTRY] }, { locked: false });
+    expect(planner.placements[2].opts).toBeUndefined();
   });
 
   it('GLB bytes without a working folder fall back to a blob entry and flag persisted=false', async () => {

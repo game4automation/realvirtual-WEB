@@ -16,6 +16,10 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { createLibraryCommandDescriptors } from '../src/core/library/library-commands';
+import { createQueryCommandDescriptors } from '../src/core/hmi/query-commands';
+import { createPlannerCommandDescriptors } from '../src/plugins/layout-planner/planner-commands';
+import { createDocumentCommandDescriptors } from '../src/core/hmi/document-commands';
 // The instance list moved to tests/helpers/mcp-schemas.ts with plan-707: three
 // tests need it now, and three private copies is how one of them goes stale.
 import { allSchemas } from './helpers/mcp-schemas';
@@ -58,11 +62,55 @@ const DOMAINS = new Set([
   // `transport`: that domain READS the material flow, these two act on one
   // carrier by its engine id.
   'mu',
+  // plan-655 — `web_library_list/_attach/_detach`: the external part CATALOGS a
+  // project subscribes to (`project.json.libraries[]`). Back as a domain with a
+  // NARROWER meaning than the one retired in the 2026-08-19 rework: there,
+  // `web_library_*` was the placeable parts list itself (now `web_catalog_list`);
+  // here a library is the catalog SOURCE you attach, its parts stay in `catalog`.
+  'library',
   // 8a34c524 (2026-10-08) — `web_collision_watch/_status/_reset`: session-only
   // collision roles and the latched contact pairs. Not folded into `node` or
   // `scene`: the tools manage a watch with its own lifecycle (watch → status →
   // reset), not a property of one node. Absorbed at the 6.4.0 release.
   'collision',
+  // plan-764 — `web_export_usd`: a file in another FORMAT than the document's
+  // own GLB. Not folded into `document`: that domain lists, opens and saves the
+  // project's GLB documents; an export leaves the document as it is and writes
+  // a foreign-format file beside it.
+  'export',
+  // plan-764 Phase 2 — `web_import_usd_extras` / `_commit`: data from a file in
+  // another FORMAT taken INTO the open document (preview, then commit). The
+  // mirror of `export`; not `document`, which lists/opens/saves GLB documents.
+  'import',
+  // plan-629 — `web_trace_top` / `web_trace_set`: the congestion trace (blocked /
+  // utilization share per path bucket over sim time). Not folded into `sim`: that
+  // domain CONTROLS the run (play / reset / speed / mode); the trace is a
+  // measurement overlay that only reads the vehicles.
+  'trace',
+  // plan-641 — `web_macro_*`: recording, listing, saving and replaying macros
+  // (lists of command calls with reasons). Not folded into `editor`: a macro is
+  // ABOUT the document and runs in every projection, and its replay is a job
+  // with its own lifecycle (replay → status → cancel).
+  'macro',
+  // plan-641 Phase 4 — `web_check_gap` / `web_check_contact`: mesh-exact geometry
+  // checks in a pose. Not folded into `node` (that domain navigates and reads one
+  // node) nor `measure` (a root tool, AABB only): a check compares TWO nodes and is
+  // what an assertion line of a macro replays.
+  'check',
+  // plan-641 Phase 5 — `web_part_lookup`: the shipped part library (type code →
+  // stroke, moving / fixed sub-parts). Not `knowledge`: that domain is the durable
+  // notes OF the open model; the part library is shipped reference data.
+  'part',
+  // plan-773 Phases 1-3 — `web_robot_list` / `_get_chain` / `_get_state` /
+  // `_verify_fk` / `_rig_diagnose` / `_rig_from_library`, plus the path half
+  // (`_path_create`, `_path_inspect`, `_target_add` / `_set` / `_remove` /
+  // `_reorder`, `_solve_target`): the IK rig of a six-axis
+  // robot. Not folded into `component` (that domain reads and writes ONE field of
+  // ONE component, and a rig is six ordered references plus seven measured
+  // constants that are each wrong alone) and not into `drive` (that one runs an
+  // axis; this one describes the kinematics above it). It is the same split
+  // decision `mechanism` made for the rigid-body joint graph.
+  'robot',
 ]);
 
 /**
@@ -84,6 +132,12 @@ const ROOT_TOOLS = new Set([
   // "is the tab alive" is not a question about drives, scenes or projects, and
   // it is deliberately the one tool with no imports and no timers.
   'web_ping',
+  // plan-641 — the reduced command interface (the SolidCraft way): list the
+  // registry, execute one command, execute several. Root-level because they are
+  // not about one domain — every model change of every domain runs through them.
+  'web_commands', 'web_execute', 'web_batch',
+  // plan-2007 F3: the read door — runs read-only registry commands only.
+  'web_query',
 ]);
 
 const MAX_DESCRIPTION_WORDS = 110;
@@ -268,7 +322,96 @@ describe('MCP tool conventions', () => {
     // that commit's own follow-up fixes them, 185 is live against a pin of 182.
     // 182 -> 185 at the 6.4.0 release: the three collision tools are absorbed
     // deliberately (domain `collision` above) so the release ships a green suite.
-    expect(schemas.length).toBe(185);
+    // 185 -> 186 with plan-764: `web_export_usd` (write — a file into the project).
+    // 186 -> 188 with plan-764 Phase 2: `web_import_usd_extras` (read — preview)
+    // and `web_import_usd_extras_commit` (write — replaces the open document file).
+    // 188 -> 190 with plan-629: `web_trace_top` (read) and `web_trace_set` (write).
+    // 190 -> 193 with plan-621: `web_editor_solidcraft_connect` / `_resync` / `_disconnect` (writes).
+    // 193 -> 205 with plan-641 Phases 0-2: `web_commands` (read), `web_execute`,
+    // `web_batch` (writes) and the nine `web_macro_*` tools (record_start, record_stop,
+    // annotate, save, replay, cancel = writes; list, get, status = reads).
+    // 205 -> 209 with plan-641 Phases 4-5: `web_check_gap`, `web_check_contact`,
+    // `web_part_lookup` (reads) and `web_macro_assert` (write — a macro line).
+    // 209 -> 210 with plan-641 Phase 2b: `web_macro_import` (write — a macro into the book).
+    // 210 -> 213 with plan-650 Phase 4: `web_editor_parametric_define` / `_set` (writes) and
+    // `web_editor_parametric_inspect` (read).
+    // 213 -> 216 with plan-655: `web_library_list` (read), `web_library_attach` /
+    // `_detach` (writes, views of `library.attach` / `library.detach`).
+    // 216 -> 222 with plan-773 Phases 1-2: `web_robot_list`, `_get_chain`, `_get_state`,
+    // `_verify_fk`, `_rig_diagnose` (reads — the web pendants of Unity's `ik_*` tools plus
+    // the read-only rig derivation) and `web_robot_rig_from_library` (write — the one call
+    // that builds a RobotIK instead of seven fields set by hand).
+    // 222 -> 229 with plan-773 Phase 3: `web_robot_path_inspect` (read) and the six writes
+    // that author a robot program — `web_robot_path_create`, `_target_add`, `_target_set`,
+    // `_target_remove`, `_target_reorder`, `_solve_target`. The three robotics components
+    // stay un-authorable; this family is the way in (decision E6).
+    // 229 -> 230 with plan-773 Phase 5: `web_robot_program_export` (read — it re-solves every
+    // waypoint but writes nothing) turns a path into a vendor robot program. It is BOUND to
+    // `ik.program.export`, so it does not appear in `tools/list`; this count is the announced
+    // catalogue before the alias filter, which is why it still rises by one.
+    // 230 -> 231 with plan-664 Phase 2: `web_sensor_read` (read — the current scan
+    // frame of a Rangefinder / LaserScanner out of the sensor data channel, plus
+    // the sensor's configuration). Unbound: there is no button it is a view of,
+    // and nothing to undo.
+    // 231 -> 233: plan-2007 Phase 0 adds `web_query` (the read door, read-only); the
+    // second one arrived on main before plan-2007 (measured 2026-10-27).
+    // plan-2007 Phase 1 moves 14 write tools to registry commands.
+    // plan-2007 Phase 2A moves four more write tools to registry commands.
+    // Phase 2B retires five further writing tools.
+    // plan-2007 Phase 3: eight mechanism writes moved to commands.
+    // Phase 4A: 18 read-only queries moved behind web_query:
+    // web_editor_mechanism_inspect -> mechanism.inspect
+    // web_editor_mechanism_forces -> mechanism.forces
+    // web_editor_mechanism_path_inspect -> mechanism.pathInspect
+    // web_editor_mechanism_snap_list -> mechanism.snapList
+    // web_editor_mechanism_trajectory_export -> mechanism.trajectoryExport
+    // web_editor_mechanism_trajectory_inspect -> mechanism.trajectoryInspect
+    // web_editor_mechanism_validate -> mechanism.validate
+    // web_robot_list -> ik.robot.list
+    // web_robot_get_chain -> ik.robot.chain
+    // web_robot_get_state -> ik.robot.state
+    // web_robot_verify_fk -> ik.robot.verifyFk
+    // web_robot_rig_diagnose -> ik.robot.rigDiagnose
+    // web_robot_path_inspect -> ik.path.inspect
+    // web_editor_list_kinematics -> editor.listKinematics
+    // web_editor_material_presets -> editor.materialPresets
+    // web_editor_material_stats -> editor.materialStats
+    // web_editor_project_files -> editor.projectFiles
+    // web_editor_project_info -> editor.projectInfo
+    // Phase 4B moves 16 read-only tools behind web_query:
+    // web_layout_list -> layout.list
+    // web_layout_export -> layout.export
+    // web_layout_snap_list -> layout.snapList
+    // web_layout_snap_suggest -> layout.snapSuggest
+    // web_library_list -> library.list
+    // web_catalog_list -> library.catalogList
+    // web_catalog_describe -> library.catalogDescribe
+    // web_signal_bindings_list -> signal.bindingsList
+    // web_signal_sources_list -> signal.sourcesList
+    // web_signal_reconcile -> signal.reconcile
+    // web_signal_usage -> signal.usage
+    // web_des_components -> des.components
+    // web_des_stats -> des.stats
+    // web_des_bottleneck -> des.bottleneck
+    // web_plc_status -> plc.status
+    // web_des_status -> des.status
+    // Phase 4C: 15 read-only tools become queries (168 -> 153).
+    // web_drive_list -> drive.list
+    // web_sensor_list -> sensor.list
+    // web_sensor_read -> sensor.read
+    // web_transport_status -> transport.status
+    // web_logic_flow -> logic.flow
+    // web_trace_top -> trace.top
+    // web_collision_status -> collision.status
+    // web_group_list -> group.list
+    // web_knowledge_get -> knowledge.get
+    // web_knowledge_list -> knowledge.list
+    // web_document_info_get -> document.infoGet
+    // web_import_usd_extras -> document.usdExtrasPreview
+    // web_link_compose -> link.compose
+    // web_part_lookup -> part.lookup
+    // web_prompt_list -> prompt.list
+    expect(schemas.length).toBe(74);
   });
 
   /**
@@ -295,11 +438,9 @@ describe('MCP tool conventions', () => {
   describe('destructive classification', () => {
     const destructive = schemas.filter((s) => s.annotations?.destructiveHint === true);
 
-    it('web_document_update is a destructive write', () => {
-      const t = schemas.find((s) => s.name === 'web_document_update');
-      expect(t, 'web_document_update must exist').toBeTruthy();
-      expect(t!.annotations?.readOnlyHint).toBe(false);
-      expect(t!.annotations?.destructiveHint).toBe(true);
+    it('document.delete is a destructive write', () => {
+      const d = createDocumentCommandDescriptors().find(d => d.id === 'document.delete');
+      expect(d).toMatchObject({ readOnly: false, destructive: true });
     });
 
     it('nothing read-only is marked destructive', () => {
@@ -308,7 +449,7 @@ describe('MCP tool conventions', () => {
     });
 
     it('the hint stays rare — every carrier is listed here deliberately', () => {
-      expect(destructive.map((s) => s.name).sort()).toEqual(['web_document_update']);
+      expect(destructive.map((s) => s.name).sort()).toEqual([]);
     });
   });
 
@@ -322,9 +463,11 @@ describe('MCP tool conventions', () => {
    * descriptions.
    */
   it('the catalogue listing and the document listing stay distinct', () => {
-    const catalogue = schemas.find((s) => s.name === 'web_catalog_list');
+    // plan-2007: the library reads live in the query family (out of the embed graph).
+    const catalogue = createQueryCommandDescriptors().find((d) => d.id === 'library.catalogList');
     const documents = schemas.find((s) => s.name === 'web_document_list');
-    expect(catalogue?.description).toContain('catalogId');
+    expect(catalogue?.readOnly).toBe(true);
+    expect(catalogue?.argsSchema).toEqual({ source: 'string', query: 'string', limit: 'number' });
     expect(documents?.description).toContain('document');
     expect(Object.keys(documents!.inputSchema.properties)).not.toContain('catalogId');
     expect(documents!.annotations?.readOnlyHint).toBe(true);
@@ -336,7 +479,7 @@ describe('MCP tool conventions', () => {
   it('the shared instance list covers every linted delegate', () => {
     const names = new Set(schemas.map((s) => s.name));
     for (const t of ['web_status', 'web_editor_open',
-      'web_signal_bind', 'web_knowledge_set', 'web_describe', 'web_help',
+      'web_describe', 'web_help',
       // plan-716 Phase 5 — the announced-but-unlinted delegate. `web_document_list`
       // is THE one document list; leaving it out of this list left it out of
       // the generated reference too, which is where an agent looks for it.
@@ -344,7 +487,7 @@ describe('MCP tool conventions', () => {
       'web_ping',
       // plan-437 — the link composer. Announced and documented from this one
       // list like everything else.
-      'web_link_compose']) {
+      'web_query']) {
       expect(names.has(t), `${t} must come from the shared allSchemas() list`).toBe(true);
     }
   });
@@ -374,13 +517,13 @@ describe('MCP tool conventions', () => {
       for (const n of ['web_node_find', 'web_node_tree', 'web_help', 'web_status',
         'web_measure', 'web_node_shape', 'web_component_get', 'web_signal_list',
         // plan-394: reading a stored note observes nothing an operator can see.
-        'web_knowledge_get', 'web_knowledge_list',
+        'web_query',
         // plan-707 F4: web_describe aggregates existing getters and moves
         // neither selection, panels nor camera — unlike web_node_bounds below.
         'web_describe',
         // plan-437: composing a URL is string work over live getters — it opens
         // nothing, mints no share and moves no viewport.
-        'web_link_compose',
+
         // plan-740: every capture renders OFFSCREEN through the agent camera.
         // `web_view_sweep` joined this group in Phase 3 (D-A8 / review finding
         // I3) — it used to fly the viewport through six poses, and now moves no
@@ -392,7 +535,7 @@ describe('MCP tool conventions', () => {
 
       // Mutations, obviously.
       for (const n of ['web_signal_set_bool', 'web_drive_jog', 'web_sim_reset',
-        'web_editor_import_cad', 'web_editor_save', 'web_layout_place', 'web_plc_run',
+        'web_editor_save', 'web_layout_place',
         // plan-394: writes rv_extras into the document and thence into the GLB.
         'web_knowledge_set',
         // plan-740 D-A8 / I2: the captures moved offscreen, but this still
@@ -408,8 +551,8 @@ describe('MCP tool conventions', () => {
       // The transient/viewport group stays a write on purpose: it persists nothing, but a
       // watching operator sees the view jump — a surprise on a running plant, not a feature.
       for (const n of ['web_camera_set', 'web_camera_focus', 'web_camera_orbit',
-        'web_camera_projection', 'web_view_isolate',
-        'web_select', 'web_select_similar', 'web_view_source_markers']) {
+        'web_camera_projection',
+        'web_select', 'web_select_similar']) {
         expect(readOnly.has(n), `${n} is viewport-transient and must be gated as a write`).toBe(false);
       }
 
@@ -437,9 +580,10 @@ describe('MCP tool conventions', () => {
     const mechanismTools = schemas.filter((s) => s.name.includes('mechanism'));
     const kinematicTools = schemas.filter((s) => /kinemati/i.test(s.name));
 
-    it('there are tools on both sides of the collision', () => {
-      expect(mechanismTools.length).toBeGreaterThan(10);
-      expect(kinematicTools.length).toBeGreaterThan(2);
+    it('both authoring families have moved out of the decorated tool roster', () => {
+      expect(mechanismTools.length).toBe(0);
+      // Phase 6A retired the remaining authoring aliases.
+      expect(kinematicTools.length).toBe(0);
     });
 
     it('every mechanism description carries the demarcation', () => {
@@ -454,13 +598,13 @@ describe('MCP tool conventions', () => {
     });
 
     it('no mechanism description points at kinematize as if it were a synonym', () => {
-      // `web_editor_kinematize` CREATES axis groups. Naming it inside a
+      // `web_execute("editor.kinematize", …)` CREATES axis groups. Naming it inside a
       // mechanism description reads as "the same thing, other spelling"; the
       // demarcation points at the read tool instead.
       const bad = mechanismTools
         .filter((s) => s.description.includes('kinematize'))
         .map((s) => s.name);
-      expect(bad, `these must reference web_editor_list_kinematics instead: ${bad.join(', ')}`)
+      expect(bad, `these must reference editor.listKinematics instead: ${bad.join(', ')}`)
         .toEqual([]);
     });
 
@@ -507,7 +651,8 @@ describe('MCP tool conventions', () => {
       'web_scene_export',    // → web_layout_export (it exports the planner snapshot)
       'web_library_assets',  // merged into web_document_list
       'web_library_update',  // → web_document_update
-      'web_library_list',    // → web_catalog_list
+      // 'web_library_list' is BACK since plan-655 with the narrower meaning
+      // (attached catalogs, not their parts) — see the `library` domain above.
       'web_library_describe']) { // → web_catalog_describe
       expect(names.has(gone), `${gone} should be renamed/removed`).toBe(false);
     }
@@ -522,10 +667,13 @@ describe('MCP tool conventions', () => {
    * alias.
    */
   it('the retired names have live replacements', () => {
+    const queries = [...createLibraryCommandDescriptors(), ...createQueryCommandDescriptors(), ...createPlannerCommandDescriptors()];
+    for (const id of ['library.catalogList', 'library.catalogDescribe', 'layout.export']) {
+      expect(queries.find((d) => d.id === id)?.readOnly).toBe(true);
+    }
     const names = new Set(schemas.map((s) => s.name));
     for (const kept of ['web_document_list', 'web_document_open', 'web_document_save',
-      'web_document_new', 'web_document_update', 'web_catalog_list',
-      'web_catalog_describe', 'web_layout_export']) {
+      'web_execute', 'web_query']) {
       expect(names.has(kept), `${kept} replaces a retired name and must exist`).toBe(true);
     }
   });

@@ -14,13 +14,13 @@ import { ThemeProvider } from '@mui/material/styles';
 import type { ReactNode } from 'react';
 import { rvDarkTheme } from '../src/core/hmi/theme';
 import {
-  IEC_BEZEL, IEC_CAP, IEC_LAMP, IEC_LAMP_OFF,
+  IEC_BEZEL, IEC_CAP, IEC_LAMP, IEC_LAMP_OFF, PANEL_SURFACE,
 } from '../src/core/hmi/shared-sx';
 import {
   EmergencyStop, IlluminatedPushButton, OperatorPanel, OperatorPanelPlugin, PilotLamp, RELEASE_HOLD_MS,
   SelectorSwitch, StackLight, validateOperatorPanelConfig, type OperatorPanelConfig,
 } from '../src/core/hmi/operator-devices';
-import { ControlWindow } from '../src/core/hmi/ControlWindow';
+import { ControlWindow, PLATE_SURFACE } from '../src/core/hmi/ControlWindow';
 import { SignalStore } from '../src/core/engine/rv-signal-store';
 import { ConnectionModeController } from '../src/core/engine/rv-connection-mode';
 
@@ -397,7 +397,21 @@ describe('F10 — a lit lamp glows, an unlit one never', () => {
 // ─── F11: plate surface ─────────────────────────────────────────────────
 
 describe('F11 — ControlWindow surface="plate"', () => {
-  it('puts the window on the darkest glass, the default stays glass', () => {
+  /**
+   * plan-2047 — superseded expectation, nachgezogen. plan-542 F11 gave `plate`
+   * its own darker background and left the default on the theme's 60 % glass.
+   * `452b4594` then put EVERY floating panel on `PANEL_SURFACE`, because a
+   * chart on 60 % glass over a white floor drove its own axis labels below 3:1
+   * (FloatingPanel.tsx, DESIGN.md "Floating Glass Panel"). The contrast rule
+   * won; the background is now the same on both, and `PLATE_SURFACE` is a
+   * tautological alias of `PANEL_SURFACE`.
+   *
+   * So this pins the two things that are true today: the shared surface, and
+   * what the prop still DOES — density. Whether the prop should stay, be
+   * renamed to a density prop or go is deliberately NOT asserted here; that is
+   * an API clean-up with its own caller risk (plan-2047 § "Nicht in diesem Plan").
+   */
+  it('both surfaces sit on PANEL_SURFACE — the contrast rule applies to every panel', () => {
     render(
       <Wrapper>
         <ControlWindow title="Plate" panelId="t-plate" surface="plate"><span>p</span></ControlWindow>
@@ -406,7 +420,30 @@ describe('F11 — ControlWindow surface="plate"', () => {
     );
     const bg = (name: string) => getComputedStyle(screen.getByRole('region', { name })).backgroundColor;
     expect(bg('Plate')).toBe('rgba(15, 15, 15, 0.92)');
-    expect(bg('Glass')).toBe('rgba(30, 30, 30, 0.6)');
+    expect(bg('Glass')).toBe('rgba(15, 15, 15, 0.92)');
+    // Stated as the rule, not as a literal: both read the one constant.
+    expect(bg('Glass')).toBe(bg('Plate'));
+    expect(PLATE_SURFACE).toBe(PANEL_SURFACE);
+  });
+
+  it('surface="plate" still means something: a denser content box', () => {
+    render(
+      <Wrapper>
+        <ControlWindow title="Plate" panelId="t-plate" surface="plate"><span>p</span></ControlWindow>
+        <ControlWindow title="Glass" panelId="t-glass"><span>g</span></ControlWindow>
+      </Wrapper>,
+    );
+    const box = (name: string) => screen.getByRole('region', { name })
+      .querySelector('[data-surface]') as HTMLElement;
+    const plate = getComputedStyle(box('Plate'));
+    const glass = getComputedStyle(box('Glass'));
+    expect(box('Plate').getAttribute('data-surface')).toBe('plate');
+    expect(box('Glass').getAttribute('data-surface')).toBe('glass');
+    // ControlWindow.tsx: gap 0.75 vs 1.25, padding 1 vs 1.25 (MUI 8 px spacing).
+    expect(plate.gap).toBe('6px');
+    expect(glass.gap).toBe('10px');
+    expect(plate.padding).toBe('8px');
+    expect(glass.padding).toBe('10px');
   });
 });
 

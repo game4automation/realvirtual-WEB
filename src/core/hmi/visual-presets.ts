@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * Visual presets — named snapshots of the full visual look: render mode +
  * per-mode lighting/shadows, ground/background/reflection, tone mapping,
@@ -26,6 +28,7 @@ import {
 } from './visual-settings-store';
 import { markEnvironmentUserModified } from './environment-presets';
 import { deepCloneJSON } from '../ops/rv-op-utils';
+import { RENDER_MODE_IDS } from '../rv-render-modes';
 
 /** VisualSettings keys a preset captures — the "full visual look + antialias".
  *  Deliberately excludes camera bookmarks, FPV/orbit navigation, and UI zoom. */
@@ -182,12 +185,21 @@ function mergePresetOverBase(base: VisualSettings, preset: VisualPreset): Visual
     // generic rule and the test that protects it stay untouched, and
     // `schemaVersion` stays 1 — no preset file needs migrating.
     uiBlurScale: ps.uiBlurScale ?? def.uiBlurScale,
-    modeSettings: {
-      simple:  { ...def.modeSettings.simple,  ...base.modeSettings.simple,  ...(psModes.simple  ?? {}) },
-      default: { ...def.modeSettings.default, ...base.modeSettings.default, ...(psModes.default ?? {}) },
-      toon:    { ...def.modeSettings.toon,    ...base.modeSettings.toon,    ...(psModes.toon    ?? {}) },
-    },
+    modeSettings: mergeModeSettings(def.modeSettings, base.modeSettings, psModes),
   };
+}
+
+/** Per render mode (every id of RENDER_MODE_IDS): defaults ← base ← preset. */
+function mergeModeSettings(
+  def: VisualSettings['modeSettings'],
+  base: VisualSettings['modeSettings'],
+  ps: Partial<VisualSettings['modeSettings']>,
+): VisualSettings['modeSettings'] {
+  const out = {} as VisualSettings['modeSettings'];
+  for (const mode of RENDER_MODE_IDS) {
+    out[mode] = { ...def[mode], ...(base?.[mode] ?? {}), ...(ps[mode] ?? {}) };
+  }
+  return out;
 }
 
 /** Apply a preset: merge its fields over the current settings, persist, and
@@ -286,7 +298,7 @@ export function matchPreset(presets: VisualPreset[], settings?: VisualSettings):
 
 function loadLocalPresets(): VisualPreset[] {
   try {
-    const raw = localStorage.getItem(LOCAL_KEY);
+    const raw = readLocalStorage(LOCAL_KEY);
     if (!raw) return [];
     const arr = JSON.parse(raw);
     return Array.isArray(arr) ? arr.filter(isValidPreset) : [];
@@ -296,7 +308,7 @@ function loadLocalPresets(): VisualPreset[] {
 function saveLocalPreset(p: VisualPreset): void {
   const list = loadLocalPresets().filter((x) => x.name !== p.name);
   list.push(p);
-  try { localStorage.setItem(LOCAL_KEY, JSON.stringify(list)); } catch { /* quota — ignore */ }
+  try { writeLocalStorage(LOCAL_KEY, JSON.stringify(list)); } catch { /* quota — ignore */ }
 }
 
 // ─── Published (public/presets) presets ───────────────────────────────────

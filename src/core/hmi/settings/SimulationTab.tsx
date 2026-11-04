@@ -23,7 +23,9 @@ import {
   usePhysicsWholeScene, setPhysicsWholeScene,
   usePhysicsFull, setPhysicsFull,
 } from '../visual-settings-store';
+import { getDropDetectionSettings, setDropDetectionEnabled, subscribeDropDetectionSettings } from '../../drop-detection-settings-store';
 import { getAppConfig } from '../rv-app-config';
+import { useViewer } from '../../../hooks/use-viewer';
 import {
   isPhysicsEnabledByModel, physicsDiagnostics, subscribePhysicsState, type PhysicsDiagnostics,
 } from '../../engine/rv-physics-registry';
@@ -88,6 +90,8 @@ function BetaChip() {
 }
 
 export function SimulationTab() {
+  const viewer = useViewer();
+  const dropSettings = useSyncExternalStore(subscribeDropDetectionSettings, getDropDetectionSettings);
   const physicsOn = usePhysicsWholeScene();
   const fullOn = usePhysicsFull();
   // Deployment kill-switch (settings.json simulation.physicsEnabled: false)
@@ -100,6 +104,20 @@ export function SimulationTab() {
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+      <SettingsSection id="simulation-drop-detection" title="Drop detection">
+        <FieldRow label="Unsupported-part detection" hint="Reports parts with no support; takes effect immediately">
+          <Switch
+            size="small"
+            inputProps={{ 'aria-label': 'Unsupported-part detection' }}
+            checked={dropSettings.enabled}
+            onChange={(_, enabled) => setDropDetectionEnabled(enabled)}
+          />
+        </FieldRow>
+        <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', mt: 0.5 }}>
+          On by default for every model. An optional DropDetection component tunes the scene;
+          its Enabled=false also disables detection. Existing reports stay until acknowledged or reset.
+        </Typography>
+      </SettingsSection>
       <SettingsSection id="simulation-physics" title="Physics">
         <FieldRow label="Physics (whole scene)" hint="takes effect on next model load">
           <Switch

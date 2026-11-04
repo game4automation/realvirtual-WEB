@@ -26,7 +26,7 @@ import { getDefaultPathNetwork } from '../../src/core/engine/rv-path-network';
 import { getDefaultZoneRegistry } from '../../src/core/engine/rv-zone-registry';
 import { getDefaultAgvFleet, type AgvTask } from '../../src/core/engine/rv-agv-fleet';
 import { getDefaultMovementAuthority } from '../../src/core/engine/rv-movement-authority';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
+import { DESRunner } from '@rv/plugins/des/des-runner';
 import {
   TICK, makeHost, makeAgvRoot, bindDes, clearShared, footprint, satOverlap,
   type BodyExtents, type Footprint, type TestBody,

@@ -18,7 +18,10 @@
 import type { RVViewer } from '../rv-viewer';
 import type { RVViewerPlugin } from '../rv-plugin';
 import { getOverriddenFields, type RVExtrasOverlay } from '../engine/rv-extras-overlay-store';
-import { overrideTargetOf, overriddenFieldsOf } from '../ops/rv-reference-guard';
+import {
+  overrideTargetOf, overriddenFieldsOf, revertComponentOverride, writeOverride,
+} from '../ops/rv-reference-guard';
+import { getActivePersistenceTarget } from './rv-edit-target';
 
 const NO_FIELDS: readonly string[] = [];
 
@@ -45,7 +48,40 @@ export function referenceOverriddenFields(
   if (!node) return NO_FIELDS;
   const target = overrideTargetOf(node, viewer.currentModelRoot ?? null);
   if (!target) return NO_FIELDS;
-  return overriddenFieldsOf(target.referenceNode, target.nodeId, componentType);
+  return overriddenFieldsOf(target.referenceNode, target.address, componentType);
+}
+
+/**
+ * Drop the instance override for one field — or, with no field, for the whole
+ * component — the reference half of the inspector's Revert.
+ *
+ * A no-op when the node is not inside a reference, which is the common case;
+ * the caller does not branch, so a Revert always means the same thing.
+ *
+ * Also a no-op in the ASSET EDITOR (plan-774 F1): there the Revert's
+ * `unsetField` op (`RvExtrasEditorPlugin.resetField` / `resetComponent`)
+ * clears the override itself — in the same undo entry, with the live value
+ * back to the asset's own. Writing it here first would leave that op nothing
+ * to capture, and its undo would bring back the value but not the override.
+ */
+export function revertReferenceOverride(
+  viewer: RVViewer,
+  nodePath: string,
+  componentType: string,
+  fieldName?: string,
+): void {
+  if (viewer.modes.activeMode === 'viewer') return;
+  if (getActivePersistenceTarget() === 'asset') return;
+  const node = viewer.registry?.getNode(nodePath);
+  if (!node) return;
+  const target = overrideTargetOf(node, viewer.currentModelRoot ?? null);
+  if (!target) return;
+  if (fieldName === undefined) {
+    revertComponentOverride(target.referenceNode, target.address, componentType);
+  } else {
+    writeOverride(target.referenceNode, target.address, componentType, fieldName, undefined);
+  }
+  viewer.markRenderDirty();
 }
 
 /** Fields of `componentType` the scene overlay (rv-extras editor) overrides on `nodePath`. */

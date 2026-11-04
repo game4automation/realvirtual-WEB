@@ -4,7 +4,8 @@
 import type { RVViewerPlugin } from '../../core/rv-plugin';
 import type { RVViewer } from '../../core/rv-viewer';
 import type { UISlotEntry } from '../../core/rv-ui-plugin';
-import { modeContext } from '../../core/rv-mode-manager';
+import { SIGNAL_LINK_REST_MODE, SIGNAL_LINK_TOOLBAR_CONTEXTS, isSignalLinkingAllowed } from './signal-link-gate';
+import { TOOL_GROUP } from '../../core/hmi/button-panel-sections';
 import type { LoadResult } from '../../core/engine/rv-scene-loader';
 import type { SignalMapping } from '../layout-planner/rv-layout-store';
 import { disposeSignalDrag } from '../../core/hmi/signal-drag-store';
@@ -17,7 +18,7 @@ import { createSignalBindingPersistence } from './signal-binding-persistence';
 import { DropTargetOverlayController } from './drop-target-overlay';
 import { SignalLinkModeButton } from './SignalLinkModeButton';
 import { BindingsOverviewButton } from './BindingsOverviewButton';
-import { isSignalLinkModeActive } from './signal-link-mode-store';
+import { isSignalLinkModeActive, setSignalLinkModeSuspended } from './signal-link-mode-store';
 import { isDuplicateSignalName } from '../../core/engine/rv-signal-construction';
 import { registerSignalBulkActions } from './component-bulk-actions';
 import type { SignalBindingManager } from '../../core/engine/rv-signal-binding-manager';
@@ -44,33 +45,21 @@ export class SignalBindPlugin implements RVViewerPlugin {
     slot: 'button-group',
     component: SignalLinkModeButton,
     order: 64,
-    visibilityRule: {
-      shownOnlyInAny: [
-        modeContext('hmi'),
-        modeContext('planner'),
-        modeContext('des'),
-        modeContext('editor'),
-        // plan-423: binding model slots to live signals IS the commissioning
-        // workflow — without this opt-in the Signal Link button would not exist
-        // in the very workspace built for it (ButtonPanel auto-hides ruleless
-        // entries in a focused mode, so nothing else grants it).
-        modeContext('commissioning'),
-      ],
-    },
+    group: TOOL_GROUP.model,
+    // plan-423: binding model slots to live signals IS the commissioning
+    // workflow — the rule must name it (ButtonPanel auto-hides ruleless entries
+    // in a focused mode). The operator workspaces (hmi, viewer) are NOT in the
+    // list: signal linking is engineering work (signal-link-gate.ts).
+    // plan-2010: DES is not in the TOOLBAR list (Thomas, 2026-10-27).
+    visibilityRule: { shownOnlyInAny: [...SIGNAL_LINK_TOOLBAR_CONTEXTS] },
   }, {
     // Directly beside the link-mode toggle: making links and reviewing them are
     // the two halves of one job (plan-425 F7).
     slot: 'button-group',
     component: BindingsOverviewButton,
     order: 65,
-    visibilityRule: {
-      shownOnlyInAny: [
-        modeContext('hmi'),
-        modeContext('planner'),
-        modeContext('des'),
-        modeContext('editor'),
-      ],
-    },
+    group: TOOL_GROUP.model,
+    visibilityRule: { shownOnlyInAny: [...SIGNAL_LINK_TOOLBAR_CONTEXTS] },
   }];
 
   private viewer: RVViewer | null = null;
@@ -85,9 +74,17 @@ export class SignalBindPlugin implements RVViewerPlugin {
   private readonly unitTargets = new Set<string>();
   private fmuUnsub: (() => void) | null = null;
   private fmuSignalKey = '';
+  /** plan-2010: follows the workspace mode so a switched-on link mode rests in DES. */
+  private modeUnsub: (() => void) | null = null;
 
   init(viewer: RVViewer): void {
     this.viewer = viewer;
+    // The link mode rests while the workspace is DES (its toolbar switch is not
+    // offered there): the stored switch stays, badges and the tooltip gate follow
+    // `active`. The mode may already be DES at boot, hence the initial sync.
+    this.modeUnsub?.();
+    setSignalLinkModeSuspended(viewer.modes?.activeMode === SIGNAL_LINK_REST_MODE);
+    this.modeUnsub = viewer.on('mode-changed', ({ to }) => setSignalLinkModeSuspended(to === SIGNAL_LINK_REST_MODE));
     // plan-512 F7: an FMU registers its signal units in `init()`, which can run
     // AFTER the mappings that read them were applied (placements, editor
     // attach). A changed FMU signal set re-derives the unit problems.
@@ -137,6 +134,9 @@ export class SignalBindPlugin implements RVViewerPlugin {
       // an active link mode (explicit toggle or a running signal drag) a scene
       // click must never surface the binding popover.
       if (!isSignalLinkModeActive()) return;
+      // A link toggle left on in an engineering mode stays dormant in the
+      // operator workspaces (signal-link-gate.ts).
+      if (!isSignalLinkingAllowed(viewer)) return;
       const target = findSignalBindTarget(viewer, node);
       if (!target || target.kind === 'placed') return;
       if (!signalBindEligibility(viewer, target).eligible) return;
@@ -326,6 +326,9 @@ export class SignalBindPlugin implements RVViewerPlugin {
 
   dispose(): void {
     this.teardownModel();
+    this.modeUnsub?.();
+    this.modeUnsub = null;
+    setSignalLinkModeSuspended(false);
     this.unitManagerUnsub?.();
     this.unitManagerUnsub = null;
     this.unitManager = null;

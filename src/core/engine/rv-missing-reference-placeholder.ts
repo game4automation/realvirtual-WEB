@@ -46,6 +46,8 @@
 
 import { BoxGeometry, EdgesGeometry, LineBasicMaterial, LineSegments, Object3D } from 'three';
 import type { RvReferenceBounds } from './rv-asset-reference';
+import { getLibrarySource } from '../library/library-source-registry';
+import { isQualifiedRef } from '../library/library-origin';
 
 /** rv_extras key marking a node as a placeholder. Never written to a file. */
 export const RV_MISSING_PLACEHOLDER_KEY = 'MissingAssetPlaceholder';
@@ -88,6 +90,23 @@ export function missingReferenceLabel(ref: { assetId?: string; path?: string }):
   if (stem) return stem;
   const id = (ref.assetId ?? '').trim();
   return id !== '' ? id : '<missing asset>';
+}
+
+/**
+ * The placeholder name of a PLACEMENT (plan-778 §3.2): a qualified reference
+ * names its library — "Missing: <doc> from library <label>", the label of the
+ * library source when it is registered, else its project id; everything else
+ * is {@link missingReferenceLabel} unchanged.
+ */
+export function missingPlacementLabel(ref: { assetId?: string; path?: string; providerId?: string; sourceId?: string }): string {
+  if (!isQualifiedRef(ref)) return missingReferenceLabel(ref);
+  const doc = missingReferenceLabel({ assetId: ref.assetId });
+  let library = ref.sourceId as string;
+  try {
+    const label = getLibrarySource(ref.providerId as string, ref.sourceId as string)?.label;
+    if (label) library = label;
+  } catch { /* the id is the name then */ }
+  return `Missing: ${doc} from library ${library}`;
 }
 
 /**

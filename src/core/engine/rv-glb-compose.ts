@@ -53,13 +53,19 @@ import {
   type AssetReference,
   type OrphanedOverride,
   MAX_REFERENCE_DEPTH,
-  applyAssetOverrides,
+  applyResolvedOverrideSets,
   collectReferenceNodes,
   getAssetOverrides,
   getPlacementMeta,
   makeSubtreeResolvers,
+  migrateLegacyOverridePaths,
+  recordOverridePathMigration,
+  resolveAssetOverrides,
+  setAssetOverrides,
+  type ResolvedOverrides,
 } from './rv-asset-reference';
 import { pivotToFloorCenter } from './rv-placement-pivot';
+import { isQualifiedRef } from '../library/library-origin';
 import {
   buildMissingReferencePlaceholder,
   missingReferenceLabel,
@@ -68,11 +74,11 @@ import {
   ROOT_OCCURRENCE,
   ROOT_SOURCE_KEY,
   childOccurrence,
-  deriveNodeIdsForSubtree,
-  getNodeId,
 } from './rv-node-id';
 import { parseGlbSubtreeWithMeta } from './rv-glb-parse';
 import { debug } from './rv-debug';
+import { RV_ORIG_NAME_KEY } from './rv-authored-keys';
+import { identityIdOf, type FileIdentity } from './rv-decode-identity';
 
 // ─── Errors ──────────────────────────────────────────────────────────────
 
@@ -85,7 +91,7 @@ import { debug } from './rv-debug';
  */
 export class ReferenceCycleError extends Error {
   constructor(public readonly trail: string[]) {
-    super(`Referenzzyklus (reference cycle): ${trail.join(' → ')}`);
+    super(`Reference cycle: ${trail.join(' → ')}`);
     this.name = 'ReferenceCycleError';
   }
 }
@@ -94,7 +100,7 @@ export class ReferenceCycleError extends Error {
 export class ReferenceDepthError extends Error {
   constructor(public readonly depth: number, public readonly trail: string[]) {
     super(
-      `Referenztiefe überschritten (reference depth exceeded, max ${MAX_REFERENCE_DEPTH}): `
+      `Reference depth exceeded (max ${MAX_REFERENCE_DEPTH}): `
       + trail.join(' → '),
     );
     this.name = 'ReferenceDepthError';
@@ -262,6 +268,8 @@ export interface GlbTemplate {
   signaturePresent: boolean;
   gltfNodeIndices: Map<Object3D, number>;
   gltfNodeNames: readonly (string | undefined)[];
+  /** plan-769: the referenced file's identity record (seeded ids, authored index). */
+  identity?: FileIdentity | null;
 }
 
 /**
@@ -373,6 +381,8 @@ export interface ComposedFrame {
   /** node → index in THIS file's `nodes[]`, keyed on this occurrence's clones. */
   gltfNodeIndices: Map<Object3D, number>;
   gltfNodeNames: readonly (string | undefined)[];
+  /** plan-769: the referenced file's identity record — registered with this occurrence. */
+  identity?: FileIdentity | null;
   /** The referenced file changed since the reference was written (F9). */
   updated: boolean;
 }
@@ -421,6 +431,8 @@ export interface ComposeResult {
   deferred: DeferredReference[];
   /** Overrides whose target no longer exists (F9). */
   orphanedOverrides: OrphanedOverride[];
+  /** plan-769 F14: reference nodes whose old `trsByNodeId` part moves were not applied, with their count. */
+  droppedTransforms: Array<{ occurrence: string; assetId: string; count: number }>;
   /** References that resolved to nothing. */
   missing: MissingReference[];
   /** The subset of {@link frames} whose file changed since it was referenced. */
@@ -436,9 +448,9 @@ export interface ComposeResult {
 export interface ComposeOptions {
   /** URL of the root file — the base for its own relative reference paths. */
   baseUrl: string;
-  /** Content hash of the root file, when known. Derived NodeIds hang on it. */
+  /** Content hash of the root file, when known (plan-769 F12: no ids are derived from it any more). */
   sha256?: string;
-  /** node → index in the ROOT file's `nodes[]`, for root-level NodeId derivation. */
+  /** node → index in the ROOT file's `nodes[]` (kept for callers; plan-769 F12 derives no ids from it). */
   gltfNodeIndices?: Map<Object3D, number>;
   signatureState?: SignatureState;
   signaturePresent?: boolean;
@@ -475,6 +487,12 @@ interface Frame {
 
 /** The cache/cycle key of a reference: identity first, location second. */
 function referenceKey(ref: AssetReference, resolvedPath: string): string {
+  // plan-778: a QUALIFIED reference names (library, document) — two libraries'
+  // equal document ids are two assets, so B's `models/pump` placing C's
+  // `models/pump` is no cycle. A legacy reference keeps its bare-id key.
+  if (ref.assetId && isQualifiedRef(ref)) {
+    return `id:${ref.providerId}/${ref.sourceId}/${ref.assetId}`;
+  }
   return ref.assetId ? `id:${ref.assetId}` : `url:${resolvedPath}`;
 }
 
@@ -505,13 +523,13 @@ function remapIndices(
 /**
  * The occurrence segment a reference node contributes.
  *
- * Its `NodeId` when it has one. When it does not — a scene written before ids
- * existed — an ordinal within its own file stands in: deterministic for the same
- * bytes, which is all the address needs to be, and far better than refusing to
- * compose the file at all.
+ * Its IDENTITY (plan-769 F12): the authored `NodeId`, else the decode seed — every
+ * node of a decoded file has one, so the segment is the same one the registry and
+ * the placement instancer use. Only a tree that never went through a decode (a
+ * hand-built test graph) falls back to an ordinal within its own file.
  */
 function occurrenceSegment(referenceNode: Object3D, ordinal: number): string {
-  return getNodeId(referenceNode) ?? `@${ordinal}`;
+  return identityIdOf(referenceNode) ?? `@${ordinal}`;
 }
 
 // ─── compose ─────────────────────────────────────────────────────────────
@@ -533,6 +551,7 @@ export async function compose(root: Object3D, options: ComposeOptions): Promise<
   const frames: ComposedFrame[] = [];
   const deferred: DeferredReference[] = [];
   const orphanedOverrides: OrphanedOverride[] = [];
+  const droppedTransforms: ComposeResult['droppedTransforms'] = [];
   const missing: MissingReference[] = [];
   const grafted: Array<{ parent: Object3D; child: Object3D }> = [];
 
@@ -542,13 +561,11 @@ export async function compose(root: Object3D, options: ComposeOptions): Promise<
   if (options.assetId) rootKeys.add(`id:${options.assetId}`);
   if (options.baseUrl) rootKeys.add(`url:${options.baseUrl}`);
 
-  // The root file's own nodes get derived ids too, so a reference node in the
-  // scene can contribute a stable occurrence segment. Files we write carry
-  // authored ids already and keep them — `deriveNodeIdsForSubtree` skips those.
-  if (options.sha256 && options.gltfNodeIndices) {
-    const indices = options.gltfNodeIndices;
-    await deriveNodeIdsForSubtree(root, options.sha256, (node) => indices.get(node));
-  }
+  // plan-769 F12: no sha256-derived ids any more — every decoded node carries its
+  // identity (authored id, else the decode seed), and that is what an occurrence
+  // segment and an override address are built from.
+  /** Every reference node's override set, resolved when its subtree was complete; applied together at the end. */
+  const overrideSets: Array<{ referenceNode: Object3D; resolved: ResolvedOverrides; depth: number; occurrence: string; assetId: string }> = [];
 
   const rootFrame: Frame = {
     assetId: options.assetId ?? '',
@@ -621,12 +638,6 @@ export async function compose(root: Object3D, options: ComposeOptions): Promise<
           if (!resolved) return null;
           const parsed = await parseGlbSubtreeWithMeta(resolved.bytes);
           const sha256 = resolved.sha256 ?? '';
-          // Stamp derived ids on the TEMPLATE, so every clone inherits them for
-          // free (`Object3D.copy` deep-copies `userData`). Doing it per clone
-          // would hash the same file once per occurrence for an identical result.
-          if (sha256) {
-            await deriveNodeIdsForSubtree(parsed.root, sha256, (n) => parsed.gltfNodeIndices.get(n));
-          }
           return {
             root: parsed.root,
             url: resolved.url,
@@ -637,6 +648,7 @@ export async function compose(root: Object3D, options: ComposeOptions): Promise<
             signaturePresent: resolved.signaturePresent ?? false,
             gltfNodeIndices: parsed.gltfNodeIndices,
             gltfNodeNames: parsed.gltfNodeNames,
+            identity: parsed.identity ?? null,
           };
         });
       } catch (e) {
@@ -710,17 +722,18 @@ export async function compose(root: Object3D, options: ComposeOptions): Promise<
 
       const overrides = getAssetOverrides(referenceNode);
       if (overrides) {
-        const result = applyAssetOverrides(overrides, makeSubtreeResolvers(clone), {
+        // plan-769: the clone's nodes are addressed by their IDENTITY (authored id, else
+        // the decode seed) — a Unity asset has no authored ids — and scoped per
+        // occurrence (`b#id` reaches into the grafted nested reference `b`, F13).
+        // Resolved NOW (the subtree is complete), applied at the end with every other
+        // set through ONE precedence point (`applyOverrideLayers`, outer wins).
+        overrideSets.push({
+          referenceNode,
+          resolved: resolveAssetOverrides(overrides, makeSubtreeResolvers(clone, identityIdOf), { occurrence, assetId: ref.assetId }),
+          depth: frame.depth,
           occurrence,
           assetId: ref.assetId,
         });
-        orphanedOverrides.push(...result.orphaned);
-        // A transform override changed a LOCAL matrix inside a subtree that is
-        // already grafted (plan-444 F4). Everything downstream of composition —
-        // bounds, auto-align, the first raycast — reads `matrixWorld`, and none
-        // of it waits for a render, so the refresh happens once here. Skipped
-        // entirely when no transform was applied, which is the normal case.
-        if (result.transformsApplied > 0) clone.updateMatrixWorld(true);
       }
 
       const updated = !!ref.sha256 && !!template.sha256 && ref.sha256 !== template.sha256;
@@ -741,12 +754,36 @@ export async function compose(root: Object3D, options: ComposeOptions): Promise<
         renamedNodes,
         gltfNodeIndices,
         gltfNodeNames: template.gltfNodeNames,
+        identity: template.identity ?? null,
         updated,
       });
     }
   };
 
   await composeSubtree(root, rootFrame);
+
+  // plan-769 Phase 4b: every set at once, per target node in precedence order.
+  applyResolvedOverrideSets(overrideSets.map((s) => ({ hits: s.resolved.hits, depth: s.depth })));
+  for (const s of overrideSets) {
+    orphanedOverrides.push(...s.resolved.orphaned);
+    // Composition grafts every nested reference, so a nested address that did not
+    // resolve inside the complete subtree has no target (no routing here).
+    for (const n of s.resolved.nested) {
+      orphanedOverrides.push({
+        addressing: n.addressing, key: n.key, occurrence: s.occurrence, assetId: s.assetId,
+        componentTypes: Object.keys(n.patch ?? {}),
+      });
+    }
+    // 9.22: a legacy `byPath` that resolved is an address from now on; the reference
+    // node holds the 769 form (no `byNodeId`, no `trsByNodeId`) in memory, so the
+    // next save writes `byAddress` only. Part moves are not applied (F14) — reported.
+    const own = getAssetOverrides(s.referenceNode);
+    if (own) setAssetOverrides(s.referenceNode, migrateLegacyOverridePaths(own, s.resolved.migratedPaths));
+    recordOverridePathMigration(s.referenceNode, s.resolved.migratedPaths);
+    if (s.resolved.droppedTransforms > 0) {
+      droppedTransforms.push({ occurrence: s.occurrence, assetId: s.assetId, count: s.resolved.droppedTransforms });
+    }
+  }
 
   if (frames.length > 0 || deferred.length > 0) {
     debug('loader', `Composition: ${frames.length} occurrence(s) from ${cache.size} file(s), `
@@ -758,6 +795,7 @@ export async function compose(root: Object3D, options: ComposeOptions): Promise<
     frames,
     deferred,
     orphanedOverrides,
+    droppedTransforms,
     missing,
     updated: frames.filter((f) => f.updated),
     loads: cache.loads,
@@ -776,7 +814,7 @@ export async function compose(root: Object3D, options: ComposeOptions): Promise<
 function remapRenamedNodes(template: Object3D, clone: Object3D): Map<Object3D, string> {
   const out = new Map<Object3D, string>();
   const walk = (t: Object3D, c: Object3D): void => {
-    const orig = (t.userData as Record<string, unknown> | undefined)?.['_rvOrigName'];
+    const orig = (t.userData as Record<string, unknown> | undefined)?.[RV_ORIG_NAME_KEY];
     if (typeof orig === 'string' && orig.length > 0) out.set(c, orig);
     const count = Math.min(t.children.length, c.children.length);
     for (let i = 0; i < count; i++) walk(t.children[i], c.children[i]);

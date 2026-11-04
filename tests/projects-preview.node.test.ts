@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, rmSync, writeFileSync, mkdtempSync } from 'node:fs';
 import { join } from 'node:path';

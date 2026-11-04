@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage, readLocalStorage, removeLocalStorage } from '../rv-safe-storage';
+
 /**
  * "I trust THIS shared model with my plant" — persisted, per model (plan-423 F6).
  *
@@ -91,7 +93,7 @@ export async function digestOfBytes(bytes: ArrayBuffer): Promise<string | null> 
 
 function readTable(): TrustTable {
   try {
-    const raw = localStorage.getItem(SHARE_TRUST_KEY);
+    const raw = readLocalStorage(SHARE_TRUST_KEY);
     if (!raw) return {};
     const parsed: unknown = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
@@ -105,7 +107,7 @@ function readTable(): TrustTable {
 
 function writeTable(table: TrustTable): boolean {
   try {
-    localStorage.setItem(SHARE_TRUST_KEY, JSON.stringify(table));
+    getLocalStorage()!.setItem(SHARE_TRUST_KEY, JSON.stringify(table));
     return true;
   } catch {
     return false;
@@ -152,7 +154,7 @@ export function forgetShareTrust(key: string): void {
   if (!(key in table)) return;
   delete table[key];
   if (Object.keys(table).length === 0) {
-    try { localStorage.removeItem(SHARE_TRUST_KEY); } catch { /* see writeTable */ }
+    removeLocalStorage(SHARE_TRUST_KEY);
     return;
   }
   writeTable(table);

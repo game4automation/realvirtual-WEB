@@ -66,6 +66,7 @@ import {
   DriveFileRenameOutline,
   Extension,
   FileDownload,
+  FileUpload,
   Link as LinkIcon,
   MenuBookOutlined,
   MoreVert,
@@ -79,12 +80,14 @@ import {
   getActiveDocumentViewVersion,
   resolveActiveDocumentView,
   subscribeActiveDocumentView,
+  type ActiveDocumentFileExport,
   type ActiveDocumentVerb,
   type ActiveDocumentView,
 } from '../../editor/active-document-view';
+import type { ApplyPreview, DocumentExportMode } from '../../export/rv-export-provider';
 import type { Object3D } from 'three';
 import { useOptionalViewer } from '../../../hooks/use-viewer';
-import { getAssetReference } from '../../engine/rv-asset-reference';
+import { getAssetReference, isUnresolvedReferenceNode } from '../../engine/rv-asset-reference';
 import { getLibrarySource } from '../../library/library-source-registry';
 import { DirtyDot, DIRTY_INK } from '../rv-dirty-dot';
 import {
@@ -94,6 +97,7 @@ import {
   SAVE_PROMPT_BUSY,
 } from './save-dialog-store';
 import { DocumentCrumbs } from './DocumentCrumbs';
+import { SceneConfirmDialog } from './rv-scene-confirm-dialog';
 import { ShareDialog } from '../../share/ShareDialog';
 import type { RvShareMeta, RvShareLevel } from '../../share/rv-share-meta';
 
@@ -242,6 +246,75 @@ const VERB_ICONS: Record<string, SvgIconComponent> = {
 };
 
 type NameDialogState = { verb: ActiveDocumentVerb; value: string } | null;
+
+/** The lazily loaded module with the two non-GLB dialogs (plan-764). */
+type FileExportDialogsModule = typeof import('./DocumentFileExportDialogs');
+
+/** The open non-GLB export dialog (plan-764): which format and its modes. */
+type FileExportDialogState = {
+  exp: ActiveDocumentFileExport;
+  modes: DocumentExportMode[];
+  dialogs: FileExportDialogsModule;
+} | null;
+
+/**
+ * The open "Apply … extras" dialog (plan-764 F7): the preview is on screen.
+ * Nothing is changed before the click.
+ */
+type ApplyDialogState = {
+  exp: ActiveDocumentFileExport;
+  preview: ApplyPreview;
+  dialogs: FileExportDialogsModule;
+} | null;
+
+/**
+ * Loads the dialog module of the non-GLB exports (plan-764 "Lazy-Apply-Dialog").
+ *
+ * Not `React.lazy`: a rejected `lazy()` import is cached for good and needs an
+ * error boundary to be seen at all. Here the card awaits the module where it
+ * is about to open a dialog, so a failed load lands in the card's own message
+ * dialog with a reason, and the next attempt loads again (the promise is only
+ * kept while it has not failed).
+ */
+let fileExportDialogsLoader: () => Promise<FileExportDialogsModule> = () => import('./DocumentFileExportDialogs');
+let fileExportDialogsPromise: Promise<FileExportDialogsModule> | null = null;
+
+function loadFileExportDialogs(): Promise<FileExportDialogsModule> {
+  if (!fileExportDialogsPromise) {
+    fileExportDialogsPromise = fileExportDialogsLoader().catch((e: unknown) => {
+      fileExportDialogsPromise = null;
+      throw e;
+    });
+  }
+  return fileExportDialogsPromise;
+}
+
+/** Test seam: replace (or with `null` restore) the dialog module loader. */
+export function setFileExportDialogsLoaderForTests(loader: (() => Promise<FileExportDialogsModule>) | null): void {
+  fileExportDialogsLoader = loader ?? (() => import('./DocumentFileExportDialogs'));
+  fileExportDialogsPromise = null;
+}
+
+/** The sentence a failed dialog load shows — the cause stays visible. */
+function dialogLoadFailure(what: string, e: unknown): string {
+  const detail = e instanceof Error ? e.message : String(e);
+  return `The ${what} dialog could not be loaded (${detail}). Check the connection and try again.`;
+}
+
+/**
+ * Hand bytes to the browser as a download.
+ *
+ * Revoked on the next tick: a synchronous revoke races the download in
+ * Firefox, which reads the blob after the click handler returns.
+ */
+function downloadBytes(bytes: ArrayBuffer | Uint8Array, mime: string, fileName: string): void {
+  const url = URL.createObjectURL(new Blob([bytes as unknown as BlobPart], { type: mime }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
 
 /** One-shot pulse when `label` changes to a NEW non-null value (mount is not
  *  an event — an existing binding pulses nothing). */
@@ -450,6 +523,8 @@ export function DocumentCard({
 
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
   const [nameDialog, setNameDialog] = useState<NameDialogState>(null);
+  /** The destructive verb waiting for the user's answer ("Discard changes"). */
+  const [confirmVerb, setConfirmVerb] = useState<ActiveDocumentVerb | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [shareOpen, setShareOpen] = useState(false);
@@ -457,12 +532,15 @@ export function DocumentCard({
     { embed: boolean; estimate: Awaited<ReturnType<NonNullable<NonNullable<ActiveDocumentView['actions']['exportGlb']>['estimate']>>> | null } | null
   >(null);
   const [exporting, setExporting] = useState(false);
+  const [fileExportDialog, setFileExportDialog] = useState<FileExportDialogState>(null);
+  const [applyDialog, setApplyDialog] = useState<ApplyDialogState>(null);
+  /** The provider whose apply the hidden file input is choosing a file for. */
+  const applyTargetRef = useRef<ActiveDocumentFileExport | null>(null);
+  const applyInputRef = useRef<HTMLInputElement | null>(null);
   /** The live region. Written on save transitions only — never on an edit. */
   const [announcement, setAnnouncement] = useState('');
 
-  const documentKey = view
-    ? (view.thumbnailKey ? JSON.stringify(view.thumbnailKey) : view.name)
-    : null;
+  const documentKey = view ? view.name : null;
 
   /**
    * One tick per model load/clear. The picture and the reference tally both
@@ -485,10 +563,13 @@ export function DocumentCard({
   /**
    * Distinct referenced assets of the loaded model, split local vs cloud.
    *
-   * Read from the composition the loader already produced (frames + missing —
-   * an unresolved reference is still a reference), not from any store: which
-   * files this GLB pulls in is a fact about the loaded model, the same
-   * altitude as its picture. The bucket is decided by the KIND of the library
+   * Read from the loaded model's own reference nodes (plan-774: every viewer
+   * load — the editor's included — defers its references, so the
+   * composition has no frames to read any more; a reference whose placement
+   * failed still has its node, so it is still counted), not from any store:
+   * which files this GLB pulls in is a fact about the loaded model, the same
+   * altitude as its picture. Only the document's OWN references count — the
+   * walk never enters placed content. The bucket is decided by the KIND of the library
    * source the reference resolves through; a path-resolved reference with no
    * provider identity is by definition local.
    */
@@ -506,8 +587,11 @@ export function DocumentCard({
         : null;
       buckets.set(ref?.assetId ?? fallbackId, src && CLOUD_KINDS.has(src.kind) ? 'cloud' : 'local');
     };
-    for (const f of result.composition?.frames ?? []) add(f.referenceNode, f.assetId);
-    for (const m of result.composition?.missing ?? []) add(m.referenceNode, m.assetId);
+    const walk = (node: Object3D): void => {
+      if (isUnresolvedReferenceNode(node)) { add(node, node.name); return; }
+      for (const child of node.children) walk(child);
+    };
+    walk(result.root);
     let local = 0;
     let cloud = 0;
     for (const kind of buckets.values()) (kind === 'cloud' ? cloud++ : local++);
@@ -541,8 +625,7 @@ export function DocumentCard({
    * declined" is the only outcome that writes nothing. The click that would
    * have raced is already stopped one level up, in `onSave`.
    */
-  // The document's NAME, deliberately, and not `documentKey` (which folds in a
-  // thumbnail identity the editor never publishes): this key has to agree with
+  // The document's NAME, deliberately: this key has to agree with
   // the one `runSaveFlow` uses on the other side of the seam, or the two save
   // entry points would hold two different pending slots and §2.10 would guard
   // nothing. `saveDocumentPromptKey` is the one derivation, shared by both.
@@ -616,6 +699,12 @@ export function DocumentCard({
       setNameDialog({ verb, value: verb.prompt.initial });
       return;
     }
+    // Throwing work away is never one click: the same Save / Discard / Cancel
+    // question the exit and switch guards ask, so "Discard" means one thing.
+    if (verb.id === 'discard') {
+      setConfirmVerb(verb);
+      return;
+    }
     const saves = verb.id === 'save-as';
     if (saves) setAnnouncement('Saving…');
     try {
@@ -628,6 +717,19 @@ export function DocumentCard({
       if (saves) setAnnouncement(`Save failed: ${detail}`);
     }
   }, [closeMenu]);
+
+  /** "Discard" in the confirm dialog: run the verb the menu offered (store.discard()). */
+  const confirmDiscard = useCallback(async () => {
+    const verb = confirmVerb;
+    setConfirmVerb(null);
+    if (!verb) return;
+    try {
+      const result = await verb.run();
+      if (typeof result === 'string') setMessage(result);
+    } catch (e) {
+      setMessage(e instanceof Error ? e.message : String(e));
+    }
+  }, [confirmVerb]);
 
   const submitNameDialog = useCallback(async () => {
     const pending = nameDialog;
@@ -665,16 +767,7 @@ export function DocumentCard({
     setExporting(true);
     try {
       const bytes = await exp.run({ embedReferences: exportDialog.embed });
-      const url = URL.createObjectURL(
-        new Blob([bytes as unknown as BlobPart], { type: 'model/gltf-binary' }),
-      );
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = exp.fileName;
-      a.click();
-      // Revoked on the next tick: a synchronous revoke races the download in
-      // Firefox, which reads the blob after the click handler returns.
-      setTimeout(() => URL.revokeObjectURL(url), 0);
+      downloadBytes(bytes, 'model/gltf-binary', exp.fileName);
       setExportDialog(null);
     } catch (e) {
       setExportDialog(null);
@@ -683,6 +776,70 @@ export function DocumentCard({
       setExporting(false);
     }
   }, [exportDialog, view]);
+
+  /**
+   * Open a non-GLB export (plan-764): its modes are asked for NOW, not at menu
+   * render, and the dialog module is loaded now (lazy — a failed load says so).
+   */
+  const openFileExport = useCallback(async (exp: ActiveDocumentFileExport) => {
+    closeMenu();
+    let modes: DocumentExportMode[];
+    try {
+      modes = exp.modes();
+    } catch (e) {
+      setMessage(e instanceof Error ? e.message : String(e));
+      return;
+    }
+    if (modes.length === 0) {
+      setMessage(`${exp.label.replace(/…$/, '')} is not available for this document.`);
+      return;
+    }
+    let dialogs: FileExportDialogsModule;
+    try {
+      dialogs = await loadFileExportDialogs();
+    } catch (e) {
+      setMessage(dialogLoadFailure('export', e));
+      return;
+    }
+    setFileExportDialog({ exp, modes, dialogs });
+  }, [closeMenu]);
+
+  /** "Apply … extras" (plan-764 F7): choose the file first — nothing happens before. */
+  const openApply = useCallback((exp: ActiveDocumentFileExport) => {
+    closeMenu();
+    if (!exp.apply) return;
+    // Start the dialog module while the user picks the file. Its outcome is
+    // read in onApplyFile, where a failure is shown; here it is only a head start.
+    loadFileExportDialogs().catch(() => undefined);
+    applyTargetRef.current = exp;
+    applyInputRef.current?.click();
+  }, [closeMenu]);
+
+  /** The chosen file → preview (reads, matches, guards — changes nothing). */
+  const onApplyFile = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    const exp = applyTargetRef.current;
+    if (!file || !exp?.apply) return;
+    setExporting(true);
+    try {
+      let dialogs: FileExportDialogsModule;
+      try {
+        dialogs = await loadFileExportDialogs();
+      } catch (err) {
+        // No dialog, no preview: nothing was read or changed.
+        setMessage(dialogLoadFailure('apply', err));
+        return;
+      }
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const preview = await exp.apply.preview({ name: file.name, bytes });
+      setApplyDialog({ exp, preview, dialogs });
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : String(err));
+    } finally {
+      setExporting(false);
+    }
+  }, []);
 
   // Nothing open — the header renders no chrome, the hero renders its own
   // empty state (which is why that lives in the hero SECTION, not here).
@@ -694,8 +851,9 @@ export function DocumentCard({
   // The bind entries count towards the menu EXISTING (F7): on a document whose
   // mode publishes no verbs at all the kebab would otherwise never render, and
   // the keyboard route would be missing precisely where it is the only route.
+  const fileExports = view.actions.exports ?? [];
   const hasMenu = menu.length > 0 || bindActions.length > 0
-    || !!view.actions.share || !!view.actions.exportGlb;
+    || !!view.actions.share || !!view.actions.exportGlb || fileExports.length > 0;
 
   // Instrument Blue only when the click would DO something: unsaved changes,
   // a save in flight, or the read-only copy (which materialises a document
@@ -811,15 +969,17 @@ export function DocumentCard({
    *    where a user's eye already looks for it (see `DocumentCrumbs`).
    *  - **Undo / redo.** Ctrl+Z and Ctrl+Shift+Z are global (`HMIShell`), and a
    *    disabled pair of arrows in the tightest row of the app bought nothing.
-   *  - **The kebab.** Every verb behind it is on the hero card of the projects
-   *    dashboard, which is where document-level actions live. A second entry
-   *    point in the panel header made the row compete with its own title.
+   *
+   * The kebab came BACK (2026-10-25, Thomas): "Discard changes" has to be
+   * reachable where the user is working, not only from the dashboard hero.
+   * It is the same menu as the hero's — one list of verbs, two doorways.
    */
   const compactIdentity = (
     <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, minWidth: 0, flex: 1 }}>
-      {view.dirty
-        ? <DirtyDot title="Unsaved changes — click Save to write them" />
-        : <Box sx={{ width: 7, minWidth: 7 }} />}
+      {/* No placeholder when clean: a reserved 7 px slot plus the gap pushed
+          the trail 13 px in from the header's padding, so the title no
+          longer lined up with the search field and the tree below it. */}
+      {view.dirty && <DirtyDot title="Unsaved changes — click Save to write them" />}
       <DocumentCrumbs
         crumbs={view.crumbs}
         location={view.location}
@@ -831,17 +991,18 @@ export function DocumentCard({
     </Box>
   );
 
-  // Hero only. The compact header is a panel title with a Save button; the
-  // document's verbs have ONE home, and it is the card on the dashboard that
-  // has room to show them. Two doorways to one menu is how a user learns that
-  // neither is the real one.
-  const kebab = hero && hasMenu && (
+  // The document's verbs (Save as…, Rename…, Duplicate, Discard changes,
+  // exports). The same menu on the hero and in the compact header.
+  const kebab = hasMenu && (
     <Tooltip title="More actions" placement="top">
       <IconButton
         size="small"
+        data-testid="document-card-more"
         sx={{ p: 0.25 }}
         aria-label="More actions"
-        onClick={(e) => setMenuAnchor(e.currentTarget)}
+        aria-haspopup="menu"
+        aria-expanded={menuAnchor ? 'true' : undefined}
+        onClick={(e) => { e.stopPropagation(); setMenuAnchor(e.currentTarget); }}
       >
         <MoreVert sx={{ fontSize: 16 }} />
       </IconButton>
@@ -973,13 +1134,15 @@ export function DocumentCard({
             </Box>
           </Box>
         ) : (
-          /* Two items, and one of them is the name. Everything the row used to
-             carry between them (undo, redo, kebab, the "UNSAVED" word) is
-             either global, on the hero, or already said by the dot — and each
-             of them was width the trail did not have. */
+          /* The name, then Save and the document menu. Undo, redo and the
+             "UNSAVED" word stay out: global shortcuts or already said by the
+             dot — width the trail does not have. */
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0 }}>
             {compactIdentity}
-            <Box sx={{ flexShrink: 0 }}>{saveButton}</Box>
+            <Box sx={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 0.25 }}>
+              {saveButton}
+              {kebab}
+            </Box>
           </Box>
         )}
 
@@ -1024,7 +1187,7 @@ export function DocumentCard({
             </MenuItem>
           ))}
           {bindActions.length > 0
-            && (menu.length > 0 || view.actions.share || view.actions.exportGlb)
+            && (menu.length > 0 || view.actions.share || view.actions.exportGlb || fileExports.length > 0)
             && <Divider />}
           {menu.map((verb) => {
             const Icon = VERB_ICONS[verb.id];
@@ -1070,7 +1233,64 @@ export function DocumentCard({
               <ListItemText primaryTypographyProps={{ fontSize: 13 }}>Export .glb…</ListItemText>
             </MenuItem>,
           ]}
+          {/* Registered non-GLB formats (plan-764): after GLB, under the same divider. */}
+          {fileExports.length > 0 && !view.actions.exportGlb && <Divider key="file-export-divider" />}
+          {fileExports.map((exp) => (
+            <MenuItem
+              key={`export-${exp.id}`}
+              data-testid={`document-card-verb-export-${exp.id}`}
+              onClick={() => { void openFileExport(exp); }}
+            >
+              <ListItemIcon sx={{ minWidth: 28 }}><FileDownload sx={{ fontSize: 16 }} /></ListItemIcon>
+              <ListItemText primaryTypographyProps={{ fontSize: 13 }}>{exp.label}</ListItemText>
+            </MenuItem>
+          ))}
+          {/* Re-import of a provider (plan-764 F7), right under its export. */}
+          {fileExports.filter((exp) => exp.apply).map((exp) => (
+            <MenuItem
+              key={`apply-${exp.id}`}
+              data-testid={`document-card-verb-apply-${exp.id}`}
+              disabled={exporting}
+              onClick={() => openApply(exp)}
+            >
+              <ListItemIcon sx={{ minWidth: 28 }}><FileUpload sx={{ fontSize: 16 }} /></ListItemIcon>
+              <ListItemText primaryTypographyProps={{ fontSize: 13 }}>{exp.apply!.label}</ListItemText>
+            </MenuItem>
+          ))}
         </Menu>
+      )}
+
+      <SceneConfirmDialog
+        open={confirmVerb !== null}
+        sceneName={view.name}
+        canSave
+        aboveModals
+        onSave={() => { setConfirmVerb(null); void onSave(); }}
+        onSaveAs={() => { setConfirmVerb(null); void onSave(); }}
+        onDiscard={() => { void confirmDiscard(); }}
+        onCancel={() => setConfirmVerb(null)}
+      />
+
+      {/* The file of an apply — chosen BEFORE anything is read or changed. */}
+      {fileExports.some((exp) => exp.apply) && (
+        <input
+          ref={applyInputRef}
+          type="file"
+          accept=".usdz,.usda,.usd"
+          style={{ display: 'none' }}
+          data-testid="document-card-apply-file"
+          onChange={(e) => { void onApplyFile(e); }}
+        />
+      )}
+
+      {/* Apply … extras (plan-764 §3.1) — the lazily loaded dialog module. */}
+      {applyDialog && (
+        <applyDialog.dialogs.DocumentApplyDialog
+          exp={applyDialog.exp}
+          preview={applyDialog.preview}
+          onClose={() => setApplyDialog(null)}
+          onMessage={setMessage}
+        />
       )}
 
       {/* One name dialog for every verb that needs one. */}
@@ -1153,6 +1373,17 @@ export function DocumentCard({
           </Button>
         </DialogActions>
       </Dialog>
+
+      {/* Non-GLB export (plan-764) — the lazily loaded dialog module. */}
+      {fileExportDialog && (
+        <fileExportDialog.dialogs.DocumentFileExportDialog
+          exp={fileExportDialog.exp}
+          modes={fileExportDialog.modes}
+          onClose={() => setFileExportDialog(null)}
+          onMessage={setMessage}
+          download={downloadBytes}
+        />
+      )}
 
       {view.actions.share && (
         <ShareDialog

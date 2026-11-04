@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage } from '../rv-safe-storage';
+
 /**
  * rv-debug.ts — Structured debug logging for the WebViewer.
  *
@@ -62,7 +64,11 @@ const ALL_CATEGORIES: DebugCategory[] = [
   'config', 'multiuser', 'interface', 'render', 'perf',
 ];
 
-const LOG_LEVELS: LogLevel[] = ['trace', 'debug', 'info', 'warn', 'error'];
+/** Every log level, lowest first (the order `queryLogs({level})` filters by). */
+export const LOG_LEVELS: readonly LogLevel[] = ['trace', 'debug', 'info', 'warn', 'error'];
+
+/** Every category a buffered entry can carry — the debug categories plus `system`. */
+export const LOG_CATEGORIES: readonly (DebugCategory | 'system')[] = [...ALL_CATEGORIES, 'plugins', 'system'];
 
 const LOG_BUFFER_SIZE = 500;
 
@@ -77,6 +83,19 @@ let verboseEnabled = false;
 /** Ring buffer for structured log entries */
 const logBuffer = new RingBuffer<LogEntry>(LOG_BUFFER_SIZE);
 
+/** Internal diagnostics tap. Kept out of the public logging API. */
+let logSink: ((entry: LogEntry) => void) | null = null;
+
+/** @internal Install the single process-wide diagnostics listener. */
+export function setLogSink(sink: ((entry: LogEntry) => void) | null): void {
+  logSink = sink;
+}
+
+function pushLog(entry: LogEntry): void {
+  logBuffer.push(entry);
+  try { logSink?.(entry); } catch { /* diagnostics must never break application logging */ }
+}
+
 /** Page load time for elapsed calculation */
 const startTime = performance.now();
 
@@ -88,7 +107,11 @@ function init(): void {
   if (typeof window === 'undefined') return;
 
   const params = new URLSearchParams(window.location.search);
-  const debugParam = params.get('debug') ?? localStorage.getItem('rv-debug') ?? '';
+  // Runs at module evaluation, before any gate: a storage that throws (blocked
+  // site data, sandboxed iframe) must not kill the whole boot (plan-2209 §9.4c).
+  let stored: string | null = null;
+  try { stored = readLocalStorage('rv-debug'); } catch { /* storage unavailable */ }
+  const debugParam = params.get('debug') ?? stored ?? '';
 
   // 'verbose' is a modifier that travels in the same list as the categories — pull it
   // out before matching the rest against ALL_CATEGORIES so that 'all,verbose' still
@@ -161,7 +184,7 @@ export function setVerbose(on: boolean): void {
 
 /** Structured debug log — always buffers, only prints to console if category is active */
 export function debug(category: DebugCategory, message: string, ...args: unknown[]): void {
-  logBuffer.push({
+  pushLog({
     level: 'debug',
     category,
     message,
@@ -182,7 +205,7 @@ export function debug(category: DebugCategory, message: string, ...args: unknown
  * with model size; use {@link debug} for the summary that follows it.
  */
 export function debugVerbose(category: DebugCategory, message: string, ...args: unknown[]): void {
-  logBuffer.push({
+  pushLog({
     level: 'trace',
     category,
     message,
@@ -196,7 +219,7 @@ export function debugVerbose(category: DebugCategory, message: string, ...args: 
 
 /** Structured debug warning — always buffers, only prints to console if category is active */
 export function debugWarn(category: DebugCategory, message: string, ...args: unknown[]): void {
-  logBuffer.push({
+  pushLog({
     level: 'warn',
     category,
     message,
@@ -211,7 +234,7 @@ export function debugWarn(category: DebugCategory, message: string, ...args: unk
 
 /** Structured debug error — always buffers, only prints to console if category is active */
 export function debugError(category: DebugCategory, message: string, ...args: unknown[]): void {
-  logBuffer.push({
+  pushLog({
     level: 'error',
     category,
     message,
@@ -228,7 +251,7 @@ export function debugError(category: DebugCategory, message: string, ...args: un
 
 /** Log at info level (category 'system') — always buffers and prints */
 export function logInfo(message: string, data?: unknown): void {
-  logBuffer.push({
+  pushLog({
     level: 'info',
     category: 'system',
     message,
@@ -241,7 +264,7 @@ export function logInfo(message: string, data?: unknown): void {
 
 /** Log at warn level (category 'system') — always buffers and prints */
 export function logWarn(message: string, data?: unknown): void {
-  logBuffer.push({
+  pushLog({
     level: 'warn',
     category: 'system',
     message,
@@ -255,7 +278,7 @@ export function logWarn(message: string, data?: unknown): void {
 
 /** Log at error level (category 'system') — always buffers and prints */
 export function logError(message: string, data?: unknown): void {
-  logBuffer.push({
+  pushLog({
     level: 'error',
     category: 'system',
     message,
@@ -282,7 +305,8 @@ export function getLastLogs(n: number): LogEntry[] {
 /** Query logs with optional filters. */
 export function queryLogs(opts: {
   level?: LogLevel;
-  category?: DebugCategory | 'system';
+  /** One category, or a set of them (plan-2005 F7) — filtered BEFORE the limit. */
+  category?: DebugCategory | 'system' | readonly (DebugCategory | 'system')[];
   since?: number;       // timestamp (Date.now())
   limit?: number;
 }): LogEntry[] {
@@ -291,7 +315,10 @@ export function queryLogs(opts: {
     const minIdx = LOG_LEVELS.indexOf(opts.level);
     entries = entries.filter(e => LOG_LEVELS.indexOf(e.level) >= minIdx);
   }
-  if (opts.category) entries = entries.filter(e => e.category === opts.category);
+  if (opts.category) {
+    const wanted = new Set<string>(typeof opts.category === 'string' ? [opts.category] : opts.category);
+    entries = entries.filter(e => wanted.has(e.category));
+  }
   if (opts.since !== undefined) entries = entries.filter(e => e.timestamp >= opts.since!);
   if (opts.limit) entries = entries.slice(-opts.limit);
   return entries;

@@ -123,6 +123,9 @@ export function AgentEyeMonitorPanel() {
       minWidth={PREVIEW_W}
       autoHeight
       resizable={false}
+      // Auto-open on every capture: a user who folded it to its title bar keeps it folded.
+      collapsible
+      persistCollapsed
       toolbar={frames.length > 0 ? (
         <Tooltip title="Clear history">
           <IconButton aria-label="Clear history" size="small" onClick={handleClear} sx={{ p: 0.3 }}>
@@ -160,9 +163,8 @@ function EmptyState() {
         No agent capture yet.
       </Typography>
       <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.45)' }}>
-        Every image an AI tool produces appears here. The offscreen tools
-        (web_eye, web_view_*) need the classic WebGL renderer —
-        under WebGPU only web_screenshot delivers.
+        Every image an AI tool produces appears here — the offscreen tools
+        (web_eye, web_view_*) and web_screenshot, on WebGL and WebGPU alike.
       </Typography>
     </Box>
   );

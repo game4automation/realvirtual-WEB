@@ -18,7 +18,7 @@
  *  - highlight the CURRENT step's targets (highlightStep) as a type-colored fill
  *    overlay + silhouette edges (the same visual as the metadata object
  *    highlight) plus the pulsing OutlinePass status outline in the same color
- *    (rv-status-outline.ts — the Toray-style silhouette pulse).
+ *    (rv-status-outline.ts — the CAD-import showcase model-style silhouette pulse).
  *
  * The per-step camera focus is driven by the panel plugin (View button →
  * viewer.fitToNodes / isolateNodes), not here.
@@ -46,8 +46,9 @@ import {
 } from './rv-error-visual';
 import { showStatusOutline, hideStatusOutline } from './rv-status-outline';
 import { wireValueSignal } from './rv-signal-wiring';
-import { reportProblem } from '../hmi/problems-store';
+import { reportProblem, UNRESOLVED_INSTRUCTION_TARGET_CODE } from '../hmi/problems-store';
 import type { InstructionEntry, InstructionStep } from './rv-instruction-runtime-store';
+import { storedRefString } from './rv-stored-ref-label';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -113,19 +114,16 @@ const warnedTargetPaths = new Set<string>();
 
 /** Coerce ONE raw target reference (string path or `{path}` object) to a node
  *  path, or null when empty/invalid. */
-function parseTargetRef(t: unknown): string | null {
-  if (typeof t === 'string') return t.length > 0 ? t : null;
-  if (t && typeof t === 'object' && typeof (t as Record<string, unknown>).path === 'string') {
-    const p = (t as Record<string, unknown>).path as string;
-    return p.length > 0 ? p : null;
-  }
-  return null;
+function parseTargetRef(t: unknown, owner?: Object3D | null): string | null {
+  // plan-769 Phase 3: a path, a `{ path }` record, or a web-saved `{ address }` /
+  // `{ unresolvedPath }` — kept as a label the owner's `readStoredRef` reads back.
+  return storedRefString(owner, t);
 }
 
 /** Coerce a raw rv_extras step entry to an InstructionStep (defensive).
  *  Reads BOTH the new `targetObjects` list (multi-target, highlighted in
  *  parallel) and the legacy single `targetObject` field, de-duplicated. */
-function parseStep(raw: unknown): InstructionStep | null {
+function parseStep(raw: unknown, owner?: Object3D | null): InstructionStep | null {
   if (!raw || typeof raw !== 'object') return null;
   const r = raw as Record<string, unknown>;
   const instruction = typeof r.instruction === 'string' ? r.instruction : '';
@@ -135,12 +133,12 @@ function parseStep(raw: unknown): InstructionStep | null {
   const arr = r.targetObjects;
   if (Array.isArray(arr)) {
     for (const item of arr) {
-      const p = parseTargetRef(item);
+      const p = parseTargetRef(item, owner);
       if (p && !targetPaths.includes(p)) targetPaths.push(p);
     }
   }
   // Legacy single-target field, appended for backward compatibility.
-  const legacy = parseTargetRef(r.targetObject);
+  const legacy = parseTargetRef(r.targetObject, owner);
   if (legacy && !targetPaths.includes(legacy)) targetPaths.push(legacy);
 
   const targetPath = targetPaths.length > 0 ? targetPaths[0] : null;
@@ -150,12 +148,12 @@ function parseStep(raw: unknown): InstructionStep | null {
 
 /** Parse the raw `steps` value. Tolerant of BOTH a JSON array and the legacy
  *  numeric-keyed JObject (`{"0":…,"1":…}`) that pre-export-fix GLBs carry. */
-export function parseSteps(raw: unknown): InstructionStep[] {
+export function parseSteps(raw: unknown, owner?: Object3D | null): InstructionStep[] {
   if (raw == null) return [];
   const list = Array.isArray(raw) ? raw : (typeof raw === 'object' ? Object.values(raw as object) : []);
   const out: InstructionStep[] = [];
   for (const item of list) {
-    const step = parseStep(item);
+    const step = parseStep(item, owner);
     if (step) out.push(step);
   }
   return out;
@@ -222,7 +220,7 @@ export class RVCustomRuntimeInstruction implements RVComponent {
     // Read steps RAW from rv_extras (resolveComponentRefs would null targetObject).
     const rv = this.node.userData?.realvirtual as Record<string, Record<string, unknown>> | undefined;
     const block = rv?.['CustomRuntimeInstruction'];
-    this.steps = parseSteps(block?.['steps']);
+    this.steps = parseSteps(block?.['steps'], this.node);
 
     // Highlight color: type color by default; custom only when UseCustomErrorColor.
     this._highlightHex = TYPE_COLOR[this.type] ?? TYPE_COLOR.info;
@@ -321,13 +319,13 @@ export class RVCustomRuntimeInstruction implements RVComponent {
   private _resolveTargets(ctx: ComponentContext): void {
     const registry = ctx.registry;
     for (const step of this.steps) {
-      const unresolved = step.targetPaths.filter((p) => registry.getNode(p) === null);
+      const unresolved = step.targetPaths.filter((p) => this._targetNode(registry, p) === null);
       step.unresolvedTargetPaths = unresolved;
       for (const path of unresolved) {
         reportProblem({
-          id: `unresolved-instruction-target:${this.path}:${path}`,
+          id: `${UNRESOLVED_INSTRUCTION_TARGET_CODE}:${this.path}:${path}`,
           severity: 'warning',
-          code: 'unresolved-instruction-target',
+          code: UNRESOLVED_INSTRUCTION_TARGET_CODE,
           title: 'Instruction target not found',
           // F16: a problem must always name what was looked for, or the user is
           // sent hunting through the hierarchy by eye.
@@ -336,6 +334,16 @@ export class RVCustomRuntimeInstruction implements RVComponent {
         });
       }
     }
+  }
+
+  /**
+   * The node one step target names. plan-769 Phase 1b: a target is a STORED path
+   * of this node's file — read by the file's verdict (its migration, by address),
+   * never by a guessing stage; only a path the file does not carry (written this
+   * session, or a document without an identity record) goes through `getNode`.
+   */
+  private _targetNode(registry: ComponentContext['registry'], path: string): Object3D | null {
+    return registry.storedNode(this.node, path);
   }
 
   /** Build the store entry from the current parsed config. */
@@ -423,7 +431,7 @@ export class RVCustomRuntimeInstruction implements RVComponent {
     if (!step) return;
     const targetNodes: Object3D[] = [];
     for (const path of step.targetPaths) {
-      const node = registry.getNode(path);
+      const node = this._targetNode(registry, path);
       if (!node) {
         if (!warnedTargetPaths.has(path)) {
           warnedTargetPaths.add(path);
@@ -437,7 +445,7 @@ export class RVCustomRuntimeInstruction implements RVComponent {
       this._stepGizmos.push(...createStatusHighlightGizmos(gm, node, this._highlightHex));
     }
     // Blinking outline via the OutlinePass status channel (the same visual as
-    // the Toray severity pulse). Batched targets get invisible proxies.
+    // the CAD-import showcase model severity pulse). Batched targets get invisible proxies.
     const om = this._ctx?.outlineManager;
     const scene = this._ctx?.scene;
     if (om && scene && targetNodes.length > 0) {

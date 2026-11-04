@@ -12,7 +12,7 @@
  *
  * ## Where this must NOT sit
  *
- * Not in the picking path. `doc-render-picking.md` §2.4 rule 1: nothing may get
+ * Not in the picking path. `contract-bake-picking.md` §2.4 rule 1: nothing may get
  * between `_resolveHit` and its gate order. The outermost-reference rule runs
  * **after** the hit is resolved, at the same place the existing viewport
  * resolution (`findLayoutObjectAncestor`, `rv-extras-editor.tsx:283-300`) already
@@ -29,7 +29,7 @@
  */
 
 import type { Object3D } from 'three';
-import { getAssetReference } from './rv-asset-reference';
+import { getAssetReference, isUnresolvedReferenceNode } from './rv-asset-reference';
 
 /** Where a selection request came from — mirrors `SelectionSource`. */
 export type ReferenceSelectionSource = 'tree' | 'viewport' | 'api';
@@ -76,6 +76,131 @@ export function isInsideReference(node: Object3D, boundary?: Object3D | null): b
     current = current.parent;
   }
   return false;
+}
+
+// ─── Owned vs placed content (plan-774 F9) ──────────────────────────────
+
+/**
+ * Is `node` a placed reference node — the boundary below which everything is
+ * PLACED content (another asset, baked like in the HMI)? An `embedded`
+ * reference is not: its subtree is part of this file.
+ */
+export function isPlacedReferenceNode(node: Object3D): boolean {
+  return isUnresolvedReferenceNode(node);
+}
+
+/**
+ * plan-774: is `node` OWNED content of the open document — neither a placed
+ * reference node nor anything below one? The negation of
+ * {@link isInsideReference}, named for the editor filters that use it: whole-tree
+ * tools (stats, material lists, select-similar, separate/merge candidates,
+ * topology picks) and the editor arenas act on owned content only.
+ */
+export function isOwnedContent(node: Object3D, boundary?: Object3D | null): boolean {
+  return !isInsideReference(node, boundary);
+}
+
+/**
+ * Visit every node of `root`'s OWNED content, depth-first, pre-order: the walk
+ * never enters a placed reference node (nor visits it). `root` itself is always
+ * visited when it is owned; a `root` inside placed content visits nothing.
+ * `visit` returning `false` skips that node's children.
+ */
+export function forEachOwnedNode(
+  root: Object3D,
+  visit: (node: Object3D) => boolean | void,
+  boundary?: Object3D | null,
+): void {
+  if (!isOwnedContent(root, boundary)) return;
+  const stack: Object3D[] = [root];
+  while (stack.length > 0) {
+    const node = stack.pop()!;
+    if (visit(node) === false) continue;
+    const kids = node.children;
+    for (let i = kids.length - 1; i >= 0; i--) {
+      const kid = kids[i];
+      if (!isPlacedReferenceNode(kid)) stack.push(kid);
+    }
+  }
+}
+
+/**
+ * plan-774: does the registry PATH lie inside a placed reference — does a
+ * PROPER prefix of it resolve to a placed reference node? Answered by the
+ * prefixes, so it works for a path whose own node does not exist (any more):
+ * the reference node itself is own content and exists from the load on; only
+ * what lies below it is placed.
+ */
+export function pathInPlacedContent(
+  path: string,
+  registry: PlacedPathResolver | null | undefined,
+): boolean {
+  if (!registry || !path) return false;
+  const segments = path.split('/');
+  let prefix = '';
+  for (let i = 0; i < segments.length - 1; i++) {
+    prefix = i === 0 ? segments[0] : `${prefix}/${segments[i]}`;
+    const node = exactNodeOf(registry, prefix);
+    if (node && isPlacedReferenceNode(node)) return true;
+  }
+  return false;
+}
+
+/**
+ * What {@link pathInPlacedContent} / {@link placedReferenceOfPath} resolve
+ * prefixes with. `getNodeExact` (the `NodeRegistry`'s canonical/alias lookup)
+ * is preferred; a resolver without it (a test fake) answers through `getNode`.
+ */
+export interface PlacedPathResolver {
+  getNode(path: string): Object3D | null | undefined;
+  getNodeExact?(path: string): Object3D | null | undefined;
+}
+
+/**
+ * plan-774 review fix E6: a reference PREFIX is looked up exactly — a guessing
+ * stage (suffix, sanitized name) would classify an own-content path as placed
+ * because some reference node elsewhere shares a name with one of its segments.
+ */
+function exactNodeOf(registry: PlacedPathResolver, path: string): Object3D | null {
+  return (registry.getNodeExact ? registry.getNodeExact(path) : registry.getNode(path)) ?? null;
+}
+
+/**
+ * plan-774 review fix E4: the INNERMOST placed reference node a proper prefix
+ * of `path` resolves to (exactly), or null when the path is not inside placed
+ * content. Innermost because that is the placement whose instance must hold the
+ * target — an outer placement can be materialised while a nested one is not.
+ */
+export function placedReferenceOfPath(path: string, registry: PlacedPathResolver | null | undefined): Object3D | null {
+  if (!registry || !path) return null;
+  const segments = path.split('/');
+  let prefix = '';
+  let innermost: Object3D | null = null;
+  for (let i = 0; i < segments.length - 1; i++) {
+    prefix = i === 0 ? segments[0] : `${prefix}/${segments[i]}`;
+    const node = exactNodeOf(registry, prefix);
+    if (node && isPlacedReferenceNode(node)) innermost = node;
+  }
+  return innermost;
+}
+
+/**
+ * The refusal of an authoring tool on placed content (plan-774, user decision
+ * "mechanism authoring on owned content only"), in the structural guard's
+ * wording: `<what> is part of the placed asset "<name>". Open that asset
+ * (double-click the reference) to author its mechanism.` — `null` when `node`
+ * is owned content. `<name>` is the OUTERMOST reference (what a click selects
+ * and a double-click descends into).
+ */
+export function placedContentRefusal(
+  node: Object3D,
+  what: string,
+  boundary?: Object3D | null,
+): string | null {
+  const ref = outermostReference(node, boundary);
+  if (!ref) return null;
+  return `${what} is part of the placed asset "${ref.name || '(unnamed)'}". `
+    + 'Open that asset (double-click the reference) to author its mechanism.';
 }
 
 // ─── The selection rule (§2.4.1, F10) ───────────────────────────────────

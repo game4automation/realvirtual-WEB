@@ -27,7 +27,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 const h = vi.hoisted(() => ({
-  /** Scene store handed to `sceneSaveTargetFor` — set per test, default none. */
+  /** Scene store handed to `plannerSaveTargetFor` — set per test, default none. */
   sceneStore: null as unknown,
   sceneSaves: 0,
 }));
@@ -42,12 +42,10 @@ vi.mock('../src/core/engine/rv-local-filesystem', () => ({ isSupported: () => tr
 vi.mock('../src/core/editor/rv-asset-glb-export', () => ({
   exportAssetGlb: async () => new TextEncoder().encode('GLB').buffer,
 }));
-vi.mock('../src/core/thumbnails/thumbnail-renderer', () => ({
-  ThumbnailRenderer: class {
-    render(): string | null { return null; }
-    dispose(): void {}
-  },
-}));
+// plan-776: the save reaches the renderer only through the thumbnail writer —
+// one shared stand-in for it (tests/helpers/mock-thumbnail-write.ts).
+vi.mock('../src/core/thumbnails/rv-thumbnail-write', async () =>
+  (await import('./helpers/mock-thumbnail-write')).mockThumbnailWriteModule());
 vi.mock('../src/core/hmi/scene/scene-store-singleton', () => ({
   getSceneStore: () => h.sceneStore,
 }));
@@ -244,7 +242,7 @@ describe('"Save as…" is the only fork', () => {
 describe('a bound document saves through the scene writer', () => {
   function sceneStoreFor(documentId: string) {
     return {
-      lineage: 'scene' as const,
+      lineage: 'planner' as const,
       getSnapshot: () => ({
         draft: { name: 'Line' },
         saved: { id: documentId },
@@ -306,7 +304,7 @@ describe('the bound-save guard matches by document IDENTITY (field finding 2026-
    */
   function identityStoreFor(identityId: string | null, savedId: string | null) {
     return {
-      lineage: 'scene' as const,
+      lineage: 'planner' as const,
       getSnapshot: () => ({
         draft: { name: 'Line' },
         saved: savedId ? { id: savedId } : null,
@@ -362,7 +360,7 @@ describe('the bound-save guard matches by document IDENTITY (field finding 2026-
     const base = documentBase('doc_line', 'Line', 'Line.glb');
     const { viewer, doc } = context('Line', base, { bound: true });
     h.sceneStore = {                                 // the plain facade shape
-      lineage: 'scene' as const,
+      lineage: 'planner' as const,
       getSnapshot: () => ({
         draft: { name: 'Line' }, saved: { id: 'doc_line' },
         isDraft: false, dirty: true, transient: false,

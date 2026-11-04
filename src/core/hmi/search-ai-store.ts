@@ -73,7 +73,7 @@ export function getSearchAiSnapshot(): SearchAiState {
 }
 
 /** CONNECT's literal "nothing found" remedy (DiagnosisService fallback). */
-const NOT_FOUND_REMEDY = 'Nicht in der Dokumentation gefunden.';
+const NOT_FOUND_REMEDY = 'Not found in the documentation.';
 
 /** True when ONE answer has nothing to say (F8). Exported for the dialog's tab preselection. */
 export function isEmptyAnswer(result: DiagnoseResult): boolean {

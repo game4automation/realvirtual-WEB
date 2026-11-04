@@ -27,7 +27,7 @@
  * synchronous pass, so the user's camera, controls, and scene state are
  * never touched and every tile shows the same simulation instant.
  *
- * Contracts honored (doc-render-picking.md §1.6): no live-scene mutation at
+ * Contracts honored (contract-bake-picking.md §1.6): no live-scene mutation at
  * all — no `setVisibleAt`, no re-layering of batched sources, no visibility
  * writes (hence no `markShadowsDirty` needed). Isolation happens exclusively
  * in a private scene built from clones; `overrideMaterial` is only ever set
@@ -51,7 +51,7 @@ import {
 } from 'three';
 import type { Camera, Mesh, Object3D, WebGLRenderer } from 'three';
 import { disableOverlayLayers } from '../../core/engine/rv-group-registry';
-import { ensureShadowMaps, readRenderTargetPixelsFlipped } from '../../core/engine/rv-offscreen-capture';
+import { ensureShadowMaps, readTargetPixelsTopDown } from '../../core/engine/rv-offscreen-capture';
 import type { RVViewer } from '../../core/rv-viewer';
 import {
   formatBoundsLabel,
@@ -156,7 +156,10 @@ export class ObjectAnalyzer {
    * Render the analysis mosaic for `nodes`. Fully synchronous — all renders,
    * readbacks, compositing and labeling happen in one call with no awaits.
    */
-  analyze(nodes: Object3D[], opts: AnalyzeOptions): AnalyzeResult | { error: string } {
+  /** Async since plan-763 (WebGPU readback): every tile renders and ISSUES its readbacks with the
+   *  renderer state applied, restores it, and only then awaits — the viewport frame never runs with a
+   *  private target bound. */
+  async analyze(nodes: Object3D[], opts: AnalyzeOptions): Promise<AnalyzeResult | { error: string }> {
     // Caller guards `viewer.isWebGPU` — on the classic backend the renderer IS
     // a WebGLRenderer (readRenderTargetPixels etc.), the facade just types it
     // as the backend-neutral `Renderer`.
@@ -185,6 +188,10 @@ export class ObjectAnalyzer {
       const contentBox = contentBounds(mainScene, sceneBox);
 
       this._syncLighting(mainScene);
+      // plan-766: the live scene is rendered below OUTSIDE the frame loop — the
+      // editor arenas must carry this moment's matrices/visibility, not the last
+      // frame's. No arenas = no-op.
+      this._viewer.editorArena?.beforeFrame();
 
       const layout = mosaicLayout(opts.tileSize);
       const mosaic = document.createElement('canvas');
@@ -197,9 +204,6 @@ export class ObjectAnalyzer {
       ctx.fillRect(0, 0, layout.width, layout.height);
       this._drawHeader(ctx, layout.width, opts.pathsLabel, size, center, targets.length);
 
-      const prevTarget = renderer.getRenderTarget();
-      const prevClearAlpha = renderer.getClearAlpha();
-      const prevAutoClear = renderer.autoClear;
       try {
         for (const cell of layout.cells) {
           let view = VIEW_DEFS.find((v) => v.name === cell.view)!;
@@ -215,21 +219,18 @@ export class ObjectAnalyzer {
           else if (view.framing === 'near') {
             // The fixed ¾ angle can look straight into an occluder — probe
             // the four diagonal angles and take the one showing the target.
-            view = { ...view, dir: this._pickNearDir(renderer, mainScene, view, center, size, sceneBox, contentBox) };
+            view = { ...view, dir: await this._pickNearDir(renderer, mainScene, view, center, size, sceneBox, contentBox) };
           }
           const camera = this._makeCamera(view, center, size, sceneBox, contentBox);
           if (cell.kind === 'isolated') {
-            this._renderIsolatedCell(renderer, camera, cell, ctx);
+            await this._renderIsolatedCell(renderer, camera, cell, ctx);
           } else {
-            this._renderContextCell(renderer, mainScene, camera, cell, ctx, center);
+            await this._renderContextCell(renderer, mainScene, camera, cell, ctx, center);
           }
           this._drawCellChrome(ctx, cell);
         }
       } finally {
         this._isoScene.overrideMaterial = null;
-        renderer.autoClear = prevAutoClear;
-        renderer.setClearAlpha(prevClearAlpha);
-        renderer.setRenderTarget(prevTarget);
       }
 
       return {
@@ -418,8 +419,21 @@ export class ObjectAnalyzer {
    * (scene colour, visible mask, full silhouette) and compares them, so a
    * shared buffer would make all three the last one.
    */
-  private _readPixels(renderer: WebGLRenderer, rt: WebGLRenderTarget, size: number): Uint8Array {
-    return readRenderTargetPixelsFlipped(renderer, rt, size, size);
+  private _readPixels(renderer: WebGLRenderer, rt: WebGLRenderTarget, size: number): Promise<Uint8Array> {
+    return readTargetPixelsTopDown(renderer, rt, size, size);
+  }
+
+  /** Save the renderer state a tile's passes touch; returns the restore. */
+  private _hijack(renderer: WebGLRenderer): () => void {
+    const prevTarget = renderer.getRenderTarget();
+    const prevClearAlpha = renderer.getClearAlpha();
+    const prevAutoClear = renderer.autoClear;
+    return () => {
+      this._isoScene.overrideMaterial = null;
+      renderer.autoClear = prevAutoClear;
+      renderer.setClearAlpha(prevClearAlpha);
+      renderer.setRenderTarget(prevTarget);
+    };
   }
 
   /** Composite top-down RGBA pixels into the mosaic over a backdrop color. */
@@ -450,20 +464,27 @@ export class ObjectAnalyzer {
   }
 
   /** Isolated tile: private clone scene, neutral mid-grey backdrop. */
-  private _renderIsolatedCell(
+  private async _renderIsolatedCell(
     renderer: WebGLRenderer,
     camera: Camera,
     cell: MosaicCell,
     ctx: CanvasRenderingContext2D,
-  ): void {
+  ): Promise<void> {
     const rt = this._target(cell.size);
-    this._isoScene.overrideMaterial = null;
-    renderer.autoClear = true;
-    renderer.setRenderTarget(rt);
-    renderer.setClearAlpha(0);
-    renderer.clear();
-    renderer.render(this._isoScene, camera);
-    this._blit(ctx, cell, this._readPixels(renderer, rt, cell.size), ISOLATED_BACKDROP);
+    const restore = this._hijack(renderer);
+    let read: Promise<Uint8Array>;
+    try {
+      this._isoScene.overrideMaterial = null;
+      renderer.autoClear = true;
+      renderer.setRenderTarget(rt);
+      renderer.setClearAlpha(0);
+      renderer.clear();
+      renderer.render(this._isoScene, camera);
+      read = this._readPixels(renderer, rt, cell.size);
+    } finally {
+      restore();
+    }
+    this._blit(ctx, cell, await read, ISOLATED_BACKDROP);
   }
 
   /**
@@ -480,46 +501,52 @@ export class ObjectAnalyzer {
     camera: Camera,
     size: number,
     withNormals = false,
-  ): { color: Uint8Array; visPix: Uint8Array; allPix: Uint8Array; normPix: Uint8Array | null } {
+  ): { color: Promise<Uint8Array>; visPix: Promise<Uint8Array>; allPix: Promise<Uint8Array>; normPix: Promise<Uint8Array> | null } {
+    // All passes render and all readbacks are ISSUED synchronously here —
+    // each into its own buffer, the copy enqueued before the next render
+    // reuses the target — and the renderer state is restored before the
+    // caller awaits any of them (plan-763).
     const rt = this._target(size);
-    renderer.setRenderTarget(rt);
-    renderer.setClearAlpha(0);
+    const restore = this._hijack(renderer);
+    try {
+      renderer.setRenderTarget(rt);
+      renderer.setClearAlpha(0);
 
-    renderer.autoClear = true;
-    renderer.clear();
-    // The live scene with its real materials: the shadow map must exist or
-    // every lit draw is dropped (see ensureShadowMaps in rv-offscreen-capture).
-    ensureShadowMaps(renderer, mainScene);
-    renderer.render(mainScene, camera);
-    const color = this._readPixels(renderer, rt, size);
+      renderer.autoClear = true;
+      renderer.clear();
+      // The live scene with its real materials: the shadow map must exist or
+      // every lit draw is dropped (see ensureShadowMaps in rv-offscreen-capture).
+      ensureShadowMaps(renderer, mainScene);
+      renderer.render(mainScene, camera);
+      const color = this._readPixels(renderer, rt, size);
 
-    this._isoScene.overrideMaterial = this._maskMat;
-    renderer.autoClear = false;
-    renderer.render(this._isoScene, camera);
-    const visPix = this._readPixels(renderer, rt, size);
+      this._isoScene.overrideMaterial = this._maskMat;
+      renderer.autoClear = false;
+      renderer.render(this._isoScene, camera);
+      const visPix = this._readPixels(renderer, rt, size);
 
-    renderer.clear();
-    renderer.render(this._isoScene, camera);
-    const allPix = this._readPixels(renderer, rt, size);
-
-    let normPix: Uint8Array | null = null;
-    if (withNormals) {
-      this._isoScene.overrideMaterial = this._normalMat;
       renderer.clear();
       renderer.render(this._isoScene, camera);
-      normPix = this._readPixels(renderer, rt, size);
+      const allPix = this._readPixels(renderer, rt, size);
+
+      let normPix: Promise<Uint8Array> | null = null;
+      if (withNormals) {
+        this._isoScene.overrideMaterial = this._normalMat;
+        renderer.clear();
+        renderer.render(this._isoScene, camera);
+        normPix = this._readPixels(renderer, rt, size);
+      }
+
+      return { color, visPix, allPix, normPix };
+    } finally {
+      restore();
     }
-
-    this._isoScene.overrideMaterial = null;
-    renderer.autoClear = true;
-
-    return { color, visPix, allPix, normPix };
   }
 
   /** Probe the four diagonal ¾ angles at low resolution and pick the one
    *  where the target is most visible. The default (front-right) wins ties
    *  so results stay stable across calls. */
-  private _pickNearDir(
+  private async _pickNearDir(
     renderer: WebGLRenderer,
     mainScene: Scene,
     baseView: ViewDef,
@@ -527,13 +554,18 @@ export class ObjectAnalyzer {
     size: Vector3,
     sceneBox: Box3,
     contentBox: Box3,
-  ): readonly [number, number, number] {
+  ): Promise<readonly [number, number, number]> {
     const PROBE = 128;
     const candidates = NEAR_CANDIDATES;
     const scores: number[] = [];
-    for (const cand of candidates) {
+    // The four probes render back to back (each issues its reads before the
+    // next one reuses the target) and are awaited together afterwards.
+    const probes = candidates.map((cand) => {
       const cam = this._makeCamera({ ...baseView, dir: cand }, center, size, sceneBox, contentBox);
-      const { visPix, allPix } = this._maskPasses(renderer, mainScene, cam, PROBE);
+      return this._maskPasses(renderer, mainScene, cam, PROBE);
+    });
+    for (const probe of probes) {
+      const [visPix, allPix] = await Promise.all([probe.visPix, probe.allPix]);
       let vis = 0;
       let all = 0;
       for (let i = 0; i < PROBE * PROBE; i++) {
@@ -551,24 +583,21 @@ export class ObjectAnalyzer {
   }
 
   /** Context tile: live-scene render plus the screen-space target highlight. */
-  private _renderContextCell(
+  private async _renderContextCell(
     renderer: WebGLRenderer,
     mainScene: Scene,
     camera: Camera,
     cell: MosaicCell,
     ctx: CanvasRenderingContext2D,
     targetCenter: Vector3,
-  ): void {
+  ): Promise<void> {
     // The near tile gets X-ray edges (silhouette + interior creases) instead
     // of the plain silhouette outline — the translucent fill stays on both.
     const xray = cell.view === 'near';
-    const { color, visPix, allPix, normPix } = this._maskPasses(
-      renderer,
-      mainScene,
-      camera,
-      cell.size,
-      xray,
-    );
+    const reads = this._maskPasses(renderer, mainScene, camera, cell.size, xray);
+    const [color, visPix, allPix, normPix] = await Promise.all([
+      reads.color, reads.visPix, reads.allPix, reads.normPix ?? Promise.resolve(null),
+    ]);
     this._blit(ctx, cell, color, CONTEXT_BACKDROP);
     const silhouettePx = this._compositeHighlight(ctx, cell, visPix, allPix, normPix);
     // A near-invisible highlight (tiny or fully buried target) gets a ring

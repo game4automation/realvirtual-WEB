@@ -46,3 +46,30 @@ describe('SEW MOVI-C catalog preset', () => {
     expect(nextInterfaceId('MQTT')).toBe('mqtt-1');
   });
 });
+
+describe('SEW MOVI-C UDP catalog preset', () => {
+  it('follows the generic Udp row with Unity defaults and a distinct preset id', () => {
+    const genericIndex = CONNECT_INTERFACE_TYPES.findIndex(d => d.type === 'Udp' && !d.preset);
+    expect(genericIndex).toBeGreaterThanOrEqual(0);
+    expect(CONNECT_INTERFACE_TYPES[genericIndex + 1]).toEqual({
+      type: 'Udp',
+      preset: 'SEW-UDP',
+      label: 'SEW MOVI-C (UDP)',
+      description: 'Fixed binary UDP telegrams of a SEW MOVI-C station (Unity SEW UDP layout); SEW symbol table import',
+      defaults: {
+        udp: {
+          localPort: 11001,
+          localBindAddress: '0.0.0.0',
+          remoteHost: '127.0.0.1',
+          remotePort: 11000,
+          littleEndian: true,
+          symbolTable: '',
+          splitChar: ';',
+        },
+        updateCycleMs: 20,
+      },
+    });
+    expect(nextInterfaceId('Udp', 'SEW-UDP')).toBe('sew-udp-1');
+    expect(nextInterfaceId('Udp')).toBe('udp-1');
+  });
+});

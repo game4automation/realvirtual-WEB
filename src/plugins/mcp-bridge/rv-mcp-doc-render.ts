@@ -75,13 +75,15 @@ export function domainOf(name: string): string {
     // the tab alive" belongs to no family, and a one-tool `ping` domain in the
     // roster would advertise a family that does not exist.
     'web_ping',
+    // plan-641: the reduced command interface — root-level like the lint's ROOT_TOOLS.
+    'web_commands', 'web_execute', 'web_batch',
   ]);
   return ROOT_NAMES.has(name) ? ROOT : m[1];
 }
 
 // ─── Renderers ──────────────────────────────────────────────────────────
 
-/** `web_editor_import_glb` → ``` `relPath` string **req**, `replace` boolean ```. */
+/** `web_execute("editor.importGlb", …)` → ``` `relPath` string **req**, `replace` boolean ```. */
 function renderParams(schema: ToolSchema): string {
   const props = schema.inputSchema?.properties ?? {};
   const required = new Set(schema.inputSchema?.required ?? []);
@@ -137,7 +139,7 @@ function accessOf(schema: ToolSchema): string {
 /** Full per-tool table — for the on-demand guides. */
 const renderToolTable: Renderer = (schemas) => {
   const rows = schemas.map((s) =>
-    `| \`${s.name}\` | ${accessOf(s)} | ${renderParams(s)} | ${summarise(s.description)} |`);
+    `| \`${s.name}\` | ${accessOf(s)}${s.listed === false ? ' · alias (web_execute)' : ''} | ${renderParams(s)} | ${summarise(s.description)} |`);
   return [
     `_${schemas.length} tool${schemas.length === 1 ? '' : 's'} in this family, generated from the`
     + ' @McpTool decorators — do not edit by hand._',
@@ -149,7 +151,12 @@ const renderToolTable: Renderer = (schemas) => {
 };
 
 /** Compact roster grouped by domain — for the always-loaded instruction. */
-const renderDomainRoster: Renderer = (schemas) => {
+const renderDomainRoster: Renderer = (all) => {
+  // plan-641 Nachtrag 2026-10-21: command-bound aliases (`listed: false`) are not in
+  // tools/list, so the always-loaded roster leaves them out too and only counts them —
+  // the on-demand guides (`web_help`) still list them, marked `alias`.
+  const schemas = all.filter((s) => s.listed !== false);
+  const hiddenCount = all.length - schemas.length;
   const byDomain = new Map<string, string[]>();
   for (const s of schemas) {
     const d = domainOf(s.name);
@@ -172,6 +179,9 @@ const renderDomainRoster: Renderer = (schemas) => {
     `_${schemas.length} tools across ${domains.length} domains, generated from the @McpTool`
     + ' decorators — do not edit by hand. Purpose and workflow live in the prose above and in'
     + ' `web_help(topic)`._',
+    ...(hiddenCount > 0 ? ['', `_Plus ${hiddenCount} command-bound aliases that are NOT in tools/list`
+      + ' (e.g. `web_drive_jog`): run them as `web_execute(command, args)`;'
+      + ' `web_commands(query="<old tool name>")` gives the command id, `argsSchema` and description._'] : []),
     '',
     '| Domain | # | Tools |',
     '|--------|---|-------|',
@@ -215,8 +225,9 @@ export const DOC_FAMILIES: readonly FamilySpec[] = [
     marker: 'tool-reference simulation',
     file: 'src/plugins/mcp-bridge/help/simulation.md',
     // plan-567: `web_mu_*` (remove / move a workpiece carrier) belongs to the material flow.
+    // plan-629: `web_trace_*` (the congestion trace along the path network) measures it.
     match: (n) => startsWithAny(n, ['web_drive_', 'web_signal_', 'web_sensor_', 'web_sim_',
-      'web_transport_', 'web_logic_', 'web_mu_']),
+      'web_transport_', 'web_logic_', 'web_mu_', 'web_trace_']),
     render: renderToolTable,
   },
   {

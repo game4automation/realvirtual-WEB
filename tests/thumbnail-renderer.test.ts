@@ -78,12 +78,15 @@ async function decodeDataUrl(dataUrl: string): Promise<DecodedImage> {
 }
 
 describe('ThumbnailRenderer HQ pipeline', () => {
-  it('renders a 512x512 PNG with transparent corners and opaque subject', async () => {
+  it('renders a 512x512 canvas with transparent corners and opaque subject', async () => {
     const { renderer, scene } = makeRendererAndScene();
     const tr = new ThumbnailRenderer(renderer, scene);
     try {
-      const dataUrl = tr.render(makeUnitCube(), 512)!;
-      expect(dataUrl.startsWith('data:image/png')).toBe(true);
+      // plan-776: the renderer hands back its output canvas; the save path
+      // encodes it. A PNG data URL of it is the cheapest decodable snapshot.
+      const canvas = (await tr.render(makeUnitCube(), 512))!;
+      expect(canvas).toBeInstanceOf(HTMLCanvasElement);
+      const dataUrl = canvas.toDataURL('image/png');
 
       const { width, height, pixelAt } = await decodeDataUrl(dataUrl);
       expect(width).toBe(512);
@@ -154,9 +157,9 @@ describe('ThumbnailRenderer HQ pipeline', () => {
     }
   });
 
-  it('returns null on a WebGPU renderer without touching GL state', () => {
-    const fakeWebGPU = { isWebGPURenderer: true } as unknown as WebGLRenderer;
-    const tr = new ThumbnailRenderer(fakeWebGPU, new Scene());
-    expect(tr.render(makeUnitCube(), 512)).toBeNull();
+  it('rejects on a renderer that cannot read pixels back (plan-763: WebGPU itself renders)', async () => {
+    const stub = { isWebGPURenderer: true } as unknown as WebGLRenderer;
+    const tr = new ThumbnailRenderer(stub, new Scene());
+    await expect(tr.render(makeUnitCube(), 512)).rejects.toThrow();
   });
 });

@@ -24,6 +24,7 @@ import {
   WarningAmber,
 } from '@mui/icons-material';
 import { ISA_AMBER, ISA_GREEN } from './isa-colors';
+import { OfflineActivationDialog } from './OfflineActivationDialog';
 import {
   activateCommercialLicense,
   clearLicenseAction,
@@ -53,12 +54,12 @@ function registrationMessage(registration: LicenseRegistrationStatus | null | un
     case 'portalUnreachable':
       return {
         severity: 'warning' as const,
-        message: 'The registration portal is currently unreachable. CONNECT will keep trying. For an air-gapped machine, import a signed license with --license-file <path>.',
+        message: 'The registration portal is currently unreachable. CONNECT will keep trying. For an air-gapped machine, choose Activate offline.',
       };
     case 'expired':
       return {
         severity: 'warning' as const,
-        message: 'This registration request expired. Enter your email again to request a new link, or use --license-file <path> for an offline license.',
+        message: 'This registration request expired. Enter your email again to request a new link, or choose Activate offline.',
       };
     default:
       return null;
@@ -70,6 +71,7 @@ export function LicenseSection({ serverUrl, statusOverride }: LicenseSectionProp
   const status = statusOverride === undefined ? snapshot.status : statusOverride;
   const supported = statusOverride === undefined ? snapshot.supported : true;
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [offlineDialogOpen, setOfflineDialogOpen] = useState(false);
   const [email, setEmail] = useState('');
   const [licenseKey, setLicenseKey] = useState('');
   const [productUpdatesConsent, setProductUpdatesConsent] = useState(false);
@@ -293,6 +295,15 @@ export function LicenseSection({ serverUrl, statusOverride }: LicenseSectionProp
             >
               {snapshot.action === 'activating' ? 'Activating...' : 'Activate license'}
             </Button>
+            <Button
+              size="small"
+              variant="text"
+              onClick={() => { setDialogOpen(false); clearLicenseAction(); setOfflineDialogOpen(true); }}
+              disabled={busy}
+              sx={{ display: 'block', mt: 0.5, px: 0, fontSize: 10, textTransform: 'none' }}
+            >
+              No internet on this computer? Activate offline
+            </Button>
           </Box>
 
           <Typography sx={{ fontSize: 10, color: 'text.secondary', lineHeight: 1.4 }}>
@@ -323,6 +334,12 @@ export function LicenseSection({ serverUrl, statusOverride }: LicenseSectionProp
           <Button onClick={closeDialog} disabled={busy} sx={{ textTransform: 'none' }}>Close</Button>
         </DialogActions>
       </Dialog>
+      <OfflineActivationDialog
+        open={offlineDialogOpen}
+        onClose={() => setOfflineDialogOpen(false)}
+        serverUrl={serverUrl}
+        initialLicenseKey={licenseKey}
+      />
     </>
   );
 }

@@ -52,6 +52,10 @@
 
 import { MathUtils, Quaternion, Vector3 } from 'three';
 import { lookRotation } from '../engine/rv-pose-align';
+import { reportProblem } from '../hmi/problems-store';
+
+const GENERATION_BASE = 2 ** 32;
+const MAX_POOL_SIZE = 2 ** 21;
 
 // ─── Public target shapes (structural — no private/RV imports) ───────────
 
@@ -85,6 +89,7 @@ export interface PositionTweenTarget {
  * drive.applyToNode(); }`), so the public registry never imports `RVDrive`.
  */
 export interface DriveTweenTarget {
+  readonly node?: object;
   setPosition(value: number): void;
 }
 
@@ -118,6 +123,9 @@ export type TweenHandle = number;
 
 /** JSON-only active tween window used by DES snapshot v3. */
 export type TweenDataSnapshot =
+  | { kind: 'drive'; t0: number; t1: number; driveRef: string; from: number; to: number;
+      ease: TweenEase; writePolicy: TweenWritePolicy; eventId: number | null }
+
   | {
       kind: 'position'; t0: number; t1: number; muId: number;
       from: [number, number, number]; to: [number, number, number];
@@ -328,11 +336,26 @@ export class TweenRegistry {
     return this._encode(idx, r.gen);
   }
 
-  /**
-   * Cancel a tween (e.g. its DES event was cancelled). Frees the pooled record
-   * so a stale tween can never keep animating an MU (V4). Stale or already-freed
-   * handles are ignored via the generation check.
-   */
+  /** Restore one target at its saved sample time without retiring its window.
+   * Sampling time directly avoids a rounding change through normalized progress. */
+  samplePathAt(handle: TweenHandle, simTime: number): void {
+    if (handle < 0) return;
+    const r = this._pool[this._decodeIdx(handle)];
+    if (!r || !r.active || r.gen !== this._decodeGen(handle)
+      || r.kind !== 'path' || !r.posTarget || !r.pathSampler) return;
+    const time = Math.min(Math.max(simTime, r.t0), r.t1);
+    const s = r.sAt ? r.sAt(time)
+      : r.fromScalar + (r.toScalar - r.fromScalar) * ((time - r.t0) / (r.t1 - r.t0));
+    r.pathSampler.getAbsPosition(s, _scratch);
+    r.posTarget.setPosition(_scratch);
+    const target = r.posTarget as PathTweenTarget;
+    if (target.setQuaternion && r.pathSampler.getAbsDirection) {
+      r.pathSampler.getAbsDirection(s, _scratchDir);
+      target.setQuaternion(lookRotation(_scratchDir, r.pathSampler.align ?? _PATH_UP, _scratchQuat));
+    }
+  }
+
+  /** Cancel a tween. Stale or already-freed handles are ignored. */
   cancel(handle: TweenHandle): void {
     if (handle < 0) return;
     const idx = this._decodeIdx(handle);
@@ -524,6 +547,22 @@ export class TweenRegistry {
       : null;
   }
 
+  /** Current arc length of the latest active path tween for this MU. */
+  pathSForMu(muId: number, simNow: number): number | null {
+    if (muId < 0) return null;
+    let best: TweenRecord | null = null;
+    for (const idx of this._active) {
+      const r = this._pool[idx];
+      if (!r.active || r.muId !== muId || r.kind !== 'path') continue;
+      if (simNow < r.t0 || simNow > r.t1) continue;
+      if (!best || r.t0 >= best.t0) best = r;
+    }
+    if (!best) return null;
+    if (best.sAt) return best.sAt(Math.min(Math.max(simNow, best.t0), best.t1));
+    const p = MathUtils.clamp((simNow - best.t0) / Math.max(0.001, best.t1 - best.t0), 0, 1);
+    return best.fromScalar + (best.toScalar - best.fromScalar) * p;
+  }
+
   /** Write the exact current position of the latest active MU tween into `out`. */
   positionForMu(muId: number, simNow: number, out: Vector3): boolean {
     if (muId < 0) return false;
@@ -572,11 +611,19 @@ export class TweenRegistry {
   }
 
   /** Capture only reconstructable MU tween windows as pure JSON. */
-  toSnapshot(): TweenDataSnapshot[] {
+  toSnapshot(driveRef?: (target: DriveTweenTarget) => string,
+    eventId?: (handle: TweenHandle) => number | null): TweenDataSnapshot[] {
     const out: TweenDataSnapshot[] = [];
     for (const idx of this._active) {
       const r = this._pool[idx];
-      if (!r.active || r.muId < 0) continue;
+      if (!r.active) continue;
+      if (r.kind === 'drive' && r.driveTarget && driveRef
+        && (!eventId || eventId(this._encode(idx, r.gen)) !== null)) {
+        out.push({ kind: 'drive', t0: r.t0, t1: r.t1, driveRef: driveRef(r.driveTarget),
+          from: r.fromScalar, to: r.toScalar, ease: r.ease, writePolicy: r.writePolicy,
+          eventId: eventId?.(this._encode(idx, r.gen)) ?? null });
+      }
+      if (r.muId < 0) continue;
       if (r.kind === 'pos') {
         out.push({
           kind: 'position', t0: r.t0, t1: r.t1, muId: r.muId,
@@ -598,16 +645,20 @@ export class TweenRegistry {
     saved: readonly TweenDataSnapshot[],
     resolveTarget: (muId: number) => PositionTweenTarget | null,
     resolvePath: (pathRef: string) => PathTweenSampler | null,
-  ): void {
+    resolveDrive: (ref: string) => DriveTweenTarget | null = () => null,
+  ): TweenHandle[] {
     this.clear();
+    const handles: TweenHandle[] = [];
     for (const tween of saved) {
       const duration = Math.max(0.001, tween.t1 - tween.t0);
-      if (tween.kind === 'position') {
+      if (tween.kind === 'drive') {
+        handles.push(this.addDrive(resolveDrive(tween.driveRef), tween.from, tween.to, tween.t0, duration, tween));
+      } else if (tween.kind === 'position') {
         _scratch.set(tween.from[0], tween.from[1], tween.from[2]);
         _scratchDir.set(tween.to[0], tween.to[1], tween.to[2]);
-        this.addPosition(resolveTarget(tween.muId), _scratch, _scratchDir, tween.t0, duration, tween.muId);
+        handles.push(this.addPosition(resolveTarget(tween.muId), _scratch, _scratchDir, tween.t0, duration, tween.muId));
       } else {
-        this.addPath(
+        handles.push(this.addPath(
           resolvePath(tween.pathRef),
           resolveTarget(tween.muId) as PathTweenTarget | null,
           tween.fromS,
@@ -616,21 +667,29 @@ export class TweenRegistry {
           duration,
           tween.muId,
           tween.pathRef,
-        );
+        ));
       }
     }
+    return handles;
   }
 
   // ─── Pool internals ────────────────────────────────────────────────────
 
   private _grow(by: number): void {
     const start = this._pool.length;
+    if (start >= MAX_POOL_SIZE || by > MAX_POOL_SIZE - start) {
+      reportProblem({
+        id: 'tween-handle-exhausted', code: 'tween-handle-exhausted', severity: 'error',
+        title: 'Tween handle capacity exhausted', detail: 'Tween pool indices must remain below 2^21.',
+      });
+      throw new Error('Tween handle capacity exhausted');
+    }
     for (let i = 0; i < by; i++) {
       this._pool.push({
         active: false, kind: '', t0: 0, t1: 0,
         posTarget: null, driveTarget: null, pathSampler: null, pathRef: '',
         fromVec: new Vector3(), toVec: new Vector3(),
-        fromScalar: 0, toScalar: 0, muId: -1, gen: 0,
+        fromScalar: 0, toScalar: 0, muId: -1, gen: 1,
         writePolicy: 'always', ease: 'linear', sAt: null,
       });
       this._free.push(start + i);
@@ -639,7 +698,7 @@ export class TweenRegistry {
 
   /** Rent a free pool index, growing the pool if exhausted. */
   private _rent(): number {
-    if (this._free.length === 0) this._grow(this._pool.length); // geometric
+    if (this._free.length === 0) this._grow(Math.min(this._pool.length, MAX_POOL_SIZE - this._pool.length) || 1);
     return this._free.pop()!;
   }
 
@@ -657,20 +716,27 @@ export class TweenRegistry {
     r.ease = 'linear';
     r.sAt = null;
     r.gen++;
-    this._free.push(idx);
+    if (r.gen < GENERATION_BASE - 1) this._free.push(idx); // terminal generation retires the slot
   }
 
-  // Handle = (idx << 20) | gen — packs the generation so a freed-and-reused
-  // record's old handle is detected as stale on cancel. (idx is small; 20 bits
-  // of generation is ample for a per-record monotonic counter.)
+  /** Test-only: advance a free slot near retirement without billions of rents. */
+  __setGenerationForTest(idx: number, gen: number): void {
+    const r = this._pool[idx];
+    if (!r || r.active || !Number.isInteger(gen) || gen < r.gen || gen >= GENERATION_BASE - 1) {
+      throw new Error('Invalid test generation');
+    }
+    r.gen = gen;
+  }
+
+  // All 53 integer bits are exact: 21 index bits + 32 generation bits.
   private _encode(idx: number, gen: number): TweenHandle {
-    return (idx << 20) | (gen & 0xfffff);
+    return idx * GENERATION_BASE + gen;
   }
   private _decodeIdx(handle: TweenHandle): number {
-    return handle >>> 20;
+    return Math.floor(handle / GENERATION_BASE);
   }
   private _decodeGen(handle: TweenHandle): number {
-    return handle & 0xfffff;
+    return handle % GENERATION_BASE;
   }
 
   /** Write one record at an already-clamped/eased progress value. */

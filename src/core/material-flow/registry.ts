@@ -28,6 +28,7 @@
 import type { Object3D } from 'three';
 import {
   registerComponentSchema,
+  registerParamApply,
   getRegisteredFactories,
   type ComponentSchema,
 } from '../engine/rv-component-registry';
@@ -83,6 +84,12 @@ export function registerMaterialFlow(def: MaterialFlowDefinition): void {
   }
   _flows.set(type, { type, models, def, desActions });
 
+  // plan-630 §2.14: a type the DES runner binds re-reads its schema fields from the
+  // extras on `reconfigureFromExtras` — its config fields can be planning parameters.
+  // Set BEFORE the factory guard below: an engine-owned type (Source) is bound by the
+  // DES runner through THIS definition all the same.
+  if (desActions.length > 0) registerParamApply(type, 'des-extras');
+
   // 2. registerComponent schema adapter — make the type loader/inspector visible.
   //    We register only the SCHEMA (not a full create() factory) here, which is
   //    enough for GLB extras auto-mapping + inspector visibility and stays
@@ -101,7 +108,7 @@ export function registerMaterialFlow(def: MaterialFlowDefinition): void {
   if (getRegisteredFactories().has(type)) return;
   try {
     registerComponentSchema(type, def.schema as ComponentSchema, {
-      ui: { filter: 'MaterialFlow', category: 'material-flow' },
+      ui: { filter: 'MaterialFlow', category: 'material-flow', tooltip: 'des-component' },
       ...(def.bake ? { bake: def.bake } : {}),
       ...(def.pick ? { pick: def.pick } : {}),
     });

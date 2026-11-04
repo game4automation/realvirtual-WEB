@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, removeLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * connect-write-gate-store — who decided what about writing to a PLC (plan-562 F8).
  *
@@ -53,7 +55,7 @@ export function writeGateKey(serverUrl: string, interfaceId: string): string {
 
 function readStoredMap(): Record<string, boolean> {
   try {
-    const raw = localStorage.getItem(CONNECT_WRITE_GATE_READONLY_KEY);
+    const raw = readLocalStorage(CONNECT_WRITE_GATE_READONLY_KEY);
     if (!raw) return {};
     const parsed = JSON.parse(raw) as unknown;
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
@@ -66,7 +68,7 @@ function readStoredMap(): Record<string, boolean> {
 
 function writeStoredMap(map: Record<string, boolean>): void {
   try {
-    localStorage.setItem(CONNECT_WRITE_GATE_READONLY_KEY, JSON.stringify(map));
+    writeLocalStorage(CONNECT_WRITE_GATE_READONLY_KEY, JSON.stringify(map));
   } catch {
     // Private mode or disabled storage: the in-memory decision carries the session.
   }
@@ -124,10 +126,6 @@ export function useWriteGateDecisions(): number {
 export function _resetWriteGateStore(): void {
   sessionReadOnly.clear();
   sessionDismissed.clear();
-  try {
-    localStorage.removeItem(CONNECT_WRITE_GATE_READONLY_KEY);
-  } catch {
-    // Nothing persisted, nothing to clear.
-  }
+  removeLocalStorage(CONNECT_WRITE_GATE_READONLY_KEY);
   notify();
 }

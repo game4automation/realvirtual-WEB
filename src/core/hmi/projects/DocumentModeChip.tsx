@@ -18,7 +18,7 @@
  */
 
 import { Box, type SxProps, type Theme } from '@mui/material';
-import { CHIP_RADIUS } from '../shared-sx';
+import { LABEL_CHIP_SX } from '../shared-sx';
 
 export interface DocumentModeChipProps {
   /** The mode the row opens in, or null/undefined when it names none. */
@@ -39,13 +39,7 @@ export function DocumentModeChip({ mode, modeLabel, testId, sx }: DocumentModeCh
       data-testid={testId}
       data-mode={mode}
       sx={[
-        {
-          flexShrink: 0, px: 0.75, py: 0.25,
-          borderRadius: CHIP_RADIUS,
-          border: '1px solid rgba(255,255,255,0.14)',
-          fontSize: 10, letterSpacing: 0.4, color: 'text.secondary',
-          whiteSpace: 'nowrap',
-        },
+        LABEL_CHIP_SX,
         ...(Array.isArray(sx) ? sx : sx ? [sx] : []),
       ]}
     >

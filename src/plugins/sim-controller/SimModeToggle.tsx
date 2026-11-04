@@ -37,6 +37,9 @@ import type {
   SimulationMode, SimSubMode, SimDesControl,
 } from '../../core/material-flow/simulation-kernel';
 
+import { runLeaseBlocker, subscribeRunLease } from '../../core/hmi/rv-run-lease';
+import { parseBatchProgress } from '../../core/material-flow/rv-batch-progress';
+
 /** Hybrid multiplier presets offered in the dropdown (Plan 194 §4.1). */
 const HYBRID_MULTIPLIERS = [1, 5, 10, 50] as const;
 
@@ -50,6 +53,7 @@ interface KernelSnapshot {
   readonly mode: SimulationMode;
   readonly hasDes: boolean;
   readonly switching: boolean;
+  readonly experimentRunning: boolean;
   readonly subMode: SimSubMode | null;
   readonly multiplier: number;
   readonly ffProgress: number | null;
@@ -77,25 +81,27 @@ export function SimModeToggle({ viewer }: UISlotProps) {
   );
 
   const handleSubMode = useCallback(
-    (m: SimSubMode) => { desControl()?.setSubMode(m); },
-    [desControl],
+    (m: SimSubMode) => { if (!getSnapshot().experimentRunning) desControl()?.setSubMode(m); },
+    [desControl, getSnapshot],
   );
 
   const handleHybridPick = useCallback(
     (n: number) => {
+      if (getSnapshot().experimentRunning) return;
       const ctl = desControl();
       ctl?.setMultiplier(n);
       ctl?.setSubMode('hybrid');
       setHybridAnchor(null);
     },
-    [desControl],
+    [desControl, getSnapshot],
   );
 
   const handleStep = useCallback(() => {
+    if (getSnapshot().experimentRunning) return;
     const ctl = desControl();
     ctl?.setSubMode('step');
     ctl?.step();
-  }, [desControl]);
+  }, [desControl, getSnapshot]);
 
   const handleCancelFf = useCallback(() => {
     desControl()?.cancelFastForward?.();
@@ -147,25 +153,27 @@ export function SimModeToggle({ viewer }: UISlotProps) {
       {/* ── Sub-mode row (DES only) ── */}
       {desActive && (
         <Box sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.25 }} data-testid="sim-submode-row">
-          <Tooltip title="Animated (1×)" placement="bottom">
-            <IconButton
+          <Tooltip title={snap.experimentRunning ? 'An experiment is running' : 'Animated (1\u00d7)'} placement="bottom">
+            <span><IconButton
               size="small"
               onClick={() => handleSubMode('animated')}
               color={snap.subMode === 'animated' ? 'primary' : 'inherit'}
               sx={{ p: 0.5 }}
+              disabled={snap.experimentRunning}
               data-testid="sim-submode-animated"
             >
               <PlayArrow fontSize="small" />
-            </IconButton>
+            </IconButton></span>
           </Tooltip>
 
-          <Tooltip title={`Hybrid (${snap.multiplier}× time-lapse)`} placement="bottom">
+          <Tooltip title={snap.experimentRunning ? 'An experiment is running' : `Hybrid (${snap.multiplier}× time-lapse)`} placement="bottom">
             <Box sx={{ display: 'inline-flex', alignItems: 'center' }}>
               <IconButton
                 size="small"
                 onClick={() => handleSubMode('hybrid')}
                 color={snap.subMode === 'hybrid' ? 'primary' : 'inherit'}
                 sx={{ p: 0.5 }}
+                disabled={snap.experimentRunning}
                 data-testid="sim-submode-hybrid"
               >
                 <Speed fontSize="small" />
@@ -174,6 +182,7 @@ export function SimModeToggle({ viewer }: UISlotProps) {
                 size="small"
                 onClick={(e) => setHybridAnchor(e.currentTarget)}
                 sx={{ p: 0.25 }}
+                disabled={snap.experimentRunning}
                 data-testid="sim-submode-hybrid-multiplier"
               >
                 <ArrowDropDown fontSize="small" />
@@ -181,28 +190,30 @@ export function SimModeToggle({ viewer }: UISlotProps) {
             </Box>
           </Tooltip>
 
-          <Tooltip title="Fast Forward (analysis)" placement="bottom">
-            <IconButton
+          <Tooltip title={snap.experimentRunning ? 'An experiment is running' : "Fast Forward (analysis)"} placement="bottom">
+            <span><IconButton
               size="small"
               onClick={() => handleSubMode('fastforward')}
               color={snap.subMode === 'fastforward' ? 'primary' : 'inherit'}
               sx={{ p: 0.5 }}
+              disabled={snap.experimentRunning}
               data-testid="sim-submode-fastforward"
             >
               <FastForward fontSize="small" />
-            </IconButton>
+            </IconButton></span>
           </Tooltip>
 
-          <Tooltip title="Step (one event)" placement="bottom">
-            <IconButton
+          <Tooltip title={snap.experimentRunning ? 'An experiment is running' : "Step (one event)"} placement="bottom">
+            <span><IconButton
               size="small"
               onClick={handleStep}
               color={snap.subMode === 'step' ? 'primary' : 'inherit'}
               sx={{ p: 0.5 }}
+              disabled={snap.experimentRunning}
               data-testid="sim-submode-step"
             >
               <SkipNext fontSize="small" />
-            </IconButton>
+            </IconButton></span>
           </Tooltip>
 
           {/* Hybrid multiplier dropdown */}
@@ -214,6 +225,7 @@ export function SimModeToggle({ viewer }: UISlotProps) {
             {HYBRID_MULTIPLIERS.map((n) => (
               <MenuItem
                 key={n}
+                disabled={snap.experimentRunning}
                 selected={snap.multiplier === n}
                 onClick={() => handleHybridPick(n)}
                 sx={{ fontSize: 12 }}
@@ -289,11 +301,13 @@ function makeStore(viewer: UISlotProps['viewer']): KernelStore {
 
   const subscribe = (listener: () => void): (() => void) => {
     listeners.add(listener);
+    const offLease = subscribeRunLease(refresh);
     const off = viewer.on('simulation-mode-changed', refresh as (data: unknown) => void);
     if (pollId === null) pollId = setInterval(refresh, POLL_MS);
     return () => {
       listeners.delete(listener);
       off();
+      offLease();
       if (listeners.size === 0 && pollId !== null) {
         clearInterval(pollId);
         pollId = null;
@@ -313,13 +327,14 @@ function readSnapshot(viewer: UISlotProps['viewer'], version: number): KernelSna
   if (!kernel) {
     return {
       available: false, mode: 'continuous', hasDes: false, switching: false,
-      subMode: null, multiplier: 1, ffProgress: null, version,
+      subMode: null, multiplier: 1, ffProgress: null, experimentRunning: !!runLeaseBlocker(), version,
     };
   }
   const ctl = kernel.desControl();
   const ff = ctl?.ffProgress;
   return {
     available: true,
+    experimentRunning: !!runLeaseBlocker() || parseBatchProgress(ctl?.batchProgressJson?.())?.phase === 'running',
     mode: kernel.mode,
     hasDes: kernel.hasDesRunner(),
     switching: kernel.isSwitching,
@@ -332,6 +347,7 @@ function readSnapshot(viewer: UISlotProps['viewer'], version: number): KernelSna
 
 function sameSnapshot(a: KernelSnapshot, b: KernelSnapshot): boolean {
   return a.available === b.available
+    && a.experimentRunning === b.experimentRunning
     && a.mode === b.mode
     && a.hasDes === b.hasDes
     && a.switching === b.switching

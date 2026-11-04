@@ -13,11 +13,22 @@
  *
  * ## It never disappears entirely
  *
- * Without an `rv_share` block the card shrinks to filename plus origin — it does
- * not vanish. The origin line *is* the security measure (§2.8): a visitor must
- * always be able to see that what he is looking at came from somewhere else,
- * which is the standard countermeasure for `?src=<foreign url>` patterns.
- * Everything else on the card is optional decoration around that one line.
+ * Without an `rv_share` block the card shrinks to its label plus filename — it
+ * does not vanish, so a visitor always sees that he is looking at a shared
+ * model. (The former "loaded from <host>" row was dropped from the display on
+ * Thomas' request; `info.originHost` and the trust checks behind it are
+ * unchanged.)
+ *
+ * ## Placement
+ *
+ * Bottom-left of the 3D viewport region, never on the HMI chrome:
+ * - desktop: left of the card = activity bar + any open left-docked window
+ *   (`useViewportInsets().left`, handed in as `viewportLeft`) + the floating ButtonPanel column (8 + 46 + 8),
+ *   bottom = `BOTTOM_BAR_HEIGHT + 12` — the floor every floating panel keeps
+ *   above the search bar. Full-bleed (HMI hidden, FPV/XR): 16 px from the edge.
+ * - compact layout (< 900 px): above the mobile tool dock and the search button
+ *   (60 + 40 + 8 px plus safe area), 16 px from the left; at ≤ 600 px it spans
+ *   the full width minus 16 px gutters.
  *
  * The expiry row follows the opposite rule: it appears **only** when the
  * provider actually set a deadline (F5). A default "expires: never" line would
@@ -26,13 +37,23 @@
 
 import { Box, Paper, Typography, Button, IconButton, Stack, Tooltip } from '@mui/material';
 import {
-  Close, Download, Public, HourglassBottom, OpenInNew,
+  Close, Download, HourglassBottom, OpenInNew,
   BookmarkAddOutlined, BookmarkAdded, Lock,
 } from '@mui/icons-material';
 import type { SharedGlbInfo } from './rv-share-meta';
 import { FS, ICON_SIZE, INK_LOW, INK_MID } from '../hmi/shared-sx';
+import { ACTIVITY_BAR_WIDTH, BOTTOM_BAR_HEIGHT } from '../hmi/layout-constants';
 
 const ACCENT = '#4fc3f7';
+
+/** Gap between the card and whatever chrome it clears. */
+const GUTTER = 16;
+/** The floating ButtonPanel column right of the activity bar: 8 gap + 46 wide + 8 gap. */
+const BUTTON_COLUMN_CLEARANCE = 8 + ACTIVITY_BAR_WIDTH + 8;
+/** Desktop floor: the same clearance every floating panel keeps above the search bar. */
+const DESKTOP_BOTTOM = BOTTOM_BAR_HEIGHT + 12;
+/** Compact floor: the search FAB (bottom 60, 40 tall) and the dock below it, plus a gap. */
+const COMPACT_BOTTOM = 'calc(108px + env(safe-area-inset-bottom, 0px))';
 
 export interface SharedGlbInfoCardProps {
   /** The loaded share. `null` while loading or after a failure. */
@@ -49,6 +70,14 @@ export interface SharedGlbInfoCardProps {
   /** Already bookmarked: the button says so instead of offering a second copy. */
   bookmarked?: boolean;
   onDismiss?: (() => void) | undefined;
+  /**
+   * Left edge of the 3D viewport region in css-px (`useViewportInsets().left`:
+   * activity bar + open left-docked window; 0 = full-bleed). Passed in by the
+   * slot wrapper so the card itself stays renderable without a viewer.
+   */
+  viewportLeft?: number;
+  /** Compact (mobile) layout — the card rises above the tool dock. */
+  compact?: boolean;
 }
 
 /** Human date for the expiry row; falls back to the raw ISO string. */
@@ -67,8 +96,12 @@ export function SharedGlbInfoCard({
   onAddToLibrary,
   bookmarked = false,
   onDismiss,
+  viewportLeft = 0,
+  compact = false,
 }: SharedGlbInfoCardProps) {
   if (!info && !error && !loading) return null;
+
+  const left = compact || viewportLeft === 0 ? GUTTER : viewportLeft + BUTTON_COLUMN_CLEARANCE;
 
   const meta = info?.meta ?? null;
   // "assembly · Thomas Strigl · CC-BY-4.0" — only the parts that exist, so a
@@ -80,11 +113,13 @@ export function SharedGlbInfoCard({
       elevation={0}
       sx={{
         position: 'absolute',
-        left: 16,
-        bottom: 16,
+        left,
+        bottom: compact ? COMPACT_BOTTOM : DESKTOP_BOTTOM,
         zIndex: 12,
         width: 320,
-        maxWidth: 'calc(100vw - 32px)',
+        maxWidth: `calc(100vw - ${left + GUTTER}px)`,
+        // Phone width: full width minus the gutters, nothing beside it.
+        '@media (max-width: 600px)': { left: GUTTER, right: GUTTER, width: 'auto', maxWidth: 'none' },
         p: 1.5,
         borderRadius: 1.5,
         bgcolor: 'rgba(18,20,24,0.86)',
@@ -144,22 +179,11 @@ export function SharedGlbInfoCard({
 
       {info && (
         <>
-          <Box sx={{ height: '1px', bgcolor: 'rgba(255,255,255,0.08)', my: 1 }} />
-
-          {/* Origin — the one row that is always present. */}
-          <Stack direction="row" spacing={0.75} alignItems="center">
-            <Public sx={{ fontSize: 14, color: 'rgba(255,255,255,0.4)' }} />
-            <Typography
-              data-testid="shared-glb-origin"
-              sx={{ fontSize: 11, color: 'rgba(255,255,255,0.6)', overflow: 'hidden', textOverflow: 'ellipsis' }}
-            >
-              loaded from {info.originHost ?? 'an unknown source'}
-            </Typography>
-          </Stack>
+          <Box sx={{ height: '1px', bgcolor: 'rgba(255,255,255,0.08)', my: 1, '&:last-child': { display: 'none' } }} />
 
           {/* Expiry — only when the provider set one (F5). */}
           {meta?.expiresAt && (
-            <Stack direction="row" spacing={0.75} alignItems="center" sx={{ mt: 0.5 }}>
+            <Stack direction="row" spacing={0.75} alignItems="center">
               <HourglassBottom sx={{ fontSize: 14, color: 'rgba(255,255,255,0.4)' }} />
               <Typography data-testid="shared-glb-expiry" sx={{ fontSize: 11, color: 'rgba(255,255,255,0.6)' }}>
                 link expires on {formatExpiry(meta.expiresAt)}

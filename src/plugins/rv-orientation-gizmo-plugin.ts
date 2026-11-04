@@ -49,6 +49,11 @@ const MARGIN_RIGHT_PX = 0;
  *  the gizmo owns the top-right corner. SVG `overflow: visible` keeps labels that
  *  spill out of the box readable. */
 const MARGIN_TOP_PX = 0;
+/** Just below #react-root (`position: fixed; z-index: 1000; pointer-events: none`).
+ *  The gizmo belongs to the 3D viewport, so every HMI window (Problems, Inspector,
+ *  dialogs …) must cover it and swallow its clicks. Where no HMI element sits,
+ *  #react-root lets pointer events through and the cube stays clickable. */
+const GIZMO_Z_INDEX = 999;
 
 /** SVG center coord — bars project outward from here. */
 const CENTER = SIZE_PX / 2;
@@ -321,13 +326,8 @@ export class OrientationGizmoPlugin implements RVViewerPlugin {
     //  - The Projects dashboard: it covers the whole viewport, so the cube
     //    orients nothing and merely overlaps the header controls.
     //
-    // Hiding is the only option available to us, not merely the tidiest one.
-    // The gizmo is a direct child of <body> at z-index 1100, while the dashboard
-    // lives inside #react-root — which is itself `position: fixed; z-index: 1000`
-    // and therefore a stacking context. Every z-index inside it is resolved
-    // against 1000, so no value the dashboard sets can ever rise above 1100.
-    // Raising #react-root instead would lift the entire HMI over every
-    // body-level overlay, which is a much larger change than this problem.
+    // The gizmo now sits below #react-root (see GIZMO_Z_INDEX), so the dashboard
+    // would cover it anyway — hiding still keeps it out of the accessibility tree.
     //
     // Driven from the same ResizeObserver as the positioning, plus the
     // dashboard subscription, so it toggles live in both directions.
@@ -431,7 +431,7 @@ export class OrientationGizmoPlugin implements RVViewerPlugin {
       right: ${MARGIN_RIGHT_PX}px;
       width: ${SIZE_PX}px;
       height: ${SIZE_PX + 30}px;
-      z-index: 1100;
+      z-index: ${GIZMO_Z_INDEX};
       pointer-events: none;
       user-select: none;
       -webkit-user-select: none;

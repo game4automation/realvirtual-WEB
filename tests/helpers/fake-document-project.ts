@@ -168,6 +168,101 @@ export function installFakeDocumentProject(opts: {
   };
 }
 
+// ─── plan-778: a second project as a library ────────────────────────────
+
+/** One document of a {@link fakeLibraryProject}. */
+export interface FakeLibraryDocument {
+  id: string;
+  path: string;
+  name?: string;
+  aliases?: string[];
+  /** Written into the GLB's node name, so a test can tell whose bytes it got. */
+  marker?: string;
+}
+
+export interface FakeLibraryProject {
+  backend: ProjectBackend;
+  manifest: RvProject;
+  /** Object URLs handed out by `readDocumentUrl` and not released yet. */
+  outstandingUrls(): number;
+  /** url → marker of every URL handed out (released ones included). */
+  markers: Map<string, string>;
+  /** The whole library is gone (folder moved / deleted, F8): every following `readDocumentUrl` AND `readManifest` fails. */
+  failReads(fail: boolean): void;
+  /** One file of the library is gone (renamed / deleted) — the manifest still reads. */
+  dropFile(path: string): void;
+  readManifestCalls(): number;
+}
+
+/**
+ * A READ-ONLY project B (plan-778 9.2-9.5): its own manifest (id, name,
+ * `libraries[]`), documents with bytes, `readDocumentUrl` handing out real
+ * object URLs whose release is counted. Never activated — exactly what the
+ * library loader gets from its factory.
+ */
+export function fakeLibraryProject(opts: {
+  id: string;
+  name?: string;
+  documents?: FakeLibraryDocument[];
+  libraries?: RvProject['libraries'];
+  kind?: 'folder' | 'browser' | 'bundled';
+  backendId?: string;
+}): FakeLibraryProject {
+  const rows: RvDocumentEntry[] = (opts.documents ?? []).map((d) => ({
+    id: d.id, path: d.path, name: d.name ?? d.id,
+    ...(d.aliases ? { aliases: d.aliases } : {}),
+  }) as RvDocumentEntry);
+  const bytesByPath = new Map<string, Uint8Array>();
+  for (const d of opts.documents ?? []) bytesByPath.set(d.path, fakeGlb(d.marker ?? `${opts.id}:${d.id}`));
+  const markerByPath = new Map((opts.documents ?? []).map((d) => [d.path, d.marker ?? `${opts.id}:${d.id}`] as const));
+  const manifest = {
+    schemaVersion: 3,
+    id: opts.id,
+    name: opts.name ?? opts.id,
+    documents: rows,
+    ...(opts.libraries ? { libraries: opts.libraries } : {}),
+  } as RvProject;
+  const live = new Set<string>();
+  const markers = new Map<string, string>();
+  let failing = false;
+  let manifestReads = 0;
+  const backend = {
+    kind: opts.kind ?? 'folder',
+    id: opts.backendId ?? `${opts.kind ?? 'folder'}:${opts.id}`,
+    writable: false,
+    isActive: false,
+    async readManifest() { manifestReads++; if (failing) throw new Error('NotFoundError: the folder is gone'); return manifest; },
+    async listDocuments() { return rows.map((r) => ({ ...r })); },
+    async statDocuments() { return []; },
+    async activate() { throw new Error('a library backend is never activated'); },
+    async deactivate() {},
+    async readSettings() { return null; },
+    async readDocument() { return null; },
+    async readDocumentUrl(ref: DocRef) {
+      if (failing) throw new Error('NotFoundError: the folder is gone');
+      const path = docPathOf(ref);
+      const bytes = bytesByPath.get(path);
+      if (!bytes) return null;
+      const url = URL.createObjectURL(new Blob([bytes as unknown as BlobPart], { type: 'model/gltf-binary' }));
+      live.add(url);
+      markers.set(url, markerByPath.get(path) ?? path);
+      return { url, release: () => { if (live.delete(url)) URL.revokeObjectURL(url); } };
+    },
+    async writeDocument() { throw new Error('read-only'); },
+    async deleteDocument() { throw new Error('read-only'); },
+    async flush() {},
+  } as unknown as ProjectBackend;
+  return {
+    backend,
+    manifest,
+    outstandingUrls: () => live.size,
+    markers,
+    failReads: (f) => { failing = f; },
+    dropFile: (path) => { bytesByPath.delete(path); },
+    readManifestCalls: () => manifestReads,
+  };
+}
+
 /** The revision a document's current bytes hash to — the CAS precondition. */
 export async function revisionOfFile(
   fixture: FakeDocumentProject,

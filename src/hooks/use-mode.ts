@@ -18,7 +18,7 @@ import type { ModeId, ModeDescriptor } from '../core/rv-mode-manager';
 export interface UseModeResult {
   /** Active mode id, or null before the first switch. */
   active: ModeId | null;
-  /** Registered modes, sorted by order (for the dropdown). */
+  /** Modes the switcher offers, sorted by order: the registered ones minus those the open document forbids (`documents[].modes`). */
   modes: ModeDescriptor[];
   /**
    * Switch to a mode through the GUARDED path (runs the leaving mode's exit
@@ -36,7 +36,7 @@ export function useMode(): UseModeResult {
   useSyncExternalStore(viewer.modes.subscribe, viewer.modes.getSnapshot);
   return {
     active: viewer.modes.activeMode,
-    modes: viewer.modes.list(),
+    modes: viewer.modes.available(),
     setMode: (id: ModeId) => { void viewer.modes.requestMode(id); },
     locked: viewer.modes.lockedMode !== null,
   };

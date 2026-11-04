@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage, readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * des-run-settings-store.ts — user preferences for DES simulation runs
  * (plan-260): seed mode, checkpoint autosave frequency, retention.
@@ -42,8 +44,8 @@ const DEFAULTS: DesRunSettings = {
 
 function load(): DesRunSettings {
   try {
-    if (typeof localStorage === 'undefined') return DEFAULTS;
-    const raw = localStorage.getItem(STORAGE_KEY);
+    if (getLocalStorage() === null) return DEFAULTS;
+    const raw = readLocalStorage(STORAGE_KEY);
     if (!raw) return DEFAULTS;
     const parsed = JSON.parse(raw) as Partial<DesRunSettings> | null;
     if (!parsed || typeof parsed !== 'object') return DEFAULTS;
@@ -75,10 +77,23 @@ export function getDesRunSettings(): DesRunSettings {
 export function updateDesRunSettings(patch: Partial<DesRunSettings>): void {
   desRunSettingsStore.set((prev) => ({ ...prev, ...patch }));
   try {
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(desRunSettingsStore.getSnapshot()));
+    if (getLocalStorage() !== null) {
+      writeLocalStorage(STORAGE_KEY, JSON.stringify(desRunSettingsStore.getSnapshot()));
     }
   } catch { /* quota / privacy mode — settings stay session-local */ }
+}
+
+/** "Auto-save checkpoints" of the clock window and `des.checkpoints.set`: the interval in sim seconds, 0 = off. */
+export function setCheckpointAutosaveInterval(seconds: number): void {
+  updateDesRunSettings({ autoSaveInterval: Math.max(0, seconds) });
+}
+
+/** "keep newest" of the clock window and `des.checkpoints.set`. Returns false (unchanged) below 1. */
+export function setCheckpointKeep(n: number): boolean {
+  const keep = Math.floor(n);
+  if (!Number.isFinite(keep) || keep < 1) return false;
+  updateDesRunSettings({ checkpointMax: keep });
+  return true;
 }
 
 /** Roll a fresh random seed (auto mode). Positive 31-bit int (GLB-field safe). */

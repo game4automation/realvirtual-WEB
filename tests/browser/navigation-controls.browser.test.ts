@@ -223,7 +223,8 @@ afterEach(async () => {
   if (v.projection !== 'perspective') v.projection = 'perspective';
   v.controls.zoomSpeed = 1;
   if (v.navController) v.navController.wheelZoomToCursor = true;
-  await frames(12); // let a wheel gesture end ('end' after GESTURE_IDLE_MS)
+  await new Promise((r) => setTimeout(r, GESTURE_IDLE_MS + 50));
+  await frames(2); // let a wheel gesture end ('end' after GESTURE_IDLE_MS)
 });
 
 describe('plan-515 Phase 1a — wheel zoom toward the surface (real OrbitControls)', () => {
@@ -568,7 +569,12 @@ describe('plan-515 Phase 1a — wheel zoom toward the surface (real OrbitControl
     v.controls.addEventListener('end', onEnd);
     v.controls.addEventListener('change', onChange);
     try {
-      for (let i = 0; i < 6; i++) { wheel(320, 240, -100); await frame(); }
+      // Keep the burst synchronous so a delayed frame cannot expire the gesture.
+      for (let i = 0; i < 6; i++) {
+        const ev = wheel(320, 240, -100);
+        v.navController!.tick(ev.timeStamp);
+        v.controls.update();
+      }
       expect(starts).toBe(1);
       expect(ends).toBe(0);
       expect(changes).toBeGreaterThanOrEqual(6);

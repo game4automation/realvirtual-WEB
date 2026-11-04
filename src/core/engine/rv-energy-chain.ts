@@ -1047,7 +1047,7 @@ export class RVEnergyChain implements RVComponent {
  * as the float 3.0 — clamped to white — and the `rmPacked` (roughness,
  * metalness) attribute was dropped altogether, which the shader reads as
  * roughness 0: a white, mirror-shiny energy chain on every baked model
- * (Festo, 2026-09-24). Float attributes (an unbaked element with an ordinary
+ * (pick-and-place cell, 2026-09-24). Float attributes (an unbaked element with an ordinary
  * material) pass through unchanged.
  *
  * The source geometry is never touched: a shallow copy carries float versions

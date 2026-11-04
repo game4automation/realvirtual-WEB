@@ -113,6 +113,11 @@ export class RVDriveFollowPosition implements IDriveBehavior, RVComponent {
       'component',
       { slotContext: path },
     );
+    // A slot the reference resolution left as a non-string (a malformed or
+    // unresolved reference object) is unwired, as for every other drive slot —
+    // kept, it would claim the axis every tick and be read as a path.
+    if (typeof this.Position !== 'string') this.Position = null;
+    if (typeof this.CurrentPosition !== 'string') this.CurrentPosition = null;
     this.positionSignalName = this.Position
       ? (context.signalStore.nameForPath(this.Position) ?? this.Position)
       : null;

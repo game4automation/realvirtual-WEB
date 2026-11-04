@@ -195,6 +195,33 @@ const ENTRIES: EntryCase[] = [
     },
   },
   {
+    // plan-774 F2: the asset editor's load (authoring flags) defers its
+    // references like every other load — the reference node is materialised by
+    // the SAME instancer, through the same cache, as the runtime reload above.
+    name: 'editor load (authoring flags, deferred — plan-774)',
+    place: async (w) => {
+      const result = await loadGLB('editor-layout.glb', new Scene(), {
+        data: await layoutBytes('plc_editor'),
+        referenceResolver: (async () => null) as never,
+        deferPlacements: true,
+        preserveHierarchy: true,
+        preserveAuthoringHierarchy: true,
+        bakeRegistry: w.registry,
+        bakePickPort: createPickBuildPort({ createWorker: () => null }),
+        loadKinematicsSidecar: false,
+      });
+      // A second root in the viewer's scene — its own path space next to the layout.
+      result.root.name = 'EditorLayout';
+      w.h.viewer.scene.add(result.root);
+      const entries = collectDeferredPlacements(result.root);
+      expect(entries, 'the editor load left ONE empty, deferred reference node').toHaveLength(1);
+      expect(entries[0].node.children).toHaveLength(0);
+      w.h.plugin.placements.materializeDeferred(entries);
+      await w.h.plugin.placements.whenMaterialized();
+      return entries[0].node;
+    },
+  },
+  {
     name: 'placeFromRecord (restore / undo / op replay)',
     place: async (w) => {
       const rec: PlacedComponent = {
@@ -323,19 +350,41 @@ describe('PlacementInstancer — the primitive itself', () => {
     expect(instancer.sourceOf({ catalogId: 'nothing', glbUrl: '' })).toBeNull();
   });
 
+  it('an UNANCHORED relative path with an asset id goes through the host resolver, not a page-root fetch', async () => {
+    // What resolveReferenceUrl leaves under an opaque base (a document opened from a project,
+    // `rvproject:`): `./assets/vehicles/sedan.glb` stays bare. Fetched as is it 404s against the
+    // page root and the asset id never gets its turn (aXite, 2026-10-31: 0 of 6 materialized).
+    const resolveReference = vi.fn(async () => null);
+    const loader = { loadAsync: async () => ({ scene: makeAsset() }) } as unknown as GLTFLoader;
+    const registry = new BakeRegistry();
+    const instancer = new PlacementInstancer({
+      bakeRegistry: () => registry, loader, uber: () => uber, pickPort: () => createPickBuildPort({ createWorker: () => null }),
+      applyRenderMode: vi.fn(), resolveReference,
+    });
+    const ref = { catalogId: 'doc_vehicle_sedan', glbUrl: 'assets/vehicles/sedan.glb' };
+    expect(instancer.sourceOf(ref), 'no url-keyed source for a bare path').toBeNull();
+    await expect(instancer.resolveBaked(ref)).rejects.toThrow(/resolves to nothing/);
+    expect(resolveReference).toHaveBeenCalledWith(ref);
+    // Anchored paths, and a bare path without an id or without a host resolver, keep the url key.
+    expect(instancer.sourceOf({ catalogId: 'doc_x', glbUrl: '/private-assets/p/a.glb' })?.key).toBe('/private-assets/p/a.glb');
+    expect(instancer.sourceOf({ catalogId: '', glbUrl: 'a.glb' })?.key).toBe('a.glb');
+  });
+
   it('materialize applies overrides AFTER the pivot, and pivot:false keeps the authored frame', async () => {
     const { instancer, renderMode } = makeInstancer();
     const ref = { catalogId: CATALOG_ID, glbUrl: ASSET_URL };
-    const trs: [number, number, number] = [5, 6, 7];
 
-    const split = await instancer.resolveBaked(ref, { forceSplitNodeIds: [PART_ID] });
-    const moved = instancer.createRoot(split);
-    const inst = instancer.materialize(moved, split, {
+    // plan-769: component values only (`trsByNodeId` is gone, F14) — a legacy byPath
+    // resolves in the pivoted instance and comes back as its address.
+    const first = await instancer.resolveBaked(ref);
+    const patched = instancer.createRoot(first);
+    const inst = instancer.materialize(patched, first, {
       id: 'a', label: 'A', catalogId: CATALOG_ID,
-      overrides: { byNodeId: {}, trsByNodeId: { [PART_ID]: { position: trs } } },
+      overrides: { byAddress: {}, legacyByPath: { 'Drive-A': { Drive: { TargetSpeed: 7 } } } },
     });
-    expect(inst.logicNodes.find((n) => n.name === 'Part')!.position.toArray()).toEqual(trs);
-    expect(renderMode).toHaveBeenCalledWith(moved);
+    const driveA = inst.logicNodes.find((n) => n.name === 'Drive-A')!;
+    expect((driveA.userData.realvirtual as { Drive: { TargetSpeed: number } }).Drive.TargetSpeed).toBe(7);
+    expect(renderMode).toHaveBeenCalledWith(patched);
 
     const baked = await instancer.resolveBaked(ref);
     const raw = instancer.createRoot(baked);

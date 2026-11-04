@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
+import { DesExperimentsToolbarButton, DesExperimentWindowHost } from './DesExperimentsButton';
+
 
 /**
  * DESControllerToolbar — the leading sim-control group shown while the DES
@@ -7,7 +9,7 @@
  * (hidden in `mode:des`) so the top-left toolbar always reflects the active
  * execution kernel: Realtime controls outside DES, DES controls inside.
  *
- * One unified toolbar (the old bottom DESControlBar is gone). Layout:
+ * One unified toolbar. Layout:
  *   [ Play/Pause ] | [ Reset ] | [ Animated · Hybrid N× · FastForward · Step ]
  *   | [ time DD:HH:MM:SS.s ] | [ Event Queue ] | [ Save · Load ]
  * plus an inline FastForward progress bar + cancel while a FF run is in flight.
@@ -23,39 +25,55 @@
  * `@rv-private` overlay the DES workspace registers.
  */
 
-import { useState, useCallback, useEffect, useSyncExternalStore, lazy, type MouseEvent } from 'react';
-import { Box, Menu, MenuItem, LinearProgress, TextField, Checkbox, FormControlLabel, Divider, Typography, ToggleButton, ToggleButtonGroup } from '@mui/material';
+import { useState, useCallback, useEffect, useSyncExternalStore, type MouseEvent } from 'react';
+import { Box, Chip, Tooltip, Menu, MenuItem, LinearProgress, TextField, Checkbox, FormControlLabel, Divider, Typography, ToggleButton, ToggleButtonGroup } from '@mui/material';
 import {
-  Speed, FastForward, SkipNext, Close, Schedule, Science,
+  Speed, FastForward, SkipNext, Close, Schedule, CheckCircleOutline, WarningAmber,
 } from '@mui/icons-material';
 import type { UISlotProps } from '../../core/rv-ui-plugin';
 import { ActionSegment, ActionDivider } from '../../core/hmi/action-group';
+import { useCommandView } from '../../core/hmi/rv-command-view';
+import { ensureDesRunCommandsRegistered } from '../../core/hmi/des-run-commands';
+import { ensureDesPlcCommandsRegistered } from '../../core/hmi/des-plc-commands';
 import { useKernelSnapshot } from '../../hooks/use-kernel-snapshot';
 import { PlayPauseSegment, ResetSegment } from './SimControllerToolbar';
-import type { SimSubMode, SimDesControl } from '../../core/material-flow/simulation-kernel';
-import { ensureDesManagerNode, persistDesEndTime, persistDesStatReset, persistDesMasterSeed } from '../../core/material-flow/des-manager-node';
-import { formatSimClock, formatDesDuration, parseDesDuration } from './format-sim-time';
+import type { SimDesControl } from '../../core/material-flow/simulation-kernel';
+import { ensureDesManagerNode, persistDesEndTime, persistDesStatReset, applyDesMasterSeed } from '../../core/material-flow/des-manager-node';
+import { formatSimClock, formatDesDuration, parseDesDuration, formatRunFinishedTime } from './format-sim-time';
+import { setDesStatsWindowOpen } from './des-stats-window-store';
 import { FloatingPanel } from '../../core/hmi/FloatingPanel';
-import { desRunSettingsStore, updateDesRunSettings, type SeedMode } from '../../core/hmi/des-run-settings-store';
+import { desRunSettingsStore, updateDesRunSettings, setCheckpointAutosaveInterval, setCheckpointKeep, type SeedMode } from '../../core/hmi/des-run-settings-store';
 import { ensureActiveScope } from '../../core/material-flow/rv-project-manager';
-import { LazyPanelBoundary } from '../../core/hmi/LazyPanelBoundary';
-import {
-  desMatrixWindowStore, closeDesMatrixWindow, toggleDesMatrixWindow,
-} from './des-matrix-window-store';
 
-/**
- * The Experiment Matrix is a 46 KB panel that most sessions never open, so it is
- * code-split out of the startup path (plan-344 Phase 4). `lazy()` alone would NOT
- * achieve that: the toolbar used to render the panel UNCONDITIONALLY and let the
- * `open` prop decide visibility, which means the chunk would be requested the
- * moment the toolbar first renders. The `matrixEverOpened || runsOpen` gate below
- * is the part that actually keeps it out of the initial load.
- */
-const DESExperimentMatrixPanel = lazy(() =>
-  import('./DESExperimentMatrixPanel').then((m) => ({ default: m.DESExperimentMatrixPanel })));
+ensureDesRunCommandsRegistered();
+
+ensureDesPlcCommandsRegistered();
 
 /** Play-speed factors: 1× = real-time (animated), higher = time-lapse (hybrid). */
 const SPEED_FACTORS = [1, 5, 10, 50] as const;
+
+function SpeedMenuItem({ viewer, factor, selected, onClose, autoFocus, tabIndex }: {
+  autoFocus?: boolean; tabIndex?: number;
+  viewer: UISlotProps['viewer']; factor: number; selected: boolean; onClose: () => void;
+}) {
+  const view = useCommandView({
+    id: 'des.setMode', viewer, buttonKey: `des.speed.${factor}`,
+    args: () => factor === 1 ? { subMode: 'animated' } : { subMode: 'hybrid', multiplier: factor },
+  });
+  return (
+    <MenuItem
+      {...view.dataAttrs}
+      autoFocus={autoFocus}
+      tabIndex={tabIndex}
+      selected={selected}
+      disabled={view.disabled}
+      onClick={() => { view.onClick(); onClose(); }}
+      sx={{ fontSize: 13, minHeight: 0, py: 0.5, justifyContent: 'center' }}
+    >
+      {factor}×
+    </MenuItem>
+  );
+}
 
 // Duration format/parse moved to format-sim-time.ts (shared with the matrix);
 // re-exported here so existing importers keep working.
@@ -80,6 +98,16 @@ function TimeField({ defaultValue, onChange, helper }: {
   );
 }
 
+/** Explanation in the run-state chip tooltip (replaces the former bottom notice). */
+function runFinishedTooltip(r: { runState: string; reason: string; endTime: number; finishedAt: number | null }): string {
+  const at = formatRunFinishedTime(r.finishedAt ?? 0);
+  if (r.runState === 'stalled') return `No more events at ${at}, before the end time. Reset to run again.`;
+  if (r.reason === 'duration-reached') {
+    return `End time ${formatRunFinishedTime(r.endTime)} reached, not blocked. Press Play to continue; Reset starts again.`;
+  }
+  return `No more events at ${at}, the run is complete. Reset to run again.`;
+}
+
 export function DESControllerToolbar({ viewer }: UISlotProps) {
   const snap = useKernelSnapshot(viewer);
   const [hybridAnchor, setHybridAnchor] = useState<HTMLElement | null>(null);
@@ -90,30 +118,13 @@ export function DESControllerToolbar({ viewer }: UISlotProps) {
     [viewer],
   );
 
-  const handleSubMode = useCallback(
-    (m: SimSubMode) => { desControl()?.setSubMode(m); },
-    [desControl],
-  );
-
-  // FastForward is a TOGGLE: click → FF (max throughput, no animation); click again
-  // → back to the mode you came from (e.g. Hybrid 5×), so you can dip into FF and
-  // return WITHOUT re-picking the speed in the dropdown. The pre-FF sub-mode lives
-  // on the runner (`preFastForwardSubMode`), so it survives toolbar remounts and
-  // covers FF entries from other paths (MCP, persisted mode); the multiplier-based
-  // fallback covers runners without that surface.
-  const handleFastForwardToggle = useCallback(() => {
-    const ctl = desControl();
-    if (!ctl) return;
-    if (snap.subMode === 'fastforward') {
-      ctl.setSubMode(ctl.preFastForwardSubMode ?? (snap.multiplier > 1 ? 'hybrid' : 'animated'));
-    } else {
-      ctl.setSubMode('fastforward');
-    }
-  }, [desControl, snap.subMode, snap.multiplier]);
-
   // ── Clock settings (sim end + statistics-reset) ──
   // Each change updates BOTH the live manager (desControl) AND the scene's
   // DESManager component (durable setField op) so the values survive a reload.
+  // The FIRST edit creates the `Simulation` node (plan-616 Teil 1 — mode entry
+  // only reads): `ensureDesManagerNode` queues its `addNode` op, the persister
+  // then queues the `setField`, and the document's single-flight op queue runs
+  // them in that call order, so no await is needed between the two.
   const [clockOpen, setClockOpen] = useState(false);
   const endInfinite = !Number.isFinite(snap.endTime);
   const setEndInfinite = useCallback((infinite: boolean) => {
@@ -135,17 +146,8 @@ export function DESControllerToolbar({ viewer }: UISlotProps) {
 
   // ── Seed + run settings (plan-260) ──
   const runSettings = useSyncExternalStore(desRunSettingsStore.subscribe, desRunSettingsStore.getSnapshot);
-  // Shared open-state: the private DES side-tool button toggles the SAME window.
-  const runsOpen = useSyncExternalStore(desMatrixWindowStore.subscribe, desMatrixWindowStore.getSnapshot);
-  // `hasLoaded || open`, NOT a plain `open &&` (plan-344 Phase 4): the matrix
-  // holds real user state — the experiment list, batch progress, the CRN flag and
-  // half-typed parameter input. Unmounting it on close would silently discard all
-  // of that, a behaviour regression dressed up as a performance patch. So it is
-  // loaded on FIRST open and then stays mounted, exactly as before, and only the
-  // startup cost is removed.
-  const [matrixEverOpened, setMatrixEverOpened] = useState(false);
-  useEffect(() => { if (runsOpen) setMatrixEverOpened(true); }, [runsOpen]);
   const currentSeed = desControl()?.masterSeed ?? 42;
+  const [seedError, setSeedError] = useState<string | null>(null);
 
   // Bootstrap the run scope (default project + experiment by glb fingerprint)
   // once a DES runner is active — the private lifecycle archives into it.
@@ -154,10 +156,10 @@ export function DESControllerToolbar({ viewer }: UISlotProps) {
   }, [snap.hasDes, snap.mode, viewer]);
 
   const setSeedValue = useCallback((v: string) => {
-    const seed = Math.floor(Number(v));
-    if (!Number.isFinite(seed) || seed <= 0) return;
-    desControl()?.setMasterSeed?.(seed);
-    persistDesMasterSeed(ensureDesManagerNode(viewer), seed);
+    // A refused seed (a variant is in the scene) or a failed scene write is shown under the field;
+    // an incomplete entry while typing is not.
+    void applyDesMasterSeed(viewer, desControl(), Number(v))
+      .then(r => setSeedError(r.ok || r.code === 'invalid' ? null : r.reason));
   }, [desControl, viewer]);
 
   const setSeedMode = useCallback((mode: SeedMode | null) => {
@@ -166,26 +168,12 @@ export function DESControllerToolbar({ viewer }: UISlotProps) {
 
   const setAutoSave = useCallback((v: string) => {
     const seconds = parseDesDuration(v) ?? 0; // empty → off (0)
-    updateDesRunSettings({ autoSaveInterval: Math.max(0, seconds) });
+    setCheckpointAutosaveInterval(seconds);
   }, []);
 
   const setKeepN = useCallback((v: string) => {
-    const n = Math.floor(Number(v));
-    if (Number.isFinite(n) && n >= 1) updateDesRunSettings({ checkpointMax: n });
+    setCheckpointKeep(Number(v));
   }, []);
-
-  // ONE speed selector replaces the old Animated + Hybrid buttons: 1× = real-time
-  // ("animated"), any higher factor = time-lapse ("hybrid"). Running the DES is the
-  // standard Play; this only picks HOW FAST.
-  const handleSpeedPick = useCallback(
-    (n: number) => {
-      const ctl = desControl();
-      if (n === 1) ctl?.setSubMode('animated');
-      else { ctl?.setMultiplier(n); ctl?.setSubMode('hybrid'); }
-      setHybridAnchor(null);
-    },
-    [desControl],
-  );
 
   const handleStep = useCallback(() => {
     const ctl = desControl();
@@ -224,7 +212,7 @@ export function DESControllerToolbar({ viewer }: UISlotProps) {
           />
           <ActionSegment
             title="Fast Forward (max throughput, no animation) — click again to return to the previous speed"
-            onClick={handleFastForwardToggle}
+            command={{ id: 'des.fastForward', viewer }}
             active={snap.subMode === 'fastforward'}
             icon={<FastForward />}
             buttonProps={{ 'data-testid': 'des-submode-fastforward' }}
@@ -258,16 +246,25 @@ export function DESControllerToolbar({ viewer }: UISlotProps) {
             {endInfinite && <Box component="span" sx={{ fontSize: 13, color: 'text.disabled', lineHeight: 1 }}>∞</Box>}
           </Box>
 
-          {/* Experiments — first-class toolbar entry to THE Experiment Matrix
-              window (plan-265). Same icon as the private side-tool toggle so
-              both paths read as the same feature. */}
-          <ActionSegment
-            title="Experiments — run matrix (experiments × parameters × KPIs)"
-            onClick={toggleDesMatrixWindow}
-            active={runsOpen}
-            icon={<Science />}
-            buttonProps={{ 'data-testid': 'des-runs-open' }}
-          />
+          {(snap.runState.runState === 'finished' || snap.runState.runState === 'stalled') && (
+            <Tooltip title={runFinishedTooltip(snap.runState)}>
+              <Chip
+                data-testid="des-run-state"
+                size="small"
+                variant="outlined"
+                color={snap.runState.runState === 'finished' ? 'success' : 'warning'}
+                icon={snap.runState.runState === 'finished' ? <CheckCircleOutline /> : <WarningAmber />}
+                label={`${snap.runState.runState === 'finished' ? 'Run finished' : 'No more events'} · ${formatRunFinishedTime(
+                  snap.runState.reason === 'duration-reached' ? snap.runState.endTime : snap.runState.finishedAt ?? 0,
+                )}`}
+                onClick={() => setDesStatsWindowOpen(true)}
+              />
+            </Tooltip>
+          )}
+          {/* Experiments — first-class toolbar entry to THE Experiment Matrix window
+              (plan-265). Core button; without the commercial experiment manager it shows
+              the commercial notice (plan-2211 G5). */}
+          <DesExperimentsToolbarButton viewer={viewer} />
 
           {/* Event Queue + Save/Load snapshot moved to the side DES tool menu. */}
 
@@ -281,14 +278,13 @@ export function DESControllerToolbar({ viewer }: UISlotProps) {
             transformOrigin={{ vertical: 'top', horizontal: 'center' }}
           >
             {SPEED_FACTORS.map((n) => (
-              <MenuItem
+              <SpeedMenuItem
                 key={n}
+                viewer={viewer}
+                factor={n}
                 selected={n === 1 ? snap.subMode === 'animated' : (snap.subMode === 'hybrid' && snap.multiplier === n)}
-                onClick={() => handleSpeedPick(n)}
-                sx={{ fontSize: 13, minHeight: 0, py: 0.5, justifyContent: 'center' }}
-              >
-                {n}×
-              </MenuItem>
+                onClose={() => setHybridAnchor(null)}
+              />
             ))}
           </Menu>
 
@@ -353,6 +349,8 @@ export function DESControllerToolbar({ viewer }: UISlotProps) {
                   defaultValue={String(currentSeed)}
                   disabled={runSettings.seedMode === 'auto'}
                   onChange={(e) => setSeedValue(e.target.value)}
+                  error={!!seedError}
+                  helperText={seedError ?? undefined}
                   inputProps={{
                     'data-testid': 'des-seed-input',
                     style: { fontFamily: 'ui-monospace, monospace', fontSize: 13, textAlign: 'center', padding: '6px 8px' },
@@ -395,13 +393,9 @@ export function DESControllerToolbar({ viewer }: UISlotProps) {
             </Box>
           </FloatingPanel>
 
-          {/* THE single DES Experiment Matrix window (plan-265), code-split and
-              gated so its chunk is fetched on the first open only. */}
-          {(matrixEverOpened || runsOpen) && (
-            <LazyPanelBoundary label="Experiment Matrix">
-              <DESExperimentMatrixPanel viewer={viewer} open={runsOpen} onClose={closeDesMatrixWindow} />
-            </LazyPanelBoundary>
-          )}
+          {/* THE single DES Experiment Matrix window, rendered by the experiment manager's
+              host (own chunk, fetched on the first open only). */}
+          <DesExperimentWindowHost viewer={viewer} />
 
           {/* FastForward progress + cancel (only while a FF run is in flight). */}
           {snap.ffProgress !== null && (

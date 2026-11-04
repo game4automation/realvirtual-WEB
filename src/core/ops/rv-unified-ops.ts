@@ -35,6 +35,8 @@
  *      group. Neither can express the other without loss. Both kinds live on.
  *
  * Net: 25 primitives + `composite`. (14 + 14 − 2 identical − 1 merged.)
+ * plan-621 added a 26th, the asset-lineage `replaceNodeGeometry` — a new kind,
+ * not a merge; the arithmetic above describes the union plan-703 built.
  *
  * Pure module — no Three.js, no DOM, no storage. Application to a live scene is
  * `rv-unified-executors.ts`; the queue/undo machinery is `rv-document.ts`.
@@ -61,12 +63,14 @@ import type {
   DeleteNodeOp,
   SetNodeVisibleOp,
   CreateNodeOp,
+  CloneNodeOp,
   ReparentNodeOp,
   AddComponentOp,
   RemoveComponentOp,
   SetMaterialOp,
   SeparateMeshOp,
   MergeMeshOp,
+  ReplaceNodeGeometryOp,
 } from '../editor/rv-asset-ops';
 import { COALESCE_WINDOW_MS, deepCloneJSON, freshOpId } from './rv-op-utils';
 
@@ -183,6 +187,10 @@ export type RvSetMaterialOp = WithHeader<SetMaterialOp>;
 export type RvSeparateMeshOp = WithHeader<SeparateMeshOp>;
 /** origin: asset */
 export type RvMergeMeshOp = WithHeader<MergeMeshOp>;
+/** origin: asset — a mesh node's geometry, swapped by cache hash (plan-621). */
+export type RvReplaceNodeGeometryOp = WithHeader<ReplaceNodeGeometryOp>;
+/** origin: asset — deep copy of a live subtree (plan-641 Phase 3). */
+export type RvCloneNodeOp = WithHeader<CloneNodeOp>;
 
 // ─── Composite ──────────────────────────────────────────────────────────
 
@@ -199,6 +207,24 @@ export interface RvOpMeta {
    * replaying only the model part.
    */
   journalId?: string;
+  /**
+   * plan-610: this composite is a reference-safe rename/move as a WHOLE
+   * (structure ops + the `setField` steps that rewrite the referrers). The
+   * asset executor defers the referrers' schema re-apply + reference
+   * resolution to the END of the composite and re-binds foreign referrers
+   * there — forward, inverse and rollback. Absent on every other composite
+   * (their behaviour is unchanged).
+   */
+  referenceRewrite?: true;
+  /**
+   * plan-610: index ranges `[start, endExclusive]` of the reference-rewrite
+   * GROUPS inside this composite's op list. Written when a marked composite is
+   * flattened into a transaction entry next to unmarked siblings: only the ops
+   * of a range run in a deferred re-bind session, the siblings keep today's
+   * immediate behaviour (e.g. `Drive.Offset` + `transformNode`). A composite
+   * carrying {@link referenceRewrite} is the special case "one range over all".
+   */
+  referenceRewriteRanges?: Array<[number, number]>;
 }
 
 /** origin: both — same form in both vocabularies; composites never nest. */
@@ -208,6 +234,39 @@ export interface RvCompositeOp extends RvOpHeader {
   ops: RvPrimitiveOp[];
   /** Optional entry metadata (plan-590) — absent on every ordinary composite. */
   meta?: RvOpMeta;
+}
+
+/** plan-610: does this op carry a reference-rewrite marker (whole composite or ranges)? */
+export function isReferenceRewriteOp(op: RvOp | null | undefined): boolean {
+  return referenceRewriteRangesOf(op).length > 0;
+}
+
+/**
+ * plan-610: the reference-rewrite ranges of a composite, normalised — `[[0, n]]`
+ * for a wholly marked one, the validated (in bounds, non-empty, ascending,
+ * non-overlapping) `referenceRewriteRanges` otherwise, `[]` for anything else.
+ * A malformed persisted range is dropped rather than trusted: a range over the
+ * wrong ops would re-order their configuration effects.
+ */
+export function referenceRewriteRangesOf(op: RvOp | null | undefined): ReadonlyArray<readonly [number, number]> {
+  if (!op || op.kind !== 'composite' || op.ops.length === 0) return [];
+  const n = op.ops.length;
+  if (op.meta?.referenceRewrite === true) return [[0, n]];
+  const raw: unknown = op.meta?.referenceRewriteRanges;
+  if (!Array.isArray(raw)) return [];
+  const out: Array<readonly [number, number]> = [];
+  let floor = 0;
+  for (const r of raw as unknown[]) {
+    if (!Array.isArray(r) || r.length !== 2) continue;
+    const [start, end] = r as [unknown, unknown];
+    if (!Number.isInteger(start) || !Number.isInteger(end)) continue;
+    const s = start as number;
+    const e = end as number;
+    if (s < floor || e <= s || e > n) continue;
+    out.push([s, e]);
+    floor = e;
+  }
+  return out;
 }
 
 /** The signal-rename journal id of a history entry, if it carries one (plan-590). */
@@ -248,7 +307,9 @@ export type RvPrimitiveOp =
   | RvRemoveComponentOp
   | RvSetMaterialOp
   | RvSeparateMeshOp
-  | RvMergeMeshOp;
+  | RvMergeMeshOp
+  | RvReplaceNodeGeometryOp
+  | RvCloneNodeOp;
 
 /** Anything that may appear in an {@link RvDocument} op log. */
 export type RvOp = RvPrimitiveOp | RvCompositeOp;
@@ -295,6 +356,9 @@ const RV_OP_ORIGIN_TABLE = {
   setMaterial: 'asset',
   separateMesh: 'asset',
   mergeMesh: 'asset',
+  replaceNodeGeometry: 'asset',
+  // plan-641 Phase 3: a 27th kind (asset lineage), the subtree copy of `editor.clone`.
+  cloneNode: 'asset',
 } as const;
 
 export const RV_OP_ORIGIN: Readonly<Record<RvOpKind, RvOpOrigin>> = Object.freeze(RV_OP_ORIGIN_TABLE);
@@ -350,7 +414,9 @@ function compositeOf(label: string, ops: RvPrimitiveOp[], meta?: RvOpMeta): RvCo
   const op: RvCompositeOp = { id: freshOpId(), ts: Date.now(), schemaV: 1, kind: 'composite', label, ops };
   // Only a meta that says something is written: an ordinary composite keeps
   // exactly its old shape (persisted logs, op-equality tests).
-  if (meta && meta.journalId) op.meta = { ...meta };
+  if (meta && (meta.journalId || meta.referenceRewrite || (meta.referenceRewriteRanges?.length ?? 0) > 0)) {
+    op.meta = { ...meta };
+  }
   return op;
 }
 
@@ -474,6 +540,11 @@ export function canCoalesceRvOps(last: RvOp, next: RvOp): boolean {
       return a.nodePaths.length === next.nodePaths.length
         && a.nodePaths.every((p, i) => p === next.nodePaths[i]);
     }
+    // plan-621: an absolute setter of one node's geometry. Same node AND the
+    // same cache namespace, so `prevSha256` of the first and `sha256` of the
+    // newest address one cache, and one undo returns to the first geometry.
+    case 'replaceNodeGeometry':
+      return sameGeometryTarget(last as RvReplaceNodeGeometryOp, next);
     // Structural / discrete user actions — never coalesce, in EITHER lineage.
     case 'addPlacement':
     case 'removePlacement':
@@ -491,6 +562,7 @@ export function canCoalesceRvOps(last: RvOp, next: RvOp): boolean {
     case 'removeComponent':
     case 'separateMesh':
     case 'mergeMesh':
+    case 'cloneNode':
       return false;
   }
 }
@@ -526,9 +598,168 @@ export function mergeRvOps(last: RvOp, next: RvOp): RvOp {
       return { ...(last as RvRenameNodeOp), name: next.name };
     case 'setMaterial':
       return { ...(last as RvSetMaterialOp), material: deepCloneJSON(next.material) };
+    case 'replaceNodeGeometry':
+      // `prevSha256` of the FIRST stays (the undo target), `sha256` of the newest wins.
+      return { ...(last as RvReplaceNodeGeometryOp), sha256: next.sha256 };
     default:
       throw new Error(`mergeRvOps: ${next.kind} never coalesces`);
   }
+}
+
+/** Same node and the same cache namespace — the coalescing target of `replaceNodeGeometry`. */
+function sameGeometryTarget(a: RvReplaceNodeGeometryOp, b: RvReplaceNodeGeometryOp): boolean {
+  return a.nodePath === b.nodePath && a.quality === b.quality && a.converter === b.converter
+    && JSON.stringify(a.sharedNodePaths ?? []) === JSON.stringify(b.sharedNodePaths ?? []);
+}
+
+// ─── Keyed composite coalescing (plan-621, Spike (b) V2 "keyed amend") ──
+//
+// Two consecutive transaction entries that carry the same coalesce key (one
+// live CAD-sync session, say) become ONE undo entry. Pure function; the guards
+// (key, sliding window, clean point, chain break) live in
+// `RvDocument._recordKeyed`.
+//
+// Merge = "amend the top entry": `next`'s children are appended to `top`,
+// EXCEPT a child that is an absolute state SETTER whose target already has a
+// setter in the entry and that COMMUTES with every op standing between that
+// setter and the end of the entry. Such a child is FOLDED into the earlier
+// setter (keeps that setter's id and `prev`, takes the child's forward payload)
+// — the rule `mergeRvOps` applies to adjacent primitives. The folded child's id
+// leaves the history; it is returned in `absorbed` so the executor can drop
+// what it stashed for it (the intermediate material / geometry no undo reaches).
+//
+// Reference-rewrite ranges are never folded into or across; they are carried
+// over with their indices shifted to where their ops land.
+
+/** Kinds that set an absolute state of exactly one target. */
+const SETTER_KINDS: ReadonlySet<RvOpKind> = new Set<RvOpKind>([
+  'transformNode', 'setField', 'setMaterial', 'replaceNodeGeometry',
+]);
+
+/** The node path(s) a setter writes to. */
+function setterPaths(op: RvPrimitiveOp): readonly string[] {
+  switch (op.kind) {
+    case 'transformNode':
+    case 'setField':
+      return [op.nodePath];
+    case 'replaceNodeGeometry':
+      return [op.nodePath, ...(op.sharedNodePaths ?? [])];
+    case 'setMaterial':
+      return op.nodePaths;
+    default:
+      return [];
+  }
+}
+
+/** Same target in the `mergeRvOps` sense (the time window is the document's business). */
+function sameSetterTarget(a: RvPrimitiveOp, b: RvPrimitiveOp): boolean {
+  if (a.kind !== b.kind) return false;
+  switch (b.kind) {
+    case 'transformNode':
+      return (a as RvTransformNodeOp).nodePath === b.nodePath;
+    case 'setField': {
+      const x = a as RvSetFieldOp;
+      return x.nodePath === b.nodePath && x.componentType === b.componentType && x.fieldName === b.fieldName;
+    }
+    case 'setMaterial': {
+      const x = a as RvSetMaterialOp;
+      return x.nodePaths.length === b.nodePaths.length && x.nodePaths.every((p, i) => p === b.nodePaths[i]);
+    }
+    case 'replaceNodeGeometry':
+      return sameGeometryTarget(a as RvReplaceNodeGeometryOp, b);
+    default:
+      return false;
+  }
+}
+
+/** Same node, an ancestor or a descendant. */
+function relatedPaths(p: string, q: string): boolean {
+  return p === q || p.startsWith(q + '/') || q.startsWith(p + '/');
+}
+
+/**
+ * May `a` and `b` swap their order without changing the end state? Conservative:
+ *  - both must be setters, on different targets (the same target is the fold);
+ *  - a `setField` RE-APPLIES its component, which may move its node
+ *    (`Drive.Offset`, pinned in rewrite-composite-isolation.test.ts) or measure
+ *    its geometry (collider / sensor bounds) — so a `setField` never commutes
+ *    with a `transformNode` or a `replaceNodeGeometry` on a related node.
+ */
+function setterCommutes(a: RvPrimitiveOp, b: RvPrimitiveOp): boolean {
+  if (!SETTER_KINDS.has(a.kind) || !SETTER_KINDS.has(b.kind)) return false;
+  if (sameSetterTarget(a, b)) return false;
+  const reapplies = (x: RvPrimitiveOp, y: RvPrimitiveOp): boolean =>
+    x.kind === 'setField' && (y.kind === 'transformNode' || y.kind === 'replaceNodeGeometry');
+  if (reapplies(a, b) || reapplies(b, a)) {
+    for (const p of setterPaths(a)) for (const q of setterPaths(b)) if (relatedPaths(p, q)) return false;
+  }
+  return true;
+}
+
+/** Result of {@link foldKeyedComposite}. */
+export interface KeyedCompositeFold {
+  merged: RvCompositeOp;
+  /** Ids of `next`'s children that were folded away — their executor stash is garbage. */
+  absorbed: string[];
+  /** How many of `next`'s children were appended (not folded). */
+  appended: number;
+}
+
+/**
+ * Amend `top` with `next` (two transaction entries of the same coalesce key).
+ *
+ * Returns null when the two must stay separate entries: a journaled entry
+ * (plan-590) is undone by the history interceptor and addressed by its id, so
+ * neither side of a merge may carry one. The merged entry keeps `top`'s id, ts
+ * and label.
+ */
+export function foldKeyedComposite(top: RvCompositeOp, next: RvCompositeOp): KeyedCompositeFold | null {
+  if (journalIdOf(top) || journalIdOf(next)) return null;
+  const out: RvPrimitiveOp[] = [...top.ops];
+  const topRanges = referenceRewriteRangesOf(top);
+  const inRange: boolean[] = out.map(() => false);
+  for (const [s, e] of topRanges) for (let i = s; i < e; i++) inRange[i] = true;
+  const nextRanges = referenceRewriteRangesOf(next);
+  const nextInRange = (j: number): boolean => nextRanges.some(([s, e]) => j >= s && j < e);
+  const newIndexOf: number[] = [];
+  const absorbed: string[] = [];
+
+  for (let j = 0; j < next.ops.length; j++) {
+    const c = next.ops[j];
+    let folded = false;
+    if (SETTER_KINDS.has(c.kind) && !nextInRange(j)) {
+      // The newest setter of the same target in the entry so far.
+      let k = -1;
+      for (let i = out.length - 1; i >= 0; i--) if (sameSetterTarget(out[i], c)) { k = i; break; }
+      if (k >= 0 && !inRange[k]) {
+        let clear = true;
+        for (let i = k + 1; i < out.length && clear; i++) {
+          if (inRange[i] || !setterCommutes(out[i], c)) clear = false;
+        }
+        if (clear) {
+          out[k] = mergeRvOps(out[k], c) as RvPrimitiveOp;
+          absorbed.push(c.id);
+          folded = true;
+        }
+      }
+    }
+    if (!folded) {
+      newIndexOf[j] = out.length;
+      out.push(c);
+      inRange.push(nextInRange(j));
+    }
+  }
+
+  // Ranges: top's stay where they were (a fold replaces in place); next's
+  // children inside a range are never folded, so each of its ranges landed
+  // contiguously and only moves. Adjacent ranges stay separate sessions.
+  const ranges: Array<[number, number]> = topRanges.map(([s, e]) => [s, e]);
+  for (const [s, e] of nextRanges) ranges.push([newIndexOf[s], newIndexOf[e - 1] + 1]);
+
+  const merged: RvCompositeOp = { ...top, ops: out };
+  delete merged.meta;
+  if (ranges.length > 0) merged.meta = { referenceRewriteRanges: ranges };
+  return { merged, absorbed, appended: next.ops.length - absorbed.length };
 }
 
 // ─── Hierarchy classification ───────────────────────────────────────────
@@ -553,6 +784,7 @@ export function rvOpTouchesHierarchy(op: RvOp): boolean {
     case 'removeComponent':
     case 'separateMesh':
     case 'mergeMesh':
+    case 'cloneNode':
       return true;
     default:
       return false;
@@ -596,6 +828,8 @@ export function describeRvOp(op: RvOp): string {
     case 'separateMesh':      return `Separate ${leaf(op.sourcePath)} (${op.childNames.length} parts)`;
     case 'mergeMesh':
       return `Merge ${leaf(op.rootPath)} (${op.sourcePaths.length} → ${op.outputs.length} mesh${op.outputs.length === 1 ? '' : 'es'})`;
+    case 'replaceNodeGeometry': return `Update geometry of ${leaf(op.nodePath)}`;
+    case 'cloneNode':         return `Clone ${leaf(op.sourcePath)} → ${leaf(op.nodePath)}`;
     case 'composite':         return op.label;
   }
 }

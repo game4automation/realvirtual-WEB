@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { listLocalStorageKeys, readLocalStorage, removeLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * Persistence for user plugin overrides (plan-435 Phase 3).
  *
@@ -72,7 +74,7 @@ function storageKey(scope: string): string {
  */
 export function loadOverrides(scope: string): string[] {
   try {
-    const raw = localStorage.getItem(storageKey(scope));
+    const raw = readLocalStorage(storageKey(scope));
     if (!raw) return [];
     const parsed = JSON.parse(raw) as Partial<PluginOverrideRecord> | null;
     if (!parsed || parsed.v !== 1 || !Array.isArray(parsed.disabled)) return [];
@@ -94,11 +96,11 @@ export function saveOverrides(scope: string, ids: readonly string[]): void {
   const disabled = ids.filter((id) => !isPluginOverrideProtected(id));
   try {
     if (disabled.length === 0) {
-      localStorage.removeItem(storageKey(scope));
+      removeLocalStorage(storageKey(scope));
       return;
     }
     const record: PluginOverrideRecord = { v: 1, disabled };
-    localStorage.setItem(storageKey(scope), JSON.stringify(record));
+    writeLocalStorage(storageKey(scope), JSON.stringify(record));
   } catch {
     // Private mode or quota: the session keeps its in-memory overrides.
   }
@@ -106,11 +108,7 @@ export function saveOverrides(scope: string, ids: readonly string[]): void {
 
 /** Drop the stored overrides for a scope (RESET button, `?resetPlugins=1`). */
 export function clearOverrides(scope: string): void {
-  try {
-    localStorage.removeItem(storageKey(scope));
-  } catch {
-    // Nothing persisted, nothing to clear.
-  }
+  removeLocalStorage(storageKey(scope));
 }
 
 /**
@@ -122,11 +120,10 @@ export function clearOverrides(scope: string): void {
 export function clearAllOverrides(): void {
   try {
     const keys: string[] = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
+    for (const key of listLocalStorageKeys()) {
       if (key?.startsWith(LS_KEY_PLUGIN_OVERRIDES_PREFIX)) keys.push(key);
     }
-    for (const key of keys) localStorage.removeItem(key);
+    for (const key of keys) removeLocalStorage(key);
   } catch {
     // Storage unavailable — nothing was persisted either.
   }

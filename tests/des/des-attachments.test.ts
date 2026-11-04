@@ -1,18 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { testAddressRegistry } from '../helpers/test-address-registry';
+
+import { componentState } from './snapshot-test-utils';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { BoxGeometry, Mesh, Object3D } from 'three';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
-import { MaterialFlowAdapter } from '@rv-private/plugins/des/material-flow-adapter';
-import { Downtime } from '@rv-private/plugins/des/material-flow/Downtime';
-import { Processing } from '@rv-private/plugins/des/material-flow/Processing';
-import { IndexingConveyor } from '@rv-private/plugins/des/material-flow/IndexingConveyor';
-import { PathTransport } from '@rv-private/plugins/des/material-flow/PathTransport';
-import { RobotHandling } from '@rv-private/plugins/des/material-flow/RobotHandling';
-import { loadMUOnCarrier } from '@rv-private/plugins/des/rv-des-component';
-import { _resetDesHookCache } from '@rv-private/plugins/des/des-hook-adapter';
-import { resetDESMUCounter, type DESMU } from '@rv-private/plugins/des/rv-des-mu';
+import { DESRunner } from '@rv/plugins/des/des-runner';
+import { MaterialFlowAdapter } from '@rv/plugins/des/material-flow-adapter';
+import { Downtime } from '@rv/plugins/des/material-flow/Downtime';
+import { Processing } from '@rv/plugins/des/material-flow/Processing';
+import { IndexingConveyor } from '@rv/plugins/des/material-flow/IndexingConveyor';
+import { PathTransport } from '@rv/plugins/des/material-flow/PathTransport';
+import { RobotHandling } from '@rv/plugins/des/material-flow/RobotHandling';
+import { loadMUOnCarrier } from '@rv/plugins/des/rv-des-component';
+import { _resetDesHookCache } from '@rv/plugins/des/des-hook-adapter';
+import { resetDESMUCounter, type DESMU } from '@rv/plugins/des/rv-des-mu';
 import { ConveyorFlow } from '../../src/behaviors/Conveyor';
 import {
   createSelf,
@@ -83,7 +86,7 @@ function host(drives: unknown[] = []): BindContextHost {
     on: (event, callback) => events.on(event, callback as never),
     contextMenu: new ContextMenuStore(),
     drives: drives as never,
-    registry: null,
+    registry: null, desAddresses: testAddressRegistry(),
     getPlugin: () => undefined,
   };
 }
@@ -119,7 +122,7 @@ function bindNode(
     })(),
   });
   Object.assign(self.prop, config);
-  adapter = runner.addInstance(def, self, node);
+  adapter = runner.addInstance(def, self, node, undefined, { desId: node.name + '@' + def.type });
   return { def, self, adapter, node };
 }
 
@@ -186,7 +189,7 @@ function consumed(sink: Bound): number {
 }
 
 function frozenFor(runner: DESRunner, path: string): Array<{ remaining: number }> {
-  const component = runner.fullSnapshot().components[path] as unknown as {
+  const component = componentState(runner.fullSnapshot(), path) as unknown as {
     frozen?: Array<{ remaining: number }>;
   };
   return component.frozen ?? [];
@@ -392,8 +395,8 @@ describe('central attachment components (Downtime + Processing)', () => {
     expect(target.self.state).toBe('Processing');
     runner.tick(1);
     expect(target.adapter.isFailure).toBe(true);
-    const snapshot = JSON.parse(runner.snapshotJson()) as ReturnType<DESRunner['fullSnapshot']>;
-    const combinedFrozen = (snapshot.components.CombinedTarget as unknown as {
+    const snapshot = JSON.parse(runner.snapshotJson()) as import('../../src/plugins/des/rv-des-snapshot-v4').DESSnapshotV4;
+    const combinedFrozen = (componentState(snapshot, 'CombinedTarget') as unknown as {
       frozen?: Array<{ remaining: number }>;
     }).frozen;
     expect(combinedFrozen).toHaveLength(1);

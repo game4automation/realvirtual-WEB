@@ -38,6 +38,7 @@ import {
   componentFromManual,
   componentFromPackageDir,
   DEFAULT_LICENSE_TEXTS_DIR,
+  NOTICE_DELIVERY_TIERS,
   loadManualComponents,
   loadPolicy,
   renderJson,
@@ -132,8 +133,8 @@ const walkFiles = (root) => walkRelativeFiles(root);
  *   policies: Array<{ path: string, scope: 'public'|'private'|'customer', optional?: boolean }>,
  *   manualComponents?: string,               // third-party/manual-components.json
  *   licenseTextsDir?: string,
- *   tier?: 'public'|'demo'|'private',
- *   mode?: 'warn'|'enforce',                 // explicit mode (tests); otherwise resolveNoticesMode
+ *   tier?: 'public'|'demo'|'private'|'core'|'commercial'|'restricted'|'internal',
+ *   mode?: 'warn'|'enforce',               // explicit mode (tests); otherwise resolveNoticesMode
  *   releaseBuild?: boolean,                  // our own staged/embed build
  *   env?: Record<string,string|undefined>,
  *   product?: string,
@@ -302,7 +303,11 @@ export function createThirdPartyNotices(options) {
   /** Builds both outputs. Exposed for the dev middleware and tests. */
   function generate({ components, mode, problems, preview = false }) {
     const policies = loadPolicies(problems);
-    const { violations } = applyPolicy(components, policies, { tier, declared: declaredNames() });
+    const { violations, notInTier } = applyPolicy(components, policies, { tier, declared: declaredNames() });
+    // plan-679 Phase 3: entries for another tier are information, never a violation.
+    for (const entry of notInTier) {
+      console.log(`[rv-third-party-notices] not-in-tier: ${entry.name} ${entry.version} (tiers ${entry.tiers.join(', ')}; this build: ${tier})`);
+    }
     const txt = renderNotices({ product, components, violations, mode, preview, incomplete: problems });
     const json = renderJson({ product, components, violations, mode, tier, incomplete: problems });
     return { txt, json, violations };
@@ -422,11 +427,27 @@ function writeDebugDump(rootDir, collector) {
   } catch { /* debug aid only */ }
 }
 
-/** Tier of a WEB build from the environment (F12): public / demo / private. */
+/**
+ * Tier of a WEB build from the environment (F12, plan-679 Phase 3), decided in this order:
+ *
+ * 1. no private tree -> `public` (an inherited `RV_NOTICES_TIER` is ignored: a `core` workspace
+ *    without private code is a public build);
+ * 2. demo mode (private tree, no `VITE_PRIVATE_BUILD`) -> `demo`;
+ * 3. `RV_NOTICES_TIER` set -> that delivery tier (`runBuild` sets it for a customer workspace);
+ *    a value outside the delivery tiers is a hard error, never a silent fallback;
+ * 4. otherwise -> `private`, the full build.
+ */
 export function noticesTierFromEnv(hasPrivate, env = process.env) {
   if (!hasPrivate) return 'public';
-  if (env.VITE_PRIVATE_BUILD === '1') return 'private';
-  return 'demo';
+  if (env.VITE_PRIVATE_BUILD !== '1') return 'demo';
+  const delivery = env.RV_NOTICES_TIER;
+  if (delivery !== undefined && delivery !== '') {
+    if (!NOTICE_DELIVERY_TIERS.includes(delivery)) {
+      throw new Error(`RV_NOTICES_TIER="${delivery}" is not a delivery tier (${NOTICE_DELIVERY_TIERS.join(', ')}).`);
+    }
+    return delivery;
+  }
+  return 'private';
 }
 
 /** Default policy set for a WEB build rooted at `rootDir` (F12). */

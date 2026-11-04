@@ -1,0 +1,10 @@
+[
+  { "input": "apiKey=secret123", "expected": "apiKey=[redacted]" },
+  { "input": "X-Api-Key: secret123", "expected": "X-Api-Key: [redacted]" },
+  { "input": "{\"apiKey\":\"secret123\"}", "expected": "{\"apiKey\":\"[redacted]\"}" },
+  { "input": "devkey=developer-secret", "expected": "devkey=[redacted]" },
+  { "input": "https://host/view#k=fragment-secret", "expected": "https://host/view#k=[redacted]" },
+  { "input": "password=hunter2 passwd:second pwd=third", "expected": "password=[redacted] passwd:[redacted] pwd=[redacted]" },
+  { "input": "Authorization: Bearer eyJhbGciOi.secret", "expected": "Authorization: Bearer [redacted]" },
+  { "input": "licenseKey=AAA licenceKey:BBB license=CCC", "expected": "licenseKey=[redacted] licenceKey:[redacted] license=[redacted]" }
+]

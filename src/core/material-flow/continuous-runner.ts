@@ -30,6 +30,7 @@
  */
 
 import { simStageProbe } from '../engine/perf/rv-sim-stage-hooks';
+import { getDefaultMovementAuthority } from '../engine/rv-movement-authority';
 import type { RVTransportManager } from '../engine/rv-transport-manager';
 import type { BehaviorManager } from '../behaviors';
 import type { CoreSubsystems } from '../engine/rv-core-subsystems';
@@ -49,6 +50,18 @@ export interface TransportManagerLike {
 /** Minimal slice of `BehaviorManager` the runner drives (lets tests pass a mock). */
 export interface BehaviorManagerLike {
   tick(dt: number): void;
+}
+
+/**
+ * Vehicle-ownership hooks of the continuous kernel (plan-648 §2.4). The owner of
+ * the vehicles is the Agv behaviour, which the core must not import; the viewer
+ * wires its exported functions here when it builds the kernel.
+ */
+export interface ContinuousTrafficHooks {
+  /** Kernel switch OUT of continuous: every continuous binding releases its vehicle id. */
+  suspend(): void;
+  /** Kernel switch INTO continuous: every binding without its id restarts from its start pose and acquires it. */
+  activate(): void;
 }
 
 /**
@@ -78,6 +91,8 @@ export class ContinuousRunner implements SimulationExecutor {
    *  old `_physicsPluginActive` bypass, now evaluated per tick inside the runner
    *  so the drive loop + visuals keep running while a physics plugin owns transport). */
   private readonly transportGate: (() => boolean) | null;
+  /** Vehicle-ownership hooks (plan-648) — null in minimal setups without a viewer. */
+  private traffic: ContinuousTrafficHooks | null = null;
 
   /**
    * @param transport     The RVViewer's existing `RVTransportManager`.
@@ -117,8 +132,28 @@ export class ContinuousRunner implements SimulationExecutor {
    * the continuous topology is (re)seeded from `defs` + `topology`.
    */
   start(_defs: MaterialFlowDefinition[], _topology: SimulationTopology): void {
-    // No-op: continuous discovery/binding is owned by the BehaviorManager and
-    // the scene loader. See jsdoc above.
+    // Continuous discovery/binding is owned by the BehaviorManager and the
+    // scene loader. See jsdoc above. plan-648: the kernel calls start() only
+    // when it switches INTO continuous — the vehicles of the continuous
+    // bindings take their ids back from their start pose.
+    this.traffic?.activate();
+  }
+
+  /** Wire the vehicle-ownership hooks (plan-648) — the viewer, once per kernel build. */
+  setTrafficHooks(hooks: ContinuousTrafficHooks | null): void {
+    this.traffic = hooks;
+  }
+
+  /**
+   * Kernel switch OUT of continuous (plan-648 §2.4): every continuous binding
+   * releases its vehicle id, then the continuous movement authority drops its
+   * whole queue (vehicles + clock). Without wired hooks (minimal setups) a no-op.
+   * IMPLEMENTS SimulationExecutor::suspend
+   */
+  suspend(): void {
+    if (!this.traffic) return;
+    this.traffic.suspend();
+    getDefaultMovementAuthority('continuous').clear();
   }
 
   /**

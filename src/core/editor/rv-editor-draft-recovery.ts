@@ -139,10 +139,11 @@ export interface RecoveryRoot {
 export function chooseRecoveryRoot(
   drafts: readonly RvDocumentDraft[],
   projectId: string | null,
+  libraryProjectIds: readonly string[] = [],
 ): RecoveryRoot | null {
   let best: RvDocumentDraft | null = null;
   for (const d of drafts) {
-    if ((d.frame.projectId ?? null) !== projectId) continue;
+    if ((d.frame.projectId ?? null) !== projectId && !isLibraryDraftOf(d, libraryProjectIds)) continue;
     // A SHARED document's record lives in this same keyspace since plan-711
     // §2.4 — one frame for a document two projections take turns showing — and
     // it is the SCENE's to recover, not the editor's (`assetDraftOfFrame`
@@ -156,6 +157,19 @@ export function chooseRecoveryRoot(
   return best
     ? { projectId: best.frame.projectId ?? null, rootDocumentId: best.frame.rootDocumentId }
     : null;
+}
+
+/**
+ * A draft of a LIBRARY document (plan-778 Phase 5, Stab 4): its frame is keyed
+ * by the library's project id, and it is offered while that library is one of
+ * the open project's (`libraryProjectIds`). Base and key must agree — a stray
+ * record of the library's own document (opened as a project) is not one.
+ */
+function isLibraryDraftOf(d: RvDocumentDraft, libraryProjectIds: readonly string[]): boolean {
+  const base = d.shell.base;
+  return base.kind === 'libraryDocument'
+    && d.frame.projectId === base.libraryProjectId
+    && libraryProjectIds.includes(base.libraryProjectId);
 }
 
 /**

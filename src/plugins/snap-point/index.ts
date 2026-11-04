@@ -20,7 +20,7 @@ import type { UISlotEntry, UISlotProps } from '../../core/rv-ui-plugin';
 import type { ModeId } from '../../core/rv-mode-manager';
 import type { LayoutPlannerPlugin } from '../layout-planner';
 import { SnapPointRegistry } from '../../core/engine/rv-snap-point-registry';
-import { PathSnapSource, PATH_SNAP_ID_PREFIX } from './path-snap-source';
+import { PathSnapSource, PATH_SNAP_ID_PREFIX, pathPlacementPorts, type PathPlacementPort } from './path-snap-source';
 import { flowsCompatible, type SnapFlow } from './snap-name-parser';
 import { SnapPointController } from './snap-point-controller';
 import { SnapMarkerRenderer } from './snap-marker-renderer';
@@ -28,11 +28,11 @@ import { SnapPlacementService } from './snap-placement-service';
 import { SnapMagneticController } from './snap-magnetic-controller';
 import { SnapChainPreview } from './snap-chain-preview';
 import { scanAndRegisterSnaps } from './snap-scanner';
-import { computeProximityPairings, type RebuildSnapInput } from './snap-pairing-rebuild';
+import { pairRegistryByProximity } from '../../core/connect/rv-connection-registry';
+import { SNAP_PAIR_EPS_M } from '../../core/connect/snap-pairing';
 import { snapHoverStore } from './snap-hover-store';
 import { snapToolbarStore } from './snap-toolbar-store';
-import { Quaternion, Vector3, type Object3D } from 'three';
-import type { PlacedComponentId } from '../../core/engine/rv-snap-point-registry';
+import { Group, Vector3, type Object3D } from 'three';
 import {
   _subscribe as subscribeUiContext,
   isContextActive,
@@ -61,7 +61,7 @@ const SNAP_APPROACH_RADIUS_M = 5;
  *  length, typically ≥ 250 mm). The greedy nearest-match in
  *  `computeProximityPairings` still prefers the closest partner, so widening the
  *  window does not mis-pair when the true partner is nearer. */
-export const SNAP_PAIR_REBUILD_EPS_M = 0.03;
+export const SNAP_PAIR_REBUILD_EPS_M = SNAP_PAIR_EPS_M; // one value, owned by core/connect (plan-633)
 
 export class SnapPointPlugin implements RVViewerPlugin {
   readonly id = 'snap-point';
@@ -89,6 +89,8 @@ export class SnapPointPlugin implements RVViewerPlugin {
   private registry: SnapPointRegistry | null = null;
   /** DES/AGV path ends as data-bound snappoints (plan-447 F2). */
   private pathSnaps: PathSnapSource | null = null;
+  /** plan-628 8.2: scene container of the path-end snap holders. */
+  private pathSnapHolders: Group | null = null;
   /** Unregisters the station-snap candidate source from the path visualizer (F4). */
   private unsubscribePathCandidates: (() => void) | null = null;
   private controller: SnapPointController | null = null;
@@ -125,8 +127,36 @@ export class SnapPointPlugin implements RVViewerPlugin {
     // Path ends (rv_extras.Path) join the SAME registry as GLB-authored snaps.
     // The source subscribes to the path network's change channel itself, so a
     // planner drag re-registers them without anyone here knowing (plan-447).
-    this.pathSnaps = new PathSnapSource(this.registry);
+    // plan-628 8.2: path ends are standard snaps — a newly placed block gets its
+    // markers (rebuild when ends appeared / vanished), a link change hides or
+    // shows the marker of the end it connects (occupancy refresh).
+    // The holders live in the scene (an empty overlay container), or the
+    // sprites the marker renderer attaches to the end nodes would never draw.
+    this.pathSnapHolders = new Group();
+    this.pathSnapHolders.name = '__pathSnapHolders';
+    viewer.scene?.add?.(this.pathSnapHolders);
+    this.pathSnaps = new PathSnapSource(this.registry, {
+      holderParent: this.pathSnapHolders,
+      onChange: (idsChanged) => {
+        if (!this.registry || !this.markerRenderer) return;
+        // A handle takes its idle / occupied colour when it is built, so an
+        // end whose occupancy flipped (a move freed or linked it, 8.8) needs a
+        // rebuild too, not only a visibility refresh.
+        const occ = this.pathOccupancySignature();
+        const occChanged = occ !== this.lastPathOccupancy;
+        this.lastPathOccupancy = occ;
+        if (idsChanged || occChanged) {
+          this.markerRenderer.rebuild(this.registry.size);
+          // New handles start hidden: re-apply hover + pinned reveals (8.8).
+          this.applyPinnedPathSnaps();
+          this.controller?.reapplyReveals();
+        } else {
+          this.markerRenderer.refreshAll();
+        }
+      },
+    });
     this.wirePathDragCandidates(viewer);
+    this.wirePathLineHover(viewer);
 
     // Drag-time magnetic snap: the layout-planner emits the lifecycle on
     // the viewer's event bus. We listen here so the planner doesn't have to
@@ -303,6 +333,51 @@ export class SnapPointPlugin implements RVViewerPlugin {
     this.markerRenderer.rebuild(this.registry.size);
   }
 
+  /**
+   * plan-628 8.3: every free `path`-typed placement port as a tangent-true
+   * attach target for path blocks (the path-network tool merges them with the
+   * free path ends).
+   */
+  listPathPlacementPorts(): PathPlacementPort[] {
+    return this.registry ? pathPlacementPorts(this.registry) : [];
+  }
+
+  /** Re-derive the path-end snaps from the current network (plan-628: after a path-network command, undo or redo). */
+  syncPathSnaps(): void {
+    this.pathSnaps?.syncAll();
+  }
+
+  /**
+   * plan-628 8.8: keep the FREE end snaps of these paths revealed without
+   * hover — the path network UI pins the selected block's paths and the ends a
+   * move freed. Empty clears. Unknown / closed paths are skipped.
+   */
+  setPinnedPathSnaps(pathIds: readonly string[]): void {
+    this.pinnedPathIds = [...pathIds];
+    this.applyPinnedPathSnaps();
+  }
+
+  private pinnedPathIds: string[] = [];
+  /** Occupied path-end snap ids at the last path-snap change (marker colour refresh, 8.8). */
+  private lastPathOccupancy = '';
+
+  private pathOccupancySignature(): string {
+    let sig = '';
+    for (const sp of this.registry?.getAll() ?? []) {
+      if (sp.occupied && sp.id.startsWith(`${PATH_SNAP_ID_PREFIX}:`)) sig += `${sp.id};`;
+    }
+    return sig;
+  }
+
+  private applyPinnedPathSnaps(): void {
+    const owners: Object3D[] = [];
+    for (const id of this.pinnedPathIds) {
+      const h = this.pathSnaps?.holderOf(id);
+      if (h) owners.push(h);
+    }
+    this.controller?.setPinnedOwners(owners);
+  }
+
   onModelCleared?(): void {
     this.pathSnaps?.clear();
     this.registry?.clear();
@@ -349,6 +424,8 @@ export class SnapPointPlugin implements RVViewerPlugin {
     this.magnetic = null;
     this.pathSnaps?.dispose();
     this.pathSnaps = null;
+    this.pathSnapHolders?.removeFromParent();
+    this.pathSnapHolders = null;
     this.unsubscribePathCandidates?.();
     this.unsubscribePathCandidates = null;
     this.registry?.clear();
@@ -402,6 +479,23 @@ export class SnapPointPlugin implements RVViewerPlugin {
   }
 
   /**
+   * plan-628 8.2 (G4): hovering a path LINE reveals its end snaps. Path lines
+   * are overlay geometry the raycast manager never hovers, and the snaps' owner
+   * (an invisible holder per path) is not in the scene, so the controller gets
+   * a pointer resolver: the visualizer's fat-line pick → the hovered path's
+   * holder. Looked up by plugin id with a structural type (no module import).
+   */
+  private wirePathLineHover(viewer: RVViewer): void {
+    if (typeof viewer.getPlugin !== 'function') return;
+    this.controller?.setPointerOwnerResolver((clientX, clientY) => {
+      const viz = viewer.getPlugin<{ id: string; pickLineAt?(x: number, y: number, px?: number): { pathId: string } | null }>('path-visualizer');
+      const hit = viz?.pickLineAt?.(clientX, clientY);
+      const holder = hit ? this.pathSnaps?.holderOf(hit.pathId) ?? null : null;
+      return holder ? [holder] : NO_OWNERS;
+    });
+  }
+
+  /**
    * Re-register every snap under `root` with `root` itself as ownerRoot.
    *
    * The owner is what makes a snap pairable: `computeProximityPairings` skips
@@ -438,53 +532,20 @@ export class SnapPointPlugin implements RVViewerPlugin {
     const reg = this.registry;
     if (!v || !reg) return;
 
-    // Some ports ride on a drive-controlled node (a turntable's rotating
-    // platform owns its connection ports). The two snaps were mated at the
-    // drive's HOME pose, so we must sample there — a drive left rotated moves
-    // the port away from its static partner and the coincidence test fails.
-    // Snapshot, move home, sample, restore.
-    const drives = v.drives ?? [];
-    const restore: { node: Object3D; pos: Vector3; quat: Quaternion }[] = [];
-    for (const d of drives) {
-      restore.push({ node: d.node, pos: d.node.position.clone(), quat: d.node.quaternion.clone() });
-      d.getHomeLocalPosition(d.node.position);
-      d.getHomeLocalQuaternion(d.node.quaternion);
-    }
-    v.scene.updateMatrixWorld(true);
-
-    const wp = new Vector3();
-    const inputs: RebuildSnapInput[] = [];
-    for (const sp of reg.getAll()) {
-      if (sp.occupied) continue; // keep any connection already established live
-      sp.object3D.getWorldPosition(wp);
-      inputs.push({
-        id: sp.id, typeId: sp.typeId, flow: sp.flow,
-        owner: sp.ownerRoot, x: wp.x, y: wp.y, z: wp.z,
-      });
-    }
-
-    for (const r of restore) {
-      r.node.position.copy(r.pos);
-      r.node.quaternion.copy(r.quat);
-    }
-    if (restore.length > 0) v.scene.updateMatrixWorld(true);
-
-    if (inputs.length < 2) return;
-
-    const pairs = computeProximityPairings(inputs, SNAP_PAIR_REBUILD_EPS_M);
-    for (const { aId, bId } of pairs) {
-      const a = reg.getById(aId);
-      const b = reg.getById(bId);
-      if (!a || !b) continue;
-      // Each snap is occupied BY the asset on the OPPOSITE side — the
-      // convention placeAtSnapPoint and the magnetic drag controller use.
-      const aPlaced = (placedIdOf?.(a.ownerRoot) ?? `snap:${a.id}`) as PlacedComponentId;
-      const bPlaced = (placedIdOf?.(b.ownerRoot) ?? `snap:${b.id}`) as PlacedComponentId;
-      reg.markOccupied(a.id, bPlaced);
-      reg.markOccupied(b.id, aPlaced);
-      reg.pair(a.id, b.id);
-    }
-    if (pairs.length > 0) v.markRenderDirty();
+    // ONE pairing logic (plan-633): the core `pairRegistryByProximity` — the
+    // same function the headless DES binding uses. Ports riding a drive (a
+    // turntable's rotating platform) are sampled in the drive's HOME pose,
+    // where they were mated (snapshot, move home, sample, restore); only
+    // unoccupied snaps take part, so live connections are never disturbed;
+    // each snap is occupied BY the asset on the OPPOSITE side, the convention
+    // placeAtSnapPoint and the magnetic drag controller use.
+    const pairs = pairRegistryByProximity(reg, {
+      epsilon: SNAP_PAIR_REBUILD_EPS_M,
+      drives: v.drives ?? [],
+      roots: [v.scene],
+      ...(placedIdOf ? { placedIdOf } : {}),
+    });
+    if (pairs > 0) v.markRenderDirty();
   }
 
   // Public accessors for other modules (scene-mutations, picker)
@@ -518,6 +579,22 @@ export class SnapPointPlugin implements RVViewerPlugin {
   private _isChainEnabled(): boolean {
     const planner = this.viewer?.getPlugin<LayoutPlannerPlugin>('layout-planner');
     return planner?.store?.chainModeEnabled ?? true;
+  }
+
+  /**
+   * The placement roots that move together with `root` — the same set a gizmo
+   * drag follows: with chain mode on, every root reachable through paired
+   * snaps (including `root`); with chain mode off, just `root`. Used by the
+   * planner Align tool (plan-779).
+   */
+  chainRootsFor(root: Object3D): Object3D[] {
+    if (!this.registry || !this._isChainEnabled()) return [root];
+    return [...this.registry.walkChain(root)];
+  }
+
+  /** Public form of the solo-drag detach (plan-779 Align with chain mode off). */
+  detachAssetConnections(assetRoot: Object3D): void {
+    this._detachAssetConnections(assetRoot);
   }
 
   /** Sever every chain connection owned by `assetRoot` — both ends of each
@@ -589,5 +666,7 @@ export class SnapPointPlugin implements RVViewerPlugin {
     }
   }
 }
+
+const NO_OWNERS: readonly Object3D[] = Object.freeze([]);
 
 export const snapPointPlugin = new SnapPointPlugin();

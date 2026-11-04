@@ -120,3 +120,81 @@ describe('plan-411 T5 — bindable slots for a runtime-attached drive behavior',
     expect(slots.filter((s) => s.componentType === 'Drive_FollowPosition')).toHaveLength(0);
   });
 });
+
+// ─── Authored signal-slot values (editor.addComponent / editor.setField) ──
+
+describe.runIf(__RV_HAS_PRIVATE__)('signal slots: authored values are normalised to ComponentReference (private)', () => {
+  type Ctx = ReturnType<typeof normalizeCtx>;
+  function normalizeCtx(h: ReturnType<typeof harness>, added: Array<Record<string, unknown>>) {
+    return {
+      doc: {
+        lockOwner: null,
+        addComponent: (_p: string, t: string, fields: Record<string, unknown>) => { added.push(fields); return t; },
+        whenIdle: async () => {},
+        withTransaction: async (_l: string, fn: () => Promise<void>) => fn(),
+      },
+      viewer: { registry: h.registry, currentModelRoot: h.root },
+      selection: [],
+    };
+  }
+  async function addImpl() {
+    const { impls } = await import('@rv-private/plugins/asset-editor/editor-commands');
+    return impls['editor.addComponent'] as unknown as {
+      run(ctx: Ctx, a: { path: string; type: string; propsJson?: string }): Promise<Record<string, unknown>>;
+    };
+  }
+
+  it('a {path} object without type and a bare signal path become typed references; the drive moves', async () => {
+    const { addSignal } = await import('../src/core/engine/rv-signal-construction');
+    const h = harness();
+    const drive = constructComponentOnNode(h.deps, h.axis, 'Drive', { Direction: 'LinearX', TargetSpeed: 100 }) as RVDrive;
+    const fwd = addSignal(h.axis, 'Fwd', 'PLCOutputBool', h.signalStore, h.registry);
+    const bwd = addSignal(h.axis, 'Bwd', 'PLCOutputBool', h.signalStore, h.registry);
+    const added: Array<Record<string, unknown>> = [];
+    const impl = await addImpl();
+    await impl.run(normalizeCtx(h, added), {
+      path: 'Root/Axis', type: 'Drive_Simple', propsJson: JSON.stringify({ Forward: { path: fwd.path }, Backward: bwd.path }),
+    });
+    const fields = added[0]!;
+    expect(fields['Forward']).toEqual({ type: 'ComponentReference', path: fwd.path, componentType: 'PLCOutputBool' });
+    // A typed reference to a real signal passes unchanged.
+    const typed = { type: 'ComponentReference', path: fwd.path, componentType: 'PLCOutputBool' };
+    await impl.run(normalizeCtx(h, added), { path: 'Root/Axis', type: 'Drive_Simple', propsJson: JSON.stringify({ Forward: typed }) });
+    expect(added[1]!['Forward']).toEqual(typed);
+    expect(fields['Backward']).toEqual({ type: 'ComponentReference', path: bwd.path, componentType: 'PLCOutputBool' });
+
+    constructComponentOnNode(h.deps, h.axis, 'Drive_Simple', fields);
+    h.signalStore.set(fwd.name, true);
+    for (let i = 0; i < 30; i++) drive.update(1 / 60);
+    expect(drive.currentPosition).toBeGreaterThan(0);
+  });
+
+  it('malformed shapes, unresolved paths and non-signal nodes are refused with a field-specific error', async () => {
+    const h = harness();
+    constructComponentOnNode(h.deps, h.axis, 'Drive', { Direction: 'LinearX' });
+    const impl = await addImpl();
+    const run = (props: Record<string, unknown>) => impl.run(normalizeCtx(h, []), {
+      path: 'Root/Axis', type: 'Drive_Simple', propsJson: JSON.stringify(props),
+    });
+    await expect(run({ Forward: { type: 'Signal', path: 'Root/Axis' } })).rejects.toThrow(/Drive_Simple\.Forward .*"type" must be "ComponentReference"/);
+    await expect(run({ Forward: { address: 'x' } })).rejects.toThrow(/Drive_Simple\.Forward .*no "path"/);
+    await expect(run({ Forward: 42 })).rejects.toThrow(/Drive_Simple\.Forward .*got number/);
+    await expect(run({ Forward: 'Root/Nope' })).rejects.toThrow(/Drive_Simple\.Forward .*no node at "Root\/Nope"/);
+    await expect(run({ Forward: 'Root/Axis' })).rejects.toThrow(/is not a signal node/);
+    // Typed references are checked too: an empty path, or a resolving non-signal node.
+    // One that does not resolve yet stays legal (plan-769 unresolvedPath contract).
+    await expect(run({ Forward: { type: 'ComponentReference', path: '' } })).rejects.toThrow(/empty "path"/);
+    await expect(run({ Forward: { type: 'ComponentReference' } })).rejects.toThrow(/names no target/);
+    await expect(run({ Forward: { type: 'ComponentReference', path: 'Later/Signal' } })).resolves.toBeTruthy();
+    // A PLC node that is not a signal (a PLC program) does not qualify.
+    const program = new Object3D();
+    program.name = 'Program';
+    program.userData.realvirtual = { PLCProgram: {} };
+    h.root.add(program);
+    h.registry.registerNode('Root/Program', program);
+    await expect(run({ Forward: 'Root/Program' })).rejects.toThrow(/is not a signal node/);
+    await expect(run({ Forward: { type: 'ComponentReference', path: 'Root/Program' } })).rejects.toThrow(/is not a signal node/);
+    // Clearing stays allowed.
+    await expect(run({ Forward: null })).resolves.toBeTruthy();
+  });
+});

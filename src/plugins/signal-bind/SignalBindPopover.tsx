@@ -20,7 +20,7 @@
  * the inline inspector — plan §9.10), and self-registers under id `'signal-bind'`.
  */
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSyncExternalStore } from 'react';
 import { Box, Typography } from '@mui/material';
 import type { RVViewer } from '../../core/rv-viewer';
@@ -386,8 +386,14 @@ function SignalBindPopoverConnected({ viewer }: { viewer: RVViewer }) {
 // Self-register as the 'signal-bind' popover content. The AnchoredPopover passes
 // the viewer from React context; we read it via the hook.
 import { useViewer } from '../../hooks/use-viewer';
+import { useSignalLinkingAllowed } from './signal-link-gate';
 function SignalBindPopoverRoot() {
   const viewer = useViewer();
+  // Never in an operator workspace (signal-link-gate.ts): a popover opened in an
+  // engineering mode closes when the workspace switches to HMI.
+  const allowed = useSignalLinkingAllowed(viewer);
+  useEffect(() => { if (!allowed) signalBindStore.clear(); }, [allowed]);
+  if (!allowed) return null;
   return <SignalBindPopoverConnected viewer={viewer} />;
 }
 popoverContentRegistry.register('signal-bind', SignalBindPopoverRoot);

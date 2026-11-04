@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../../core/rv-safe-storage';
+
 /**
  * LayoutLibraryPanel — Multi-tab library browser for the Layout Planner.
  *
@@ -22,14 +24,11 @@ import {
   MenuItem,
   ListItemIcon,
   Divider,
-  CircularProgress,
   Menu,
 } from '@mui/material';
 import {
   Tune,
-  CameraAlt,
   FolderOpen,
-  ErrorOutline,
   Close,
   ViewSidebar,
   KeyboardArrowUp,
@@ -38,6 +37,7 @@ import {
   Refresh,
   Link as LinkIcon,
   Edit as EditIcon,
+  ZoomIn,
 } from '@mui/icons-material';
 import { useViewer } from '../../hooks/use-viewer';
 import { useMobileLayout } from '../../hooks/use-mobile-layout';
@@ -46,8 +46,9 @@ import { LeftPanel, WINDOW_DARK_BG } from '../../core/hmi/LeftPanel';
 import { RV_SCROLL_CLASS } from '../../core/hmi/shared-sx';
 import { LAYOUT_PANEL_WIDTH, LEFT_PANEL_ZINDEX } from '../../core/hmi/layout-constants';
 import { showInfoOverlay } from '../../core/hmi/info-overlay-store';
-import { setPendingAssetOpen } from '@rv-private/plugins/asset-editor/pending-open-store';
-import { libraryDocumentBase } from '../../core/editor/active-asset-store';
+import { setPendingAssetOpen } from '@rv-private/plugins/asset-editor/shared/pending-open-store';
+import { libraryDocumentBase, projectDocumentBase } from '../../core/editor/active-asset-store';
+import type { AssetBase } from '../../core/editor/rv-asset-document';
 import type { LayoutPlannerPlugin } from './index';
 import type { LibraryCatalogEntry, LayoutSnapshot } from './rv-layout-store';
 
@@ -74,6 +75,10 @@ import {
   type RegisteredLibrarySource,
 } from '../../core/library/library-source-registry';
 import { PROJECT_LIBRARY_PROVIDER_ID } from '../../core/library/project-library-provider';
+import { isProjectBackedProvider, LIBRARY_PROJECTS_PROVIDER_ID } from '../../core/library/library-origin';
+import { isLibraryProjectSource, type LibraryProjectSource } from '../../core/library/library-projects-provider';
+import { buildNeededByGroups, libraryStateBadge, runLibraryRepair } from '../../core/library/library-project-ui';
+import { ensureLibraryCommandsRegistered } from '../../core/library/library-commands';
 import { GLOBAL_LIBRARY_PROVIDER_ID } from '../../core/library/global-library-provider';
 import { crossSourceKeyOf } from '../../core/hmi/projects/assets-library-groups';
 import { PROJECT_PLACEMENT_PREFIX } from './planner-persistence';
@@ -82,9 +87,9 @@ import { commandRegistry } from '../../core/hmi/rv-command-registry';
 import { aiTouchSx, useCommandView } from '../../core/hmi/rv-command-view';
 import { getAiTouchMs } from '../../core/hmi/button-sim-state';
 import { AssetCard } from '../../core/library/AssetCard';
-import { openProjectsDashboard } from '../../core/hmi/projects/projects-dashboard-store';
-import { plannerThumbnailKey } from './planner-thumbnail-key';
-import { useThumbnailVisibility } from '../../core/thumbnails/use-thumbnail-visibility';
+import { AssetPreviewDialog } from '../../core/library/AssetPreviewDialog';
+import { openAddLibraryDialog } from '../../core/hmi/projects/projects-dashboard-store';
+import { useThumbnailUrl } from '../../core/thumbnails/rv-thumbnail-url-store';
 import { getProjectStore } from '../../core/project/project-store';
 // Lives in its own module so the lazy-loading host (LayoutLibraryPanelHost) can
 // show it WITHOUT pulling this panel's chunk (plan-344 Phase 4).
@@ -163,6 +168,9 @@ export interface LibraryTab {
   error?: string | null;
   loaded?: boolean;
   cloudStatus?: LibraryItem['cloudStatus'];
+  /** plan-778: a library PROJECT tab — its project id and node state. */
+  libraryProjectId?: string;
+  state?: LibraryProjectSource['state'];
 }
 
 /** The half of an AM connection state this module reads. */
@@ -190,6 +198,9 @@ export function registryTabId(providerId: string, sourceId: string): string {
  * would make catalog cards blink out and back in during the async load.
  */
 export function projectDedupKeys(sources: readonly RegisteredLibrarySource[]): Set<string> | null {
+  // plan-778 provider-filter decision: only the OPEN project's own documents
+  // are the "project wins" reference — a library project is someone else's
+  // project, and its documents never hide a catalog card.
   const projectSources = sources.filter(s => s.providerId === PROJECT_LIBRARY_PROVIDER_ID);
   if (projectSources.length === 0) return null;
   if (!projectSources.every(s => s.source.loaded)) return null;
@@ -217,7 +228,10 @@ export function dedupedEntries(
   dedupKeys: Set<string> | null,
 ): LibraryCatalogEntry[] {
   const entries = safeListEntries(registered.source);
-  if (dedupKeys === null || registered.providerId === PROJECT_LIBRARY_PROVIDER_ID) return entries;
+  // plan-778: a project-backed source (the open project, a library project) is
+  // never deduplicated — its entries are documents with an identity of their
+  // own (a library's `models/pump` is not the project's `models/pump`, F4).
+  if (dedupKeys === null || isProjectBackedProvider(registered.providerId)) return entries;
   return entries.filter(entry => {
     const key = crossSourceKeyOf(entry);
     return key === null || !dedupKeys.has(key);
@@ -238,19 +252,27 @@ export function buildLibraryTabs(
   amConnections: readonly AmConnectionLike[],
 ): LibraryTab[] {
   const dedupKeys = projectDedupKeys(sources);
-  const registry = sources.filter(s => s.providerId !== CLOUD_PROVIDER_ID);
+  // A `hidden` source is resolver-only (its service is unreachable) — no tab.
+  // plan-778: transitive library projects (and the built-in realvirtual library
+  // while unlisted) are `hidden` — they resolve but are not placeable (Decision
+  // 4/C); `buildNeededByGroups` lists them separately.
+  const registry = sources.filter(s => s.providerId !== CLOUD_PROVIDER_ID && s.source.hidden !== true);
+  // Order: the open project, then its library projects (in `libraries[]`
+  // order — one section each), then every external catalog.
   const ordered = [
     ...registry.filter(s => s.providerId === PROJECT_LIBRARY_PROVIDER_ID),
-    ...registry.filter(s => s.providerId !== PROJECT_LIBRARY_PROVIDER_ID),
+    ...registry.filter(s => s.providerId === LIBRARY_PROJECTS_PROVIDER_ID),
+    ...registry.filter(s => !isProjectBackedProvider(s.providerId)),
   ];
 
   const tabs: LibraryTab[] = [];
   for (const registered of ordered) {
     const { providerId, source } = registered;
-    if (providerId !== PROJECT_LIBRARY_PROVIDER_ID && dedupKeys !== null && source.loaded) {
+    if (!isProjectBackedProvider(providerId) && dedupKeys !== null && source.loaded) {
       const raw = safeListEntries(source);
       if (raw.length > 0 && dedupedEntries(registered, dedupKeys).length === 0) continue;
     }
+    const lib = providerId === LIBRARY_PROJECTS_PROVIDER_ID && isLibraryProjectSource(source) ? source : null;
     tabs.push({
       id: registryTabId(providerId, source.id),
       kind: source.kind,
@@ -259,6 +281,7 @@ export function buildLibraryTabs(
       sourceId: source.id,
       error: source.error ?? null,
       loaded: source.loaded,
+      ...(lib ? { libraryProjectId: lib.id, state: lib.state } : {}),
     });
   }
 
@@ -364,12 +387,14 @@ export function LayoutLibraryPanel() {
     () => buildLibraryTabs(registrySources, amConnections),
     [registrySources, amConnections],
   );
+  // plan-778: transitive libraries, listed under the library that needs them.
+  const neededBy = useMemo(() => buildNeededByGroups(registrySources), [registrySources]);
 
   // Active tab: a registry tab id ("<provider>:<source>") or "am:<connectionId>".
   // Seeded from the panel key so the first paint after a reload already shows
   // the library the user last picked, rather than flashing the default.
   const [activeTabId, setActiveTabId] = useState<string | null>(() => {
-    try { return localStorage.getItem(LS_KEY_PLANNER_ACTIVE_LIBRARY); } catch { return null; }
+    try { return readLocalStorage(LS_KEY_PLANNER_ACTIVE_LIBRARY); } catch { return null; }
   });
 
   const [searchText, setSearchText] = useState('');
@@ -401,7 +426,7 @@ export function LayoutLibraryPanel() {
     setActiveTabId(id);
     setSelectedChip(null);
     // Panel key first — it is the only record that can express every tab kind.
-    try { localStorage.setItem(LS_KEY_PLANNER_ACTIVE_LIBRARY, id); } catch { /* ignore */ }
+    try { writeLocalStorage(LS_KEY_PLANNER_ACTIVE_LIBRARY, id); } catch { /* ignore */ }
     // Store second, and ONLY for a store-backed catalog: handing it a project
     // or AM id would be silently dropped and leave the store pointing at the
     // previously picked catalog (plan-723 §2.4).
@@ -415,11 +440,26 @@ export function LayoutLibraryPanel() {
    * Everything that used to live here — add URL / GitHub / Asset Manager,
    * remove, edit connection — is now one door into the Projects
    * dashboard's Assets tab, which groups the same libraries by source and can
-   * attach new ones.
+   * attach new ones. plan-655 F2: the door opens WITH the Add-library dialog
+   * showing — the dashboard alone left users looking for a small "+".
    */
   const handleManageLibraries = useCallback(() => {
-    openProjectsDashboard({ kind: 'globalLibraries' });
+    openAddLibraryDialog();
   }, []);
+
+  // Progressive grid (plan-660 speed): a remote catalog has thousands of
+  // entries, and mounting one ThumbnailCard per entry cost ~40 s before the
+  // first picture appeared on the SimReady source. Render a page, grow it as
+  // the sentinel at the end of the grid scrolls near the viewport; a new tab,
+  // search or chip starts at the first page again.
+  const listKey = [activeTabId ?? '', searchText, selectedChip ?? ''].join('|');
+  const [renderLimit, setRenderLimit] = useState(LIBRARY_RENDER_PAGE);
+  const [renderLimitKey, setRenderLimitKey] = useState(listKey);
+  if (renderLimitKey !== listKey) {
+    setRenderLimitKey(listKey);
+    setRenderLimit(LIBRARY_RENDER_PAGE);
+  }
+  const growRenderLimit = useCallback(() => setRenderLimit((n) => n + LIBRARY_RENDER_PAGE), []);
 
   if (!plugin || !store || !snapshot) return null;
 
@@ -466,6 +506,9 @@ export function LayoutLibraryPanel() {
       )
     : fullEntries;
   const displayedEntries = filterByChip(searchedEntries, selectedChip);
+  const visibleEntries = displayedEntries.length > renderLimit
+    ? displayedEntries.slice(0, renderLimit)
+    : displayedEntries;
 
   // Library dropdown items — one per tab, carrying the kind/status the selector
   // needs to render its icon.
@@ -474,11 +517,25 @@ export function LayoutLibraryPanel() {
     label: tab.label,
     kind: tab.kind,
     ...(tab.cloudStatus ? { cloudStatus: tab.cloudStatus } : {}),
-    error: !!tab.error,
+    // A library project's own state says more than the error flag (locked is no error).
+    error: !!tab.error && !tab.state,
+    ...(tab.state ? { state: tab.state } : {}),
   }));
 
   const handleSelectLibrary = (id: string): void => {
     switchToLibrary(id);
+  };
+
+  // Removing a library stays in the Projects dashboard — this panel keeps its
+  // ONE management route (plan-702 F8); "Manage libraries…" leads there.
+
+  // The repair of the active library project (plan-778 §3.3) — dispatched
+  // straight from the click so Grant / Locate keep the user activation.
+  const activeBadge = activeTab?.state ? libraryStateBadge(activeTab.state, activeTab.libraryProjectId ?? undefined) : null;
+  const repairActive = (): void => {
+    if (!activeTab?.libraryProjectId) return;
+    ensureLibraryCommandsRegistered();
+    void runLibraryRepair(activeTab.libraryProjectId, activeTab.state, viewer)?.catch(() => { /* the command reports */ });
   };
 
   // Chip row is redundant when a single facet already covers every entry
@@ -494,6 +551,23 @@ export function LayoutLibraryPanel() {
         <Typography variant="caption" sx={{ color: 'text.secondary' }}>
           No libraries loaded. Attach one via “Manage libraries…” in the library dropdown.
         </Typography>
+      </Box>
+    );
+  } else if (activeBadge?.attention) {
+    // plan-778: a library project that is locked / unknown / broken — say which,
+    // and offer its repair right here (the same command as the Problems row).
+    emptyContent = (
+      <Box sx={{ p: 2, textAlign: 'center' }} data-testid="library-unavailable" data-library-state={activeTab?.state}>
+        <Typography variant="caption" sx={{ color: '#ffa726', display: 'block' }}>
+          {activeTab?.state === 'locked'
+            ? `Library '${activeTab.label}' needs folder access again.`
+            : `Library '${activeTab?.label}' is unavailable${activeError ? `: ${activeError}` : '.'}`}
+        </Typography>
+        {activeBadge.repairLabel && (
+          <Button size="small" variant="outlined" onClick={repairActive} sx={{ mt: 1, textTransform: 'none', fontSize: 11 }}>
+            {activeBadge.repairLabel}
+          </Button>
+        )}
       </Box>
     );
   } else if (activeError) {
@@ -530,7 +604,9 @@ export function LayoutLibraryPanel() {
         /* Compact layout: a horizontal thumbnail strip docked above the bottom
            nav instead of the fullscreen panel — keeps the scene visible. */
         <MobileLibraryStrip
-          entries={displayedEntries}
+          entries={visibleEntries}
+          remaining={displayedEntries.length - visibleEntries.length}
+          onMore={growRenderLimit}
           plugin={plugin}
           snapshot={snapshot}
           isAmTab={isAmTab}
@@ -571,6 +647,8 @@ export function LayoutLibraryPanel() {
           activeId={resolvedActiveTabId}
           onSelect={handleSelectLibrary}
           onManage={handleManageLibraries}
+          neededBy={neededBy}
+          stateText={(s) => libraryStateBadge(s).text}
         />
 
         {/* Every catalog source shares the CatalogBrowser shell. (The private
@@ -589,15 +667,20 @@ export function LayoutLibraryPanel() {
           empty={emptyContent !== null}
           emptyContent={emptyContent}
         >
-          {displayedEntries.map((entry) => (
+          {visibleEntries.map((entry) => (
             <ThumbnailCard
               key={entry.id}
               entry={entry}
               isPlacing={snapshot.placementMode === entry.id}
-              isPending={snapshot.thumbnailPending.has(entry.id)}
               plugin={plugin}
             />
           ))}
+          {visibleEntries.length < displayedEntries.length && (
+            <LoadMoreSentinel
+              onVisible={growRenderLimit}
+              remaining={displayedEntries.length - visibleEntries.length}
+            />
+          )}
         </CatalogBrowser>
       </LeftPanel>
       )}
@@ -605,10 +688,55 @@ export function LayoutLibraryPanel() {
   );
 }
 
+/** Cards mounted per page of the progressive library grid. */
+export const LIBRARY_RENDER_PAGE = 120;
+
+/**
+ * The end of a partially rendered grid: asks for the next page once it comes
+ * within a few rows of the viewport, and is a plain button too (keyboard,
+ * environments without IntersectionObserver).
+ */
+function LoadMoreSentinel({ onVisible, remaining }: { onVisible: () => void; remaining: number }) {
+  const ref = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || typeof IntersectionObserver === 'undefined') return;
+    const io = new IntersectionObserver((records) => {
+      if (records.some((r) => r.isIntersecting)) onVisible();
+    }, { rootMargin: '600px 0px' });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [onVisible, remaining]);
+  return (
+    <Box
+      component="button"
+      ref={ref}
+      type="button"
+      onClick={onVisible}
+      data-testid="library-load-more"
+      sx={{
+        gridColumn: '1 / -1',
+        border: 'none',
+        bgcolor: 'transparent',
+        color: 'text.secondary',
+        fontSize: 10,
+        py: 1,
+        cursor: 'pointer',
+        '&:hover': { color: 'primary.main' },
+      }}
+    >
+      {remaining} more…
+    </Box>
+  );
+}
+
 // ─── Mobile: horizontal strip ───────────────────────────────────────────
 
 interface MobileLibraryStripProps {
   entries: LibraryCatalogEntry[];
+  /** Entries not mounted yet (progressive grid); 0 = all shown. */
+  remaining?: number;
+  onMore?: () => void;
   plugin: LayoutPlannerPlugin;
   snapshot: LayoutSnapshot;
   isAmTab: boolean;
@@ -624,7 +752,7 @@ interface MobileLibraryStripProps {
  *  docked above the bottom nav. Keeps the 3D scene visible (unlike the
  *  fullscreen panel) — tap a card to enter placement mode, then tap the scene. */
 function MobileLibraryStrip({
-  entries, plugin, snapshot, isAmTab, libraryItems, activeId,
+  entries, remaining, onMore, plugin, snapshot, isAmTab, libraryItems, activeId,
   onSelect, onManage, onClose,
 }: MobileLibraryStripProps) {
   // Single combined menu (library switch + manage) opened from the floating ⋮.
@@ -671,11 +799,15 @@ function MobileLibraryStrip({
                 <ThumbnailCard
                   entry={entry}
                   isPlacing={snapshot.placementMode === entry.id}
-                  isPending={snapshot.thumbnailPending.has(entry.id)}
                   plugin={plugin}
                 />
               </Box>
             ))
+          )}
+          {(remaining ?? 0) > 0 && onMore && (
+            <Box sx={{ width: MOBILE_CARD_WIDTH, display: 'flex' }}>
+              <LoadMoreSentinel onVisible={onMore} remaining={remaining!} />
+            </Box>
           )}
         </Box>
 
@@ -750,18 +882,54 @@ function MobileLibraryStrip({
   );
 }
 
+/**
+ * The asset-editor identity behind a card's "Edit asset".
+ *
+ * Two kinds of `localPath`: a local-folder entry carries it RELATIVE to
+ * `library/` ("conveyor/belt.glb"), a project document carries its full
+ * project path ("library/simready/APM2.glb", "models/x.glb"). Feeding the
+ * latter to `libraryDocumentBase` produced `library/library/...` — an editor
+ * that opened nothing (plan-660 G3).
+ */
+export function editAssetBaseOf(entry: LibraryCatalogEntry): AssetBase | null {
+  if (!entry.localPath) return null;
+  // plan-778 Decision 3: a library project is read-only inside this project;
+  // "Edit in library" (Phase 5) is the explicit door — no editor base here.
+  if (entry.libraryOrigin) return null;
+  if (entry.id.startsWith(PROJECT_PLACEMENT_PREFIX)) {
+    const file = entry.localPath.split('/').pop() ?? entry.localPath;
+    return projectDocumentBase(entry.localPath, file.replace(/\.glb$/i, ''));
+  }
+  return libraryDocumentBase(entry.localPath);
+}
+
 // ─── Thumbnail Card (draggable) ─────────────────────────────────────────
 
 interface ThumbnailCardProps {
   entry: LibraryCatalogEntry;
   isPlacing: boolean;
-  /** True while the preview is being auto-generated in the background. */
-  isPending: boolean;
   plugin: LayoutPlannerPlugin;
 }
 
-export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isPending, plugin }: ThumbnailCardProps) {
+export const ThumbnailCard = memo(function ThumbnailCard({ entry: catalogEntry, isPlacing, plugin }: ThumbnailCardProps) {
   const viewer = useViewer();
+  // A project document names its SAVED preview by pointer (plan-776 F9); it is
+  // read through the project backend, never rendered. A catalog entry brings
+  // its own `thumbnailUrl`. The resolved picture is merged into a copy — the
+  // entry is store state.
+  const savedPointer = !catalogEntry.thumbnailUrl ? catalogEntry.thumbnailPointer ?? null : null;
+  const savedUrl = useThumbnailUrl(savedPointer ? getProjectStore().getBackend() : null, savedPointer);
+  const entry = useMemo(
+    () => (savedUrl ? { ...catalogEntry, thumbnailUrl: savedUrl } : catalogEntry),
+    [catalogEntry, savedUrl],
+  );
+  // The asset is decoding + baking right now (hover prefetch or a cold drag).
+  // A boolean selector: the card re-renders only when ITS state flips, not on
+  // every planner store change.
+  const preparing = useSyncExternalStore(
+    plugin.store.subscribe,
+    () => plugin.store.getSnapshot().preparingEntryIds.includes(catalogEntry.id),
+  );
   // Hover-intent prefetch (plan-371 F8). The timer is the whole mechanism:
   // start on enter, drop on leave, so only a deliberate rest over the card
   // warms its GLB. Touch has no hover at all — `pointerdown` stands in and
@@ -777,7 +945,9 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
   // Virtual/DES and splat entries never take the placeholder path, so warming
   // them buys nothing — and a registry entry has no URL to test, which is why
   // the gate is on the entry KIND rather than on `prefetchableUrl` (plan-723).
-  const warmable = entry.virtual !== true && !entry.splatUrl;
+  // `noPrefetch` entries (a server-side conversion, plan-660) resolve only on a
+  // real placement or drag, never on hover intent.
+  const warmable = entry.virtual !== true && !entry.splatUrl && entry.noPrefetch !== true;
 
   const startPrefetchIntent = useCallback(() => {
     if (!warmable) return;
@@ -796,52 +966,13 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
 
   useEffect(() => cancelPrefetchIntent, [cancelPrefetchIntent]);
 
-  // ── Visibility-scheduled preview (plan-372 §2.7/§2.8) ────────────────
-  // Previews are pulled, not pushed: the card asks for its picture once it
-  // enters the prefetch band and withdraws the request when it leaves. The
-  // service de-duplicates by key, so re-entering the viewport is free.
-  const { ref: cardRef, visible } = useThumbnailVisibility<HTMLDivElement>();
-  // A project document has no `glbUrl` and its picture is written by the SAVE
-  // path, not here — but until one exists the card may still render an
-  // in-memory preview through the resolve path (plan-723 F9).
+  // A project document has no `glbUrl`; it is opened by its own path.
   const isProjectEntry = entry.id.startsWith(PROJECT_PLACEMENT_PREFIX);
-  const needsPreview = !entry.thumbnailUrl && !entry.virtual && !entry.splatUrl
-    && (!!entry.glbUrl || isProjectEntry);
 
-  useEffect(() => {
-    if (!needsPreview || !viewer) return;
-    // Optional chaining is deliberate: a missing preview service must never
-    // throw out of a card render. Constrained shells and test doubles hand back
-    // viewers that do not carry it, and a card without a picture is a far
-    // better outcome than a broken library panel.
-    const service = viewer.thumbnails;
-    if (!service?.isAvailable) return;  // WebGPU / unavailable — manual button remains
-    const key = plannerThumbnailKey(entry.id);
-
-    let cancelled = false;
-    if (!visible) { service.cancel(key); return; }
-
-    plugin.store.setThumbnailPending(entry.id, true);
-    void service
-      .enqueue(key, () => plugin.loadEntryModel(entry), 1)
-      .then((blob) => {
-        if (cancelled || !blob) return;
-        plugin.store.setEntryThumbnail(entry.id, URL.createObjectURL(blob));
-      })
-      .finally(() => {
-        if (!cancelled) plugin.store.setThumbnailPending(entry.id, false);
-      });
-
-    return () => { cancelled = true; };
-  }, [visible, needsPreview, viewer, plugin, entry]);
-
-  // Preview generation state — kept local because it only matters for the
-  // single card showing the camera button. Multiple cards can generate in
-  // parallel; each tracks its own progress.
-  const [generating, setGenerating] = useState(false);
-  const [genError, setGenError] = useState<string | null>(null);
-  const errorClearTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null);
+  // The larger view of the picture (magnifier on the card, or the context menu).
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const hasPicture = !!(entry.previewUrl || entry.thumbnailUrl);
   // Hover tooltip showing the component's general behavior description. Suppressed
   // while dragging (controlled `open`) so it doesn't float over the drag ghost.
   const [dragging, setDragging] = useState(false);
@@ -855,11 +986,15 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
     if (entry.splatUrl) {
       // plan-499: the direct place IS `layout.place` — the same command as web_layout_place.
       void commandRegistry.execute<unknown>(
-        'layout.place', { catalogId: entry.id, x: 0, y: 0, z: 0, onto: null }, { origin: 'ui', ...(viewer ? { viewer } : {}) },
+        'layout.place', {
+          catalogId: entry.id, x: 0, y: 0, z: 0, onto: null,
+          // plan-778: the library the entry came from — the same id may live in two libraries.
+          ...(entry.libraryOrigin ? { libraryProjectId: entry.libraryOrigin.sourceId } : {}),
+        }, { origin: 'ui', ...(viewer ? { viewer } : {}) },
       ).then((r) => {
         if (r.ok) return;
         console.error(`[LayoutPlanner] Failed to place splat "${entry.name}":`, r.reason);
-        showInfoOverlay(`Splat konnte nicht platziert werden: ${r.reason}`);
+        showInfoOverlay(`Splat could not be placed: ${r.reason}`);
       });
       return;
     }
@@ -882,49 +1017,11 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
     ...(placeView.touch ? aiTouchSx(placeView.aiTouch, getAiTouchMs()) : null),
   };
 
-  const runGeneratePreview = useCallback(async () => {
-    if (generating) return;
-    if (errorClearTimer.current) {
-      clearTimeout(errorClearTimer.current);
-      errorClearTimer.current = null;
-    }
-    setGenerating(true);
-    setGenError(null);
-    try {
-      const result = await plugin.saveThumbnail(entry.id, entry.glbUrl ?? '');
-      // `result` is null when generation succeeded in-memory but persistence
-      // was skipped (e.g. user denied write access on the local folder, or
-      // the dev-server route is unavailable). The in-memory thumbnail is
-      // still set on the store, so the card switches away from the camera
-      // fallback — no error in that case.
-      if (!result && !entry.thumbnailUrl) {
-        setGenError('Preview konnte nicht erzeugt werden — Schreibrechte verweigert oder GLB-Ladefehler');
-      }
-    } catch (err) {
-      setGenError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setGenerating(false);
-      // Auto-dismiss the error indicator after a while so the card returns
-      // to a neutral state and the user can retry without manual cleanup.
-      errorClearTimer.current = setTimeout(() => setGenError(null), 6000);
-    }
-  }, [generating, plugin, entry.id, entry.glbUrl, entry.thumbnailUrl]);
-
-  const handleGeneratePreview = useCallback((e: React.MouseEvent) => {
-    e.stopPropagation();
-    void runGeneratePreview();
-  }, [runGeneratePreview]);
-
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
     setCtxPos({ x: e.clientX, y: e.clientY });
   }, []);
-
-  const handleCtxUpdate = useCallback(() => {
-    setCtxPos(null);
-    void runGeneratePreview();
-  }, [runGeneratePreview]);
 
   const handleDragStart = (e: React.DragEvent) => {
     setDragging(true);
@@ -960,12 +1057,12 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
       sx={{ borderRadius: 0.5, ...placeGlow }}
     >
     <AssetCard
-      ref={cardRef}
       entry={entry}
       variant="compact"
       draggable={!isSplat}
       cursor={isSplat ? 'pointer' : (isPlacing ? 'crosshair' : 'grab')}
       selected={isPlacing}
+      busy={preparing}
       // The full name first — the card label is one clipped line — then the
       // behaviour description when the component has one.
       tooltip={(
@@ -986,41 +1083,9 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
       onMouseEnter={() => { setHovered(true); startPrefetchIntent(); }}
       onMouseLeave={() => { setHovered(false); cancelPrefetchIntent(); }}
       onPointerDown={prefetchNow}
-      // No manual "Generate preview" for a project document: its thumbnail is
-      // written by the SAVE path (`doc.thumbnail`), and this button's only
-      // persistence route is the dev-server catalog middleware, which would
-      // never reach the project (plan-723 F9). The automatic in-memory preview
-      // above still fills the card.
-      placeholderAction={isProjectEntry ? undefined : (
-        <Tooltip
-          title={
-            (generating || isPending) ? 'Generating preview…'
-              : genError ? genError
-              : 'Generate preview'
-          }
-          placement="top"
-        >
-          <Box component="span" sx={{ display: 'inline-flex' }}>
-            <IconButton
-              size="small"
-              disabled={generating || isPending}
-              sx={{
-                color: genError ? '#ef5350' : 'rgba(255,255,255,0.25)',
-                '&:hover': { color: genError ? '#ef5350' : 'rgba(79,195,247,0.8)' },
-                '&.Mui-disabled': { color: 'rgba(79,195,247,0.6)' },
-              }}
-              onClick={handleGeneratePreview}
-            >
-              {(generating || isPending)
-                ? <CircularProgress size={18} sx={{ color: 'rgba(79,195,247,0.8)' }} />
-                : genError
-                  ? <ErrorOutline sx={{ fontSize: 20 }} />
-                  : <CameraAlt sx={{ fontSize: 20 }} />
-              }
-            </IconButton>
-          </Box>
-        </Tooltip>
-      )}
+      onPreview={hasPicture ? () => { setHovered(false); setPreviewOpen(true); } : undefined}
+      // No "Generate preview" button (plan-776 #4): a picture exists once the
+      // document is saved, otherwise the card shows its type placeholder.
     />
     </Box>
     <Menu
@@ -1029,14 +1094,13 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
       anchorReference="anchorPosition"
       anchorPosition={ctxPos ? { top: ctxPos.y, left: ctxPos.x } : undefined}
     >
-      {!isProjectEntry && (
+      {hasPicture && (
         <MenuItem
-          onClick={handleCtxUpdate}
-          disabled={generating || !entry.glbUrl}
+          onClick={() => { setCtxPos(null); setPreviewOpen(true); }}
           sx={{ fontSize: 12 }}
         >
-          <CameraAlt sx={{ fontSize: 14, mr: 1 }} />
-          {entry.thumbnailUrl ? 'Update Preview' : 'Generate Preview'}
+          <ZoomIn sx={{ fontSize: 14, mr: 1 }} />
+          Show preview
         </MenuItem>
       )}
       {/* Local work-folder GLBs can be opened in the asset editor. Saving
@@ -1047,7 +1111,7 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
         <MenuItem
           onClick={() => {
             setCtxPos(null);
-            setPendingAssetOpen(libraryDocumentBase(entry.localPath!));
+            setPendingAssetOpen(editAssetBaseOf(entry)!);
             void viewer.modes.requestMode('editor');
           }}
           sx={{ fontSize: 12 }}
@@ -1057,6 +1121,16 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
         </MenuItem>
       )}
     </Menu>
+    {previewOpen && (
+      <AssetPreviewDialog
+        entry={entry}
+        onClose={() => setPreviewOpen(false)}
+        // Same verb as a click on the card: arm the placement. (A later round
+        // may turn this into "import into the project library".)
+        onPlace={isSplat ? undefined : () => plugin.store.setPlacementMode(entry.id)}
+        placeLabel="Place in scene"
+      />
+    )}
     </>
   );
 });

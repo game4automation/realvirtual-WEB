@@ -1,0 +1,447 @@
+{
+ "_comment": [
+  "plan-659 - MEASURED DIMENSIONS of the Microduck collision meshes. Dimensions only;",
+  "no geometry. Produced by spikes/659/duck/measure-collision-hulls.mjs from the",
+  "CC BY-NC-SA 4.0 STL fixture, which is gitignored and not shipped. This file is the",
+  "input of build-collision-primitives.mjs, which needs no mesh. Lengths in millimetres,",
+  "in each mesh's own CAD (file) frame; the MJCF geom pos/quat place that frame."
+ ],
+ "generated_by": "spikes/659/duck/measure-collision-hulls.mjs",
+ "source_scene": "fixtures/microduck/mjcf/prepared-scene.xml",
+ "sole_cant_deg": 5,
+ "geoms": [
+  {
+   "mesh": "power_support",
+   "body": "trunk_base",
+   "name": null,
+   "class": "self_collision_only",
+   "selfCheckUm": 0
+  },
+  {
+   "mesh": "np_f970",
+   "body": "trunk_base",
+   "name": null,
+   "class": "collision",
+   "selfCheckUm": 0
+  },
+  {
+   "mesh": "hip_l",
+   "body": "hip_l",
+   "name": null,
+   "class": "collision",
+   "selfCheckUm": 0
+  },
+  {
+   "mesh": "leg",
+   "body": "leg",
+   "name": null,
+   "class": "collision",
+   "selfCheckUm": 0
+  },
+  {
+   "mesh": "sole_left",
+   "body": "ankle_left",
+   "name": "left_foot_collision",
+   "class": "collision",
+   "selfCheckUm": 0
+  },
+  {
+   "mesh": "top_head_shell",
+   "body": "jaw_soft",
+   "name": null,
+   "class": "collision",
+   "selfCheckUm": 0
+  },
+  {
+   "mesh": "jaw",
+   "body": "jaw_soft",
+   "name": null,
+   "class": "collision",
+   "selfCheckUm": 0
+  },
+  {
+   "mesh": "bottom_head_shell",
+   "body": "jaw_soft",
+   "name": null,
+   "class": "collision",
+   "selfCheckUm": 0
+  },
+  {
+   "mesh": "hip_l",
+   "body": "hip_l_2",
+   "name": null,
+   "class": "collision",
+   "selfCheckUm": 0
+  },
+  {
+   "mesh": "leg",
+   "body": "leg_2",
+   "name": null,
+   "class": "collision",
+   "selfCheckUm": 0
+  },
+  {
+   "mesh": "sole_right",
+   "body": "ankle_right",
+   "name": "right_foot_collision",
+   "class": "collision",
+   "selfCheckUm": 0
+  }
+ ],
+ "parts": {
+  "power_support": {
+   "verts": 1404,
+   "cad_min_mm": [
+    -27.243,
+    18,
+    -26.546
+   ],
+   "cad_max_mm": [
+    27.25,
+    35,
+    56.944
+   ],
+   "cad_size_mm": [
+    54.493,
+    17,
+    83.489
+   ],
+   "fit_rms_mm": {
+    "box": 6.294,
+    "ellipsoid": 6.449
+   },
+   "fit_max_overreach_mm": {
+    "box": 10.628,
+    "ellipsoid": 2.42
+   }
+  },
+  "np_f970": {
+   "verts": 2493,
+   "cad_min_mm": [
+    -19.3,
+    -10.318,
+    -35.399
+   ],
+   "cad_max_mm": [
+    19.308,
+    10.25,
+    35.406
+   ],
+   "cad_size_mm": [
+    38.608,
+    20.568,
+    70.805
+   ],
+   "fit_rms_mm": {
+    "box": 1.514,
+    "ellipsoid": 8.699
+   },
+   "fit_max_overreach_mm": {
+    "box": 3.353,
+    "ellipsoid": -0.416
+   }
+  },
+  "hip_l": {
+   "verts": 2324,
+   "cad_min_mm": [
+    8,
+    -25,
+    -9.5
+   ],
+   "cad_max_mm": [
+    40.45,
+    9.497,
+    9.5
+   ],
+   "cad_size_mm": [
+    32.45,
+    34.497,
+    19
+   ],
+   "fit_rms_mm": {
+    "box": 6.679,
+    "ellipsoid": 4.042
+   },
+   "fit_max_overreach_mm": {
+    "box": 20.216,
+    "ellipsoid": 11.843
+   }
+  },
+  "leg": {
+   "verts": 1721,
+   "cad_min_mm": [
+    32.5,
+    12,
+    -12.223
+   ],
+   "cad_max_mm": [
+    40.45,
+    32,
+    45.777
+   ],
+   "cad_size_mm": [
+    7.95,
+    20,
+    58
+   ],
+   "fit_rms_mm": {
+    "box": 3.993,
+    "ellipsoid": 1.549
+   },
+   "fit_max_overreach_mm": {
+    "box": 6.36,
+    "ellipsoid": 0.467
+   }
+  },
+  "sole_left": {
+   "verts": 1975,
+   "cad_min_mm": [
+    29.455,
+    -12,
+    -31.249
+   ],
+   "cad_max_mm": [
+    70.547,
+    42,
+    -18.342
+   ],
+   "cad_size_mm": [
+    41.091,
+    54,
+    12.907
+   ],
+   "fit_rms_mm": {
+    "box": 3.636,
+    "ellipsoid": 5.233
+   },
+   "fit_max_overreach_mm": {
+    "box": 7.791,
+    "ellipsoid": 0.811
+   },
+   "sole": {
+    "cant_deg_used": 5,
+    "cant_deg_fitted": 5.012,
+    "q_cad_to_plane": [
+     0.999048222,
+     0,
+     0.043619387,
+     0
+    ],
+    "plane_frame_min_mm": [
+     27.208,
+     -12,
+     -34.389
+    ],
+    "plane_frame_max_mm": [
+     68.401,
+     42,
+     -20.894
+    ],
+    "plane_frame_size_mm": [
+     41.192,
+     54,
+     13.495
+    ],
+    "ground_band": {
+     "1": {
+      "x_mm": [
+       30.96,
+       64.719
+      ],
+      "y_mm": [
+       -7.666,
+       37.791
+      ],
+      "verts": 214
+     },
+     "0.2": {
+      "x_mm": [
+       33.11,
+       62.55
+      ],
+      "y_mm": [
+       -5.485,
+       35.509
+      ],
+      "verts": 63
+     },
+     "0.5": {
+      "x_mm": [
+       32.163,
+       63.847
+      ],
+      "y_mm": [
+       -6.574,
+       36.759
+      ],
+      "verts": 141
+     }
+    }
+   }
+  },
+  "top_head_shell": {
+   "verts": 1965,
+   "cad_min_mm": [
+    -45.806,
+    -66.19,
+    -0.001
+   ],
+   "cad_max_mm": [
+    45.796,
+    56.5,
+    46.333
+   ],
+   "cad_size_mm": [
+    91.602,
+    122.69,
+    46.334
+   ],
+   "fit_rms_mm": {
+    "box": 15.278,
+    "ellipsoid": 11.977
+   },
+   "fit_max_overreach_mm": {
+    "box": 35.307,
+    "ellipsoid": 9.305
+   }
+  },
+  "jaw": {
+   "verts": 1235,
+   "cad_min_mm": [
+    -45.708,
+    -59.702,
+    -12.923
+   ],
+   "cad_max_mm": [
+    45.708,
+    9,
+    16.5
+   ],
+   "cad_size_mm": [
+    91.415,
+    68.702,
+    29.423
+   ],
+   "fit_rms_mm": {
+    "box": 6.497,
+    "ellipsoid": 10.308
+   },
+   "fit_max_overreach_mm": {
+    "box": 19.297,
+    "ellipsoid": 10.439
+   }
+  },
+  "bottom_head_shell": {
+   "verts": 2347,
+   "cad_min_mm": [
+    -45.875,
+    -60.24,
+    -12.632
+   ],
+   "cad_max_mm": [
+    45.869,
+    56.5,
+    7.5
+   ],
+   "cad_size_mm": [
+    91.744,
+    116.74,
+    20.132
+   ],
+   "fit_rms_mm": {
+    "box": 10.708,
+    "ellipsoid": 8.899
+   },
+   "fit_max_overreach_mm": {
+    "box": 20.382,
+    "ellipsoid": 4.299
+   }
+  },
+  "sole_right": {
+   "verts": 1988,
+   "cad_min_mm": [
+    -70.548,
+    -12,
+    -31.239
+   ],
+   "cad_max_mm": [
+    -29.455,
+    42,
+    -18.342
+   ],
+   "cad_size_mm": [
+    41.093,
+    54,
+    12.897
+   ],
+   "fit_rms_mm": {
+    "box": 3.633,
+    "ellipsoid": 5.233
+   },
+   "fit_max_overreach_mm": {
+    "box": 7.809,
+    "ellipsoid": 0.707
+   },
+   "sole": {
+    "cant_deg_used": -5,
+    "cant_deg_fitted": -5.261,
+    "q_cad_to_plane": [
+     0.999048222,
+     0,
+     -0.043619387,
+     0
+    ],
+    "plane_frame_min_mm": [
+     -68.401,
+     -12,
+     -34.389
+    ],
+    "plane_frame_max_mm": [
+     -27.209,
+     42,
+     -20.894
+    ],
+    "plane_frame_size_mm": [
+     41.192,
+     54,
+     13.495
+    ],
+    "ground_band": {
+     "1": {
+      "x_mm": [
+       -64.576,
+       -30.974
+      ],
+      "y_mm": [
+       -7.544,
+       37.791
+      ],
+      "verts": 210
+     },
+     "0.2": {
+      "x_mm": [
+       -62.762,
+       -33.144
+      ],
+      "y_mm": [
+       -5.593,
+       35.516
+      ],
+      "verts": 63
+     },
+     "0.5": {
+      "x_mm": [
+       -63.675,
+       -31.84
+      ],
+      "y_mm": [
+       -6.557,
+       36.761
+      ],
+      "verts": 136
+     }
+    }
+   }
+  }
+ }
+}

@@ -95,7 +95,7 @@ describe('viewer_status (plan-564)', () => {
 
     const types = ws.last.sentTypes();
     expect(types.indexOf('viewer_status')).toBeGreaterThan(types.indexOf('discover'));
-    expect(statusFrames(ws.last)).toEqual([{ type: 'viewer_status', visible: true, seq: 1 }]);
+    expect(statusFrames(ws.last)).toEqual([{ type: 'viewer_status', visible: true, seq: 1, ai: true }]);
   });
 
   it('follows visibilitychange, numbered, and never before the socket is open', () => {
@@ -133,7 +133,7 @@ describe('viewer_status (plan-564)', () => {
     ws.last.open();
 
     expect(statusFrames(ws.last)[0]).toEqual({
-      type: 'viewer_status', visible: true, seq: 1, claimSession: { id: 'c0abc', secret: 's3cret' },
+      type: 'viewer_status', visible: true, seq: 1, claimSession: { id: 'c0abc', secret: 's3cret' }, ai: true,
     });
   });
 
@@ -218,6 +218,8 @@ describe('close codes around standby', () => {
     ws.last.open();
     ws.last.message({ type: 'status', status: STATUS });
     ws.last.serverClose(1008, 'Another WebViewer tab took ownership.');
-    expect(plugin.mcpEnabled).toBe(false);
+    // plan-668: 1008 stops the CHANNEL for good (lifetime), it does not touch AI control.
+    expect((plugin as unknown as { _destroyed: boolean })._destroyed).toBe(true);
+    expect(plugin.mcpEnabled).toBe(true);
   });
 });

@@ -285,8 +285,8 @@ describe('Veraltete Frames (§2.7.1)', () => {
 describe('Hinweiszeile zu unterdrueckten Overrides (§2.7.2)', () => {
   it('Singular, Plural, und nichts bei null', () => {
     expect(describeSuppressedOverrides(0)).toBeNull();
-    expect(describeSuppressedOverrides(1)).toBe('1 Override dieser Instanz ist ausgeblendet');
-    expect(describeSuppressedOverrides(3)).toBe('3 Overrides dieser Instanz sind ausgeblendet');
+    expect(describeSuppressedOverrides(1)).toBe('1 override of this instance is hidden');
+    expect(describeSuppressedOverrides(3)).toBe('3 overrides of this instance are hidden');
   });
 
   it('die Spitze bestimmt die Zeile', () => {
@@ -300,7 +300,7 @@ describe('Hinweiszeile zu unterdrueckten Overrides (§2.7.2)', () => {
       doc: docB, assetId: 'b', name: 'Station',
       referenceNodeId: 'ref-b', isolatedRoots: [h.roots.b], suppressedOverrides: 2,
     });
-    expect(h.stack.suppressionNotice()).toBe('2 Overrides dieser Instanz sind ausgeblendet');
+    expect(h.stack.suppressionNotice()).toBe('2 overrides of this instance are hidden');
 
     h.stack.pop();
     expect(h.stack.suppressionNotice()).toBeNull();

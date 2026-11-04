@@ -43,8 +43,8 @@ import { setCachedFrom } from './rv-scene-owner';
 import {
   newProject,
   sceneGlbRelPathFor,
+  type RvDocumentEntry,
   type RvProject,
-  type RvProjectSceneEntry,
 } from './rv-project-types';
 
 export interface CreateProjectFromScenesOptions {
@@ -98,7 +98,7 @@ export async function createProjectFromScenes(
 
   const read = opts.readScene ?? readScene;
   const readGlb = opts.readSceneGlb ?? readSceneGlb;
-  const entries: RvProjectSceneEntry[] = [];
+  const entries: RvDocumentEntry[] = [];
   const written: string[] = [];
   const skipped: string[] = [];
 

@@ -86,9 +86,13 @@ Contributions:
    did not author, you must clearly identify it, including its source and
    license, when submitting the Contribution.
 
-5. **Outbound license.** Your Contribution will be published as part of this
+5. **Outbound license.** Code contributions will be published as part of this
    repository under the AGPL-3.0-only license (see [LICENSE](LICENSE)) — in
    addition to the commercial licensing by realvirtual GmbH described above.
+   For content contributions (3D models, library components, textures), the
+   applicable content license (see [CONTENT-LICENSE.md](CONTENT-LICENSE.md))
+   and the necessary rights are agreed explicitly before the contribution is
+   accepted. Licenses already granted remain unaffected.
 
 6. **No obligation.** You are not required to provide support for your
    Contribution. realvirtual GmbH is not obligated to accept, use, or retain

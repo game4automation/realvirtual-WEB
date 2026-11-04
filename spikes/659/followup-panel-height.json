@@ -1,0 +1,28 @@
+{
+  "staleGeometrySeed": {
+    "x": 64,
+    "y": 120,
+    "w": 330,
+    "h": 470
+  },
+  "fresh": {
+    "found": true,
+    "cssHeight": "415.875px",
+    "windowHeightPx": 416,
+    "windowWidthPx": 290,
+    "emptyBelowContentPx": 9,
+    "hasKeyLegend": true,
+    "keyLegendRows": 5,
+    "statusText": "WALKING — KEYS BELOW STEER IT"
+  },
+  "used": {
+    "found": true,
+    "cssHeight": "415.875px",
+    "windowHeightPx": 416,
+    "windowWidthPx": 330,
+    "emptyBelowContentPx": 9,
+    "hasKeyLegend": true,
+    "keyLegendRows": 5,
+    "statusText": "WALKING — KEYS BELOW STEER IT"
+  }
+}

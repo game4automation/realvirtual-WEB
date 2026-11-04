@@ -38,11 +38,13 @@ export interface DestructiveConfirmRequest {
 export interface DestructiveConfirmDialogProps {
   request: DestructiveConfirmRequest | null;
   onClose: () => void;
+  /** Stacking order when the dialog is opened from a floating panel that sits above MUI's modal layer. */
+  zIndex?: number;
 }
 
-export function DestructiveConfirmDialog({ request, onClose }: DestructiveConfirmDialogProps) {
+export function DestructiveConfirmDialog({ request, onClose, zIndex }: DestructiveConfirmDialogProps) {
   return (
-    <Dialog open={request !== null} onClose={onClose} maxWidth="xs" fullWidth>
+    <Dialog open={request !== null} onClose={onClose} maxWidth="xs" fullWidth sx={zIndex !== undefined ? { zIndex } : undefined}>
       <DialogTitle sx={{ fontSize: 14, fontWeight: 600 }}>
         {request?.title}
       </DialogTitle>

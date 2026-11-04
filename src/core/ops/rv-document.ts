@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { bumpModelEditEpoch } from '../engine/rv-model-edit-epoch';
+import { isDesRunConfigField } from '../material-flow/des-manager-settings';
 /**
  * rv-document — ONE op-log document class (plan-703 Phase 1).
  *
@@ -46,14 +48,46 @@ import { MAX_OP_HISTORY } from './rv-op-utils';
 import {
   canCoalesceRvOps,
   describeRvOp,
+  foldKeyedComposite,
   journalIdOf,
   makeComposite,
   mergeRvOps,
+  referenceRewriteRangesOf,
+  type RvCompositeOp,
   type RvOp,
   type RvOpMeta,
   type RvPrimitiveOp,
 } from './rv-unified-ops';
 import type { RvDocumentMode, RvExecutor } from './rv-unified-executors';
+import { planPlacedReplay, type RvPlacedReplaySkip } from './rv-placed-replay';
+
+/**
+ * plan-774 F3 / review fix E3: the gate a draft replay asks per op — "does this
+ * op need placed content that is still materialising?" (`authoringReplayGate`
+ * in `rv-authoring-load.ts`; structural here so core ops stay free of the
+ * editor). `wait()` resolves true once the content arrived for THIS document,
+ * false when another document took the viewer first.
+ */
+export interface RvDocumentReplayGate {
+  needsWait(op: RvOp): boolean;
+  wait(): Promise<boolean>;
+}
+
+/** Options of {@link RvDocument.replayOps}. */
+export interface RvDocumentReplayOptions {
+  /** Ops from the first one the gate must wait for on become the PENDING tail. */
+  gate?: RvDocumentReplayGate;
+  /**
+   * How long the pending tail waits for its placements (the authoring join's
+   * budget). After it the tail goes into the history UNAPPLIED (kept in the
+   * draft, reported "still loading") and the document queue is free again.
+   * Default {@link DEFAULT_REPLAY_WAIT_BUDGET_MS}.
+   */
+  waitBudgetMs?: number;
+}
+
+/** Default wait of a pending replay tail — the authoring join's default budget (60 s). */
+export const DEFAULT_REPLAY_WAIT_BUDGET_MS = 60_000;
 
 /**
  * The three document INTRINSICS every facade snapshot carries (plan-710 §2.4).
@@ -154,6 +188,48 @@ export interface RvTransactionOptions {
    * the signal back instead of releasing and re-registering it.
    */
   beforeRollback?: () => void;
+  /**
+   * Coalesce the committed entry with the previous entry of the SAME key into
+   * one undo step (plan-621, Spike (b) V2 "keyed amend") — a live CAD sync
+   * passes `solidcraft-sync:<session>`. See {@link RvDocument} `_recordKeyed`
+   * for the exact merge conditions and the chain breaks. In memory only: the
+   * key is never persisted, so after a reload there is no chain to continue.
+   * A nested transaction's option is ignored (the outermost one commits).
+   */
+  coalesce?: RvCoalesceOptions;
+}
+
+/** {@link RvTransactionOptions.coalesce}. */
+export interface RvCoalesceOptions {
+  /** Chain identity — only entries of the same key merge. */
+  key: string;
+  /**
+   * SLIDING quiet gap in ms (default {@link DEFAULT_COALESCE_WINDOW_MS}): measured
+   * from the last step merged into the entry, not from the first, so a steady
+   * 250 ms poll stays one entry for as long as it keeps arriving.
+   */
+  windowMs?: number;
+}
+
+/** Default sliding window of a keyed coalesce chain (plan-621 §2.3). */
+export const DEFAULT_COALESCE_WINDOW_MS = 1000;
+
+/** The open coalesce chain — in memory only, never persisted. */
+interface RvCoalesceTail {
+  key: string;
+  /** Id of the history entry the chain amends. */
+  entryId: string;
+  /** ts of the last step merged into it — the sliding-window anchor. */
+  lastTs: number;
+  windowMs: number;
+}
+
+/** Counters of the keyed coalesce (tests, diagnostics). */
+export interface RvCoalesceStats {
+  /** Entries amended instead of pushed. */
+  merged: number;
+  /** Child ops folded away (their stash was released). */
+  absorbed: number;
 }
 
 /** Direction of a history move. */
@@ -180,6 +256,24 @@ export type RvHistoryInterceptor = (
   doc: RvDocument,
 ) => Promise<RvHistoryVerdict>;
 
+/**
+ * Asked before ANY entry is undone or redone (plan-453 §2.6) — unlike the ONE
+ * {@link RvHistoryInterceptor}, which is offered only journaled entries and
+ * owns the slot. Synchronous and side-effect free: `false` refuses the move
+ * (the stacks and the scene stay as they are, nothing is emitted), `true` lets
+ * it through. A guard decides only for entries it recognises and returns
+ * `true` for everything else. The structural path verbs use it so an undo of
+ * a segment-list change obeys the same simulation lock as the verb itself.
+ */
+export type RvHistoryGuard = (entry: RvOp, direction: RvHistoryDirection) => boolean;
+
+/**
+ * Decides whether an op may be applied forward (plan-681 `structural-derived-locked`):
+ * an `Error` refuses it (the entry rejects with that error, nothing is applied or
+ * recorded), `null` lets it through. Synchronous and side-effect free.
+ */
+export type RvOpGuard = (op: RvOp) => Error | null;
+
 /** Position of the history stacks — what a journal compares before it moves them. */
 export interface RvHistoryHead {
   undoLen: number;
@@ -195,6 +289,27 @@ export interface RvHistoryInterception {
   journalId: string;
   direction: RvHistoryDirection;
   verdict: RvHistoryVerdict;
+}
+
+/**
+ * One actual change of the op stack (plan-641 M9) — see {@link RvDocument.onHistoryChange}.
+ *
+ *  - `record`   — a new entry was pushed (plain or keyed);
+ *  - `coalesce` — the top entry was amended in place (same count, new content);
+ *  - `undo` / `redo` — an entry moved between the stacks (incl. a journal replay);
+ *  - `replace`  — the whole history was swapped (`restoreHistory` with announce,
+ *                 a draft replay);
+ *  - `rollback` — entries above a floor were taken back for good (`rollbackTo`).
+ *
+ * A history move that did nothing (undo on an empty stack, a refused
+ * interception) fires NOTHING.
+ */
+export interface RvHistoryChange {
+  kind: 'record' | 'coalesce' | 'undo' | 'redo' | 'replace' | 'rollback';
+  /** Id of the entry concerned, when there is one. */
+  opId?: string;
+  /** {@link RvDocument.changeSeq} after this change. */
+  seq: number;
 }
 
 /** A frozen photograph of a document's history — see {@link RvDocument.captureHistory}. */
@@ -237,6 +352,15 @@ export class RvDocument {
   private readonly _hasUnpersistedWork?: () => boolean;
 
   private _ops: RvOp[] = [];
+  /**
+   * plan-774 review fix E3: the PENDING replay tail — recovered ops a draft
+   * replay could not apply yet because the placed content they target was
+   * still materialising. Not history (never applied, not undoable) but part of
+   * the DOCUMENT: the draft recipe carries it ({@link draftOps}), `dirty` counts
+   * it, a superseded wait keeps it and the next replay onto a fresh tree
+   * (Back, recompose — {@link replayPendingLocked}) re-attempts it.
+   */
+  private _pendingReplay: RvOp[] = [];
   private _redo: RvOp[] = [];
   /** Ids of `_ops` at the last clean point (fresh open / save). */
   private _baselineIds: string[] = [];
@@ -260,9 +384,18 @@ export class RvDocument {
   private _txnMeta: RvOpMeta | null = null;
   /** Hooks to run before the open transaction rolls back (plan-590). */
   private _txnBeforeRollback: Array<() => void> = [];
+  /** Coalesce option of the open transaction (the outermost one's, plan-621). */
+  private _txnCoalesce: RvCoalesceOptions | null = null;
+  /** The chain the next keyed entry may amend (plan-621) — null = broken. */
+  private _coalesceTail: RvCoalesceTail | null = null;
+  private readonly _coalesceStats: RvCoalesceStats = { merged: 0, absorbed: 0 };
 
   /** History interceptor (plan-590) — see {@link setHistoryInterceptor}. */
   private _historyInterceptor: RvHistoryInterceptor | null = null;
+  /** History guards (plan-453) — asked for EVERY entry before it is undone / redone. */
+  private readonly _historyGuards = new Set<RvHistoryGuard>();
+  /** Op guards (plan-681) — asked for EVERY op before it is applied forward. */
+  private readonly _opGuards = new Set<RvOpGuard>();
   /** True while the interceptor runs — an undo/redo from inside it is re-entrant. */
   private _intercepting = false;
   private _lastInterception: RvHistoryInterception | null = null;
@@ -273,6 +406,18 @@ export class RvDocument {
 
   private _snapshot: RvDocumentSnapshot | null = null;
   private readonly _listeners = new Set<() => void>();
+
+  /** Monotone count of actual op-stack changes (plan-641 M9). */
+  private _changeSeq = 0;
+  private readonly _historyObservers = new Set<(change: RvHistoryChange) => void>();
+  /**
+   * Coalesce floor (plan-641 M8): while set, neither coalescing path may amend
+   * an entry at an index below it. Null = no floor. Shifted with the history cap
+   * exactly like `_baselineFloor`.
+   */
+  private _coalesceFloor: number | null = null;
+  /** Token of the current floor owner — a stale release must not drop a newer floor. */
+  private _coalesceFloorToken = 0;
 
   constructor(opts: RvDocumentOptions) {
     this.id = opts.id;
@@ -342,15 +487,115 @@ export class RvDocument {
     this._commitHooks.add(cb);
     return () => { this._commitHooks.delete(cb); };
   }
+
+  // ─── Change evidence (plan-641 M8/M9) ───────────────────────────────
+
+  /**
+   * Monotone counter of ACTUAL op-stack changes — one per
+   * {@link RvHistoryChange}. Unlike `opCount` it moves on a coalesce (same
+   * count, new content), and unlike the commit hook it does not move on an
+   * undo that had nothing to undo.
+   */
+  get changeSeq(): number { return this._changeSeq; }
+
+  /**
+   * Observe every actual change of the op stack, SYNCHRONOUSLY and one call per
+   * change (plan-641 M9). A recorder counts these per event — never by
+   * comparing a "last state" — so an undo in between cannot be hidden by a
+   * redo. Returns the unsubscribe.
+   */
+  onHistoryChange(cb: (change: RvHistoryChange) => void): () => void {
+    this._historyObservers.add(cb);
+    return () => { this._historyObservers.delete(cb); };
+  }
+
+  /**
+   * Set a coalesce floor at the current top (plan-641 M8): no entry recorded
+   * BEFORE this call can be amended afterwards — neither by the unkeyed
+   * time-window coalescing nor by a keyed chain. Returns the release; a release
+   * of a floor that has since been replaced by a newer one is a no-op.
+   */
+  markCoalesceFloor(): () => void {
+    this._coalesceFloor = this._ops.length;
+    this._coalesceTail = null;
+    const token = ++this._coalesceFloorToken;
+    return () => {
+      if (this._coalesceFloorToken === token) this._coalesceFloor = null;
+    };
+  }
+
+  /** The active coalesce floor, or null (tests, diagnostics). */
+  get coalesceFloor(): number | null { return this._coalesceFloor; }
+
+  /**
+   * Mark document METADATA dirty without an op (plan-641 M5: a new macro line
+   * belongs to the document and has to reach the next save).
+   */
+  markMetaDirty(): void {
+    if (this._metaDirty) return;
+    this._metaDirty = true;
+    this._changed();
+  }
+
+  private async _applyModelForward(op: RvOp): Promise<void> {
+    await this.executor.applyForward(op);
+    this._recordModelEdit(op);
+  }
+
+  private async _applyModelInverse(op: RvOp): Promise<void> {
+    await this.executor.applyInverse(op);
+    this._recordModelEdit(op);
+  }
+
+  private _recordModelEdit(op: RvOp): void {
+    // Camera ops share the document log, but carry view state only. Authored
+    // setNodeVisible changes the file; groups-panel hide/isolate uses no op.
+    // DESManager run parameters (end / warm-up / seed) are run configuration, not model.
+    const authored = (item: RvOp): boolean => item.kind === 'composite'
+      ? item.ops.some(authored)
+      : item.kind !== 'setCamera'
+        && !((item.kind === 'setField' || item.kind === 'unsetField') && isDesRunConfigField(item.componentType, item.fieldName));
+    if (authored(op)) bumpModelEditEpoch('document-edit');
+  }
+
+  private _emitHistory(kind: RvHistoryChange['kind'], opId?: string): void {
+    this._changeSeq++;
+    if (this._historyObservers.size === 0) return;
+    const change: RvHistoryChange = { kind, seq: this._changeSeq, ...(opId ? { opId } : {}) };
+    for (const cb of [...this._historyObservers]) {
+      try { cb(change); } catch (e) { console.error('[rv-document] history observer failed:', e); }
+    }
+  }
+
+  /** True when the top entry may still be amended (above the undo AND the coalesce floor). */
+  private _topAboveFloors(): boolean {
+    return this._ops.length > this._baselineFloor
+      && (this._coalesceFloor === null || this._ops.length > this._coalesceFloor);
+  }
   /** The live op log. Treat as read-only — mutate through the op API. */
   get ops(): readonly RvOp[] { return this._ops; }
+  /** plan-774 review fix E3: recovered ops still waiting for their placed content (see {@link replayOps}). */
+  get pendingReplayOps(): readonly RvOp[] { return this._pendingReplay; }
+  /**
+   * The draft recipe (plan-774 review fix E3): the history PLUS the pending
+   * replay tail, in log order — what every draft writer stores, so leaving the
+   * editor while the tail waits loses none of it.
+   */
+  get draftOps(): RvOp[] {
+    return this._pendingReplay.length === 0 ? [...this._ops] : [...this._ops, ...this._pendingReplay];
+  }
   get opCount(): number { return this._ops.length; }
+
+  /** Keyed-coalesce counters (plan-621) — a copy, for tests and diagnostics. */
+  get coalesceStats(): RvCoalesceStats { return { ...this._coalesceStats }; }
   get baselineFloor(): number { return this._baselineFloor; }
   get isDisposed(): boolean { return this._disposed; }
 
   /** Derived from the op log, never a side flag (plan §5.2). */
   get dirty(): boolean {
     if (this._metaDirty) return true;
+    // A pending replay tail is recovered work the tree does not show yet.
+    if (this._pendingReplay.length > 0) return true;
     if (this._ops.length !== this._baselineIds.length) return true;
     return this._ops.some((op, i) => op.id !== this._baselineIds[i]);
   }
@@ -432,7 +677,8 @@ export class RvDocument {
   applyOp(op: RvOp): Promise<void> {
     return this._enqueue(async () => {
       if (this._canApply && !this._canApply()) return;
-      await this.executor.applyForward(op);
+      this._checkOpGuards(op);
+      await this._applyModelForward(op);
       this._record(op);
     });
   }
@@ -445,7 +691,51 @@ export class RvDocument {
    * rolls back and still rejects at the caller that opened it.
    */
   applyOpDetached(op: RvOp): void {
-    void this.applyOp(op).catch((e) => {
+    this.trackDetached(this.applyOp(op));
+  }
+
+  /**
+   * Plan an op and apply it in ONE queue slot (plan-610 §2.4 "Planung in der
+   * Dokument-Queue").
+   *
+   * `plan` runs ON the queue, i.e. against the state every op queued before it
+   * has already produced, and nothing can land between the scan it does and the
+   * apply of the op it returns. That is what a reference rewrite needs: it reads
+   * every referrer of the document, and an op still waiting in the queue would
+   * otherwise change what was scanned before the composite runs.
+   *
+   * - `plan` THROWS → nothing is applied, the promise rejects with that error.
+   * - `plan` returns `op: null` → nothing to apply, `result` is handed back.
+   * - otherwise the op is applied and recorded exactly like {@link applyOp}
+   *   (rejects without recording when the executor fails).
+   *
+   * Resolves to `null` when the document refuses ops right now (`canApply`,
+   * e.g. a base swap) — `plan` is then not called, mirroring the silent drop
+   * of {@link applyOp}.
+   */
+  applyPlanned<T>(plan: () => { op: RvOp | null; result: T }): Promise<T | null> {
+    let out: T | null = null;
+    return this._enqueue(async () => {
+      if (this._canApply && !this._canApply()) return;
+      const planned = plan();
+      if (planned.op) {
+        this._checkOpGuards(planned.op);
+        await this._applyModelForward(planned.op);
+        this._record(planned.op);
+      }
+      out = planned.result;
+    }).then(() => out);
+  }
+
+  /**
+   * Hold the failure of a promise nobody awaits (a `void` mutator's): inside a
+   * transaction it is remembered, so the transaction still rolls back and
+   * rejects at the caller that opened it. `benign` failures (a refusal the
+   * mutator already reported) are swallowed without poisoning the transaction.
+   */
+  trackDetached(p: Promise<unknown>, benign?: (e: unknown) => boolean): void {
+    void p.catch((e) => {
+      if (benign?.(e)) return;
       if (this._txnOps && this._txnError === null) this._txnError = e;
     });
   }
@@ -460,9 +750,13 @@ export class RvDocument {
       if (await this._intercept(op, 'undo')) return;
       // The stacks move only AFTER the inverse applied — popping first would
       // discard the entry on a failed undo, leaving the change with no way back.
-      await this.executor.applyInverse(op);
+      await this._applyModelInverse(op);
       this._ops.pop();
       this._redo.push(op);
+      // plan-621: the next keyed step must never amend an entry below the one
+      // the user just took back.
+      this._coalesceTail = null;
+      this._emitHistory('undo', op.id);
     });
     this._changed();
   }
@@ -475,9 +769,11 @@ export class RvDocument {
       const op = this._redo[this._redo.length - 1];
       if (!op) return;
       if (await this._intercept(op, 'redo')) return;
-      await this.executor.applyForward(op);
+      await this._applyModelForward(op);
       this._redo.pop();
       this._ops.push(op);
+      this._coalesceTail = null;
+      this._emitHistory('redo', op.id);
     });
     this._changed();
   }
@@ -494,6 +790,34 @@ export class RvDocument {
   }
 
   get historyInterceptor(): RvHistoryInterceptor | null { return this._historyInterceptor; }
+
+  /**
+   * Add a history guard (plan-453) — see {@link RvHistoryGuard}. Several guards
+   * may coexist; ALL must agree. Returns the removal.
+   */
+  addHistoryGuard(guard: RvHistoryGuard): () => void {
+    this._historyGuards.add(guard);
+    return () => { this._historyGuards.delete(guard); };
+  }
+
+  /**
+   * Add an op guard (plan-681) — asked for EVERY op `applyOp` / `applyPlanned`
+   * is about to apply, BEFORE the executor runs. A guard returns an `Error` to
+   * refuse (the entry rejects with it; scene and history stay as they are) or
+   * `null` to let the op through. Several guards may coexist; the first refusal
+   * wins. Undo / redo are guarded through {@link addHistoryGuard}. Returns the removal.
+   */
+  addOpGuard(guard: RvOpGuard): () => void {
+    this._opGuards.add(guard);
+    return () => { this._opGuards.delete(guard); };
+  }
+
+  private _checkOpGuards(op: RvOp): void {
+    for (const guard of this._opGuards) {
+      const refusal = guard(op);
+      if (refusal) throw refusal;
+    }
+  }
 
   /** The verdict of the last intercepted undo/redo, or null. */
   get lastHistoryInterception(): RvHistoryInterception | null { return this._lastInterception; }
@@ -539,22 +863,25 @@ export class RvDocument {
    * executor fails; the stacks move only after the executor succeeded.
    */
   async replayHistory(journalId: string, direction: RvHistoryDirection): Promise<void> {
+    this._coalesceTail = null;
     if (direction === 'undo') {
       const op = this._ops[this._ops.length - 1];
       if (!op || journalIdOf(op) !== journalId || !this.canUndo()) {
         throw new Error(`[rv-document] replayHistory: the newest undoable entry of "${this._name}" is not journal ${journalId}`);
       }
-      await this.executor.applyInverse(op);
+      await this._applyModelInverse(op);
       this._ops.pop();
       this._redo.push(op);
+      this._emitHistory('undo', op.id);
     } else {
       const op = this._redo[this._redo.length - 1];
       if (!op || journalIdOf(op) !== journalId) {
         throw new Error(`[rv-document] replayHistory: the newest redoable entry of "${this._name}" is not journal ${journalId}`);
       }
-      await this.executor.applyForward(op);
+      await this._applyModelForward(op);
       this._redo.pop();
       this._ops.push(op);
+      this._emitHistory('redo', op.id);
     }
     this._changed();
   }
@@ -577,6 +904,17 @@ export class RvDocument {
 
   /** Offer an entry to the interceptor. True when the document must not move the stacks itself. */
   private async _intercept(op: RvOp, direction: RvHistoryDirection): Promise<boolean> {
+    // plan-453: a refusing guard keeps the stacks — before the journal interceptor.
+    for (const guard of this._historyGuards) {
+      let ok: boolean;
+      try {
+        ok = guard(op, direction);
+      } catch (e) {
+        console.error(`[rv-document] history guard of "${this._name}" threw — ${direction} refused:`, e);
+        ok = false;
+      }
+      if (!ok) return true;
+    }
     const journalId = journalIdOf(op);
     const interceptor = this._historyInterceptor;
     if (!journalId || !interceptor) return false;
@@ -603,6 +941,7 @@ export class RvDocument {
       this._txnError = null;
       this._txnMeta = null;
       this._txnBeforeRollback = [];
+      this._txnCoalesce = null;
       // Publish "busy" BEFORE suppression starts — the only notification the UI
       // gets while the transaction runs (F6). ORDER IS LOAD-BEARING: `_notify`
       // returns early once `_txnOps` is set, so assigning the buffer first
@@ -614,8 +953,14 @@ export class RvDocument {
     }
     // plan-590: a nested transaction keeps its meta at the TOP level — the
     // outermost transaction is the one that commits, so it carries it.
-    if (opts?.meta?.journalId && !this._txnMeta?.journalId) this._txnMeta = { ...opts.meta };
+    if (opts?.meta?.journalId && !this._txnMeta?.journalId) this._txnMeta = { ...this._txnMeta, ...opts.meta };
+    // plan-610: a transaction opened AS a reference rewrite marks the whole
+    // committed entry; the marker is sticky across nesting.
+    if (opts?.meta?.referenceRewrite) this._txnMeta = { ...this._txnMeta, referenceRewrite: true };
     if (opts?.beforeRollback) this._txnBeforeRollback.push(opts.beforeRollback);
+    // plan-621: only the transaction that COMMITS decides whether its entry
+    // joins a chain — a nested caller cannot turn the outer edit into a sync step.
+    if (opts?.coalesce && this._txnDepth === 0) this._txnCoalesce = { ...opts.coalesce };
     this._txnDepth++;
     return Object.freeze({ _depth: this._txnDepth });
   }
@@ -637,6 +982,7 @@ export class RvDocument {
       const label = this._txnLabel;
       const meta = this._txnMeta;
       const beforeRollback = this._txnBeforeRollback;
+      const coalesce = this._txnCoalesce;
       this._closeTransaction();
       if (failure !== null) {
         runBeforeRollback(beforeRollback);
@@ -648,12 +994,29 @@ export class RvDocument {
       // A child composite's journal id survives the flattening at the TOP
       // level (plan-590): it is what routes the undo of the whole entry.
       let journalId = meta?.journalId;
-      const flattened = collected.flatMap((o) => {
-        if (o.kind !== 'composite') return [o as RvPrimitiveOp];
+      // plan-610: a reference-rewrite composite folded into the transaction
+      // keeps its BOUNDARIES, not a top-level marker — the entry records the
+      // index range of every rewrite group over the flattened list, so its
+      // undo/redo/replay defers the re-bind for exactly those ops while the
+      // unmarked siblings keep their immediate behaviour (SOL R3 #2).
+      const wholeEntry = meta?.referenceRewrite === true;
+      const ranges: Array<[number, number]> = [];
+      const flattened: RvPrimitiveOp[] = [];
+      for (const o of collected) {
+        if (o.kind !== 'composite') { flattened.push(o as RvPrimitiveOp); continue; }
         journalId ??= journalIdOf(o);
-        return o.ops;
-      });
-      this._record(this._composite(label, flattened, journalId ? { ...meta, journalId } : undefined));
+        const base = flattened.length;
+        for (const [start, end] of referenceRewriteRangesOf(o)) ranges.push([base + start, base + end]);
+        for (const child of o.ops) flattened.push(child);
+      }
+      const extra: RvOpMeta = {};
+      if (journalId) extra.journalId = journalId;
+      if (wholeEntry) extra.referenceRewrite = true;
+      else if (ranges.length > 0) extra.referenceRewriteRanges = ranges;
+      const outMeta: RvOpMeta | undefined = Object.keys(extra).length > 0 ? { ...meta, ...extra } : undefined;
+      const entry = this._composite(label, flattened, outMeta) as RvCompositeOp;
+      if (coalesce) this._recordKeyed(entry, coalesce);
+      else this._record(entry);
     }).finally(() => { this._closeTransaction(); });
   }
 
@@ -706,6 +1069,7 @@ export class RvDocument {
     this._txnBusy = false;
     this._txnMeta = null;
     this._txnBeforeRollback = [];
+    this._txnCoalesce = null;
   }
 
   /**
@@ -720,7 +1084,7 @@ export class RvDocument {
     try {
       for (let i = ops.length - 1; i >= 0; i--) {
         try {
-          await this.executor.applyInverse(ops[i]);
+          await this._applyModelInverse(ops[i]);
         } catch (e) {
           console.error('[rv-document] transaction rollback failed — the scene may be inconsistent:', e);
         }
@@ -749,14 +1113,156 @@ export class RvDocument {
    *
    * Ops are pushed WITHOUT coalescing and without clearing redo: a replay
    * reproduces a history, it does not author one. One notification at the end.
+   *
+   * plan-774 F8 / review fixes E4, E5 (`planPlacedReplay`, shared with the
+   * recompose replay): an op whose target inside PLACED content is missing is
+   * not applied — dropped from the history when its placement is materialised
+   * (the bake merged the node away), KEPT unapplied when it is not (placeholder:
+   * the next load that brings the asset applies it); a composite loses only its
+   * missing placed children. Every skip is reported (Problems
+   * `replay-op-skipped` through the executor), never lost silently.
+   *
+   * Review fixes E3 / E6: with `opts.gate` the gate is asked per op, on the
+   * tree as the ops before it left it — from the first op that must wait for
+   * placed content on, the rest becomes the PENDING tail ({@link pendingReplayOps},
+   * part of the draft) and is applied on the document's own queue once the
+   * placements arrived, so a user edit made meanwhile lands behind it. The
+   * wait is bounded by `opts.waitBudgetMs`; a superseded wait keeps the tail
+   * pending (re-attempted by {@link replayPendingLocked} on Back / recompose,
+   * or by the next load from the draft).
+   *
+   * @returns the skips of the part replayed now.
    */
-  async replayOps(ops: readonly RvOp[]): Promise<void> {
-    for (const op of ops) {
-      await this.executor.applyForward(op);
-      this._ops.push(op);
+  async replayOps(ops: readonly RvOp[], opts: RvDocumentReplayOptions = {}): Promise<RvPlacedReplaySkip[]> {
+    // plan-621: a replay reproduces a history — nothing authored before it may
+    // be amended by the next keyed step.
+    this._coalesceTail = null;
+    const { skipped, rest } = await this._replayRun(ops, opts.gate);
+    if (rest.length > 0 && opts.gate) {
+      this._pendingReplay.push(...rest);
+      this._notify();
+      const gate = opts.gate;
+      const budget = opts.waitBudgetMs ?? DEFAULT_REPLAY_WAIT_BUDGET_MS;
+      void this.runExclusive(() => this._settlePendingReplay(gate, budget)).catch((e) => {
+        console.error(`[rv-document] replaying the pending tail of '${this._name}' failed:`, e);
+      });
+    }
+    return skipped;
+  }
+
+  /**
+   * Re-attempt the pending replay tail onto a FRESH tree (plan-774 review fix
+   * E3) — Back from a descend, a recompose. The caller MUST hold the document's
+   * queue (it is the inside of `recomposeProjection`). `gate` is that reload's
+   * own (placements not ready in time): the wait is bounded like the first one.
+   * No-op without a pending tail.
+   */
+  async replayPendingLocked(gate?: RvDocumentReplayGate, waitBudgetMs?: number): Promise<void> {
+    if (this._pendingReplay.length === 0) return;
+    if (gate && this._pendingReplay.some((op) => gate.needsWait(op))) {
+      await this._settlePendingReplay(gate, waitBudgetMs ?? DEFAULT_REPLAY_WAIT_BUDGET_MS);
+      return;
+    }
+    const tail = this._pendingReplay;
+    this._pendingReplay = [];
+    await this._replayRun(tail, undefined);
+  }
+
+  /**
+   * Apply `ops` in order (the history part of a replay); stops at the first op
+   * `gate` must wait for and hands that op and everything after it back as
+   * `rest`. Reports the placed skips once.
+   */
+  private async _replayRun(
+    ops: readonly RvOp[],
+    gate: RvDocumentReplayGate | undefined,
+  ): Promise<{ skipped: RvPlacedReplaySkip[]; rest: RvOp[] }> {
+    const skipped: RvPlacedReplaySkip[] = [];
+    let rest: RvOp[] = [];
+    // plan-766 §2.4.4: one bracket around the whole replay, so observers that
+    // rebuild per op (the editor arenas) build once at the end instead.
+    this.executor.beginReplay?.();
+    try {
+      for (let i = 0; i < ops.length; i++) {
+        const op = ops[i];
+        // E6: asked HERE, per op — an earlier op of this replay (a rename of the
+        // reference node, say) has already changed the tree the gate reads.
+        if (gate?.needsWait(op)) {
+          rest = ops.slice(i);
+          break;
+        }
+        const plan = planPlacedReplay(this.executor, op);
+        skipped.push(...plan.skips);
+        if (plan.apply) await this._applyModelForward(plan.apply);
+        if (plan.keep) this._ops.push(plan.keep);
+      }
+    } finally {
+      this.executor.endReplay?.();
     }
     this._enforceCap();
+    if (ops.length > 0) this._emitHistory('replace');
     this._notify();
+    this._reportReplaySkips(skipped);
+    return { skipped, rest };
+  }
+
+  /**
+   * The pending tail's wait (on the queue): placements arrived → applied;
+   * superseded → kept pending; the budget ran out → moved into the history
+   * UNAPPLIED (kept in the draft, reported "still loading") so the queue is
+   * free again — never an endless `runExclusive`.
+   */
+  private async _settlePendingReplay(gate: RvDocumentReplayGate, budgetMs: number): Promise<void> {
+    if (this._disposed || this._pendingReplay.length === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race<boolean | 'timeout'>([
+      gate.wait().catch(() => false),
+      new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), Math.max(0, budgetMs)); }),
+    ]);
+    if (timer !== undefined) clearTimeout(timer);
+    if (this._disposed) return;
+    if (outcome === false) {
+      // Another document took the viewer (a descend, a switch): the tail stays
+      // pending — the draft keeps it, Back / the next load re-attempts it.
+      console.warn(`[rv-document] '${this._name}': ${this._pendingReplay.length} recovered op(s) wait for placed content of a document that is not on screen — kept`);
+      return;
+    }
+    const tail = this._pendingReplay;
+    this._pendingReplay = [];
+    if (outcome === 'timeout') {
+      // In log order: an op on placed content goes into the history UNAPPLIED
+      // (kept — the draft and every later recompose carry it); an own-content op
+      // of the tail is applied as usual, its targets do not wait for anything.
+      const skipped: RvPlacedReplaySkip[] = [];
+      this.executor.beginReplay?.();
+      try {
+        for (const op of tail) {
+          const target = this.executor.replayTargetInPlacedContent?.(op) ?? null;
+          if (target) {
+            skipped.push({ kind: op.kind, nodePath: target.nodePath, reason: 'still-loading' });
+          } else {
+            await this._applyModelForward(op);
+          }
+          this._ops.push(op);
+        }
+      } finally {
+        this.executor.endReplay?.();
+      }
+      this._enforceCap();
+      this._emitHistory('replace');
+      this._notify();
+      this._reportReplaySkips(skipped);
+      return;
+    }
+    await this._replayRun(tail, undefined);
+  }
+
+  private _reportReplaySkips(skipped: readonly RvPlacedReplaySkip[]): void {
+    if (skipped.length === 0) return;
+    console.warn(`[rv-document] replay onto '${this._name}': ${skipped.length} op(s) on placed content not applied`);
+    try { this.executor.reportReplaySkips?.(skipped, this._name); } catch (e) {
+      console.warn('[rv-document] reporting skipped replay ops failed:', e);
+    }
   }
 
   /**
@@ -770,6 +1276,9 @@ export class RvDocument {
     if (opts?.floor !== undefined) this._baselineFloor = Math.max(0, opts.floor);
     this._baselineIds = this._ops.map((o) => o.id);
     this._metaDirty = false;
+    // plan-621: a save is a clean point — the next keyed step must not amend an
+    // entry that is part of the saved state.
+    this._coalesceTail = null;
     this._changed();
   }
 
@@ -802,7 +1311,7 @@ export class RvDocument {
       try {
         for (let i = doomed.length - 1; i >= 0; i--) {
           try {
-            await this.executor.applyInverse(doomed[i]);
+            await this._applyModelInverse(doomed[i]);
           } catch (e) {
             console.error('[rv-document] discard rollback failed — the scene may be inconsistent:', e);
           }
@@ -812,6 +1321,9 @@ export class RvDocument {
       }
       this._ops.length = target;
       this._redo.length = 0;
+      this._coalesceTail = null;
+      if (this._coalesceFloor !== null) this._coalesceFloor = Math.min(this._coalesceFloor, target);
+      this._emitHistory('rollback');
       this._changed();
       return doomed.length;
     });
@@ -880,6 +1392,7 @@ export class RvDocument {
    * is restored (plan-703 Phase 4).
    */
   restoreHistory(state: RvDocumentHistory, opts?: { announce?: boolean }): void {
+    this._coalesceTail = null;
     this._ops = [...state.ops];
     this._redo = [...state.redoOps];
     this._baselineIds = [...state.baselineIds];
@@ -890,8 +1403,12 @@ export class RvDocument {
     // changed and the draft writers have to hear about it. Every other restore
     // puts back what was already there — announcing that would wake a draft
     // write for a document that did not change.
-    if (opts?.announce) this._changed();
-    else this._notify();
+    if (this._coalesceFloor !== null) this._coalesceFloor = Math.min(this._coalesceFloor, this._ops.length);
+    if (opts?.announce) {
+      // plan-641 M9: an announced restore is a DIFFERENT history — a change.
+      this._emitHistory('replace');
+      this._changed();
+    } else this._notify();
   }
 
   dispose(): void {
@@ -933,17 +1450,77 @@ export class RvDocument {
       this._txnOps.push(op);
       return;
     }
+    // plan-621: every entry recorded WITHOUT a coalesce key (a user edit, an
+    // un-keyed transaction) breaks the open keyed chain.
+    this._coalesceTail = null;
     const last = this._ops[this._ops.length - 1];
     // The stricter of the two rules (SceneStore): never coalesce INTO a
     // protected baseline op — that would rewrite a `prev` undo can't reach.
-    const headIsAboveFloor = this._ops.length > this._baselineFloor;
+    // plan-641 M8: a coalesce floor (macro recording) protects like the baseline.
+    const headIsAboveFloor = this._topAboveFloors();
+    let kind: RvHistoryChange['kind'] = 'record';
+    let opId = op.id;
     if (last && headIsAboveFloor && canCoalesceRvOps(last, op)) {
       this._ops[this._ops.length - 1] = mergeRvOps(last, op);
+      // The merged op keeps `last`'s id and inverse payload, so whatever the
+      // executor stashed for `op` (the intermediate material / geometry) is
+      // unreachable from here on (plan-621).
+      this.executor.releaseAbsorbed?.([op.id]);
+      kind = 'coalesce';
+      opId = last.id;
     } else {
       this._ops.push(op);
     }
     this._redo.length = 0; // a new edit invalidates the redo branch
     this._enforceCap();
+    this._emitHistory(kind, opId);
+    this._changed();
+  }
+
+  /**
+   * Record a KEYED transaction entry (plan-621, Spike (b) V2): amend the top
+   * entry when the chain is unbroken, push it otherwise.
+   *
+   * Merge only when ALL hold:
+   *  1. a chain is open with the same key and the top entry IS the chain's
+   *     entry — any other record, undo, redo, journal replay, save, draft
+   *     replay, history restore or rollback cleared the chain;
+   *  2. the step arrives within the SLIDING window of the last merged step;
+   *  3. the top entry is above the undo floor AND not part of the clean point
+   *     (`_baselineIds`) — the asset lineage has floor 0, so the floor alone
+   *     does not protect a saved entry;
+   *  4. {@link foldKeyedComposite} accepts (neither side is journaled).
+   *
+   * A failed (rolled back) step never reaches this method, so it leaves the
+   * chain standing. A different key starts a new chain.
+   */
+  private _recordKeyed(op: RvCompositeOp, coalesce: RvCoalesceOptions): void {
+    const windowMs = coalesce.windowMs ?? DEFAULT_COALESCE_WINDOW_MS;
+    const top = this._ops[this._ops.length - 1];
+    const tail = this._coalesceTail;
+    const canMerge = !!top && top.kind === 'composite' && !!tail
+      && tail.key === coalesce.key
+      && tail.entryId === top.id
+      && op.ts >= tail.lastTs && op.ts - tail.lastTs <= tail.windowMs
+      && this._topAboveFloors()
+      && !this._baselineIds.includes(top.id);
+    const fold = canMerge ? foldKeyedComposite(top as RvCompositeOp, op) : null;
+    if (fold) {
+      this._ops[this._ops.length - 1] = fold.merged;
+      this._coalesceStats.merged++;
+      this._coalesceStats.absorbed += fold.absorbed.length;
+      if (fold.absorbed.length > 0) this.executor.releaseAbsorbed?.(fold.absorbed);
+      this._redo.length = 0;
+      this._coalesceTail = { key: coalesce.key, entryId: fold.merged.id, lastTs: op.ts, windowMs };
+      this._emitHistory('coalesce', fold.merged.id);
+      this._changed();
+      return;
+    }
+    this._ops.push(op);
+    this._redo.length = 0;
+    this._enforceCap();
+    this._coalesceTail = { key: coalesce.key, entryId: op.id, lastTs: op.ts, windowMs };
+    this._emitHistory('record', op.id);
     this._changed();
   }
 
@@ -953,6 +1530,8 @@ export class RvDocument {
     const drop = this._ops.length - MAX_OP_HISTORY;
     this._ops.splice(0, drop);
     this._baselineFloor = Math.max(0, this._baselineFloor - drop);
+    // plan-641 M8: the coalesce floor moves with the entries it protects.
+    if (this._coalesceFloor !== null) this._coalesceFloor = Math.max(0, this._coalesceFloor - drop);
     if (this._baselineIds.length > 0) {
       this._baselineIds = this._baselineIds.slice(Math.min(drop, this._baselineIds.length));
     }

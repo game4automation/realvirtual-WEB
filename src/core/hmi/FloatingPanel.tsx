@@ -15,7 +15,9 @@ import { useState, useRef, useEffect, useCallback, useSyncExternalStore, type Re
 import { createPortal } from 'react-dom';
 import { Box, IconButton, Typography, Paper } from '@mui/material';
 import { Close, UnfoldMore, UnfoldLess, DragIndicator, ExpandLess, ExpandMore } from '@mui/icons-material';
+import { loadPanelGeometry, savePanelGeometry, loadPanelCollapsed, savePanelCollapsed, subscribePanelGeometry, type PanelGeometry } from './floating-panel-store';
 import { BOTTOM_BAR_HEIGHT } from './layout-constants';
+import { PANEL_SURFACE, INK_LOW } from './shared-sx';
 import { useMobileLayout } from '../../hooks/use-mobile-layout';
 import { getRecentAnchorPoint, placeAdjacentToAnchor, getCSSViewportSize, clientToCSS } from './panel-anchor-store';
 import { getFloatingPanelRoot } from './HMIShell';
@@ -31,50 +33,11 @@ const BOTTOM_MARGIN = BOTTOM_BAR_HEIGHT + 12;
 const TITLE_BAR_KEEP = 40;
 /** px of a too-wide panel that must stay on screen, for the same reason. */
 const EDGE_KEEP = 120;
-const LS_PREFIX = 'rv-panel-geo:';
-/** Collapsed state of a `collapsible` panel — plan-477 F2/F16. */
-const LS_COLLAPSED_PREFIX = 'rv-panel-collapsed:';
 const DBLCLICK_MS = 350;
 
 // Open-order stack of mounted panels so Escape closes only the most
 // recently opened one instead of every open panel at once.
 const escStack: symbol[] = [];
-
-// ─── Geometry persistence ──────────────────────────────────────────────
-
-interface PanelGeometry {
-  x: number; y: number;
-  w: number; h: number;
-}
-
-function loadPanelGeometry(panelId: string): PanelGeometry | null {
-  try {
-    const raw = localStorage.getItem(LS_PREFIX + panelId);
-    if (!raw) return null;
-    const g = JSON.parse(raw) as PanelGeometry;
-    if (typeof g.x === 'number' && typeof g.y === 'number' &&
-        typeof g.w === 'number' && typeof g.h === 'number') return g;
-  } catch { /* corrupt entry */ }
-  return null;
-}
-
-function savePanelGeometry(panelId: string, geo: PanelGeometry): void {
-  try { localStorage.setItem(LS_PREFIX + panelId, JSON.stringify(geo)); } catch { /* quota */ }
-}
-
-/** Persisted collapsed state, or null when the panel has never been collapsed. */
-function loadPanelCollapsed(panelId: string): boolean | null {
-  try {
-    const raw = localStorage.getItem(LS_COLLAPSED_PREFIX + panelId);
-    if (raw === '1') return true;
-    if (raw === '0') return false;
-  } catch { /* unavailable */ }
-  return null;
-}
-
-function savePanelCollapsed(panelId: string, collapsed: boolean): void {
-  try { localStorage.setItem(LS_COLLAPSED_PREFIX + panelId, collapsed ? '1' : '0'); } catch { /* quota */ }
-}
 
 /**
  * Is the kiosk context active? (plan-477 F14.)
@@ -191,6 +154,40 @@ export function useDrag(
 
 // ─── Resize hook ────────────────────────────────────────────────────────
 
+/** Edge or corner a resize grabs: compass directions, `se` is the classic corner. */
+export type ResizeDir = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
+
+const RESIZE_CURSOR: Record<ResizeDir, string> = {
+  n: 'ns-resize', s: 'ns-resize', e: 'ew-resize', w: 'ew-resize',
+  nw: 'nwse-resize', se: 'nwse-resize', ne: 'nesw-resize', sw: 'nesw-resize',
+};
+
+/** Ignore a second pointer (multi-touch) while one resize runs. Id 0 = synthetic, accepted. */
+function samePointer(e: PointerEvent, id: number): boolean {
+  return !e.pointerId || !id || e.pointerId === id;
+}
+
+/** Options for edges that move the panel origin (west / north). */
+export interface ResizeOriginOptions {
+  /** The rectangle actually rendered, CSS-px (after the render-time clamp and height cap). */
+  getRect: () => { x: number; y: number; w: number; h: number };
+  setPos: (p: { x: number; y: number }) => void;
+  /**
+   * Limits of the rendered geometry, CSS-px: the smallest origin a west/north
+   * drag may reach, the largest y the render clamp leaves alone and the height
+   * cap. Inside them the edge opposite the dragged one never moves.
+   */
+  getBounds: () => { minX: number; minY: number; maxY: number; maxH: number };
+}
+
+/**
+ * Resize by any element inside `ref` carrying `data-resize-dir` (delegated, so
+ * ONE listener set, one state and one end-of-resize callback serve all eight
+ * handles — the classic bottom-right corner is simply direction `se`).
+ *
+ * East/south move the far edge; west/north move the origin while the opposite
+ * edge stays put, which needs `origin`. Without it, west/north are ignored.
+ */
 export function useResize(
   ref: React.RefObject<HTMLDivElement | null>,
   size: { w: number; h: number },
@@ -201,13 +198,16 @@ export function useResize(
   /** Called once after a resize this hook actually owned — see {@link useDrag}. */
   onEnd?: () => void,
   host?: HTMLElement | null,
+  origin?: ResizeOriginOptions,
 ) {
-  const resizing = useRef(false);
-  const start = useRef({ mx: 0, my: 0, w: 0, h: 0 });
+  const resizing = useRef<{ dir: ResizeDir; pointerId: number; handle: HTMLElement } | null>(null);
+  const start = useRef({ mx: 0, my: 0, w: 0, h: 0, x: 0, y: 0, minX: 0, minY: 0, maxY: Infinity, maxH: Infinity });
   const sizeRef = useRef(size);
   sizeRef.current = size;
   const onEndRef = useRef(onEnd);
   onEndRef.current = onEnd;
+  const originRef = useRef(origin);
+  originRef.current = origin;
 
   useEffect(() => {
     if (!active) return;
@@ -215,44 +215,131 @@ export function useResize(
     if (!el) return;
 
     const onDown = (e: PointerEvent) => {
-      resizing.current = true;
-      // Same CSS-zoom conversion as useDrag — resize state (w, h) is in
+      // One resize at a time: a second finger must not take over the gesture.
+      if (resizing.current || e.button > 0) return;
+      const target = e.target as HTMLElement | null;
+      const handle = (target?.closest?.('[data-resize-dir]') as HTMLElement | null) ?? null;
+      // Delegated: a pointerdown anywhere else in the container is not ours.
+      if (!handle || !el.contains(handle)) return;
+      const dir = handle.dataset.resizeDir as ResizeDir;
+      const moves = dir.includes('w') || dir.includes('n');
+      const o = originRef.current;
+      if (moves && !o) return;
+      const r0 = o ? o.getRect() : { x: 0, y: 0, ...sizeRef.current };
+      const b = o ? o.getBounds() : { minX: -Infinity, minY: -Infinity, maxY: Infinity, maxH: Infinity };
+      resizing.current = { dir, pointerId: e.pointerId, handle };
+      // Same CSS-zoom conversion as useDrag — resize state (w, h, x, y) is in
       // CSS-px so the deltas computed from clientX/Y must be too.
       start.current = {
         mx: clientToCSS(e.clientX),
         my: clientToCSS(e.clientY),
-        w: sizeRef.current.w,
-        h: sizeRef.current.h,
+        w: r0.w,
+        h: r0.h,
+        x: r0.x,
+        y: r0.y,
+        // Never force a jump: a panel already outside a bound keeps its place.
+        minX: Math.min(b.minX, r0.x),
+        minY: Math.min(b.minY, r0.y),
+        maxY: Math.max(b.maxY, r0.y),
+        maxH: Math.max(b.maxH, r0.h),
       };
-      el.setPointerCapture(e.pointerId);
+      // Capture keeps a fast drag that leaves the 6 px zone in this gesture.
+      try { handle.setPointerCapture(e.pointerId); } catch { /* synthetic pointer */ }
       e.preventDefault();
       e.stopPropagation();
     };
     const onMove = (e: PointerEvent) => {
-      if (!resizing.current) return;
-      const dw = clientToCSS(e.clientX) - start.current.mx;
-      const dh = clientToCSS(e.clientY) - start.current.my;
-      setSize({
-        w: Math.max(minW, start.current.w + dw),
-        h: Math.max(minH, start.current.h + dh),
-      });
+      const r = resizing.current;
+      if (!r || !samePointer(e, r.pointerId)) return;
+      const s = start.current;
+      const dx = clientToCSS(e.clientX) - s.mx;
+      const dy = clientToCSS(e.clientY) - s.my;
+      let { w, h } = s;
+      let { x, y } = s;
+      if (r.dir.includes('e')) w = Math.max(minW, s.w + dx);
+      if (r.dir.includes('s')) h = Math.max(minH, Math.min(s.maxH, s.h + dy));
+      if (r.dir.includes('w')) {
+        // The right edge stays put; the origin may not pass its bound.
+        const right = s.x + s.w;
+        w = Math.max(minW, Math.min(s.w - dx, right - s.minX));
+        x = right - w;
+      }
+      if (r.dir.includes('n')) {
+        // The bottom edge stays put: the top may not pass minY, the height not
+        // the render cap, and y not the render clamp (which would move the panel).
+        const bottom = s.y + s.h;
+        h = Math.max(minH, bottom - s.maxY, Math.min(s.h - dy, bottom - s.minY, s.maxH));
+        y = bottom - h;
+      }
+      setSize({ w, h });
+      if ((r.dir.includes('w') || r.dir.includes('n')) && originRef.current) {
+        originRef.current.setPos({ x, y });
+      }
     };
-    const onUp = () => {
-      const wasResizing = resizing.current;
-      resizing.current = false;
-      if (wasResizing) onEndRef.current?.();
+    const onUp = (e: PointerEvent) => {
+      const r = resizing.current;
+      if (!r || !samePointer(e, r.pointerId)) return;
+      resizing.current = null;
+      onEndRef.current?.();
     };
 
     el.addEventListener('pointerdown', onDown);
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
     return () => {
       el.removeEventListener('pointerdown', onDown);
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+      // An in-flight resize whose listeners go away (maximize, collapse, close,
+      // resize switched off) ends here without touching geometry again.
+      const r = resizing.current;
+      if (r) {
+        try { r.handle.releasePointerCapture(r.pointerId); } catch { /* already released */ }
+      }
+      resizing.current = null;
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ref, setSize, minW, minH, active, host]);
+}
+
+// ─── Resize handle layout ──────────────────────────────────────────────
+
+/** Thickness of the invisible edge hit zones, px. */
+const EDGE_HIT = 6;
+/** Corner hit zones, px — a little larger so the diagonal is easy to grab. */
+const CORNER_HIT = 12;
+/** The visible bottom-right grip, px. */
+const GRIP_HIT = 16;
+
+function resizeHandleSx(dir: ResizeDir) {
+  const base = {
+    position: 'absolute' as const,
+    cursor: RESIZE_CURSOR[dir],
+    touchAction: 'none',
+    userSelect: 'none' as const,
+    zIndex: dir.length === 2 ? 3 : 2,
+  };
+  switch (dir) {
+    case 'n': return { ...base, top: 0, left: CORNER_HIT, right: CORNER_HIT, height: EDGE_HIT };
+    case 's': return { ...base, bottom: 0, left: CORNER_HIT, right: GRIP_HIT, height: EDGE_HIT };
+    case 'w': return { ...base, left: 0, top: CORNER_HIT, bottom: CORNER_HIT, width: EDGE_HIT };
+    case 'e': return { ...base, right: 0, top: CORNER_HIT, bottom: GRIP_HIT, width: EDGE_HIT };
+    case 'nw': return { ...base, top: 0, left: 0, width: CORNER_HIT, height: CORNER_HIT };
+    case 'ne': return { ...base, top: 0, right: 0, width: CORNER_HIT, height: CORNER_HIT };
+    case 'sw': return { ...base, bottom: 0, left: 0, width: CORNER_HIT, height: CORNER_HIT };
+    case 'se': return {
+      ...base,
+      bottom: 0, right: 0, width: GRIP_HIT, height: GRIP_HIT,
+      display: 'flex', alignItems: 'flex-end', justifyContent: 'flex-end',
+      p: '2px',
+      boxSizing: 'border-box' as const,
+      color: INK_LOW,
+      transition: 'color 0.15s',
+      '&:hover': { color: 'rgba(255,255,255,0.9)' },
+    };
+  }
 }
 
 // ─── FloatingPanel Component ───────────────────────────────────────────────
@@ -294,7 +381,12 @@ export interface FloatingPanelProps {
   /** Desktop minimum width (resize floor + restore clamp). Defaults to 400 — set
    *  smaller for compact settings panels so they don't feel bulky. */
   minWidth?: number;
+  /** Optional resize floor for panels with fixed controls. */
+  minHeight?: number;
   defaultPosition?: { x: number; y: number };
+  /** Anchor a freshly opened panel next to the click that opened it. Default `true`.
+   *  `false` uses `defaultPosition` instead — for a trigger the panel must not cover. */
+  anchorToClick?: boolean;
   zIndex?: number;
   /** Stable key for localStorage geometry persistence. Defaults to title. */
   panelId?: string;
@@ -321,7 +413,9 @@ export function FloatingPanel({
   fixedWidth,
   defaultHeight = 340,
   minWidth,
+  minHeight = MIN_H,
   defaultPosition,
+  anchorToClick = true,
   zIndex = 1500,
   panelId,
   toolbar,
@@ -368,7 +462,6 @@ export function FloatingPanel({
     : { ...storedSize, w: Math.min(fixedWidth, cssVP0.w - 16) };
 
   const dragRef = useRef<HTMLDivElement>(null);
-  const resizeRef = useRef<HTMLDivElement>(null);
 
   // Refs that mirror current state — used by the resize listener (which
   // captures stale closures) and to remember pre-expand geometry without
@@ -398,27 +491,64 @@ export function FloatingPanel({
     [autoHeight],
   );
 
-  // ── Geometry persistence for a panel that never closes (§2.5) ──
-  // A closable panel writes its geometry in the `!open` branch below; a panel
-  // that never closes never reaches it. So it writes at the end of each drag
-  // and resize — and only the NORMAL geometry: maximized and collapsed are
-  // transient states, and persisting either would restore a window the user
-  // never arranged.
+  // ── Geometry persistence (§2.5) ──
+  // Only the NORMAL desktop geometry is ever persisted: maximized, collapsed and
+  // mobile are transient layouts, and persisting any of them would restore a
+  // window the user never arranged. `lastNormalRect` is that geometry — set when
+  // the open path places the panel, updated at the end of a normal desktop drag
+  // or resize and by a geometry command, and left alone while the panel is
+  // maximized, collapsed or mobile. Close and unmount both save exactly it.
   const expandedRef = useRef(expanded);
   expandedRef.current = expanded;
   const collapsedRef = useRef(effectiveCollapsed);
   collapsedRef.current = effectiveCollapsed;
-  const persistGeometryNow = useCallback(() => {
-    if (closable || isMobile) return;
-    if (expandedRef.current || collapsedRef.current) return;
-    savePanelGeometry(stableId, {
+  const lastNormalRect = useRef<PanelGeometry | null>(null);
+  // A closable panel writes on close (and unmount); a panel that never closes
+  // reaches neither, so it also writes at the end of each drag and resize.
+  const noteGeometryEnd = useCallback(() => {
+    if (isMobile || expandedRef.current || collapsedRef.current) return;
+    lastNormalRect.current = {
       x: posRef.current.x, y: posRef.current.y,
       w: sizeRef.current.w, h: sizeRef.current.h,
-    });
+    };
+    if (!closable) savePanelGeometry(stableId, lastNormalRect.current);
   }, [closable, isMobile, stableId]);
 
-  useDrag(dragRef, pos, setPos, effectiveOpen, closable ? undefined : persistGeometryNow, portalRoot);
-  useResize(resizeRef, size, setSize, minW, MIN_H, effectiveOpen, closable ? undefined : persistGeometryNow, portalRoot);
+  useDrag(dragRef, pos, setPos, effectiveOpen, noteGeometryEnd, portalRoot);
+  // West/north edges move the origin. They start from the position actually
+  // rendered (after the render-time clamp below), so the opposite edge stays
+  // exactly where the user sees it.
+  const renderRectRef = useRef({ ...pos, ...size });
+  const isMobileRef = useRef(isMobile);
+  isMobileRef.current = isMobile;
+  const resizeOrigin = useRef<ResizeOriginOptions>({
+    getRect: () => renderRectRef.current,
+    setPos,
+    getBounds: () => {
+      const vp = getCSSViewportSize();
+      return {
+        // Same left/top bounds as clampToViewport: never over the button
+        // column, never above the top gutter.
+        minX: isMobileRef.current ? 4 : 72,
+        minY: 8,
+        // The render-time clamp of `top` and the `maxHeight` cap (desktop).
+        maxY: vp.h - 40,
+        maxH: Math.max(MIN_H, vp.h - 8 - BOTTOM_MARGIN),
+      };
+    },
+  }).current;
+  // Which resize handles exist. Maximized, collapsed and content-width panels
+  // have none. The bottom-right corner keeps its pre-edge behaviour (also on
+  // mobile); the other seven handles are desktop-only. An `autoHeight` panel
+  // takes its height from the content, so only handles that change the width
+  // without moving the top are offered. The hook is inactive whenever there
+  // are no handles, so a gesture in flight ends when they disappear.
+  const canResize = resizable && fixedWidth === undefined && !effectiveCollapsed && !expanded;
+  const resizeDirs: ResizeDir[] = !canResize ? []
+    : isMobile ? ['se']
+    : autoHeight ? ['e', 'w', 'sw', 'se']
+    : ['n', 's', 'e', 'w', 'nw', 'ne', 'sw', 'se'];
+  useResize(panelElRef, size, setSize, minW, minHeight, effectiveOpen && canResize, noteGeometryEnd, portalRoot, resizeOrigin);
 
   /** Clamp (x, y) so the panel is fully inside the viewport. Leaves room
    *  for the left-sidebar ButtonPanel so the panel never covers its own
@@ -452,15 +582,13 @@ export function FloatingPanel({
   // If a saved geometry exists in localStorage, restore it. Otherwise
   // anchor next to the trigger (button, KPI card, context menu item).
   // Falls back to the consumer's defaultPosition prop, then bottom-left.
+  const wasOpen = useRef(false);
   useEffect(() => {
+    const closing = wasOpen.current;
+    wasOpen.current = effectiveOpen;
     if (!effectiveOpen) {
-      // Persist geometry on close (before resetting expand state).
-      if (!isMobile && posRef.current && sizeRef.current) {
-        savePanelGeometry(stableId, {
-          x: posRef.current.x, y: posRef.current.y,
-          w: sizeRef.current.w, h: sizeRef.current.h,
-        });
-      }
+      // Persist the normal geometry on close — never the maximized/collapsed one.
+      if (closing && lastNormalRect.current) savePanelGeometry(stableId, lastNormalRect.current);
       setExpanded(false);
       preExpandPos.current = null;
       preExpandSize.current = null;
@@ -473,9 +601,13 @@ export function FloatingPanel({
     const saved = !isMobile ? loadPanelGeometry(stableId) : null;
     if (saved) {
       const w = Math.max(minW, Math.min(saved.w, vp.w - 16));
-      const h = Math.max(MIN_H, Math.min(saved.h, vp.h - BOTTOM_MARGIN - 8));
+      const h = Math.max(minHeight, Math.min(saved.h, vp.h - BOTTOM_MARGIN - 8));
+      const restored = clampToViewport(saved.x, saved.y, w, h);
       setSize({ w, h });
-      setPos(clampToViewport(saved.x, saved.y, w, h));
+      setPos(restored);
+      // Set synchronously: a cleanup before the next render (StrictMode, an
+      // immediate unmount) must save the restored rectangle, not the defaults.
+      lastNormalRect.current = { ...restored, w, h };
       return;
     }
 
@@ -483,7 +615,7 @@ export function FloatingPanel({
     const h = defaultHeight;
     setSize({ w, h });
 
-    const anchor = getRecentAnchorPoint();
+    const anchor = anchorToClick ? getRecentAnchorPoint() : null;
     let nextPos: { x: number; y: number };
     if (anchor) {
       nextPos = placeAdjacentToAnchor(anchor, w, h, vp.w);
@@ -493,23 +625,74 @@ export function FloatingPanel({
         y: vp.h - h - BOTTOM_MARGIN,
       };
     }
-    setPos(clampToViewport(nextPos.x, nextPos.y, w, h));
+    const placed = clampToViewport(nextPos.x, nextPos.y, w, h);
+    setPos(placed);
+    // The first placement counts as normal geometry on desktop, so a panel that is
+    // only opened and closed again writes where it was — as it always did.
+    lastNormalRect.current = isMobile ? null : { ...placed, w, h };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [effectiveOpen]);
+
+  // A host that unmounts the panel instead of passing open={false} (e.g. the AI prompt window)
+  // never reaches the close branch above — persist on unmount as well, or a moved window
+  // reopens at its default place. Bound to the panel identity only: a breakpoint change is
+  // not an unmount, and the saved rectangle is the normal one whatever layout is current.
+  useEffect(() => () => {
+    if (wasOpen.current && lastNormalRect.current) savePanelGeometry(stableId, lastNormalRect.current);
+  }, [stableId]);
+
+  // A panel opened in the mobile layout has no normal desktop rectangle yet. When it enters the
+  // desktop layout, its current normal geometry becomes that rectangle, so closing it there
+  // writes where it is — as it did before, even without a drag or resize.
+  useEffect(() => {
+    if (!effectiveOpen || isMobile || lastNormalRect.current) return;
+    if (expandedRef.current || collapsedRef.current) return;
+    lastNormalRect.current = {
+      x: posRef.current.x, y: posRef.current.y,
+      w: sizeRef.current.w, h: sizeRef.current.h,
+    };
+  }, [effectiveOpen, isMobile]);
+
+  // Commands update mounted panels immediately, including panels currently closed.
+  useEffect(() => subscribePanelGeometry(stableId, update => {
+    if (update.rect) {
+      // The SAME normalization as the open path (min size, viewport fit, clamped position).
+      const vp = getCSSViewportSize();
+      const w = Math.max(minW, Math.min(update.rect[2], vp.w - 16));
+      const h = Math.max(minHeight, Math.min(update.rect[3], vp.h - BOTTOM_MARGIN - 8));
+      const clamped = clampToViewport(update.rect[0], update.rect[1], w, h);
+      const x = clamped.x, y = clamped.y;
+      // Do not let the maximize effect restore the old rectangle over this one.
+      preExpandPos.current = null;
+      preExpandSize.current = null;
+      setExpanded(false);
+      posRef.current = { x, y };
+      sizeRef.current = { w, h };
+      // An explicit command is the user's (or agent's) arrangement — the new normal geometry.
+      lastNormalRect.current = { x, y, w, h };
+      setPos({ x, y });
+      setSize({ w, h });
+    }
+    if (update.collapsed !== undefined) {
+      if (update.collapsed) setExpanded(false);
+      setCollapsed(update.collapsed);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), [stableId, minW, clampToViewport]);
 
   // Keep the panel in frame while the user resizes the browser.
   useEffect(() => {
     if (!effectiveOpen) return;
     const onResize = () => {
       const clamped = clampToViewport(posRef.current.x, posRef.current.y, sizeRef.current.w, currentH());
-      if (clamped.x !== posRef.current.x || clamped.y !== posRef.current.y) {
-        setPos(clamped);
-      }
+      // Re-render even if the stored position still fits: the mobile size caps
+      // and rendered position must follow rotation within the same breakpoint.
+      setPos(clamped);
     };
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [effectiveOpen]);
+  }, [effectiveOpen, clampToViewport]);
 
   // ── Collapse: persist, and leave maximize on the way in (§2.4) ──
   useEffect(() => {
@@ -565,8 +748,17 @@ export function FloatingPanel({
   // entry is removed on close/unmount; siblings checking the stack top in
   // the same keydown still see the closing panel's id, so exactly one
   // panel closes per Escape press.
+  //
+  // The stack position is the OPEN order, so the entry must not move while the
+  // panel stays open (plan-2044). `onClose` is read through a ref: callers pass
+  // inline arrows, and with `onClose` as an effect dependency every re-render of
+  // the parent (the CONNECT panel re-renders on every store update) removed
+  // the entry and pushed it again — on top of panels opened after it, so the
+  // last panel to re-render, not the last one opened, took the Escape.
   const escId = useRef<symbol | null>(null);
   if (escId.current === null) escId.current = Symbol('floating-panel-esc');
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
     // A panel that cannot be closed takes no place on the Escape stack — not
     // even an inert one, or it would swallow the Escape meant for the panel
@@ -575,7 +767,7 @@ export function FloatingPanel({
     const id = escId.current!;
     escStack.push(id);
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && escStack[escStack.length - 1] === id) onClose?.();
+      if (e.key === 'Escape' && escStack[escStack.length - 1] === id) onCloseRef.current?.();
     };
     window.addEventListener('keydown', onKey);
     return () => {
@@ -583,7 +775,7 @@ export function FloatingPanel({
       if (i >= 0) escStack.splice(i, 1);
       window.removeEventListener('keydown', onKey);
     };
-  }, [effectiveOpen, closable, onClose]);
+  }, [effectiveOpen, closable]);
 
   if (!effectiveOpen) return null;
 
@@ -593,7 +785,13 @@ export function FloatingPanel({
   // visible if both somehow miss a frame. CSS-px coords (zoom-aware).
   const _vpRender = getCSSViewportSize();
   const clampedX = Math.max(0, Math.min(pos.x, _vpRender.w - size.w - 8));
-  const clampedY = Math.max(0, Math.min(pos.y, _vpRender.h - 40));
+  const mobileMaxHeight = Math.max(40, _vpRender.h - 8 - BOTTOM_MARGIN);
+  const clampedY = isMobile
+    ? Math.max(8, Math.min(pos.y, _vpRender.h - Math.min(currentH(), mobileMaxHeight) - BOTTOM_MARGIN))
+    : Math.max(0, Math.min(pos.y, _vpRender.h - 40));
+  const renderMaxH = isMobile ? mobileMaxHeight : Math.max(MIN_H, _vpRender.h - 8 - BOTTOM_MARGIN);
+  // What the user sees — the start of a west/north resize (see useResize).
+  renderRectRef.current = { x: clampedX, y: clampedY, w: size.w, h: Math.min(size.h, renderMaxH) };
 
   const contentId = `rv-panel-content-${stableId.replace(/[^A-Za-z0-9_-]/g, '-')}`;
 
@@ -609,6 +807,7 @@ export function FloatingPanel({
         left: clampedX,
         top: clampedY,
         width: size.w,
+        ...(isMobile ? { maxWidth: Math.max(0, _vpRender.w - 16) } : {}),
         // Collapsed = title bar only; autoHeight = as tall as the content.
         height: effectiveCollapsed || autoHeight ? 'auto' : size.h,
         // ...but never taller than the screen it has to be dragged around in.
@@ -618,11 +817,11 @@ export function FloatingPanel({
         // content area scrolls instead, so the window stays both movable and
         // complete. Position-independent on purpose: a cap that shrank as the
         // panel is dragged down would reflow the content under the pointer.
-        maxHeight: Math.max(MIN_H, _vpRender.h - 8 - BOTTOM_MARGIN),
+        maxHeight: renderMaxH,
         zIndex,
         display: 'flex',
         flexDirection: 'column',
-        borderRadius: 2,
+        borderRadius: 1,
         border: '1px solid rgba(255,255,255,0.08)',
         overflow: 'hidden',
         pointerEvents: 'auto',
@@ -632,7 +831,7 @@ export function FloatingPanel({
         // on the darkest near-opaque glass — not the lighter floating tier the
         // theme's Paper default provides. A chart floating over a white floor
         // on 60 % glass put its own axis labels below 3:1.
-        backgroundColor: 'rgba(15,15,15,0.92)',
+        backgroundColor: `${PANEL_SURFACE} !important`,
       }}
     >
       {/* ── Draggable title bar ── */}
@@ -725,33 +924,23 @@ export function FloatingPanel({
         </Box>
       )}
 
-      {/* ── Resize handle (bottom-right corner) ── */}
-      {resizable && fixedWidth === undefined && !effectiveCollapsed && (
-      <Box
-        ref={resizeRef}
-        data-resize-handle="true"
-        sx={{
-          position: 'absolute',
-          right: 0,
-          bottom: 0,
-          width: 24,
-          height: 24,
-          cursor: 'nwse-resize',
-          touchAction: 'none',
-          '&::after': {
-            content: '""',
-            position: 'absolute',
-            right: 3,
-            bottom: 3,
-            width: 8,
-            height: 8,
-            borderRight: '2px solid rgba(255,255,255,0.15)',
-            borderBottom: '2px solid rgba(255,255,255,0.15)',
-            borderRadius: '0 0 4px 0',
-          },
-        }}
-      />
-      )}
+      {/* ── Resize handles: four edges + four corners, one code path (useResize) ── */}
+      {resizeDirs.map((dir) => (
+        <Box
+          key={dir}
+          data-resize-dir={dir}
+          // The corner the existing tests and callers know as "the" resize handle.
+          {...(dir === 'se' ? { 'data-resize-handle': 'true' } : {})}
+          aria-hidden="true"
+          sx={resizeHandleSx(dir)}
+        >
+          {dir === 'se' && (
+            <svg width="10" height="10" viewBox="0 0 10 10" style={{ display: 'block', pointerEvents: 'none' }}>
+              <path d="M9 1 L1 9 M9 4.5 L4.5 9 M9 8 L8 9" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" fill="none" />
+            </svg>
+          )}
+        </Box>
+      ))}
     </Paper>
   );
 

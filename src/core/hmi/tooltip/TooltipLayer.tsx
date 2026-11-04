@@ -58,6 +58,45 @@ const SingleTooltipBubble: FC<SingleTooltipBubbleProps> = ({ tooltip }) => {
   const rafRef = useRef(0);
   const { primary } = tooltip;
   const isPinned = primary.lifecycle === 'pinned';
+  /** Visual top-left the bubble was last drawn at (viewport px, unzoomed). */
+  const lastPosRef = useRef<{ left: number; top: number } | null>(null);
+  /**
+   * Screen position frozen while the user works in a pinned bubble. A world /
+   * fixed bubble is anchored by its BOTTOM edge, so without the freeze every
+   * height change (expanding a document group) pushed the header the user had
+   * just clicked upwards, and on a moving axis the bubble ran away from the
+   * mouse. Set on the first pointerenter, kept for the bubble's pinned life.
+   */
+  const lockRef = useRef<{ left: number; top: number } | null>(null);
+
+  // Pointer inside a pinned bubble: freeze its position and stop the pin
+  // auto-hide (tooltipStore.pointerInsidePinned, read by the controller).
+  // Native listeners: React's onPointerEnter is emulated from pointerover/out.
+  const ownerKey = tooltip.key;
+  useEffect(() => {
+    const el = tooltipRef.current;
+    if (!isPinned || !el) return;
+    let inside = false;
+    const onEnter = () => {
+      inside = true;
+      if (!lockRef.current && lastPosRef.current) lockRef.current = { ...lastPosRef.current };
+      tooltipStore.setPointerInsidePinned(ownerKey, true);
+    };
+    const onLeave = () => {
+      inside = false;
+      tooltipStore.setPointerInsidePinned(ownerKey, false);
+    };
+    el.addEventListener('pointerenter', onEnter);
+    el.addEventListener('pointerleave', onLeave);
+    return () => {
+      el.removeEventListener('pointerenter', onEnter);
+      el.removeEventListener('pointerleave', onLeave);
+      // Unmounted (pin closed) with the pointer still inside: no pointerleave
+      // will ever come, so release here or the auto-hide stays frozen.
+      if (inside) tooltipStore.setPointerInsidePinned(ownerKey, false);
+      lockRef.current = null;
+    };
+  }, [isPinned, ownerKey]);
 
   // Right-click on pinned tooltip opens context menu for the target node
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
@@ -129,7 +168,11 @@ const SingleTooltipBubble: FC<SingleTooltipBubbleProps> = ({ tooltip }) => {
         // clampToViewport expects Y to be the BOTTOM of the tooltip (matches
         // the translateY(-100%) world/fixed anchor). For cursor mode we
         // convert Y from top→bottom before clamping, then back.
-        const yBottom = isCursor ? rawY + tooltipHeight : rawY;
+        let yBottom = isCursor ? rawY + tooltipHeight : rawY;
+        // Frozen pinned bubble: keep its top-left, let it grow downwards (the
+        // clamp still pushes it back up when it would leave the viewport).
+        const lock = isPinned && !isCursor ? lockRef.current : null;
+        if (lock) { rawX = lock.left; yBottom = lock.top + tooltipHeight; }
         // Reserve the BottomBar strip so a low tooltip never covers the search bar.
         const clampHeight = window.innerHeight - BOTTOM_SAFE_AREA;
         const clamped = clampToViewport(
@@ -137,6 +180,7 @@ const SingleTooltipBubble: FC<SingleTooltipBubbleProps> = ({ tooltip }) => {
           VIEWPORT_MARGIN, window.innerWidth, clampHeight,
         );
         const finalTop = isCursor ? clamped.y - tooltipHeight : clamped.y;
+        lastPosRef.current = { left: clamped.x, top: isCursor ? finalTop : finalTop - tooltipHeight };
         // CSS `zoom` on HMIShell scales its children, so a raw viewport pixel
         // value written to `left/top` inside the zoomed container is RENDERED
         // at viewport × zoom. Mouse events (clientX/Y) stay in unzoomed
@@ -156,7 +200,7 @@ const SingleTooltipBubble: FC<SingleTooltipBubbleProps> = ({ tooltip }) => {
 
     rafRef.current = requestAnimationFrame(tick);
     return () => { mounted = false; cancelAnimationFrame(rafRef.current); };
-  }, [primary, viewer]);
+  }, [primary, viewer, isPinned]);
 
   // Resolve content providers for all entries in this bubble
   const providers = tooltip.contentEntries

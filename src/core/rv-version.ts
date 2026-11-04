@@ -28,11 +28,11 @@ export interface RVVersionInfo {
 
 /** The version info for the current build. */
 export const RV_VERSION: RVVersionInfo = {
-  version: __RV_VERSION__,
-  webBuild: __RV_WEB_BUILD__,
-  commit: __RV_COMMIT__,
-  buildDate: __RV_BUILD_DATE__,
-  buildTime: __RV_BUILD_TIME__,
+  version: typeof __RV_VERSION__ === 'undefined' ? 'dev' : __RV_VERSION__,
+  webBuild: typeof __RV_WEB_BUILD__ === 'undefined' ? '' : __RV_WEB_BUILD__,
+  commit: typeof __RV_COMMIT__ === 'undefined' ? '' : __RV_COMMIT__,
+  buildDate: typeof __RV_BUILD_DATE__ === 'undefined' ? '' : __RV_BUILD_DATE__,
+  buildTime: typeof __RV_BUILD_TIME__ === 'undefined' ? '' : __RV_BUILD_TIME__,
 };
 
 /** Short label, e.g. "v6.3.0 · build 1247". */

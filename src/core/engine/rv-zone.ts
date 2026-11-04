@@ -80,6 +80,7 @@ import type { MULoadHost } from './rv-mu-load';
 import type { GizmoHandle, GizmoOverlayManager } from './rv-gizmo-manager';
 import { createSignalWriter, type SignalWriter } from './rv-signal-store';
 import { wireBoolSignal } from './rv-signal-wiring';
+import { slotBound, slotDeclare, slotRefuse, slotUndeclare, slotWrite } from './rv-slot-io';
 import { NodeRegistry } from './rv-node-registry';
 import { sweptClamp } from './rv-swept-aabb';
 import {
@@ -160,7 +161,9 @@ function dominantAxis(d: Vector3): Axis {
  * other subsystem owns. Every other MU sees the plain Block rule.
  */
 function singleReleaseEligible(c: AnyMU): boolean {
-  if (c.isInstanced || c.physicsOwned || c.markedForRemoval) return false;
+  // Box2D-owned MUs (plan-661) stay eligible: a 2D zone moves them in the
+  // plane, the pose is current every tick. Only Rapier bodies are excluded.
+  if (c.isInstanced || c.owner === 'rapier' || c.markedForRemoval) return false;
   const mu = c as RVMovingUnit;
   return mu.heldBy === null && !mu.loadedOn;
 }
@@ -225,6 +228,8 @@ export class RVZone implements RVComponent {
   private readonly localBounds = new Box3();
   private _wasActive = false;
   private _signalLevel = false;
+  /** `ActivationSignal` carries a value — wired, or bound directly in the viewer (SlotIO). */
+  private _activationBound = false;
   private _prevAxisPos = NaN;
   private _writer: SignalWriter | null = null;
   private _manager: { zones: Set<RVZone> } | null = null;
@@ -257,11 +262,20 @@ export class RVZone implements RVComponent {
     this._manager = manager;
     this._collision = ctx.collisionManager ?? null;
 
-    if (this.Activation === 'Signal' && typeof this.ActivationSignal === 'string') {
-      const w = wireBoolSignal(ctx.signalStore, this.ActivationSignal,
-        (v) => { this._signalLevel = v; }, `Zone "${this.node.name}": ActivationSignal`, ctx.reapply);
+    if (this.Activation === 'Signal') {
+      // Unwired, the slot is bound directly (SlotIO); neutralize = no level,
+      // i.e. inactive exactly like an unwired signal activation.
+      const address = typeof this.ActivationSignal === 'string' ? this.ActivationSignal : null;
+      const w = wireBoolSignal(ctx.signalStore, address, (v) => {
+        this._signalLevel = v;
+        this._activationBound = slotBound(this, 'ActivationSignal', address);
+      }, `Zone "${this.node.name}": ActivationSignal`, ctx.reapply, { instance: this, field: 'ActivationSignal' });
       this._unsubs.push(w.unsubscribe);
+    } else {
+      slotRefuse(this, 'ActivationSignal', `Zone "${this.node.name}": ActivationSignal is only read with Activation = Signal (now ${this.Activation})`);
     }
+    // Written from `setOccupied`; unwired, the value is published to a direct binding.
+    slotDeclare(this, 'SignalOccupied', 'feedback', { initial: this.occupied });
     if (typeof this.SignalOccupied === 'string' && this.SignalOccupied) {
       const path = NodeRegistry.computeNodePath(this.node);
       this._writer = createSignalWriter(ctx.signalStore, `component:Zone:${path}`, 'component', { slotContext: path });
@@ -448,7 +462,7 @@ export class RVZone implements RVComponent {
   updateActivation(): void {
     switch (this.Activation) {
       case 'Signal':
-        this.active = this.ActivationSignal !== null && this._signalLevel !== this.InvertSignal;
+        this.active = this._activationBound && this._signalLevel !== this.InvertSignal;
         return;
       case 'Axis': {
         const d = this.ActivationDrive;
@@ -512,7 +526,9 @@ export class RVZone implements RVComponent {
     if (one) this.bounds.getCenter(_center);
     for (let i = 0; i < candidates.length; i++) {
       const c = candidates[i];
-      if (c.isInstanced || c.markedForRemoval || c.physicsOwned) continue;
+      // Box2D-owned MUs may be held (plan-661): the 2D zone plugin hands a held
+      // MU back to the transport (holding wins). Rapier bodies stay excluded.
+      if (c.isInstanced || c.markedForRemoval || c.owner === 'rapier') continue;
       const mu = c as RVMovingUnit;
       if (mu.heldBy !== null || mu.loadedOn) continue;
       if (!boxContains(_grown, mu.aabb)) continue;
@@ -669,7 +685,7 @@ export class RVZone implements RVComponent {
   private setOccupied(occ: boolean): void {
     if (occ === this.occupied) return;
     this.occupied = occ;
-    if (this._writer && this.SignalOccupied) this._writer.setByPath(this.SignalOccupied, occ);
+    slotWrite(this, 'SignalOccupied', this.SignalOccupied, occ, this._writer);
   }
 
   // ─── Lifecycle ──────────────────────────────────────────────────────
@@ -706,6 +722,7 @@ export class RVZone implements RVComponent {
     this._clearSingleRelease();
     for (const unsub of this._unsubs) unsub();
     this._unsubs.length = 0;
+    slotUndeclare(this);
     this._manager?.zones.delete(this);
     this._manager = null;
     this._writer = null;

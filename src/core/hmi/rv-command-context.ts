@@ -24,7 +24,8 @@ import {
   type McpCallContext,
   type ToolCommandBinding,
 } from '../engine/rv-mcp-tools';
-import { commandRegistry, type CommandRegistry, type ExecuteResult } from './rv-command-registry';
+import { commandRegistry, CommandError, type CommandRegistry, type ExecuteResult } from './rv-command-registry';
+import { runCommandStep } from '../../plugins/mcp-bridge/rv-mcp-command-tools';
 
 export type { McpCallContext } from '../engine/rv-mcp-tools';
 
@@ -86,15 +87,43 @@ export async function dispatchBoundCommand<R = unknown>(
   registry: CommandRegistry = commandRegistry,
 ): Promise<ExecuteResult<R> | UnboundResult> {
   if (!ctx.bound) return { ok: false, kind: 'unbound', reason: ctx.refusal };
-  return registry.execute<R>(ctx.bound.id, ctx.bound.args, {
-    origin: 'mcp',
+  // plan-641: the alias path runs through the SAME wrapper as web_execute — so a
+  // bound web_editor_* call is recorded as a macro line while a recording runs.
+  const step = await runCommandStep({
+    command: ctx.bound.id,
+    args: ctx.bound.args,
     ...(ctx.bound.buttonKey ? { buttonKey: ctx.bound.buttonKey } : {}),
     ...(viewer ? { viewer } : {}),
-    context: { handle: ctx.handle, selection: ctx.selection },
+    captured: { handle: ctx.handle, selection: ctx.selection },
+    meta: ctx.meta ?? null,
+    registry,
   });
+  return step.result as ExecuteResult<R>;
+}
+
+/** Serialise the value/refusal returned by a bound alias. */
+export function commandResultJson<R>(
+  r: { readonly ok: true; readonly value: R } | { readonly ok: false; readonly reason: string | null; readonly details?: Readonly<Record<string, unknown>> },
+  shape: (value: R) => unknown = (value) => value,
+): string {
+  return JSON.stringify(r.ok ? shape(r.value) : commandErrorJson(r));
 }
 
 /** Serialise a failed dispatch the way every tool reports errors: `{error, ...details}`. */
 export function commandErrorJson(r: { reason: string | null; details?: Readonly<Record<string, unknown>> }): Record<string, unknown> {
   return { error: r.reason ?? 'Nothing to do', ...(r.details ?? {}) };
+}
+
+/**
+ * plan-641 Nachtrag 2026-10-21 - a command whose body is an existing tool routine
+ * that answers JSON: `{error, ...details}` becomes a CommandError (so the bound
+ * tool serialises it back to the same shape), anything else is the value.
+ */
+export function valueOrThrowToolJson(json: string): Record<string, unknown> {
+  const parsed = JSON.parse(json) as Record<string, unknown>;
+  if (typeof parsed['error'] === 'string') {
+    const { error, ...details } = parsed;
+    throw new CommandError(error as string, details);
+  }
+  return parsed;
 }

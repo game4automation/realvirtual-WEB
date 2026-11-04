@@ -13,7 +13,7 @@ import { parsePathExtras } from '../../src/core/engine/rv-path';
 import { getDefaultPathNetwork } from '../../src/core/engine/rv-path-network';
 import { findUnzonedMerges } from '../../src/core/engine/rv-movement-authority';
 import { clearAllProblems, getProblems } from '../../src/core/hmi/problems-store';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
+import { DESRunner } from '@rv/plugins/des/des-runner';
 import { makeHost, makeAgvRoot, bindDes, clearShared } from '../helpers/agv-harness';
 
 beforeEach(() => { clearShared(); clearAllProblems(); });

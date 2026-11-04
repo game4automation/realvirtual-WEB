@@ -1,0 +1,184 @@
+{
+  "version": 1,
+  "description": "Forbidden public paths after the commercial cut. Split entries are inventory only; their public core portions remain. Test moves are recorded in the scratch inventory pending Phase 3.",
+  "paths": [
+    {
+      "path": "src/plugins/sim-controller/DESExperimentMatrixPanel.tsx",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/sim-controller/DesMatrixCells.tsx",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/sim-controller/DesMatrixKpiSection.tsx",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/sim-controller/DesSeriesOverlayChart.tsx",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/sim-controller/DesKpiDefEditor.tsx",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/sim-controller/DesKpiBarChart.tsx",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/sim-controller/DesFactorPicker.tsx",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/sim-controller/des-matrix-actions.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/sim-controller/des-matrix-columns.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/sim-controller/des-matrix-helpers.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/sim-controller/des-matrix-stats.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/sim-controller/des-matrix-sx.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/sim-controller/des-matrix-sync.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/sim-controller/des-matrix-window-store.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/sim-controller/des-series-aggregate.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/sim-controller/des-experiment-factors.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/sim-controller/des-experiments-helpers.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/sim-controller/des-param-script-lint.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/sim-controller/experiment-commands.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/des/experiment-commands-impl.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/des/des-batch-runner.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/des/des-batch-variants.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/des/des-batch-factors.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/des/des-param-script-runner.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/des/rv-des-experiment-store.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/des/rv-des-experiment-model.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/des/des-column-model.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/des/des-column-migration.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/des/des-base-key.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/des/des-base-key-provider.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/des/des-experiment-project-file.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/des/series/*",
+      "action": "move"
+    },
+    {
+      "path": "src/core/experiments/**",
+      "action": "move"
+    },
+    {
+      "path": "doc-experiment-manager.md",
+      "action": "move"
+    },
+    {
+      "path": "src/plugins/des/rv-des-run-lifecycle.ts",
+      "action": "split",
+      "note": "S2: RunIdentity stays core; persistence moves private"
+    },
+    {
+      "path": "src/core/material-flow/rv-project-manager.ts",
+      "action": "split",
+      "note": "S8: project/model utilities stay; experiment recovery/migration moves"
+    },
+    {
+      "path": "src/plugins/sim-controller/des-matrix-ops.ts",
+      "action": "split",
+      "note": "S9: BatchProgress/parseBatchProgress to core/material-flow/rv-batch-progress.ts"
+    },
+    {
+      "path": "src/plugins/planning-parameters/planning-commands.ts",
+      "action": "split",
+      "note": "S6/G7b: planning.factor.* deleted; planning.param.* stays"
+    },
+    {
+      "path": "src/plugins/planning-parameters/planning-command-descriptors.ts",
+      "action": "split",
+      "note": "S6/G7b: planning.factor.* descriptors deleted"
+    },
+    {
+      "path": "src/core/material-flow/des-column-selection.ts",
+      "action": "move"
+    },
+    {
+      "path": "src/core/material-flow/rv-run-aggregation.ts",
+      "action": "move"
+    },
+    {
+      "path": "tests/run-aggregation.test.ts",
+      "action": "move"
+    }
+  ],
+  "forbiddenMarkers": [
+    "DESExperimentMatrixPanel",
+    "DesBatchRunner",
+    "IndexedDBSnapshotStore"
+  ]
+}

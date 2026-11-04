@@ -31,7 +31,7 @@
  */
 
 import { parseAddress } from './s7-tag-table';
-import type { ConnectInterfaceSignal } from '../hmi/connect-store';
+import type { ConnectConfigOp, ConnectInterfaceSignal } from '../hmi/connect-store';
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -569,6 +569,44 @@ export function buildInterfaceSignals(
     }
   }
   return out;
+}
+
+/**
+ * "Adopt legacy addresses" as write-core ops (plan-2025 F10, matrix B5): the same entries
+ * {@link buildInterfaceSignals} would write, as one `signal.upsert` each with `addressMode: fillEmpty`.
+ * An interface signal that already carries an address is skipped here AND protected on the gateway
+ * (FillEmpty keeps it, even when another writer set it after this report was made). The comment
+ * written is the text AFTER the address prefix — an address never lands in a comment (plan-589).
+ */
+export function legacyAdoptOps(
+  interfaceId: string,
+  report: AutoMapReport,
+  existing: readonly ConnectInterfaceSignal[],
+): ConnectConfigOp[] {
+  const byName = new Map<string, ConnectInterfaceSignal>();
+  for (const s of existing) if (!byName.has(s.name)) byName.set(s.name, s);
+  const ops: ConnectConfigOp[] = [];
+  const emitted = new Set<string>();
+  for (const c of APPLY_CATEGORIES) {
+    for (const e of report.categories[c]) {
+      if (!e.type || !e.protocolAddress || emitted.has(e.name)) continue;
+      const prev = byName.get(e.name);
+      if (prev && (prev.protocolAddress ?? '').trim() !== '') continue;
+      emitted.add(e.name);
+      ops.push({
+        op: 'signal.upsert',
+        interfaceId,
+        name: e.name,
+        type: e.type,
+        protocolAddress: e.protocolAddress,
+        addressMode: 'fillEmpty',
+        ...(e.dataType ? { dataType: e.dataType } : {}),
+        ...(e.text ? { comment: e.text } : {}),
+        ...(prev ? {} : { record: false }),
+      });
+    }
+  }
+  return ops;
 }
 
 /** True when two signal arrays carry the same content (order-sensitive). */

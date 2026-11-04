@@ -6,7 +6,7 @@
  *
  * Verifies the `SimulationKernel`:
  *  - default mode is 'continuous'; activeExecutor is the continuous runner.
- *  - hasDesRunner() is false with the public stub (createDesRunner = null).
+ *  - hasDesRunner() is false with a null factory (DES feature not activated).
  *  - setMode('des') is a guarded no-op when no DES runner is registered.
  *  - rapid-toggle / same-mode guard (W4/W5).
  *  - setMode is try/catch-wrapped — a throwing executor never wedges the toggle.
@@ -18,7 +18,10 @@
 import { describe, it, expect } from 'vitest';
 import { SimulationKernel } from '../src/core/material-flow/simulation-kernel';
 import { ContinuousRunner } from '../src/core/material-flow/continuous-runner';
-import { createDesRunner } from '../src/private-stubs/des-runner-stub';
+import type { DesRunnerFactory } from '../src/core/material-flow/simulation-kernel';
+
+// plan-680: the stub is gone; `null` is what the kernel holds before the DES feature runs.
+const createDesRunner: DesRunnerFactory = null;
 import type { SimulationExecutor } from '../src/core/material-flow/simulation-executor';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -61,7 +64,7 @@ describe('SimulationKernel — defaults & DES availability', () => {
     expect(k.activeExecutor.mode).toBe('continuous');
   });
 
-  it('hasDesRunner() is false with the public stub (createDesRunner === null)', () => {
+  it('hasDesRunner() is false with a null factory (DES feature not activated)', () => {
     expect(createDesRunner).toBe(null);
     const k = new SimulationKernel({
       continuousRunner: makeContinuousRunner(),

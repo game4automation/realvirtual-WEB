@@ -29,7 +29,10 @@
  * - `measurements`, `clipping` — deliberately ungated (they are what the viewer
  *   is for, see App.tsx).
  * - `layout-planner`, `kinematics`, `materials` — right-side slots owned by
- *   mode-scoped plugins that close them in their own `onModeDeactivate`.
+ *   mode-scoped plugins that close them in their own `onModeDeactivate`. A slot
+ *   that appears WITHOUT a switch out of the owning mode (the boot
+ *   `restore()`, a late plugin restore, an MCP tool) is reclaimed by
+ *   `attachModeOwnedPanelReconciler` (`mode-owned-panels.ts`) instead.
  * - `scene` — the window was deleted (plan-372 Phase 13); `orphanedLeftSlot`
  *   treats a persisted slot as unconditionally orphaned instead.
  */

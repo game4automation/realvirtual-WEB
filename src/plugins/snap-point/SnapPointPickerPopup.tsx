@@ -7,9 +7,15 @@
  *
  * Opens on click (driven by SnapPointController), closes on ESC, outside
  * click, or after a successful placement.
+ *
+ * plan-628 8.4 (G3): at a free `path`-typed snap (a path end, or a `path` port
+ * of a placement) the picker also offers a "Path blocks" section — Straight,
+ * Curve L/R, Branch, Merge, Stub — placed through the path network UI
+ * (`layout.path.place` / `layout.path.junction`, one undo step, chained and
+ * tangent-true). Conveyor and other snaps are unchanged.
  */
 
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import type { ReactElement } from 'react';
 import { Box, Paper, Typography, CircularProgress, ButtonBase } from '@mui/material';
 import type { UISlotProps } from '../../core/rv-ui-plugin';
@@ -20,6 +26,7 @@ import { SNAP_ATTACH_KEY } from '../layout-planner/planner-commands';
 import { useSnapHoverState, snapHoverStore } from './snap-hover-store';
 import { findCompatibleLibraryAssets } from './library-snap-index';
 import { oppositeDirection } from './snap-name-parser';
+import { PATH_END_SNAP_TYPE_ID } from './path-snap-source';
 import type { SnapPointPlugin } from './index';
 import { t } from './strings';
 import { useMobileLayout } from '../../hooks/use-mobile-layout';
@@ -28,6 +35,20 @@ interface CompatibleEntry {
   entry: LibraryCatalogEntry;
   ownSnapName: string;
 }
+
+/** Header of the path-block section (8.4). */
+const PATH_BLOCKS_LABEL = 'Path blocks';
+
+/** The slice of the path network UI the picker uses (structural: no module import of the plugin). */
+interface PathPickerHost {
+  subscribeInteraction?: (cb: () => void) => () => void;
+  readonly interaction: {
+    pickerEntries(): readonly { id: string; label: string }[];
+    placeAtSnap(entryId: string, snapId: string): Promise<{ ok: boolean; reason?: string }>;
+  } | null;
+}
+
+const subscribeNothing = (): (() => void) => () => {};
 
 export function SnapPointPickerPopup({ viewer }: UISlotProps): ReactElement | null {
   const hover = useSnapHoverState();
@@ -54,6 +75,14 @@ export function SnapPointPickerPopup({ viewer }: UISlotProps): ReactElement | nu
   const [status, setStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const [errorMsg, setErrorMsg] = useState<string>('');
   const [isPlacing, setIsPlacing] = useState(false);
+  // plan-628 8.4: path blocks at a path-typed snap (null = no path network UI here).
+  const plugin = viewer.getPlugin<PathPickerHost & { id: string }>('path-network-ui');
+  const getInteraction = useCallback(() => plugin?.interaction ?? null, [plugin]);
+  const pathUi = useSyncExternalStore(plugin?.subscribeInteraction ?? subscribeNothing, getInteraction);
+  const pathEntries = useMemo(
+    () => (pathUi && hover.pickerAnchor?.typeId === PATH_END_SNAP_TYPE_ID ? pathUi.pickerEntries() : []),
+    [pathUi, hover.pickerAnchor],
+  );
 
   // Load compatible items whenever the picker opens
   useEffect(() => {
@@ -75,7 +104,8 @@ export function SnapPointPickerPopup({ viewer }: UISlotProps): ReactElement | nu
     findCompatibleLibraryAssets(allEntries, target.typeId, preferred, target.flow)
       .then((found) => {
         if (cancelled) return;
-        setItems(found);
+        // Procedural path blocks have their own section (8.4), never a GLB row.
+        setItems(found.filter((f) => !f.entry.pathBlock));
         setStatus('ready');
       })
       .catch((e) => {
@@ -160,6 +190,26 @@ export function SnapPointPickerPopup({ viewer }: UISlotProps): ReactElement | nu
     }
   };
 
+  const onPickPathBlock = async (entryId: string): Promise<void> => {
+    if (isPlacing || !pathUi) return;
+    const target = hover.pickerAnchor;
+    if (!target) return;
+    if (target.occupied) {
+      setErrorMsg(t('error.occupied'));
+      return;
+    }
+    setIsPlacing(true);
+    try {
+      const r = await pathUi.placeAtSnap(entryId, target.id);
+      if (r.ok) snapHoverStore.closePicker();
+      else setErrorMsg(r.reason ?? 'Placement rejected');
+    } catch (e) {
+      setErrorMsg(String(e));
+    } finally {
+      setIsPlacing(false);
+    }
+  };
+
   const left = hover.pickerScreenPos.x + 12;
   const top = hover.pickerScreenPos.y + 12;
 
@@ -201,6 +251,29 @@ export function SnapPointPickerPopup({ viewer }: UISlotProps): ReactElement | nu
         </Typography>
       </Box>
 
+      {pathEntries.length > 0 && (
+        <Box data-testid="snap-picker-path-blocks" sx={{ pb: 0.75, mb: 0.75, borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+          <Typography variant="caption" sx={{ display: 'block', opacity: 0.7, mb: 0.5 }}>{PATH_BLOCKS_LABEL}</Typography>
+          <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 0.5 }}>
+            {pathEntries.map((pe) => (
+              <ButtonBase
+                key={pe.id}
+                data-testid={`snap-picker-path-${pe.id}`}
+                disabled={isPlacing}
+                onClick={() => { void onPickPathBlock(pe.id); }}
+                sx={{
+                  py: 0.75, px: 0.5, borderRadius: 1, justifyContent: 'center',
+                  border: '1px solid rgba(255,255,255,0.12)',
+                  '&:hover': { backgroundColor: 'rgba(255,255,255,0.06)' },
+                }}
+              >
+                <Typography variant="body2">{pe.label}</Typography>
+              </ButtonBase>
+            ))}
+          </Box>
+        </Box>
+      )}
+
       {status === 'loading' && (
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 1 }}>
           <CircularProgress size={16} />
@@ -212,7 +285,7 @@ export function SnapPointPickerPopup({ viewer }: UISlotProps): ReactElement | nu
         <Typography variant="body2" color="error">{errorMsg || 'Error'}</Typography>
       )}
 
-      {status === 'ready' && items.length === 0 && (
+      {status === 'ready' && items.length === 0 && pathEntries.length === 0 && (
         <Typography variant="body2" sx={{ py: 1, opacity: 0.7 }}>
           {t('picker.empty')}
         </Typography>

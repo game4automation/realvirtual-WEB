@@ -1,0 +1,7 @@
+# Vitest failure screenshots of the measurement runs. This repo has a public
+# remote (an unfiltered GitHub mirror) — screenshots do not belong in it, and a
+# shot of a measurement is not the measurement. The numbers live in the
+# `[672-P0]` console lines of the run itself, reproducible with
+#   node scripts/with-test-lock.mjs npx vitest run --config spikes/672/vitest.spike.config.ts
+__screenshots__/
+*.png

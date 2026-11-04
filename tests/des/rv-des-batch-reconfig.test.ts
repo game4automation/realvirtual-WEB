@@ -16,9 +16,9 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Object3D } from 'three';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
-import { _resetDesHookCache } from '@rv-private/plugins/des/des-hook-adapter';
-import { resetDESMUCounter } from '@rv-private/plugins/des/rv-des-mu';
+import { DESRunner } from '@rv/plugins/des/des-runner';
+import { _resetDesHookCache } from '@rv/plugins/des/des-hook-adapter';
+import { resetDESMUCounter } from '@rv/plugins/des/rv-des-mu';
 import {
   createSelf,
   readConfigNumber,
@@ -107,7 +107,7 @@ describe('DES batch re-config (runner/adapter path)', () => {
       // Read entityId LIVE — reset() re-registers the adapter with a fresh id.
       scheduler: runner.makeScheduler(def, () => adapter.entityId),
     });
-    adapter = runner.addInstance(def, self, node);
+    adapter = runner.addInstance(def, self, node, undefined, { desId: node.name + '@' + def.type });
 
     runner.start([def], { root: node });
 

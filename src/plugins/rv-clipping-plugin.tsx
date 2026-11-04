@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage, readLocalStorage } from '../core/rv-safe-storage';
+
 /**
  * rv-clipping-plugin.tsx — Section / clipping-plane tool for the realvirtual WebViewer.
  *
@@ -161,6 +163,7 @@ import { useSyncExternalStore, useCallback } from 'react';
 import { IconButton, Tooltip } from '@mui/material';
 import { ContentCut } from '@mui/icons-material';
 import { useViewer } from '../hooks/use-viewer';
+import { TOOL_GROUP } from '../core/hmi/button-panel-sections';
 
 function ClipButton(_props: UISlotProps) {
   const viewer = useViewer();
@@ -193,7 +196,7 @@ export class ClippingPlugin extends RVBehavior {
     // entries WITHOUT a rule in non-hmi workspace modes (des/planner/editor);
     // an (empty) rule opts the section tool into every mode. fpv/xr hide the
     // whole toolbar and would need a separate UI surface (out of scope).
-    { slot: 'button-group', component: ClipButton, order: 65, visibilityRule: {} },
+    { slot: 'button-group', component: ClipButton, order: 65, group: TOOL_GROUP.view, visibilityRule: {} },
   ];
 
   // Fixed 3-element array [x, y, z] — length is ALWAYS 3 (no shader recompile
@@ -201,11 +204,19 @@ export class ClippingPlugin extends RVBehavior {
   private readonly planes: Plane[] = [new Plane(), new Plane(), new Plane()];
   private bbox: Box3 | null = null;
   private clippedMaterials = new Set<Material>();
+  /** Keep clones own their materials; release both references when they are disposed. */
+  private readonly _onMaterialDispose = ({ target: mat }: { target: Material }): void => {
+    mat.removeEventListener('dispose', this._onMaterialDispose);
+    this.clippedMaterials.delete(mat);
+  };
   /** True once an axis was enabled for this model — from then on the planes are bound. */
   private _planesBound = false;
-  /** Model / placed subtrees seen before the first use; bound when the planes are. */
+  /** Model / placed subtrees seen before the first use; bound when the planes are.
+   *  A placement removed before the first use leaves both lists again
+   *  (`layout-content-removed`), otherwise every DES run / planner rebuild that
+   *  re-instantiates placements pins the discarded subtrees for the session. */
   private _pendingRoots: Object3D[] = [];
-  private _pendingChunks: Mesh[] = [];
+  private _pendingChunks = new Map<Object3D, Mesh[]>();
   private state: ClippingState = structuredClone(DEFAULT_CLIPPING_STATE);
   private _active = false;
   private _modelHash = '';
@@ -259,18 +270,35 @@ export class ClippingPlugin extends RVBehavior {
         if (root) this._attachSubtree(root, payload?.chunks);
       });
       this.addCleanup(off);
+
+      // Fired once per instance root (nested first) by `disposePlacedRoot`.
+      this.addCleanup(viewer.on('layout-content-removed', (data: unknown) => {
+        const root = (data as { root?: Object3D } | undefined)?.root;
+        if (root) this._forgetPending(root);
+      }));
     }
+  }
+
+  /** Drop a removed subtree from the before-first-use lists (no-op once bound). */
+  private _forgetPending(root: Object3D): void {
+    if (this._planesBound) return;
+    const i = this._pendingRoots.indexOf(root);
+    if (i >= 0) this._pendingRoots.splice(i, 1);
+    this._pendingChunks.delete(root);
   }
 
   protected onDestroy(): void {
     const viewer = this.viewer;
     (viewer as { setSectionClippingPlanes?: (planes: Plane[] | null) => void } | undefined)
       ?.setSectionClippingPlanes?.(null);
-    for (const mat of this.clippedMaterials) mat.clippingPlanes = null;
+    for (const mat of this.clippedMaterials) {
+      mat.removeEventListener('dispose', this._onMaterialDispose);
+      mat.clippingPlanes = null;
+    }
     this.clippedMaterials.clear(); // avoid leak across model switches
     this._planesBound = false;
     this._pendingRoots = [];
-    this._pendingChunks = [];
+    this._pendingChunks.clear();
     this._disposePlaneViz();
     // Only disable local clipping when no TankFillManager is relying on it.
     if (viewer && !viewer.tankFillManager) {
@@ -355,10 +383,10 @@ export class ClippingPlugin extends RVBehavior {
     // original RVBehavior viewer surface. The production RVViewer provides it.
     (this.viewer as { setSectionClippingPlanes?: (planes: Plane[] | null) => void } | null)
       ?.setSectionClippingPlanes?.(this.planes);
-    for (const chunk of this._pendingChunks) this._bindMesh(chunk);
+    for (const chunks of this._pendingChunks.values()) for (const chunk of chunks) this._bindMesh(chunk);
     for (const root of this._pendingRoots) this._attachClippingPlanes(root);
     this._pendingRoots = [];
-    this._pendingChunks = [];
+    this._pendingChunks.clear();
   }
 
   private _bindMesh(mesh: Mesh): void {
@@ -367,6 +395,7 @@ export class ClippingPlugin extends RVBehavior {
       mat.clippingPlanes = this.planes; // stable reference, length 3
       mat.clipShadows = true;
       this.clippedMaterials.add(mat);
+      mat.addEventListener('dispose', this._onMaterialDispose);
     }
   }
 
@@ -423,7 +452,7 @@ export class ClippingPlugin extends RVBehavior {
     if (!this._planesBound) {
       // Bounds still grow now (plane viz / slider range); the binding waits for first use.
       if (!this._pendingRoots.includes(root)) this._pendingRoots.push(root);
-      if (chunks) this._pendingChunks.push(...chunks);
+      if (chunks?.length) this._pendingChunks.set(root, [...(this._pendingChunks.get(root) ?? []), ...chunks]);
     }
 
     if (chunks && chunks.length > 0) {
@@ -533,7 +562,7 @@ export class ClippingPlugin extends RVBehavior {
   private _restoreFromLocalStorage(hash: string): void {
     this._modelHash = hash;
     try {
-      const raw = localStorage.getItem(LS_PREFIX + hash);
+      const raw = readLocalStorage(LS_PREFIX + hash);
       if (raw) this.state = deserializeClippingState(raw);
     } catch {
       // corrupt localStorage — keep defaults
@@ -542,7 +571,7 @@ export class ClippingPlugin extends RVBehavior {
 
   private _persist(): void {
     try {
-      localStorage.setItem(LS_PREFIX + this._modelHash, serializeClippingState(this.state));
+      getLocalStorage()?.setItem(LS_PREFIX + this._modelHash, serializeClippingState(this.state));
     } catch (e) {
       if (e instanceof DOMException && e.name === 'QuotaExceededError') {
         console.warn('[ClippingPlugin] localStorage quota exceeded, state not saved');

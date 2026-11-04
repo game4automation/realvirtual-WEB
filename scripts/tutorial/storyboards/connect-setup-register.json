@@ -1,0 +1,187 @@
+{
+  "$schema": "rv-tutorial/1",
+  "id": "connect-setup-register",
+  "title": "realvirtual WEB - Set up CONNECT (part 2: connect and register the free community license)",
+  "url": "/?doc=doc_demorealvirtualweb_7l7hfw&mode=hmi",
+  "connect": "live",
+  "viewport": {
+    "width": 1920,
+    "height": 1080
+  },
+  "welcome": "dismiss",
+  "ready": "#rv-viewport",
+  "minStepSec": 2,
+  "setup": [
+    {
+      "type": "waitFor",
+      "scene": true,
+      "doc": "rvproject:DemoRealvirtualWeb.glb",
+      "timeoutMs": 120000
+    }
+  ],
+  "steps": [
+    {
+      "id": "overview",
+      "holdSec": 1,
+      "actions": [
+        {
+          "type": "camera",
+          "position": [
+            3.9,
+            3.6,
+            3.4
+          ],
+          "target": [
+            0.62,
+            1.1,
+            0.4
+          ],
+          "durationSec": 2
+        },
+        {
+          "type": "camera",
+          "position": [
+            7.13,
+            5.89,
+            6.64
+          ],
+          "target": [
+            0.62,
+            1.23,
+            0.13
+          ],
+          "durationSec": 2
+        }
+      ]
+    },
+    {
+      "id": "open-connect-panel",
+      "holdSec": 2,
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "selector": "button[aria-label=\"realvirtual CONNECT\"]"
+          }
+        },
+        {
+          "type": "waitFor",
+          "selector": "button:has-text(\"Connect...\")",
+          "timeoutMs": 10000
+        }
+      ]
+    },
+    {
+      "id": "connect",
+      "holdSec": 3,
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "selector": "button:has-text(\"Connect...\")"
+          }
+        },
+        {
+          "type": "waitFor",
+          "selector": "button:text-is(\"Connect\")",
+          "timeoutMs": 10000
+        },
+        {
+          "type": "click",
+          "target": {
+            "selector": "button:text-is(\"Connect\")"
+          }
+        },
+        {
+          "type": "waitFor",
+          "selector": "[data-testid=\"license-status-line\"]",
+          "timeoutMs": 30000
+        }
+      ]
+    },
+    {
+      "id": "open-license-dialog",
+      "holdSec": 2,
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "selector": "button:has-text(\"Activate license...\")"
+          }
+        },
+        {
+          "type": "waitFor",
+          "selector": "[role=\"dialog\"]:has-text(\"Activate realvirtual CONNECT\")",
+          "timeoutMs": 10000
+        }
+      ]
+    },
+    {
+      "id": "enter-email",
+      "holdSec": 2,
+      "actions": [
+        {
+          "type": "type",
+          "target": {
+            "selector": "[role=\"dialog\"] input[type=\"email\"]"
+          },
+          "text": "info@realvirtual.io",
+          "delayMs": 60
+        }
+      ]
+    },
+    {
+      "id": "send-confirmation",
+      "holdSec": 3,
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "selector": "[role=\"dialog\"] button:has-text(\"Send confirmation link\")"
+          }
+        },
+        {
+          "type": "waitFor",
+          "selector": "[aria-label=\"License pending\"]",
+          "timeoutMs": 60000
+        }
+      ]
+    },
+    {
+      "id": "license-confirmed",
+      "holdSec": 3,
+      "actions": [
+        {
+          "type": "waitFor",
+          "selector": "[aria-label=\"License active\"]",
+          "timeoutMs": 900000
+        }
+      ]
+    },
+    {
+      "id": "closing-flight",
+      "holdSec": 2,
+      "tailSec": 0.4,
+      "actions": [
+        {
+          "type": "press",
+          "key": "Escape"
+        },
+        {
+          "type": "camera",
+          "position": [
+            5.5,
+            4.6,
+            5.2
+          ],
+          "target": [
+            0.62,
+            1.15,
+            0.3
+          ],
+          "durationSec": 3
+        }
+      ]
+    }
+  ]
+}

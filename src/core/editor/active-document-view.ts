@@ -13,7 +13,7 @@
  *    populated while that plugin is active. A card mounted in the core
  *    hierarchy header that imported it would be the core→plugin upward import
  *    that plan-703 already had to undo once for `active-asset-store`.
- *  - Scene documents — planner, HMI, DES, i.e. three of the four modes — have
+ *  - Documents open in the planner, HMI or DES — three of the four modes — have
  *    no `RvDocumentStack` at all. The card would have read the empty snapshot
  *    forever and rendered nothing.
  *  - `RvStackSnapshot` carries neither `busy` nor `saveVerb` nor a thumbnail
@@ -51,10 +51,15 @@
  */
 
 import type { RvStackCrumb } from '../ops/rv-document-stack';
-import type { ThumbnailKeyParts } from '../thumbnails/thumbnail-key';
 import type { SaveVerb } from './rv-save-document';
 import type { AssetBase } from './rv-asset-document';
 import { getOpenDocumentBase } from './active-asset-store';
+import type {
+  ApplyCommitResult,
+  ApplyPreview,
+  DocumentExportMode,
+  DocumentExportResult,
+} from '../export/rv-export-provider';
 
 // ─── What the card renders ──────────────────────────────────────────────
 
@@ -110,6 +115,38 @@ export interface ActiveDocumentExport {
 }
 
 /**
+ * A non-GLB export format of the open document (plan-764 §2.3), bound to it.
+ *
+ * The writer binds a registered `DocumentExportProvider` to its document
+ * context, so the card only ever sees "modes" and "run" — it never builds a
+ * context and never learns which store is behind it. `exportGlb` stays its own
+ * field: GLB keeps its embed dialog and its test ids.
+ */
+export interface ActiveDocumentFileExport {
+  /** Provider id, e.g. 'usd' — the card's test id is `document-card-verb-export-<id>`. */
+  id: string;
+  /** Menu label, e.g. 'Export USD…'. */
+  label: string;
+  /** The modes offered now (e.g. overlay only for USD-stamped documents). */
+  modes(): DocumentExportMode[];
+  run(modeId: string): Promise<DocumentExportResult>;
+  /**
+   * The provider's re-import, bound to the open document (plan-764 F7) —
+   * absent when the provider has none. `preview` changes nothing; `commit`
+   * takes only a token `preview` handed out.
+   */
+  apply?: {
+    /** Menu label, e.g. 'Apply USD extras…'. */
+    label: string;
+    preview(file: { name: string; bytes: Uint8Array }): Promise<ApplyPreview>;
+    commit(
+      previewToken: string,
+      confirm: { acceptExtrasLoss?: boolean; confirmExtrasLost?: boolean },
+    ): Promise<ApplyCommitResult>;
+  };
+}
+
+/**
  * The verbs of the open document.
  *
  * Part of the seam rather than reachable from the card directly, for exactly
@@ -117,18 +154,29 @@ export interface ActiveDocumentExport {
  * `runSaveFlow()` itself would have to know which one applies, which is the
  * mode knowledge this whole seam removes.
  */
+/** How a breadcrumb navigation ({@link ActiveDocumentActions.onCrumb}) ended. */
+export type ActiveDocumentCrumbOutcome =
+  | { status: 'done' }
+  | { status: 'not-done'; reason: 'superseded' | 'cancelled' | 'failed' };
+
 export interface ActiveDocumentActions {
   /** The one save. Routed by whoever published this view. */
   save(prompt?: NamePrompt): Promise<ActiveDocumentSaveOutcome>;
   undo?: () => void | Promise<void>;
   redo?: () => void | Promise<void>;
   menu?: ActiveDocumentVerb[];
-  /** Breadcrumb chip click — the stack bar's Back/Descend handler, shared. */
-  onCrumb?: (crumb: RvStackCrumb) => void | Promise<void>;
+  /**
+   * Breadcrumb chip click — the stack bar's Back/Descend handler, shared. May
+   * answer how it ended (review round 2, R4): `superseded` = another document
+   * took the viewer while the parent was rebuilt — not done, and not an error.
+   */
+  onCrumb?: (crumb: RvStackCrumb) => void | Promise<void | ActiveDocumentCrumbOutcome>;
   /** Hero: double-click the preview reopens in the last active mode (§3.2). */
   openPreview?: () => void | Promise<void>;
   share?: ActiveDocumentShare;
   exportGlb?: ActiveDocumentExport;
+  /** Registered non-GLB formats (plan-764). Absent or empty: the card shows only GLB. */
+  exports?: ActiveDocumentFileExport[];
 }
 
 export interface ActiveDocumentView {
@@ -149,7 +197,7 @@ export interface ActiveDocumentView {
   busy: boolean;
   /** Editor: `stack.anyDirty`. Scene: identical to {@link dirty}. */
   stackDirty: boolean;
-  /** A lower frame of the same asset saved under this one (§2.2.1-5). */
+  /** A lower frame of the same document saved under this one (§2.2.1-5). */
   stale: boolean;
   saveVerb: SaveVerb;
   /** Why Save is blocked. Present exactly when `saveVerb === 'blocked'`. */
@@ -160,14 +208,6 @@ export interface ActiveDocumentView {
   canRedo?: boolean;
   undoLabel?: string | null;
   redoLabel?: string | null;
-  /**
-   * Preview identity of the document.
-   *
-   * Carried by the seam because it belongs to the document, not to the place
-   * it is rendered; the hero uses it to key its preview slot so a switch
-   * cannot leave the previous document's picture standing.
-   */
-  thumbnailKey?: ThumbnailKeyParts;
   actions: ActiveDocumentActions;
 }
 
@@ -360,6 +400,8 @@ export function documentLocationCrumbs(base: AssetBase | null | undefined): stri
       // was resolvable; without one the honest statement is that we are inside
       // another file, not a folder we cannot name.
       return base.path ? folderSegments(base.path) : ['Referenced'];
+    case 'libraryDocument':
+      return ['Library', base.libraryLabel || base.libraryProjectId, ...folderSegments(base.path)];
     // There is no `'empty'` case any more (plan-719 F3): an asset that lived
     // nowhere and printed "Unsaved" as its location cannot occur, because a
     // document is created with a folder before it is ever opened.
@@ -383,6 +425,7 @@ export function nameOfAssetBase(base: AssetBase): string {
     case 'builtinModel': return base.name || 'Model';
     case 'providerAsset': return base.label;
     case 'referencedAsset': return base.label;
+    case 'libraryDocument': return base.name || fileStem(base.path) || 'Untitled';
     default: return 'Untitled';
   }
 }

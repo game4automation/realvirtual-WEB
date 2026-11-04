@@ -354,7 +354,7 @@ export class RaycastManager {
     // own pointerdown handlers whatever the construction order. Nothing pending
     // means hover is already current and no ray is spent.
     this.onPointerDownCapture = (e: PointerEvent) => {
-      if (!this._enabled || !this._pointerMovedSinceRay) return;
+      if (!this._enabled || !this._pointerMovedSinceRay || this.pickBlocked?.()) return;
       this._sampleHover(e.clientX, e.clientY);
     };
     renderer.domElement.addEventListener('pointerdown', this.onPointerDownCapture, { capture: true });
@@ -415,6 +415,15 @@ export class RaycastManager {
    * WebLabel is under the mouse, `null` otherwise (then the reset is `''`).
    */
   cursorOverride: (() => string | null) | null = null;
+
+  /**
+   * plan-2215 2.6: true while a pointer pick from screen coordinates is invalid
+   * (the viewer installs `() => viewer.pointerPickBlocked`). Hover and the
+   * pointer pick APIs ({@link raycastForRVNodeDetailed}, {@link pickDetailed})
+   * then find nothing — independent of {@link setEnabled}, so a manager rebuilt
+   * by a model load is blocked from its first event.
+   */
+  pickBlocked: (() => boolean) | null = null;
 
   /** Install the pick-path timing sink (null to disable). */
   setMetrics(metrics: PickMetrics | null): void {
@@ -628,10 +637,69 @@ export class RaycastManager {
     // Empty targets is NOT "nothing pickable" when a backend is installed
     // (a model without MU pools has only backend geometry).
     if (!this.registry || (this._targets.length === 0 && !this._hasBackend())) return null;
+    if (this.pickBlocked?.()) return null;
     pointerToNDC(e.clientX, e.clientY, this.renderer.domElement, this.pointer);
 
     this.raycaster.setFromCamera(this.pointer, this.getCamera());
     return this._resolveFirstEnabledHit(this._rankForWirePick(this._timedIntersect()));
+  }
+
+  /**
+   * RAW GEOMETRY pick (plan-779, planner Align tool): the nearest visible
+   * triangle under the pointer — mesh, triangle index and its three vertex
+   * indices — WITHOUT the allow filter, the ancestor overrides and pick
+   * ownership. A documented exception to doc-bake-picking-internals § 2.4 contract 4:
+   * a tool that snaps to geometry needs the triangle, not the selectable node,
+   * and must reach the main model while the planner's allow filter only admits
+   * placements. Still honoured: exclude filters, on-top / aux gizmo hulls,
+   * objects tagged `userData._isAlignOverlay`, effective visibility of
+   * non-chunk meshes (chunks skip hidden segments themselves), instanced and
+   * skinned meshes (no usable corner). Reads the chunk index, never writes it.
+   * Changes no hover state; independent of {@link setEnabled}.
+   */
+  pickDetailed(e: { clientX: number; clientY: number }): {
+    mesh: Mesh;
+    faceIndex: number;
+    face: { a: number; b: number; c: number };
+    point: Vector3;
+  } | null {
+    if (!this.registry || (this._targets.length === 0 && !this._hasBackend())) return null;
+    if (this.pickBlocked?.()) return null;
+    pointerToNDC(e.clientX, e.clientY, this.renderer.domElement, this.pointer);
+    const prevFar = this.raycaster.far;
+    const prevNear = this.raycaster.near;
+    try {
+      this.raycaster.setFromCamera(this.pointer, this.getCamera());
+      const hits = this._timedIntersect();
+      for (let i = 0; i < hits.length; i++) {
+        const hit = hits[i];
+        const obj = hit.object;
+        if (!hit.face || hit.faceIndex === undefined || hit.faceIndex === null) continue;
+        if (!(obj as Mesh).isMesh) continue;
+        if ((obj as InstancedMesh).isInstancedMesh || (obj as { isSkinnedMesh?: boolean }).isSkinnedMesh) continue;
+        if (this._isExcluded(obj) || this._auxOnTop.has(obj) || this._auxOwners.has(obj)) continue;
+        if (obj.userData?._isAlignOverlay) continue;
+        // Chunk hits carry rvSegment: the pick structure already skipped hidden
+        // segments. Plain meshes (keep meshes, unbaked content) are not filtered
+        // by three.js for a hidden ancestor, so gate them here.
+        const isChunkHit = (hit as { rvSegment?: number }).rvSegment !== undefined;
+        if (!isChunkHit) {
+          if (!isEffectivelyVisible(obj)) continue;
+          if (this._isolationGate && !this._isolationGate(obj)) continue;
+        }
+        return {
+          mesh: obj as Mesh,
+          faceIndex: hit.faceIndex,
+          face: { a: hit.face.a, b: hit.face.b, c: hit.face.c },
+          point: hit.point,
+        };
+      }
+      return null;
+    } finally {
+      // setFromCamera writes near/far for the ortho camera, so both are restored.
+      this.raycaster.far = prevFar;
+      this.raycaster.near = prevNear;
+    }
   }
 
   /**
@@ -661,7 +729,7 @@ export class RaycastManager {
    * Runs through the SAME resolution chain as raycastForRVNodeDetailed
    * (_timedIntersect → _isExcluded → _resolveHit → _isTypeEnabled) so the
    * visibility, isolation and hover-type gates cannot drift apart
-   * (doc-render-picking.md §2.4 contract 4: do not bypass the resolution
+   * (contract-bake-picking.md §2.4 contract 4: do not bypass the resolution
    * pipeline; contract 2: never raycast render meshes or arenas directly).
    * Changes NO hover state and adds no per-frame work — one call per use.
    *
@@ -907,7 +975,7 @@ export class RaycastManager {
     this.pointerClientX = e.clientX;
     this.pointerClientY = e.clientY;
 
-    if (!this._enabled) {
+    if (!this._enabled || this.pickBlocked?.()) {
       this._clearHover();
       return;
     }
@@ -959,7 +1027,7 @@ export class RaycastManager {
     }
     this._hoverFrameHandle = requestAnimationFrame(() => {
       this._hoverFrameHandle = null;
-      if (!this._pointerMovedSinceRay || !this._enabled) return;
+      if (!this._pointerMovedSinceRay || !this._enabled || this.pickBlocked?.()) return;
       this._sampleHover(this._pendingPointerX, this._pendingPointerY);
     });
   }

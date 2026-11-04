@@ -21,10 +21,11 @@
  *    `rv-share-boot.test.ts` uses for the same block.
  */
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import { queryValue } from './helpers/query-value';
 import mainSource from '../src/main.ts?raw';
 import {
-  McpLinkTools,
+  LinkQueries,
   composeLink,
   stripOptionParam,
   baseLabelOfUrl,
@@ -83,20 +84,29 @@ function makeViewer(over: { mode?: string | null; modelUrl?: string | null } = {
   } as never;
 }
 
+/** Keep the original injected catalogue fixtures while exercising the read door. */
+async function queryLink(tools: LinkQueries, args: Record<string, unknown> = {}): Promise<string> {
+  const body = LinkQueries.prototype.queryLinkCompose.bind(tools);
+  const spy = vi.spyOn(LinkQueries.prototype, 'queryLinkCompose').mockImplementation(body);
+  try {
+    return await queryValue(makeViewer(), 'link.compose', args);
+  } finally {
+    spy.mockRestore();
+  }
+}
+
 afterEach(() => resetModelOptionRegistry());
 
 // ── Compose mode ────────────────────────────────────────────────────────
 
 describe('web_link_compose — compose mode', () => {
   it('link_ComposeDoc_CanonicalOrderAndEncoding', async () => {
-    const tools = new McpLinkTools(
+    const tools = new LinkQueries(
       () => makeViewer(),
       async () => makeState(),
       () => makeEnv(),
     );
-    const res = JSON.parse(await tools.webLinkCompose(
-      '', '', 'doc_a', '', 'planner', '', BASE,
-    ));
+    const res = JSON.parse(await queryLink(tools, { doc: 'doc_a', mode: 'planner', base: BASE }));
 
     expect(res.url).toBe('https://host.example.org/app/?doc=doc_a&mode=planner');
     expect(res.warnings).toEqual([]);
@@ -216,8 +226,8 @@ describe('web_link_compose — compose mode', () => {
   });
 
   it('no viewer is an error object, never a throw', async () => {
-    const tools = new McpLinkTools(() => undefined);
-    expect(JSON.parse(await tools.webLinkCompose('', '', '', '', '', '', ''))).toEqual({
+    const tools = new LinkQueries(() => undefined);
+    expect(JSON.parse(await queryLink(tools))).toEqual({
       error: 'No viewer',
     });
   });
@@ -231,14 +241,14 @@ describe('web_link_compose — the allowlist', () => {
     // has it. Nothing in the composer may read this.
     const pageUrl = `${BASE}?devkey=SUPERSECRET&sharetoken=ONETIME&doc=doc_b&joinCode=42`;
 
-    const tools = new McpLinkTools(
+    const tools = new LinkQueries(
       () => makeViewer({ mode: 'hmi' }),
       async () => makeState({ documentId: 'doc_a' }),
       // The env stub mirrors readLinkEnv's contract: origin + pathname ONLY.
       () => makeEnv({ defaultBase: new URL(pageUrl).origin + new URL(pageUrl).pathname, activeMode: 'hmi' }),
     );
 
-    const res = JSON.parse(await tools.webLinkCompose('', '', '', '', '', '', ''));
+    const res = JSON.parse(await queryLink(tools));
 
     for (const secret of ['devkey', 'SUPERSECRET', 'sharetoken', 'ONETIME', 'joinCode', '42']) {
       expect(res.url, `"${secret}" leaked into the composed link`).not.toContain(secret);
@@ -272,13 +282,13 @@ describe('web_link_compose — the allowlist', () => {
 
 describe('web_link_compose — snapshot mode', () => {
   it('link_Snapshot_ReadsModeLiveNotFromUrl', async () => {
-    const tools = new McpLinkTools(
+    const tools = new LinkQueries(
       () => makeViewer({ mode: 'planner' }),
       async () => makeState({ documentId: 'doc_a' }),
       // defaultBase has NO ?mode= — the mode can only come from the manager.
       () => makeEnv({ activeMode: 'planner' }),
     );
-    const res = JSON.parse(await tools.webLinkCompose('', '', '', '', '', '', ''));
+    const res = JSON.parse(await queryLink(tools));
     expect(res.url).toBe(`${BASE}?doc=doc_a&mode=planner`);
     expect(res.params.mode).toBe('planner');
   });
@@ -438,6 +448,8 @@ describe('web_link_compose — main.ts mirror', () => {
 
   it('the mode boot still reads ?mode= and still writes nothing back', () => {
     expect(mainSource).toContain("const urlMode = params.get('mode')");
-    expect(mainSource).toContain('viewer.modes.setMode(urlMode)');
+    // plan-652: ?mode= feeds resolveBootMode; the boot enters its result.
+    expect(mainSource).toContain('url: urlMode,');
+    expect(mainSource).toContain('viewer.modes.setMode(bootTarget.mode)');
   });
 });

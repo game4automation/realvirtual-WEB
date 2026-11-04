@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { activeHistoryStep } from './rv-edit-target';
 import { Suspense, lazy, useEffect, useRef, useSyncExternalStore } from 'react';
 import { Box } from '@mui/material';
 import { useViewer } from '../../hooks/use-viewer';
@@ -108,10 +109,10 @@ export function HMIShell({ children }: HMIShellProps) {
       const key = e.key.toLowerCase();
       if (key === 'z' && !e.shiftKey) {
         e.preventDefault();
-        void sceneStore.undo();
+        if (!activeHistoryStep('undo')) void sceneStore.undo();
       } else if ((key === 'z' && e.shiftKey) || key === 'y') {
         e.preventDefault();
-        void sceneStore.redo();
+        if (!activeHistoryStep('redo')) void sceneStore.redo();
       }
     }
     window.addEventListener('keydown', onKeyDown);

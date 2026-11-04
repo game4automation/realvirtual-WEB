@@ -18,6 +18,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import MAIN_SOURCE from '../src/main.ts?raw';
+import BOOT_MODE_SOURCE from '../src/core/rv-boot-mode.ts?raw';
 import {
   DOCUMENT_MODES_DB_NAME,
   __closeDocumentModesDb,
@@ -89,9 +90,13 @@ describe('main.ts wiring (source)', () => {
   });
 
   it('?mode= beats a published boot mode, which beats the resume mode', () => {
-    const url = MAIN_SOURCE.indexOf('if (urlMode && viewer.modes.has(urlMode))');
-    const published = MAIN_SOURCE.indexOf('} else if (publishedBootMode && viewer.modes.has(publishedBootMode))');
-    const resume = MAIN_SOURCE.indexOf('} else if (resumeBootMode && viewer.modes.has(resumeBootMode))');
+    // plan-652: the cascade lives in resolveBootMode (rv-boot-mode.ts).
+    expect(MAIN_SOURCE.indexOf('url: urlMode,')).toBeGreaterThan(0);
+    expect(MAIN_SOURCE.indexOf('published: publishedBootMode,')).toBeGreaterThan(0);
+    expect(MAIN_SOURCE.indexOf('resume: resumeBootMode,')).toBeGreaterThan(0);
+    const url = BOOT_MODE_SOURCE.indexOf("['url', candidates.url]");
+    const published = BOOT_MODE_SOURCE.indexOf("['published', candidates.published]");
+    const resume = BOOT_MODE_SOURCE.indexOf("['resume', candidates.resume]");
     expect(url).toBeGreaterThan(0);
     expect(published).toBeGreaterThan(url);
     expect(resume).toBeGreaterThan(published);
@@ -99,7 +104,7 @@ describe('main.ts wiring (source)', () => {
 
   it('the document-mode tracking is attached before the mode boot', () => {
     const tracking = MAIN_SOURCE.indexOf('attachDocumentModeTracking(viewer,');
-    const boot = MAIN_SOURCE.indexOf('if (urlMode && viewer.modes.has(urlMode))');
+    const boot = MAIN_SOURCE.indexOf('const bootTarget = resolveBootMode(');
     expect(tracking).toBeGreaterThan(0);
     expect(tracking).toBeLessThan(boot);
   });

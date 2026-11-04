@@ -1,0 +1,133 @@
+{
+  "plan": 659,
+  "phase": 0,
+  "procured": "2026-10-22",
+  "role": "demo run pair AND test fixture (priority change 2026-10-22: Microduck is the demo target)",
+  "sources": {
+    "space": {
+      "id": "huggingface.co/spaces/pollen-robotics/microduck-simulator",
+      "revision": "ad9d41a7",
+      "repo_license": "apache-2.0 (LICENSE file + card front matter)",
+      "url_template": "https://huggingface.co/spaces/pollen-robotics/microduck-simulator/resolve/ad9d41a7/{path}"
+    },
+    "policies_model_repo": {
+      "id": "huggingface.co/pollen-robotics/microduck-policies",
+      "revision": "665ae4eb20bfe13bca1ef4ea6d4bb6b4a096e448",
+      "repo_license": "apache-2.0 (model card front matter; weights-only repository)",
+      "url_template": "https://huggingface.co/pollen-robotics/microduck-policies/resolve/665ae4eb20bfe13bca1ef4ea6d4bb6b4a096e448/{path}",
+      "note": "Authoritative licence statement for the weights. The two files we use are byte-identical to the Space copies."
+    },
+    "training_repo": {
+      "id": "github.com/pollen-robotics/microduck_rl",
+      "revision": "b02fdea4902c2b93b7d34a83a6f05da4ececb7d3",
+      "repo_license": "apache-2.0, with LICENSE-MODELS.md carving the .stl 3D model files out to CC BY-NC-SA 4.0"
+    },
+    "robot_repo": {
+      "id": "github.com/pollen-robotics/microduck",
+      "revision": "942e58e3aa6dbb28e7037203fff11866122c7567",
+      "repo_license": "apache-2.0",
+      "note": "Checked for the MJCF/policies named in the plan: NOT present at this revision. They live in the Space and in the model repo."
+    }
+  },
+  "files": [
+    {
+      "path": "mjcf/robot_allcollisions.xml",
+      "bytes": 32898,
+      "sha256": "7a6fdf437f5a80c7348ad801f43f906b997a834389cb70cca5e1e8517ba38044",
+      "from": "space",
+      "source_path": "app/public/robot/mjlab/robot_allcollisions.xml",
+      "license": "Apache-2.0",
+      "modified": false
+    },
+    {
+      "path": "mjcf/prepared-scene.xml",
+      "bytes": 17117,
+      "sha256": "6c23c003041917fdea4149a3a356af78a628a5f08a8035faa813bae270e67e1d",
+      "from": "derived",
+      "source_path": "mjcf/robot_allcollisions.xml",
+      "license": "Apache-2.0 (derivative)",
+      "modified": true,
+      "modification": "spikes/659/make-microduck-fixtures.py: visual geoms stripped, unreferenced mesh assets dropped, <option timestep=0.005>, floor plane and STAND keyframe injected. Mirrors the Space's buildPhysicsXml() minus arena walls, ball and relief hfield."
+    },
+    {
+      "path": "mjcf/assets/*.stl",
+      "file_count": 9,
+      "bytes": 1714756,
+      "from": "space",
+      "source_path": "app/public/robot/mjlab/meshes/",
+      "files": [
+        "bottom_head_shell.stl", "hip_l.stl", "jaw.stl", "leg.stl", "np_f970.stl",
+        "power_support.stl", "sole_left.stl", "sole_right.stl", "top_head_shell.stl"
+      ],
+      "license": "CC BY-NC-SA 4.0 (NonCommercial)",
+      "license_note": "Exactly the meshes the collision geoms of robot_allcollisions.xml reference (8 class=collision + power_support as class=self_collision_only). The remaining 29 referenced meshes are visual-only and are not needed once the visual geoms are stripped.",
+      "modified": false
+    },
+    {
+      "path": "policies/BEST_alpha_walking.onnx",
+      "bytes": 793705,
+      "sha256": "e36332d383997d51401897734cd3e79cf5038406feddb18b4d57ecfb141daa6c",
+      "from": "space",
+      "also_at": "policies_model_repo:alpha_walking.onnx (byte-identical)",
+      "source_path": "app/public/policies/BEST_alpha_walking.onnx",
+      "license": "Apache-2.0 (explicit, model card)",
+      "modified": false,
+      "contract": { "input": "obs [1,61] float32", "output": "actions [1,14] float32" }
+    },
+    {
+      "path": "policies/BEST_alpha_stand.onnx",
+      "bytes": 793705,
+      "sha256": "1569268713e40deea795dd2922dba50d3621e15a872855408b6b1b125b1c094b",
+      "from": "space",
+      "also_at": "policies_model_repo:alpha_stand.onnx (byte-identical)",
+      "source_path": "app/public/policies/BEST_alpha_stand.onnx",
+      "license": "Apache-2.0 (explicit, model card)",
+      "modified": false,
+      "contract": { "input": "obs [1,61] float32", "output": "actions [1,14] float32" },
+      "role": "get-up / fall recovery policy, needed by the demo and by test 9.9"
+    },
+    {
+      "path": "policies/vendor-manifest.json",
+      "bytes": 2847,
+      "sha256": "c566390738dd90a54c1e2de829aaab0e904c636949e2c2c6158ee7bbb889b818",
+      "from": "policies_model_repo",
+      "source_path": "manifest.json",
+      "license": "Apache-2.0",
+      "modified": false,
+      "note": "Vendor's own declaration: schema_version 2, model_api 1, obs_len 61, action_len 14, robot microduck/xl330, control_hz 50. This is the manifest the M11 validation pattern checks against."
+    },
+    {
+      "path": "visual/microduck.glb",
+      "bytes": 1279444,
+      "sha256": "ad0b8d1c886a857fd09d337be11e731f4ac72bf099b0af63081031f97ed6eadb",
+      "from": "space",
+      "source_path": "app/public/robot/mjlab/microduck.glb",
+      "license": "UNRESOLVED - conservatively CC BY-NC-SA 4.0",
+      "license_note": "glTF 2.0, generator stl_to_glb.py, 38 flat nodes named <part>.stl, no materials, no textures: a container of the 38 visual STL meshes. LICENSE-MODELS.md's attribution clause explicitly anticipates 'converted meshes' of the covered .stl files, so the NonCommercial reading is the conservative one, but the file itself lives only in the Apache-2.0 Space.",
+      "modified": false,
+      "role": "the ONLY visual asset; the 9 collision meshes are not a presentable robot"
+    },
+    {
+      "path": "rig/kinematics.json",
+      "bytes": 26666,
+      "sha256": "099c64fa03280514eed881accf563061a640eb7800d5ce15be5af92d1f63d38b",
+      "from": "space",
+      "source_path": "app/public/robot/mjlab/kinematics.json",
+      "license": "Apache-2.0 (generated metadata)",
+      "modified": false,
+      "note": "Keys: bodies, actuated_joints, mesh_dir. Names all 14 joints. The Space builds its three.js rig from this plus the GLB meshes and drives it from qpos (plan finding M3)."
+    }
+  ],
+  "sizes": {
+    "collision_meshes_bytes": 1714756,
+    "policies_bytes": 1590257,
+    "visual_glb_bytes": 1279444,
+    "rig_bytes": 26666,
+    "mjcf_bytes": 50015,
+    "licenses_bytes": 30589,
+    "reference_fixtures_bytes": 37317,
+    "total_bytes": 4746161,
+    "foreign_binary_bytes": 4584457,
+    "foreign_binary_note": "9 STL + 2 ONNX + 1 GLB = 12 foreign binary files, 4.58 MB. Relevant to plan-659 N7 (this repo's public remote is an unfiltered mirror)."
+  }
+}

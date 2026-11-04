@@ -26,7 +26,8 @@
  *   "successors": ["<pathId>"], // graph chaining (junctions)
  *   "align": [0,1,0],           // up vector for the carrier pose
  *   "zone": "X1",               // optional: control-point zone this path belongs to (Phase 2)
- *   "zoneCapacity": 1           // optional: explicit zone capacity (max of declarations wins)
+ *   "zoneCapacity": 1,          // optional: explicit zone capacity (max of declarations wins)
+ *   "connectCheck": false       // optional (plan-633): opt out of the successor check (crossings)
  * }
  * ```
  *
@@ -51,6 +52,10 @@ import type { ComponentContext, ComponentSchema, RVComponent } from './rv-compon
 import { registerComponent, setComponentInstance, loadSchemaFromSpec } from './rv-component-registry';
 import { defaultPathNetwork } from './rv-path-network';
 import { defaultZoneRegistry } from './rv-zone-registry';
+import { getDefaultPathDockRegistry } from './rv-path-dock';
+import {
+  clearPathIdCollisionProblem, clearPathIdCollisionProblems, reportPathIdCollision, subscribeProblemsDocument,
+} from '../hmi/problems-store';
 
 const DEG2RAD = Math.PI / 180;
 
@@ -174,6 +179,12 @@ export interface RVPathOptions {
   zoneId?: string | null;
   /** Explicit zone capacity declared by this path — null/absent = not declared. */
   zoneCapacity?: number | null;
+  /**
+   * Take part in the load-time successor check (plan-633 F8). Default true;
+   * false marks a deliberate crossing/bridge whose ends touch other paths
+   * without being connected to them.
+   */
+  connectCheck?: boolean;
 }
 
 /** One curvature interval of a path (meters; `radiusM = Infinity` = straight). */
@@ -196,6 +207,8 @@ export class RVPath {
   readonly zoneId: string | null;
   /** Explicit zone capacity declared by this path — null = not declared. */
   readonly zoneCapacity: number | null;
+  /** False = opted out of the successor check (plan-633 F8, `rv_extras.Path.connectCheck`). */
+  readonly connectCheck: boolean;
   /** Resolved graph links — filled by `RVPathNetwork.resolveGraph()`. */
   readonly successors: RVPath[] = [];
   readonly predecessors: RVPath[] = [];
@@ -221,6 +234,7 @@ export class RVPath {
     this.successorIds = [...(opts.successorIds ?? [])];
     this.zoneId = opts.zoneId ?? null;
     this.zoneCapacity = opts.zoneCapacity ?? null;
+    this.connectCheck = opts.connectCheck ?? true;
     this.prefix = new Float64Array(segments.length);
     let sum = 0;
     for (let i = 0; i < segments.length; i++) {
@@ -296,6 +310,19 @@ export class RVPath {
     const { i, t } = this.locate(meters);
     if (i < 0) return out.copy(DEGENERATE_DIR);
     return this.segments[i].getDirection(t, out);
+  }
+
+  /** Writes world position and normalised tangent using one segment lookup. */
+  getAbsPose(meters: number, outPos: Vector3, outDir: Vector3): void {
+    const { i, t } = this.locate(meters);
+    if (i < 0) {
+      outPos.set(0, 0, 0);
+      outDir.copy(DEGENERATE_DIR);
+      return;
+    }
+    const segment = this.segments[i];
+    segment.getPosition(t, outPos);
+    segment.getDirection(t, outDir);
   }
 
   /**
@@ -400,6 +427,8 @@ export interface PathExtras {
   zone?: string;
   /** Explicit zone capacity (≥ 0; capacity 0 = zone never enterable). */
   zoneCapacity?: number;
+  /** false = opt out of the load-time successor check (plan-633 F8). Default true. */
+  connectCheck?: boolean;
 }
 
 /** Schema defaults (TS-SSOT) — mirrored by the conformance tests (§9.6). */
@@ -410,6 +439,7 @@ export const PATH_EXTRAS_DEFAULTS = Object.freeze({
   align: [0, 1, 0] as readonly [number, number, number],
   zone: null as string | null,
   zoneCapacity: null as number | null,
+  connectCheck: true,
 });
 
 /**
@@ -494,6 +524,8 @@ export function parsePathExtras(raw: unknown, fallbackId: string): RVPath | null
     successorIds,
     zoneId,
     zoneCapacity,
+    // Opt-out only by an explicit `false` — anything else keeps the check on.
+    connectCheck: raw.connectCheck !== false,
   });
 }
 
@@ -526,6 +558,77 @@ export function pathFromNode(node: Object3D): RVPath | null {
   return path;
 }
 
+// ─── Path-id collision check (plan-559 Phase 2a) ──────────────────────────
+
+/** Which node (and its path at registration) registered an `RVPath` object. */
+const _pathOwners = new WeakMap<RVPath, { node: Object3D; nodePath: string }>();
+
+/** Node paths of the open `path-id-collision` per id (every claimant, not just the last two). */
+const _pathIdCollisions = new Map<string, Set<string>>();
+
+// Per-document, like the Problems entries themselves.
+subscribeProblemsDocument(() => _pathIdCollisions.clear());
+
+/** Scene path of a path node: registry path when known, else the name chain. */
+function pathNodePathOf(node: Object3D, ctx?: ComponentContext): string {
+  const fromRegistry = ctx?.registry?.getPathForNode?.(node);
+  if (fromRegistry) return fromRegistry;
+  const names: string[] = [];
+  for (let cur: Object3D | null = node; cur; cur = cur.parent) if (cur.name) names.push(cur.name);
+  return names.reverse().join('/');
+}
+
+/**
+ * Report (never resolve) a second path node registering an id the network
+ * already holds from ANOTHER node — path ids are global, so the network keeps
+ * only the last one (decision A2: ids are not scoped). Called right before
+ * `register()`; registration order and routing are unchanged.
+ */
+function checkPathIdCollision(path: RVPath, node: Object3D, ctx?: ComponentContext): void {
+  const nodePath = pathNodePathOf(node, ctx);
+  _pathOwners.set(path, { node, nodePath });
+  const previous = defaultPathNetwork.get(path.id);
+  if (!previous || previous === path) return;
+  const owner = _pathOwners.get(previous);
+  if (!owner || owner.node === node) return;
+  let claimants = _pathIdCollisions.get(path.id);
+  if (!claimants) _pathIdCollisions.set(path.id, (claimants = new Set()));
+  claimants.add(owner.nodePath);
+  claimants.add(nodePath);
+  reportPathIdCollision(path.id, [...claimants], nodePath);
+}
+
+/**
+ * Forget every path-id collision with its Problems entries — the model is
+ * cleared (`RVViewer.clearModel`). Path components get no dispose there, so
+ * without this a reload of the SAME document (no document-key change) kept the
+ * old claimants and their entries (plan-559 2b).
+ */
+export function resetPathIdCollisions(): void {
+  _pathIdCollisions.clear();
+  clearPathIdCollisionProblems();
+}
+
+/**
+ * A path node leaves the scene: it stops being a claimant of its id. With
+ * fewer than two claimants left the collision entry goes; otherwise it is
+ * re-reported with the remaining node paths (plan-559 2b — before, ANY leaving
+ * claimant cleared the entry although the collision still stood).
+ */
+function forgetPathIdClaimant(path: RVPath): void {
+  const id = path.id;
+  const claimants = _pathIdCollisions.get(id);
+  if (!claimants) return;
+  const own = _pathOwners.get(path);
+  if (own) claimants.delete(own.nodePath);
+  if (claimants.size < 2) {
+    _pathIdCollisions.delete(id);
+    clearPathIdCollisionProblem(id);
+    return;
+  }
+  reportPathIdCollision(id, [...claimants]);
+}
+
 // ─── Scene-loader factory component ──────────────────────────────────────
 
 /**
@@ -551,32 +654,58 @@ export class RVPathComponent implements RVComponent {
   /** The reconstructed path — null when the payload could not be parsed. */
   path: RVPath | null = null;
 
+  /**
+   * The zone declaration this component holds (plan-647 D4, R3-3) — kept
+   * INDEPENDENTLY of {@link path}: an unparsable payload nulls `path`, but the
+   * last valid declaration stays until a valid payload replaces it or
+   * {@link dispose} withdraws it. The declarant is the `RVPath` OBJECT.
+   */
+  private declared: { zoneId: string; path: RVPath } | null = null;
+
   constructor(node: Object3D) {
     this.node = node;
   }
 
-  init(_ctx: ComponentContext): void {
+  init(ctx: ComponentContext): void {
     this.node.userData._rvType = 'Path';
     this.path = pathFromNode(this.node);
     if (!this.path) {
       console.warn(`[Path] node '${this.node.name}' carries rv_extras.Path but it could not be parsed`);
       return;
     }
+    checkPathIdCollision(this.path, this.node, ctx);
     defaultPathNetwork.register(this.path);
     // Declare the zone (Phase 2) so `capacityOf` reflects the schema before the
-    // first claim. Max of explicit declarations wins across paths sharing the id.
+    // first claim. The path OBJECT is the declarant (plan-647 D4): the maximum
+    // over all declarations wins across paths sharing the id.
     if (this.path.zoneId) {
-      defaultZoneRegistry.define(this.path.zoneId, this.path.zoneCapacity ?? undefined);
+      defaultZoneRegistry.declare(this.path.zoneId, this.path, this.path.zoneCapacity ?? undefined);
+      this.declared = { zoneId: this.path.zoneId, path: this.path };
     }
   }
 
+  /**
+   * The path leaves the scene (placement removal, editor delete): unregister
+   * it from the network, unbind the dock on it (plan-647 D3) and withdraw its
+   * zone declaration. Only the OWN declaration goes (plan-647 D4): a zone
+   * another path still declares keeps every claim — a removed placement must
+   * not free the crossing a vehicle of another placement stands in. The last
+   * declaration takes the zone and its holders with it.
+   */
   dispose(): void {
     if (this.path) {
-      defaultPathNetwork.unregister(this.path.id);
-      // Drop the zone definition on model-cleared so a later model declaring a
-      // SMALLER capacity for the same id is not widened by a stale max().
-      // (Partial single-path removal re-declares on the next claim walk.)
-      if (this.path.zoneId) defaultZoneRegistry.undefine(this.path.zoneId);
+      forgetPathIdClaimant(this.path);
+      // plan-559 2b (identity check like plan-647 R4-1): only the CURRENTLY
+      // registered object of the id gives the id up — a non-owner sharing the
+      // id (path-id-collision) must not delete another node's path or its dock.
+      if (defaultPathNetwork.get(this.path.id) === this.path) {
+        defaultPathNetwork.unregister(this.path.id);
+        getDefaultPathDockRegistry().unbindPath(this.path.id);
+      }
+    }
+    if (this.declared) {
+      defaultZoneRegistry.withdraw(this.declared.zoneId, this.declared.path, { preserveHolders: false });
+      this.declared = null;
     }
     this.path = null;
   }
@@ -586,12 +715,17 @@ export class RVPathComponent implements RVComponent {
    *  setField/unsetField (`reapplySchemaForComponent` → `reapplyConfig`), so
    *  segment/successor/zone edits take effect live — id changes included.
    *
-   *  This is the LIVE-EDIT path (plan-447), NOT model-clear:
-   *  - the zone declaration goes through `ZoneRegistry.redefine` (hard capacity
-   *    overwrite so a SHRINK takes effect, holders preserved) instead of
-   *    `undefine` + `define` — a claim held by a driving vehicle must survive a
-   *    geometry edit, otherwise two vehicles end up inside one exclusive zone;
-   *    `undefine` stays reserved for {@link dispose} (model-cleared);
+   *  This is the LIVE-EDIT path (plan-447, plan-647 D4), NOT model-clear:
+   *  - the edit REPLACES the `RVPath` object, so the zone declaration moves
+   *    from the old object to the new one: the old declaration is withdrawn
+   *    with its holders kept (also when the path left its zone — the zone stays
+   *    "undeclared" with the vehicle inside), the new one is set HARD (a
+   *    capacity shrink takes effect against the own earlier value; other
+   *    declarants of the zone still count — MAX-WINS). Both happen BEFORE the
+   *    availability notification (`ZoneRegistry.replaceDeclaration`), because
+   *    a notification can flush the planner synchronously (plan-647 R4-1);
+   *  - an unparsable payload leaves the declaration standing until a valid
+   *    payload or dispose (R3-3);
    *  - the network is notified per pathId afterwards, which re-projects every
    *    traveler onto the FRESH readonly `RVPath` object (rv-path-network.ts,
    *    `reprojectTravelersOnPath`) and lets the visualizer / snap sources
@@ -599,8 +733,8 @@ export class RVPathComponent implements RVComponent {
    */
   reapplyConfig(): void {
     const prevId = this.path?.id ?? null;
-    const prevZone = this.path?.zoneId ?? null;
-    if (this.path) defaultPathNetwork.unregister(this.path.id);
+    // Owner only (plan-559 2b): a non-owner's edit must not drop the owner's path.
+    if (this.path && defaultPathNetwork.get(this.path.id) === this.path) defaultPathNetwork.unregister(this.path.id);
     // Invalidate the parse cache (pathFromNode memoizes on userData).
     delete (this.node.userData as Record<string, unknown>)['_rvPath'];
     this.path = pathFromNode(this.node);
@@ -610,17 +744,17 @@ export class RVPathComponent implements RVComponent {
       if (prevId !== null) defaultPathNetwork.notifyPathChanged(prevId);
       return;
     }
+    checkPathIdCollision(this.path, this.node);
     defaultPathNetwork.register(this.path);
-    // The path LEFT its previous zone → withdraw only its capacity DECLARATION
-    // (back to "undeclared"), never the holders: another path may still share
-    // the zone, and the Agv claim walk re-declares the effective capacity on
-    // its next pass. `undefine` here would again free live claims.
-    if (prevZone && prevZone !== this.path.zoneId) {
-      defaultZoneRegistry.redefine(prevZone);
+    const prev = this.declared ? { zoneId: this.declared.zoneId, declarant: this.declared.path } : null;
+    const zoneId = this.path.zoneId;
+    if (prev || zoneId) {
+      defaultZoneRegistry.replaceDeclaration(
+        prev,
+        zoneId ? { zoneId, declarant: this.path, capacity: this.path.zoneCapacity ?? undefined } : null,
+      );
     }
-    if (this.path.zoneId) {
-      defaultZoneRegistry.redefine(this.path.zoneId, this.path.zoneCapacity ?? undefined);
-    }
+    this.declared = zoneId ? { zoneId, path: this.path } : null;
     // An id rename affects BOTH ids: the old one vanished, the new one appeared.
     if (prevId !== null && prevId !== this.path.id) {
       defaultPathNetwork.notifyPathChanged(prevId);

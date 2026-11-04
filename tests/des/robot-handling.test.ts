@@ -1,18 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { testAddressRegistry } from '../helpers/test-address-registry';
+
+import { componentState, reservations } from './snapshot-test-utils';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { Object3D } from 'three';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
-import { MaterialFlowAdapter } from '@rv-private/plugins/des/material-flow-adapter';
-import { RobotHandling } from '@rv-private/plugins/des/material-flow/RobotHandling';
-import { PalletSource } from '@rv-private/plugins/des/material-flow/PalletSource';
-import { IndexingConveyor } from '@rv-private/plugins/des/material-flow/IndexingConveyor';
-import { _resetDesHookCache } from '@rv-private/plugins/des/des-hook-adapter';
+import { DESRunner } from '@rv/plugins/des/des-runner';
+import { MaterialFlowAdapter } from '@rv/plugins/des/material-flow-adapter';
+import { RobotHandling } from '@rv/plugins/des/material-flow/RobotHandling';
+import { PalletSource } from '@rv/plugins/des/material-flow/PalletSource';
+import { IndexingConveyor } from '@rv/plugins/des/material-flow/IndexingConveyor';
+import { _resetDesHookCache } from '@rv/plugins/des/des-hook-adapter';
 import {
   loadMUOnCarrier,
-} from '@rv-private/plugins/des/rv-des-component';
-import { resetDESMUCounter, type DESMU } from '@rv-private/plugins/des/rv-des-mu';
+} from '@rv/plugins/des/rv-des-component';
+import { resetDESMUCounter, type DESMU } from '@rv/plugins/des/rv-des-mu';
 import {
   createSelf,
   type MaterialFlowSelf,
@@ -62,7 +65,7 @@ function testHost(): BindContextHost {
     on: (event, callback) => events.on(event, callback as never),
     contextMenu: new ContextMenuStore(),
     drives: [] as never,
-    registry: null,
+    registry: null, desAddresses: testAddressRegistry(),
     getPlugin: () => undefined,
   };
 }
@@ -107,7 +110,7 @@ function bind(
     })(),
   });
   Object.assign(self.prop, config);
-  adapter = runner.addInstance(def, self, node);
+  adapter = runner.addInstance(def, self, node, undefined, { desId: node.name + '@' + def.type });
   return { def, self, adapter, node };
 }
 
@@ -238,7 +241,7 @@ describe('RobotHandling', () => {
     expect(cycle(a.self)).toMatchObject({ n: 2 });
     expect(cycle(b.self)).toMatchObject({ n: 1 });
     expect(runner.getManager().activeReservationCount).toBe(2);
-    const reservedSlots = (runner.fullSnapshot().reservations ?? [])
+    const reservedSlots = (reservations(runner.fullSnapshot()) ?? [])
       .reduce((sum, reservation) => sum + (reservation.carrier?.slots ?? 0), 0);
     expect(reservedSlots).toBe(3);
 
@@ -305,7 +308,7 @@ describe('RobotHandling', () => {
     expect(blocked.adapter.acceptMU(retained)).toBe(true);
     expect(blocked.self.state).toBe('Blocked');
     expect(blocked.adapter.heldMUs).toContain(retained);
-    expect(blockedRunner.fullSnapshot().components.RobotBlocked.currentStateName).toBe('Blocked');
+    expect(componentState(blockedRunner.fullSnapshot(), 'RobotBlocked').currentStateName).toBe('Blocked');
   });
 
   it('cycle time = timePerCycle + n * timePerPick; partial batch after maxWaitTime', () => {
@@ -423,12 +426,12 @@ describe('RobotHandling', () => {
 
     const expectedCycle = structuredClone(robot.self.prop.cycle);
     const snapshot = JSON.parse(runner.snapshotJson());
-    expect(snapshot.reservations).toHaveLength(1);
+    expect(reservations(snapshot)).toHaveLength(1);
     runner.tick(1);
     runner.restoreFull(snapshot);
     expect(robot.self.prop.cycle).toEqual(expectedCycle);
     expect(runner.getManager().activeReservationCount).toBe(1);
-    expect(runner.fullSnapshot().reservations).toEqual(snapshot.reservations);
+    expect(reservations(runner.fullSnapshot())).toEqual(reservations(snapshot));
     expect(robot.self.sig.Busy.get()).toBe(true);
 
     robot.adapter.setFailure(true);

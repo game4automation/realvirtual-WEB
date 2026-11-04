@@ -68,7 +68,7 @@ function buildComposedAsset(): { root: Group; referenceNode: Object3D } {
     sha256: 'deadbeef',
   });
   setAssetOverrides(referenceNode, {
-    byNodeId: { 'n-finger': { Drive: { TargetSpeed: 250 } } },
+    byAddress: { '#n-finger': { Drive: { TargetSpeed: 250 } } },
   });
   root.add(referenceNode);
 
@@ -134,7 +134,7 @@ describe('exportAssetGlb preserves AssetReferences', () => {
 
     const overrides = getAssetOverrides(findByName(reloaded, 'GripperRef')!);
     expect(overrides).not.toBeNull();
-    expect(overrides!.byNodeId['n-finger']).toEqual({ Drive: { TargetSpeed: 250 } });
+    expect(overrides!.byAddress['#n-finger']).toEqual({ Drive: { TargetSpeed: 250 } });
   });
 
   it('keeps the reference node transform (it belongs to THIS file)', async () => {

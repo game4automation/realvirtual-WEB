@@ -57,11 +57,12 @@
 
 import type { RVViewer } from '../rv-viewer';
 import type { RvOp, RvAssetOp, RvSceneOp } from './rv-unified-ops';
+import type { RvPlacedReplaySkip, RvPlacedReplayTarget } from './rv-placed-replay';
 import { RV_OP_ORIGIN } from './rv-unified-ops';
 import { applyForward as applySceneForward, applyInverse as applySceneInverse } from '../hmi/scene/rv-scene-executors';
 // TYPE-ONLY on purpose — see `_ensureAsset`. A value import here would put the
 // whole asset-editor executor graph (mesh merge/separator, CAD provider, …) in
-// every chunk that reaches a scene document, i.e. the core bundle.
+// every chunk that reaches the planner's document, i.e. the core bundle.
 import type { AssetExecutorContext } from '../editor/rv-asset-executors';
 
 /** Which target an {@link RvDocument} writes to. */
@@ -82,6 +83,40 @@ export interface RvExecutor {
    * make the seam wider to express something they do not have.
    */
   setMode?(mode: RvDocumentMode): void;
+  /**
+   * Bracket a bulk replay (draft replay, recompose) — plan-766 §2.4.4.
+   *
+   * OPTIONAL for the same reason as {@link setMode}: only an executor with
+   * observers that would rather react ONCE after the replay than once per op
+   * (the editor arenas) has anything to do here. Nests; callers pair every
+   * `beginReplay` with exactly one `endReplay` (try/finally).
+   */
+  beginReplay?(): void;
+  /** Counterpart of {@link beginReplay}. */
+  endReplay?(): void;
+  /**
+   * Ops a coalesce folded away no longer exist in any history (plan-621):
+   * drop whatever the executor stashed for them — the intermediate material or
+   * geometry between two merged steps, which no undo or redo reaches again.
+   * OPTIONAL like the hooks above: a double without a stash ignores it.
+   */
+  releaseAbsorbed?(opIds: readonly string[]): void;
+  /**
+   * plan-774 F8 (OPTIONAL): asked by a REPLAY (draft replay, recompose) before
+   * it applies `op` — the first target path of `op` that lies inside PLACED
+   * content, whether that node is absent, and whether the innermost placed
+   * reference over it is materialised (review fix E4: missing + materialised =
+   * baked away, missing + not materialised = not loaded — `rv-placed-replay.ts`).
+   * A replay skips an op whose placed target is missing instead of letting it
+   * no-op silently. `null` = the op touches no placed content.
+   */
+  replayTargetInPlacedContent?(op: RvOp): RvPlacedReplayTarget | null;
+  /**
+   * plan-774 F8 (OPTIONAL): the ops of one replay that were skipped on placed
+   * content (`what` = the document's label) — the asset executor turns them into
+   * Problems `replay-op-skipped`. Called once per replay, only with skips.
+   */
+  reportReplaySkips?(skips: ReadonlyArray<RvPlacedReplaySkip>, what: string): void;
 }
 
 /** Where a single op is applied. */
@@ -208,6 +243,7 @@ export class RvUnifiedExecutor implements RvExecutor {
     if (this._asset === ctx) return;
     this._asset?.dispose();
     this._asset = ctx;
+    for (let i = 0; i < this._replayDepth; i++) ctx.beginReplay();
   }
 
   /**
@@ -243,7 +279,10 @@ export class RvUnifiedExecutor implements RvExecutor {
     if (!this._asset) {
       const { AssetExecutorContext: Ctor } = await import('../editor/rv-asset-executors');
       // Re-check: an await is a suspension point, and two ops can race here.
-      if (!this._asset) this._asset = new Ctor(this._viewer);
+      if (!this._asset) {
+        this._asset = new Ctor(this._viewer);
+        for (let i = 0; i < this._replayDepth; i++) this._asset.beginReplay();
+      }
     }
     return this._asset;
   }
@@ -288,6 +327,45 @@ export class RvUnifiedExecutor implements RvExecutor {
       return;
     }
     await applySceneInverse(op as RvSceneOp, { viewer: this._viewer });
+  }
+
+  /** Open replay brackets (plan-766) — handed on to an asset executor that appears mid-replay. */
+  private _replayDepth = 0;
+
+  /** Bulk replay starts — forwarded to the asset executor (plan-766 §2.4.4). */
+  beginReplay(): void {
+    this._replayDepth++;
+    this._asset?.beginReplay();
+  }
+
+  /** Counterpart of {@link beginReplay}. */
+  endReplay(): void {
+    if (this._replayDepth === 0) return;
+    this._replayDepth--;
+    this._asset?.endReplay();
+  }
+
+  /**
+   * Ops folded away by a coalesce (plan-621) — forwarded to the asset side, the
+   * only one that stashes per-op state. IMPLEMENTS RvExecutor::releaseAbsorbed
+   */
+  releaseAbsorbed(opIds: readonly string[]): void {
+    this._asset?.releaseAbsorbed(opIds);
+  }
+
+  /**
+   * plan-774 F8 — forwarded for ASSET ops only (the editor's placed content);
+   * a scene op keeps the scene executor's own handling.
+   * IMPLEMENTS RvExecutor::replayTargetInPlacedContent
+   */
+  replayTargetInPlacedContent(op: RvOp): RvPlacedReplayTarget | null {
+    if (!this._asset || resolveOpTarget(op, this.mode) !== 'asset') return null;
+    return this._asset.replayTargetInPlacedContent(op);
+  }
+
+  /** plan-774 F8 — forwarded. IMPLEMENTS RvExecutor::reportReplaySkips */
+  reportReplaySkips(skips: ReadonlyArray<RvPlacedReplaySkip>, what: string): void {
+    this._asset?.reportReplaySkips(skips, what);
   }
 
   /** Release the asset side's trash / payload maps (document close). */

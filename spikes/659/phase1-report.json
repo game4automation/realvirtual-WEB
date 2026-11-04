@@ -1,0 +1,124 @@
+{
+  "plan": 659,
+  "phase": 1,
+  "generatedAt": "2026-10-23T19:17:45.941Z",
+  "versions": {
+    "node": "v24.18.0",
+    "@mujoco/mujoco": "3.11.0",
+    "onnxruntime-node": "1.23.2",
+    "platform": "win32-x64"
+  },
+  "pythonBaseline": {
+    "walk_vx0.25_10s_baseline": {
+      "control_steps": 500,
+      "sim_time_s": 10,
+      "base_height_end_m": 0.11726057356217585,
+      "base_height_min_m": 0.11363830409400971,
+      "distance_xy_m": 1.0592225715298544,
+      "displacement_x_m": 1.0590556514451412,
+      "mean_speed_x_mps": 0.10590556514451413,
+      "finite": true
+    },
+    "walk_vx0.2_10s_no_gait": {
+      "control_steps": 500,
+      "sim_time_s": 10,
+      "base_height_end_m": 0.11473183156380895,
+      "base_height_min_m": 0.11441020068498653,
+      "distance_xy_m": 0.013621268524477169,
+      "displacement_x_m": 0.013126293452992578,
+      "mean_speed_x_mps": 0.0013126293452992578,
+      "finite": true
+    },
+    "walk_vx0.25_60s": {
+      "control_steps": 3000,
+      "sim_time_s": 60,
+      "base_height_end_m": 0.11989436630138535,
+      "base_height_min_m": 0.11363830409400971,
+      "distance_xy_m": 6.618845568245956,
+      "displacement_x_m": 6.612033797348853,
+      "mean_speed_x_mps": 0.11020056328914755,
+      "finite": true
+    },
+    "stand_cmd0_3s": {
+      "control_steps": 150,
+      "sim_time_s": 3,
+      "base_height_end_m": 0.11623005307187283,
+      "base_height_min_m": 0.11467314046731822,
+      "distance_xy_m": 0.002330527359502421,
+      "displacement_x_m": 0.0023282495437475298,
+      "mean_speed_x_mps": 0.0007760831812491766,
+      "finite": true
+    }
+  },
+  "runs": {
+    "physicsOnly10kSteps": {
+      "steps": 10000,
+      "simTimeS": 50,
+      "wallClockS": 0.6736373999999999,
+      "msPerStep": 0.06736373999999999,
+      "msPerSimSecond": 13.472748,
+      "realTimeFactor": 74.22390740181588
+    },
+    "walk10s": {
+      "controlSteps": 500,
+      "simTimeS": 10,
+      "baseHeightEndM": 0.11922192951446842,
+      "baseHeightMinM": 0.11366963162647634,
+      "distanceXyM": 1.0761472543988604,
+      "displacementXM": 1.04563016364028,
+      "meanSpeedXMps": 0.10456301636402801,
+      "fallen": false,
+      "fallAtSimTimeS": null,
+      "finite": true,
+      "wallClockS": 0.2334840999999999,
+      "physicsWallS": 0.1364405999999997,
+      "contactsAtEnd": 2,
+      "latencyMedianMs": 0.07529999999997017,
+      "latencyP95Ms": 0.14765000000002143,
+      "realTimeFactor": 42.829468901736796,
+      "pythonBaselineXM": 1.0590556514451412,
+      "ratioToPython": 0.9873231517281067
+    },
+    "walk60s": {
+      "controlSteps": 3000,
+      "simTimeS": 60,
+      "baseHeightEndM": 0.11867383803920062,
+      "baseHeightMinM": 0.11366963162647634,
+      "distanceXyM": 3.476454824013972,
+      "displacementXM": -0.7722452879939892,
+      "meanSpeedXMps": -0.01287075479989982,
+      "fallen": false,
+      "fallAtSimTimeS": null,
+      "finite": true,
+      "wallClockS": 1.2368843000000003,
+      "physicsWallS": 0.8376575999999913,
+      "contactsAtEnd": 2,
+      "latencyMedianMs": 0.05960000000004584,
+      "latencyP95Ms": 0.1368999999999687,
+      "realTimeFactor": 48.50898341906352,
+      "secondsPerSimSecond": 0.020614738333333337,
+      "physicsShare": 0.677231977154202,
+      "pythonBaselineXM": 6.612033797348853,
+      "ratioToPython": -0.11679391117202502,
+      "droppedSimTimeS": 0,
+      "droppedSimTimeNote": "structurally 0 in the synchronous headless mode: no render loop, no cap (N2)"
+    }
+  },
+  "determinism": {
+    "twoIdenticalRunsBitEqualQpos": true,
+    "twoIdenticalRunsBitEqualActions": true,
+    "maxQposDeltaAfter500Steps": 0,
+    "note": "test 9.9 may compare qpos exactly inside the WASM chain",
+    "maxQposDeltaVsPython": 0.27326495205642165,
+    "bitEqualVsPython": false
+  },
+  "contacts": {
+    "nconReadable": true,
+    "contactListReadable": true,
+    "minNcon": 0,
+    "maxNcon": 8,
+    "meanNcon": 2.715,
+    "sampleContactDist": -0.0004045239580084334,
+    "note": "Microduck comment \"the WASM bindings expose no contact array\" does NOT hold for @mujoco/mujoco 3.11.0: data.ncon and data.contact (copy, MjContactVec) are both readable. Phase 4 can count contacts directly instead of using a height heuristic."
+  }
+}

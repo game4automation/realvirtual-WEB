@@ -18,6 +18,7 @@
  * | `Sensor`         | beam from the `Ray` child or own source bounds   | init `autoConfigureRay` |
  * | `MachiningVolume`| `Shape: 'Mesh'` → keep its own stock geometry    | init voxelize      |
  * | `RibbonPath`     | marks the `Material` DONOR node `keep`           | init donor read    |
+ * | `TransportSurface` | roller-mantle speed groups + figures (plan-675) | —                  |
  *
  * THE RULE (R2b): extras in, extras-or-tree out. No hook here resolves another
  * component, reads a signal, touches the viewer, or keeps a reference to
@@ -35,12 +36,19 @@ import {
   RV_BAKE_ROLE_KEY,
   type PreBakeContext,
 } from './rv-component-registry';
+import { storedReferenceLabel, storedReferenceValue } from './rv-node-path-rewrite.mjs';
 import { NodeRegistry } from './rv-node-registry';
 import { registerPartitionExtras, RV_PARTITION_KEY } from './rv-bake-chunk';
-import { computeBeamFromBounds, findRayChild } from './rv-sensor';
+import { computeBeamFromBounds, computeSensorLocalBox, findRayChild } from './rv-sensor';
+import { prepareRollerSpin } from './rv-roller-spin';
+// The TransportSurface capability registration must exist before its hook is
+// attached (`registerCapabilities()` would rebuild the type and drop it) —
+// the same reason the Sensor hook's module is imported above.
+import './rv-transport-surface';
 import {
   RV_DRIVE_HOME_KEY,
   RV_SENSOR_BEAM_KEY,
+  RV_SENSOR_BOX_KEY,
   type DriveHomePose,
   type PreBakedSensorBeam,
 } from './rv-pre-bake-keys';
@@ -233,10 +241,14 @@ function onPreBakeKinematic(_node: Object3D, _extras: Record<string, unknown>, c
   // Pass 2 — KinematicParentEnable: the axis node itself moves under `Parent`.
   for (const { node: kinNode, data } of kinematicNodes) {
     if (data['KinematicParentEnable'] !== true) continue;
-    const parentRef = data['Parent'] as { path?: string } | string | undefined;
-    const parentPath = typeof parentRef === 'string' ? parentRef : parentRef?.path;
-    if (!parentPath) continue;
-    const parentNode = ctx.resolvePath(parentPath);
+    // plan-769 Phase 1b / 3: `Parent` is a stored path field — the file's verdict
+    // (by id, independent of pass 1's moves), never a guessing stage; a path, a
+    // `{ path }` record, or (web-saved) an `{ address }` / `{ unresolvedPath }`.
+    const parentValue = storedReferenceValue(data['Parent']);
+    if (parentValue === null) continue;
+    const parentNode = ctx.resolveStored
+      ? ctx.resolveStored(parentValue)
+      : (typeof parentValue === 'string' ? ctx.resolvePath(parentValue) : null);
     if (!parentNode || parentNode === kinNode || isAncestorOf(kinNode, parentNode)) continue;
     const previousPath = NodeRegistry.computeNodePath(kinNode);
     parentNode.attach(kinNode);
@@ -273,9 +285,15 @@ function isAncestorOf(maybeAncestor: Object3D, node: Object3D): boolean {
 function onPreBakeSensor(node: Object3D, extras: Record<string, unknown>): void {
   const cfg = extras['Sensor'] as Record<string, unknown> | undefined;
   if (!cfg) return;
+  if (node.userData?.realvirtual?.BoxCollider || hasBoxCollider(extras)) return;
+  // plan-655 B1: a COLLISION sensor's box comes from its own meshes — which the
+  // bake merges into a chunk, leaving the loader's `AABB.fromNode` an empty box
+  // at the node origin (the SolidCraft sensor beam never became occupied). The
+  // node-local box is stamped here while the meshes are still there.
+  const box = computeSensorLocalBox(node);
+  if (box) node.userData[RV_SENSOR_BOX_KEY] = box;
   // Same gate as `RVSensor.init()`: only convention sensors auto-configure.
   if (cfg['AutoRay'] === false) return;
-  if (node.userData?.realvirtual?.BoxCollider || hasBoxCollider(extras)) return;
   const beam = computeBeamFromBounds(node, findRayChild(node));
   if (!beam) return;
   const stored: PreBakedSensorBeam = {
@@ -295,6 +313,22 @@ function hasBoxCollider(extras: Record<string, unknown>): boolean {
     if (t === 'BoxCollider') return true;
   }
   return false;
+}
+
+// ─── TransportSurface — animated roller mantle (plan-675) ────────────
+
+/**
+ * plan-675 Phase 3 (SOL R2-1/R2-3): measure the rollers that wear an animated
+ * mantle, canonicalise their U, split them into speed groups (one material
+ * each — the dedup fingerprint keeps groups apart) and leave the per-group
+ * figures as plain data on THIS surface node. Tree in, tree + extras out; the
+ * binding happens at runtime (`rv-roller-spin.ts`).
+ */
+function onPreBakeTransportSurface(node: Object3D, extras: Record<string, unknown>, ctx: PreBakeContext): void {
+  const key = Object.keys(extras).find((k) => k === 'TransportSurface' || /^TransportSurface_\d+$/.test(k));
+  const cfg = key ? extras[key] as Record<string, unknown> | undefined : undefined;
+  if (!cfg) return;
+  prepareRollerSpin(ctx.root, node, cfg);
 }
 
 // ─── MachiningVolume / RibbonPath — the authored-override route ──────
@@ -317,11 +351,14 @@ function onPreBakeMachiningVolume(node: Object3D, extras: Record<string, unknown
 function onPreBakeRibbonPath(node: Object3D, extras: Record<string, unknown>, ctx: PreBakeContext): void {
   const cfg = extras['RibbonPath'] as Record<string, unknown> | undefined;
   if (!cfg) return;
-  const ref = cfg['Material'] as { path?: string } | string | null | undefined;
-  const path = typeof ref === 'string' ? ref : ref?.path;
+  // Any stored form (plan-769 Phase 3): a path, a ComponentReference, an address.
+  const stored = storedReferenceValue(cfg['Material']);
   const materialName = typeof cfg['MaterialName'] === 'string' ? (cfg['MaterialName'] as string) : '';
-  if (!path) return;
-  const donor = ctx.resolvePath(path);
+  if (stored === null) return;
+  // A stored reference (plan-769 Phase 1b): the file's verdict first.
+  const donor = ctx.resolveStored
+    ? ctx.resolveStored(stored)
+    : (typeof stored === 'string' ? ctx.resolvePath(stored) : null);
   if (!donor) return;
 
   const mesh = donor as { isMesh?: boolean; material?: unknown };
@@ -332,7 +369,7 @@ function onPreBakeRibbonPath(node: Object3D, extras: Record<string, unknown>, ct
   // consumer can find it without walking the graph. Under the AUTHORED name
   // too when there is one — that is the key the runtime asks for (plan-496).
   if (single) {
-    ctx.keepMaterial(path, single);
+    ctx.keepMaterial(storedReferenceLabel(cfg['Material']) ?? '', single);
     if (materialName) ctx.keepMaterial(materialName, single);
   }
 
@@ -394,6 +431,7 @@ export function registerBuiltInPreBakeHooks(): void {
   registerPreBakeHook('Sensor', onPreBakeSensor);
   registerPreBakeHook('MachiningVolume', onPreBakeMachiningVolume);
   registerPreBakeHook('RibbonPath', onPreBakeRibbonPath);
+  registerPreBakeHook('TransportSurface', onPreBakeTransportSurface);
 }
 
 /** Re-install after `_resetCapabilitiesForTesting()` cleared the map (test-only). */

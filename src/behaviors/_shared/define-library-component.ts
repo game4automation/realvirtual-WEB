@@ -35,6 +35,7 @@ import {
   type MaterialFlowDefinition,
   type RequiresKind,
 } from '../../core/material-flow/define-material-flow';
+import { trafficOwnedOf } from '../../core/material-flow/simulation-executor';
 import {
   createSelf,
   type MaterialFlowSelf,
@@ -64,6 +65,10 @@ const STANDARD_BADGE: ComponentCapabilities = {
     filter: 'Behavior',
     category: 'logic',
     hidden: true,
+    // plan-2030 F1: the node carries `<Type>Behavior`, not the bare material-flow type,
+    // so the hover tooltip must be declared on the marker key too. The resolver answers
+    // null outside DES mode / without a runner.
+    tooltip: 'des-component',
   },
 };
 
@@ -129,7 +134,9 @@ export function defineLibraryComponent<
   //    one source of truth for the inspector (F2). Guarded so a re-register
   //    (HMR / a second module evaluation) does not emit the DEV double-warn.
   const markerType = `${def.type}Behavior`;
-  const caps = opts.capabilities ?? STANDARD_BADGE;
+  const caps: ComponentCapabilities = opts.capabilities
+    ? (opts.capabilities.ui?.tooltip ? opts.capabilities : { ...opts.capabilities, ui: { ...opts.capabilities.ui, tooltip: 'des-component' } })
+    : STANDARD_BADGE;
   if (!_registeredMarkers.has(markerType)) {
     registerComponentSchema(markerType, def.schema, caps);
     _registeredMarkers.add(markerType);
@@ -230,20 +237,41 @@ export function defineLibraryComponent<
       // relay is then authoritative. Kept in the component (transparent), not here.
       const fixed = c.fixedUpdate;
       const late = c.lateFixedUpdate;
+      // plan-648 §2.3 / G5: a definition that owns traffic ids (Agv) is MUTED
+      // while its continuous instance is not of the active traffic kernel (DES
+      // runs): fixedUpdate / lateFixedUpdate / reset / start / resetStat do not
+      // run. Teardown always runs (its release is owner-checked). Every other
+      // definition is wired exactly as before.
+      const traffic = trafficOwnedOf(def as MaterialFlowDefinition);
+      const trafficSelf = self as unknown as MaterialFlowSelf;
       if (!opts.inert && (fixed || late)) {
-        rv.onFixedUpdate((dt: number) => {
-          if (fixed) fixed(self, dt);
-          if (late) late(self, dt);
-        });
+        if (traffic) {
+          rv.onFixedUpdate((dt: number) => {
+            if (traffic.trafficMuted(trafficSelf)) return;
+            if (fixed) fixed(self, dt);
+            if (late) late(self, dt);
+          });
+        } else {
+          rv.onFixedUpdate((dt: number) => {
+            if (fixed) fixed(self, dt);
+            if (late) late(self, dt);
+          });
+        }
       }
 
       // Reset lifecycle: restore internal state to the start (reset), (re)start
       // from the clean state (start), and clear stat accumulators (resetStat) —
       // each wired to the matching viewer event. Authors opt in per block. Live
       // instance only (we are past the disable checks).
-      if (def.reset) rv.onReset(() => def.reset!(self));
-      if (def.start) rv.onStart(() => def.start!(self));
-      if (def.resetStat) rv.onResetStat(() => def.resetStat!(self));
+      if (traffic) {
+        if (def.reset) rv.onReset(() => { if (!traffic.trafficMuted(trafficSelf)) def.reset!(self); });
+        if (def.start) rv.onStart(() => { if (!traffic.trafficMuted(trafficSelf)) def.start!(self); });
+        if (def.resetStat) rv.onResetStat(() => { if (!traffic.trafficMuted(trafficSelf)) def.resetStat!(self); });
+      } else {
+        if (def.reset) rv.onReset(() => def.reset!(self));
+        if (def.start) rv.onStart(() => def.start!(self));
+        if (def.resetStat) rv.onResetStat(() => def.resetStat!(self));
+      }
 
       if (c.teardown || (mgr && statsPath)) {
         rv.onDispose(() => {

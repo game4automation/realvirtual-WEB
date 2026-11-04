@@ -118,6 +118,16 @@ describe('plan-506 §9.2 — writeDocumentInfo', () => {
     expect(meta.extrasScan).toBe(2);
   });
 
+  it('can keep an imported blob path-addressed without dropping revision protection', async () => {
+    const b = fakeBackend();
+    const result = await writeDocumentInfo(b, doc, { v: 1, summary: 'Imported part' },
+      { addressByPath: true, now: NOW, updatedBy: null });
+    expect(b.lastRef).toBe(doc.path);
+    expect(b.lastOpts?.expectedRevision).toBe(revision);
+    const read = await sceneExtrasOfGlbBlob(new Blob([b.written! as BlobPart]));
+    expect(read?.documentInfo).toEqual(result.documentInfo);
+  });
+
   it('an empty block is a removal, and the neighbour block survives', async () => {
     const b1 = fakeBackend();
     await writeDocumentClassification(b1, doc, { v: 1, level: 'plant' });

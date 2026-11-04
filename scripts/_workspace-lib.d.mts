@@ -1,5 +1,5 @@
 export interface DeliveryProfile {
-  /** DISPLAY name ("Mauser 3D HMI") — never a key. */
+  /** DISPLAY name ("Acme 3D HMI") — never a key. */
   project?: string;
   /** Repository-level slug; defaults to the config file name. */
   customer?: string;
@@ -72,6 +72,43 @@ export interface ProjectReplacePreview {
 export interface TierManifest { defaults: string; rules: Array<Record<string, any>>; registrations: Record<string, any>; path: string }
 export function loadTierManifest(path: string): TierManifest;
 export function resolveTier(manifest: TierManifest, path: string): { tier: string; feature?: string | null };
+/** Tier of one manifest registration, resolved from its adapter file. */
+export function featureTier(manifest: TierManifest, feature: string): string;
+/** plan-679 Phase 3: the delivery tiers of a customer workspace. */
+export const DELIVERY_TIERS: readonly string[];
+/** plan-679 Phase 3: the private package.json as a customer workspace receives it (pruned). */
+export function prunedPrivateManifest<T extends Record<string, any>>(manifest: T): T;
+/** One row of the public feature catalog `features.catalog.json` (plan-646 §2.3). */
+export interface FeatureCatalogRow {
+  id: string;
+  label: string;
+  group: 'visualize' | 'simulate' | 'build' | 'connect' | 'interfaces' | 'integrate';
+  summary: string;
+  edition?: 'community';
+  status?: 'beta';
+  ids?: string[];
+  docs?: string;
+  demo?: { doc: string; mode?: string };
+  public?: boolean;
+  /** Fixed column texts (e.g. the CONNECT interfaces); such a row carries no edition, ids, status or demo. */
+  cells?: FeatureCatalogCells;
+}
+/** The three column texts of a `cells` row, each a non-empty string. */
+export interface FeatureCatalogCells { community: string; commercial: string; demo: string }
+export interface FeatureCatalog {
+  version: 1;
+  editions: { community: string; commercial: string; demo: string };
+  groups: Array<{ id: FeatureCatalogRow['group']; label: string; note?: string }>;
+  rows: FeatureCatalogRow[];
+}
+export const FEATURE_CATALOG_FILE: string;
+/** Generated build inputs the staging copies as-is when present (plan-646 F3b). */
+export const CORE_GENERATED_FILES: string[];
+export function loadFeatureCatalog(catalogPath?: string): FeatureCatalog;
+export function validateFeatureCatalog(catalog: unknown): FeatureCatalog;
+export function coreCapabilities(catalog?: FeatureCatalog): string[];
+export function coreCapabilityProse(catalog?: FeatureCatalog): string;
+export function catalogLabelsByRegistration(catalog?: FeatureCatalog): Map<string, string>;
 export function loadDeliveryConfig(privateRoot: string, projectKey: string, manifest?: TierManifest): DeliveryProfile;
 export function loadDeliveryConfigByCustomer(privateRoot: string, customer: string, manifest?: TierManifest): DeliveryProfile;
 export function listDeliveryConfigs(privateRoot: string, manifest?: TierManifest): DeliveryProfile[];
@@ -121,6 +158,7 @@ export function assertLfsPointer(repoRoot: string): void;
 export function assertNoUnfetchedLfsObjects(privateRoot: string, key: string, files: Iterable<string>): void;
 /** Fails when `projects/<key>` carries any change or untracked, unignored file. */
 export function assertProjectTreeClean(privateRoot: string, key: string): void;
+export function libraryGitGuard(privateRoot: string): (folder: string) => void;
 export function assertNoSentinelInArtifacts(distRoot: string, sentinels: string[]): void;
 export function gitProvenance(repoRoot: string, options?: { requireTag?: boolean }): { commit: string; tags: string[] };
 export function hashTree(root: string, excludes?: string[]): string;
@@ -196,18 +234,42 @@ export interface PrivateSourceDiff {
   reason: string | null;
   added: string[];
   removed: string[];
+  /** plan-679: approved paths that no longer arrive as new (only with `approved`). */
+  approvedUnused?: string[];
 }
 export function inventoryDigest(paths: readonly string[]): string;
+/** plan-679 Phase 4: the baseline tag from the existing delivery tags and the HEAD manifest's name. */
+export function selectBaselineTag(tags: readonly string[], namedTag: string | null | undefined): string | null;
+/** plan-679 Phase 4: the baseline inventory of a remote, via a bare blob-filtered clone (read-only). */
+export function readRemoteBaselineInventory(remote: string, options?: { tmpBase?: string; timeoutMs?: number }): {
+  remoteEmpty: boolean;
+  untagged: boolean;
+  baselineTag: string | null;
+  inventory: BaselineSourceInventory | null;
+  damage: string | null;
+};
 export function collectPrivateSourceInventory(workspaceRoot: string): PrivateSourceInventory;
 export function parseBaselineSourceInventory(baseline: string | Record<string, any> | null | undefined): BaselineSourceInventory | null;
 export function diffPrivateSourceInventory(baseline: BaselineSourceInventory | null, current: PrivateSourceInventory): PrivateSourceDiff;
 export function assertPrivateSourceInventory(
   baseline: BaselineSourceInventory | null,
   current: PrivateSourceInventory,
-  options?: { acceptNew?: boolean },
+  options?: { acceptNew?: boolean; approved?: readonly string[] | null },
 ): PrivateSourceDiff;
 export function readBaselineSourceInventory(clone: string, baselineTag: string | null): BaselineSourceInventory | null;
 export function deliveryChangelog(coreRoot: string, previousCoreCommit: string | null, options?: { limit?: number }): string;
+/** plan-679 Phase 5/6: CHANGELOG.md sections, byte-preserving. */
+export function parseChangelogSections(text: string): {
+  preamble: string;
+  sections: Array<{ unreleased: boolean; version: string | null; date: string | null; heading: string; body: string }>;
+};
+export function stripInternalBlock(body: string): string;
+export function normalizeReleaseNotes(text: string): string;
+export function releaseNotesFromChangelog(text: string, fromVersion: string | null, toVersion: string): string;
+export function releaseNotesBetween(coreRoot: string, fromVersion: string | null, toVersion: string): string;
+export function versionOfBaselineTag(tag: string | null | undefined): string | null;
+/** `null` when `after` promotes `## Unreleased` into exactly the approved `version` section; else the reason. */
+export function changelogPromotionProblem(before: string, after: string, version: string, approvedText: string): string | null;
 
 /**
  * Options for {@link generatedSettings} (plan-721 F7).

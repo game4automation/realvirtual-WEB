@@ -7,17 +7,26 @@
  * On a big CAD model the scene graph holds tens of thousands of structural
  * Group nodes. Three.js walks ALL of them every frame in
  * `scene.updateMatrixWorld()` — measured as the dominant CPU cost (~2x the
- * render-loop time on the Mauser line, ~40 ms/frame), paid even when nothing
+ * render-loop time on the large CAD line, ~40 ms/frame), paid even when nothing
  * moves and again on every post-processing pass that re-renders the scene.
  *
  * This pass sets `matrixWorldAutoUpdate = false` AND `matrixAutoUpdate = false`
  * on every node that is provably static. Three.js (r185) has no recursion gate:
  * `updateMatrixWorld` visits every child and re-composes the LOCAL matrix of
  * every node with `matrixAutoUpdate`, whatever `matrixWorldAutoUpdate` says —
- * freezing only the world flag left ~23k static Mauser nodes composing a matrix
+ * freezing only the world flag left ~23k static nodes composing a matrix
  * per frame and per pass (profile 2026-09-17). Every thaw site
  * (`ensureMovableTransform`, placement materialize, scene-button bind, chain
  * clones, the editor's drive preview) re-enables both flags together.
+ *
+ * This pass is the LAST WORD on BOTH flags, in both directions (plan-673): a
+ * local mover gets `matrixAutoUpdate = true` FORCED on, everything else gets it
+ * forced off. Until plan-673 the pass could only tighten — a local mover was
+ * merely exempted — so a `false` written by an earlier pass survived, and a
+ * `FreeBody` obstacle whose `position` the MuJoCo mirror had advanced 506.0 mm
+ * drew at 0.0000 mm (live walker demo, 40.8 s). If you add a pass that writes
+ * `matrixAutoUpdate` AFTER this one, that claim stops being true and this
+ * comment has to change with it.
  * A node is kept DYNAMIC iff it,
  * one of its ancestors, or one of its descendants carries a component whose
  * bake role is `chunk` (a mover: Drive(*), Kinematic, Grip, SceneButtonMoveable,
@@ -112,7 +121,10 @@ export function isMoverNode(node: Object3D): boolean {
 /**
  * Freeze `matrixWorldAutoUpdate` on every provably-static node. Returns counts
  * for diagnostics. Pure with respect to the graph topology — only the
- * `matrixWorldAutoUpdate` flags change. See the file header for the contract.
+ * `matrixWorldAutoUpdate` and `matrixAutoUpdate` flags change, and this pass
+ * sets BOTH of them in both directions (see the file header: a local mover is
+ * forced dynamic, everything else forced static). Nothing is re-parented, no
+ * transform is written. See the file header for the contract.
  */
 export function freezeStaticMatrices(
   root: Object3D,
@@ -134,7 +146,7 @@ export function freezeStaticMatrices(
   // Nodes whose LOCAL transform is written at runtime: the movers themselves.
   // Their ancestors and descendants only need a live WORLD matrix — their
   // local matrix is as constant as a static node's, so they stop re-composing
-  // it (16k nodes under the Mauser's 169 drives, per frame AND per pass).
+  // it (16k nodes under the large CAD line's 169 drives, per frame AND per pass).
   const localMovers = new Set<Object3D>();
   const keepAlive = (node: Object3D, writesLocal = true): void => {
     if (writesLocal) localMovers.add(node);
@@ -160,7 +172,27 @@ export function freezeStaticMatrices(
   root.traverse((node) => {
     total++;
     if (dynamic.has(node)) {
-      if (!localMovers.has(node) && node !== root) node.matrixAutoUpdate = false;
+      if (localMovers.has(node)) {
+        // plan-673: FORCE the flag on, do not merely skip the freeze. A local
+        // mover's whole point is that something writes its `position` /
+        // `quaternion` at runtime, and with `matrixAutoUpdate = false` Three.js
+        // never re-composes the local matrix, so the write reaches neither
+        // `matrix` nor `matrixWorld` nor the drawn chunk. Exempting it here was
+        // not enough, because an EARLIER pass can already have turned the flag
+        // off: `processMeshes()` in rv-scene-loader.ts classifies a mesh static
+        // from a key list that does not know every pose-writing component, and
+        // `makeTemplateNode()` (rv-bake-pipeline.ts) copies that `false` into
+        // the baked template. Measured on the walker demo before this line: an
+        // obstacle `FreeBody` whose `position` had advanced 506.0 mm drew at
+        // 0.0000 mm; the identical write with the flag on drew the full
+        // 300.00 mm of the control. Forcing it here makes this pass the actual
+        // last word on `matrixAutoUpdate` instead of a one-way ratchet, so the
+        // NEXT component type missing from that key list is a performance
+        // regression at worst, not an invisible frozen body.
+        node.matrixAutoUpdate = true;
+      } else if (node !== root) {
+        node.matrixAutoUpdate = false;
+      }
       return;
     }
     // Local matrices are current (the forced update above composed them).

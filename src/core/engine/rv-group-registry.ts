@@ -23,6 +23,7 @@
 
 import type { Camera, Object3D } from 'three';
 import { MEASUREMENT_LAYER, NO_AO_LAYER } from './rv-constants';
+import { ArenaCaptureLatch, arenaSinkOf } from './rv-arena-sink';
 
 /** Three.js layer bit used to mark the currently isolated group's subtree. */
 export const ISOLATE_FOCUS_LAYER = 2;
@@ -87,6 +88,18 @@ export function disableOverlayLayers(camera: Camera): void {
 export function setOverlayLayersOnly(camera: Camera): void {
   camera.layers.set(OVERLAY_LAYERS[0]);
   for (let i = 1; i < OVERLAY_LAYERS.length; i++) camera.layers.enable(OVERLAY_LAYERS[i]);
+}
+
+/**
+ * The overlay layers as ONE camera layer mask (`setOverlayLayersOnly`'s
+ * result as a number) — for render paths that take a mask instead of a
+ * camera: the TSL post pipeline composites the overlays in-graph through a
+ * pass restricted to this mask (rv-post-processing-tsl.ts, OverlayPassNode).
+ */
+export function overlayLayerMask(): number {
+  let mask = 0;
+  for (const layer of OVERLAY_LAYERS) mask |= 1 << layer;
+  return mask;
 }
 
 /**
@@ -195,7 +208,10 @@ export class GroupRegistry {
     }
     if (group.nodes.includes(node)) return;
     group.nodes.push(node);
-    if (!group.visible) node.visible = false;
+    if (!group.visible) {
+      node.visible = false;
+      this._arenaBump(node);
+    }
   }
 
   /**
@@ -211,7 +227,10 @@ export class GroupRegistry {
     const idx = group.nodes.indexOf(node);
     if (idx === -1) return false;
     group.nodes.splice(idx, 1);
-    if (!group.visible) node.visible = true;
+    if (!group.visible) {
+      node.visible = true;
+      this._arenaBump(node);
+    }
     if (group.nodes.length === 0) {
       if (this._isolateActiveName === resolvedName) {
         this._clearIsolateState();
@@ -253,6 +272,7 @@ export class GroupRegistry {
     for (const node of group.nodes) {
       node.visible = visible;
     }
+    this._arenaBump(group.nodes[0]);
   }
 
   /**
@@ -284,6 +304,8 @@ export class GroupRegistry {
     this._dimOpacity = opts?.dimOpacity ?? null;
     // Raycast restriction is enforced centrally by RVViewer's isolation gate
     // — see RaycastManager.setIsolationGate().
+    this._arenaBump(targetGroup.nodes[0]);
+    this._syncArenaCapture();
   }
 
   /** Per-isolate dim opacity override (null = renderer default). */
@@ -311,10 +333,12 @@ export class GroupRegistry {
     for (const entry of this._priorVisibility) {
       entry.node.visible = entry.visible;
     }
+    this._arenaBump(this._priorVisibility[0]?.node);
     this._isolatedNodes = [];
     this._priorVisibility = [];
     this._isolateActiveName = null;
     this._dimOpacity = null;
+    this._syncArenaCapture();
   }
 
   /** External isolate override — true while a plugin owns ISOLATE_FOCUS_LAYER. */
@@ -338,6 +362,7 @@ export class GroupRegistry {
     this._externalIsolatedRoots = [];
     if (!roots || roots.length === 0) {
       this.externalIsolateActive = false;
+      this._syncArenaCapture();
       return;
     }
     this._externalIsolatedRoots = roots.slice();
@@ -345,6 +370,7 @@ export class GroupRegistry {
       tagIsolateSubtree(node);
     }
     this.externalIsolateActive = true;
+    this._syncArenaCapture();
   }
 
   /**
@@ -448,5 +474,36 @@ export class GroupRegistry {
     this._clearIsolateState();
     this._groups.clear();
     this._kinematicGroups.clear();
+    this._arenaLatch.release();
+  }
+
+  // ─── editor arenas (plan-766 F11 / §2.4.5) ─────────────────────────────
+  //
+  // Both are null checks unless the editor installed arenas for the scene the
+  // nodes live in (`arenaSinkOf`), so runtime behaviour is unchanged.
+
+  /** Capture held while an isolate (group or external) is active. */
+  private readonly _arenaLatch = new ArenaCaptureLatch();
+
+  /** A `.visible` was written without an op — arenas recompute next frame. */
+  private _arenaBump(node: Object3D | undefined): void {
+    arenaSinkOf(node)?.bumpVisibility();
+  }
+
+  /** Isolate tags layer bits on the SOURCES: arenas must step aside meanwhile. */
+  private _syncArenaCapture(): void {
+    const any = this._isolatedNodes[0] ?? this._externalIsolatedRoots[0];
+    this._arenaLatch.sync(arenaSinkOf(any), this.isIsolateActive);
+  }
+
+  /**
+   * Re-take the isolate capture from scratch — called by the editor right after
+   * it (re)installed its arenas (plan-766 Schritt 5). An isolate that was already
+   * active when the arenas were built held no capture on them (or one on a
+   * manager that has since been disposed and rebuilt).
+   */
+  resyncArenaCapture(): void {
+    this._arenaLatch.release();
+    this._syncArenaCapture();
   }
 }

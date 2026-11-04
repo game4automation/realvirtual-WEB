@@ -47,6 +47,7 @@ import { referenceTargetOf } from '../hmi/rv-reference-field';
 import { parseWebOperatorPanelConfig } from './rv-extras-validator';
 import { operatorPanelSignals } from '../hmi/operator-devices/operator-panel-model';
 import { isDuplicateSignalName } from './rv-signal-construction';
+import { isComponentReference, storedReferenceForm, storedReferenceLabel, storedReferenceValue } from './rv-node-path-rewrite.mjs';
 import { getPlcRuntime, subscribePlcSignalUsages, type PlcRuntime, type PlcSignalUsageAccess } from '../plc-control';
 
 // ─── Data model ──────────────────────────────────────────────────────────
@@ -135,12 +136,6 @@ const EMPTY: readonly SignalUsage[] = Object.freeze([]);
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
 
-interface RawRef { type?: unknown; path?: unknown; componentType?: unknown }
-
-function isComponentRef(v: unknown): v is { type: 'ComponentReference'; path: string; componentType?: string } {
-  return !!v && typeof v === 'object' && !Array.isArray(v)
-    && (v as RawRef).type === 'ComponentReference' && typeof (v as RawRef).path === 'string';
-}
 
 function leaf(path: string): string {
   const i = path.lastIndexOf('/');
@@ -204,12 +199,12 @@ export function collectComponentUsages(viewer: SignalUsageViewerLike, sink: Sign
       if (componentType === 'WebOperatorPanel' || componentType === 'PLCProgram') continue; // own collectors
       const kind: SignalUsageKind = componentType.startsWith('LogicStep_') ? 'logic-step' : 'component-field';
       for (const [field, value] of Object.entries(data as Record<string, unknown>)) {
-        if (isComponentRef(value)) {
+        if (isComponentReference(value)) {
           if (!isSignalReferenceField(componentType, field, value)) continue;
           addReferenceUsage(registry, store, node, path, componentType, field, value, kind, sink);
         } else if (Array.isArray(value)) {
           for (const item of value) {
-            if (!isComponentRef(item) || !isSignalReferenceField(componentType, field, item)) continue;
+            if (!isComponentReference(item) || !isSignalReferenceField(componentType, field, item)) continue;
             addReferenceUsage(registry, store, node, path, componentType, field, item, kind, sink);
           }
         } else if (typeof value === 'string' && value.length > 0 && isStringSignalField(componentType, field)) {
@@ -227,6 +222,24 @@ function usageLabel(kind: SignalUsageKind, nodePath: string, componentType: stri
   return { label: leaf(nodePath), detail: `${componentType}.${field}` };
 }
 
+/**
+ * The signal node one stored reference names: a path through the signal lookup
+ * (scope, registry, name in scope); an address-form reference (plan-769 Phase 3) by
+ * its file's verdict — its id, never a name match. A miss keeps the label as path.
+ */
+function signalReferenceHit(
+  registry: NodeRegistry,
+  node: Object3D,
+  ref: { path?: string; address?: string; unresolvedPath?: string },
+): { path: string; resolved: boolean; byName: boolean } {
+  const form = storedReferenceForm(ref);
+  if (!form) return { path: '', resolved: false, byName: false };
+  if (form.form === 'path') return registry.resolveSignalReference(form.path, node);
+  const r = registry.readStoredRef(node, storedReferenceValue(ref)!);
+  const at = r.status === 'resolved' ? registry.getPathForNode(r.node) : null;
+  return at ? { path: at, resolved: true, byName: false } : { path: storedReferenceLabel(ref) ?? '', resolved: false, byName: false };
+}
+
 function addReferenceUsage(
   registry: NodeRegistry,
   store: SignalStore | null,
@@ -234,15 +247,15 @@ function addReferenceUsage(
   nodePath: string,
   componentType: string,
   field: string,
-  ref: { path: string; componentType?: string },
+  ref: { path?: string; address?: string; unresolvedPath?: string; componentType?: string },
   kind: SignalUsageKind,
   sink: SignalUsageSink,
 ): void {
-  const hit = registry.resolveSignalReference(ref.path, node);
+  const hit = signalReferenceHit(registry, node, ref);
   let name = store ? (store.exactNameForPath(hit.path) ?? store.nameForPath(hit.path)) : undefined;
   // A process-image signal legitimately has no node — the store may still know the path.
   const resolved = hit.resolved || name !== undefined;
-  if (!name) name = leaf(ref.path);
+  if (!name) name = leaf(hit.path);
   if (!name) return;
   const { label, detail } = usageLabel(kind, nodePath, componentType, field);
   sink.add({

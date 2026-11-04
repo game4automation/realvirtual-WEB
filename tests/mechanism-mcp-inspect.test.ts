@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { executeValue } from './helpers/execute-value';
+import { queryValue } from './helpers/query-value';
+
 /**
  * plan-706 T1 / T1b / T2 — the READ half of the mechanism MCP surface, plus the
  * two things the write half must get right before anything else.
@@ -33,6 +36,7 @@ import { Scene, Group, Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { AssetDocument } from '../src/core/editor/rv-asset-document';
+import { McpCommandTools } from '../src/plugins/mcp-bridge/rv-mcp-command-tools';
 import { McpEditorTools } from '../src/plugins/mcp-bridge/rv-mcp-editor-tools';
 import { setActiveAssetContext } from '../src/core/editor/active-asset-store';
 import { __clearDraftStoresForTests } from '../src/core/ops/rv-document-drafts';
@@ -45,6 +49,7 @@ import {
   type MechanismUiBridge,
   type MechanismView,
 } from '../src/core/engine/rv-kinematic-registry';
+import { movedToolOf } from '../src/plugins/mcp-bridge/rv-mcp-moved-tools';
 import { allSchemas } from './helpers/mcp-schemas';
 import { commandRegistry } from '../src/core/hmi/rv-command-registry';
 import { ERR_EDITOR_UNAVAILABLE } from '../src/core/editor/rv-editor-guard-core';
@@ -57,6 +62,11 @@ const BOUND = new Set([
   'web_editor_mechanism_add_body', 'web_editor_mechanism_set_mass', 'web_editor_mechanism_set_limits',
   'web_editor_mechanism_statics', 'web_editor_mechanism_fix',
 ]);
+
+async function execute(command: string, args: Record<string, unknown>): Promise<string> {
+  const r = JSON.parse(await new McpCommandTools(() => env.viewer).webExecute(command, JSON.stringify(args)));
+  return JSON.stringify(r.value ?? r);
+}
 
 // ─── Bridge double ──────────────────────────────────────────────────────────
 
@@ -237,11 +247,11 @@ const parse = (json: string): Record<string, any> => JSON.parse(json) as Record<
 
 // ─── T1 — inspect ───────────────────────────────────────────────────────────
 
-describe('T1 — web_editor_mechanism_inspect passes the bridge views through', () => {
+describe.skipIf(!__RV_HAS_PRIVATE__)('T1 — mechanism.inspect passes the bridge views through', () => {
   beforeEach(() => { setMechanismUiBridge(new FakeBridge([mechanismView('Mech')])); });
 
   it('returns joints, links and findings in full', async () => {
-    const r = parse(await env.tools.webEditorMechanismInspect('', ''));
+    const r = parse(await queryValue(env.viewer, 'mechanism.inspect', { path: '', include: '' }));
     expect(r.error).toBeUndefined();
     expect(r.mechanisms).toHaveLength(1);
 
@@ -274,7 +284,7 @@ describe('T1 — web_editor_mechanism_inspect passes the bridge views through', 
   });
 
   it('include=findings drops joints and links from the answer', async () => {
-    const r = parse(await env.tools.webEditorMechanismInspect('', 'findings'));
+    const r = parse(await queryValue(env.viewer, 'mechanism.inspect', { path: '', include: 'findings' }));
     const m = r.mechanisms[0];
     expect(m.joints).toBeUndefined();
     expect(m.links).toBeUndefined();
@@ -287,7 +297,7 @@ describe('T1 — web_editor_mechanism_inspect passes the bridge views through', 
   // ── plan-472 — the centre of gravity ──────────────────────────────────────
 
   it('carries the cog block verbatim, including the counting half', async () => {
-    const r = parse(await env.tools.webEditorMechanismInspect('', ''));
+    const r = parse(await queryValue(env.viewer, 'mechanism.inspect', { path: '', include: '' }));
     const cog = r.mechanisms[0].cog;
     expect(cog).toBeDefined();
     expect(cog.cogWorldMm).toEqual([12.4, 630.1, -3.8]);
@@ -302,7 +312,7 @@ describe('T1 — web_editor_mechanism_inspect passes the bridge views through', 
   });
 
   it('survives include= narrowing — an agent saving context must not lose it silently', async () => {
-    const r = parse(await env.tools.webEditorMechanismInspect('', 'findings'));
+    const r = parse(await queryValue(env.viewer, 'mechanism.inspect', { path: '', include: 'findings' }));
     const m = r.mechanisms[0];
     expect(m.links).toBeUndefined();
     expect(m.cog.cogWorldMm).toEqual([12.4, 630.1, -3.8]);
@@ -310,7 +320,7 @@ describe('T1 — web_editor_mechanism_inspect passes the bridge views through', 
 
   it('a null cog serialises as null, never as an invented origin', async () => {
     setMechanismUiBridge(new FakeBridge([mechanismView('Mech', { cog: null })]));
-    const raw = await env.tools.webEditorMechanismInspect('', '');
+    const raw = await queryValue(env.viewer, 'mechanism.inspect', { path: '', include: '' });
     expect(raw).toContain('"cog":null');
     expect(parse(raw).mechanisms[0].cog).toBeNull();
   });
@@ -322,7 +332,7 @@ describe('T1 — web_editor_mechanism_inspect passes the bridge views through', 
         skippedLinks: [{ nodePath: 'Mech/Base', reason: 'no body' }],
       }),
     })]));
-    const cog = parse(await env.tools.webEditorMechanismInspect('', '')).mechanisms[0].cog;
+    const cog = parse(await queryValue(env.viewer, 'mechanism.inspect', { path: '', include: '' })).mechanisms[0].cog;
     expect(cog.cogWorldMm).toBeNull();
     expect(cog.contributingLinks).toBe(0);
     expect(cog.totalLinks).toBe(3);
@@ -335,19 +345,19 @@ describe('T1 — web_editor_mechanism_inspect passes the bridge views through', 
     // produces on the private side.
     const bridge = new FakeBridge([mechanismView('Mech')]);
     setMechanismUiBridge(bridge);
-    const before = parse(await env.tools.webEditorMechanismInspect('', '')).mechanisms[0].cog;
+    const before = parse(await queryValue(env.viewer, 'mechanism.inspect', { path: '', include: '' })).mechanisms[0].cog;
     expect(before.totalMassKg).toBeCloseTo(12.75, 6);
 
     bridge.setViews([mechanismView('Mech', {
       cog: cogView('Mech', { totalMassKg: 52.75, cogWorldMm: [12.4, 320.5, -3.8] }),
     })]);
-    const after = parse(await env.tools.webEditorMechanismInspect('', '')).mechanisms[0].cog;
+    const after = parse(await queryValue(env.viewer, 'mechanism.inspect', { path: '', include: '' })).mechanisms[0].cog;
     expect(after.totalMassKg).toBeCloseTo(52.75, 6);
     expect(after.cogWorldMm[1]).toBeCloseTo(320.5, 6);
   });
 
   it('an unknown path refuses and names the ones that exist', async () => {
-    const r = parse(await env.tools.webEditorMechanismInspect('Nope', ''));
+    const r = parse(await queryValue(env.viewer, 'mechanism.inspect', { path: 'Nope', include: '' }));
     expect(r.error).toContain('Nope');
     expect(r.availablePaths).toEqual(['Mech']);
   });
@@ -359,9 +369,7 @@ describe('T1b — _mechCommit rebuilds the RIGHT mechanism', () => {
   it('(a) ancestor hit: a joint under Mech rebuilds exactly Mech, once', async () => {
     const bridge = new FakeBridge([mechanismView('Mech')]);
     setMechanismUiBridge(bridge);
-    const r = parse(await env.tools.webEditorMechanismSetLimits(
-      'Mech/Arm/Joint1', 'KinematicJoint', true, -45, 45,
-    ));
+    const r = parse(await executeValue(env.viewer, 'mechanism.setLimits', { path: 'Mech/Arm/Joint1', componentType: 'KinematicJoint', useLimits: true, lower: -45, upper: 45 }));
     if (!__RV_HAS_PRIVATE__) {
       // A command view without its private implementation: refused up front.
       expect(r).toEqual({ error: ERR_EDITOR_UNAVAILABLE });
@@ -378,7 +386,7 @@ describe('T1b — _mechCommit rebuilds the RIGHT mechanism', () => {
     bridge.opCounter = () => env.doc.getSnapshot().opCount;
     setMechanismUiBridge(bridge);
     const before = env.doc.getSnapshot().opCount;
-    await env.tools.webEditorMechanismSetLimits('Mech/Arm/Joint1', 'KinematicJoint', true, -45, 45);
+    await executeValue(env.viewer, 'mechanism.setLimits', { path: 'Mech/Arm/Joint1', componentType: 'KinematicJoint', useLimits: true, lower: -45, upper: 45 });
     expect(bridge.opCountAtRebuild).toHaveLength(1);
     // Rebuilding a half-applied composite would hand the solver a joint whose
     // body is not assigned yet.
@@ -393,7 +401,7 @@ describe('T1b — _mechCommit rebuilds the RIGHT mechanism', () => {
     const view = mechanismView('Mech', { joints: [], links: [] });
     const bridge = new FakeBridge([view, mechanismView('Other')]);
     setMechanismUiBridge(bridge);
-    const r = parse(await env.tools.webEditorMechanismAddBody('Mech/Arm/FreshBody', 'aluminum'));
+    const r = parse(await executeValue(env.viewer, 'mechanism.addBody', { path: 'Mech/Arm/FreshBody', densityPreset: 'aluminum' }));
     expect(r.error).toBeUndefined();
     expect(bridge.rebuilt).toEqual(['Mech']);
   });
@@ -405,7 +413,7 @@ describe('T1b — _mechCommit rebuilds the RIGHT mechanism', () => {
       mechanismView('Other', { joints: [], links: [] }),
     ]);
     setMechanismUiBridge(bridge);
-    const r = parse(await env.tools.webEditorMechanismAddBody('Outside', 'steel'));
+    const r = parse(await executeValue(env.viewer, 'mechanism.addBody', { path: 'Outside', densityPreset: 'steel' }));
     expect(r.error).toBeUndefined();
     expect(bridge.rebuilt).toEqual(['Mech', 'Other']);
   });
@@ -417,7 +425,7 @@ describe('T1b — _mechCommit rebuilds the RIGHT mechanism', () => {
       mechanismView('Other', { joints: [], links: [] }),
     ]);
     setMechanismUiBridge(bridge);
-    await env.tools.webEditorMechanismAddBody('Outside', 'steel');
+    await executeValue(env.viewer, 'mechanism.addBody', { path: 'Outside', densityPreset: 'steel' });
     expect(bridge.rebuilt).toEqual(['Mech']);
   });
 
@@ -427,9 +435,7 @@ describe('T1b — _mechCommit rebuilds the RIGHT mechanism', () => {
     if (!__RV_HAS_PRIVATE__) return;
     const bridge = new FakeBridge([mechanismView('Mech')]);
     setMechanismUiBridge(bridge);
-    await env.tools.webEditorMechanismSetAnchor(
-      'Mech/Arm/Joint1', 'KinematicJoint', '{"x":1,"y":0,"z":0}', '',
-    );
+    await execute('mechanism.setAnchor', { path: 'Mech/Arm/Joint1', componentType: 'KinematicJoint', anchorAJson: '{"x":1,"y":0,"z":0}', anchorBJson: '' });
     // Before plan-706 this array was empty for every MCP write, and an anchor an
     // agent set only took effect when a human next touched the panel.
     expect(bridge.rebuilt).toEqual(['Mech']);
@@ -443,63 +449,55 @@ describe('T2 — without the private bundle every mechanism tool refuses', () =>
    * Derived from the SCHEMA ROSTER rather than hand-listed, so a 17th mechanism
    * tool cannot slip past this guarantee by simply not being written down here.
    */
-  const mechanismTools = allSchemas()
-    .map((s) => s.name)
-    .filter((n) => n.includes('mechanism'));
+  const mechanismTools = [...BOUND];
 
   // 16 -> 22 with plan-729 (Cartesian mechanism paths: add_target, path_create,
   // path_add_waypoint, path_remove_waypoint, path_move_waypoint, path_inspect).
   // 22 -> 26 with plan-501 (drive sizing: trajectory_import, _run, _inspect, _export).
-  it('the roster carries all 26 mechanism tools', () => {
-    expect(mechanismTools.length).toBe(26);
+  it('all 11 former mechanism bindings are commands, with no decorated mechanism tools', () => {
+    expect(mechanismTools.length).toBe(11);
+    expect(allSchemas().filter((s) => s.name.includes('mechanism'))).toEqual([]);
+    for (const name of mechanismTools) expect(movedToolOf(name)?.movedTo).toHaveLength(1);
   });
 
   it('each returns an error, names the alternative, and appends NO op', async () => {
     setMechanismUiBridge(null);
     const calls: Record<string, () => Promise<string>> = {
-      web_editor_mechanism_create: () => env.tools.webEditorMechanismCreate('Mech/Arm'),
-      web_editor_mechanism_add_joint: () => env.tools.webEditorMechanismAddJoint('Mech/Arm/Joint1', 'Revolute', 'Mech/Arm', '', '', '', ''),
-      web_editor_mechanism_set_anchor: () => env.tools.webEditorMechanismSetAnchor('Mech/Arm/Joint1', 'KinematicJoint', '{"x":1,"y":0,"z":0}', ''),
-      web_editor_mechanism_assign_drive: () => env.tools.webEditorMechanismAssignDrive('Mech/Arm/Joint1', 'KinematicJoint', ''),
-      web_editor_mechanism_validate: () => env.tools.webEditorMechanismValidate(''),
-      web_editor_mechanism_jog: () => env.tools.webEditorMechanismJog('Mech/Arm/Joint1', 10, ''),
-      web_editor_mechanism_inspect: () => env.tools.webEditorMechanismInspect('', ''),
-      web_editor_mechanism_snap_list: () => env.tools.webEditorMechanismSnapList(0.5, 0.5, 12),
-      web_editor_mechanism_set_anchor_snap: () => env.tools.webEditorMechanismSetAnchorSnap('Mech/Arm/Joint1', 'KinematicJoint', 'B', 'snap0', true, ''),
-      web_editor_mechanism_set_axis: () => env.tools.webEditorMechanismSetAxis('Mech/Arm/Joint1', 'KinematicJoint', '', '{"x":0,"y":0,"z":1}', '', false),
-      web_editor_mechanism_add_body: () => env.tools.webEditorMechanismAddBody('Mech/Arm/FreshBody', 'steel'),
-      web_editor_mechanism_set_mass: () => env.tools.webEditorMechanismSetMass('Mech/Arm/FreshBody', 'steel', 0, '', ''),
-      web_editor_mechanism_set_limits: () => env.tools.webEditorMechanismSetLimits('Mech/Arm/Joint1', 'KinematicJoint', true, -1, 1),
-      web_editor_mechanism_forces: () => env.tools.webEditorMechanismForces('Mech', '', false),
-      web_editor_mechanism_statics: () => env.tools.webEditorMechanismStatics('Mech'),
-      web_editor_mechanism_fix: () => env.tools.webEditorMechanismFix('Mech/Arm/Joint1', 'AnchorsApart'),
-      web_editor_mechanism_add_target: () => env.tools.webEditorMechanismAddTarget('Mech/Arm', 'Linear', 0, 0, ''),
-      web_editor_mechanism_path_create: () => env.tools.webEditorMechanismPathCreate('Mech/Arm', 'Mech', 'Mech/Arm', '', false, 0, 0),
-      web_editor_mechanism_path_add_waypoint: () => env.tools.webEditorMechanismPathAddWaypoint('Mech/Arm', 'Mech/Arm', 0),
-      web_editor_mechanism_path_remove_waypoint: () => env.tools.webEditorMechanismPathRemoveWaypoint('Mech/Arm', 0),
-      web_editor_mechanism_path_move_waypoint: () => env.tools.webEditorMechanismPathMoveWaypoint('Mech/Arm', 0, 1),
-      web_editor_mechanism_path_inspect: () => env.tools.webEditorMechanismPathInspect(''),
-      web_editor_mechanism_trajectory_import: () => env.tools.webEditorMechanismTrajectoryImport('Mech/Arm', 'time;X;Y;Z\n0;0;0;0\n0.002;0;0;0', '', 'Mech', 'Mech/Arm', ''),
-      web_editor_mechanism_trajectory_run: () => env.tools.webEditorMechanismTrajectoryRun('Mech/Arm'),
-      web_editor_mechanism_trajectory_inspect: () => env.tools.webEditorMechanismTrajectoryInspect('', 0),
-      web_editor_mechanism_trajectory_export: () => env.tools.webEditorMechanismTrajectoryExport('Mech/Arm'),
+      web_editor_mechanism_create: () => executeValue(env.viewer, 'mechanism.create', { path: 'Mech/Arm' }),
+      web_editor_mechanism_add_joint: () => executeValue(env.viewer, 'mechanism.addJoint', { path: 'Mech/Arm/Joint1', jointType: 'Revolute', bodyBPath: 'Mech/Arm', bodyAPath: '', anchorAJson: '', anchorBJson: '', axisAJson: '' }),
+      web_editor_mechanism_assign_drive: () => executeValue(env.viewer, 'mechanism.assignDrive', { path: 'Mech/Arm/Joint1', componentType: 'KinematicJoint', drivePath: '' }),
+      web_editor_mechanism_validate: () => queryValue(env.viewer, 'mechanism.validate', { path: '' }),
+      web_editor_mechanism_jog: () => executeValue(env.viewer, 'mechanism.jog', { path: 'Mech/Arm/Joint1', value: 10, componentType: '' }),
+      web_editor_mechanism_inspect: () => queryValue(env.viewer, 'mechanism.inspect', { path: '', include: '' }),
+      web_editor_mechanism_snap_list: () => queryValue(env.viewer, 'mechanism.snapList', { x: 0.5, y: 0.5, maxCandidates: 12 }),
+      web_editor_mechanism_set_anchor_snap: () => executeValue(env.viewer, 'mechanism.setAnchorSnap', { path: 'Mech/Arm/Joint1', componentType: 'KinematicJoint', side: 'B', candidateId: 'snap0', assignBody: true, pickJson: '' }),
+      web_editor_mechanism_set_axis: () => executeValue(env.viewer, 'mechanism.setAxis', { path: 'Mech/Arm/Joint1', componentType: 'KinematicJoint', candidateId: '', axisWorldJson: '{"x":0,"y":0,"z":1}', secondaryAxisWorldJson: '', snapToPrincipal: false }),
+      web_editor_mechanism_add_body: () => executeValue(env.viewer, 'mechanism.addBody', { path: 'Mech/Arm/FreshBody', densityPreset: 'steel' }),
+      web_editor_mechanism_set_mass: () => executeValue(env.viewer, 'mechanism.setMass', { path: 'Mech/Arm/FreshBody', densityPreset: 'steel', densityKgM3: 0, massKg: '', comJson: '' }),
+      web_editor_mechanism_set_limits: () => executeValue(env.viewer, 'mechanism.setLimits', { path: 'Mech/Arm/Joint1', componentType: 'KinematicJoint', useLimits: true, lower: -1, upper: 1 }),
+      web_editor_mechanism_forces: () => queryValue(env.viewer, 'mechanism.forces', { mechanismPath: 'Mech', channelId: '', series: false }),
+      web_editor_mechanism_statics: () => executeValue(env.viewer, 'mechanism.statics', { mechanismPath: 'Mech' }),
+      web_editor_mechanism_fix: () => executeValue(env.viewer, 'mechanism.fix', { path: 'Mech/Arm/Joint1', code: 'AnchorsApart' }),
+      web_editor_mechanism_path_inspect: () => queryValue(env.viewer, 'mechanism.pathInspect', { path: '' }),
+      web_editor_mechanism_trajectory_inspect: () => queryValue(env.viewer, 'mechanism.trajectoryInspect', { path: '', maxPoints: 0 }),
+      web_editor_mechanism_trajectory_export: () => queryValue(env.viewer, 'mechanism.trajectoryExport', { path: 'Mech/Arm' }),
     };
     // Every roster entry must be exercised — a tool missing from this map would
     // otherwise be "covered" by not being called.
-    expect(Object.keys(calls).sort()).toEqual([...mechanismTools].sort());
+    expect(Object.keys(calls).sort()).toEqual([...mechanismTools, 'web_editor_mechanism_inspect', 'web_editor_mechanism_forces', 'web_editor_mechanism_path_inspect', 'web_editor_mechanism_snap_list', 'web_editor_mechanism_trajectory_export', 'web_editor_mechanism_trajectory_inspect', 'web_editor_mechanism_validate'].sort());
 
     const opsBefore = env.doc.getSnapshot().opCount;
     for (const [name, call] of Object.entries(calls)) {
       const r = parse(await call());
       expect(r.error, `${name} must refuse without the bridge`).toBeTruthy();
-      if (!__RV_HAS_PRIVATE__ && BOUND.has(name)) {
+      if (!__RV_HAS_PRIVATE__ && (BOUND.has(name) || !mechanismTools.includes(name))) {
         // plan-504: a command view in the community build refuses at the
         // descriptor's capability — the edition text, never "Unknown command".
         expect(r.error, name).toBe(ERR_EDITOR_UNAVAILABLE);
         continue;
       }
       expect(String(r.error), `${name} must name the alternative`)
-        .toContain('web_editor_create_kinematic');
+        .toContain('editor.createKinematic');
     }
     expect(env.doc.getSnapshot().opCount, 'no mechanism tool may write without a solver')
       .toBe(opsBefore);
@@ -515,32 +513,31 @@ describe('plan-729 9.4 — mechanism path tools write one composite each and reb
     ((rv(path).MechanismPath?.Path ?? []) as { path: string }[]).map((e) => e.path);
 
   it('target → path → add / move / remove waypoint round-trip through the document', async () => {
+    if (!__RV_HAS_PRIVATE__) return;
     const bridge = new FakeBridge([mechanismView('Mech')]);
     setMechanismUiBridge(bridge);
 
-    let r = parse(await env.tools.webEditorMechanismAddTarget('Mech/Arm/FreshBody', 'PointToPoint', 0, 0.3, ''));
+    let r = parse(await execute('mechanism.targetCreate', { path: 'Mech/Arm/FreshBody', interpolation: 'PointToPoint', speedToTarget: 0, waitForSeconds: 0.3, mechanismPath: '' }));
     expect(r.ok).toBe(true);
     expect(rv('Mech/Arm/FreshBody').MechanismTarget).toMatchObject({
       InterpolationToTarget: 'PointToPoint', WaitForSeconds: 0.3,
     });
     expect(rv('Mech/Arm/FreshBody').MechanismTarget.SpeedToTarget).toBeUndefined();
 
-    r = parse(await env.tools.webEditorMechanismPathCreate(
-      'Mech/Arm', 'Mech', 'Mech/Arm/Joint1', 'Mech/Arm/FreshBody', true, 300, 0,
-    ));
+    r = parse(await execute('mechanism.pathCreate', { path: 'Mech/Arm', mechanismPath: 'Mech', targetLinkPath: 'Mech/Arm/Joint1', waypointPaths: 'Mech/Arm/FreshBody', loopPath: true, linearSpeed: 300, linearAcceleration: 0 }));
     expect(r.ok).toBe(true);
     expect(rv('Mech/Arm').MechanismPath).toMatchObject({ LoopPath: true, LinearSpeedToTarget: 300 });
     expect(list('Mech/Arm')).toEqual(['Mech/Arm/FreshBody']);
 
     const before = env.doc.getSnapshot().opCount;
-    r = parse(await env.tools.webEditorMechanismPathAddWaypoint('Mech/Arm', 'Mech/Arm/FreshBody', 0));
+    r = parse(await execute('mechanism.pathAddWaypoint', { path: 'Mech/Arm', waypointPath: 'Mech/Arm/FreshBody', index: 0 }));
     expect(r.waypoints).toEqual(['Mech/Arm/FreshBody', 'Mech/Arm/FreshBody']);
     // ONE op per list edit — one undo step.
     expect(env.doc.getSnapshot().opCount).toBe(before + 1);
 
-    r = parse(await env.tools.webEditorMechanismPathMoveWaypoint('Mech/Arm', 0, 1));
+    r = parse(await execute('mechanism.pathMoveWaypoint', { path: 'Mech/Arm', from: 0, to: 1 }));
     expect(r.ok).toBe(true);
-    r = parse(await env.tools.webEditorMechanismPathRemoveWaypoint('Mech/Arm', 1));
+    r = parse(await execute('mechanism.pathRemoveWaypoint', { path: 'Mech/Arm', index: 1 }));
     expect(r.removed).toBe('Mech/Arm/FreshBody');
     expect(list('Mech/Arm')).toEqual(['Mech/Arm/FreshBody']);
 
@@ -549,19 +546,20 @@ describe('plan-729 9.4 — mechanism path tools write one composite each and reb
   });
 
   it('refuses a waypoint that is not a MechanismTarget, and an out-of-range index', async () => {
+    if (!__RV_HAS_PRIVATE__) return;
     setMechanismUiBridge(new FakeBridge([mechanismView('Mech')]));
-    await env.tools.webEditorMechanismPathCreate('Mech/Arm', 'Mech', 'Mech/Arm/Joint1', '', false, 0, 0);
+    await execute('mechanism.pathCreate', { path: 'Mech/Arm', mechanismPath: 'Mech', targetLinkPath: 'Mech/Arm/Joint1', waypointPaths: '', loopPath: false, linearSpeed: 0, linearAcceleration: 0 });
     const before = env.doc.getSnapshot().opCount;
-    let r = parse(await env.tools.webEditorMechanismPathAddWaypoint('Mech/Arm', 'Mech/Arm/Joint1', 0));
-    expect(String(r.error)).toContain('web_editor_mechanism_add_target');
-    r = parse(await env.tools.webEditorMechanismPathRemoveWaypoint('Mech/Arm', 3));
+    let r = parse(await execute('mechanism.pathAddWaypoint', { path: 'Mech/Arm', waypointPath: 'Mech/Arm/Joint1', index: 0 }));
+    expect(String(r.error)).toContain('mechanism.targetCreate');
+    r = parse(await execute('mechanism.pathRemoveWaypoint', { path: 'Mech/Arm', index: 3 }));
     expect(r.error).toBeTruthy();
-    r = parse(await env.tools.webEditorMechanismPathCreate('Mech/Arm/Joint1', 'Outside', 'Mech/Arm', '', false, 0, 0));
+    r = parse(await execute('mechanism.pathCreate', { path: 'Mech/Arm/Joint1', mechanismPath: 'Outside', targetLinkPath: 'Mech/Arm', waypointPaths: '', loopPath: false, linearSpeed: 0, linearAcceleration: 0 }));
     expect(String(r.error)).toContain('not a KinematicMechanism');
     expect(env.doc.getSnapshot().opCount).toBe(before);
   });
 
-  it('path_inspect hands the bridge path views through, and reads [] from a bridge without listPaths', async () => {
+  it.skipIf(!__RV_HAS_PRIVATE__)('path_inspect hands the bridge path views through, and reads [] from a bridge without listPaths', async () => {
     const view = {
       nodePath: 'Mech/Arm', name: 'Arm', mechanismPath: 'Mech', targetLinkPath: 'Mech/Arm',
       loopPath: true, speedOverride: 1, linearSpeedToTarget: 500, linearAcceleration: 1000,
@@ -576,13 +574,13 @@ describe('plan-729 9.4 — mechanism path tools write one composite each and reb
     const withPaths = new FakeBridge([mechanismView('Mech')]) as FakeBridge & { listPaths(): typeof view[] };
     withPaths.listPaths = () => [view];
     setMechanismUiBridge(withPaths);
-    let r = parse(await env.tools.webEditorMechanismPathInspect(''));
+    let r = parse(await queryValue(env.viewer, 'mechanism.pathInspect', { path: '' }));
     expect(r.paths).toEqual([view]);
-    r = parse(await env.tools.webEditorMechanismPathInspect('Nope'));
+    r = parse(await queryValue(env.viewer, 'mechanism.pathInspect', { path: 'Nope' }));
     expect(r.availablePaths).toEqual(['Mech/Arm']);
 
     setMechanismUiBridge(new FakeBridge([mechanismView('Mech')]));
-    r = parse(await env.tools.webEditorMechanismPathInspect(''));
+    r = parse(await queryValue(env.viewer, 'mechanism.pathInspect', { path: '' }));
     expect(r.paths).toEqual([]);
   });
 });
@@ -590,15 +588,15 @@ describe('plan-729 9.4 — mechanism path tools write one composite each and reb
 // ─── plan-504 — the command views ────────────────────────────────────────────
 
 describe('plan-504 — mechanism tools are command views', () => {
-  it('cold start: loading the tool module registered all twelve descriptors (no setup registration)', () => {
+  it('cold start: loading the tool module registered all twenty-seven descriptors (no setup registration)', () => {
     // Nothing in this file registers commands: the import of McpEditorTools did.
     for (const id of MECHANISM_COMMAND_IDS) expect(commandRegistry.get(id), id).toBeDefined();
-    expect(MECHANISM_COMMAND_IDS).toHaveLength(12);
+    expect(MECHANISM_COMMAND_IDS).toHaveLength(27);
   });
 
   it('statics without a solvable snapshot answers the reason (no force recorder figures invented)', async () => {
     setMechanismUiBridge(new FakeBridge([mechanismView('Mech')]));
-    const r = parse(await env.tools.webEditorMechanismStatics('Mech'));
+    const r = parse(await executeValue(env.viewer, 'mechanism.statics', { mechanismPath: 'Mech' }));
     if (!__RV_HAS_PRIVATE__) {
       expect(r).toEqual({ error: ERR_EDITOR_UNAVAILABLE });
       return;
@@ -611,7 +609,7 @@ describe('plan-504 — mechanism tools are command views', () => {
     const bridge = new FakeBridge([mechanismView('Mech')]);
     setMechanismUiBridge(bridge);
     const opsBefore = env.doc.getSnapshot().opCount;
-    const r = parse(await env.tools.webEditorMechanismAddBody('Mech/Arm/FreshBody', 'unobtainium'));
+    const r = parse(await executeValue(env.viewer, 'mechanism.addBody', { path: 'Mech/Arm/FreshBody', densityPreset: 'unobtainium' }));
     if (!__RV_HAS_PRIVATE__) {
       expect(r).toEqual({ error: ERR_EDITOR_UNAVAILABLE });
       return;

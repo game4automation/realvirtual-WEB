@@ -2,7 +2,8 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -19,8 +20,10 @@ import {
   createDeliveryManifest,
   deliveryChangelog,
   detectDeliveryBaseline,
+  diffPrivateSourceInventory,
   formatSnapshotSummary,
   gitProvenance,
+  hashTree,
   loadDeliveryConfig,
   loadDeliveryConfigByCustomer,
   loadTierManifest,
@@ -28,13 +31,18 @@ import {
   readBaselineSourceInventory,
   readCloneDeliveryManifest,
   readPlasticChangeset,
+  readRemoteBaselineInventory,
+  releaseNotesBetween,
   resolveRequestedProjects,
+  versionOfBaselineTag,
   runBuild,
   stageFilteredSourceTree,
 } from './_workspace-lib.mjs';
+import { SHARED_ORG, SHARED_REPO } from './_rv-customers.mjs';
 import { compileProjectDir } from './compile-project-scripts.mjs';
 import { knownProjectKeys } from './_rv-guards.mjs';
 import { recordPublishProvenance } from './_rv-provenance.mjs';
+import { parseLibrarySourceArgs } from './lib/rv-library-trim.mjs';
 
 const coreRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const privateRoot = resolve(coreRoot, '../realvirtual-WebViewer-Private~');
@@ -63,6 +71,13 @@ export function listArg(args, name) {
   return values;
 }
 
+//! plan-778 F15: `--projects-dir` / `--library <id>=<folder>` as the staging's library sources.
+//! Without a `--projects-dir` the staging searches the private tree's own `projects/`.
+function librarySourcesOf(args) {
+  const parsed = parseLibrarySourceArgs(args);
+  return { ...(parsed.projectsDir ? { projectsDir: resolve(parsed.projectsDir) } : {}), libraries: parsed.libraries };
+}
+
 function requireArg(args, name) {
   const value = arg(args, name);
   if (!value) throw new Error(`Missing --${name}.`);
@@ -73,6 +88,50 @@ function requireArg(args, name) {
 //! or null for a --no-rag delivery. Null propagates to stageFilteredSourceTree, which then writes
 //! no connect/ folder and generates a README/start script that never references one.
 function buildRagPair(args, projectKey, projectDir) {
+  return resolveRagPair(args, projectKey, projectDir)?.dir ?? null;
+}
+
+function sha256File(path) {
+  return createHash('sha256').update(readFileSync(path)).digest('hex');
+}
+
+/**
+ * The content key of one diagnosis package (plan-679 A4).
+ *
+ * Everything the pair is computed from: the project key, the seed index, the preset, the corpus
+ * bundle-rag embeds (`docs/`), the bundler, the .NET indexer it runs (sources, not build output),
+ * and the gateway it is configured for (base URL, a hash of the key — never the key). The
+ * embedding model is bundle-rag's own default, so it is covered by the bundler's hash.
+ * Contents, never timestamps: an unchanged corpus delivered a week later hits the cache.
+ */
+export function computeRagCacheKey({ projectKey, projectDir, seedIndex, diagnosisConfig, tools = connectTools, env = process.env }) {
+  const docs = join(projectDir, 'docs');
+  const parts = {
+    schema: 1,
+    projectKey,
+    seedIndex: sha256File(seedIndex),
+    preset: sha256File(diagnosisConfig),
+    corpus: existsSync(docs) ? hashTree(docs) : hashTree(projectDir),
+    bundler: sha256File(join(tools, 'bundle-rag.mjs')),
+    indexer: hashTree(join(tools, 'build-rag-index'), ['bin/**', 'bin2/**', 'obj/**']),
+    baseUrl: env.REQUESTY_BASE_URL ?? '',
+    apiKey: createHash('sha256').update(env.REQUESTY_API_KEY ?? '').digest('hex'),
+  };
+  return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+}
+
+/**
+ * Resolves the diagnosis package, optionally through the content-keyed cache (plan-679 A4).
+ *
+ * `--rag-cache <dir>`: a hit (meta + both files, hashes intact) is used as is; a miss is built and
+ * stored. `--rag-expect <key>,<zipSha256>,<configSha256>` (the release push, from the receipt):
+ * the key must be recomputed identically and the entry must exist with exactly those hashes —
+ * anything else refuses this target with "a new dry-run is needed". A cache entry whose files no
+ * longer match its own recorded hashes is refused in every mode.
+ *
+ * Returns `null` without a package, else `{ dir, cache: { key, ragZipSha256, projectConfigSha256, hit } | null }`.
+ */
+export function resolveRagPair(args, projectKey, projectDir, deps = {}) {
   if (args.includes('--no-rag')) {
     console.log('[customer-workspace] --no-rag: no diagnosis package is built or delivered.');
     return null;
@@ -86,18 +145,65 @@ function buildRagPair(args, projectKey, projectDir) {
     return null;
   }
   const supplied = arg(args, 'connect-artifacts');
-  if (supplied) return resolve(supplied);
+  if (supplied) return { dir: resolve(supplied), cache: null };
   const seedIndex = requireArg(args, 'seed-index');
   const diagnosisConfig = requireArg(args, 'diagnosis-config');
-  const output = mkdtempSync(join(tmpdir(), `rv-rag-${projectKey}-`));
-  execFileSync(process.execPath, [join(connectTools, 'bundle-rag.mjs'),
+  const build = deps.build ?? ((output) => execFileSync(process.execPath, [join(connectTools, 'bundle-rag.mjs'),
     '--project-dir', projectDir,
     '--project', projectKey,
     '--output-dir', output,
     '--seed-index', resolve(seedIndex),
     '--extra-config', resolve(diagnosisConfig),
-  ], { stdio: 'inherit', env: process.env });
-  return output;
+  ], { stdio: 'inherit', env: process.env }));
+  const cacheRoot = arg(args, 'rag-cache');
+  const expect = arg(args, 'rag-expect');
+  if (!cacheRoot) {
+    if (expect) throw new Error('--rag-expect needs --rag-cache.');
+    const output = mkdtempSync(join(tmpdir(), `rv-rag-${projectKey}-`));
+    build(output);
+    return { dir: output, cache: null };
+  }
+  const key = (deps.computeKey ?? computeRagCacheKey)({ projectKey, projectDir, seedIndex, diagnosisConfig });
+  const entry = join(resolve(cacheRoot), key);
+  const metaPath = join(entry, 'meta.json');
+  const files = { zip: join(entry, 'rag.zip'), config: join(entry, 'project-config.json') };
+  const expected = expect ? expect.split(',') : null;
+  if (expected && (expected.length !== 3 || expected.some((value) => !/^[0-9a-f]{64}$/.test(value)))) {
+    throw new Error(`--rag-expect must be <key>,<zipSha256>,<configSha256> (got "${expect}").`);
+  }
+  if (expected && expected[0] !== key) {
+    throw new Error(`The inputs of the diagnosis package changed since the release dry-run `
+      + `(cache key ${key.slice(0, 12)}…, receipt ${expected[0].slice(0, 12)}…). A new dry-run is needed.`);
+  }
+  if (existsSync(metaPath) && existsSync(files.zip) && existsSync(files.config)) {
+    const meta = JSON.parse(readFileSync(metaPath, 'utf8'));
+    const actual = { ragZipSha256: sha256File(files.zip), projectConfigSha256: sha256File(files.config) };
+    if (actual.ragZipSha256 !== meta.ragZipSha256 || actual.projectConfigSha256 !== meta.projectConfigSha256) {
+      throw new Error(`The cached diagnosis package ${entry} no longer matches its recorded hashes. `
+        + 'Delete the entry; a new dry-run is needed.');
+    }
+    if (expected && (actual.ragZipSha256 !== expected[1] || actual.projectConfigSha256 !== expected[2])) {
+      throw new Error(`The cached diagnosis package ${entry} differs from the one the release dry-run recorded. A new dry-run is needed.`);
+    }
+    console.log(`[customer-workspace] diagnosis package from cache ${key.slice(0, 12)}…`);
+    return { dir: entry, cache: { key, ...actual, hit: true } };
+  }
+  if (expected) {
+    throw new Error(`No cached diagnosis package for key ${key.slice(0, 12)}… under ${resolve(cacheRoot)}. A new dry-run is needed.`);
+  }
+  const output = mkdtempSync(join(tmpdir(), `rv-rag-${projectKey}-`));
+  try {
+    build(output);
+    mkdirSync(entry, { recursive: true });
+    copyFileSync(join(output, 'rag.zip'), files.zip);
+    copyFileSync(join(output, 'project-config.json'), files.config);
+  } finally {
+    rmSync(output, { recursive: true, force: true });
+  }
+  const meta = { key, ragZipSha256: sha256File(files.zip), projectConfigSha256: sha256File(files.config), createdAt: new Date().toISOString() };
+  writeFileSync(metaPath, JSON.stringify(meta, null, 2) + '\n');
+  console.log(`[customer-workspace] diagnosis package built and cached under ${key.slice(0, 12)}…`);
+  return { dir: entry, cache: { key, ragZipSha256: meta.ragZipSha256, projectConfigSha256: meta.projectConfigSha256, hit: false } };
 }
 
 function initializeLfsIndex(workspaceRoot) {
@@ -232,9 +338,28 @@ export async function compileStagedProjectScripts(workspaceRoot, projectKeys) {
   }
 }
 
+/**
+ * The change part of a delivery commit body (plan-679 Phase 6, D7 / A6).
+ *
+ * The released CHANGELOG sections between the customer's baseline version (`delivery/<version>`)
+ * and this version, without `**Internal**`. `requireReleaseNotes` (the release path, with a
+ * receipt): no section is an ERROR — the commit must carry what was approved. Otherwise (a manual
+ * single delivery) the old commit-subject summary is the fallback.
+ */
+export function deliveryCommitNotes({ coreRoot, baselineTag, version, previousCoreCommit: previous = null, requireReleaseNotes = false }) {
+  const notes = releaseNotesBetween(coreRoot, versionOfBaselineTag(baselineTag), version);
+  if (notes) return `Release notes:\n\n${notes}`;
+  if (requireReleaseNotes) {
+    throw new Error(`CHANGELOG.md has no released section for ${version}; a release delivery must carry the `
+      + 'approved release notes in its commit. Promote "## Unreleased" first (/release-web).');
+  }
+  return deliveryChangelog(coreRoot, previous);
+}
+
 export function snapshotPush({
   workspaceRoot, remote, version, plasticChangeset = null,
   push = false, coreRoot = null, replaceProjects = [], force = false, acceptNewPrivateFiles = false,
+  approvedPrivateFiles = null, requireReleaseNotes = false,
 }) {
   const header = Number.isInteger(plasticChangeset) ? `viewer ${version}-${plasticChangeset}` : `viewer ${version}`;
   let message = header;
@@ -270,7 +395,12 @@ export function snapshotPush({
     }
     // Read the manifest before the snapshot overwrites it: it names the previously
     // delivered core commit, which bounds the change summary for the customer.
-    const changelog = coreRoot ? deliveryChangelog(coreRoot, previousCoreCommit(clone)) : '';
+    // plan-679 Phase 6 (D7): the body carries the APPROVED release notes — the CHANGELOG sections
+    // since the version of the customer's baseline — not raw commit subjects. On the release path
+    // (receipt) a missing section is an error; a manual single delivery falls back to the subjects.
+    const changelog = coreRoot
+      ? deliveryCommitNotes({ coreRoot, baselineTag: baseline.baselineTag, version, previousCoreCommit: previousCoreCommit(clone), requireReleaseNotes })
+      : '';
     // Read while the clone still carries the customer's copy: it is what decides whether this
     // is the first delivery under the new model, and therefore whether the commit explains it.
     const previousManifestVersion = readCloneDeliveryManifest(clone).manifestVersion;
@@ -288,14 +418,20 @@ export function snapshotPush({
     const inventoryDiff = assertPrivateSourceInventory(
       readBaselineSourceInventory(clone, snapshot.baselineTag),
       collectPrivateSourceInventory(workspaceRoot),
-      { acceptNew: acceptNewPrivateFiles },
+      // plan-679 Phase 4: the release path brings the APPROVED list; the blanket flag stays for
+      // the manual single delivery only.
+      { acceptNew: acceptNewPrivateFiles, approved: approvedPrivateFiles },
     );
     if (!inventoryDiff.gated) {
       console.log('[tier-gate] first delivery for this customer; no baseline inventory to compare against.');
     } else {
       if (inventoryDiff.added.length) {
-        console.log(`[tier-gate] ${inventoryDiff.added.length} new private source file(s) accepted via --accept-new-private-files:`);
+        console.log(`[tier-gate] ${inventoryDiff.added.length} new private source file(s) accepted via `
+          + `${approvedPrivateFiles ? 'the approved list' : '--accept-new-private-files'}:`);
         for (const path of inventoryDiff.added) console.log(`[tier-gate]   + ${path}`);
+      }
+      for (const path of inventoryDiff.approvedUnused ?? []) {
+        console.log(`[tier-gate]   (approved, but no longer new: ${path})`);
       }
       // A removal never blocks, but it must be visible: a file that silently stops
       // being delivered is how a customer loses a feature without anyone noticing.
@@ -322,8 +458,275 @@ export function snapshotPush({
   }
 }
 
+// ─── release check (plan-679 Phase 4) ─────────────────────────────────────
+
+//! Schema version of the per-target release-check result file.
+export const RELEASE_CHECK_SCHEMA_VERSION = 1;
+
+//! The id a release run uses for a delivery target: `<org>/<repo>` for the shared repository,
+//! the customer slug otherwise — the key of the approved-files map (`--accept-private-files`).
+export function releaseTargetId(delivery) {
+  return delivery.sharedRepo ? `${SHARED_ORG}/${SHARED_REPO}` : delivery.customer;
+}
+
+/**
+ * Reads the approved private files of one target from an approval/receipt-style file:
+ * `{ "<target>": [paths] }` at the top level or under `privateFiles`. A target the file does not
+ * name has approved nothing (`[]`), which is the safe reading.
+ */
+export function readApprovedPrivateFiles(path, targetId) {
+  const data = JSON.parse(readFileSync(path, 'utf8'));
+  const map = data && typeof data === 'object' && data.privateFiles && typeof data.privateFiles === 'object'
+    ? data.privateFiles : data;
+  const list = map?.[targetId] ?? [];
+  if (!Array.isArray(list) || list.some((entry) => typeof entry !== 'string')) {
+    throw new Error(`${path}: the approved private files of "${targetId}" must be a list of paths.`);
+  }
+  return [...list];
+}
+
+/**
+ * Runs every check of one delivery target WITHOUT pushing, cloning a working tree or uploading
+ * anything, and collects ALL findings instead of stopping at the first (plan-679 F4/F5).
+ *
+ * Independent checks: (i) diagnosis inputs, (ii) staging + guards (collect mode), (iii) build incl.
+ * notices, (iv) remote baseline + tier diff (needs only the staged tree). A check that depends on a
+ * failed one is reported as `not-run: <reason>`, never as passed. A diagnosis failure does not stop
+ * the rest: the target is staged without the package and stays `ok: false`.
+ *
+ * New private files are an APPROVAL finding (severity `approval`), not an error: they go into the
+ * release-notes approval, and `ok` stays true.
+ *
+ * `deps` are the real pipeline steps in production and fakes in the tests.
+ */
+export async function runReleaseCheck(context, deps) {
+  const startedAt = Date.now();
+  const timings = {};
+  const time = async (name, fn) => {
+    const t0 = Date.now();
+    try { return await fn(); } finally { timings[name] = Math.round((Date.now() - t0) / 100) / 10; }
+  };
+  const findings = [];
+  const checks = {};
+  const error = (check, message) => findings.push({ check, severity: 'error', message });
+  const { delivery, projectKey, args } = context;
+  const wantsDiagnosis = Boolean(projectKey) && !args.includes('--no-rag');
+
+  // (i) diagnosis — never blocks the other checks.
+  let rag = null;
+  let diagnosis = wantsDiagnosis ? 'yes' : 'none';
+  if (wantsDiagnosis) {
+    const unavailable = arg(args, 'diagnosis-unavailable');
+    if (unavailable) {
+      error('diagnosis', unavailable);
+      diagnosis = 'failed';
+    } else {
+      try {
+        rag = await time('rag', () => deps.resolveRag());
+      } catch (failure) {
+        error('diagnosis', `diagnosis package could not be built: ${failure.message}`);
+        diagnosis = 'failed';
+      }
+    }
+  }
+  checks.diagnosis = diagnosis === 'failed' ? 'failed' : 'ok';
+
+  // (ii) staging + guards.
+  let staged = null;
+  try {
+    staged = await time('staging', () => deps.stage({ connectArtifacts: rag?.dir ?? null }));
+    checks.staging = 'ok';
+  } catch (failure) {
+    error('staging', failure.message);
+    checks.staging = 'failed';
+  }
+  const notRun = (why) => `not-run: ${why}`;
+  let guardsFailed = false;
+  if (staged) {
+    const collected = [];
+    try {
+      await time('guards', () => deps.guards(staged, collected));
+    } catch (failure) {
+      collected.push({ guard: 'guards', kind: 'fatal', message: failure.message });
+    }
+    for (const entry of collected) error(`guard:${entry.guard}`, entry.message);
+    guardsFailed = collected.length > 0;
+    checks.guards = guardsFailed ? 'failed' : 'ok';
+  } else {
+    checks.guards = notRun('staging failed');
+  }
+
+  // (iv) remote baseline + tier diff — needs the staged tree, not the build.
+  let tierDiff = null;
+  if (staged) {
+    try {
+      const remote = await time('remote', () => deps.readRemote(delivery.remote));
+      const current = deps.collectInventory(staged);
+      if (remote.damage) error('tier-diff', `${remote.damage} — without a baseline the approval list cannot be right.`);
+      // The binding gate's own comparison — no second algorithm.
+      const diff = diffPrivateSourceInventory(remote.inventory, current);
+      tierDiff = { baselineTag: remote.baselineTag, gated: diff.gated, trusted: diff.trusted, reason: diff.reason, added: diff.added, removed: diff.removed };
+      for (const path of diff.added) findings.push({ check: 'tier-diff', severity: 'approval', message: `new private source file: ${path}` });
+      checks.tierDiff = remote.damage ? 'failed' : 'ok';
+    } catch (failure) {
+      error('tier-diff', failure.message);
+      checks.tierDiff = 'failed';
+    }
+  } else {
+    checks.tierDiff = notRun('staging failed');
+  }
+
+  // (iii) build incl. third-party notices. Runs after a guard finding too: the guards report
+  // content, the build is independent of it, and the point is every finding in one run.
+  if (staged) {
+    try {
+      await time('build', () => deps.build(staged));
+      checks.build = 'ok';
+    } catch (failure) {
+      error('build', failure.message);
+      checks.build = 'failed';
+    }
+  } else {
+    checks.build = notRun('staging failed');
+  }
+
+  const result = {
+    schemaVersion: RELEASE_CHECK_SCHEMA_VERSION,
+    target: releaseTargetId(delivery),
+    customer: delivery.customer,
+    remote: delivery.remote,
+    releaseVersion: context.releaseVersion,
+    viewerVersion: context.viewerVersion,
+    coreHead: context.coreHead,
+    privateHead: context.privateHead,
+    projects: [...(delivery.projects ?? [])],
+    diagnosis,
+    rag: rag?.cache ? { cacheKey: rag.cache.key, ragZipSha256: rag.cache.ragZipSha256, projectConfigSha256: rag.cache.projectConfigSha256, cacheHit: rag.cache.hit } : null,
+    connectPin: context.connectPin ?? null,
+    ok: !findings.some((finding) => finding.severity === 'error'),
+    checks,
+    findings,
+    tierDiff,
+    timings: { ...timings, total: Math.round((Date.now() - startedAt) / 100) / 10 },
+  };
+  if (context.outFile) {
+    mkdirSync(dirname(resolve(context.outFile)), { recursive: true });
+    writeFileSync(resolve(context.outFile), JSON.stringify(result, null, 2) + '\n');
+  }
+  return result;
+}
+
+async function releaseCheckMain(args) {
+  if (args.includes('--push')) throw new Error('--release-check never pushes; it cannot be combined with --push.');
+  const outFile = requireArg(args, 'release-check');
+  const releaseVersion = requireArg(args, 'release-version');
+  if (!/^\d+\.\d+\.\d+(?:[-+].+)?$/.test(releaseVersion)) throw new Error(`--release-version must be X.Y.Z (got "${releaseVersion}").`);
+  const manifest = loadTierManifest(privateRoot);
+  const customer = arg(args, 'customer');
+  const delivery = customer
+    ? loadDeliveryConfigByCustomer(privateRoot, customer, manifest)
+    : loadDeliveryConfig(privateRoot, requireArg(args, 'project'), manifest);
+  const projectKey = delivery.projectKey;
+  const projectDir = projectKey ? join(privateRoot, 'projects', projectKey) : null;
+  const project = projectDir ? JSON.parse(readFileSync(join(projectDir, 'project.json'), 'utf8')) : null;
+  // The check runs BEFORE the tag exists: no tag requirement here (the push path keeps it).
+  const core = gitProvenance(coreRoot, { requireTag: false });
+  const privateRepo = gitProvenance(privateRoot);
+  const plasticChangeset = readPlasticChangeset(resolve(coreRoot, '../../../..'));
+  const connectPin = JSON.parse(readFileSync(resolve(requireArg(args, 'connect-lock')), 'utf8'));
+  const packageJson = JSON.parse(readFileSync(join(coreRoot, 'package.json'), 'utf8'));
+  let stagedRoot = null;
+  const tmpBase = resolve(process.env.RV_DELIVER_TMP ?? tmpdir());
+  try {
+    const result = await runReleaseCheck({
+      args, delivery, projectKey, outFile, releaseVersion,
+      viewerVersion: packageJson.version,
+      coreHead: core.commit,
+      privateHead: privateRepo.commit,
+      connectPin: { channel: delivery.connectChannel, ...connectPin },
+    }, {
+      resolveRag: () => resolveRagPair(args, projectKey, projectDir),
+      stage: async ({ connectArtifacts }) => {
+        const staged = stageFilteredSourceTree({
+          coreRoot, privateRoot, projectKey, projectKeys: delivery.projects, project, delivery,
+          profile: { tier: delivery.tier, restrictedFeatures: delivery.restrictedFeatures },
+          librarySources: librarySourcesOf(args),
+          connectArtifacts,
+          hasDiagnosis: connectArtifacts !== null,
+          connectPin: { channel: delivery.connectChannel, ...connectPin },
+        });
+        stagedRoot = staged.workspaceRoot;
+        await compileStagedProjectScripts(staged.workspaceRoot, staged.projectKeys);
+        initializeLfsIndex(staged.workspaceRoot);
+        const stagedProjects = Object.fromEntries(staged.projectKeys.map((key) =>
+          [key, JSON.parse(readFileSync(join(staged.workspaceRoot, 'projects', key, 'project.json'), 'utf8'))]));
+        const deliveryManifest = createDeliveryManifest({
+          core, privateRepo,
+          profile: { tier: delivery.tier, restrictedFeatures: delivery.restrictedFeatures },
+          connect: { channel: delivery.connectChannel, ...connectPin },
+          projectRoot: projectDir,
+          viewerVersion: packageJson.version,
+          plasticChangeset,
+          projects: stagedProjects,
+          privateSources: collectPrivateSourceInventory(staged.workspaceRoot),
+        });
+        // Stamped so a staged release-check tree can never be mistaken for a delivery: it was
+        // built from an untagged HEAD, for a version that does not exist yet.
+        deliveryManifest.releaseCheck = { releaseVersion };
+        writeFileSync(join(staged.workspaceRoot, 'delivery-manifest.json'), JSON.stringify(deliveryManifest, null, 2) + '\n');
+        assertNoCrossTierLeak(staged.workspaceRoot, manifest, delivery);
+        return staged;
+      },
+      guards: (staged, collect) => assertWorkspaceGuards(staged.workspaceRoot, {
+        projectKey,
+        projectKeys: staged.projectKeys,
+        knownProjectKeys: knownProjectKeys(privateRoot, { kind: 'customer' }),
+        lfsRepoRoot: staged.workspaceRoot,
+        collect,
+      }),
+      // No dependency archive in a release check, whatever the flags say (Gate R1 finding 4):
+      // packing and uploading it is a write to the CDN, and the check writes nothing anywhere.
+      build: (staged) => {
+        let build;
+        try {
+          build = runBuild(staged.workspaceRoot, { mode: 'private', projectKey, fast: args.includes('--fast'), noticesTier: delivery.tier });
+        } catch (error) {
+          // The build streams to the console; its cause (a [rv-third-party-notices] violation, a
+          // compile error) stands right above this line in the log, not in the exception.
+          throw new Error(`${error.message} — the cause is in the build output above `
+            + '(look for "error during build", e.g. [rv-third-party-notices] licence-policy violations).');
+        }
+        const html = join(build.coreRoot, 'dist', 'index.html');
+        if (existsSync(html) && readFileSync(html, 'utf8').includes('rv-watermark')) {
+          throw new Error('the built index.html still carries the AGPL watermark (#rv-watermark); a commercial delivery must not.');
+        }
+        if (existsSync(html) && readFileSync(html, 'utf8').includes('rv-demo-notice')) {
+          throw new Error('the built index.html carries the public-demo notice (#rv-demo-notice); a customer delivery must not.');
+        }
+        return build;
+      },
+      readRemote: (remote) => readRemoteBaselineInventory(remote, { tmpBase }),
+      collectInventory: (staged) => collectPrivateSourceInventory(staged.workspaceRoot),
+    });
+    const errors = result.findings.filter((finding) => finding.severity === 'error');
+    const approvals = result.findings.filter((finding) => finding.severity === 'approval');
+    console.log(`[release-check] ${result.target}: ${result.ok ? 'OK' : 'FAILED'} — ${errors.length} error(s), `
+      + `${approvals.length} new private file(s) for approval, diagnosis ${result.diagnosis}, ${result.timings.total}s.`);
+    for (const finding of errors) console.log(`[release-check]   ERROR ${finding.check}: ${finding.message.split('\n')[0]}`);
+    for (const finding of approvals) console.log(`[release-check]   approve ${finding.message}`);
+    console.log(`[release-check] result: ${resolve(outFile)}`);
+    if (!result.ok) process.exitCode = 2;
+  } finally {
+    if (stagedRoot && !args.includes('--keep-staging')) rmSync(stagedRoot, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   const args = process.argv.slice(2);
+  if (args.includes('--release-check')) {
+    await releaseCheckMain(args);
+    return;
+  }
   const push = args.includes('--push');
   const fast = args.includes('--fast');
   const force = args.includes('--force');
@@ -340,6 +743,12 @@ async function main() {
   const delivery = customer
     ? loadDeliveryConfigByCustomer(privateRoot, customer, manifest)
     : loadDeliveryConfig(privateRoot, requireArg(args, 'project'), manifest);
+  // plan-679 Phase 4: the approved list from the release approval replaces the blanket flag.
+  const approvalFile = arg(args, 'accept-private-files');
+  if (approvalFile && acceptNewPrivateFiles) {
+    throw new Error('--accept-private-files and --accept-new-private-files exclude each other; the release path uses the approved list.');
+  }
+  const approvedPrivateFiles = approvalFile ? readApprovedPrivateFiles(resolve(approvalFile), releaseTargetId(delivery)) : null;
   // A `standard` customer carries no projects (plan-434 Phase 4): no primary key,
   // no project directory, no project.json. `null` travels all the way down —
   // staging, the generated files and the manifest each have a projectless form.
@@ -364,6 +773,7 @@ async function main() {
   const staged = stageFilteredSourceTree({
     coreRoot, privateRoot, projectKey, projectKeys, project, delivery,
     profile: { tier: delivery.tier, restrictedFeatures: delivery.restrictedFeatures },
+    librarySources: librarySourcesOf(args),
     connectArtifacts: ragArtifacts,
     hasDiagnosis: ragArtifacts !== null,
     connectPin: { channel: delivery.connectChannel, ...connectPin },
@@ -418,7 +828,8 @@ async function main() {
       knownProjectKeys: knownProjectKeys(privateRoot, { kind: 'customer' }),
       lfsRepoRoot: staged.workspaceRoot,
     });
-    const build = runBuild(staged.workspaceRoot, { mode: 'private', projectKey, fast });
+    // noticesTier (plan-679 Phase 3): the licence check judges this build as its delivery tier.
+    const build = runBuild(staged.workspaceRoot, { mode: 'private', projectKey, fast, noticesTier: delivery.tier });
     if (fast) console.log(`[customer-workspace] build cache ${build.cacheStatus === 'hit' ? `hit (${build.cacheMethod})` : 'rebuild'}.`);
     await writeDependencyPin(staged.workspaceRoot, build.coreRoot, args);
     const result = snapshotPush({
@@ -434,6 +845,9 @@ async function main() {
       replaceProjects: resolveRequestedProjects(requestedProjects, staged.projectKeys),
       force,
       acceptNewPrivateFiles,
+      approvedPrivateFiles,
+      // With a receipt this IS a release delivery: its commit must carry the approved notes.
+      requireReleaseNotes: Boolean(arg(args, 'receipt')),
     });
     // Provenance is recorded only for a push that actually landed, and on the
     // SOURCE manifests, not the staged copies about to be deleted (§2.8 / B15).

@@ -6,6 +6,357 @@ Maintained by `/release-web`; the contract is described in `Documentation/web/RE
 
 ## Unreleased
 
+## 6.6.0 — 2026-11-04
+
+**New**
+- SEW MOVI-C (UDP): CONNECT offers it in the interface list (UDP with the SEW defaults), and every
+  UDP card imports a SEW symbol table in the browser; a re-import replaces the signals and keeps
+  the connection settings.
+- DES experiment manager (Commercial): plan, run and compare experiment matrices in their own
+  window; the public demo stays available for evaluation and non-commercial use.
+- DES commands for AI/MCP: create, duplicate, rename and delete experiment columns, set experiment
+  values, read and set the DES seed, and live checkpoints (experiment and checkpoint commands are
+  part of the Commercial experiment manager).
+- Signal Connector component: connects signals with conversion (copy, int/bool, bit from/to word,
+  scale, invert) and checks fan-in, cycles, width and direction. It loads on demand, so models
+  without it do not pay for it.
+- Stereo 3D (Commercial, Beta): side-by-side stereo rendering.
+- 3D display walls (Commercial, Beta): off-axis viewports with head tracking, set up and edited in
+  Settings > Stereo 3D, with projector and "2 people stereo" templates.
+- Flystick navigation (Commercial, Beta): the Flystick drives the existing viewer functions,
+  including ray clicks and dragging parts.
+- SpaceMouse navigation via WebHID, with its own settings tab.
+- Libraries as projects: the realvirtual library and your own libraries are projects; edit a
+  library document in place or copy it into your project, attach libraries by id, and repair an
+  unavailable library from the Problems panel.
+- Drop detection reports parts that fall off while being carried (switchable in Settings), and
+  conveyors set supported parts down on horizontal surfaces; the vertical reach is set per
+  transport surface.
+- Public demo terms: evaluation and non-commercial use.
+
+**Improved**
+- Layout Planner and Guided maintenance are stable; the Beta label is gone.
+- DES: stability and memory fixes — a run after Reset starts like the first run, the experiment
+  window no longer re-renders on every run or poll, and invalid commands fail clearly.
+- Virtual PLC (Structured Text): IEC operator precedence, EXIT/RETURN, `=>` output parameters,
+  bitwise logic and shifts, initial values, VAR CONSTANT and RV_FirstScan; the supported language
+  scope is documented.
+- SolidCraft live link: AI control of SolidCraft is a setting (off by default), moved designs are
+  confirmed before they are applied, and reconnects after save/reopen are robust.
+- Settings keep one ordered tab list and reopen on the last tab.
+- Smaller start bundle: drop detection no longer pulls in the full component schema.
+- Documentation updated for the new features.
+
+**Fixed**
+- Switching from continuous simulation to DES resets progress tracking, so the snapshot taken
+  afterwards is correct.
+- 3D scene buttons react to a click on the button cap.
+- Flystick: a ray drag no longer starts a second gesture, and a ray click on a chart filters by
+  the element that was hit.
+- Section/clipping tool releases its materials and forgets removed placements.
+- Boolean variant fields accept "true"/"false".
+- The development build no longer fills the browser's User Timing buffer.
+
+**Internal**
+- Tier changes (plan-2215): Stereo 3D, display walls and Flystick moved from Preview to the
+  commercial tier as Beta; SpaceMouse stays in the core. The fleet control / PalletYard forklift
+  logic stays open source (AGPL) — not part of the commercial cut.
+- DES experiment manager cut out of the public tree into the commercial module (plan-2211, ADR-054);
+  KPI definitions and the Experiments button stay in the core.
+- New DES commands: `des.seed.get/set`, commercial `des.checkpoint.*`, experiment column / cell
+  value commands (plan-2208b).
+- SignalConnector lazy-loaded with its own release-gate guards and signal-conversion drift test
+  (plan-2227); eager-source-graph ratchet re-pinned several times.
+- Stress harness for `/stresstest`.
+- Contracts renamed `doc-*` → `contract-*`; node-identity and bake-picking contracts split.
+
+## 6.5.4 — 2026-11-03
+
+**New**
+- Model-Scripts run on the DES clock: in a discrete-event run they receive sink arrivals
+  (`self.sink(path).on`), are carried through snapshots and continuation, and their frame hooks
+  only update the display.
+- PalletYard demo: ShippingMonitor script and a "Late shipments" KPI.
+- Robot commands for AI/MCP: run, stop and check a robot path, move the TCP, set a target's grip
+  (`ik.*` commands), plus a "robot" help topic.
+- Asset library: Loading Gantry in Pallet Handling.
+- AI clicks can be switched off in the toolbar; the AI then acts without simulated pointer clicks.
+- Scripts of the bundled demo project run without the `?scripts` switch.
+- Share shows the upload limits before you upload.
+- The public demo and the commercial development workspace ask once for consent to the terms of
+  use.
+
+**Improved**
+- The viewer keeps working when the browser blocks local storage (private windows, strict site
+  settings).
+
+**Fixed**
+- Drill-in on a project-library placement in the asset editor works again, also after a page
+  reload.
+- Model content can no longer inject prototype keys.
+- A deployed project reads its DES experiment archive only when it declares one (no more 404).
+- DES: deterministic MU ids and correct snapshots with pending MU retirements.
+
+**Internal**
+- AxisCorrection removed from WEB IK; `perf:des --script`.
+
+## 6.5.3 — 2026-11-02
+
+**New**
+- DES experiment manager: "+ Add KPI" defines your own KPIs. A KPI can be a component property
+  (picked like "+ Add property", or a name pattern summed over matching components), a value a
+  script publishes, or a predefined component metric such as utilization, breakdown or traffic-stop
+  share over a name pattern (mean, sum, min or max).
+- Property and script KPIs are evaluated as a counter (change over the measured time, optionally
+  per hour) or as a state (time-weighted mean, maximum or end value). The kind is proposed from the
+  field name and can be switched. The warm-up period is always excluded.
+- Runs recorded before a KPI existed say "needs a rerun" instead of showing a value; deltas are
+  coloured by each KPI's better direction.
+- Experiment columns carry a description: Base and every variant can be described via the column
+  menu (*Edit description…*). The text shows under the column state and does not invalidate
+  recorded results.
+- The asset library shows preview images.
+- PalletYard demo: descriptions for every column and three new KPIs (AGV breakdown share, AGV
+  traffic stops, pallets out per hour).
+- Bundled with realvirtual CONNECT 1.7.0: offline licence activation for computers without internet
+  access, and *Save diagnostics…* in the tray menu, which writes a ZIP for support.
+
+**Improved**
+- Public and hosted pages no longer probe a local CONNECT gateway on page load, so visitors no
+  longer see the browser's local-network access prompt. The AI panel checks the gateway only once
+  CONNECT is connected or when you open the panel or an AI command.
+- The "+ Add KPI" property picker offers only numeric fields of the running simulation components
+  and runtime counters.
+- On document cards, the Bundled chip sits at the bottom-left of the preview with the same look as
+  the mode chip; on small cards both labels shorten instead of overflowing.
+- MCP: `editor.importCad` also imports FBX, USD and DXF files, through the same import path as the
+  import dialog.
+
+**Fixed**
+- Run all started right after editing *Stop at* or *Measure after* now runs with the new values;
+  before, the click could be lost and every column turned stale with "run length changed".
+- *Stop at* and *Measure after* are locked while a batch or snapshot runs, instead of accepting an
+  edit that was then dropped.
+- A *Measure after* that is not shorter than *Stop at* is refused with a message next to the
+  fields, and the run buttons say why they are blocked.
+- Column descriptions, and their removal, survive a reload.
+- A difference that displays as 0.0 is no longer coloured.
+
+**Internal**
+- Private test excludes regenerated (ai-prompt-no-local-probe); reference baseline updated
+  (PalletYard.glb after the experiment-descriptions fix, SEWStackerCrane project added).
+- Import providers declare their file extensions; `editor.importCad` resolves a file without a CAD
+  provider through the import provider that claims its extension.
+- Experiment manager README wording: the experiment manager is a commercial module.
+
+## 6.5.2 — 2026-11-02
+
+**New**
+- DES experiment manager: compare model variants side by side in one table. Base and
+  each variant are columns; property rows edit a variant's overrides, KPI rows show the results.
+- Replications per column with mean and 95% confidence interval. The difference to Base is computed as a
+  paired comparison when runs share their seeds, otherwise with Welch's test; when no comparison is
+  possible, the cell says why.
+- Time series per run: KPIs recorded over simulation time, shown as bars or over-time charts with a
+  confidence band across replications.
+- Snapshots: save the state of a running DES model and continue it later with identical results. A
+  snapshot remembers its variant column. AGV fleets, scripts, conveyors, turntables and chain transfers
+  are included.
+- Reproducible random streams: every component and script draws from its own named stream, so the same
+  seed gives the same result, also after the model is rebuilt.
+- Experiments are saved with the project in writable project folders and travel with a project export.
+- PalletYard experiment example in the demo: AGV breakdowns per vehicle, 2, 3 and 4 AGVs, and a variant
+  without downtime.
+- MCP: `experiment.*` commands let AI assistants run experiments and read results, time series, rows and
+  snapshots.
+- Floating panels resize from all edges and corners, with a visible corner grip.
+- Thumbnails are written into the project on save; the demo documents ship with preview images.
+- A library asset shows that it is loading on its first placement.
+- `camera.fit` frames nodes into the area that no floating window covers.
+
+**Improved**
+- DES core is stable and part of the AGPL Community edition; the Beta label is gone. The experiment
+  manager becomes a separate commercial module.
+- Run all executes every column in its own variant, restores the scene afterwards and leaves Play
+  usable. Models with logic steps, PLC programs or IK paths are refused with a plain-text reason.
+- Archived experiment results from earlier versions are shown as "stale" once after the update; rerun
+  a column to refresh it.
+- The inspector shows the effective variant value; number fields keep a typed value until it is
+  confirmed.
+- The legacy planning window starts collapsed and is hidden in variant mode.
+- Faster DES snapshot capture and time-series recording.
+- A deployed PLC program is stored in the model.
+- Material assignment paints meshes with material arrays.
+- Agent Eye can be collapsed; the folded state is remembered.
+- A lamp without an On colour lights in its lens colour.
+- The hierarchy Back pill is compact and truncates long names.
+- Delivered workspaces carry `NOTICE.md`, `CONTENT-LICENSE.md` and `CONTENT-MANIFEST.md` next to
+  `LICENSE`.
+
+**Fixed**
+- Resetting a variant field to Base survives a reload.
+- Run all no longer leaves a gap between columns in which Play could restart the batch.
+- A column reads current again after a successful rerun; an unsaved variant edit is restored after a
+  reload.
+- Same seed, same result across PalletYard rebuilds; changing the yard size scales the fleet again.
+- MU colliders are sized correctly under scaled parents; explicit static colliders no longer form
+  invisible walls around MUs.
+- A WebOperatorPanel configuration given as a raw object stays usable.
+- An editor test run keeps the user camera.
+- On document cards, the Bundled badge no longer overlaps the mode chip.
+- Running an experiment batch no longer reports spurious 'variant conflicts with the model' problems.
+- Signal names are reserved per document; name collisions are resolved after a rename.
+- The AI window stays running until the CLI exits.
+
+**Internal**
+- DES snapshot contract v4 (participants, persistable fleet timers, behaviour state, continuation harness)
+  and RNG v2 named streams (plan-2059, plan-2061).
+- Experiment manager V1 phases A–J and experiment commands (plan-2013, plan-2208); performance bisect
+  fixes (plan-2063).
+- Register-driven customer-name guard for the public tree; bundle-budget re-pins; release staging carries
+  the licence files.
+
+## 6.5.1 — 2026-11-01
+
+**New**
+- Procedural drive sounds: a Sound component makes a drive audible as an electric motor, pneumatic cylinder
+  or hydraulic axis, synthesised in the browser without audio files. A speaker button with a volume
+  slider switches it on.
+- The password page of encrypted links shows a "Decrypting model file..." step and the heading
+  "realvirtual Digital Twin".
+- A central statistics hub collects DES results, path traffic, planning key figures and component
+  statistics in one window.
+- Variant management: create, rename and switch model variants from the toolbar, see the differing
+  fields per part, reset a field to the base, and save variants with the document.
+- Blockage diagnostics for material flow and AGV fleets: deadlock and stall probes, wait edges and a
+  cause chain in the Problems panel, and "Save diagnostics" for a browser log package.
+- AI panel: run Claude Code or Codex from the AI entry with the current selection and screenshots,
+  and keep several sessions.
+- Open the asset behind a placed reference in the same tab with Back and breadcrumb, or in a new tab.
+- New material-flow components with Unity parity: guided arc and line conveyors, MU variant switching
+  on sensor entry, MU pushers, source destinations and direct gripping on sensor entry.
+- CONNECT: offline licence activation, signal configuration written to CONNECT with addresses filled
+  from the controller, and address table import.
+- Robot paths export as ABB or SEW programs.
+- Simulated KPI chips open a trend window of their source.
+
+**Improved**
+- DES: seeded randomness for takt sources and downtimes, a finished run continues with one click, and
+  runs are reproducible under load.
+- Raycast sensors behave like Unity: they hit colliders only and report entries per collider.
+- Faster start: the CONNECT panel, path network editing and the planner load on demand.
+- The editor keeps placed references baked and keeps instance overrides of placed content on save.
+- Toolbar tools are grouped, with flyouts for related tools.
+- The user interface is English throughout.
+
+**Fixed**
+- The light barriers of the standard demo detect their MUs again.
+- A signal badge no longer blanks the HMI.
+- Picking stays responsive when a background worker fails; the work finishes inline.
+
+## 6.5.0 — 2026-10-23
+
+**New**
+- AI assistants work through a compact command interface: `web_commands` lists the viewer's commands,
+  `web_execute` and `web_batch` run them.
+- MCP macros: an assistant records its model changes with a reason per step, the macro is saved inside
+  the GLB, and any later session can replay it with a report per line.
+- Geometry checks for assistants: mesh-exact gap and contact between two parts, also with drives moved
+  to given positions, usable as macro assertions.
+- A part library reads stroke and moving sub-parts of common pneumatic and electric drives from their
+  type code.
+- New editor commands: clone a subtree, define a material, reorder children.
+- NVIDIA SimReady assets are available as a source in the realvirtual WEB Library: search, preview and
+  import them like any other library part, with attribution kept.
+- SolidCraft live link: connect to SolidCraft from the activity bar and model CAD next to the viewer.
+  Bodies keep stable identities across updates, joints become drives, and settings you changed in WEB
+  survive the next CAD update.
+- Guided maintenance: author step-by-step procedures in the asset editor, and the machine moves along
+  with each step (drives, transforms, signals, transparency, spray effects, saved camera views). The
+  standard demo includes a guided coolant nozzle cleaning.
+- Parametric part families: define a part once with parameters (stretch, bend, duplicate, nested
+  families) and set the parameters per placement in the inspector.
+- Path network authoring for AGV layouts: draw path blocks and junctions, drag them from the catalog,
+  live validation, and structural edits (sweep, append, split, remove).
+- AGVs can drive in reverse, and congestion trace bands show where traffic piles up over time.
+- USD export with all realvirtual settings preserved, USD import that reads them back, and a one-way
+  USD live link to NVIDIA Isaac Sim / Kit including a downloadable Kit extension.
+- DXF import for 2D floor plans as locked layout placements.
+- Asset editor statistics: heaviest parts, a per-mesh heatmap and a mesh simplification core that
+  reduces triangle counts without moving contact surfaces.
+- Robot tools for AI assistants: rig a library robot in one call and author robot paths by pose or by
+  joint angles.
+- Operator panels gain analog elements, a keyboard legend, an optional compact density, and a window
+  that fits its content.
+- The public demo opens with a welcome window, and a hosted project can name its start document and
+  mode in its project.json.
+
+**Improved**
+- References in a saved model point at the part itself, not at its name or place in the tree: renaming,
+  moving or re-importing a part no longer breaks drives, signals, kinematics or settings that use it.
+- Settings changed inside a placed machine are kept at any nesting depth, and the outer file's value wins.
+- Moving a single part inside a placed machine is no longer saved; move the whole placement, or move the
+  part in its asset. Older files that moved parts this way open with a notice, and the parts sit where
+  their asset puts them.
+- GLBs saved by realvirtual WEB can no longer be imported into Unity. Unity exports keep opening in
+  realvirtual WEB as before.
+- Faster start: the asset editor, DES and other features load only when you first need them, with a
+  visible retry if a part fails to load.
+- AI control is a switch of its own and no longer tied to the CONNECT channel; the HMI shows both
+  separately.
+- JT import reads JT 9.5 and JT 8.x files.
+- Renaming or moving a part in the asset editor rewrites every reference to it, and a reference audit
+  lists broken links in the Problems panel.
+- The editor saves the names you typed, refuses duplicate names among siblings, and warns before a
+  save would lose a reference.
+- Planner, DES material flow and path network share one connection system, so a line connected in
+  one place is connected everywhere.
+- DES hands material over at its real set-down pose instead of jumping onto the next belt.
+- The asset editor has a transform-tool toggle (Move, shortcut T) and a cleaner selection highlight.
+- The library catalog search covers all library sources.
+- The Problems panel stays closed after you close it until a new or changed entry appears.
+- Lower memory use and quicker loading of large models; the Fast preset renders lighter.
+
+**Fixed**
+- Robot TCP and IK solving work correctly on baked models and under scaling; IK failures are reported
+  instead of being silent.
+- Sensor collision boxes and mechanism link masses survive model baking, so sensors and forces work
+  on baked models.
+- Spawned MUs keep the template's size under a scaled parent.
+- Undo and redo through the trash keep the restored part's components.
+- A new document asks for its name first; double-clicking a project card opens it reliably.
+- Shadows come back after switching render modes on WebGPU.
+- A conveyor in DES no longer drops a waiting MU when it starts.
+- SolidCraft parts are sized correctly in the planner, and connecting to SolidCraft works from a page
+  served by CONNECT.
+- The USD live link no longer stops on textures it cannot export.
+- Hosted deployments always ship their feature list and no longer probe localhost on page load.
+
+**Internal**
+- Raytraced render mode (restricted, beta): G-buffer, temporal resolve, worker-built TLAS.
+- MuJoCo locomotion spike: walking robot driven by signals in a real scene.
+- 2D interaction zones (Box2D) for dense material flow on conveyors (jam, buffer table, diverter, merge): in development, not active in customer builds.
+- Dev toolbar replaces the dev-server banner; agent/CI dev servers never open a browser.
+- Test lock: maximum run time, startup limit, GPU test group.
+- References stored by node address; edition feature catalog as single source; third-party notices gate enforced in release builds.
+
+## 6.4.3 — 2026-10-15
+
+**Fixed**
+- Customer source deliveries no longer stop at their own secret check.
+
+## 6.4.2 — 2026-10-15
+
+**Improved**
+- The robot loading screen appears only while the viewer starts; switching scenes stays in the HMI.
+- Ambient occlusion on Max Quality is sharp, and the Fast preset renders without it.
+- WebGPU rendering is complete: no more grey screen, and picking works.
+
+**Fixed**
+- A part held by a gripper no longer lets the parts behind it drive into it on a conveyor.
+- The Problems window remembers when you closed it for a model.
+- Gizmos draw underneath the HMI panels.
+
 ## 6.4.1 — 2026-10-13
 
 **Improved**

@@ -20,6 +20,7 @@
 //    only form that supports the required graceful skip. Used below.
 
 import { describe, it, expect, beforeAll } from 'vitest';
+import { loadRapier } from '@rv-private/physics/rapier-lib-loader';
 import {
   PHYSICS_SETTLE_LIN_VEL,
   PHYSICS_SETTLE_FRAMES,
@@ -82,26 +83,15 @@ interface SpikeRapier {
 
 const FIXED_DT = PHYSICS_FIXED_DT;
 
-/** Out-of-band import seam — URL path, resolved by the vitest browser dev server. */
-const RAPIER_MJS_URL = '/node_modules/@dimforge/rapier3d-compat/rapier.mjs';
-
 let RAPIER: SpikeRapier | null = null;
 
 beforeAll(async () => {
-  try {
-    const mod = (await import(/* @vite-ignore */ RAPIER_MJS_URL)) as SpikeRapier;
-    await mod.init();
-    RAPIER = mod;
-  } catch {
-    RAPIER = null; // package not installed (out-of-band) — tests skip gracefully
-  }
+  // NO graceful skip: an unloadable Rapier is a hard failure (shared loader = the vite alias).
+  RAPIER = (await loadRapier()) as unknown as SpikeRapier;
 }, 30000);
 
 function requireRapier(): boolean {
-  if (!RAPIER) {
-    console.warn('[spike] @dimforge/rapier3d-compat not installed (out-of-band) — skipping');
-    return false;
-  }
+  if (!RAPIER) throw new Error('[spike] @dimforge/rapier3d-compat did not load (beforeAll)');
   return true;
 }
 
@@ -230,8 +220,14 @@ describe('physics spike: kinematic↔dynamic handover (plan-276 Phase 0)', () =>
       }
 
       const p = cube.translation();
-      expect(Math.abs(p.x)).toBeLessThan(0.001); // no lateral drift (< 1 mm)
-      expect(Math.abs(p.z)).toBeLessThan(0.001);
+      // No lateral drift. Bound: 10 mm (5 % of the 0.2 m cube). Rapier <= 0.19 landed a flat cube
+      // bit-symmetrically (< 1 mm); the 0.20 solver (rewritten contact graph, clustered contacts,
+      // per-substep friction) resolves the four corner contacts of the impact in a fixed but
+      // asymmetric order, so a 0.5 m drop leaves a deterministic 3-5 mm slide (measured 1-14 mm over
+      // 0.2-1.5 m drops, not reducible by any exposed solver parameter). A real sideways throw is
+      // hundreds of millimetres, so 10 mm still separates "drops straight" from "drifts".
+      expect(Math.abs(p.x)).toBeLessThan(0.01);
+      expect(Math.abs(p.z)).toBeLessThan(0.01);
       expect(Math.abs(p.y - 0.1)).toBeLessThan(0.01); // rests on ground
       expect(speed[speed.length - 1]).toBeLessThan(0.01);
       console.log(

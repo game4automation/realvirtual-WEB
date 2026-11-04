@@ -33,7 +33,7 @@ import type { RVViewer } from '../src/core/rv-viewer';
 const MODEL = '/demo-realvirtual/LaserWeldingAssemblyStation.glb';
 const DT = 1 / 60;
 const TEST_PLC = 'test-plc';
-const T = 'PLC/FG_Transport/';
+const T = 'Signals/FG_Transport/';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Json = any;
@@ -75,10 +75,10 @@ describe('plan-570 — the saved GLB (static)', () => {
 
   it('F5: gripper commands and feedback are swapped; the grippers start in the new home pose (MaxPos)', () => {
     const cases: [string, string][] = [
-      ['FG01_Gripper_A', 'PLC/FG01/FG01_Y_Gripper_'],
-      ['FG03_Gripper1_A', 'PLC/FG03/FG03_Y_Gripper1_'],
-      ['FG03_Gripper2_A', 'PLC/FG03/FG03_Y_Gripper2_'],
-      ['FG05_Gripper_1', 'PLC/FG05/FG05_Y_Gripper_'],
+      ['FG01_Gripper_A', 'Signals/FG01/FG01_Y_Gripper_'],
+      ['FG03_Gripper1_A', 'Signals/FG03/FG03_Y_Gripper1_'],
+      ['FG03_Gripper2_A', 'Signals/FG03/FG03_Y_Gripper2_'],
+      ['FG05_Gripper_1', 'Signals/FG05/FG05_Y_Gripper_'],
     ];
     for (const [node, p] of cases) {
       const c = rv(node).Drive_Cylinder;
@@ -93,9 +93,9 @@ describe('plan-570 — the saved GLB (static)', () => {
   it('F5b: FG03 X1 and Y1 signals are swapped; X1 (vertical node FG03_Y1) works downwards', () => {
     const vert = rv('FG03_Y1');
     const horiz = rv('FG03_X1').Drive_Cylinder;
-    expect(refPath(vert.Drive_Cylinder.Out)).toBe('PLC/FG03/FG03_Y_AxisX1_WorkPos');
-    expect(refPath(vert.Drive_Cylinder.In)).toBe('PLC/FG03/FG03_Y_AxisX1_HomePos');
-    expect(refPath(vert.Drive_Cylinder.IsIn)).toBe('PLC/FG03/FG03_Y_AxisX1_InHome');
+    expect(refPath(vert.Drive_Cylinder.Out)).toBe('Signals/FG03/FG03_Y_AxisX1_WorkPos');
+    expect(refPath(vert.Drive_Cylinder.In)).toBe('Signals/FG03/FG03_Y_AxisX1_HomePos');
+    expect(refPath(vert.Drive_Cylinder.IsIn)).toBe('Signals/FG03/FG03_Y_AxisX1_InHome');
     // plan-569 Teil 3 inverted this cylinder (was [-75, 0, -75], i.e. home at the LOWER limit).
     // The drawn GLB pose is the PARKED pose above the pallet, not the working pose: the jaws only
     // enclose the valve body while the turn axis sits 43.7…130.6 mm above the pallet underside, and
@@ -106,9 +106,9 @@ describe('plan-570 — the saved GLB (static)', () => {
     // the geometry is unambiguous and the axis naming in that same list was already swapped.
     // Open for confirmation by Andreas — see plan-569 § Wendeeinheit.
     expect([vert.Drive_Cylinder.MinPos, vert.Drive_Cylinder.MaxPos, vert.Drive.StartPosition]).toEqual([0, -75, 0]);
-    expect(refPath(horiz.Out)).toBe('PLC/FG03/FG03_Y_AxisY1_WorkPos');
-    expect(refPath(horiz.In)).toBe('PLC/FG03/FG03_Y_AxisY1_HomePos');
-    expect(refPath(horiz.IsIn)).toBe('PLC/FG03/FG03_Y_AxisY1_InHome');
+    expect(refPath(horiz.Out)).toBe('Signals/FG03/FG03_Y_AxisY1_WorkPos');
+    expect(refPath(horiz.In)).toBe('Signals/FG03/FG03_Y_AxisY1_HomePos');
+    expect(refPath(horiz.IsIn)).toBe('Signals/FG03/FG03_Y_AxisY1_InHome');
   });
 
   it('F6/F7: no sim-only return stopper left; every stopper output has exactly one writer', () => {

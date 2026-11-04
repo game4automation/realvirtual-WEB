@@ -142,6 +142,28 @@ describe('reference tags — target finding', () => {
     );
   });
 
+  it('2D physics zone (plan-661): Surface, Guides and KinematicDrives survive the bake as merge targets', () => {
+    const root = group('Line');
+    const surface = group('Outfeed');
+    const guideL = withComponent(group('GuideL'), 'BoxCollider', { center: { x: 0, y: 0, z: 0 }, size: { x: 0.01, y: 0.05, z: 2 } });
+    const guideR = group('GuideR');
+    const pusher = group('Pusher');
+    const zone = withComponent(group('JamZone'), 'WebPhysicsZone2D', {
+      Kind: 'Jam',
+      Surface: { type: 'ComponentReference', path: 'Line/Outfeed', componentType: 'realvirtual.TransportSurface' },
+      Guides: [{ type: 'ComponentReference', path: 'Line/GuideL' }, { type: 'ComponentReference', path: 'Line/GuideR' }],
+      KinematicDrives: [{ type: 'ComponentReference', path: 'Line/Pusher', componentType: 'realvirtual.Drive' }],
+    });
+    root.add(surface, guideL, guideR, pusher, zone);
+    const model = computeSurvival(root, registryFor(root));
+    for (const n of [surface, guideR, pusher]) {
+      expect(model.reasonOf(n)).toBe('referenced');
+      expect(model.incoming.get(n)).toBe('merge');
+    }
+    expect(model.incoming.get(guideL)).toBe('merge');
+    expect(model.counts.unresolvedReferences).toBe(0);
+  });
+
   it('connections: every edge endpoint of the Connections block is a merge target', () => {
     const root = group('Asset');
     const s = group('StationA'); const t = group('StationB');
@@ -266,7 +288,7 @@ describe('forEachComponentRef — the one ref-field iterator', () => {
       A: refTo('p/a'), N: 5, S: 'text', L: [refTo('p/l0'), 'raw', refTo('p/l2')], O: { nested: refTo('p/n') }, Z: null,
     };
     const seen: Array<[string, string, number | null]> = [];
-    forEachComponentRef(record, (key, ref, index) => seen.push([key, ref.path, index]));
+    forEachComponentRef(record, (key, ref, index) => seen.push([key, ref.path ?? '', index]));
     expect(seen).toEqual([['A', 'p/a', null], ['L', 'p/l0', 0], ['L', 'p/l2', 2]]);
   });
 

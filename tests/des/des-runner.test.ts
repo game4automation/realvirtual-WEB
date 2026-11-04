@@ -15,15 +15,15 @@
  *  - the tween registry is driven on lateTick (Animated) / off in FastForward.
  *  - createDesRunner factory is non-null in the private build (kernel wiring).
  *
- * Runs only in the private build (imports `@rv-private/plugins/des/*`).
+ * Imports `@rv/plugins/des/*` — DES is core code since plan-680.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Object3D, Vector3 } from 'three';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
-import { createDesRunner } from '@rv-private/plugins/des/register-des-runner';
-import { _resetDesHookCache } from '@rv-private/plugins/des/des-hook-adapter';
-import { resetDESMUCounter } from '@rv-private/plugins/des/rv-des-mu';
+import { DESRunner } from '@rv/plugins/des/des-runner';
+import { createDesRunner } from '@rv/plugins/des/register-des-runner';
+import { _resetDesHookCache } from '@rv/plugins/des/des-hook-adapter';
+import { resetDESMUCounter } from '@rv/plugins/des/rv-des-mu';
 import {
   createSelf,
   type MaterialFlowSelf,
@@ -459,7 +459,7 @@ describe('DESRunner — Station definition (DES-only wrapper)', () => {
 
   it('holds an MU for ProcessingTime, then transfers it downstream', async () => {
     // Import here so the def self-registers AFTER the registry reset.
-    const { Station } = await import('@rv-private/plugins/des/material-flow/Station');
+    const { Station } = await import('@rv/plugins/des/material-flow/Station');
     const def = Station as unknown as MaterialFlowDefinition<MaterialFlowSelf<{ processingTime: number }>>;
     const defAny = def as unknown as MaterialFlowDefinition;
 
@@ -483,7 +483,7 @@ describe('DESRunner — Station definition (DES-only wrapper)', () => {
       scheduler: runner.makeScheduler(sinkDef as MaterialFlowDefinition, () => sink.entityId),
     });
     const sink = runner.addInstance(sinkDef as MaterialFlowDefinition, sinkSelf, sinkNode);
-    const adapter = runner.addInstance(defAny, self as unknown as MaterialFlowSelf, node);
+    const adapter = runner.addInstance(defAny, self as unknown as MaterialFlowSelf, node, undefined, { desId: node.name + '@' + defAny.type });
 
     // Wire the Station's downstream to the sink (native handshake routing).
     runner.start([defAny, sinkDef as MaterialFlowDefinition], { root: node });

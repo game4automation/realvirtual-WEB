@@ -17,6 +17,12 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { RVViewerProvider } from '../src/hooks/use-viewer';
 import { commandRegistry } from '../src/core/hmi/rv-command-registry';
 import { ensureViewCommandsRegistered } from '../src/core/hmi/view-commands';
+import { ensureSessionOverlayCommandsRegistered } from '../src/core/hmi/session-overlay-commands';
+import { ensureComponentCommandsRegistered } from '../src/core/hmi/component-commands';
+import { ensureQueryCommandsRegistered } from '../src/core/hmi/query-commands';
+import { ensureDocumentCommandsRegistered } from '../src/core/hmi/document-commands';
+import { ensureSignalAutomapCommandsRegistered } from '../src/core/hmi/signal-automap-commands';
+import { ensureDesPlcCommandsRegistered } from '../src/core/hmi/des-plc-commands';
 import { loadVisualSettings } from '../src/core/hmi/visual-settings-store';
 import { setAppConfig } from '../src/core/rv-app-config';
 import { VisualTab } from '../src/core/hmi/settings/VisualTab';
@@ -35,6 +41,12 @@ beforeEach(() => {
   localStorage.clear();
   setAppConfig({});
   ensureViewCommandsRegistered();
+  ensureSessionOverlayCommandsRegistered();
+  ensureComponentCommandsRegistered();
+  ensureQueryCommandsRegistered();
+  ensureDocumentCommandsRegistered();
+  ensureSignalAutomapCommandsRegistered();
+  ensureDesPlcCommandsRegistered();
 });
 
 afterEach(() => {

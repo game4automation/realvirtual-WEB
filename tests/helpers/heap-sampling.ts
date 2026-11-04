@@ -87,3 +87,17 @@ export async function sampleAllocations(
   const allFrames = [...byFrame.entries()].sort((a, b) => b[1] - a[1]).map(([frame, bytes]) => ({ frame, bytes }));
   return { totalBytes: total, byModule, top: allFrames.slice(0, 12), allFrames };
 }
+
+/**
+ * JS heap in use after a forced full GC (bytes, `Runtime.getHeapUsage`), or null when CDP is
+ * unavailable. For long-run upper bounds (plan-612 soak): `performance.memory` is quantised and
+ * cached in headless Chromium, this figure is exact and garbage-free.
+ */
+export async function heapUsedAfterGc(): Promise<number | null> {
+  type Sender = { send(method: string, params?: unknown): Promise<any> };
+  let session: Sender;
+  try { session = cdp() as unknown as Sender; await session.send('HeapProfiler.enable'); } catch { return null; }
+  await session.send('HeapProfiler.collectGarbage');
+  const u = await session.send('Runtime.getHeapUsage') as { usedSize: number };
+  return u.usedSize;
+}

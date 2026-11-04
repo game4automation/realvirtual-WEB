@@ -36,6 +36,8 @@
  */
 
 import { BufferGeometry, Group, Matrix4, Mesh, Object3D } from 'three';
+import { isRuntimeHelperNode } from './rv-runtime-helper-node';
+import { isUnsafeObjectKey } from '../engine/rv-safe-keys';
 import type { Material } from 'three';
 import type { RVViewer } from '../rv-viewer';
 import type { RVDrive } from '../engine/rv-drive';
@@ -71,22 +73,43 @@ import {
 } from './rv-mesh-merge';
 import { unsupportedMeshShapeReason } from '../engine/rv-mesh-guards';
 import { debug } from '../engine/rv-debug';
-import { parseGlbSubtree } from '../engine/rv-glb-parse';
+import { parseGlbSubtree, RV_ORIG_NAME_KEY } from '../engine/rv-glb-parse';
 import { compactSharedVertexPools } from './rv-mesh-compact';
 import { GROUP_KEY_RE, syncNodeGroups, syncSubtreeGroups } from '../engine/rv-group-sync';
 import { getCadProvider, cadFormatOfName } from './rv-cad-provider';
 import { ensureMovableTransform, refreshWorldMatricesDeep } from '../engine/rv-node-transform';
-import { getCadGlb } from '../import/rv-cad-glb-cache';
+import { getCadGlb, type CadConverter } from '../import/rv-cad-glb-cache';
 import { weldImportedGlb } from '../import/rv-glb-weld';
 import { materialForValue } from './rv-asset-material';
 import { assetOpTouchesHierarchy } from './rv-asset-ops';
-import type { RvAssetOp, RvAssetPrimitiveOp, RvNodeTransform } from '../ops/rv-unified-ops';
+import type { RvAssetOp, RvAssetPrimitiveOp, RvNodeTransform, RvOp } from '../ops/rv-unified-ops';
+import { referenceRewriteRangesOf } from '../ops/rv-unified-ops';
+import { isComponentReference } from '../engine/rv-node-path-rewrite.mjs';
+import { getRawOdtDef } from '../engine/rv-component-registry';
+import { authoredAssetRelativePath, authoredPathIsAmbiguous } from '../hmi/rv-reference-field';
+import {
+  assignRuntimeIdentity,
+  instantiateSubtree,
+  mintFromIdMap,
+  reidentifySubtree,
+  type NodeIdMap,
+} from '../engine/rv-subtree-instantiate';
+import { identityIdOf } from '../engine/rv-decode-identity';
+import { registerNodeAliasesInRegistry } from '../engine/rv-node-aliases';
+import type { VisitedReference } from '../engine/rv-node-path-rewrite.mjs';
+import { addressedReferenceValue, referenceTargetForWrite } from '../engine/rv-reference-writer';
+import { opTargetPaths, overrideTargetOf, writeOverride, type OverrideTarget } from '../ops/rv-reference-guard';
+import { placedReferenceOfPath } from '../engine/rv-reference-scope';
+import { reportReplayOpsSkipped, type ReplayOpSkippedReport } from '../hmi/problems-store';
+import type { RvPlacedReplayTarget } from '../ops/rv-placed-replay';
+import { overrideBaseOf, recordOverrideBase, type OverrideBase } from '../engine/rv-asset-reference';
 import type {
   ImportCadOp,
   TransformNodeOp,
   RenameNodeOp,
   DeleteNodeOp,
   CreateNodeOp,
+  CloneNodeOp,
   ReparentNodeOp,
   AddComponentOp,
   RemoveComponentOp,
@@ -99,10 +122,75 @@ import type {
   MergeKeptNodeSpec,
   NodeTransform,
   CADLinkExtras,
+  ReplaceNodeGeometryOp,
 } from './rv-asset-ops';
 
 /** Name of the hidden trash group parked directly under the scene root. */
 const TRASH_GROUP_NAME = '_rvAssetTrash';
+
+/** Direction an op was applied in (plan-766 apply listeners). */
+export type AssetApplyDirection = 'forward' | 'inverse';
+/** Observer of applied ops — see {@link AssetExecutorContext.addApplyListener}. */
+export type AssetApplyListener = (op: RvAssetOp, direction: AssetApplyDirection) => void;
+/** Observer of bulk-replay brackets — see {@link AssetExecutorContext.addReplayListener}. */
+export type AssetReplayListener = (phase: 'begin' | 'end') => void;
+
+/** Every Mesh in a subtree (root included). */
+function meshesUnder(root: Object3D): Mesh[] {
+  const out: Mesh[] = [];
+  root.traverse((o) => { if ((o as Mesh).isMesh) out.push(o as Mesh); });
+  return out;
+}
+
+/** Authored meshes only; runtime helpers take their whole subtree out of the walk. */
+function authoredMeshesUnder(root: Object3D): Mesh[] {
+  const out: Mesh[] = [];
+  const visit = (node: Object3D): void => {
+    if (node !== root && isRuntimeHelperNode(node)) return;
+    if ((node as Mesh).isMesh) out.push(node as Mesh);
+    for (const child of node.children) visit(child);
+  };
+  visit(root);
+  return out;
+}
+
+/** Trash key for the copy a `cloneNode` created (parked by its inverse). */
+function cloneTrashKey(opId: string): string { return `clone:${opId}`; }
+
+/** A CPU buffer of `geometry` is detached (the worker BVH build transfers them while it runs). */
+function geometryBuffersDetached(geometry: BufferGeometry): boolean {
+  const arrays: Array<{ buffer?: ArrayBufferLike }> = [];
+  if (geometry.index) arrays.push(geometry.index.array as unknown as { buffer?: ArrayBufferLike });
+  for (const name in geometry.attributes) {
+    const a = geometry.attributes[name] as unknown as { array?: { buffer?: ArrayBufferLike }; data?: { array?: { buffer?: ArrayBufferLike } } };
+    const arr = a.data?.array ?? a.array;
+    if (arr) arrays.push(arr);
+  }
+  return arrays.some((arr) => arr.buffer?.byteLength === 0);
+}
+
+/**
+ * Deep copy of a live subtree for `cloneNode`: `Object3D.clone(true)` copies the
+ * nodes, local and world matrices and a JSON copy of `userData` (the
+ * non-enumerable component instances stay behind); geometry and materials are
+ * shared by three's clone and are copied here, so a later in-place edit of
+ * either side never reaches the other. A mesh the editor arena draws carries
+ * `layers.mask = 0`; the copy is put back on the main layer so the arena's
+ * reconcile picks it up as a fresh mesh instead of skipping it as "masked".
+ */
+function cloneSubtreeDeep(source: Object3D): Object3D {
+  const copy = source.clone(true);
+  copy.traverse((o) => {
+    const mesh = o as Mesh;
+    if (!mesh.isMesh) return;
+    if (mesh.geometry) mesh.geometry = (mesh.geometry as BufferGeometry).clone();
+    const mat = mesh.material as Material | Material[] | undefined;
+    if (Array.isArray(mat)) mesh.material = mat.map((m) => m.clone());
+    else if (mat) mesh.material = mat.clone();
+    if (mesh.layers.mask === 0) mesh.layers.mask = 1;
+  });
+  return copy;
+}
 
 /** Trash key for the Group a `separateMesh` created (parked by its inverse). */
 function separateTrashKey(opId: string): string { return `separate:${opId}`; }
@@ -126,6 +214,50 @@ const SEPARATOR_GEOMETRY_MARK = '_rvSeparatorPart';
  * only the geometries the merge itself BUILT may ever be disposed.
  */
 const MERGER_GEOMETRY_MARK = '_rvMergerOutput';
+
+/** Cache identity of a geometry — see {@link AssetExecutorContext.geometryKeyOf}. */
+export interface CadGeometryKey {
+  sha256: string;
+  quality: string;
+  converter?: CadConverter;
+}
+
+/**
+ * The geometry a `replaceNodeGeometry` displaced in each direction — never the
+ * live one. `prev` is held after forward (undo restores the exact instance),
+ * `next` after inverse (redo re-installs it without a cache read).
+ */
+interface GeometryStash {
+  prev: BufferGeometry | null;
+  next: BufferGeometry | null;
+}
+
+/** The one mesh a geometry swap targets: the node itself, or the only mesh in its subtree. */
+export function singleMeshOf(node: Object3D): Mesh | null {
+  if ((node as Mesh).isMesh) return node as Mesh;
+  const meshes = authoredMeshesUnder(node);
+  return meshes.length === 1 ? meshes[0] : null;
+}
+
+/**
+ * Parse GLB bytes into the geometry of their ONE mesh, in that mesh's local
+ * frame (node transforms inside the GLB are ignored). Runs the same vertex-pool
+ * compaction `importCad` runs, so an import's single mesh and a re-parse of
+ * the same cached bytes yield the same geometry. The parsed materials are
+ * dropped — a swap keeps the node's own material.
+ */
+export async function geometryFromGlb(bytes: ArrayBuffer): Promise<BufferGeometry> {
+  const root = await parseGlbSubtree(bytes);
+  compactSharedVertexPools(root);
+  const meshes = meshesUnder(root);
+  if (meshes.length !== 1) {
+    throw new Error(`replaceNodeGeometry: the GLB must hold exactly one mesh, it holds ${meshes.length}`);
+  }
+  const geometry = meshes[0].geometry as BufferGeometry;
+  const material = meshes[0].material as Material | Material[];
+  for (const m of Array.isArray(material) ? material : [material]) m?.dispose?.();
+  return geometry;
+}
 
 /**
  * The analysis result handed over from the preview so the apply does not repeat
@@ -287,6 +419,36 @@ export class MergeMeshUnappliedError extends Error {
   }
 }
 
+/** One referrer whose re-bind failed at the end of a reference-rewrite range (plan-610). */
+export interface RebindFailure {
+  /** Registry path of the referrer (`''` for a failure of the scan itself). */
+  path: string;
+  componentType: string;
+  error: unknown;
+}
+
+/**
+ * The re-bind at the end of a reference-rewrite range failed for at least one
+ * referrer (plan-610 §2.4, SOL R3 #3). Thrown only AFTER every other referrer
+ * and the foreign-referrer scan ran; the composite is then rolled back and the
+ * op is not recorded (forward), resp. the undo is re-applied and the entry stays
+ * on the undo stack (inverse).
+ */
+export class ReferenceRebindError extends Error {
+  readonly failures: readonly RebindFailure[];
+  constructor(compositeId: string, failures: readonly RebindFailure[]) {
+    const first = failures[0];
+    const what = first?.path ? `${first.componentType} on "${first.path}"` : 'the referrer scan';
+    const cause = first?.error instanceof Error ? first.error.message : String(first?.error);
+    super(
+      `reference re-bind after composite ${compositeId} failed for ${failures.length} referrer(s), ` +
+      `first: ${what}: ${cause}`,
+    );
+    this.name = 'ReferenceRebindError';
+    this.failures = failures;
+  }
+}
+
 /** One drained {@link MergeMeshUnappliedError}, flattened for the UI. */
 export interface UnappliedMerge {
   rootPath: string;
@@ -336,6 +498,19 @@ interface TrashEntry {
   node: Object3D;
   parent: Object3D;
   childIndex: number;
+  /**
+   * The component registrations of the parked subtree (set by `_detachToTrash`):
+   * the instances stay alive in the trash, but `unregisterSubtree` drops their
+   * registry entries — the restore files them again. Without it a redo of
+   * `cloneNode` / `createNode` / `importCad` and an undo of `deleteNode` brought
+   * the node back WITHOUT its components (plan-769 Phase 2 finding).
+   */
+  components?: Array<{ node: Object3D; entries: Array<[string, unknown]> }>;
+}
+
+/** Field values are JSON (rv_extras): equal when they serialise alike. */
+function jsonEqual(a: unknown, b: unknown): boolean {
+  return Object.is(a, b) || JSON.stringify(a) === JSON.stringify(b);
 }
 
 export class AssetExecutorContext {
@@ -362,7 +537,15 @@ export class AssetExecutorContext {
    * even those that can would come back as fresh unshared instances, silently
    * splitting a material the rest of the asset still shares.
    */
-  private readonly _materialTrash = new Map<string, Map<string, Material>>();
+  private readonly _materialTrash = new Map<string, Map<string, Material | Material[]>>();
+  /**
+   * plan-774 F1: the instance override a `setField` / `unsetField` on placed
+   * content found at its address BEFORE it wrote (op id → state), so the inverse
+   * restores that override — or its absence — and not merely the live value.
+   * Re-captured on every forward (redo, replay), so it never outlives the truth;
+   * a coalesce keeps the FIRST op's id and with it the state before the drag.
+   */
+  private readonly _overridePrev = new Map<string, OverrideBase>();
   /** importCad ops whose geometry could not be resolved (drained by the plugin). */
   private _missingCadGeometry: MissingCadGeometry[] = [];
   /** separateMesh ops that did not land on the live tree (drained by the plugin). */
@@ -377,9 +560,92 @@ export class AssetExecutorContext {
   private readonly _mergePayloads = new Map<string, MergeMeshPayload>();
   /** Per-`mergeMesh` bookkeeping: moved nodes, generated outputs, BVH liveness. */
   private readonly _mergeRecords = new Map<string, MergeRecord>();
+  /** Displaced geometries of `replaceNodeGeometry` ops, keyed by op id (plan-621). */
+  private readonly _geometryStash = new Map<string, GeometryStash>();
+  /** Freshly parsed geometries awaiting their `replaceNodeGeometry` op (op.id → geometry). */
+  private readonly _geometryPayloads = new Map<string, BufferGeometry>();
+  /** Cache identity of every geometry this context installed or imported (plan-621). */
+  private readonly _geometryKeys = new WeakMap<BufferGeometry, CadGeometryKey>();
+  /**
+   * Geometries a `replaceNodeGeometry` BUILT (the document's payload or a cache
+   * parse): they belong to the op alone and are disposed once no history
+   * reaches them. A geometry a node carried BEFORE its first swap (an import,
+   * the loaded base) is never in here — it may be shared with other meshes, so
+   * it is left to the GC like the rest of the trash. A set rather than a
+   * `userData` mark: geometry userData is exported as glTF primitive extras and
+   * would come back on the next load claiming an ownership it no longer has.
+   */
+  private readonly _ownedGeometries = new WeakSet<BufferGeometry>();
+  /** Geometries this context disposed — gates their background BVH build. */
+  private readonly _disposedGeometries = new WeakSet<BufferGeometry>();
 
   constructor(viewer: RVViewer) {
     this.viewer = viewer;
+  }
+
+  /**
+   * Stash the geometry the document already parsed for the matching
+   * `replaceNodeGeometry` op — same hand-off as {@link provideCadPayload}: the
+   * fresh apply skips a second parse, redo and replay read the cache instead.
+   *
+   * The geometry must be freshly parsed for this op and referenced by nothing
+   * else: from here on the op OWNS it and disposes it once no history reaches it.
+   */
+  provideGeometryPayload(opId: string, geometry: BufferGeometry): void {
+    this._ownedGeometries.add(geometry);
+    this._geometryPayloads.set(opId, geometry);
+  }
+
+  /** Drop an unconsumed geometry payload (the op never ran) — nothing else holds it. */
+  discardGeometryPayload(opId: string): void {
+    const geometry = this._geometryPayloads.get(opId);
+    this._geometryPayloads.delete(opId);
+    if (geometry) this._disposeOwnedGeometry(geometry);
+  }
+
+  /**
+   * The CAD-GLB cache key a geometry can be re-materialised from, or null.
+   *
+   * Known for every geometry a `replaceNodeGeometry` installed (in either
+   * direction), and for the single mesh of an `importCad` whose GLB holds
+   * exactly one mesh — the first geometry of a live-synced body, so its first
+   * swap has a `prevSha256` without writing anything. Everything else (a node
+   * of the loaded base, a geometry after a reload) has none, and the document
+   * snapshots it into the cache before the swap.
+   */
+  geometryKeyOf(geometry: BufferGeometry): CadGeometryKey | null {
+    return this._geometryKeys.get(geometry) ?? null;
+  }
+
+  /** Record the cache key of `geometry` (the document's snapshot path). */
+  noteGeometryKey(geometry: BufferGeometry, key: CadGeometryKey): void {
+    this._geometryKeys.set(geometry, { ...key });
+  }
+
+  /**
+   * Drop the stash of ops a coalesce folded away (plan-621). Their displaced
+   * material / geometry is the INTERMEDIATE state between two merged steps —
+   * the merged op keeps the FIRST op's id and inverse payload, so no undo or
+   * redo can reach it any more. A displaced geometry the op built is disposed
+   * here, once; the stash entry goes with it.
+   */
+  releaseAbsorbed(opIds: readonly string[]): void {
+    for (const id of opIds) {
+      this._materialTrash.delete(id);
+      this._overridePrev.delete(id);
+      const entry = this._geometryStash.get(id);
+      if (!entry) continue;
+      this._geometryStash.delete(id);
+      if (entry.prev) this._disposeOwnedGeometry(entry.prev);
+      if (entry.next) this._disposeOwnedGeometry(entry.next);
+    }
+  }
+
+  /** How much per-op state is held (tests / diagnostics). */
+  get stashStats(): { trash: number; materials: number; geometries: number } {
+    let geometries = 0;
+    for (const e of this._geometryStash.values()) geometries += (e.prev ? 1 : 0) + (e.next ? 1 : 0);
+    return { trash: this._trash.size, materials: this._materialTrash.size, geometries };
   }
 
   /** Stash the freshly parsed CAD root for the matching importCad op. */
@@ -460,7 +726,12 @@ export class AssetExecutorContext {
    *  removed from the scene; geometry disposal is left to the GC/renderer since
    *  trashed CAD meshes may share materials with live clones. */
   flushTrash(): void {
+    const arena = this.viewer.editorArena;
     for (const entry of this._trash.values()) {
+      // plan-766 §2.4.4: trashed meshes leave their arena BEFORE their
+      // geometry can be disposed below (the arena copied it, but the record
+      // still points at the source and must not outlive it).
+      if (arena) arena.remove(meshesUnder(entry.node));
       // Geometries the SEPARATOR built are exclusively owned by their island
       // mesh — nothing else in the scene references them — so this is the one
       // place where disposal is provably safe (the trashed CAD meshes above are
@@ -482,6 +753,17 @@ export class AssetExecutorContext {
     // still be shared with live materials, so leave disposal to the renderer —
     // same reasoning as the trashed CAD meshes above.
     this._materialTrash.clear();
+    // Displaced geometries of `replaceNodeGeometry` (plan-621): a stash slot
+    // never holds a live geometry, so the ones the op built are disposed here —
+    // exactly once, the slot goes with it. An undo after this point
+    // re-materialises from the CAD-GLB cache (`prevSha256`).
+    const geometryStashes = [...this._geometryStash.values()];
+    this._geometryStash.clear();
+    for (const entry of geometryStashes) {
+      if (entry.prev) this._disposeOwnedGeometry(entry.prev);
+      if (entry.next) this._disposeOwnedGeometry(entry.next);
+    }
+    for (const opId of [...this._geometryPayloads.keys()]) this.discardGeometryPayload(opId);
   }
 
   dispose(): void {
@@ -491,6 +773,7 @@ export class AssetExecutorContext {
     for (const record of this._mergeRecords.values()) record.alive.value = false;
     this.flushTrash();
     this._cadPayloads.clear();
+    this._overridePrev.clear();
     this._separatePayloads.clear();
     this._separateRecords.clear();
     for (const opId of [...this._mergePayloads.keys()]) this.discardMergePayload(opId);
@@ -522,7 +805,7 @@ export class AssetExecutorContext {
     } finally {
       // Runs on the failure path too: a rolled-back composite touched the graph
       // on its way in and out, so hierarchy/BVH consumers must resync either way.
-      this._afterApply(op);
+      this._afterApply(op, 'forward');
       endSignalSyncWave(this.viewer.signalStore);
     }
   }
@@ -533,7 +816,7 @@ export class AssetExecutorContext {
     try {
       await this._withMatrixBatch(op, () => this._inverseAny(op));
     } finally {
-      this._afterApply(op);
+      this._afterApply(op, 'inverse');
       endSignalSyncWave(this.viewer.signalStore);
     }
   }
@@ -545,7 +828,9 @@ export class AssetExecutorContext {
 
   /**
    * Run `body` with the per-node world-matrix refresh deferred to the end — but
-   * ONLY for a composite made purely of moves and renames.
+   * ONLY for a composite made purely of moves and renames (optionally followed
+   * by the setField steps of a reference rewrite, plan-610; every field
+   * re-apply drains the batch first, see `_drainMatrixBatch`).
    *
    * Why the deferral is safe there and nowhere else: those two primitives apply a
    * local TRS that was resolved BEFORE the first mutation, so nothing inside the
@@ -555,7 +840,7 @@ export class AssetExecutorContext {
    *
    * The flush is unconditional (`finally`): the editor pick backend reads
    * `matrixWorld` RAW and `freezeStaticMatrices` runs in editor loads too, so a
-   * skipped refresh would break picking AND rendering — doc-render-picking.md §2.5,
+   * skipped refresh would break picking AND rendering — contract-bake-picking.md §2.5,
    * "load-bearing invariant".
    */
   private async _withMatrixBatch(op: RvAssetOp, body: () => Promise<void>): Promise<void> {
@@ -591,7 +876,7 @@ export class AssetExecutorContext {
    *  the registry silently drives nothing — a drive gizmo that moves an empty
    *  node. Sharing a try block with an arbitrary `editor-structure-changed`
    *  listener or a BVH rebuild made that outcome one unrelated exception away. */
-  private _afterApply(op: RvAssetOp): void {
+  private _afterApply(op: RvAssetOp, direction: AssetApplyDirection): void {
     this._notifyStep(op, 'structure-changed', () => {
       if (assetOpTouchesHierarchy(op)) {
         this.viewer.emit('editor-structure-changed', { source: 'asset-editor' });
@@ -605,6 +890,105 @@ export class AssetExecutorContext {
     this._notifyStep(op, 'group-sync', () => {
       if (this._syncGroupOps(op)) this._emitGroupsChanged();
     });
+    // plan-766 §2.4.4: the op stream seam for the editor arenas. Runs AFTER
+    // the scene mutation, in both directions (undo/redo/replay included), on
+    // the failure path too — a rolled-back composite touched the tree.
+    if (this._applyListeners.size > 0) {
+      this._notifyStep(op, 'apply-listeners', () => {
+        for (const fn of [...this._applyListeners]) fn(op, direction);
+      });
+    }
+  }
+
+  // ─── Apply listeners (plan-766) ───────────────────────────────────────
+
+  private readonly _applyListeners = new Set<AssetApplyListener>();
+
+  /**
+   * Observe every applied op (forward and inverse, composites as ONE call
+   * with the composite). Used by the editor arena op listener; no listener =
+   * nothing happens. Returns the unsubscribe function.
+   */
+  addApplyListener(fn: AssetApplyListener): () => void {
+    this._applyListeners.add(fn);
+    return () => { this._applyListeners.delete(fn); };
+  }
+
+  // ─── Replay brackets (plan-766 §2.4.4) ────────────────────────────────
+
+  private readonly _replayListeners = new Set<AssetReplayListener>();
+  private _replayDepth = 0;
+
+  /** True inside a bulk replay (draft replay, recompose). */
+  get replaying(): boolean { return this._replayDepth > 0; }
+
+  /**
+   * A bulk replay starts. Nests; the OUTERMOST begin notifies the replay
+   * listeners (`'begin'`), the matching outermost {@link endReplay} notifies
+   * `'end'`. Called by `RvDocument.replayOps` / `replayOntoTreeLocked` through
+   * the unified executor — the editor arenas suspend their per-op reaction
+   * and build once at the end.
+   */
+  beginReplay(): void {
+    this._replayDepth++;
+    if (this._replayDepth === 1) this._notifyReplay('begin');
+  }
+
+  /** Counterpart of {@link beginReplay}; an unmatched call is ignored. */
+  endReplay(): void {
+    if (this._replayDepth === 0) return;
+    this._replayDepth--;
+    if (this._replayDepth === 0) this._notifyReplay('end');
+  }
+
+  /**
+   * plan-774 F8: the first target path of `op` that lies inside PLACED content
+   * (below a non-embedded reference node of the live tree), and whether its
+   * node is absent. A replay skips an op whose placed target is missing — an
+   * old draft's path into grafted CAD parts that the placed asset's bake merged
+   * away — instead of the silent no-op a field write on a missing node is.
+   * IMPLEMENTS RvExecutor::replayTargetInPlacedContent
+   */
+  replayTargetInPlacedContent(op: RvAssetOp | RvOp): RvPlacedReplayTarget | null {
+    const registry = this.viewer.registry;
+    if (!registry) return null;
+    let first: RvPlacedReplayTarget | null = null;
+    for (const path of opTargetPaths(op as RvOp)) {
+      // Review fix E4/E6: the INNERMOST placed reference over the path, found by
+      // exact prefix lookups — whether IT is materialised decides "baked away"
+      // (the instance is there, the node is not) vs "not loaded" (placeholder,
+      // offline source, cap, cycle: the content was never there to look at).
+      const reference = placedReferenceOfPath(path, registry);
+      if (!reference) continue;
+      const materialized = !!this.viewer.placements?.instanceOf?.(reference);
+      if (!registry.getNode(path)) return { nodePath: path, missing: true, materialized };
+      first ??= { nodePath: path, missing: false, materialized };
+    }
+    return first;
+  }
+
+  /**
+   * plan-774 F8: the ops of one replay skipped on placed content → Problems
+   * `replay-op-skipped` (path + op kind + why). IMPLEMENTS RvExecutor::reportReplaySkips
+   */
+  reportReplaySkips(skips: ReadonlyArray<ReplayOpSkippedReport>, what: string): void {
+    if (skips.length > 0) reportReplayOpsSkipped(skips, what);
+  }
+
+  /** Observe replay brackets. Returns the unsubscribe function. */
+  addReplayListener(fn: AssetReplayListener): () => void {
+    this._replayListeners.add(fn);
+    return () => { this._replayListeners.delete(fn); };
+  }
+
+  private _notifyReplay(phase: 'begin' | 'end'): void {
+    for (const fn of [...this._replayListeners]) {
+      try {
+        fn(phase);
+      } catch (e) {
+        console.warn(`[asset-edits] replay ${phase} listener failed:`, e);
+      }
+    }
   }
 
   /** Run one post-apply step; report its failure without taking the others down. */
@@ -653,16 +1037,7 @@ export class AssetExecutorContext {
    */
   private async _forwardAny(op: RvAssetOp): Promise<void> {
     if (op.kind === 'composite') {
-      const applied: RvAssetPrimitiveOp[] = [];
-      try {
-        for (const child of op.ops) {
-          await this._forwardAny(child as RvAssetPrimitiveOp);
-          applied.push(child as RvAssetPrimitiveOp);
-        }
-      } catch (e) {
-        await this._unwind(applied, (child) => this._inverseAny(child), op.id);
-        throw e;
-      }
+      await this._runComposite(op, 'forward');
       return;
     }
     try {
@@ -707,40 +1082,75 @@ export class AssetExecutorContext {
 
   private async _inverseAny(op: RvAssetOp): Promise<void> {
     if (op.kind === 'composite') {
-      const inverted: RvAssetPrimitiveOp[] = [];
-      try {
-        for (let i = op.ops.length - 1; i >= 0; i--) {
-          await this._inverseAny(op.ops[i] as RvAssetPrimitiveOp);
-          inverted.push(op.ops[i] as RvAssetPrimitiveOp);
-        }
-      } catch (e) {
-        // Re-apply what was already undone, so a failed undo is a no-op rather
-        // than a partial one (the document keeps the op on its undo stack).
-        await this._unwind(inverted, (child) => this._forwardAny(child), op.id);
-        throw e;
-      }
+      await this._runComposite(op, 'inverse');
       return;
     }
     await this._inverse(op);
   }
 
-  /** Reverse the primitives a failed composite already applied, newest first.
-   *  Unwind failures are logged, never rethrown — the caller must learn the
-   *  ORIGINAL error, and there is nothing better left to try. */
-  private async _unwind(
-    done: RvAssetPrimitiveOp[],
-    reverse: (op: RvAssetPrimitiveOp) => Promise<void>,
-    compositeId: string,
-  ): Promise<void> {
-    for (let i = done.length - 1; i >= 0; i--) {
-      try {
-        await reverse(done[i]);
-      } catch (e) {
-        console.error(
-          `[asset-edits] rollback of composite ${compositeId} failed at ${done[i].kind} ` +
-          `(op ${done[i].id}) — the scene may be inconsistent:`, e,
-        );
+  /**
+   * Run a composite's children in `direction` (forward: in order; inverse: in
+   * reverse) — ALL OR NOTHING: on a failure the children already run are
+   * reversed newest first (forward → inverse, a failed undo → re-apply, so the
+   * document keeps the entry on its undo stack) and the ORIGINAL error is
+   * rethrown.
+   *
+   * plan-610: the reference-rewrite ranges of the composite
+   * ({@link referenceRewriteRangesOf}) each run in their OWN re-bind session —
+   * opened when the walk enters the range, flushed when it leaves it. Outside
+   * the ranges nothing changes. A flush failure of the main pass is a failure
+   * of the composite (it triggers the rollback); the rollback's own flushes are
+   * best-effort and only log — a rollback that could roll back again would
+   * never end.
+   */
+  private async _runComposite(op: RvAssetOp & { kind: 'composite' }, direction: 'forward' | 'inverse'): Promise<void> {
+    const children = op.ops as RvAssetPrimitiveOp[];
+    const ranges = referenceRewriteRangesOf(op);
+    const rangeOf = (i: number): readonly [number, number] | null => {
+      for (const r of ranges) if (i >= r[0] && i < r[1]) return r;
+      return null;
+    };
+    const run = direction === 'forward'
+      ? (c: RvAssetPrimitiveOp) => this._forwardAny(c)
+      : (c: RvAssetPrimitiveOp) => this._inverseAny(c);
+    const back = direction === 'forward'
+      ? (c: RvAssetPrimitiveOp) => this._inverseAny(c)
+      : (c: RvAssetPrimitiveOp) => this._forwardAny(c);
+
+    // The range whose session THIS walk holds open (null = none).
+    let open: readonly [number, number] | null = null;
+    const enter = (i: number, strict: boolean): void => {
+      const r = ranges.length > 0 ? rangeOf(i) : null;
+      if (r === open) return;
+      if (open) { open = null; this._closeRefRebind(op.id, strict); }
+      if (r && this._openRefRebind()) open = r;
+    };
+
+    const done: number[] = [];
+    try {
+      const n = children.length;
+      for (let k = 0; k < n; k++) {
+        const i = direction === 'forward' ? k : n - 1 - k;
+        enter(i, true);
+        await run(children[i]);
+        done.push(i);
       }
+      if (open) { open = null; this._closeRefRebind(op.id, true); }
+    } catch (e) {
+      for (let k = done.length - 1; k >= 0; k--) {
+        const i = done[k];
+        enter(i, false);
+        try {
+          await back(children[i]);
+        } catch (undoErr) {
+          console.error(
+            `[asset-edits] rollback of composite ${op.id} failed at ${children[i].kind} ` +
+            `(op ${children[i].id}) — the scene may be inconsistent:`, undoErr,
+          );
+        }
+      }
+      if (open) { open = null; this._closeRefRebind(op.id, false); }
+      throw e;
     }
   }
 
@@ -760,6 +1170,8 @@ export class AssetExecutorContext {
       case 'setMaterial':     return this._setMaterialForward(op);
       case 'separateMesh':    return this._separateMeshForward(op);
       case 'mergeMesh':       return this._mergeMeshForward(op);
+      case 'replaceNodeGeometry': return this._replaceGeometryForward(op);
+      case 'cloneNode':       return this._cloneNodeForward(op);
     }
   }
 
@@ -772,7 +1184,10 @@ export class AssetExecutorContext {
       case 'renameNode': {
         // The node now carries the NEW name — its path ends in op.name.
         const renamedPath = replaceLeaf(op.nodePath, op.name);
-        return this._rename(renamedPath, op.prevName);
+        // plan-765 F2: the authored-name stamp the forward step deleted comes
+        // back — only when the op recorded one (old ops and unstamped nodes
+        // carry no `prevOrigName`, and nothing is written then).
+        return this._rename(renamedPath, op.prevName, op.prevOrigName);
       }
       case 'deleteNode':      return this._restoreFromTrash(op.id);
       case 'setNodeVisible':  return this._setNodeVisible(op.nodePath, op.prev);
@@ -793,14 +1208,16 @@ export class AssetExecutorContext {
         } else {
           writeUserDataField(this.viewer, op.nodePath, op.componentType, op.fieldName, op.prev);
         }
-        reapplySchemaForComponent(this.viewer, op.nodePath, op.componentType);
+        this._restoreInstanceOverride(op);
+        this._reapplyOrDefer(op.nodePath, op.componentType);
         this._syncSignals(this._node(op.nodePath));
         this.viewer.markRenderDirty();
         return;
       }
       case 'unsetField': {
         writeUserDataField(this.viewer, op.nodePath, op.componentType, op.fieldName, op.prev);
-        reapplySchemaForComponent(this.viewer, op.nodePath, op.componentType);
+        this._restoreInstanceOverride(op);
+        this._reapplyOrDefer(op.nodePath, op.componentType);
         this._syncSignals(this._node(op.nodePath));
         this.viewer.markRenderDirty();
         return;
@@ -808,6 +1225,9 @@ export class AssetExecutorContext {
       case 'setMaterial':     return this._setMaterialInverse(op);
       case 'separateMesh':    return this._separateMeshInverse(op);
       case 'mergeMesh':       return this._mergeMeshInverse(op);
+      case 'replaceNodeGeometry': return this._replaceGeometryInverse(op);
+      // Undo a clone: park the copy in the trash (redo re-attaches it).
+      case 'cloneNode':       return this._detachToTrash(cloneTrashKey(op.id), op.nodePath);
     }
   }
 
@@ -824,18 +1244,22 @@ export class AssetExecutorContext {
    */
   private _setMaterialForward(op: SetMaterialOp): void {
     const shared = materialForValue(op.material);
-    const stash = new Map<string, Material>();
-    for (const { meshPath, material } of op.prev) {
+    const stash = new Map<string, Material | Material[]>();
+    for (const { meshPath } of op.prev) {
       const mesh = this._node(meshPath) as Mesh | null;
       if (!mesh || !(mesh as { isMesh?: boolean }).isMesh) continue;
-      const current = mesh.material as Material;
+      const current = mesh.material;
       // Stash EVERY displaced material, not only the ones MaterialValue cannot
       // express. Rebuilding from the value would restore the right appearance
       // but a fresh instance, so a material shared with un-painted parts would
       // come back unshared — and the Materials window would then correctly
-      // report the result as a duplicate the user never created.
+      // report the result as a duplicate the user never created. A material
+      // ARRAY is stashed as the original array instance, for the same reason.
       if (current) stash.set(meshPath, current);
-      mesh.material = shared;
+      // Multi-material mesh: paint every slot, keep the array — its
+      // `geometry.groups` index into it, so collapsing it to one material
+      // would drop every group but the first from rendering.
+      mesh.material = Array.isArray(current) ? current.map(() => shared) : shared;
     }
     if (stash.size > 0) this._materialTrash.set(op.id, stash);
     this.viewer.markShadowsDirty();
@@ -863,6 +1287,155 @@ export class AssetExecutorContext {
     this.viewer.markShadowsDirty();
   }
 
+  // ─── replaceNodeGeometry (plan-621) ───────────────────────────────────
+
+  /**
+   * Swap the node's mesh geometry for `op.sha256`. Source, in order: the
+   * document's payload (fresh apply), the geometry the inverse displaced (redo),
+   * the CAD-GLB cache (redo after a save, draft replay). The displaced geometry
+   * is stashed under the op id so undo restores the EXACT instance.
+   *
+   * A node that no longer resolves to one mesh is skipped with a warning — the
+   * stale-op tolerance of `transformNode`/`setMaterial`; the document validates
+   * a fresh op before it is ever queued. A cache miss throws
+   * {@link CadGeometryUnavailableError}, which replay collects.
+   */
+  private async _replaceGeometryForward(op: ReplaceNodeGeometryOp): Promise<void> {
+    const mesh = this._geometryTarget(op);
+    const payload = this._geometryPayloads.get(op.id) ?? null;
+    this._geometryPayloads.delete(op.id);
+    if (!mesh) {
+      if (payload) this._disposeOwnedGeometry(payload);
+      return;
+    }
+    let entry = this._geometryStash.get(op.id);
+    let geometry: BufferGeometry | null = payload;
+    if (!geometry && entry?.next) {
+      geometry = entry.next;
+      entry.next = null;
+    }
+    geometry ??= await this._geometryFromCache(op, op.sha256);
+    this._geometryKeys.set(geometry, { sha256: op.sha256, quality: op.quality, converter: op.converter });
+    const displaced = this._installGeometry(mesh, geometry);
+    for (const path of op.sharedNodePaths ?? []) {
+      const user = this._geometryTarget({ ...op, nodePath: path });
+      if (user) this._installGeometry(user, geometry);
+    }
+    if (displaced === geometry) return;
+    if (!entry) {
+      entry = { prev: null, next: null };
+      this._geometryStash.set(op.id, entry);
+    }
+    entry.prev = displaced;
+  }
+
+  /**
+   * Put the previous geometry back: the instance the forward displaced, or —
+   * after a save flushed it — `op.prevSha256` from the CAD-GLB cache. A miss
+   * REJECTS (the undo fails and the entry stays on the undo stack); it is not
+   * collected like a replay miss, because an undo that silently does nothing
+   * would part the tree from its history.
+   */
+  private async _replaceGeometryInverse(op: ReplaceNodeGeometryOp): Promise<void> {
+    const mesh = this._geometryTarget(op);
+    if (!mesh) return;
+    let entry = this._geometryStash.get(op.id);
+    let geometry = entry?.prev ?? null;
+    if (geometry) entry!.prev = null;
+    else geometry = await this._geometryFromCache(op, op.prevSha256);
+    this._geometryKeys.set(geometry, { sha256: op.prevSha256, quality: op.quality, converter: op.converter });
+    const displaced = this._installGeometry(mesh, geometry);
+    for (const path of op.sharedNodePaths ?? []) {
+      const user = this._geometryTarget({ ...op, nodePath: path });
+      if (user) this._installGeometry(user, geometry);
+    }
+    if (displaced === geometry) return;
+    if (!entry) {
+      entry = { prev: null, next: null };
+      this._geometryStash.set(op.id, entry);
+    }
+    entry.next = displaced;
+  }
+
+  /** The one mesh `op` targets, or null (warned). */
+  private _geometryTarget(op: ReplaceNodeGeometryOp): Mesh | null {
+    const node = this._node(op.nodePath);
+    const mesh = node ? singleMeshOf(node) : null;
+    if (!mesh) {
+      console.warn(
+        `[asset-edits] replaceNodeGeometry skipped: "${op.nodePath}" ` +
+        (node ? 'does not resolve to exactly one mesh' : 'not found') + ` (op ${op.id})`,
+      );
+    }
+    return mesh;
+  }
+
+  /** Parse the geometry cached under `sha` — or throw the collected-on-replay error. */
+  private async _geometryFromCache(op: ReplaceNodeGeometryOp, sha: string): Promise<BufferGeometry> {
+    const bytes = await getCadGlb(sha, op.quality, op.converter);
+    if (!bytes) {
+      throw new CadGeometryUnavailableError({
+        File: leaf(op.nodePath), Sha256: sha, Quality: op.quality,
+        ImportScaleFactor: 0.001, ZIsUpVector: false, Converter: op.converter,
+      }, `the geometry of "${op.nodePath}" is no longer in the CAD-GLB cache`);
+    }
+    const geometry = await geometryFromGlb(bytes);
+    this._ownedGeometries.add(geometry);
+    return geometry;
+  }
+
+  /**
+   * `mesh.geometry = geometry`, and everything that hangs on it: bounds, the
+   * world matrices (unfrozen exactly like `_applyTransform` — editor loads freeze
+   * static matrices), pick membership and the mesh's local BVH. Returns the
+   * displaced geometry. The material, the node and its components stay.
+   */
+  private _installGeometry(mesh: Mesh, geometry: BufferGeometry): BufferGeometry {
+    const displaced = mesh.geometry as BufferGeometry;
+    if (displaced === geometry) return displaced;
+    mesh.geometry = geometry;
+    if (!geometry.boundingBox) geometry.computeBoundingBox();
+    if (!geometry.boundingSphere) geometry.computeBoundingSphere();
+    ensureMovableTransform(mesh);
+    refreshWorldMatricesDeep(mesh);
+    // Membership is per MESH and survives the swap; the call only guarantees
+    // it (a mesh that was not pickable before is now). The BVH is per
+    // GEOMETRY: the new one has none until the background build lands — the
+    // native raycast covers it meanwhile, and it never hits the old triangles.
+    const pick = this.viewer.instancePickIndex;
+    if (pick) {
+      pick.addSubtree(mesh);
+      this.viewer.buildMeshBvhsAsync(mesh, () => mesh.geometry === geometry && !this._disposedGeometries.has(geometry));
+    }
+    this.viewer.markShadowsDirty();
+    this.viewer.markRenderDirty();
+    return displaced;
+  }
+
+  /** Dispose a geometry this context built — never one it did not (shared imports). */
+  private _disposeOwnedGeometry(geometry: BufferGeometry): void {
+    if (!this._ownedGeometries.has(geometry)) return;
+    if (this._disposedGeometries.has(geometry)) return;
+    // A later single-user replacement can leave a shared instance live on its
+    // other users, or held by another undo entry. Dispose only the last owner.
+    let live = false;
+    const inspect = (node: Object3D) => { if ((node as Mesh).geometry === geometry) live = true; };
+    this.viewer.currentModelRoot?.traverse(inspect);
+    this._trashGroup?.traverse(inspect);
+    if (live) return;
+    for (const entry of this._geometryStash.values()) {
+      if (entry.prev === geometry || entry.next === geometry) return;
+    }
+    for (const payload of this._geometryPayloads.values()) if (payload === geometry) return;
+    this._disposedGeometries.add(geometry);
+    try {
+      geometry.disposeBoundsTree?.();
+      geometry.dispose();
+    } catch (e) {
+      console.warn('[asset-edits] replaceNodeGeometry: geometry disposal failed:', e);
+    }
+  }
+
   // ─── importCad ────────────────────────────────────────────────────────
 
   private async _importCadForward(op: ImportCadOp): Promise<void> {
@@ -875,6 +1448,9 @@ export class AssetExecutorContext {
     }
 
     let root = this._cadPayloads.get(op.id) ?? null;
+    // Were these bytes addressed by the op's own cache key? A provider rebuild
+    // (below) is a fresh conversion that may never have reached the cache.
+    let keyedBytes = true;
     if (!root) {
       // Draft replay / redo after a trash flush. The converted GLB is the single
       // source of truth: read the cached bytes and parse them — no occt, no WASM
@@ -886,7 +1462,7 @@ export class AssetExecutorContext {
         // Cache evicted. A provider that kept the ORIGINAL CAD bytes can rebuild
         // them (and re-populate the GLB cache); the public build cannot.
         try {
-          bytes = (await getCadProvider(cadFormatOfName(op.cadlink.File))?.retessellate?.(op.cadlink)) ?? null;
+          bytes = (await getCadProvider(cadFormatOfName(op.cadlink.File))?.retessellate?.(op.cadlink, { modelRoot: assetRoot })) ?? null;
         } catch (e) {
           // The provider REFUSED (plan-561: e.g. the recorded converter is CONNECT and no
           // gateway is reachable — it never silently switches converters). Recoverable like
@@ -896,6 +1472,7 @@ export class AssetExecutorContext {
         // A rebuilt GLB is a fresh conversion and gets the same weld as an import.
         // Cached bytes are NOT welded here: they replay exactly as they were stored.
         if (bytes) bytes = weldImportedGlb(bytes, op.cadlink.File);
+        keyedBytes = false;
       }
       if (!bytes) throw new CadGeometryUnavailableError(op.cadlink);
       root = await parseGlbSubtree(bytes);
@@ -915,12 +1492,44 @@ export class AssetExecutorContext {
       );
     }
 
+    // plan-621: a single-mesh import IS its body's first geometry, addressable
+    // by the import's own cache key — a later `replaceNodeGeometry` on it gets
+    // its mandatory `prevSha256` from here without writing anything.
+    // (`geometryFromGlb` re-parses these bytes with the same compaction.)
+    if (keyedBytes) {
+      const meshes = meshesUnder(root);
+      if (meshes.length === 1) {
+        this._geometryKeys.set(meshes[0].geometry as BufferGeometry, {
+          sha256: op.cadlink.Sha256, quality: op.cadlink.Quality, converter: op.cadlink.Converter,
+        });
+      }
+    }
+
     root.name = leaf(op.rootPath);
     // Unique sibling names BEFORE registration — duplicate CAD part names
     // would collapse onto one registry path (picking would always resolve
     // the same instance). Runs on fresh imports AND cache replays, so live
     // paths stay identical across sessions.
     dedupeSiblingNames(root);
+    // plan-769 Phase 2 (F11): the CAD file's ids are relative to THAT file — a
+    // second import of the same file would bring the same ids into this document.
+    // Every imported node gets a fresh id from the op's map (keyed by its seed, so a
+    // cache re-parse of the same bytes maps the same way; a CADLink re-import has
+    // pre-filled the map with the ids of the matched old nodes).
+    // plan-2216: a parametric variant's explicitly named nodes carry deterministic
+    // `<familyId>:_Generated:<name>` identities that references (Grip.PartToGrip) and
+    // overrides address. Keep them (map to themselves) instead of minting fresh ids, so
+    // every regeneration and a draft replay produce the same ids. All other nodes
+    // (CAD-style seeds) are reidentified as usual.
+    let seededMap = op.idMap;
+    if (op.cadlink.Converter === 'parametric') {
+      seededMap = { ...(op.idMap ?? {}) };
+      root.traverse((n) => {
+        const id = identityIdOf(n);
+        if (id && id.includes(':_Generated:') && seededMap![id] === undefined) seededMap![id] = id;
+      });
+    }
+    op.idMap = reidentifySubtree(root, seededMap);
     applyTransform(root, op.transform);
     // Stamp the CADLink extras (kept across GLB save/load round-trips).
     const ud = root.userData as Record<string, unknown>;
@@ -1008,13 +1617,22 @@ export class AssetExecutorContext {
     return true;
   }
 
-  private _rename(nodePath: string, name: string): void {
+  /**
+   * `restoreOrigName` is the undo leg only (plan-765 F2): forward always
+   * deletes `userData._rvOrigName` — the user's name is what a save writes
+   * from now on, and a delete is idempotent, so redo is right too — and the
+   * inverse writes the recorded stamp back when there is one.
+   */
+  private _rename(nodePath: string, name: string, restoreOrigName?: string): void {
     const node = this._node(nodePath);
     if (!node) return;
     if (this._skipRootReplay(node, nodePath, 'renameNode')) return;
     node.name = name;
+    if (typeof restoreOrigName === 'string') node.userData[RV_ORIG_NAME_KEY] = restoreOrigName;
+    else delete node.userData[RV_ORIG_NAME_KEY];
     // Re-key every registered path under this subtree (nodes + components).
-    this.viewer.registry?.recomputePathsForSubtrees([node]);
+    const rekeyed = this.viewer.registry?.recomputePathsForSubtrees([node]);
+    if (rekeyed) this._noteRemap(rekeyed.remap);
     // plan-589 spike: the signals of the subtree follow (node identity -> new path).
     this._syncSignals(node);
     // Cached pick paths are stale — re-resolve lazily on the next hit.
@@ -1029,6 +1647,7 @@ export class AssetExecutorContext {
     if (!node || !node.parent) return;
     const parent = node.parent;
     const childIndex = parent.children.indexOf(node);
+    const components = this._componentRegistrationsOf(node);
     this.viewer.registry?.unregisterSubtree(node);
     // MANDATORY, not an optimization: a trashed mesh left in the pick index
     // with a cached path would alias a node later created at the same path.
@@ -1036,7 +1655,7 @@ export class AssetExecutorContext {
     // Trashed nodes leave their groups (undo re-attaches them below).
     if (syncSubtreeGroups(this.viewer, node, 'detach')) this._emitGroupsChanged();
     this._ensureTrashGroup().add(node);
-    this._trash.set(key, { node, parent, childIndex });
+    this._trash.set(key, { node, parent, childIndex, components });
     // plan-589 spike: the trashed subtree is unregistered -> its signals are released.
     this._syncSignals(node);
     this.viewer.markShadowsDirty();
@@ -1046,14 +1665,27 @@ export class AssetExecutorContext {
     const entry = this._trash.get(key);
     if (!entry) return;
     this._trash.delete(key);
-    const { node, parent, childIndex } = entry;
+    const { node, parent, childIndex, components } = entry;
     parent.add(node);
     // Restore the original sibling position (add() appends).
     const arr = parent.children;
     arr.splice(arr.indexOf(node), 1);
     arr.splice(Math.min(childIndex, arr.length), 0, node);
     node.updateMatrixWorld(true);
+    // Same object, same userData → the SAME ids come back (plan-769 Phase 2:
+    // undo of a delete restores the identity; references to it resolve again).
     this._registerSubtree(node);
+    this._registerAuthoredAliases(node);
+    // The SAME component instances come back with their nodes (the trash parks
+    // them alive, it never disposes them), filed at the path each node has now.
+    const registry = this.viewer.registry;
+    if (registry && components) {
+      for (const { node: owner, entries } of components) {
+        const path = registry.getPathForNode(owner);
+        if (!path) continue;
+        for (const [type, instance] of entries) registry.register(type, path, instance);
+      }
+    }
     this._syncSignals(node);
     // Fresh index entries resolve lazily on the next pick (epoch 0).
     this.viewer.instancePickIndex?.addSubtree(node);
@@ -1186,6 +1818,9 @@ export class AssetExecutorContext {
         : (source.material as Material);
       const part = new Mesh(partGeometry, material);
       part.name = op.childNames[i];
+      // plan-769 Phase 2 (F11): every part is a new node with a new id (the Group
+      // keeps the source mesh's identity — it IS that node, re-formed).
+      assignRuntimeIdentity(part, mintFromIdMap(this._idMapOf(op), `part:${i}`));
       part.castShadow = source.castShadow;
       part.receiveShadow = source.receiveShadow;
       group.add(part);
@@ -1666,6 +2301,9 @@ export class AssetExecutorContext {
         rootOutput = mesh;
         outputs.push({ node: mesh, targetParent: null, originOwner: root });
       } else {
+        // plan-769 Phase 2 (F11): a child output is a new node with a new id (the
+        // root output keeps the root's identity — it replaces that node).
+        assignRuntimeIdentity(mesh, mintFromIdMap(this._idMapOf(op), `output:${i}`));
         const owner = spec.ownerPath === op.rootPath ? root : anchorByPath.get(spec.ownerPath)!;
         mesh.castShadow = owner.castShadow;
         mesh.receiveShadow = owner.receiveShadow;
@@ -1894,11 +2532,104 @@ export class AssetExecutorContext {
     }
     applyTransform(node, op.transform);
     node.updateMatrixWorld(true);
+    // plan-769 Phase 2 (F11): a new node gets a new identity — the op carries it.
+    assignRuntimeIdentity(node, mintFromIdMap(this._idMapOf(op), 'node'));
     this.viewer.registry?.registerNode(op.nodePath, node);
+    this.viewer.registry?.registerSubtreeIds?.(node);
     // A fresh empty node carries no meshes yet, but children added later
     // (reparent) index via their own ops; keep membership consistent anyway.
     this.viewer.instancePickIndex?.addSubtree(node);
     this.viewer.markRenderDirty();
+  }
+
+  // ─── clone (plan-641 Phase 3) ─────────────────────────────────────────
+
+  /**
+   * Copy the live source subtree under the parent of `op.nodePath`.
+   *
+   * Like `createNode`, a missing source or parent is warned about and skipped
+   * (draft replay must not throw); the command checks both before it creates
+   * the op. Components on the copy are constructed live (Drive first on every
+   * node, so a drive behavior finds its drive), signals and groups follow.
+   */
+  private _cloneNodeForward(op: CloneNodeOp): void {
+    const key = cloneTrashKey(op.id);
+    if (this._trash.has(key)) return this._restoreFromTrash(key);
+    const source = this._node(op.sourcePath);
+    if (!source) {
+      console.warn(`[asset-edits] cloneNode: source "${op.sourcePath}" not found (op ${op.id})`);
+      return;
+    }
+    const parentPath = dirname(op.nodePath);
+    const parent = parentPath ? this._node(parentPath) : this.viewer.currentModelRoot;
+    if (!parent) {
+      console.warn(`[asset-edits] cloneNode: parent "${parentPath}" not found (op ${op.id})`);
+      return;
+    }
+    for (const mesh of meshesUnder(source)) {
+      if (mesh.geometry && geometryBuffersDetached(mesh.geometry as BufferGeometry)) {
+        throw new Error(`cloneNode: the geometry of "${mesh.name}" is being indexed right now — retry in a moment`);
+      }
+    }
+    // plan-769 Phase 2 (F10, D9 — Unity Ctrl+D): fresh ids for every copied node
+    // (the op's id map makes them replay-stable), and a stored reference inside the
+    // copy that named a node of the copied subtree follows the copy.
+    const registry = this.viewer.registry;
+    const { root: copy, idMap } = instantiateSubtree(source, {
+      ids: 'fresh',
+      idMap: op.idMap,
+      clone: cloneSubtreeDeep,
+      attach: (c) => {
+        c.name = leaf(op.nodePath);
+        // The copy's name is the user's, not the source's authored one (the rename
+        // rule, plan-765 F2): a save must not write the copy back under the source's name.
+        if (c.name !== source.name) delete c.userData[RV_ORIG_NAME_KEY];
+        parent.add(c);
+        if (op.index !== undefined) {
+          const arr = parent.children;
+          arr.splice(arr.indexOf(c), 1);
+          arr.splice(Math.min(op.index, arr.length), 0, c);
+        }
+        refreshWorldMatricesDeep(c);
+      },
+      resolveTarget: registry ? (sourceReferrer, ref) => copiedReferenceTarget(registry, sourceReferrer, ref) : undefined,
+      spellPath: ({ copyTarget, defaultPath, copyReferrer }) => {
+        if (defaultPath) return defaultPath;
+        // The copy has another parent: the ONE writer's spelling (plan-765 F3),
+        // relative to the scope the copy now lives in.
+        if (!registry) return null;
+        const scopeRoot = registry.enclosingScope(copyReferrer).root;
+        if (authoredPathIsAmbiguous(copyTarget, scopeRoot)) return null;
+        return authoredAssetRelativePath(copyTarget, scopeRoot);
+      },
+    });
+    op.idMap = idMap;
+    this._registerSubtree(copy);
+    // The copy's AUTHORED spellings (`_rvOrigName`, copied with the userData) as
+    // aliases: a reference that follows the copy keeps the spelling it was written in.
+    this._registerAuthoredAliases(copy);
+    const deps = this._runtimeDeps();
+    if (deps) {
+      copy.traverse((node) => {
+        const rv = (node.userData as Record<string, unknown>)['realvirtual'] as Record<string, unknown> | undefined;
+        if (!rv || typeof rv !== 'object') return;
+        const keys = Object.keys(rv).sort((a, b) => Number(!/^Drive(_\d+)?$/.test(a)) - Number(!/^Drive(_\d+)?$/.test(b)));
+        for (const type of keys) {
+          const fields = rv[type];
+          if (!fields || typeof fields !== 'object' || Array.isArray(fields)) continue;
+          try {
+            constructComponentOnNode(deps, node, type, { ...(fields as Record<string, unknown>) });
+          } catch (e) {
+            console.warn(`[asset-edits] cloneNode: ${type} on "${node.name}" not constructed:`, e);
+          }
+        }
+      });
+    }
+    this._syncSignals(copy);
+    if (syncSubtreeGroups(this.viewer, copy, 'attach')) this._emitGroupsChanged();
+    this.viewer.instancePickIndex?.addSubtree(copy);
+    if (this.viewer.instancePickIndex) this.viewer.buildMeshBvhsAsync(copy);
+    this.viewer.markShadowsDirty();
   }
 
   /** Move a subtree under a new parent at a given sibling index with the
@@ -1929,11 +2660,16 @@ export class AssetExecutorContext {
     }
     applyTransform(node, transform);
     this._refreshWorldMatrix(node);
+    // A moved subtree may hold materialised placements: their nesting follows
+    // the new parent (plan-774 — highlight / bounds of the enclosing placement).
+    this.viewer.bakeRegistry?.relinkSubtree?.(node);
     // The world-preserving re-parent changed the LOCAL pose a live Drive caches
     // as home — refresh it while the registry still knows the OLD path.
     this._refreshDriveBase(nodePath);
-    // Re-key registered paths under the moved subtree AND carry every path-based
-    // reference (signal bindings, serialized ref paths) across the move.
+    // Re-key registered paths under the moved subtree and carry the signal
+    // store's path registrations across the move. Stored references in other
+    // nodes' extras are NOT touched here — that is the reference rewrite the
+    // document plans as setField steps of the same composite (plan-610).
     this._remapSubtreePaths(node);
     this._syncSignals(node);
     // Cached pick paths are stale — re-resolve lazily on the next hit.
@@ -1943,7 +2679,11 @@ export class AssetExecutorContext {
 
   /** Re-key every registered path under a moved subtree and carry the signal
    *  store's path registrations across the move, so a signal owned by a dragged
-   *  node still resolves under its new path (name↔path stay consistent).
+   *  node still resolves under its new path (name↔path stay consistent). Only
+   *  REGISTRY and SIGNAL-STORE keys move here; serialized reference paths in
+   *  `userData.realvirtual` are rewritten by the document's reference-rewrite
+   *  composite (plan-610), and the re-key's remap feeds that composite's
+   *  re-bind session ({@link _noteRemap}).
    *
    *  Unlike the loader's Phase-8c handling this does NOT register the old paths
    *  as aliases: at load time serialized references still point at the authoring
@@ -1955,6 +2695,7 @@ export class AssetExecutorContext {
     const registry = this.viewer.registry;
     if (!registry) return;
     const { remap } = registry.recomputePathsForSubtrees([node]);
+    this._noteRemap(remap);
     if (remap.size === 0) return;
     this.viewer.signalStore?.remapPaths(remap);
   }
@@ -1976,6 +2717,8 @@ export class AssetExecutorContext {
     if (visible) delete rv['Hidden'];
     else rv['Hidden'] = true;
     ud['realvirtual'] = rv;
+    // plan-766 F11: editor arena instances follow the chain visibility.
+    this.viewer.editorArena?.bumpVisibility();
     this.viewer.markShadowsDirty();
     this.viewer.markRenderDirty();
   }
@@ -1990,7 +2733,7 @@ export class AssetExecutorContext {
     nodePath: string, componentType: string, fields: Record<string, unknown>,
   ): void {
     const node = this._node(nodePath);
-    if (!node) return;
+    if (!node || isUnsafeObjectKey(componentType)) return;
     const ud = node.userData as Record<string, unknown>;
     const rv = { ...(ud['realvirtual'] as Record<string, unknown> | undefined) };
     rv[componentType] = { ...fields };
@@ -2063,17 +2806,423 @@ export class AssetExecutorContext {
   // ─── field ops ────────────────────────────────────────────────────────
 
   private _setField(op: AssetSetFieldOp): void {
-    writeUserDataField(this.viewer, op.nodePath, op.componentType, op.fieldName, op.value);
-    reapplySchemaForComponent(this.viewer, op.nodePath, op.componentType);
+    // plan-765 F3: a reference-typed value is stored in AUTHORED names. Inside a
+    // plan-610 reference-rewrite range the rewrite planner already chose the
+    // spelling of each step (F2b) — those steps are written verbatim.
+    const spelled = this._refRebind ? op.value : this._authoredReferenceValue(op);
+    // plan-769 Phase 3b: a ComponentReference the writer can pin is stored as its
+    // ADDRESS (`#id`), in the live extras too — rename/move never touch it again.
+    // Inside a plan-610 rewrite range the planner's steps are written verbatim (they
+    // re-spell PATH references a rename/move touched; address references need none).
+    const reg = this.viewer.registry;
+    const owner = reg && !this._refRebind ? this._node(op.nodePath) : null;
+    const value = reg && owner ? addressedReferenceValue(reg, owner, op.componentType, op.fieldName, spelled) : spelled;
+    // plan-774 F1: inside placed content the edit IS an instance override — the
+    // save prunes everything under the reference node, so the value must also
+    // land in `AssetOverrides.byAddress` of the OUTERMOST reference, spelled
+    // exactly as the live node got it, inside this same op.
+    const placed = this._instanceOverrideTarget(op.nodePath);
+    // The asset's own value (for a later Revert) when no override holds the
+    // field yet: the live value before this edit. Interactive ops carry it as
+    // `op.prev` (the inspector writes userData optimistically BEFORE the op
+    // runs, so userData is already the new value); a REPLAYED op's `prev` is
+    // history, not the tree it lands on — there nothing wrote ahead, so the
+    // node's current userData is the truth.
+    const liveBefore: OverrideBase | null = !placed ? null
+      : this.replaying ? this._liveFieldState(placed.node, op.componentType, op.fieldName)
+        : op.prev === undefined ? { has: false } : { has: true, value: op.prev };
+    writeUserDataField(this.viewer, op.nodePath, op.componentType, op.fieldName, value);
+    if (placed) {
+      // One read-modify-write of the record; what it held before is the undo capture.
+      const before = writeOverride(placed.target.referenceNode, placed.target.address, op.componentType, op.fieldName, value);
+      this._overridePrev.set(op.id, before);
+      if (!before.has && liveBefore) recordOverrideBase(placed.node, op.componentType, op.fieldName, liveBefore);
+    }
+    this._reapplyOrDefer(op.nodePath, op.componentType);
     this._syncSignals(this._node(op.nodePath));
     this.viewer.markRenderDirty();
   }
 
+  /**
+   * plan-765 F3: `op.value` with every reference path re-spelled by the ONE
+   * writer ({@link authoredAssetRelativePath}) when the field is reference-typed
+   * in the rv-ODT schema (`ComponentReference` or an array of them) and the
+   * written path pins exactly one node: a deterministic lookup stage (`exact` /
+   * `alias` / `space` — never the guessing `suffix` / `sanitized` /
+   * `name-in-scope` fallbacks) inside the owner's reference scope, whose
+   * authored path is not shared by a sibling twin. An MCP or script author that
+   * sends the loader's `Gripper_rv3/NL6501_1` then stores `Gripper_rv3/NL6:501`,
+   * which survives save + reload. Anything else is written as given, and the
+   * reference audit reports it. The op itself is not touched: replay re-spells
+   * deterministically, and undo writes `op.prev` verbatim (`_inverse`).
+   */
+  private _authoredReferenceValue(op: AssetSetFieldOp): unknown {
+    const prop = getRawOdtDef(op.componentType)?.properties?.[op.fieldName] as
+      (Record<string, unknown> & { items?: Record<string, unknown> }) | undefined;
+    const isRefDef = (p: Record<string, unknown> | undefined): boolean =>
+      typeof p?.['$ref'] === 'string' && (p['$ref'] as string).endsWith('/ComponentReference');
+    const single = isRefDef(prop);
+    const array = !single && prop?.['type'] === 'array' && isRefDef(prop.items);
+    if (!single && !array) return op.value;
+    const reg = this.viewer.registry;
+    const owner = this._node(op.nodePath);
+    if (!reg || !owner) return op.value;
+    const scope = reg.enclosingScope(owner);
+    const respell = (v: unknown): unknown => {
+      // An address-form reference (plan-769 Phase 3) names its target by id — there
+      // is no spelling to choose.
+      if (!isComponentReference(v) || typeof v.path !== 'string') return v;
+      const hit = reg.resolveWithStage({ path: v.path }, typeof v.componentType === 'string' ? v.componentType : '', scope);
+      if (!hit || (hit.stage !== 'exact' && hit.stage !== 'alias' && hit.stage !== 'space')) return v;
+      if (authoredPathIsAmbiguous(hit.node, scope.root)) return v;
+      const authored = authoredAssetRelativePath(hit.node, scope.root);
+      return authored && authored !== v.path ? { ...v, path: authored } : v;
+    };
+    if (single) return respell(op.value);
+    if (!Array.isArray(op.value)) return op.value;
+    let changed = false;
+    const out = op.value.map((e) => { const r = respell(e); if (r !== e) changed = true; return r; });
+    return changed ? out : op.value;
+  }
+
   private _unsetField(op: AssetUnsetFieldOp): void {
-    deleteUserDataField(this.viewer, op.nodePath, op.componentType, op.fieldName);
-    reapplySchemaForComponent(this.viewer, op.nodePath, op.componentType);
+    const placed = this._instanceOverrideTarget(op.nodePath);
+    if (!placed) {
+      deleteUserDataField(this.viewer, op.nodePath, op.componentType, op.fieldName);
+    } else {
+      // plan-774 F1: on placed content an unset is a Revert of the instance
+      // override — the override goes, and the live node returns to the asset's
+      // own value where it is known (recorded at load or at the first edit).
+      const base = overrideBaseOf(placed.node, op.componentType, op.fieldName);
+      const before = writeOverride(placed.target.referenceNode, placed.target.address, op.componentType, op.fieldName, undefined);
+      this._overridePrev.set(op.id, before);
+      if (base?.has) {
+        writeUserDataField(this.viewer, op.nodePath, op.componentType, op.fieldName, base.value);
+      } else if (base || before.has) {
+        // The asset does not set the field (known), or an override held it and
+        // the asset's value is unknown: the field goes, as on own content.
+        deleteUserDataField(this.viewer, op.nodePath, op.componentType, op.fieldName);
+      }
+      // else: nothing overrode the field and its base is unknown — the live
+      // value IS the asset's value; deleting it would make the live tree and
+      // the saved file disagree. A no-op Revert.
+    }
+    this._reapplyOrDefer(op.nodePath, op.componentType);
     this._syncSignals(this._node(op.nodePath));
     this.viewer.markRenderDirty();
+  }
+
+  // ─── plan-774 F1: instance overrides of placed content ─────────────────
+
+  /**
+   * The outermost reference that owns an override for the node at `nodePath`,
+   * with its address — null for the open file's own content (and for a node
+   * that does not resolve).
+   */
+  private _instanceOverrideTarget(nodePath: string): { node: Object3D; target: OverrideTarget } | null {
+    const node = this._node(nodePath);
+    if (!node) return null;
+    const target = overrideTargetOf(node, this.viewer.currentModelRoot ?? null);
+    return target ? { node, target } : null;
+  }
+
+  /** What the node's live extras hold for one field right now (`has: false` = not set). */
+  private _liveFieldState(node: Object3D, componentType: string, fieldName: string): OverrideBase {
+    const fields = (node.userData?.realvirtual as Record<string, unknown> | undefined)?.[componentType];
+    return fields && typeof fields === 'object' && fieldName in fields
+      ? { has: true, value: (fields as Record<string, unknown>)[fieldName] }
+      : { has: false };
+  }
+
+  /**
+   * The inverse half: put back the override the forward step found — or its
+   * absence. Same writer as forward. Without a capture (an op this executor
+   * never applied forward) the previous live value is the best available
+   * statement of the previous override — unless it IS the asset's own value
+   * (the recorded base), which no override held: then there was none.
+   */
+  private _restoreInstanceOverride(op: AssetSetFieldOp | AssetUnsetFieldOp): void {
+    const placed = this._instanceOverrideTarget(op.nodePath);
+    if (!placed) return;
+    const prev = this._overridePrev.get(op.id);
+    let value: unknown;
+    if (prev) {
+      value = prev.has ? prev.value : undefined;
+    } else {
+      const base = overrideBaseOf(placed.node, op.componentType, op.fieldName);
+      const isBase = !!base && (base.has
+        ? op.prev !== undefined && jsonEqual(base.value, op.prev)
+        : op.prev === undefined);
+      value = isBase ? undefined : op.prev;
+    }
+    writeOverride(placed.target.referenceNode, placed.target.address, op.componentType, op.fieldName, value);
+  }
+
+  // ─── plan-610: deferred reference re-binding ─────────────────────────
+
+  /**
+   * Open re-bind session of the running reference-rewrite RANGE (null = none).
+   * Holds the referrers whose schema re-apply was deferred (by node IDENTITY —
+   * their paths change inside the range) and the composed old→new path remap
+   * of every rename/reparent step.
+   */
+  private _refRebind: {
+    deferred: Map<Object3D, Set<string>>;
+    remap: Map<string, string>;
+    /** Reverse of `remap`: current path → original path. */
+    origOf: Map<string, string>;
+  } | null = null;
+
+  /**
+   * Diagnostics: what the last re-bind flush did — deferred re-applies, foreign
+   * referrers re-bound, distinct stale paths, failed referrers.
+   */
+  lastRefRebind: { deferred: number; foreign: number; stalePaths: number; failed: number } | null = null;
+
+  /** Open a session; false when one is already open (it then collects for both). */
+  private _openRefRebind(): boolean {
+    if (this._refRebind) return false;
+    this._refRebind = { deferred: new Map(), remap: new Map(), origOf: new Map() };
+    return true;
+  }
+
+  /**
+   * The schema re-apply of a written field: immediate (unscoped, as always)
+   * outside a re-bind session; inside one only the extras are written now and
+   * applySchema + resolveRefs + reapplyConfig run ONCE when the range is left.
+   * reapplyConfig moves with resolveRefs on purpose — Lamp (`_rebind`) and
+   * EnergyChain (`_resolveRefs`) read their reference fields there.
+   */
+  private _reapplyOrDefer(nodePath: string, componentType: string): void {
+    const session = this._refRebind;
+    const node = session ? this._node(nodePath) : null;
+    if (!session || !node) {
+      // A component re-apply may measure the node: never against matrices a
+      // bulk move still owes (plan-610: moves followed by setField batch).
+      this._drainMatrixBatch();
+      reapplySchemaForComponent(this.viewer, nodePath, componentType);
+      return;
+    }
+    let types = session.deferred.get(node);
+    if (!types) session.deferred.set(node, (types = new Set()));
+    types.add(componentType);
+  }
+
+  /**
+   * Fold a step's old→new remap into the session's composed remap (A→B→C =
+   * A→C, A→B→A = A→A, dropped at the flush). The reverse index `origOf` is
+   * maintained incrementally — rebuilding it per step made a 434-move batch
+   * quadratic in the number of re-keyed paths.
+   */
+  private _noteRemap(remap: ReadonlyMap<string, string>): void {
+    const session = this._refRebind;
+    if (!session || remap.size === 0) return;
+    const { remap: composed, origOf } = session;
+    for (const [from, to] of remap) {
+      // A path an earlier step produced that moves again: carry the ORIGINAL key.
+      const orig = origOf.get(from);
+      if (orig !== undefined) {
+        origOf.delete(from);
+        composed.set(orig, to);
+        origOf.set(to, orig);
+      } else if (!composed.has(from)) {
+        composed.set(from, to);
+        origOf.set(to, from);
+      }
+    }
+  }
+
+  /**
+   * Close the open session: re-apply every deferred referrer with its
+   * AUTHORING scope, then re-bind foreign referrers — components whose extras
+   * were NOT written but whose RESOLVED value is an address string under a
+   * path that moved.
+   *
+   * Failures are collected PER REFERRER and never stop the flush: every other
+   * referrer and the foreign scan still run. `strict` (the main pass of a
+   * composite) then throws {@link ReferenceRebindError}, which rolls the
+   * composite back; otherwise (a rollback's own flush) they are only logged.
+   */
+  private _closeRefRebind(compositeId: string, strict: boolean): void {
+    const session = this._refRebind;
+    this._refRebind = null;
+    const reg = this.viewer.registry;
+    if (!session || !reg) return;
+    this._drainMatrixBatch();
+    const failures: RebindFailure[] = [];
+    let deferred = 0;
+    for (const [node, types] of session.deferred) {
+      const path = reg.getPathForNode(node);
+      if (!path) continue; // trashed inside the range
+      for (const type of types) {
+        try {
+          reapplySchemaForComponent(this.viewer, path, type, { scope: node });
+          deferred++;
+        } catch (e) {
+          failures.push({ path, componentType: type, error: e });
+        }
+      }
+    }
+    const stale = new Map<string, string>();
+    for (const [from, to] of session.remap) if (from !== to) stale.set(from, to);
+    let foreign = 0;
+    if (stale.size > 0) {
+      try {
+        foreign = this._rebindForeignReferrers(stale, session.deferred, failures);
+      } catch (e) {
+        failures.push({ path: '', componentType: '', error: e });
+      }
+    }
+    // Stored references (and possibly paths) changed: "referenced by" is stale.
+    reg.invalidateReverseRefs();
+    this.lastRefRebind = { deferred, foreign, stalePaths: stale.size, failed: failures.length };
+    if (failures.length === 0) return;
+    const err = new ReferenceRebindError(compositeId, failures);
+    if (strict) throw err;
+    console.error(`[asset-edits] ${err.message} (during a rollback — not retried)`, failures);
+  }
+
+  /**
+   * Re-bind FOREIGN referrers — components whose extras the range did not
+   * write (e.g. content of a placed asset) but whose RESOLVED value is an
+   * address string (scalar or array element) under a path that moved.
+   *
+   * plan-614 F1 — the target IDENTITY is kept, nothing is re-resolved:
+   *
+   * - The address a field held BEFORE the flush is the identity of its target.
+   *   The session's composed remap (`stale`, A→B→C already folded to A→C,
+   *   A→B→A already dropped) is applied to it ONCE and exactly that address is
+   *   set. Re-resolving the unchanged extras instead (the plan-610 form) let an
+   *   old absolute spelling land on a FOREIGN node by suffix after a move — and
+   *   undo could not repair it, because the foreign address is no stale key.
+   * - Only the affected fields / array elements change. Every other field of
+   *   the component — instance references, untouched array elements, plain
+   *   values — keeps its value bit for bit (an array without an affected
+   *   element keeps even its identity).
+   * - Per component the old values are snapshotted before the first write and
+   *   the change is ATOMIC: a component is either fully re-bound or untouched.
+   * - Refuse, never guess: when the remapped address of any affected field has
+   *   no live registry node (the target was trashed inside the range, or the
+   *   remap names nothing), the component is left untouched and a failure with
+   *   the reason is recorded — the strict flush then throws
+   *   {@link ReferenceRebindError} and the composite is rolled back.
+   * - Undo / redo / rollback need no state of their own: the inverse walk
+   *   re-keys the paths the other way round, its session's remap maps the
+   *   re-bound address back, and this very routine sets it — so after undo the
+   *   field points at its OWN target again.
+   *
+   * Instance-valued references (Drive, Sensor, node) are left alone: they
+   * follow the node by identity across rename/move.
+   *
+   * Cost: one registry walk, O(components), per flushed range.
+   */
+  private _rebindForeignReferrers(
+    stale: ReadonlyMap<string, string>,
+    handled: ReadonlyMap<Object3D, ReadonlySet<string>>,
+    failures: RebindFailure[],
+  ): number {
+    const reg = this.viewer.registry;
+    if (!reg) return 0;
+    let count = 0;
+    const isStale = (v: unknown): v is string => typeof v === 'string' && stale.has(v);
+    const isLive = (p: unknown): p is string => {
+      if (typeof p !== 'string' || p === '') return false;
+      const n = reg.getNode(p);
+      return !!n && reg.getPathForNode(n) === p;
+    };
+    const isRefField = (raw: unknown): boolean =>
+      isComponentReference(raw) || (Array.isArray(raw) && raw.some((e) => isComponentReference(e)));
+
+    reg.forEachNode((path, node) => {
+      if (reg.getPathForNode(node) !== path) return; // alias entry
+      const done = handled.get(node);
+      const extrasAll = node.userData?.realvirtual as Record<string, Record<string, unknown>> | undefined;
+      if (!extrasAll) return;
+      for (const [type, instance] of reg.getComponentsAt(path)) {
+        if (done?.has(type)) continue;
+        if (!instance || typeof instance !== 'object') continue;
+        const inst = instance as Record<string, unknown>;
+        const extras = extrasAll[type];
+        if (!extras || typeof extras !== 'object') continue;
+
+        // Plan the change: per affected reference-backed field the snapshot
+        // (value before) and the remapped value. Nothing is written yet.
+        const snapshot = new Map<string, unknown>();
+        const next = new Map<string, unknown>();
+        const plan: { refusal: string | null } = { refusal: null };
+        const remapOnce = (key: string, held: string, index: number | null): string | null => {
+          const to = stale.get(held);
+          const where = index === null ? `${type}.${key}` : `${type}.${key}[${index}]`;
+          if (to === undefined) {
+            plan.refusal ??= `${where} held "${held}", which moved, but no remap target is known — refusing to guess`;
+            return null;
+          }
+          if (!isLive(to)) {
+            plan.refusal ??= `${where} held "${held}", which moved to "${to}" — no live node there, refusing to guess`;
+            return null;
+          }
+          return to;
+        };
+        for (const key of Object.keys(extras)) {
+          if (!isRefField(extras[key])) continue;
+          const held = inst[key];
+          if (isStale(held)) {
+            const to = remapOnce(key, held, null);
+            snapshot.set(key, held);
+            if (to !== null) next.set(key, to);
+          } else if (Array.isArray(held) && held.some(isStale)) {
+            const arr = held as unknown[];
+            const out = arr.slice();
+            for (let i = 0; i < arr.length; i++) {
+              const el: unknown = arr[i];
+              if (!isStale(el)) continue; // neighbour element: untouched
+              const to = remapOnce(key, el, i);
+              if (to !== null) out[i] = to;
+            }
+            snapshot.set(key, held);
+            next.set(key, out);
+          }
+        }
+        if (snapshot.size === 0) continue;
+        if (plan.refusal !== null) {
+          // Atomic: the component is left exactly as it was (binding included).
+          failures.push({ path, componentType: type, error: new Error(plan.refusal) });
+          continue;
+        }
+
+        try {
+          for (const [key, value] of next) inst[key] = value;
+        } catch (e) {
+          // A setter refused the value: put the snapshot back, report.
+          for (const [key, value] of snapshot) {
+            try { inst[key] = value; } catch { /* best effort — reported below */ }
+          }
+          failures.push({ path, componentType: type, error: e });
+          continue;
+        }
+        try {
+          // Move the consumer's listeners (Lamp `_rebind`, …) onto the new addresses.
+          const c = inst as { reapplyConfig?: () => void };
+          if (typeof c.reapplyConfig === 'function') c.reapplyConfig();
+          count++;
+        } catch (e) {
+          // The fields keep their re-bound values on purpose: a rollback's
+          // inverse remap maps exactly these back and re-runs reapplyConfig
+          // against live paths (restoring the old, now dead addresses here
+          // would subscribe to nothing).
+          failures.push({ path, componentType: type, error: e });
+        }
+      }
+    });
+    return count;
+  }
+
+  /** Run the matrix refresh a bulk move still owes, keeping the batch open. */
+  private _drainMatrixBatch(): void {
+    const batch = this._matrixBatch;
+    if (!batch || batch.size === 0) return;
+    for (const parent of batch) parent.updateMatrixWorld(true);
+    batch.clear();
   }
 
   // ─── helpers ──────────────────────────────────────────────────────────
@@ -2103,12 +3252,59 @@ export class AssetExecutorContext {
     }
   }
 
+  /** The registry's component entries of every node below `root` ({@link TrashEntry.components}). */
+  private _componentRegistrationsOf(root: Object3D): TrashEntry['components'] {
+    const registry = this.viewer.registry;
+    if (!registry) return undefined;
+    const out: NonNullable<TrashEntry['components']> = [];
+    root.traverse((n) => {
+      const path = registry.getPathForNode(n);
+      if (!path) return;
+      const entries = registry.getComponentsAt(path);
+      if (entries.length > 0) out.push({ node: n, entries });
+    });
+    return out;
+  }
+
   private _registerSubtree(root: Object3D): void {
     const registry = this.viewer.registry;
     if (!registry) return;
     root.traverse((child) => {
       registry.registerNode(NodeRegistry.computeNodePath(child), child);
     });
+    // plan-769 Phase 2 (F5): the id index follows every attach an op makes —
+    // create, clone, import, restore from the trash, a separate/merge rebuild —
+    // under the occurrence of the document the subtree landed in. The removal
+    // side is `unregisterSubtree` (detach to trash, teardown).
+    registry.registerSubtreeIds?.(root);
+  }
+
+  /**
+   * Publish the AUTHORED spellings (`userData._rvOrigName`) of a subtree an op
+   * attached as registry aliases — what the loader publishes for loaded nodes
+   * (`forEachNodeAlias`): a copy (plan-769 D9) or a subtree back from the trash
+   * resolves in the spelling its references are written in. `unregisterSubtree`
+   * takes them down again; a claimed path is never overwritten.
+   */
+  private _registerAuthoredAliases(root: Object3D): void {
+    const registry = this.viewer.registry;
+    if (!registry) return;
+    const renamed = new Map<Object3D, string>();
+    root.traverse((n) => {
+      const orig = n.userData?.[RV_ORIG_NAME_KEY];
+      if (typeof orig === 'string' && orig.length > 0 && orig !== n.name) renamed.set(n, orig);
+    });
+    if (renamed.size > 0) registerNodeAliasesInRegistry(renamed, registry);
+  }
+
+  /**
+   * plan-769 Phase 2: the op's id map, completed. A recorded op carries it (replay /
+   * redo after a trash flush give the same ids); the FIRST apply starts it empty and
+   * the map is written back onto the op before the document records it.
+   */
+  private _idMapOf(op: { idMap?: NodeIdMap }): NodeIdMap {
+    if (!op.idMap || typeof op.idMap !== 'object') op.idMap = {};
+    return op.idMap;
   }
 
   private _runtimeDeps(): RuntimeNodeDeps | null {
@@ -2135,6 +3331,20 @@ export class AssetExecutorContext {
 
 // ─── module helpers ───────────────────────────────────────────────────
 
+/**
+ * plan-769 Phase 2 (D9): the node a stored reference of `sourceReferrer` names, read
+ * exactly as the source reads it — the file's verdict for a reference the file
+ * carries (`readStoredRef`, never guessed), else (`legacy`: a path the web wrote) the
+ * registry's own chain relative to the referrer, exact stages only. A miss is null:
+ * the copy's reference then stays as written.
+ */
+function copiedReferenceTarget(registry: NodeRegistry, sourceReferrer: Object3D, ref: VisitedReference): Object3D | null {
+  // plan-769 Phase 3a: THE writer's read (`referenceTargetForWrite`, exact stages only) —
+  // the copy follows exactly the target a save would write for the source.
+  const t = referenceTargetForWrite(registry, sourceReferrer, ref.value, { exactOnly: true });
+  return t.status === 'resolved' ? t.node : null;
+}
+
 /** `BoxCollider` (with or without a `_N` dedup suffix). */
 function isBoxColliderKey(componentType: string): boolean {
   return componentType.replace(/_\d+$/, '') === 'BoxCollider';
@@ -2148,11 +3358,25 @@ function isDriveFamilyType(componentType: string): boolean {
 }
 
 /** A composite that only moves and renames nodes — the shape `reparentNodesBatch`
- *  produces, and the only one whose world-matrix refresh may be batched. */
+ *  produces — optionally FOLLOWED by setField/unsetField steps (plan-610: the
+ *  reference rewrite of a rename/move). The only shape whose world-matrix
+ *  refresh may be batched: the batch covers the move prefix, and the executor
+ *  drains it before any field re-apply runs (`_drainMatrixBatch`). */
 function isPureMoveComposite(op: RvAssetOp): boolean {
-  return op.kind === 'composite'
-    && op.ops.length > 1
-    && op.ops.every((child) => child.kind === 'reparentNode' || child.kind === 'renameNode');
+  if (op.kind !== 'composite' || op.ops.length <= 1) return false;
+  let moves = 0;
+  let inFields = false;
+  for (const child of op.ops) {
+    if (child.kind === 'reparentNode' || child.kind === 'renameNode') {
+      if (inFields) return false;
+      moves++;
+    } else if (child.kind === 'setField' || child.kind === 'unsetField') {
+      inFields = true;
+    } else {
+      return false;
+    }
+  }
+  return moves > 0;
 }
 
 /** Move an already-added child to a specific sibling slot (`add()` appends). */

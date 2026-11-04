@@ -289,7 +289,7 @@ describe('plan-582 Phase 1 — one role pass per bake (§2.4)', () => {
   });
 
   it('Test_Bake_ChunkCount_UnchangedAfterSplit', async () => {
-    // The draw-call contract (`doc-render-picking.md` § 1.3): a chunk is a
+    // The draw-call contract (`contract-bake-picking.md` § 1.3): a chunk is a
     // boundary × group-combination × material, and the split must not move one.
     // Measured on the pre-split code with this fixture: 5 chunks, these keys.
     const asset = await prepareAndBake(buildFixture(), ctxOf('chunk-count'));

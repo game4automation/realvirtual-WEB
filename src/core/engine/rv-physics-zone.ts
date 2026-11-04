@@ -40,6 +40,9 @@ import { getColliderExtras, isValidBoxDef } from './rv-collider-extras';
 import type { GizmoHandle, GizmoOverlayManager } from './rv-gizmo-manager';
 import { syncColliderGizmo } from './rv-collider-gizmo-sync';
 import type { PhysicsAABB, PhysicsZoneConfig } from './rv-physics-registry';
+import { PHYSICS_DEFAULT_SOFT_CCD_PREDICTION_M } from './rv-physics-constants';
+import { storedRefString } from './rv-stored-ref-label';
+import { buildLayerMask, getLayerRevision } from './rv-layers';
 
 // ─── Gizmo styling (plan-276 §3.2: cyan, semi-transparent wireframe) ───────
 
@@ -72,16 +75,14 @@ function aabbContains(outer: PhysicsAABB, inner: PhysicsAABB): boolean {
  * the Unity catch-all export may serialize `List<GameObject>` either way.
  * Anything else is dropped silently (defensive parsing, no throw).
  */
-export function parseStaticColliderPaths(raw: unknown): string[] {
+export function parseStaticColliderPaths(raw: unknown, owner?: Object3D | null): string[] {
   if (!Array.isArray(raw)) return [];
   const out: string[] = [];
   for (const item of raw) {
-    if (typeof item === 'string') {
-      if (item.length > 0) out.push(item);
-    } else if (item && typeof item === 'object') {
-      const path = (item as { path?: unknown }).path;
-      if (typeof path === 'string' && path.length > 0) out.push(path);
-    }
+    // plan-769 Phase 3: a web-saved `{ address }` / `{ unresolvedPath }` is kept as a
+    // label the zone's `readStoredRef` reads back (`resolveStaticCollider`).
+    const s = storedRefString(owner, item);
+    if (s) out.push(s);
   }
   return out;
 }
@@ -108,13 +109,20 @@ export class RVPhysicsZone implements RVComponent {
    * still be handed over — full containment would freeze it mid-air at the
    * zone edge. Disabled zones and zones without a resolved volume (WholeScene
    * before `applySceneBounds`) never win.
+   *
+   * `mu` (plan-2016 S7): when given, a zone whose {@link LimitToLayers} filter
+   * rejects that MU is skipped — the MU passes it kinematically, and a later
+   * zone that accepts it may still win. Without `mu` (bounds of surfaces,
+   * sensors, sinks, or an MU that already is a body) every zone counts.
    */
-  static findZoneOverlapping(aabb: PhysicsAABB): RVPhysicsZone | null {
+  static findZoneOverlapping(aabb: PhysicsAABB, mu?: { readonly layer: number } | null): RVPhysicsZone | null {
     for (const zone of RVPhysicsZone.zones) {
       if (!zone.ZoneEnabled) continue;
       const volume = zone.worldAabb;
       if (!volume) continue;
-      if (aabbsOverlap(volume, aabb)) return zone; // first registered wins (F2)
+      if (!aabbsOverlap(volume, aabb)) continue;
+      if (mu && !zone.acceptsMU(mu)) continue;
+      return zone; // first registered (accepting) zone wins (F2)
     }
     return null;
   }
@@ -145,6 +153,7 @@ export class RVPhysicsZone implements RVComponent {
     restitution?: number;
     removeBelowY?: number;
     showGizmo?: boolean;
+    softCcdPrediction?: number;
   }): RVPhysicsZone {
     const node = new Object3D();
     node.name = '__SyntheticWholeScenePhysicsZone';
@@ -154,6 +163,7 @@ export class RVPhysicsZone implements RVComponent {
     zone.Restitution = config?.restitution ?? 0.0;
     zone.RemoveBelowY = config?.removeBelowY ?? -10;
     zone.ShowGizmo = config?.showGizmo ?? false;
+    zone.SoftCcdPrediction = config?.softCcdPrediction ?? PHYSICS_DEFAULT_SOFT_CCD_PREDICTION_M;
     zone._registered = true;
     RVPhysicsZone.zones.push(zone); // registration order = F2 priority
     return zone;
@@ -168,8 +178,58 @@ export class RVPhysicsZone implements RVComponent {
   WholeScene = false;   // ignore the box volume, whole scene = zone (F3)
   Friction = 0.8;       // default friction for MUs inside the zone
   Restitution = 0.0;    // bounciness of MUs inside the zone (0 = none)
+  SoftCcdPrediction = PHYSICS_DEFAULT_SOFT_CCD_PREDICTION_M; // dynamic-MU soft-CCD look-ahead (m), 0 = off (plan-2219)
   RemoveBelowY = -10;   // MUs below this world Y (m) are removed (F9)
   ShowGizmo = true;     // wireframe box in the viewer (F13)
+
+  /**
+   * MU filter by Unity layer NAME (plan-2016 S7): only MUs whose root layer is
+   * listed become rigid bodies in this zone, every other MU passes it
+   * kinematically. Empty, or no name the layer table knows = every MU (the
+   * behaviour before the filter). Same layer table as
+   * `Sensor.AdditionalRayCastLayers` (`rv-layers.ts`).
+   */
+  get LimitToLayers(): unknown { return this._limitLayers; }
+  set LimitToLayers(value: unknown) {
+    this._limitLayers = value;
+    this._layerMaskRev = -1;
+  }
+  private _limitLayers: unknown = [];
+  private _layerMask: number | null = null;
+  /** Layer-table revision {@link _layerMask} was built against (-1 = stale). */
+  private _layerMaskRev = -1;
+  private _layerWarned = false;
+
+  /** Resolved bit mask of {@link LimitToLayers}; `null` = no filter. Lazy: the
+   *  layer table arrives with the file, after the schema was applied. */
+  get layerMask(): number | null {
+    const rev = getLayerRevision();
+    if (this._layerMaskRev !== rev) {
+      const { mask, unknown } = buildLayerMask(this._limitLayers);
+      this._layerMask = mask;
+      this._layerMaskRev = rev;
+      if (unknown.length > 0 && !this._layerWarned) {
+        this._layerWarned = true;
+        console.warn(`[WebPhysicsZone] "${this.node.name}": unknown layer(s) ${unknown.map((n) => `"${n}"`).join(', ')}`
+          + (mask === null ? ' — no MU filter' : ' — ignored'));
+      }
+    }
+    return this._layerMask;
+  }
+
+  /**
+   * Does this zone take `mu` as a rigid body? True without a filter. With a
+   * filter only an MU whose root layer (`mu.layer`: `extras.layer`, the clone
+   * stash of a spawned MU, or the template layer a pooled instance keeps) is in
+   * the mask — an MU without a layer does NOT match: the filter is an explicit
+   * allow-list, unlike the sensor ray, where an unknown layer always hits.
+   */
+  acceptsMU(mu: { readonly layer: number }): boolean {
+    const mask = this.layerMask;
+    if (mask === null) return true;
+    const layer = mu.layer;
+    return layer >= 0 && layer < 32 && ((mask >>> layer) & 1) === 1;
+  }
 
   /** RAW node paths of additional static collision geometry (chutes, bins).
    *  Stored as-is in Phase 2; resolved via `registry.getNode(path)` with a
@@ -194,6 +254,20 @@ export class RVPhysicsZone implements RVComponent {
     // A degenerate AABB (empty node without BoxCollider extras) carries no
     // volume — treat as absent so init() can warn + ignore the zone (§5.4).
     this._boxAabb = aabb && aabb.halfSize.lengthSq() > 0 ? aabb : null;
+  }
+
+  /**
+   * The node one `StaticColliders` entry names. plan-769 Phase 1b: the entry is a
+   * STORED path of this zone's file — read by the file's verdict (its migration,
+   * by address), never by a guessing stage; a path the file does not carry
+   * (written this session, a document without an identity record) still goes
+   * through `registry.getNode`. `null` = not in the scene.
+   */
+  resolveStaticCollider(
+    registry: { storedNode(referrer: Object3D | null, ref: string): Object3D | null },
+    path: string,
+  ): Object3D | null {
+    return registry.storedNode(this.node, path);
   }
 
   /** Effective zone volume in world meters, or `null` when unknown
@@ -306,6 +380,7 @@ export class RVPhysicsZone implements RVComponent {
       friction: this.Friction,
       restitution: this.Restitution,
       removeBelowY: this.RemoveBelowY,
+      softCcdPrediction: this.SoftCcdPrediction,
     };
   }
 
@@ -412,6 +487,10 @@ export function syncPhysicsZoneBounds(
   center: { x: number; y: number; z: number } | null,
   size: { x: number; y: number; z: number } | null,
 ): RVPhysicsZone | null {
+  // plan-661: a 2D zone (WebPhysicsZone2D) takes its volume from the same box —
+  // duck-typed, so this module does not import its sibling.
+  const zone2d = registry.getByPath<{ refreshBounds?: RVPhysicsZone['refreshBounds'] }>('WebPhysicsZone2D', path);
+  if (zone2d && typeof zone2d.refreshBounds === 'function') zone2d.refreshBounds(center, size);
   const zone = registry.getByPath<RVPhysicsZone>('WebPhysicsZone', path);
   if (!zone || typeof zone.refreshBounds !== 'function') return null;
   zone.refreshBounds(center, size);
@@ -437,6 +516,6 @@ registerComponent({
   create: (node, aabb) => new RVPhysicsZone(node, zoneVolumeOf(node, aabb)),
   beforeSchema: (inst, extras) => {
     // rawFields capture (schema mapper has no string-array type) — see class note.
-    (inst as RVPhysicsZone).StaticColliders = parseStaticColliderPaths(extras['StaticColliders']);
+    (inst as RVPhysicsZone).StaticColliders = parseStaticColliderPaths(extras['StaticColliders'], (inst as RVPhysicsZone).node);
   },
 });

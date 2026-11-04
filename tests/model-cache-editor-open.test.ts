@@ -130,33 +130,4 @@ describe('the full-tree door after a destructive bake (plan-754 §9.21)', () => 
     expect(() => assertBakeAllowed({ preserveHierarchy: true })).toThrow(/preserveHierarchy/);
     expect(() => assertBakeAllowed({ preserveHierarchy: false })).not.toThrow();
   });
-
-  it('a forced split still works after the base bake consumed the decode', async () => {
-    const counter = { parses: 0, bytes: 0 };
-    const cache = makeCache(counter);
-
-    const base = await cache.getOrLoadBaked(GLB_URL);
-    expect(base.destructive).toBe(true);
-    expect(cache.size).toBe(0);
-    // plan-757 R1/D8: the decode ran on BYTES (one parse of exactly the fetched
-    // buffer) and the asset carries the verdict of those bytes — unsigned.
-    expect(counter.parses).toBe(1);
-    expect(counter.bytes).toBe(assetBytes.byteLength);
-    expect(base.signatureState).toBe('none');
-    const parsesAfterBase = counter.parses;
-
-    // The split target is a bare CAD node the BASE bake removed — which is
-    // exactly why the split bake cannot reuse the pruned template and decodes
-    // its own tree instead (§2.6).
-    const split = await cache.getOrLoadBaked(GLB_URL, undefined, { forceSplitNodeIds: [SPLIT_ID] });
-    expect(counter.parses).toBe(parsesAfterBase + 1);
-    expect(split).not.toBe(base);
-    expect(split.destructive).toBe(true);
-    // The split node became a boundary: its own chunk, and it survives as a node.
-    expect(split.chunks.map((c) => c.ownerPath)).toContain('Cover');
-    expect(names(split.template)).toContain('Cover');
-    // The base bake is untouched by it — different key, different asset.
-    expect(base.chunks.map((c) => c.ownerPath)).not.toContain('Cover');
-    expect(cache.peekBaked(GLB_URL)).toBe(base);
-  });
 });

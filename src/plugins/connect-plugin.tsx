@@ -17,6 +17,7 @@ import type { LoadResult } from '../core/engine/rv-scene-loader';
 import type { UISlotEntry, UISlotProps } from '../core/rv-ui-plugin';
 import { modeContext } from '../core/rv-mode-manager';
 import { getStoredConnectPanelWidth } from '../core/hmi/layout-constants';
+import { preloadConnectPanel } from '../core/hmi/ConnectPanelHost';
 import { WebSocketRealtimeInterface } from '../interfaces/websocket-realtime-interface';
 import { INTERFACE_DEFAULTS, type InterfaceSettings } from '../interfaces/interface-settings-store';
 import {
@@ -124,6 +125,8 @@ function ConnectToolbarButton({ viewer }: UISlotProps) {
         color={isActive ? 'primary' : 'inherit'}
         sx={{ p: 0.75, position: 'relative' }}
         onClick={handleClick}
+        onPointerEnter={() => { void preloadConnectPanel(); }}
+        onFocus={() => { void preloadConnectPanel(); }}
         aria-label={title}
       >
         <Cable fontSize="small" />

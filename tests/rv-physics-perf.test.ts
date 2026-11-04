@@ -51,8 +51,10 @@ async function buildScene(): Promise<RapierPhysicsProvider | null> {
     { friction: 0.8, restitution: 0, removeBelowY: -10 },
   );
   try {
-    await provider.init(); // default URL loader — rejects when not installed
+    await provider.init(); // default loader — rejects when not installed
   } catch {
+    // A missing/unloadable Rapier is a FAILURE whenever the private tree is present (vite define).
+    if (typeof __RV_PHYSICS_REQUIRE_WASM__ !== 'undefined' && __RV_PHYSICS_REQUIRE_WASM__) throw new Error('@dimforge/rapier3d-compat is not usable');
     console.warn('[physics-perf] @dimforge/rapier3d-compat not installed (out-of-band) — skipping');
     return null;
   }
@@ -99,7 +101,7 @@ function stats(samples: number[]): { avg: number; max: number; p95: number } {
 
 describe('physics performance — 50 dynamic bodies (real Rapier WASM, out-of-band)', () => {
   beforeEach(() => {
-    setRapierLibLoader(null); // default URL-import loader
+    setRapierLibLoader(null); // default loader
     syncCount = 0;
   });
   afterEach(() => setRapierLibLoader(null));

@@ -7,11 +7,10 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { lintDesSafety } from '../src/core/sdk/rv-des-lint';
+import { lintDesSafety, loadDesAstCheck } from '../src/core/sdk/rv-des-lint';
 
 const EVENT_ONLY = `
 function setup(self) {
-  const drive = self.drive('Drive-Rot-Y');
   return {
     des: {
       onAccept(mu) { self.in(1.5, 'done', mu); return true; },
@@ -102,30 +101,12 @@ describe('des-lint — rule (c): blocked globals', () => {
   });
 });
 
-describe('des-lint — rule (d): free persistent closure state (plan-261)', () => {
-  it('flags a mutated let-variable as warning and points to onSnapshot/onRestore', () => {
-    const code = `function setup(self) {\n  let n = 0;\n  return { des: { on(hook) { n = n + 1; } } };\n}`;
-    const d = lintDesSafety(code).filter((x) => x.rule === 'closure-state');
-    expect(d).toHaveLength(1);
-    expect(d[0].severity).toBe('warning');
-    expect(d[0].message).toMatch(/onSnapshot/);
-    expect(d[0].message).toMatch(/self\.prop is read-only/);
-  });
-
-  it('stays a warning even with DesSafe: true (never breaks the lint gate)', () => {
-    const code = `let counter = 0;\ncounter += 1;`;
-    const d = lintDesSafety(code, { desSafe: true }).filter((x) => x.rule === 'closure-state');
-    expect(d).toHaveLength(1);
-    expect(d[0].severity).toBe('warning');
-  });
-
-  it('does not flag const, unmutated lets, loop counters, or scripts WITH onSnapshot', () => {
-    expect(lintDesSafety(`const a = 1;\nlet b = 2;\nreturn a + b;`)
-      .filter((x) => x.rule === 'closure-state')).toHaveLength(0);
-    expect(lintDesSafety(`for (let i = 0; i < 5; i++) { self.log(i); }`)
-      .filter((x) => x.rule === 'closure-state')).toHaveLength(0);
-    const persisted = `let n = 0;\nreturn { des: { on() { n++; } }, onSnapshot() { return { n }; }, onRestore(s) { n = s.n; } };`;
-    expect(lintDesSafety(persisted).filter((x) => x.rule === 'closure-state')).toHaveLength(0);
+describe('des-lint rule (d): AST state check', () => {
+  it('refuses undeclared state with a persistence hint', async () => {
+    await loadDesAstCheck();
+    const d = lintDesSafety('function setup(self) { let n = 0; return { des: { on() { n++; } } }; }', { desSafe: true, checkState: true });
+    expect(d.some(x => x.rule === 'des-script-undeclared-state' && x.severity === 'error')).toBe(true);
+    expect(d.find(x => x.rule === 'des-script-undeclared-state')?.message).toMatch(/use self.persist/);
   });
 });
 

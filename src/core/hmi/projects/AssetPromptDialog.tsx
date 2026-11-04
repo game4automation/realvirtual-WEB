@@ -28,8 +28,13 @@ export interface AssetPromptState {
    * `renameNode` is the same prompt for a card in the folder-contents grid
    * (Lauf 13): a different write path at the caller, an identical question here.
    */
-  kind: 'renameAsset' | 'collections' | 'renameNode';
-  /** Asset path relative to `library/` — or a tree path, for `renameNode`. */
+  kind: 'renameAsset' | 'collections' | 'renameNode' | 'newDocument';
+  /**
+   * Asset path relative to `library/` — or a tree path, for `renameNode` — or,
+   * for `newDocument`, the project-relative folder the document is created in
+   * (user report 2026-10-20: a new document asks for its name FIRST, instead
+   * of appearing as "Untitled" to be renamed afterwards).
+   */
   relPath: string;
   value: string;
 }
@@ -41,17 +46,19 @@ export interface AssetPromptDialogProps {
 }
 
 export function AssetPromptDialog({ state, onChange, onSubmit }: AssetPromptDialogProps) {
+  const isCreate = state?.kind === 'newDocument';
   const isRename = state?.kind === 'renameAsset' || state?.kind === 'renameNode';
+  const isName = isRename || isCreate;
   // Clearing collections is meaningful; clearing a file name is not.
-  const canSubmit = !isRename || (state?.value.trim().length ?? 0) > 0;
+  const canSubmit = !isName || (state?.value.trim().length ?? 0) > 0;
 
   return (
     <Dialog open={state !== null} onClose={() => onChange(null)} maxWidth="xs" fullWidth>
       <DialogTitle sx={{ fontSize: 14, fontWeight: 600 }}>
-        {isRename ? 'Rename asset' : 'Collections'}
+        {isCreate ? 'New document' : isRename ? 'Rename asset' : 'Collections'}
       </DialogTitle>
       <DialogContent>
-        {!isRename && (
+        {!isName && (
           <DialogContentText sx={{ fontSize: 12 }}>
             Comma-separated. Leave empty to remove this asset from all collections.
           </DialogContentText>
@@ -60,11 +67,13 @@ export function AssetPromptDialog({ state, onChange, onSubmit }: AssetPromptDial
           autoFocus
           fullWidth
           size="small"
-          label={isRename ? 'File name' : 'Collections'}
+          label={isCreate ? 'Name' : isRename ? 'File name' : 'Collections'}
           value={state?.value ?? ''}
           onChange={(e) => onChange(state ? { ...state, value: e.target.value } : state)}
+          // The proposed name is selected, so typing replaces it at once.
+          onFocus={isName ? (e) => e.target.select() : undefined}
           onKeyDown={(e) => { if (e.key === 'Enter' && canSubmit) onSubmit(); }}
-          sx={{ mt: isRename ? 1 : 2 }}
+          sx={{ mt: isName ? 1 : 2 }}
         />
       </DialogContent>
       <DialogActions>
@@ -79,7 +88,7 @@ export function AssetPromptDialog({ state, onChange, onSubmit }: AssetPromptDial
           data-testid="asset-prompt-confirm"
           sx={{ textTransform: 'none' }}
         >
-          {isRename ? 'Rename' : 'Save'}
+          {isCreate ? 'Create' : isRename ? 'Rename' : 'Save'}
         </Button>
       </DialogActions>
     </Dialog>

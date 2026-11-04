@@ -136,6 +136,30 @@ export function getColliderExtras(node: Object3D): ColliderExtra[] {
   return getColliderExtrasFrom(node.userData?.realvirtual as Record<string, unknown> | undefined);
 }
 
+/**
+ * `userData` key of the PARSED collider list a spawned MU clone keeps after
+ * its rv-extras are stripped (plan-2016 S5: sensors detect the active colliders
+ * of a clone, and a MUSwitcher changes which ones are active). Plain JSON data,
+ * so `Object3D.clone()` copies it.
+ */
+export const RV_COLLIDERS_KEY = '_rvColliders';
+
+/**
+ * `userData` keys that keep two facts of a node's rv-extras alive across the
+ * strip of a spawned clone (plan-2016 S5 Codex fix): the node was an object in
+ * its own right (it carried rv-extras — {@link renderPrimitivesOf} must not count
+ * its mesh as a parent's MeshCollider primitive), and it was an MU root (the
+ * collider walks stop there). Set by the Source strip BEFORE the extras go.
+ */
+export const RV_OWN_OBJECT_KEY = '_rvOwnObject';
+export const RV_IS_MU_KEY = '_rvIsMU';
+
+/** The colliders of `node`: the clone stash ({@link RV_COLLIDERS_KEY}) first, else its rv-extras. */
+export function colliderExtrasOfNode(node: Object3D): readonly ColliderExtra[] {
+  const stash = node.userData?.[RV_COLLIDERS_KEY] as ColliderExtra[] | undefined;
+  return Array.isArray(stash) ? stash : getColliderExtras(node);
+}
+
 /** True while the collider would exist as SOLID geometry in Unity: enabled and
  *  not a trigger volume (plan-467 F1). */
 export function isSolidCollider(col: ColliderExtra): boolean {
@@ -172,7 +196,8 @@ export function renderPrimitivesOf(node: Object3D): Mesh[] {
   for (const child of node.children) {
     const mesh = child as Mesh;
     if (!mesh.isMesh || !mesh.geometry) continue;
-    if (child.userData?.realvirtual) continue; // an object in its own right
+    // An object in its own right — also after a clone strip (plan-2016 S5).
+    if (child.userData?.realvirtual || child.userData?.[RV_OWN_OBJECT_KEY]) continue;
     out.push(mesh);
   }
   return out;

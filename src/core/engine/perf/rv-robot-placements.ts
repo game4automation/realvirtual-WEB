@@ -7,7 +7,8 @@
  * The synthetic line's own robot farm draws six-axis robots as box primitives —
  * right for a measurement axis ("what do N moving six-axis drives cost"), wrong
  * for looking at a line. This module puts REAL robots beside the line: the
- * library `FanucCRX-10iA-L.glb` on the production placement path
+ * benchmark copy of the library robot (`public/perf/Robots/FanucCRX-10iA-L-erratic.glb`,
+ * see `DEFAULT_ROBOT_URL`) on the production placement path
  * (`PlacementInstancer.resolveBaked` + `materialize`), exactly as the cell
  * matrix does, with the same erratic drivers for motion and the same teardown.
  *
@@ -41,8 +42,8 @@ export interface RobotPlacementsConfig {
    * `random` (default): every axis draws a fresh random target inside its
    * authored MinPos/MaxPos each time it arrives, and robot `i` runs at its own
    * tempo (a deterministic spread of ±30 % on the authored axis speeds), so no
-   * two robots move alike. `authored`: the asset's own behavior — the library
-   * Fanuc authors `IterateBetweenMaxAndMin: true` on all six axes, which makes
+   * two robots move alike. `authored`: the asset's own behavior — the benchmark
+   * copy authors `IterateBetweenMaxAndMin: true` on all six axes, which makes
    * every placed copy toggle min↔max in lockstep (Thomas, 2026-09-25: "all
    * move the same").
    */
@@ -109,7 +110,7 @@ export async function placeLibraryRobots(
     viewer.placements.materialize(placement, baked, { id, label: placement.name, catalogId: ref.catalogId, pivot: false });
     // Placement-scoped component references BEFORE the components are built,
     // or `MasterDrive`-style refs of robot 0 would suffix-match into robot 7.
-    rescopeComponentRefs(placement, NodeRegistry.computeNodePath(placement));
+    rescopeComponentRefs(placement, NodeRegistry.computeNodePath(placement), baked.identity);
     if (canIntegratePlacedContent(host)) integratePlacedContent(host, placement);
     // Position LAST: `materialize()` reads world bounds while pivoting.
     placement.position.copy(cfg.place(i, pos));

@@ -36,7 +36,7 @@
  * ## Ids
  *
  * Every entry that arrives without an `id` gets one (F2). Scene entries always
- * had one; `models[]`/`library[]` entries mostly do not, and `assetEntryKey()`
+ * had one; `models[]`/`library[]` entries mostly do not, and the id-else-path key
  * kept them addressable by path in the meantime. The id is derived from the
  * path rather than minted, so the same stored manifest yields the same
  * identities on every machine and on every read.
@@ -50,10 +50,10 @@ import {
   type DocumentSection,
 } from './rv-project-documents';
 import type {
+  LegacyProjectAssetEntry,
+  LegacyProjectSceneEntry,
   RvDocumentEntry,
   RvProject,
-  RvProjectAssetEntry,
-  RvProjectSceneEntry,
 } from './rv-project-types';
 import { RV_PROJECT_SCHEMA_VERSION } from './rv-project-types';
 
@@ -191,12 +191,12 @@ export async function migrateProjectDocuments(
   // out of no longer changes the row. The arrays are still read separately
   // because their ORDER is the migrated list's order, and because `counts` is
   // what the migration reports.
-  const scenes = arrayOf<RvProjectSceneEntry>(legacy.scenes);
+  const scenes = arrayOf<LegacyProjectSceneEntry>(legacy.scenes);
   for (const entry of scenes) documents.push(documentOfEntry(entry, mint));
   counts.scenes = scenes.length;
 
   for (const section of ['models', 'library'] as const) {
-    const list = arrayOf<RvProjectAssetEntry>(legacy[section]);
+    const list = arrayOf<LegacyProjectAssetEntry>(legacy[section]);
     for (const entry of list) documents.push(documentOfEntry(entry, mint));
     counts[section] = list.length;
   }

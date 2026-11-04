@@ -53,7 +53,7 @@ import {
 } from '../src/core/ops/rv-document-drafts';
 import type { AssetBase } from '../src/core/editor/rv-asset-document';
 import { AssetEditorPlugin } from '@rv-private/plugins/asset-editor/index';
-import { setPendingAssetOpen, takePendingAssetOpen } from '@rv-private/plugins/asset-editor/pending-open-store';
+import { setPendingAssetOpen, takePendingAssetOpen } from '@rv-private/plugins/asset-editor/shared/pending-open-store';
 import {
   getPendingDialog,
   subscribeEditorDialogs,

@@ -36,22 +36,38 @@ import type { Mesh, Object3D } from 'three';
 import { waitForMaterialTextures } from './rv-asset-material';
 import { objectToGlb } from '../import/rv-import-object';
 import { isGltfWrapperName } from '../engine/rv-gltf-unwrap';
-import { isUnresolvedReferenceNode } from '../engine/rv-asset-reference';
-import { isSensorRuntimeVizName } from '../engine/rv-sensor-viz-names';
 import {
-  RV_CHAIN_ELEMENT,
-  RV_CHAIN_PROXY,
-  RV_CHAIN_SKIN,
+  RV_AUTHORED_LAYOUT_OBJECT_KEY, RV_LAYOUT_OBJECT_STAMP_KEY, canonicalizeAssetOverridesInTree, isUnresolvedReferenceNode,
+} from '../engine/rv-asset-reference';
+import { carriedRootKeysOf } from '../engine/rv-bake-registry';
+import { isRuntimeHelperNode } from './rv-runtime-helper-node';
+export { isRuntimeHelperNode } from './rv-runtime-helper-node';
+import { RV_ORIG_NAME_KEY } from '../engine/rv-glb-parse';
+import { RV_SYNTHETIC_KEY } from '../engine/rv-bake-chunk';
+import {
   RV_CHAIN_SOURCE,
   RV_CHAIN_SOURCE_VISIBLE,
-  RV_RIBBON_BAND,
   RV_RIBBON_ROLL_SCALE,
 } from '../engine/rv-traverse-utils';
 import { RV_SHARE_KEY, RV_SHARE_VERSION, type RvShareMeta } from '../share/rv-share-meta';
+import { RV_MACROS_KEY } from './rv-macro-store';
 import {
   binaryResources,
   embedFmuBufferViews,
 } from '../engine/rv-binary-resources';
+import type { NodeRegistry } from '../engine/rv-node-registry';
+import {
+  ensureUniqueNodeIds,
+  registryForDocument,
+  writeStoredReferences,
+  type NodeIdReport,
+  type ReferenceWriteReport,
+} from '../engine/rv-reference-writer';
+import { RV_NODE_ID_KEY } from '../engine/rv-node-id';
+import { identityIdOf } from '../engine/rv-decode-identity';
+import { seedNodeId } from '../engine/rv-node-id-seed.mjs';
+import { ID_VERSION_CURRENT, ID_VERSION_KEY } from '../engine/rv-decode-identity';
+import { reportSaveIdentityProblems } from '../hmi/problems-store';
 import {
   RV_CLASSIFICATION_KEY,
   classificationPayload,
@@ -90,100 +106,59 @@ export function sanitizeUserDataForExport(root: Object3D): void {
 export function pruneRuntimeHelpers(root: Object3D): void {
   const junk: Object3D[] = [];
   root.traverse((node) => {
-    const ud = node.userData as Record<string, unknown>;
-    if (
-      node.name.startsWith('__raycastBVH')
-      || ud['_rvRaycastBVH']
-      // A BatchedMesh render arena (`rv-batched-render.ts`). Arenas are parented
-      // INTO the model tree (`anchor.add(batch)`) and their source meshes stay in
-      // the tree as well — only hidden per instance via `setVisibleAt`. Since the
-      // export passes `onlyVisible: false`, keeping the arena writes every batched
-      // mesh TWICE: once as the authored subtree, once as a flat, hierarchy-less
-      // blob serialised out of the arena geometry. The arena is rebuilt from the
-      // sources on every load, so the file must never contain one.
-      || ud['_rvBatchedRender']
-      // A baked chunk mesh (plan-753 Phase 4a): shared merged geometry under
-      // the root / a mover — rebuilt on every load, never file content. Under
-      // the destructive bake (plan-754) the merged sources are GONE rather than
-      // masked, so dropping the chunk drops their triangles: an export of a
-      // baked tree is an export of the survivors. That is why the editor never
-      // bakes (`assertBakeAllowed`) and re-decodes through
-      // `ModelCache.decodeFresh` — authoring always holds the full tree.
-      || ud['_rvBakeChunk']
-      // A spawned MU (plan-711): the SIMULATION's product, never authored
-      // content. It only reaches an export at all since scene and editor share
-      // a document — the editor projection now holds a tree a Source is
-      // spawning into, and the way back writes that tree as the scene's new
-      // bake source. Baking the parts that happened to be in flight would add
-      // them to the file permanently, and add MORE of them on the next round
-      // trip. The marker is the planner's registration flag, which is a plain
-      // boolean and therefore survives the clone (unlike its `_muRef` twin —
-      // see `detachLiveUserData`).
-      || ud['_muSelectable']
-      || ud['_rvGizmo']
-      || ud['_highlightOverlay']
-      || ud['_isGhostOverlay']
-      // A Source's ghost preview of its MU template and its floor marker
-      // (rv-source.ts `_buildGhostClone`, rv-source-marker.ts). Both are rebuilt
-      // from the rv_extras on every load; saved, the next load builds them AGAIN
-      // next to the saved copies, so every round trip added one more pair. The
-      // ghost also resets its scale to 1, so a template that carried a CAD scale
-      // came back as a 1000x giant.
-      || ud['_isSourceGhost']
-      || ud['_isSourcePreview']
-      || ud['_isSourceMarker']
-      || ud['_driveHoverOverlay']
-      // WebLabel runtime visual (plan-529): the Billboard sprite and the Plate
-      // mesh are rebuilt from the `WebLabel` extras on every load. Saved, the
-      // plate would become authored geometry and the next load would add a
-      // second one in front of it — every round trip one more.
-      || ud['_rvWebLabel']
-      // Sensor box / outline / ray tube, any dedup suffix — the ray was missing
-      // here, so every save added one more beam to the file.
-      || isSensorRuntimeVizName(node.name)
-      || node.name === '_tankFillViz'
-      // EnergyChain runtime rig (plan-362). The export must contain the
-      // ORIGINAL CAD meshes, not a skinned reconstruction of them: the rig is
-      // deterministically reproducible from the rv_extras on load, and glTF
-      // skin round-trips are a known minefield. Everything the rig added is
-      // dropped here, which `onlyVisible: false` would otherwise happily bake in.
-      || ud[RV_CHAIN_PROXY]
-      || ud[RV_CHAIN_SKIN]
-      // The bone container takes its whole subtree with it. Matching on
-      // `isBone` instead would be over-broad: an imported skinned GLB may carry
-      // legitimate authored bones that must survive a save.
-      || node.name === '__rvEnergyChainBones'
-      // Chain element clones (plan-733). `RVChain` builds `NumberOfElements`
-      // copies of its template at load; they are deterministically reproducible
-      // from the rv_extras, so the file must keep the TEMPLATE only. The primary
-      // defence is that an authoring load never clones at all
-      // (`ComponentContext.authoring`) — this is the second half, for a tree that
-      // reached the export from a simulating load. Without it a save would bake
-      // in N copies, and the next round trip N per copy.
-      || ud[RV_CHAIN_ELEMENT]
-      // The generated web band (plan-459). A `RibbonPath` computes its own geometry
-      // from the roller poses on every load, so the band is reproducible and has
-      // no business in the file — and its vertex count follows the roll
-      // diameters, so baking it in would freeze one arbitrary moment of the
-      // simulation as authored content.
-      || ud[RV_RIBBON_BAND]
-      // The procedural roll a RibbonWinder builds when no RollMesh was authored. Same
-      // rule: it exists because the file did NOT contain one.
-      || (ud['_rvGenerated'] === true && node.name.endsWith('_Roll'))
-      // FMU signal children (plan-498): an `Fmu` component creates one leaf per
-      // supported variable on every load and attach — the file's source of
-      // truth is `FmuVariables[]`, so the leaves never belong in it. The
-      // `Signals` container goes too, but only when the FMU created it AND
-      // nothing else lives in it (a drive's provisioned signals may share it).
-      || (ud['_rvFmuSignal'] === true && isFmuSignalPrunable(node))
-    ) junk.push(node);
+    if (isRuntimeHelperNode(node)) junk.push(node);
   });
   for (const node of junk) node.removeFromParent();
 }
 
-/** An FMU-stamped node is pruned when it is a leaf, or a container of FMU leaves only. */
-function isFmuSignalPrunable(node: Object3D): boolean {
-  return node.children.every((c) => (c.userData as Record<string, unknown>)['_rvFmuSignal'] === true);
+/**
+ * THE one definition of what {@link exportAssetGlb} drops from the tree it
+ * writes (plan-765 F5): true when `node` leaves the export together with its
+ * whole subtree — a runtime helper ({@link pruneRuntimeHelpers}) or a child of
+ * an unresolved reference node, i.e. composed content
+ * ({@link pruneComposedReferenceSubtrees}).
+ *
+ * Meant for a walk that SKIPS the subtree of a node it answers true for: a
+ * descendant of a composed child is not tested itself, exactly as the prune
+ * never descends there. Neither prune removes the export root, so a walk does
+ * not ask about its own root.
+ *
+ * It exists so a count over the LIVE tree (the save guard) sees the node set
+ * the file will contain without cloning; the two prunes keep their in-place
+ * loops on the clone but share their rules with this predicate.
+ */
+export function exportPrunePredicate(node: Object3D): boolean {
+  if (isRuntimeHelperNode(node)) return true;
+  const parent = node.parent;
+  return parent !== null && isUnresolvedReferenceNode(parent);
+}
+
+/**
+ * Write every node under its AUTHORED name again (plan-765 F1), in place, on
+ * the export clone.
+ *
+ * GLTFLoader sanitizes and de-duplicates node names file-wide; the loader
+ * restores pure sanitizations and stamps a real dedup's authored name into
+ * `userData._rvOrigName` (`detectRenamedNodes`). Every `ComponentReference` in
+ * the extras keeps the authored spelling — so a file written with the loader's
+ * `NL6501_1` names is self-inconsistent, and every reference to a deduplicated
+ * node is unresolved on the next load. Putting the stamp back into `name`
+ * writes the name space Unity wrote; the next load re-dedups and re-stamps
+ * exactly as it did for the Unity export.
+ *
+ * Must run BEFORE {@link sanitizeUserDataForExport}, which deletes the stamp
+ * (every `_` key). Only a non-empty string that differs from the current name
+ * counts; a node renamed in the editor carries no stamp any more (the rename
+ * op deletes it), so the user's name wins. Synthetic bake partition objects
+ * carry the key too but never exist in an editor tree — skipped defensively.
+ */
+export function restoreAuthoredNames(root: Object3D): void {
+  root.traverse((node) => {
+    const ud = node.userData as Record<string, unknown>;
+    if (ud[RV_SYNTHETIC_KEY] === true) return;
+    const orig = ud[RV_ORIG_NAME_KEY];
+    if (typeof orig === 'string' && orig.length > 0 && orig !== node.name) node.name = orig;
+  });
 }
 
 /** What {@link embedFmuPackages} did to one save. */
@@ -257,10 +232,14 @@ export function embedFmuPackages(glb: ArrayBuffer): FmuEmbedReport {
  *
  * ## What is NOT lost with the subtree
  *
- * An edit the user made INSIDE a referenced subtree does not live on those
+ * An edit the user made INSIDE a referenced subtree does not live only on those
  * nodes: `guardReferenceOp` (`rv-reference-guard.ts`) refuses structural ops
- * there and routes value edits into `AssetOverrides.byNodeId` of the reference
- * node — which is this node's own `userData` and survives untouched.
+ * there, and the editor's `setField` / `unsetField` executor
+ * (`rv-asset-executors.ts`, plan-774 F1) writes every value edit — in the same
+ * op, undoable — into `AssetOverrides.byAddress` of the OUTERMOST reference node
+ * (`#<id>`, or `<b>#<id>` for nested content). That record is the reference
+ * node's own `userData` and survives the prune untouched. (The PLANNER save routes
+ * the same edits through its bake resolver instead, `rv-scene-glb-bake.ts`.)
  *
  * @returns how many composed children were detached (0 on a reference-free
  *          asset, where this is a strict no-op).
@@ -427,6 +406,174 @@ export function mergeWrapperChainUserData(root: Object3D, content: Object3D): Re
   return merged;
 }
 
+/** Optional hooks of {@link exportAssetGlb}. */
+export interface ExportAssetGlbOptions {
+  /**
+   * Called ONCE with the export clone after the authored names are restored
+   * and both prunes ran, before the userData sanitizer and the flattening —
+   * the tree the file will contain. Read-only by contract (plan-765 F5).
+   */
+  onClone?: (clone: Object3D) => void;
+  /**
+   * plan-641 M5 — the document's macros for `scenes[0].extras.realvirtual.Macros`.
+   * `undefined` keeps whatever the root carried (an untouched macro block round-trips),
+   * `null` removes it, an array replaces it.
+   */
+  macros?: readonly unknown[] | null;
+  /**
+   * plan-769 Phase 3 — the registry that holds `assetRoot` as a document (the viewer's
+   * `registry` when exporting its current model). The reference writer reads every
+   * stored reference through it (`readStoredRef`) and writes the address. Without one —
+   * or when it does not hold `assetRoot` — a registry of the tree itself is built.
+   */
+  registry?: NodeRegistry | null;
+  /** plan-769 Phase 3 — what the id / reference writer did (tests, the save flow). */
+  onIdentityReport?: (report: ExportIdentityReport) => void;
+}
+
+/** plan-769 Phase 3: what {@link exportAssetGlb} did to the ids and references of one file. */
+export interface ExportIdentityReport {
+  ids: NodeIdReport;
+  references: ReferenceWriteReport;
+}
+
+/**
+ * plan-769 Phase 3 (F1/F2/F17) — the identity half of the export, on the CLONE, before
+ * the sanitizer: every node gets its `realvirtual.NodeId` ({@link ensureUniqueNodeIds}),
+ * then every stored reference its address ({@link writeStoredReferences}), read through
+ * the LIVE node the clone node was copied from. Duplicates and guessed targets become
+ * Problems entries.
+ */
+function writeExportIdentity(
+  assetRoot: Object3D,
+  clone: Object3D,
+  liveOf: Map<Object3D, Object3D>,
+  cloneOf: Map<Object3D, Object3D>,
+  registryOption: NodeRegistry | null | undefined,
+): ExportIdentityReport {
+  const registry = registryForDocument(assetRoot, registryOption);
+  const ids = ensureUniqueNodeIds(clone, (n) => liveOf.get(n), registry);
+  const written = new Set<Object3D>();
+  clone.traverse((n) => written.add(n));
+  const survives = (target: Object3D): boolean => {
+    const c = cloneOf.get(target);
+    return c !== undefined && written.has(c);
+  };
+  // A live target without an indexed id is written with the id its CLONE got — the
+  // export never mints into the live tree.
+  const idOf = (target: Object3D): string | null => {
+    const c = cloneOf.get(target);
+    return c !== undefined && written.has(c) ? identityIdOf(c) : null;
+  };
+  const references: ReferenceWriteReport = { references: 0, addresses: 0, unresolved: 0, guessed: [] };
+  clone.traverse((node) => {
+    const rv = (node.userData as Record<string, unknown>)['realvirtual'];
+    if (!rv || typeof rv !== 'object' || Array.isArray(rv)) return;
+    const live = liveOf.get(node);
+    if (!live) return;
+    writeStoredReferences(registry, live, rv as Record<string, unknown>, references, { survives, idOf });
+  });
+  reportSaveIdentityProblems({
+    reminted: ids.reminted.map((d) => ({
+      id: d.id, reminted: d.reminted, nodePath: registry.getPathForNode(d.node) ?? d.node.name,
+    })),
+    guessed: references.guessed.map((g) => ({
+      referrerPath: registry.getPathForNode(g.referrer) ?? g.referrer.name,
+      componentType: g.componentType, field: g.field, writtenPath: g.path,
+      targetPath: registry.getPathForNode(g.target) ?? g.target.name, stage: g.stage,
+    })),
+  });
+  return { ids, references };
+}
+
+/**
+ * plan-774 F5: `Object3D.clone(true)` without descending into a non-embedded
+ * reference node — the reference node itself is copied (its `AssetReference`
+ * and `AssetOverrides` are file content), its children (placed content) are
+ * not. Per node `clone(false)` is exactly what `clone(true)` does per node.
+ */
+export function cloneOwnContent(node: Object3D): Object3D {
+  const copy = node.clone(false);
+  if (isUnresolvedReferenceNode(node)) return copy;
+  for (const child of node.children) copy.add(cloneOwnContent(child));
+  return copy;
+}
+
+/**
+ * plan-774 F5: a placed reference node carries runtime state of its placement
+ * that is not content of the file holding it. Two kinds, both taken off here:
+ *
+ *  - the instancer's `LayoutObject` stamp (`stampPlacementMarkers`). The loader
+ *    recorded what the FILE had (`_rvAuthoredLayoutObject`) and the instancer
+ *    the pure stamp (`_rvLayoutObjectStamp`). Review fix E2: a field the file
+ *    authored is written with its LIVE value (a `Locked` / `Visible` toggle in
+ *    the editor persists); a field the file did not author is dropped while its
+ *    live value is still the stamp's, and kept once the user changed it. A file
+ *    without a record writes no `LayoutObject` at all as long as only the stamp
+ *    is there — what an un-materialised (grafted) reference node would write.
+ *  - review fix E1: the components the bake registry CARRIED from the placed
+ *    asset's root (`carriesToPlacementRoot`, e.g. `RobotIK`; recorded in
+ *    `_rvCarriedRootKeys`). A key is only carried where the file had none, so
+ *    the file's state for it is "absent": it is deleted. Left in, the parent
+ *    file would store a copy of the asset's rig that shadows the real one on
+ *    reopen.
+ *
+ * Returns the number of nodes corrected.
+ */
+export function dropRuntimePlacementStamps(root: Object3D): number {
+  let corrected = 0;
+  root.traverse((node) => {
+    const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
+    if (!rv || typeof rv !== 'object') return;
+    let touched = false;
+    for (const key of carriedRootKeysOf(node)) {
+      if (key in rv) { delete rv[key]; touched = true; }
+    }
+    const authored = node.userData[RV_AUTHORED_LAYOUT_OBJECT_KEY];
+    if (authored !== undefined && restoreAuthoredLayoutObject(rv, authored, node.userData[RV_LAYOUT_OBJECT_STAMP_KEY])) {
+      touched = true;
+    }
+    if (touched) corrected++;
+  });
+  return corrected;
+}
+
+/** E2: the `LayoutObject` the file should hold — see {@link dropRuntimePlacementStamps}. True when `rv` changed. */
+function restoreAuthoredLayoutObject(rv: Record<string, unknown>, authored: unknown, stamp: unknown): boolean {
+  const live = rv.LayoutObject;
+  if (!live || typeof live !== 'object') {
+    // The user removed the component — nothing to restore.
+    return false;
+  }
+  const authoredRecord = authored && typeof authored === 'object' ? authored as Record<string, unknown> : null;
+  const stampRecord = stamp && typeof stamp === 'object' ? stamp as Record<string, unknown> : {};
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(live as Record<string, unknown>)) {
+    const fileHadIt = authoredRecord !== null && key in authoredRecord;
+    if (!fileHadIt && key in stampRecord && jsonEqual(value, stampRecord[key])) continue;
+    out[key] = value;
+  }
+  const before = JSON.stringify(live);
+  if (authoredRecord === null && Object.keys(out).length === 0) {
+    delete rv.LayoutObject;
+    return true;
+  }
+  rv.LayoutObject = out;
+  return JSON.stringify(out) !== before;
+}
+
+function jsonEqual(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/** Clone node → live node and back, paired by position right after `cloneOwnContent`. */
+function pairClone(live: Object3D, clone: Object3D, liveOf: Map<Object3D, Object3D>, cloneOf: Map<Object3D, Object3D>): void {
+  liveOf.set(clone, live);
+  cloneOf.set(live, clone);
+  const n = Math.min(live.children.length, clone.children.length);
+  for (let i = 0; i < n; i++) pairClone(live.children[i], clone.children[i], liveOf, cloneOf);
+}
+
 /**
  * Serialize the authored asset (geometry + `userData.realvirtual` incl.
  * CADLink and authored components) to a binary GLB ArrayBuffer.
@@ -484,16 +631,27 @@ export async function exportAssetGlb(
   assetName?: string,
   shareMeta?: RvShareMeta | null,
   classification?: DocumentClassification | null,
+  options?: ExportAssetGlbOptions,
 ): Promise<ArrayBuffer> {
   // clone(true) deep-copies the tree; userData is JSON-cloned by three — which
   // is why the live engine objects come off it first (and go straight back on).
   const restoreLiveUserData = detachLiveUserData(assetRoot);
   let clone: Object3D;
   try {
-    clone = assetRoot.clone(true);
+    // plan-774 F5: the walk never copies PLACED content — everything below a
+    // non-embedded reference node is the referenced asset's (in the editor a
+    // baked placement instance: chunk geometry shared with every instance and
+    // the session cache). Copying it to prune it afterwards would clone shared
+    // chunk meshes for nothing; the prune below stays as the guard.
+    clone = cloneOwnContent(assetRoot);
   } finally {
     restoreLiveUserData();
   }
+  // plan-769 Phase 3: clone ↔ live, BEFORE any prune — the reference writer reads every
+  // reference of a clone node through the live node it was copied from.
+  const liveOf = new Map<Object3D, Object3D>();
+  const cloneOf = new Map<Object3D, Object3D>();
+  pairClone(assetRoot, clone, liveOf, cloneOf);
   restoreAuthoredLampMaterials(assetRoot, clone);
   restoreDriveHomePoses(assetRoot, clone);
   restoreSourceTemplateMaterials(assetRoot, clone);
@@ -503,7 +661,22 @@ export async function exportAssetGlb(
   // subtrees, which is strictly more than the helper prune would have to walk.
   pruneComposedReferenceSubtrees(clone);
   pruneRuntimeHelpers(clone);
+  // After both prunes (only what is written gets renamed) and before the
+  // sanitizer, which deletes the `_rvOrigName` stamp this reads (plan-765 F1).
+  restoreAuthoredNames(clone);
+  // The tree exactly as the file will hold it, names restored, stamps still
+  // on — the save guard counts its references here (plan-765 F5).
+  options?.onClone?.(clone);
+  // plan-769 Phase 3 (F1/F2): ids promoted / minted / de-duplicated, every stored
+  // reference written as its address — after the save guard (it measures the path
+  // space the names restore), before the sanitizer (it would strip the seeds read here).
+  const identityReport = writeExportIdentity(assetRoot, clone, liveOf, cloneOf, options?.registry);
+  options?.onIdentityReport?.(identityReport);
+  // plan-774 F5: before the sanitizer (it strips the `_` record read here).
+  dropRuntimePlacementStamps(clone);
   sanitizeUserDataForExport(clone);
+  // plan-769 F14: overrides in the 769 form — never `byNodeId` / `trsByNodeId` again.
+  canonicalizeAssetOverridesInTree(clone);
   stripShareMeta(clone);
 
   const content = collapseWrapperChain(clone);
@@ -523,12 +696,24 @@ export async function exportAssetGlb(
   // JSON-serialisable by construction — the two conditions §2.4 names.
   if (shareMeta) scene.userData[RV_SHARE_KEY] = { ...shareMeta, v: RV_SHARE_VERSION };
   liftRootExtrasToScene(scene, content, classification);
+  applyMacrosToScene(scene, options?.macros);
+  // plan-769 Phase 3: the file stores addresses — `scenes[0].extras.realvirtual.idVersion`.
+  stampIdVersion(scene);
 
   if (hasIdentityTransform(content)) {
     // Flatten: the content root becomes the scene itself. Child name-paths are
     // unchanged (the asset root is the path space's root either way).
     scene.add(...[...content.children]);
   } else {
+    // The lift moved the content root's block — its NodeId included — to the scene:
+    // the scene IS the asset root of the file. The content node that stays below it is a
+    // new, transform-only node and gets an id of its own, derived from the scene's so
+    // that two saves of one session write the same one.
+    const sceneId = (scene.userData.realvirtual as Record<string, unknown> | undefined)?.[RV_NODE_ID_KEY];
+    if (typeof sceneId === 'string' && sceneId) {
+      const contentUd = content.userData as Record<string, unknown>;
+      contentUd['realvirtual'] = { [RV_NODE_ID_KEY]: seedNodeId(`\u0000content\u0000${sceneId}`) };
+    }
     // A transform on the content root has to be preserved and a glTF scene
     // cannot carry one, so the node level stays. It keeps its OWN name — the
     // scene above it already carries the asset name (which is what the planner
@@ -543,7 +728,24 @@ export async function exportAssetGlb(
   // so authored-hidden nodes survive — hence the explicit prune above).
   await waitForMaterialTextures(scene);
   // plan-498 F2: the FMU packages ride along as bufferViews of the same file.
-  return embedFmuPackages(await objectToGlb(scene)).glb;
+  const glb = embedFmuPackages(await objectToGlb(scene)).glb;
+  // plan-650 Phase 5b: a SHARED family takes its child families along
+  // ("Weitergeben = eine Datei") - flat, verbatim, DocHash unchanged.
+  return shareMeta ? bundleChildFamiliesIntoShare(glb, scene.name) : glb;
+}
+
+async function bundleChildFamiliesIntoShare(glb: ArrayBuffer, name: string): Promise<ArrayBuffer> {
+  const { bundleChildFamiliesForShare } = await import('./rv-parametric-share');
+  const { glb: out, report } = await bundleChildFamiliesForShare(new Uint8Array(glb));
+  const notBundled = [...report.missing, ...report.stale];
+  if (notBundled.length > 0) {
+    const { reportParametricBundleMissing } = await import('../hmi/problems-store');
+    reportParametricBundleMissing({ families: notBundled, phase: 'export', document: name });
+  }
+  if (out.byteLength === glb.byteLength && report.bundled.length === 0) return glb;
+  return out.byteOffset === 0 && out.byteLength === out.buffer.byteLength
+    ? out.buffer as ArrayBuffer
+    : out.slice().buffer as ArrayBuffer;
 }
 
 /**
@@ -619,6 +821,25 @@ function liftRootExtrasToScene(
   delete contentUd['realvirtual'];
 }
 
+/** plan-769 Phase 3: mark the file as storing addresses (`idVersion`, rv-ODT §5a). */
+function stampIdVersion(scene: Object3D): void {
+  const ud = scene.userData as Record<string, unknown>;
+  const rv = isPlainRecord(ud['realvirtual']) ? { ...(ud['realvirtual'] as Record<string, unknown>) } : {};
+  rv[ID_VERSION_KEY] = ID_VERSION_CURRENT;
+  ud['realvirtual'] = rv;
+}
+
+/** plan-641 M5: settle the macro block on the scene extras (three-state, see the option). */
+function applyMacrosToScene(scene: Object3D, macros: readonly unknown[] | null | undefined): void {
+  if (macros === undefined) return;
+  const ud = scene.userData as Record<string, unknown>;
+  const rv = isPlainRecord(ud['realvirtual']) ? { ...(ud['realvirtual'] as Record<string, unknown>) } : {};
+  if (macros === null || macros.length === 0) delete rv[RV_MACROS_KEY];
+  else rv[RV_MACROS_KEY] = JSON.parse(JSON.stringify(macros));
+  if (Object.keys(rv).length > 0) ud['realvirtual'] = rv;
+  else delete ud['realvirtual'];
+}
+
 function isPlainRecord(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === 'object' && !Array.isArray(v);
 }
@@ -686,7 +907,10 @@ function restoreDriveHomePoses(live: Object3D, clone: Object3D): void {
       clone.updateMatrix();
     }
   }
-  for (let i = 0; i < live.children.length; i++) restoreDriveHomePoses(live.children[i], clone.children[i]);
+  // min: the clone has no placed content (plan-774 F5) — a reference node's
+  // live children have no clone counterpart.
+  const count = Math.min(live.children.length, clone.children.length);
+  for (let i = 0; i < count; i++) restoreDriveHomePoses(live.children[i], clone.children[i]);
 }
 
 function restoreAuthoredLampMaterials(live: Object3D, clone: Object3D): void {
@@ -706,7 +930,8 @@ function restoreSourceTemplateMaterials(live: Object3D, clone: Object3D): void {
     const material = getSourceTemplateMaterial(live as Mesh);
     if (material) (clone as Mesh).material = material;
   }
-  for (let i = 0; i < live.children.length; i++) {
+  const count = Math.min(live.children.length, clone.children.length);
+  for (let i = 0; i < count; i++) {
     restoreSourceTemplateMaterials(live.children[i], clone.children[i]);
   }
 }

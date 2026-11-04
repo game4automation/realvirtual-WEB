@@ -1,0 +1,70 @@
+{
+  "startedAt": "2026-10-23T00:39:54.967Z",
+  "url": "http://localhost:5659/?projectUrl=/spike-659-duck/&doc=doc_rv_walker_659",
+  "followDefault": {
+    "signal": false,
+    "plugin": {
+      "followOn": false,
+      "armed": true
+    }
+  },
+  "camera": {
+    "followOff": {
+      "frames": 104,
+      "camStepStdMm": 0,
+      "camStepMaxMm": 0,
+      "camYStdMm": 0,
+      "oldCamStepStdMm": 3.629,
+      "oldCamStepMaxMm": 25.367,
+      "oldCamYStdMm": 1.657,
+      "pushScreenPx": 133
+    },
+    "followOnDamped": {
+      "frames": 96,
+      "camStepStdMm": 1.496,
+      "camStepMaxMm": 11.661,
+      "camYStdMm": 0,
+      "oldCamStepStdMm": 3.42,
+      "oldCamStepMaxMm": 19.928,
+      "oldCamYStdMm": 1.925,
+      "pushScreenPx": 67
+    }
+  },
+  "steering": {
+    "trials": [
+      {
+        "cameraAzimuthDeg": 0,
+        "travelM": 0.448,
+        "alignWithCameraForward": 0.951
+      },
+      {
+        "cameraAzimuthDeg": 180,
+        "travelM": 0.453,
+        "alignWithCameraForward": 0.967
+      },
+      {
+        "cameraAzimuthDeg": 90,
+        "travelM": 0.147,
+        "alignWithCameraForward": 0.74
+      }
+    ]
+  },
+  "panel": {
+    "found": false,
+    "width": null,
+    "height": null,
+    "devices": 6,
+    "cells": 10,
+    "configErrors": [],
+    "stackLights": 0
+  },
+  "consoleErrors": [
+    "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+    "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+    "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+    "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+    "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+    "Failed to load resource: net::ERR_CONNECTION_REFUSED"
+  ],
+  "ok": true
+}

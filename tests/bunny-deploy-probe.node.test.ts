@@ -6,7 +6,8 @@
  *
  *  - `probePublishedAssets`: the live host answers a missing asset with a
  *    404 (Bunny's text/html error page accepted, a 200 fails), serves the
- *    catalog byte-for-byte and the first asset with bytes that hash to the
+ *    library manifest (`library/project.json` since plan-778 Phase 4) byte-for-byte
+ *    and the first asset with bytes that hash to the
  *    catalog `sha256`.
  *  - deploy ordering: the catalog is stamped AFTER signing (signing is size-
  *    preserving, the hash is not), a same-size binary whose catalog hash changed
@@ -60,10 +61,33 @@ function makeGlb(tag = 'a'): Buffer {
   return glb;
 }
 
-function writeLibrary(entries: Array<{ rel: string; bytes: Buffer; splat?: boolean }>): string {
+/**
+ * The realvirtual library as the build ships it: `library/<rel>` files and the
+ * library PROJECT manifest `library/project.json` (plan-778 Phase 4 — the bundled
+ * catalog.json is gone). Rows are stamped like the deploy stamps them. Returns
+ * the manifest text.
+ */
+function writeLibrary(entries: Array<{ rel: string; bytes: Buffer }>): string {
   mkdirSync(join(dist, 'library'), { recursive: true });
   for (const e of entries) {
     const abs = join(dist, 'library', ...e.rel.split('/'));
+    mkdirSync(join(abs, '..'), { recursive: true });
+    writeFileSync(abs, e.bytes);
+  }
+  writeFileSync(join(dist, 'library', 'project.json'), JSON.stringify({
+    schemaVersion: 2, id: 'prj_realvirtual_library', name: 'test', kind: 'demo',
+    documents: entries.map((e, i) => ({ id: `g${i}`, name: `G${i}`, path: e.rel })),
+  }, null, 2) + '\n');
+  stampCatalogHashes(dist);
+  return readFileSync(join(dist, 'library', 'project.json'), 'utf8');
+}
+
+/** An EXTERNAL URL catalog in the build (catalog.json stays their format), stamped. */
+const PARTNER = 'catalogs/partner';
+function writeCatalog(entries: Array<{ rel: string; bytes: Buffer; splat?: boolean }>): string {
+  mkdirSync(join(dist, PARTNER), { recursive: true });
+  for (const e of entries) {
+    const abs = join(dist, PARTNER, ...e.rel.split('/'));
     mkdirSync(join(abs, '..'), { recursive: true });
     writeFileSync(abs, e.bytes);
   }
@@ -74,9 +98,9 @@ function writeLibrary(entries: Array<{ rel: string; bytes: Buffer; splat?: boole
       ? { id: `s${i}`, name: `S${i}`, category: 'splat', splatUrl: e.rel }
       : { id: `g${i}`, name: `G${i}`, category: 'custom', glbUrl: e.rel })),
   };
-  writeFileSync(join(dist, 'library', 'catalog.json'), JSON.stringify(catalog, null, 2) + '\n');
+  writeFileSync(join(dist, PARTNER, 'catalog.json'), JSON.stringify(catalog, null, 2) + '\n');
   stampCatalogHashes(dist);
-  return readFileSync(join(dist, 'library', 'catalog.json'), 'utf8');
+  return readFileSync(join(dist, PARTNER, 'catalog.json'), 'utf8');
 }
 
 function response(status: number, body: Uint8Array | string, type: string): Response {
@@ -97,11 +121,11 @@ function host(routes: Record<string, () => Response>) {
 describe('probePublishedAssets', { timeout: 30_000 }, () => {
   const baseUrl = 'https://cdn.example.com/demo/';
 
-  it('passes when the missing probe is 404, the remote catalog equals dist byte-for-byte and the first asset hashes to its sha256', async () => {
+  it('passes when the missing probe is 404, the remote library manifest equals dist byte-for-byte and the first asset hashes to its sha256', async () => {
     const glb = makeGlb('first');
-    const catalogText = writeLibrary([{ rel: 'Pallet/Belt.glb', bytes: glb }]);
+    const manifestText = writeLibrary([{ rel: 'Pallet/Belt.glb', bytes: glb }]);
     const { fetchImpl, seen } = host({
-      'library/catalog.json': () => response(200, catalogText, 'application/json'),
+      'library/project.json': () => response(200, manifestText, 'application/json'),
       'library/Pallet/Belt.glb': () => response(200, glb, 'model/gltf-binary'),
     });
     const result = await probePublishedAssets({ baseUrl, distDir: dist, fetchImpl });
@@ -109,15 +133,34 @@ describe('probePublishedAssets', { timeout: 30_000 }, () => {
     expect(result.ok).toBe(true);
     expect(result.checks).toHaveLength(3);
     expect(seen[0]).toBe(`${baseUrl}${PROBE_MISSING_ASSET}`);
-    // The catalog and asset GETs bypass a stale edge copy.
-    expect(seen[1]).toMatch(/library\/catalog\.json\?rv-probe=\d+$/);
+    // The manifest and asset GETs bypass a stale edge copy.
+    expect(seen[1]).toMatch(/library\/project\.json\?rv-probe=\d+$/);
+  });
+
+  // plan-778 Phase 4: the probed manifest is library/project.json by default; an external
+  // catalog in the catalog.json format is still probed the same way when named.
+  it('probes an external catalog.json (entries form) when given as catalogRel', async () => {
+    const glb = makeGlb('p');
+    const catalogText = writeCatalog([{ rel: 'Belt.glb', bytes: glb }]);
+    const routes = (catalog: string) => ({
+      [`${PARTNER}/catalog.json`]: () => response(200, catalog, 'application/json'),
+      [`${PARTNER}/Belt.glb`]: () => response(200, glb, 'model/gltf-binary'),
+    });
+    const catalogRel = `${PARTNER}/catalog.json`;
+    const ok = await probePublishedAssets({ baseUrl, distDir: dist, fetchImpl: host(routes(catalogText)).fetchImpl, catalogRel });
+    expect(ok.findings).toEqual([]);
+    expect(ok.checks.join('\n')).toMatch(/catalogs\/partner\/catalog\.json -> 200, byte-equal to dist/);
+    const stale = catalogText.replace(/"sha256": "(.)/, (_m, c: string) => `"sha256": "${c === 'a' ? 'b' : 'a'}`);
+    const bad = await probePublishedAssets({ baseUrl, distDir: dist, fetchImpl: host(routes(stale)).fetchImpl, catalogRel });
+    expect(bad.ok).toBe(false);
+    expect(bad.findings.join('\n')).toMatch(/catalogs\/partner\/catalog\.json on the host differs from the build output/);
   });
 
   it('fails with a named finding when the missing probe answers 200 text/html', async () => {
-    const catalogText = writeLibrary([{ rel: 'Belt.glb', bytes: makeGlb() }]);
+    const manifestText = writeLibrary([{ rel: 'Belt.glb', bytes: makeGlb() }]);
     const { fetchImpl } = host({
       [PROBE_MISSING_ASSET]: () => response(200, '<!DOCTYPE html><html></html>', 'text/html'),
-      'library/catalog.json': () => response(200, catalogText, 'application/json'),
+      'library/project.json': () => response(200, manifestText, 'application/json'),
       'library/Belt.glb': () => response(200, makeGlb(), 'application/octet-stream'),
     });
     const result = await probePublishedAssets({ baseUrl, distDir: dist, fetchImpl });
@@ -147,28 +190,28 @@ describe('probePublishedAssets', { timeout: 30_000 }, () => {
     expect(result.checks[0]).toBe(`${PROBE_MISSING_ASSET} -> 404 (text/html error page, accepted)`);
   });
 
-  it('fails when the remote catalog differs from dist (the same-size skip)', async () => {
+  it('fails when the remote library manifest differs from dist (the same-size skip)', async () => {
     const glb = makeGlb();
-    const catalogText = writeLibrary([{ rel: 'Belt.glb', bytes: glb }]);
+    const manifestText = writeLibrary([{ rel: 'Belt.glb', bytes: glb }]);
     // Same length, one hash digit flipped — what a size-only diff leaves behind.
-    const stale = catalogText.replace(/"sha256": "(.)/, (_m, c: string) => `"sha256": "${c === 'a' ? 'b' : 'a'}`);
-    expect(stale.length).toBe(catalogText.length);
+    const stale = manifestText.replace(/"sha256": "(.)/, (_m, c: string) => `"sha256": "${c === 'a' ? 'b' : 'a'}`);
+    expect(stale.length).toBe(manifestText.length);
     const { fetchImpl } = host({
-      'library/catalog.json': () => response(200, stale, 'application/json'),
+      'library/project.json': () => response(200, stale, 'application/json'),
       'library/Belt.glb': () => response(200, glb, 'model/gltf-binary'),
     });
     const result = await probePublishedAssets({ baseUrl, distDir: dist, fetchImpl });
     expect(result.ok).toBe(false);
-    expect(result.findings.join('\n')).toMatch(/catalog\.json on the host differs from the build output/);
+    expect(result.findings.join('\n')).toMatch(/library\/project\.json on the host differs from the build output/);
   });
 
   it('fails when the first asset bytes hash differently (size-preserving re-sign not stamped)', async () => {
     const glb = makeGlb('x');
-    const catalogText = writeLibrary([{ rel: 'Belt.glb', bytes: glb }]);
+    const manifestText = writeLibrary([{ rel: 'Belt.glb', bytes: glb }]);
     const other = Buffer.from(glb);
     other[other.length - 1] = 0x21; // same size, different bytes
     const { fetchImpl } = host({
-      'library/catalog.json': () => response(200, catalogText, 'application/json'),
+      'library/project.json': () => response(200, manifestText, 'application/json'),
       'library/Belt.glb': () => response(200, other, 'model/gltf-binary'),
     });
     const result = await probePublishedAssets({ baseUrl, distDir: dist, fetchImpl });
@@ -178,9 +221,9 @@ describe('probePublishedAssets', { timeout: 30_000 }, () => {
 
   it('flags an HTML content-type for the asset and a network failure without throwing', async () => {
     const glb = makeGlb();
-    const catalogText = writeLibrary([{ rel: 'Belt.glb', bytes: glb }]);
+    const manifestText = writeLibrary([{ rel: 'Belt.glb', bytes: glb }]);
     const { fetchImpl } = host({
-      'library/catalog.json': () => response(200, catalogText, 'application/json'),
+      'library/project.json': () => response(200, manifestText, 'application/json'),
       'library/Belt.glb': () => response(200, glb, 'text/html'),
     });
     const html = await probePublishedAssets({ baseUrl, distDir: dist, fetchImpl });
@@ -214,35 +257,43 @@ function signingWith(key: { privateKey: KeyObject; publicKey: KeyObject }) {
 
 // Key generation and a few file round trips — generous on a loaded CI box.
 describe('deploy ordering', { timeout: 60_000 }, () => {
-  it('stampCatalogHashes after signGlbsInDirectory yields catalog sha256 == sha256 of the signed file', () => {
+  it('stampCatalogHashes after signGlbsInDirectory yields row/entry sha256 == sha256 of the signed file', () => {
     writeLibrary([{ rel: 'Pallet/Belt.glb', bytes: makeGlb('belt') }]);
-    const path = join(dist, 'library', 'Pallet', 'Belt.glb');
-    const devHash = JSON.parse(readFileSync(join(dist, 'library', 'catalog.json'), 'utf8')).entries[0].sha256;
+    writeCatalog([{ rel: 'Belt.glb', bytes: makeGlb('partner-belt') }]);
+    const libraryPath = join(dist, 'library', 'Pallet', 'Belt.glb');
+    const catalogPath = join(dist, PARTNER, 'Belt.glb');
+    const readRow = () => JSON.parse(readFileSync(join(dist, 'library', 'project.json'), 'utf8')).documents[0];
+    const readEntry = () => JSON.parse(readFileSync(join(dist, PARTNER, 'catalog.json'), 'utf8')).entries[0];
+    const devHash = readRow().sha256;
 
     // First signing (the deploy's signGlbsInDirectory), then a RE-sign with another key:
     // size-preserving by design, which is exactly why a size check cannot see it.
-    signGlbFile(path, signingWith(generateKeyPairSync('ed25519')));
-    const firstSigned = readFileSync(path);
-    signGlbFile(path, signingWith(generateKeyPairSync('ed25519')));
-    const signed = readFileSync(path);
+    signGlbFile(libraryPath, signingWith(generateKeyPairSync('ed25519')));
+    const firstSigned = readFileSync(libraryPath);
+    signGlbFile(libraryPath, signingWith(generateKeyPairSync('ed25519')));
+    const signed = readFileSync(libraryPath);
     expect(signed.length).toBe(firstSigned.length);
     expect(sha(signed)).not.toBe(sha(firstSigned));
+    signGlbFile(catalogPath, signingWith(generateKeyPairSync('ed25519')));
+    const signedPartner = readFileSync(catalogPath);
 
-    const readEntry = () => JSON.parse(readFileSync(join(dist, 'library', 'catalog.json'), 'utf8')).entries[0];
-    // Without the stamp the shipped catalog still describes the unsigned dev bytes.
-    expect(readEntry().sha256).toBe(devHash);
-    expect(readEntry().sha256).not.toBe(sha(signed));
+    // Without the stamp the shipped manifest still describes the unsigned dev bytes.
+    expect(readRow().sha256).toBe(devHash);
+    expect(readRow().sha256).not.toBe(sha(signed));
 
     const result = stampCatalogHashes(dist);
-    expect(result).toEqual({ catalogs: 1, stamped: 1 });
-    expect(readEntry().sha256).toBe(sha(signed));
-    expect(readEntry().sizeBytes).toBe(signed.length);
+    expect(result).toEqual({ catalogs: 1, stamped: 1, libraryProjects: 1, projectRows: 1 });
+    // The library project's row (plan-778) and an external catalog's entry, both from the signed bytes.
+    expect(readRow().sha256).toBe(sha(signed));
+    expect(readRow().sizeBytes).toBe(signed.length);
+    expect(readEntry().sha256).toBe(sha(signedPartner));
+    expect(readEntry().sizeBytes).toBe(signedPartner.length);
   });
 
   it('selectFilesToUpload picks catalog.json and a same-size glb AND a same-size splat whose catalog hash changed', () => {
     const glb = makeGlb('v1');
     const splat = Buffer.alloc(64, 1);
-    const published = writeLibrary([
+    const published = writeCatalog([
       { rel: 'Belt.glb', bytes: glb },
       { rel: 'Hall.splat', bytes: splat, splat: true },
       { rel: 'Same.glb', bytes: makeGlb('same') },
@@ -250,36 +301,41 @@ describe('deploy ordering', { timeout: 60_000 }, () => {
     // New bytes, identical sizes.
     const glb2 = Buffer.from(glb); glb2[glb2.length - 1] = 0x21;
     const splat2 = Buffer.alloc(64, 2);
-    writeFileSync(join(dist, 'library', 'Belt.glb'), glb2);
-    writeFileSync(join(dist, 'library', 'Hall.splat'), splat2);
+    writeFileSync(join(dist, PARTNER, 'Belt.glb'), glb2);
+    writeFileSync(join(dist, PARTNER, 'Hall.splat'), splat2);
     stampCatalogHashes(dist);
 
-    const changed = catalogChangedBinaries(dist, 'library/catalog.json', published);
-    expect(changed.sort()).toEqual(['library/Belt.glb', 'library/Hall.splat']);
+    const changed = catalogChangedBinaries(dist, `${PARTNER}/catalog.json`, published);
+    expect(changed.sort()).toEqual([`${PARTNER}/Belt.glb`, `${PARTNER}/Hall.splat`]);
 
     const local = collectLocalFiles(dist);
     const remote = new Map(local.map((f) => [f.rel.toLowerCase(), f.size] as [string, number]));
     const selected = selectFilesToUpload(local, remote, { alwaysUploadRel: changed }).map((f) => f.rel).sort();
-    expect(selected).toEqual(['library/Belt.glb', 'library/Hall.splat', 'library/catalog.json']);
-    expect(isAlwaysUploadFile('library/catalog.json')).toBe(true);
+    expect(selected).toEqual([`${PARTNER}/Belt.glb`, `${PARTNER}/Hall.splat`, `${PARTNER}/catalog.json`]);
+    expect(isAlwaysUploadFile(`${PARTNER}/catalog.json`)).toBe(true);
     expect(isAlwaysUploadFile('x/y/catalog.json')).toBe(true);
 
     // No published catalog (first deploy): every catalogued file counts as changed.
-    expect(catalogChangedBinaries(dist, 'library/catalog.json', null).sort())
-      .toEqual(['library/Belt.glb', 'library/Hall.splat', 'library/Same.glb']);
+    expect(catalogChangedBinaries(dist, `${PARTNER}/catalog.json`, null).sort())
+      .toEqual([`${PARTNER}/Belt.glb`, `${PARTNER}/Hall.splat`, `${PARTNER}/Same.glb`]);
   });
 
   it('catalogEntryBinaryRel resolves relative urls and ignores absolute ones', () => {
-    expect(catalogEntryBinaryRel('library/catalog.json', { glbUrl: 'A%20B/x.glb' })).toBe('library/A B/x.glb');
+    expect(catalogEntryBinaryRel(`${PARTNER}/catalog.json`, { glbUrl: 'A%20B/x.glb' })).toBe(`${PARTNER}/A B/x.glb`);
     expect(catalogEntryBinaryRel('catalog.json', { splatUrl: 'x.ply' })).toBe('x.ply');
-    expect(catalogEntryBinaryRel('library/catalog.json', { glbUrl: 'https://raw.githubusercontent.com/a/b.glb' })).toBeNull();
-    expect(catalogEntryBinaryRel('library/catalog.json', { glbUrl: '/library/x.glb' })).toBeNull();
-    expect(catalogEntryBinaryRel('library/catalog.json', { glbUrl: '../../x.glb' })).toBeNull();
-    expect(isCatalogFile('library/catalog.json')).toBe(true);
-    expect(isCatalogFile('library/catalog.json.bak')).toBe(false);
+    expect(catalogEntryBinaryRel(`${PARTNER}/catalog.json`, { glbUrl: 'https://raw.githubusercontent.com/a/b.glb' })).toBeNull();
+    expect(catalogEntryBinaryRel(`${PARTNER}/catalog.json`, { glbUrl: '/library/x.glb' })).toBeNull();
+    expect(catalogEntryBinaryRel(`${PARTNER}/catalog.json`, { glbUrl: '../../../x.glb' })).toBeNull();
+    expect(isCatalogFile(`${PARTNER}/catalog.json`)).toBe(true);
+    expect(isCatalogFile(`${PARTNER}/catalog.json.bak`)).toBe(false);
+    // plan-778: the library project is deferred like a catalog (hashes of the binaries beside it) ...
+    expect(isCatalogFile('library/project.json')).toBe(true);
+    // ... but any other project.json is an ordinary manifest.
+    expect(isCatalogFile('demo/project.json')).toBe(false);
+    expect(catalogEntryBinaryRel('library/project.json', { path: 'Pallet/Belt.glb' })).toBe('library/Pallet/Belt.glb');
   });
 
-  it('catalog.json is uploaded last; when a binary fails, the old catalog stays remote and the next run selects the binary again', async () => {
+  it('the library manifest is uploaded last; when a binary fails, the old manifest stays remote and the next run selects the binary again', async () => {
     const published = writeLibrary([
       { rel: 'A.glb', bytes: makeGlb('a1') },
       { rel: 'B.glb', bytes: makeGlb('b1') },
@@ -292,8 +348,9 @@ describe('deploy ordering', { timeout: 60_000 }, () => {
     stampCatalogHashes(dist);
     writeFileSync(join(dist, 'index.html'), '<html></html>');
 
+    const manifestRel = 'library/project.json';
     const remoteFiles = new Map<string, Buffer>();
-    for (const f of collectLocalFiles(dist)) remoteFiles.set(f.rel, f.rel === 'library/catalog.json' ? Buffer.from(published) : readFileSync(f.abs));
+    for (const f of collectLocalFiles(dist)) remoteFiles.set(f.rel, f.rel === manifestRel ? Buffer.from(published) : readFileSync(f.abs));
     const order: string[] = [];
     let failB = true;
     const client = {
@@ -309,27 +366,27 @@ describe('deploy ordering', { timeout: 60_000 }, () => {
     };
     const opts = { force: false, dryRun: false, alwaysUploadGlbs: false };
 
-    // Run 1: B fails → the pool rejects before the catalog and the HTML are sent.
+    // Run 1: B fails → the pool rejects before the manifest and the HTML are sent.
     const diff1 = await catalogHashDiff(client, dist, 'demo');
     expect([...diff1].sort()).toEqual(['library/A.glb', 'library/B.glb']);
     await expect(uploadDirectory(client, dist, 'demo', { ...opts, alwaysUploadRel: diff1 })).rejects.toThrow(/Failed to upload library\/B\.glb/);
     expect(order).toContain('library/A.glb');
-    expect(order).not.toContain('library/catalog.json');
+    expect(order).not.toContain(manifestRel);
     expect(order).not.toContain('index.html');
-    expect(remoteFiles.get('library/catalog.json')!.toString('utf8')).toBe(published);
+    expect(remoteFiles.get(manifestRel)!.toString('utf8')).toBe(published);
 
-    // Run 2 (resume): the remote catalog is still the old one, so B is selected again.
+    // Run 2 (resume): the remote manifest is still the old one, so B is selected again.
     failB = false;
     order.length = 0;
     const diff2 = await catalogHashDiff(client, dist, 'demo');
     expect([...diff2]).toContain('library/B.glb');
     await uploadDirectory(client, dist, 'demo', { ...opts, alwaysUploadRel: diff2 });
     expect(order).toContain('library/B.glb');
-    // The catalog follows every binary; only the HTML comes after it.
-    const catalogAt = order.indexOf('library/catalog.json');
-    expect(catalogAt).toBeGreaterThan(order.indexOf('library/B.glb'));
-    expect(order.slice(catalogAt + 1)).toEqual(['index.html']);
-    expect(remoteFiles.get('library/catalog.json')!.equals(readFileSync(join(dist, 'library', 'catalog.json')))).toBe(true);
+    // The manifest follows every binary; only the HTML comes after it.
+    const manifestAt = order.indexOf(manifestRel);
+    expect(manifestAt).toBeGreaterThan(order.indexOf('library/B.glb'));
+    expect(order.slice(manifestAt + 1)).toEqual(['index.html']);
+    expect(remoteFiles.get(manifestRel)!.equals(readFileSync(join(dist, 'library', 'project.json')))).toBe(true);
 
     // Run 3: nothing changed any more — only the always-upload files go.
     const diff3 = await catalogHashDiff(client, dist, 'demo');

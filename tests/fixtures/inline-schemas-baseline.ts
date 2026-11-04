@@ -288,11 +288,27 @@ export const INLINE_SCHEMA_BASELINE: Record<string, ComponentSchema> = {
     UseRaycast: { type: 'boolean', default: false },
     RayCastDirection: { type: 'vector3', unityCoords: true },
     RayCastLength: { type: 'number', default: 1000, unit: 'mm' },
+    // plan-2016 S6c (intentional schema change, updated together with rv-odt.json):
+    AdditionalRayCastLayers: { type: 'json', default: [] },
     SensorOccupied: { type: 'componentRef', signal: 'PLCInputBool' },
     SensorNotOccupied: { type: 'componentRef', signal: 'PLCInputBool' },
     AutoRay: { type: 'boolean', default: false },
     // plan-276 Phase 5 (intentional schema change, updated together with rv-odt.json):
     PhysicsMode: { type: 'boolean', default: false },
+  },
+
+  // plan-2016 S5 (new component, added together with rv-odt.json):
+  MUSwitcher: {
+    SwitchToGroup: { type: 'string', default: '' },
+  },
+
+  // plan-2016 S6b (new component, added together with rv-odt.json):
+  MUPusher: {
+    Drive: { type: 'componentRef' },
+    Pusher: { type: 'componentRef' },
+    Sensor: { type: 'componentRef' },
+    ReleasePosition: { type: 'number', default: 0, unit: 'mm' },
+    ReleaseSurface: { type: 'componentRef' },
   },
 
   TransportStopper: {
@@ -331,8 +347,22 @@ export const INLINE_SCHEMA_BASELINE: Record<string, ComponentSchema> = {
     // plan-255 (intentional schema change, updated together with rv-odt.json):
     Accumulate: { type: 'boolean', default: true },
     MinGap: { type: 'number', default: 0, unit: 'mm' },
+    // Festo 2026-11-04 (intentional schema change; 35de9bb2 changed rv-odt.json without this line):
+    VerticalReach: { type: 'number', default: 0, unit: 'mm', min: 0 },
     // plan-276 Phase 4 (intentional schema change, updated together with rv-odt.json):
     PhysicsMode: { type: 'boolean', default: false },
+  },
+  // plan-2016 Phase 3 (new component, updated together with rv-odt.json):
+  TransportGuided: {
+    Circular: { type: 'boolean', default: false },
+    Length: { type: 'number', default: 1, unit: 'm', min: 0.0001 },
+    Radius: { type: 'number', default: 1, unit: 'm', min: 0.0001 },
+    Angle: { type: 'number', default: 90, unit: 'deg', min: -360, max: 360 },
+    Height: { type: 'number', default: 0.5, unit: 'm', min: 0 },
+    Width: { type: 'number', default: 0.5, unit: 'm', min: 0 },
+    ColliderBorderX: { type: 'number', default: 0.2, unit: 'm', min: 0 },
+    ColliderBorderZ: { type: 'number', default: 0.2, unit: 'm', min: 0 },
+    DistanceCollider: { type: 'number', default: 0.005, unit: 'm', min: 0 },
   },
 
   Source: {
@@ -352,6 +382,8 @@ export const INLINE_SCHEMA_BASELINE: Record<string, ComponentSchema> = {
     GenerateIfDistance: { type: 'number', default: 300, aliases: ['SpawnDistance'], unit: 'mm' },
     PlaceOnTransportSurface: { type: 'boolean', default: true },
     ThisObjectAsMU: { type: 'string', default: '' },
+    // plan-2016 S1 (intentional schema change, updated together with rv-odt.json):
+    Destination: { type: 'string', default: '' },
     // plan-394 — role handed to every MU this source spawns (rv_extras of a
     // clone are stripped, so the role cannot travel on the MU itself).
     CollisionRoleForMUs: {
@@ -379,6 +411,10 @@ export const INLINE_SCHEMA_BASELINE: Record<string, ComponentSchema> = {
     SignalPick: { type: 'componentRef' },
     SignalPlace: { type: 'componentRef' },
     PartToGrip: { type: 'componentRef' },
+    // plan-2016 S4 (intentional schema change, updated together with rv-odt.json):
+    DirectlyGrip: { type: 'boolean', default: false },
+    PickAlignWithObject: { type: 'string', default: '' },
+    AlignRotation: { type: 'boolean', default: true },
   },
 
   GripTarget: {
@@ -397,6 +433,29 @@ export const INLINE_SCHEMA_BASELINE: Record<string, ComponentSchema> = {
     ConnectedSignal: { type: 'componentRef' },
   },
 
+  // plan-2227 — SignalConnector: six typed signal slots + conversion options.
+  SignalConnector: {
+    Mode: { type: 'enum', enumMap: { Copy: 'Copy', IntToBool: 'IntToBool', BoolToInt: 'BoolToInt', BitFromWord: 'BitFromWord', BitToWord: 'BitToWord', Scale: 'Scale' }, default: 'Copy' },
+    Enabled: { type: 'boolean', default: true },
+    SourceBool: { type: 'componentRef', signal: 'PLCOutputBool' },
+    SourceInt: { type: 'componentRef', signal: 'PLCOutputInt' },
+    SourceFloat: { type: 'componentRef', signal: 'PLCOutputFloat' },
+    TargetBool: { type: 'componentRef', signal: 'PLCInputBool' },
+    TargetInt: { type: 'componentRef', signal: 'PLCInputInt' },
+    TargetFloat: { type: 'componentRef', signal: 'PLCInputFloat' },
+    Condition: { type: 'enum', enumMap: { NotZero: 'NotZero', Equals: 'Equals', GreaterOrEqual: 'GreaterOrEqual' }, default: 'NotZero' },
+    CompareValue: { type: 'number', default: 0, step: 1 },
+    TrueValue: { type: 'number', default: 1, step: 1 },
+    FalseValue: { type: 'number', default: 0, step: 1 },
+    Bit: { type: 'number', default: 0, min: 0, max: 31, step: 1 },
+    Width: { type: 'enum', enumMap: { Byte: 'Byte', Word: 'Word', DWord: 'DWord' }, default: 'Word' },
+    Signed: { type: 'boolean', default: true },
+    Factor: { type: 'number', default: 1 },
+    Offset: { type: 'number', default: 0 },
+    Rounding: { type: 'enum', enumMap: { Round: 'Round', Truncate: 'Truncate' }, default: 'Round' },
+    Invert: { type: 'boolean', default: false },
+  },
+
   // plan-328 - OnColor remains raw because the schema mapper deliberately
   // does not support object-valued properties.
   Lamp: {
@@ -406,6 +465,23 @@ export const INLINE_SCHEMA_BASELINE: Record<string, ComponentSchema> = {
     Flashing:           { type: 'boolean', default: false },
     Period:             { type: 'number', default: 1, unit: 's' },
     LampOn:             { type: 'boolean', default: false },
+  },
+
+  // plan-2019 — procedural drive sound. SoundType / Mode are the legacy Unity
+  // fields: read for the mapping only, never shown (scope 'none').
+  Sound: {
+    Kind:      { type: 'enum', enumMap: { Auto: 'Auto', Drive: 'Drive', Cylinder: 'Cylinder', Hydraulic: 'Hydraulic' }, default: 'Auto' },
+    Variant:   { type: 'enum', enumMap: { Auto: 'Auto', Large: 'Large', Medium: 'Medium', Small: 'Small', Hard: 'Hard', Cushioned: 'Cushioned' }, default: 'Auto' },
+    Volume:    { type: 'number', default: 1, min: 0, max: 1 },
+    SoundType: {
+      type: 'enum',
+      enumMap: {
+        Robot1: 'Robot1', Robot2: 'Robot2', SmallElectric1: 'SmallElectric1', SmallElectric2: 'SmallElectric2', AirPressure: 'AirPressure',
+        0: 'Robot1', 1: 'Robot2', 2: 'SmallElectric1', 3: 'SmallElectric2', 4: 'AirPressure',
+      },
+      scope: 'none',
+    },
+    Mode: { type: 'enum', enumMap: { Drive: 'Drive', Pick: 'Pick', 0: 'Drive', 1: 'Pick' }, scope: 'none' },
   },
 
   // plan-417 — 3D scene buttons. The Unity classes use camelCase field names
@@ -613,6 +689,25 @@ export const INLINE_SCHEMA_BASELINE: Record<string, ComponentSchema> = {
       default: 'None',
     },
   },
+  // plan-2022 — unsupported-part detection. Scene-wide switch with parameters;
+  // the bounds are the ones the inspector clamps at the input.
+  DropDetection: {
+    Enabled: { type: 'boolean', default: true },
+    GraceTime: { type: 'number', default: 0.5, unit: 's', min: 0, max: 60 },
+    SupportProbeDistance: { type: 'number', default: 50, unit: 'mm', min: 1, max: 5000 },
+    SupportMode: {
+      type: 'enum',
+      // Appended, never inserted (see SUPPORT_MODES).
+      enumMap: { GeometryBelow: 'GeometryBelow', StateOnly: 'StateOnly' },
+      default: 'GeometryBelow',
+    },
+    SupportRecheckInterval: { type: 'number', default: 0.5, unit: 's', min: 0.05, max: 10 },
+    DeleteUnsupported: { type: 'boolean', default: false },
+    DeleteDelay: { type: 'number', default: 1, unit: 's', min: 0, max: 60 },
+    SignalDropActive: { type: 'componentRef', signal: 'PLCInputBool' },
+    SignalDropCount: { type: 'componentRef', signal: 'PLCInputInt' },
+    SignalResetDrops: { type: 'componentRef', signal: 'PLCOutputBool' },
+  },
 
   // plan-405 — CSG material removal. Added AFTER the rv-ODT migration: not a
   // pre-migration snapshot but the frozen reference for the determinism test.
@@ -682,6 +777,11 @@ export const INLINE_SCHEMA_BASELINE: Record<string, ComponentSchema> = {
     StartCollapsed: { type: 'boolean', default: false },
   },
 
+  // plan-559 Phase 2a — signal scope marker of an embedded copy.
+  InstanceScope: {
+    PrefixNode: { type: 'componentRef' },
+  },
+
   WebSensor: {
     SignalBool:  { type: 'componentRef' },
     SignalInt:   { type: 'componentRef' },
@@ -735,8 +835,141 @@ export const INLINE_SCHEMA_BASELINE: Record<string, ComponentSchema> = {
     WholeScene:   { type: 'boolean', default: false },
     Friction:     { type: 'number',  default: 0.8 },
     Restitution:  { type: 'number',  default: 0 },
+    // plan-2219 (intentional schema change, updated together with rv-odt.json):
+    SoftCcdPrediction: { type: 'number', default: 0.03, unit: 'm', min: 0, max: 0.2, step: 0.005 },
     RemoveBelowY: { type: 'number',  default: -10, unit: 'm' },
     ShowGizmo:    { type: 'boolean', default: true },
+    // plan-2016 S7 (intentional schema change, updated together with rv-odt.json):
+    LimitToLayers: { type: 'json', default: [] },
+  },
+
+  // plan-661: 2D interaction zone (Guides is a rawFields ComponentReference
+  // array, read raw in rv-physics-zone2d.ts). New type — intentional addition.
+  WebPhysicsZone2D: {
+    Kind: { type: 'enum', enumMap: { Jam: 'Jam', BufferTable: 'BufferTable', Diverter: 'Diverter', Merge: 'Merge' }, default: 'Jam' },
+    Surface:          { type: 'componentRef' },
+    KinematicDrives:  { type: 'componentRefArray', default: [] },
+    Damping:          { type: 'number',  default: 0, unit: '1/s' },
+    SleepThreshold:   { type: 'number',  default: 0.05, unit: 'm/s' },
+    ForceReturnAfter: { type: 'number',  default: 0, unit: 's' },
+    ShowGizmo:        { type: 'boolean', default: true },
+  },
+
+  // plan-673 — detail-physics layer (MuJoCo). New types; intentional addition.
+  WebMuJoCoRegion: {
+    RegionEnabled:  { type: 'boolean', default: true },
+    TimestepS:      { type: 'number',  default: 0.002, unit: 's', min: 0.0001, max: 0.1 },
+    ExitBandM:      { type: 'number',  default: 0.5, unit: 'm', min: 0 },
+    LoadTreeMode:   { type: 'enum',    enumMap: { composite: 'composite', separate: 'separate' }, default: 'composite' },
+    MjcfSource:     { type: 'string',  default: '' },
+    MeshBase:       { type: 'string',  default: '' },
+    Contract:       { type: 'string',  default: '' },
+    TrunkBody:      { type: 'string',  default: '' },
+    TrunkFreeJoint: { type: 'string',  default: '' },
+    GyroSensor:     { type: 'string',  default: '' },
+    ShowGizmo:      { type: 'boolean', default: true },
+  },
+
+  DynamicAxis: {
+    SetpointSource: {
+      type: 'enum',
+      enumMap: { planner: 'planner', signal: 'signal', operator: 'operator', policy: 'policy' },
+      default: 'planner',
+    },
+    ActuatorKind: {
+      type: 'enum',
+      enumMap: { position: 'position', velocity: 'velocity', motor: 'motor' },
+      default: 'position',
+    },
+    Kp:                 { type: 'number', default: 80000, min: 0 },
+    Kv:                 { type: 'number', default: 0, min: 0 },
+    ForceRangeMin:      { type: 'number', default: 0, unit: 'Nm' },
+    ForceRangeMax:      { type: 'number', default: 0, unit: 'Nm' },
+    Gear:               { type: 'number', default: 1 },
+    Armature:           { type: 'number', default: 0.1, unit: 'kgm2', min: 0 },
+    Damping:            { type: 'number', default: 0, min: 0 },
+    FrictionLoss:       { type: 'number', default: 0, unit: 'Nm', min: 0 },
+    BaseFollowingError: { type: 'number', default: 0, unit: 'mm', min: 0 },
+    // plan-673 Phase 4 — the overload window and the arrival tolerance.
+    FollowingErrorLimit:  { type: 'number', default: 0, unit: 'mm', min: 0 },
+    FollowingErrorTimeMs: { type: 'number', default: 200, unit: 'ms', min: 0 },
+    ArrivalTolerance:     { type: 'number', default: 0, unit: 'mm', min: 0 },
+  },
+
+  // plan-673 Phase 4 (F7) — how the Grip holds, and whether it still does.
+  GripLoad: {
+    Mode:       { type: 'enum', enumMap: { formfit: 'formfit', forcefit: 'forcefit' }, default: 'formfit' },
+    GripForce:  { type: 'number', default: 0, unit: 'N', min: 0 },
+    SlipLimit:  { type: 'number', default: 0, unit: 'mm', min: 0 },
+    SlipTimeMs: { type: 'number', default: 200, unit: 'ms', min: 0 },
+  },
+
+  ContactProfile: {
+    Profile: {
+      type: 'enum',
+      enumMap: {
+        Pallet: 'Pallet', Workpiece: 'Workpiece', BeltSurface: 'BeltSurface', StopperFace: 'StopperFace',
+        GripperJaw: 'GripperJaw', MachineFrame: 'MachineFrame', FixtureBore: 'FixtureBore', Custom: 'Custom',
+      },
+      default: 'Workpiece',
+    },
+    Priority:      { type: 'number', default: 0, min: 0, step: 1 },
+    Solmix:        { type: 'number', default: 1, min: 0 },
+    FrictionSlide: { type: 'number', default: 1, min: 0 },
+    FrictionSpin:  { type: 'number', default: 0.005, min: 0 },
+    FrictionRoll:  { type: 'number', default: 0.0001, min: 0 },
+    // The default is the MuJoCo condim 4, NOT its own default 3: without spin
+    // friction a gripped part rotates out of the jaws and nothing is reported.
+    CondDim: {
+      type: 'enum',
+      enumMap: {
+        Frictionless: 'Frictionless', Sliding: 'Sliding',
+        SlidingTorsional: 'SlidingTorsional', Full: 'Full',
+      },
+      default: 'SlidingTorsional',
+    },
+    SolrefTimeConst: { type: 'number', default: 0.02, unit: 's', min: 0 },
+    SolrefDampRatio: { type: 'number', default: 1, min: 0 },
+  },
+
+  CollisionShapeSet: {
+    Shapes:       { type: 'json',    default: [] },
+    ReplacesMesh: { type: 'boolean', default: false },
+  },
+
+  FreeBody: {
+    Enabled: { type: 'boolean', default: true },
+    MassKg:  { type: 'number',  default: 0, unit: 'kg', min: 0 },
+    CondDim: {
+      type: 'enum',
+      enumMap: {
+        Frictionless: 'Frictionless', Sliding: 'Sliding',
+        SlidingTorsional: 'SlidingTorsional', Full: 'Full',
+      },
+      default: 'SlidingTorsional',
+    },
+    FrictionSlide:  { type: 'number', default: 1, min: 0 },
+    LinearDamping:  { type: 'number', default: 0, unit: '1/s', min: 0 },
+    AngularDamping: { type: 'number', default: 0, unit: '1/s', min: 0 },
+    Restitution:    { type: 'number', default: 0, min: 0, max: 1 },
+  },
+
+  Movable: {
+    Enabled:     { type: 'boolean', default: true },
+    Axes:        { type: 'enum', enumMap: { XZ: 'XZ', XYZ: 'XYZ', X: 'X', Y: 'Y', Z: 'Z' }, default: 'XZ' },
+    SnapMm:      { type: 'number',  default: 0, unit: 'mm', min: 0 },
+    ResetOnStop: { type: 'boolean', default: false },
+  },
+
+  LocomotionPolicy: {
+    Enabled:        { type: 'boolean', default: true },
+    Policy:         { type: 'string',  default: '' },
+    FallbackPolicy: { type: 'string',  default: '' },
+    Observation:    { type: 'string',  default: '' },
+    Contract:       { type: 'string',  default: '' },
+    Decimation:     { type: 'number',  default: 4, min: 1, step: 1 },
+    ActionScale:    { type: 'number',  default: 1 },
+    Axes:           { type: 'componentRefArray', default: [] },
   },
 
   WebError: {
@@ -838,6 +1071,9 @@ export const INLINE_SCHEMA_BASELINE: Record<string, ComponentSchema> = {
     Quality:           { type: 'string',  default: 'standard', readonly: true },
     ImportScaleFactor: { type: 'number',  default: 0.001,      readonly: true },
     ZIsUpVector:       { type: 'boolean', default: true,       readonly: true },
+    // plan-621: optional, no defaults (absent Converter = 'browser'; SolidCraft only on live-synced nodes).
+    Converter:         { type: 'enum', enumMap: { connect: 'connect', browser: 'browser', solidcraft: 'solidcraft' }, readonly: true },
+    SolidCraft:        { type: 'json', readonly: true },
   },
 
   // Read-only CAD metadata written by the rv-jt reader (plan-335). No defaults on purpose:
@@ -923,6 +1159,21 @@ export const INLINE_SCHEMA_BASELINE: Record<string, ComponentSchema> = {
     GroupNamePrefix: { type: 'string', readonly: true },
   },
 
+  // BlockageBudget (plan-2038) — declaration only; numeric fields are nullable in rv-odt.json
+  // (null/absent = inherit from the ancestor or the document default), loaded as plain numbers.
+  BlockageBudget: {
+    Exempt:              { type: 'boolean' },
+    Scope:               { type: 'enum', enumMap: { node: 'node', subtree: 'subtree' }, default: 'subtree' },
+    ExpectFlow:          { type: 'boolean' },
+    MaxWaitSec:          { type: 'number', unit: 's' },
+    MaxIdleSec:          { type: 'number', unit: 's' },
+    WarmupSec:           { type: 'number', unit: 's', min: 0 },
+    ExpectedWaits:       { type: 'json' },
+    Severity:            { type: 'enum', enumMap: { error: 'error', warning: 'warning', info: 'info' } },
+    SignalSuppress:      { type: 'componentRef', signal: 'PLCOutputBool' },
+    SignalBlockageFound: { type: 'componentRef', signal: 'PLCInputBool' },
+  },
+
   // Path (plan-268) — scalar fields only; the structured fields
   // (segments/successors/align) are parsed by parsePathExtras() in rv-path.ts
   // (the executable TS-SSOT); they are declared as generic 'json' schema fields
@@ -936,6 +1187,41 @@ export const INLINE_SCHEMA_BASELINE: Record<string, ComponentSchema> = {
     align: { type: 'json', default: [0, 1, 0] },
     zone: { type: 'string' },
     zoneCapacity: { type: 'number' },
+    connectCheck: { type: 'boolean', default: true },
+  },
+
+  // plan-628 Phase 2 — path-network building block (WEB-only, no factory).
+  // params/pose are structured 'json' fields; parsePathBlockExtras() in
+  // rv-path-block.ts is the executable SSOT of their inner shape.
+  PathBlock: {
+    version: { type: 'number', default: 1 },
+    kind: {
+      type: 'enum',
+      enumMap: { straight: 'straight', curve: 'curve', diverge: 'diverge', merge: 'merge', stub: 'stub' },
+      default: 'straight',
+    },
+    params: { type: 'json', default: {} },
+    pose: { type: 'json', default: [0, 0, 0] },
+    y: { type: 'number', default: 0, unit: 'm' },
+    host: { type: 'string' },
+    hostPathId: { type: 'string' },
+    frontPathId: { type: 'string' },
+  },
+
+  // plan-650 Phase 1 — parametric part family (WEB-only). Added after the rv-ODT
+  // migration: the frozen reference for the determinism test. Params/Values are
+  // structured 'json' fields; parseParametricComponent() in
+  // rv-parametric-component.ts is the executable SSOT of their inner shape.
+  ParametricComponent: {
+    ApiVersion: { type: 'number', default: 1 },
+    Params: { type: 'json', default: [] },
+    Values: { type: 'json', default: {} },
+    Code: { type: 'string', default: '' },
+    CodeHash: { type: 'string', default: '' },
+    PartsRoot: { type: 'string', default: '_Parts' },
+    GeneratedRoot: { type: 'string', default: '_Generated' },
+    BakedInputHash: { type: 'string' },
+    DesignResource: { type: 'string' },
   },
 
   // plan-404 — rigid-body mechanisms. Added AFTER the rv-ODT migration: not a

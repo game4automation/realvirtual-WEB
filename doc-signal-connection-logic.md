@@ -43,14 +43,17 @@ The mode is active when either of these holds:
 
 - the **Signal linking** toggle in the button group is on
   (`SignalLinkModeButton`, contributed by `SignalBindPlugin` as a
-  `button-group` slot at order 64; available in the hmi, planner, des and
-  editor modes). The toggle is persisted under the `rv-layout-signal-link-mode`
+  `button-group` slot at order 64; shown in the commissioning, planner and
+  editor modes — not in hmi/viewer, and hidden in des, where a switched-on
+  link mode rests; see `SIGNAL_LINK_TOOLBAR_MODES` in `signal-link-gate.ts`). The toggle is persisted under the `rv-layout-signal-link-mode`
   key, so it survives a reload.
 - a signal drag is currently running — a drag implies the mode for its
   duration.
 
-The Property Inspector rows are always reachable without the mode; the mode
-gates the 3D click path.
+The Property Inspector rows are reachable without the mode in every workspace
+that offers signal linking (`SIGNAL_LINK_MODES`: commissioning, editor, planner,
+des); the operator workspaces (hmi, viewer) show no slot rows at all. Existing
+bindings keep working in every mode. The mode gates the 3D click path.
 
 ## Slot states
 

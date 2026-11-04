@@ -217,11 +217,11 @@ async function installHarness(page: Page): Promise<void> {
 
       /** Place `repeats` copies of the first `distinct` catalog entries. */
       async placeGrid(distinct: number, repeats: number): Promise<any> {
-        const catalog = await (await fetch('/library/catalog.json')).json();
-        const entries = catalog.entries
-          .filter((e: any) => !!e.glbUrl)
+        const manifest = await (await fetch('/library/project.json')).json();
+        const entries = manifest.documents
+          .filter((d: any) => !!d.path)
           .slice(0, distinct)
-          .map((e: any) => ({ ...e, glbUrl: `/library/${e.glbUrl}` }));
+          .map((d: any) => ({ id: d.id, name: d.name, glbUrl: `/library/${d.path}` }));
         if (entries.length < distinct) throw new Error(`catalog has only ${entries.length} usable entries`);
         const failures: string[] = [];
         const ids: string[] = [];
@@ -405,12 +405,12 @@ test('plan-753: repeating ONE asset shares its chunks', async ({ page }) => {
     const w = window as W;
     const h = w.__rv753;
     const planner = h.planner();
-    const catalog = await (await fetch('/library/catalog.json')).json() as {
-      entries: Array<{ id: string; name: string; glbUrl?: string }>;
+    const manifest = await (await fetch('/library/project.json')).json() as {
+      documents: Array<{ id: string; name: string; path?: string }>;
     };
-    const entry = catalog.entries.find((e) => e.id.includes('rollconveyor-2m') && e.glbUrl)
-      ?? catalog.entries.find((e) => !!e.glbUrl)!;
-    const withUrl = { ...entry, glbUrl: `/library/${entry.glbUrl}` };
+    const doc = manifest.documents.find((d) => d.id.includes('rollconveyor-2m') && d.path)
+      ?? manifest.documents.find((d) => !!d.path)!;
+    const withUrl = { id: doc.id, name: doc.name, glbUrl: `/library/${doc.path}` };
 
     const settle = async () => {
       await h.quiesce(20_000);

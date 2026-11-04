@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, removeLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * ConnectPanel — LeftPanel for realvirtual CONNECT gateway configuration.
  *
@@ -12,7 +14,7 @@
  *   5. Bind Selected action
  */
 
-import { useState, useSyncExternalStore, useCallback, useRef, useMemo, useEffect, type ReactNode } from 'react';
+import { useState, useSyncExternalStore, useCallback, useRef, useMemo, useEffect, useLayoutEffect, type ReactNode } from 'react';
 import {
   Box,
   Typography,
@@ -75,6 +77,7 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import { useViewer } from '../../hooks/use-viewer';
 import { SignalUsageButton } from './rv-signal-usage-list';
 import { ConnectAutoMapSection } from './ConnectAutoMapSection';
+import { SewUdpImportDialog } from './connect-sew-udp-import';
 import { LeftPanel } from './LeftPanel';
 import { FloatingPanel } from './FloatingPanel';
 import {
@@ -112,6 +115,10 @@ import {
   subscribeConnectBridges,
   reloadConnectBridges,
   requestConnectBridgeReveal,
+  holdConnectConfigEditing,
+  applyHeldConnectConfig,
+  getConnectConfigNotice,
+  subscribeConnectConfigNotice,
   fetchProfiles,
   saveProfile,
   updateProfile,
@@ -120,8 +127,9 @@ import {
   fetchActiveModel,
   nextInterfaceId,
   removeSignal,
+  removeSignals,
+  setSignalRecord,
   getSignalSchema,
-  ensureInterfaceTypes,
   CONNECT_INTERFACE_TYPES,
   getAvailableInterfaceTypes,
   isModelManagedInterfaceType,
@@ -274,6 +282,16 @@ import { ConnectOptionsWindow } from './ConnectOptionsWindow';
 import { ConnectUpdateNotice } from './ConnectUpdateNotice';
 import { CONNECT_STABLE_DOWNLOAD_URL } from './connect-downloads';
 import { useConnectDownloads } from './use-connect-downloads';
+import {
+  ConnectDownloadLinks,
+  interfaceEndpointLabel,
+  interfaceTypeLabel,
+  stableDownloadLabel,
+  channelBuildTitle,
+  UnsignedDownloadHint,
+} from './connect-panel-shared';
+import { markConnectPanelCommitted } from './connect-panel-readiness';
+export { ConnectDownloadLinks, interfaceEndpointLabel, interfaceTypeLabel } from './connect-panel-shared';
 import { statusAge } from './connect-staleness';
 import { parseDecimal } from './rv-number-format';
 import {
@@ -316,73 +334,11 @@ function statusDisplay(
     return { color: 'rgba(255,255,255,0.5)', label: 'Not connected', warn: false };
   }
   switch (state) {
-    case 'connected': return { color: connectionStateColor(state) ?? 'rgba(255,255,255,0.5)', label: 'Connected', warn: false };
+    case 'connected': return { color: connectionStateColor(state) ?? 'rgba(255,255,255,0.5)', label: 'Gateway connected', warn: false };
     case 'connecting': return { color: connectionStateColor(state) ?? 'rgba(255,255,255,0.5)', label: 'Connecting...', warn: false };
     case 'error': return { color: connectionStateColor(state) ?? 'rgba(255,255,255,0.5)', label: 'Error', warn: true };
     default: return { color: 'rgba(255,255,255,0.5)', label: 'Disconnected', warn: false };
   }
-}
-
-/** Human-readable label for an interface type — gateway catalog first, static registry as fallback. */
-/**
- * One-line endpoint summary of an interface, as the card shows it next to its id.
- * Pure and exported so the per-type summary stays testable without rendering a card.
- */
-export function interfaceEndpointLabel(iface: ConnectInterface): string {
-  if (iface.type === 'OpcUa') return (iface.endpoint as string) ?? '';
-  if (iface.type === 'S7') return `${iface.ipAddress ?? ''} R:${iface.rack ?? 0} S:${iface.slot ?? 1}`;
-  if (iface.type === 'MQTT') return (iface.brokerUrl as string) ?? '';
-  if (iface.type === 'TwinCat') return iface.twinCat?.netId ?? '';
-  if (iface.type === 'Modbus' || iface.type === 'ModbusServer') {
-    return iface.modbus ? `${iface.modbus.host}:${iface.modbus.port}` : '';
-  }
-  if (iface.type === 'EthernetIp') return iface.ethernetIp?.gateway ?? '';
-  if (iface.type === 'CtrlX') return iface.ctrlX?.address ?? '';
-  if (iface.type === 'CtrlXDataLayer') return iface.ctrlXDataLayer?.address ?? '';
-  if (iface.type === 'Keba') return iface.keba?.host ?? '';
-  if (iface.type === 'Festo') return iface.festo ? `${iface.festo.host}:${iface.festo.port}` : '';
-  if (iface.type === 'Fanuc') return iface.fanuc ? `${iface.fanuc.address}:${iface.fanuc.port}` : '';
-  if (iface.type === 'Denso') return iface.denso ? `${iface.denso.host} (${iface.denso.controllerName})` : '';
-  if (iface.type === 'Kuka') return iface.kuka ? `${iface.kuka.host}:${iface.kuka.port}` : '';
-  if (iface.type === 'KukaRsi') return iface.kukaRsi ? `${iface.kukaRsi.listenIp}:${iface.kukaRsi.rsiPort}` : '';
-  if (iface.type === 'UniversalRobots') {
-    return iface.universalRobots ? `${iface.universalRobots.host}:${iface.universalRobots.rtdePort}` : '';
-  }
-  if (iface.type === 'IgusRebel') return iface.igusRebel ? `${iface.igusRebel.host}:${iface.igusRebel.port}` : '';
-  if (iface.type === 'Mitsubishi') return iface.mitsubishi ? `${iface.mitsubishi.host}:${iface.mitsubishi.port}` : '';
-  if (iface.type === 'Udp') return iface.udp ? `${iface.udp.remoteHost}:${iface.udp.remotePort}` : '';
-  if (iface.type === 'WebSocketRealtime') {
-    const ws = iface.webSocketRealtime;
-    if (!ws) return '';
-    return ws.isServer ? `${ws.bindAddress}:${ws.port} (server)` : `${ws.address}:${ws.port}`;
-  }
-  if (iface.type === 'WinmodY200') return iface.winmodY200?.sharedMemoryName ?? '';
-  if (iface.type === 'RoboDk') return iface.roboDk ? `${iface.roboDk.host}:${iface.roboDk.port}` : '';
-  if (iface.type === 'WandelbotsNova') {
-    return iface.wandelbotsNova ? `${iface.wandelbotsNova.server} (${iface.wandelbotsNova.cell})` : '';
-  }
-  if (iface.type === 'AbbRobotStudio') return iface.abbRobotStudio?.sharedMemoryName ?? '';
-  if (iface.type === 'PlcSimAdvanced') return iface.plcSimAdvanced?.instanceName ?? '';
-  if (iface.type === 'Pvi') {
-    const pvi = iface.pvi;
-    if (!pvi) return '';
-    const line = pvi.connectionType === 'Ina2000' ? 'INA2000' : 'ANSL';
-    return `${line} ${pvi.host}${pvi.port != null ? `:${pvi.port}` : ''}`;
-  }
-  if (iface.type === 'SHM') return (iface.sharedMemory as { sharedMemoryName?: string })?.sharedMemoryName ?? '';
-  return '';
-}
-
-/**
- * Human-readable label of an interface type — the connected gateway's own
- * catalog first, the static registry as fallback. Exported since plan-562: the
- * write-gate overlay names the same target the card names, and it must read the
- * label from here rather than keep a second spelling of it.
- */
-export function interfaceTypeLabel(type: ConnectInterfaceType): string {
-  return getAvailableInterfaceTypes().find(d => d.type === type)?.label
-    ?? CONNECT_INTERFACE_TYPES.find(d => d.type === type)?.label
-    ?? type;
 }
 
 /** Dot color for a per-interface worker status (green = Connected, red = Error, amber = (re)connecting). */
@@ -453,72 +409,6 @@ export function SignalBudgetIndicator({ status }: { status: LicenseStatus | null
           {presentation.label}
         </Typography>
       )}
-    </Box>
-  );
-}
-
-/** Stable download label — brand text, enriched with the semantic version when the manifest
- *  is reachable. Falls back to the plain brand text (unchanged accessible name) otherwise. */
-function stableDownloadLabel(version: string | null): string {
-  return version
-    ? `Download realvirtual CONNECT ${version}`
-    : 'Download realvirtual CONNECT';
-}
-
-/** Human tooltip carrying the build number + date when known. */
-function channelBuildTitle(build: number | null, buildDate: string | null): string | undefined {
-  if (build == null && !buildDate) return undefined;
-  const parts = [build != null ? `build ${build}` : null, buildDate].filter(Boolean);
-  return parts.join(' · ');
-}
-
-/** Shown while the published build is not code-signed yet: Windows SmartScreen blocks the first
- *  start with "Windows protected your PC" until the user confirms. */
-function UnsignedDownloadHint({ unsigned }: { unsigned?: boolean }) {
-  if (!unsigned) return null;
-  return (
-    <Typography sx={{ fontSize: 10, lineHeight: 1.4, color: 'text.secondary', mt: 0.25, width: '100%' }}>
-      This build is not code-signed yet. If Windows SmartScreen warns on start, choose
-      {' '}<Box component="span" sx={{ fontWeight: 600 }}>More info</Box>{' → '}
-      <Box component="span" sx={{ fontWeight: 600 }}>Run anyway</Box>.
-    </Typography>
-  );
-}
-
-/** Stable + beta download affordance reused in every connection dead end. Versions come from
- *  the published release manifests; the beta link appears ONLY when a beta build exists. */
-export function ConnectDownloadLinks() {
-  const downloads = useConnectDownloads();
-  const { stable, beta } = downloads;
-  return (
-    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flexWrap: 'wrap' }}>
-      <Button
-        component="a"
-        href={stable.url}
-        target="_blank"
-        rel="noreferrer"
-        size="small"
-        variant="text"
-        title={channelBuildTitle(stable.build, stable.buildDate)}
-        sx={{ minWidth: 0, px: 0, fontSize: 10, textTransform: 'none' }}
-      >
-        {stableDownloadLabel(stable.version)}
-      </Button>
-      {beta && (
-        <Button
-          component="a"
-          href={beta.url}
-          target="_blank"
-          rel="noreferrer"
-          size="small"
-          variant="text"
-          title={channelBuildTitle(beta.build, beta.buildDate)}
-          sx={{ minWidth: 0, p: 0, fontSize: 10, color: 'text.secondary', textTransform: 'none' }}
-        >
-          {beta.version ? `beta ${beta.version}` : 'beta'}
-        </Button>
-      )}
-      <UnsignedDownloadHint unsigned={stable.unsigned} />
     </Box>
   );
 }
@@ -735,18 +625,18 @@ const LS_CONNECT_SCROLL = 'rv-connect-scroll';        // + ':' + iface.id
 const EMPTY_SIGNAL_NAMES: readonly string[] = Object.freeze([]);
 
 function loadExpandedIface(): string | null {
-  try { return localStorage.getItem(LS_CONNECT_EXPANDED) || null; } catch { return null; }
+  return readLocalStorage(LS_CONNECT_EXPANDED) || null;
 }
 function saveExpandedIface(id: string | null): void {
   try {
-    if (id) localStorage.setItem(LS_CONNECT_EXPANDED, id);
-    else localStorage.removeItem(LS_CONNECT_EXPANDED);
+    if (id) writeLocalStorage(LS_CONNECT_EXPANDED, id);
+    else removeLocalStorage(LS_CONNECT_EXPANDED);
   } catch { /* storage unavailable */ }
 }
 function loadSignalFilter(ifaceId: string): SignalFilterState {
   const base = emptySignalFilterState();
   try {
-    const raw = localStorage.getItem(`${LS_CONNECT_FILTER}:${ifaceId}`);
+    const raw = readLocalStorage(`${LS_CONNECT_FILTER}:${ifaceId}`);
     if (!raw) return base;
     const p = JSON.parse(raw) as Partial<SignalFilterState> & { types?: string[] };
     if (typeof p.text === 'string') base.text = p.text;
@@ -759,7 +649,7 @@ function loadSignalFilter(ifaceId: string): SignalFilterState {
   } catch { return base; }
 }
 function saveSignalFilter(ifaceId: string, f: SignalFilterState): void {
-  try { localStorage.setItem(`${LS_CONNECT_FILTER}:${ifaceId}`, JSON.stringify({ ...f, types: [...f.types] })); } catch { /* storage unavailable */ }
+  try { writeLocalStorage(`${LS_CONNECT_FILTER}:${ifaceId}`, JSON.stringify({ ...f, types: [...f.types] })); } catch { /* storage unavailable */ }
 }
 /**
  * Collapse identities are TYPED (plan-352 §2.4): `topic:<name>` for a configured topic group,
@@ -777,14 +667,14 @@ const treeKey = (path: string): string => `${TREE_KEY_PREFIX}${path}`;
 
 function loadCollapsedGroups(ifaceId: string): Set<string> {
   try {
-    const raw = localStorage.getItem(`${LS_CONNECT_COLLAPSED}:${ifaceId}`);
+    const raw = readLocalStorage(`${LS_CONNECT_COLLAPSED}:${ifaceId}`);
     const stored = raw ? JSON.parse(raw) as string[] : [];
     return new Set(stored.map(key => key.startsWith(TREE_KEY_PREFIX) ? key : topicKey(key)));
   } catch { return new Set(); }
 }
 function saveCollapsedGroups(ifaceId: string, s: Set<string>): void {
   const stored = [...s].map(key => key.startsWith(TREE_KEY_PREFIX) ? key : key.replace(/^topic:/, ''));
-  try { localStorage.setItem(`${LS_CONNECT_COLLAPSED}:${ifaceId}`, JSON.stringify(stored)); } catch { /* storage unavailable */ }
+  try { writeLocalStorage(`${LS_CONNECT_COLLAPSED}:${ifaceId}`, JSON.stringify(stored)); } catch { /* storage unavailable */ }
 }
 // Scroll offset of the virtualized signal list, one value per interface
 // (plan-344 Phase 3.4). Closing the panel returns `null` from ConnectPanel, which
@@ -794,15 +684,15 @@ function saveCollapsedGroups(ifaceId: string, s: Set<string>): void {
 // interface, written on scroll and restored on mount.
 function loadSignalScroll(ifaceId: string): number {
   try {
-    const raw = localStorage.getItem(`${LS_CONNECT_SCROLL}:${ifaceId}`);
+    const raw = readLocalStorage(`${LS_CONNECT_SCROLL}:${ifaceId}`);
     const n = raw === null ? 0 : Number(raw);
     return Number.isFinite(n) && n > 0 ? n : 0;
   } catch { return 0; }
 }
 function saveSignalScroll(ifaceId: string, offset: number): void {
   try {
-    if (offset > 0) localStorage.setItem(`${LS_CONNECT_SCROLL}:${ifaceId}`, String(Math.round(offset)));
-    else localStorage.removeItem(`${LS_CONNECT_SCROLL}:${ifaceId}`);
+    if (offset > 0) writeLocalStorage(`${LS_CONNECT_SCROLL}:${ifaceId}`, String(Math.round(offset)));
+    else removeLocalStorage(`${LS_CONNECT_SCROLL}:${ifaceId}`);
   } catch { /* storage unavailable */ }
 }
 
@@ -813,11 +703,6 @@ export function ConnectPanel() {
   const lpm = viewer.leftPanelManager;
   const panelSnap = useSyncExternalStore(lpm.subscribe, lpm.getSnapshot);
   const snap = useSyncExternalStore(subscribeConnectStore, getConnectSnapshot);
-
-  // Self-heal a missing type catalog: without it no interface has a signal schema, which silently
-  // costs manual signal authoring (the "+" and the add dialog) for a whole session. No-op whenever
-  // the catalog is present or the gateway genuinely has none.
-  useEffect(() => { void ensureInterfaceTypes(); }, [snap.state, snap.availableTypes]);
 
   // Same rule the connect plugin attaches the stream with — imported, not restated, so this
   // explanation cannot describe behaviour the plugin has since changed.
@@ -832,12 +717,15 @@ export function ConnectPanel() {
   const [expandedIface, setExpandedIface] = useState<string | null>(loadExpandedIface);
   const [importOpen, setImportOpen] = useState(false);
   const [importTarget, setImportTarget] = useState<string | null>(null);
+  const [sewUdpImportOpen, setSewUdpImportOpen] = useState(false);
   // The log window's open state lives in the CONNECT store (plan-562 F11): the
   // no-data notice offers "Open log" from over the 3D view, where this panel is
   // closed, so the flag must be settable from outside this component.
   const logOpen = snap.logOpen === true;
   // Bridges (mirror rules + 1:1 signal mappings) — null while unloaded / unsupported gateway.
   const bridges = useBridges(snap.state === 'connected');
+  // plan-2024 F3: a push arrived while an edit was open - the new config is held, not applied.
+  const configNotice = useSyncExternalStore(subscribeConnectConfigNotice, getConnectConfigNotice);
   // Open the Add-Mapping dialog; a string pre-fills the source signal (signal-row bridge action).
   const [mappingDialog, setMappingDialog] = useState<{ sourceSignal: string } | null>(null);
   // Pending destructive action awaiting confirmation (interface delete).
@@ -857,7 +745,7 @@ export function ConnectPanel() {
   const [panelWidth, setPanelWidth] = useState<number>(() => getStoredConnectPanelWidth());
   const handleResize = useCallback((w: number) => {
     setPanelWidth(w);
-    try { localStorage.setItem(LS_KEY_CONNECT_PANEL_WIDTH, String(w)); } catch { /* storage unavailable */ }
+    try { writeLocalStorage(LS_KEY_CONNECT_PANEL_WIDTH, String(w)); } catch { /* storage unavailable */ }
     lpm.open('connect', w); // same id → just updates the registered width / viewport shift
   }, [lpm]);
 
@@ -888,8 +776,9 @@ export function ConnectPanel() {
 
   const handleOpenImport = useCallback((targetId: string | null) => {
     setImportTarget(targetId);
-    setImportOpen(true);
-  }, []);
+    if (snap.interfaces.some(i => i.id === targetId && i.type === 'Udp')) setSewUdpImportOpen(true);
+    else setImportOpen(true);
+  }, [snap.interfaces]);
 
   // Enable/disable an interface directly from its card. A disabled interface
   // starts no worker (no broker/PLC connection, no signals), so this toggle is
@@ -980,6 +869,8 @@ export function ConnectPanel() {
     const id = window.setInterval(() => setAgeTick((t) => t + 1), 1000);
     return () => window.clearInterval(id);
   }, [isOpen, unreachable]);
+
+  useLayoutEffect(() => { markConnectPanelCommitted(); }, []);
 
   if (!isOpen) return null;
 
@@ -1196,6 +1087,28 @@ export function ConnectPanel() {
               <SignalBudgetIndicator status={licenseSnap.status} />
             </Box>
 
+            {configNotice.pending && (
+              <Alert
+                severity="info"
+                variant="outlined"
+                data-testid="connect-config-changed-notice"
+                sx={{ fontSize: 11, mb: 0.5, py: 0, flexShrink: 0, '& .MuiAlert-message': { py: 0.5 } }}
+                action={(
+                  <Button
+                    size="small"
+                    color="inherit"
+                    data-testid="connect-config-reload"
+                    onClick={() => applyHeldConnectConfig()}
+                    sx={{ fontSize: 11, textTransform: 'none' }}
+                  >
+                    Reload
+                  </Button>
+                )}
+              >
+                Configuration changed outside
+              </Alert>
+            )}
+
             {snap.interfaces.length === 0 && (
               <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.55)', textAlign: 'center', py: 2 }}>
                 No interfaces yet — Add one to link a PLC, robot or broker.
@@ -1330,10 +1243,13 @@ export function ConnectPanel() {
         open={addDialogOpen}
         onClose={() => setAddDialogOpen(false)}
         onCreated={(created) => {
-          // Visible continuation: expand the fresh card and open Edit right away,
+          // Visible continuation: expand the fresh card and open Import (UDP) or Edit,
           // so adding never ends in a silent "nothing happened".
           setExpandedIface(created.id);
-          setEditIface(created);
+          if (created.type === 'Udp') {
+            setImportTarget(created.id);
+            setSewUdpImportOpen(true);
+          } else setEditIface(created);
         }}
       />
 
@@ -1355,6 +1271,14 @@ export function ConnectPanel() {
         interfaces={snap.interfaces}
         initialTargetId={importTarget}
         onClose={() => setImportOpen(false)}
+      />
+
+      {/* ── SEW UDP symbol-table import ── */}
+      <SewUdpImportDialog
+        open={sewUdpImportOpen}
+        interfaces={snap.interfaces}
+        targetInterfaceId={importTarget}
+        onClose={() => setSewUdpImportOpen(false)}
       />
 
       {/* ── CONNECT Settings (connection, license, profiles, historian) ── */}
@@ -1602,6 +1526,11 @@ export function InterfaceCard({
             <Upload sx={{ fontSize: 14, color: 'rgba(255,255,255,0.6)' }} /> Import tag table…
           </MenuItem>
         )}
+        {iface.type === 'Udp' && (
+          <MenuItem sx={{ fontSize: 12, gap: 1 }} onClick={() => { closeMenu(); onImport(); }}>
+            <Upload sx={{ fontSize: 14, color: 'rgba(255,255,255,0.6)' }} /> Import SEW symbol table…
+          </MenuItem>
+        )}
         {!modelManaged && (
           <MenuItem sx={{ fontSize: 12, gap: 1 }} onClick={() => { closeMenu(); onEdit(); }}>
             <Edit sx={{ fontSize: 14, color: 'rgba(255,255,255,0.6)' }} /> Edit…
@@ -1698,6 +1627,17 @@ function catalogKey(def: ConnectInterfaceTypeDef): string {
   return def.preset ? `${def.type}:${def.preset}` : def.type;
 }
 
+/**
+ * plan-2024 F3: while an edit surface is open, a config push must not replace what the user is
+ * working on - connect-store holds the pushed config and the panel offers a Reload instead.
+ */
+function useConfigEditHold(active: boolean): void {
+  useEffect(() => {
+    if (!active) return undefined;
+    return holdConnectConfigEditing();
+  }, [active]);
+}
+
 export function AddInterfaceDialog({
   open,
   onClose,
@@ -1708,6 +1648,7 @@ export function AddInterfaceDialog({
   /** Called with the server-created interface so the parent can continue the flow (expand + Edit). */
   onCreated?: (iface: ConnectInterface) => void;
 }) {
+  useConfigEditHold(open);
   // Keyed by type + preset: a vendor preset (plan-457 SEW) shares its worker type with the base row.
   const [creatingType, setCreatingType] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -3702,6 +3643,7 @@ export function WandelbotsNovaFieldsBlock({
 }
 
 export function EditInterfaceDialog({ iface, open, onClose }: { iface: ConnectInterface; open: boolean; onClose: () => void }) {
+  useConfigEditHold(open);
   // ── Common fields — unchanged behavior (Enabled, UpdateCycleMs) plus AllowWebToPlc ──
   const [enabled, setEnabled] = useState(iface.enabled);
   const [updateCycleMs, setUpdateCycleMs] = useState(String(iface.updateCycleMs ?? 50));
@@ -4153,8 +4095,10 @@ const SignalRowItem = memo(function SignalRowItem({
 
   // Second row line: address · dataType · comment. Json topic signals (plan-457)
   // drop the address part — the JSON key is the name on the line above.
+  // `?? ''`: a gateway config may carry `protocolAddress: null` (plan-2022 P0); one null field
+  // must not throw out of a row and take the whole HMI root down with it.
   const subLine = [
-    hideAddress ? '' : sig.protocolAddress,
+    hideAddress ? '' : (sig.protocolAddress ?? ''),
     sig.dataType ?? '',
     sig.comment ?? '',
   ].filter(part => part.length > 0).join(' · ');
@@ -4469,6 +4413,7 @@ function menuRoutesLabel(type: string): string {
       || type === 'CtrlX' || type === 'CtrlXDataLayer' || type === 'Keba' || type === 'Festo'
       || type === 'PlcSimAdvanced' || type === 'Pvi');
   const routes: string[] = [];
+  if (type === 'Udp') return canBrowse ? 'browse for signals or import a SEW symbol table' : 'import a SEW symbol table';
   if (canBrowse) routes.push('Browse');
   if (type === 'MQTT' || type === 'S7') routes.push('Import');
   if (routes.length === 0) return 'add them';
@@ -4559,6 +4504,7 @@ export function SignalListView({ iface, overLimitSignals, onBridgeSignal }: {
    * in the header right above) went unmentioned. Say only what this interface can actually do.
    */
   const canImportTagTable = iface.type === 'MQTT' || iface.type === 'S7';
+  const canImportSewUdp = iface.type === 'Udp';
   const emptyHint = useMemo(() => {
     const routes: string[] = [];
     if (manualEdit) {
@@ -4567,9 +4513,10 @@ export function SignalListView({ iface, overLimitSignals, onBridgeSignal }: {
     }
     if (schema?.supportsDiscovery) routes.push('browse the device for symbols');
     if (canImportTagTable) routes.push('import a tag table');
+    if (canImportSewUdp) routes.push('import a SEW symbol table');
     if (routes.length === 0) return 'No signals yet.';
     return `No signals yet — ${routes.join(' or ')}.`;
-  }, [manualEdit, schema, canImportTagTable]);
+  }, [manualEdit, schema, canImportTagTable, canImportSewUdp]);
 
   /** Patch flat and MQTT ProcessImage signals through their distinct CONNECT containers. */
   const handleRecordChange = useCallback(async (
@@ -4578,20 +4525,12 @@ export function SignalListView({ iface, overLimitSignals, onBridgeSignal }: {
     topic?: string,
   ) => {
     const key = `${topic ?? '__flat__'}\u0000${sig.name}\u0000${sig.protocolAddress}`;
-    const sameSignal = (candidate: ConnectInterfaceSignal) =>
-      candidate.name === sig.name && candidate.protocolAddress === sig.protocolAddress;
     setRecordPending((current) => new Set(current).add(key));
     setRecordError(null);
     try {
-      if (topic !== undefined) {
-        const topics = (iface.topics ?? []).map((entry) => entry.topic === topic
-          ? { ...entry, signals: (entry.signals ?? []).map((candidate) => sameSignal(candidate) ? { ...candidate, record } : candidate) }
-          : entry);
-        await updateInterface(iface.id, { topics });
-      } else {
-        const signals = (iface.signals ?? []).map((candidate) => sameSignal(candidate) ? { ...candidate, record } : candidate);
-        await updateInterface(iface.id, { signals });
-      }
+      // plan-2025 F10: one `signal.upsert{record}` — only the flag travels, nothing else of the
+      // container is rewritten from this tab's snapshot (an older CONNECT gets the container PUT).
+      await setSignalRecord(iface.id, sig.name, record, topic);
     } catch (error) {
       setRecordError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -4719,8 +4658,8 @@ export function SignalListView({ iface, overLimitSignals, onBridgeSignal }: {
       }
       return matchesSignalFilter(
         {
-          name: s.name,
-          protocolAddress: s.protocolAddress,
+          name: s.name ?? '',
+          protocolAddress: s.protocolAddress ?? '',
           plcTypeKind: plcTypeKind(s.type),
           activity,
           connected,
@@ -4751,7 +4690,7 @@ export function SignalListView({ iface, overLimitSignals, onBridgeSignal }: {
     if (iface.type !== 'MQTT') return null;
     const flat = iface.signals ?? [];
     if (flat.length === 0) return null;
-    if (!flat.some(s => s.protocolAddress.includes('/'))) return null;
+    if (!flat.some(s => (s.protocolAddress ?? '').includes('/'))) return null;
     return buildTopicTree(flat, s => s.protocolAddress);
   }, [iface]);
 
@@ -4917,17 +4856,10 @@ export function SignalListView({ iface, overLimitSignals, onBridgeSignal }: {
           + " This can't be undone.",
       confirmLabel: only ? 'Delete signal' : `Delete ${count} signals`,
       onConfirm: () => {
-        const patch: { signals?: ConnectInterfaceSignal[]; topics?: ConnectInterface['topics'] } = {};
-        if (flat.size > 0) patch.signals = (iface.signals ?? []).filter(s => !flat.has(s.name));
-        if (byTopic.size > 0) {
-          patch.topics = (iface.topics ?? []).map((entry) => {
-            const drop = byTopic.get(entry.topic);
-            return drop
-              ? { ...entry, signals: (entry.signals ?? []).filter(s => !drop.has(s.name)) }
-              : entry;
-          });
-        }
-        return updateInterface(iface.id, patch)
+        // plan-2025 F10: one atomic batch of `signal.remove` across both containers.
+        const entries: Array<{ name: string; topic?: string }> = [...flat].map(name => ({ name }));
+        for (const [topic, names] of byTopic) for (const name of names) entries.push({ name, topic });
+        return removeSignals(iface.id, entries)
           .then(() => { setSelectedSignals(new Set()); setSelectionAnchor(null); })
           .catch((err) => console.error('[ConnectPanel] Failed to delete signals:', err));
       },
@@ -5697,6 +5629,7 @@ export function MqttTopicEditDialog({
   topic: ConnectMqttTopic | null;
   onClose: () => void;
 }) {
+  useConfigEditHold(open);
   const [mode, setMode] = useState<MqttTopicMode>(topic?.mode ?? 'Single');
   const [encoding, setEncoding] = useState<MqttEncoding>(topic?.encoding ?? 'Auto');
   const [interval, setInterval] = useState<string>(String(topic?.publishIntervalMs ?? 100));
@@ -5808,6 +5741,7 @@ export function ImportTagTableDialog({
   initialTargetId: string | null;
   onClose: () => void;
 }) {
+  useConfigEditHold(open);
   const mqttInterfaces = useMemo(() => interfaces.filter(i => i.type === 'MQTT'), [interfaces]);
   const s7Interfaces = useMemo(() => interfaces.filter(i => i.type === 'S7'), [interfaces]);
 
@@ -6590,11 +6524,12 @@ interface BridgesApi {
 }
 
 /**
- * Load + persist bridges while connected. Save errors (gateway validation) land in `error`.
+ * Read + persist bridges while connected. Save errors (gateway validation) land in `error`.
  *
  * The bridges themselves live in the connect-store cache since plan-566 (R2-1),
  * so the signal cross-reference list sees them while this panel is closed;
- * this hook only reads that cache and loads it when the gateway connects.
+ * the eager ConnectPanelHost owns loading on `connected` (plan-2035).
+ * This hook only reads that cache and manages panel-local save errors.
  */
 function useBridges(isConnected: boolean): BridgesApi {
   const cache = useSyncExternalStore(subscribeConnectBridges, getConnectBridges);
@@ -6603,11 +6538,7 @@ function useBridges(isConnected: boolean): BridgesApi {
   const reload = useCallback(() => reloadConnectBridges(), []);
 
   useEffect(() => {
-    if (!isConnected) {
-      setError(null);
-      return;
-    }
-    void reloadConnectBridges();
+    if (!isConnected) setError(null);
   }, [isConnected]);
 
   const mirrors = isConnected ? cache.mirrors : null;
@@ -6690,6 +6621,7 @@ function BridgeSection({
   onAddMapping: () => void;
 }) {
   const [addOpen, setAddOpen] = useState(false);
+  useConfigEditHold(addOpen);
   const [srcId, setSrcId] = useState('');
   const [dstId, setDstId] = useState('');
   const [pattern, setPattern] = useState('*');
@@ -6873,6 +6805,7 @@ function AddMappingDialog({
   bridges: BridgesApi;
   onClose: () => void;
 }) {
+  useConfigEditHold(open);
   const [source, setSource] = useState(sourceSignal);
   const [dest, setDest] = useState('');
   const [coerce, setCoerce] = useState(false);

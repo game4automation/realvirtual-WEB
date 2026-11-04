@@ -23,7 +23,7 @@
  *   form        code tier                      content                     target
  *   ----------  -----------------------------  --------------------------  -------------
  *   (default)   core only (AGPL, stubs)        public demo (scenes, lib)   {path}/
- *   --demo      commercial (all 15 features)   public demo (scenes, lib)   {path}/
+ *   --demo      commercial (all features)      public demo (scenes, lib)   {path}/
  *   --private   commercial + customer project  customer project only       {code}/
  *
  * `--demo` is the hosted demo of the full commercial product (ADR-047): the private
@@ -41,6 +41,11 @@
  *   node scripts/bunny-deploy.mjs --dry-run                # log only, no build/upload
  *   node scripts/bunny-deploy.mjs --path dev --skip-probe  # skip the post-deploy probe (plan-508)
  *   node scripts/bunny-deploy.mjs --demo --path dev --no-smoke   # skip the post-deploy demo smoke
+ *   node scripts/bunny-deploy.mjs --demo --path dev --dev-fast   # lighter /dev build profile (watcher)
+ *
+ * Every run prints `[timing] <step> <seconds>s` lines (features, stage, deps, private-deps,
+ * vite-build, provenance, postprocess, lock-wait, upload, purge, probe, smoke, total); the /dev
+ * watcher copies them into one `TIMING` line of its watch.log.
  */
 
 import { readFileSync, writeFileSync, existsSync, renameSync, rmSync, readdirSync, mkdirSync } from 'node:fs';
@@ -75,15 +80,27 @@ import {
   injectNewsIntoSettings,
   stampCatalogHashes,
   findCatalogFiles,
+  findLibraryProjectFiles,
   catalogChangedBinaries,
   probePublishedAssets,
   PROBE_MISSING_ASSET,
+  setDeliveryLookup,
+  isCatalogFile,
+  expectedHostedSnapshot,
+  reconcileRemoteSnapshot,
 } from './_bunny-lib.mjs';
+// plan-604: these three moved INTO the lib so the delivered partner CLI can reach them
+// without importing this file (which carries the register and the demo/smoke machinery).
+// Re-exported here because they were part of this module's surface and the test suite,
+// the /dev watcher and the Unity-parity comments all name them at this address.
+export { isCatalogFile, expectedHostedSnapshot, reconcileRemoteSnapshot };
 import { generateFragmentSecret, bytesToBase64Url, base64UrlToBytes } from './lib/rv-crypto.mjs';
 import { loadSigningConfig, signGlbFile } from './rv-sign-glb.mjs';
+import { parseLibrarySourceArgs } from './lib/rv-library-trim.mjs';
 import {
   assertBuildProvenance,
   assertNoCrossTierLeak,
+  hasDeliveryConfig,
   keepStagingRequested,
   loadDeliveryConfig,
   runBuild as runFilteredBuild,
@@ -98,8 +115,15 @@ import { mergeEnv, parseDotEnvText } from './lib/rv-dotenv.mjs';
 import { tmpDir } from './lib/rv-machine-paths.mjs';
 import { acquirePublishLock } from './rv-publish-lock.mjs';
 import { distFingerprint, runDemoSmoke } from './rv-demo-smoke.mjs';
+import { DEFAULT_OUTPUT as FEATURES_JSON_FILE, generateFeatures } from './gen-features-json.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
+
+// plan-604: `_bunny-lib` no longer imports the delivery machinery itself (that edge would
+// put the customer register into every partner's workspace). THIS is the caller that has
+// it, so this is where the lookup is registered — before any loadProject() call.
+setDeliveryLookup((privateRoot, folderName) =>
+  (hasDeliveryConfig(privateRoot, folderName) ? loadDeliveryConfig(privateRoot, folderName) : null));
 
 //! Load credentials from a gitignored .env file into process.env (dependency-free).
 //! CI / real shell env wins — we only fill keys that aren't already set. Vite
@@ -183,6 +207,42 @@ const MAGENTA = '\x1b[35m';
 const YELLOW = '\x1b[33m';
 
 function log(msg) { console.log(msg); }
+
+//! One `[timing] <step> <seconds>s` line per measured step (the /dev watcher parses exactly this
+//! shape out of last-deploy.log). Returns `{ mark(step, ms), time(step, fn) }`; `time` measures a
+//! sync or async `fn` and reports even when it throws. Never throws itself.
+export function createTimings(write = log, now = Date.now) {
+  const mark = (step, ms) => {
+    try { write(`[timing] ${step} ${(Math.max(0, ms) / 1000).toFixed(1)}s`); } catch { /* diagnostics only */ }
+  };
+  const time = (step, fn) => {
+    const started = now();
+    let result;
+    try {
+      result = fn();
+    } catch (error) {
+      mark(step, now() - started);
+      throw error;
+    }
+    if (result && typeof result.then === 'function') {
+      return result.finally(() => mark(step, now() - started));
+    }
+    mark(step, now() - started);
+    return result;
+  };
+  return { mark, time };
+}
+
+//! `--dev-fast` (the /dev watcher): the lighter build profile — `RV_DEV_FAST_BUILD=1` for Vite,
+//! see vite.config.ts. Allowed only for a public / `--demo` deploy to the remote prefix `dev`:
+//! `/demo`, `/demo-beta`, a `--root` deploy and every `--private` deploy keep the release build.
+export function assertDevFastAllowed({ devFast = false, private: isPrivate = false, root = false, path = null } = {}) {
+  if (!devFast) return;
+  if (isPrivate || root || normalizeRemotePrefix(path) !== 'dev') {
+    throw new Error('--dev-fast is the /dev build profile only: it needs a public or --demo deploy with --path dev '
+      + '(never --private, --root or any other target).');
+  }
+}
 function info(label, value) { console.log(`  ${CYAN}${label.padEnd(10)}${RESET}: ${value}`); }
 
 function humanSize(bytes) {
@@ -213,11 +273,14 @@ function assertSaneBase(base) {
 // ─── Build ───────────────────────────────────────────────────────────────
 
 //! The staging profile of the `--demo` form: the FULL commercial tier and nothing beyond it.
-//! `restrictedFeatures: []` is the load-bearing half — agents and omniverse are restricted, so
-//! an empty entitlement list is what keeps them (and the whole internal tier) out of a
-//! publicly hosted build. It is exactly the profile a commercial customer without extras
-//! receives, which is the point: the demo shows what a customer gets.
-const DEMO_PROFILE = Object.freeze({ tier: 'commercial', restrictedFeatures: [] });
+//! `restrictedFeatures` is the load-bearing half — agents and omniverse are restricted, so
+//! leaving them out of the entitlement list is what keeps them (and the whole internal tier)
+//! out of a publicly hosted build. It is the profile a commercial customer without extras
+//! receives, which is the point: the demo shows what a customer gets. The one entitlement is
+//! `demo-welcome` (plan-646 F14), the public-demo welcome window: restricted so that no
+//! customer delivery can carry it, and inert in every `--demo` build except the one for the
+//! target path `demo` — the build flag decides that (demoWelcomeForTarget), not the profile.
+export const DEMO_PROFILE = Object.freeze({ tier: 'commercial', restrictedFeatures: Object.freeze(['demo-welcome']) });
 
 //! Public remote prefixes whose deploys reuse the shared node_modules build cache (plan-487).
 //! Only the internal channels: `/dev` is "latest work in progress" and `/demo-beta` its
@@ -225,11 +288,26 @@ const DEMO_PROFILE = Object.freeze({ tier: 'commercial', restrictedFeatures: [] 
 //! fresh `npm ci` — reproducibility before speed where the artifact is public or delivered.
 const FAST_BUILD_PREFIXES = new Set(['dev', 'demo-beta']);
 
+//! The effective remote prefix of a public deploy as one comparable token: `demo`, `/demo/`,
+//! `demo/` and `\demo` all read `demo`; a nested prefix keeps its inner slashes.
+export function normalizeRemotePrefix(remotePrefix) {
+  return String(remotePrefix ?? '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '').toLowerCase();
+}
+
 //! Decides whether a PUBLIC deploy to `remotePrefix` builds with the dependency cache.
 export function fastBuildForPublicTarget(remotePrefix, { root = false } = {}) {
   if (root) return false;
-  const prefix = String(remotePrefix ?? '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '').toLowerCase();
-  return FAST_BUILD_PREFIXES.has(prefix);
+  return FAST_BUILD_PREFIXES.has(normalizeRemotePrefix(remotePrefix));
+}
+
+//! plan-646 F14: whether this deploy builds the public-demo welcome window
+//! (`__RV_DEMO_WELCOME__`). True only for the `--demo` form AND the effective target path
+//! `demo` — `/dev` (the watcher), `/demo-beta`, a `--root` deploy, a plain public deploy and
+//! every private deploy build it as `false`. The answer is handed to the build explicitly;
+//! an `RV_DEMO_WELCOME` in the operator's environment never decides it.
+export function demoWelcomeForTarget({ demo = false, remotePrefix = null, root = false } = {}) {
+  if (!demo || root) return false;
+  return normalizeRemotePrefix(remotePrefix) === 'demo';
 }
 
 //! The register entry of a project whose customer is reached by a hosted link only
@@ -244,7 +322,7 @@ function hostedLinkOwner(privateRoot, projectKey, resolveOwner) {
 //! is also removed here whenever the tier check, the build or the provenance check throws —
 //! the caller has no handle yet at that point (plan-487 F1). Once this returns, the caller OWNS
 //! `workspaceRoot` and must remove it itself (see releaseStaging). `deps` is a test seam.
-export function stageAndBuild({ mode, projectDir = null, base = null, dryRun = false, fast = false }, deps = {}) {
+export function stageAndBuild({ mode, projectDir = null, base = null, dryRun = false, fast = false, demoWelcome = false, devFast = false, timings = null, librarySources = null }, deps = {}) {
   const {
     stage = stageFilteredSourceTree,
     assertTierLeak = assertNoCrossTierLeak,
@@ -271,6 +349,7 @@ export function stageAndBuild({ mode, projectDir = null, base = null, dryRun = f
     }
     : (projectKey ? loadDeliveryConfig(privateRoot, projectKey) : null);
   const profile = demo ? DEMO_PROFILE : (delivery ?? { tier: 'core', restrictedFeatures: [] });
+  const stageStarted = Date.now();
   const staged = stage({
     coreRoot: ROOT,
     privateRoot,
@@ -281,14 +360,30 @@ export function stageAndBuild({ mode, projectDir = null, base = null, dryRun = f
     // the public demo content stays (a commercial tier would otherwise drop it), and no
     // customer workspace is generated (there is no customer, and no delivery config to
     // generate one from).
-    ...(demo ? { includePublicDemoContent: true, workspaceFiles: false } : {}),
+    // plan-646: generated/features.json was regenerated by deployPublic just before this.
+    ...(demo ? { includePublicDemoContent: true, includeGeneratedFiles: true, workspaceFiles: false } : {}),
     ...(hostedOwner ? { workspaceFiles: false } : {}),
+    // plan-778 F15: where the project's library projects are found for the trim.
+    ...(librarySources ? { librarySources } : {}),
   });
+  timings?.mark('stage', Date.now() - stageStarted);
   return withStagingCleanup(staged.workspaceRoot, () => {
     // The staged private tree is what gets compiled, so this is the check that the internal
     // tier never entered the demo build in the first place — before Vite, before any upload.
     if (demo) assertTierLeak(staged.workspaceRoot, staged.manifest, profile);
-    const build = buildStep(staged.workspaceRoot, { mode, base, dryRun, projectKey, fast });
+    // plan-646 F14: always an explicit boolean, and only ever true for the demo staging.
+    const build = buildStep(staged.workspaceRoot, {
+      mode, base, dryRun, projectKey, fast, demoWelcome: demo && demoWelcome === true,
+      // plan-679 Phase 3: a customer / hosted-link build judges the licence policy as its DELIVERY
+      // tier (the staging prunes what that tier does not carry). Without it the build ran as the
+      // FULL `private` tier and an entry that only the full build carries (omniverse, `tiers:
+      // ["private"]`) read as a stale exception. Never for the demo or an unscoped build.
+      ...(!demo && delivery?.tier ? { noticesTier: delivery.tier } : {}),
+      // Only ever true for the /dev target (assertDevFastAllowed in main); absent otherwise, so
+      // every other build call is byte-for-byte what it was.
+      ...(devFast === true ? { devFast: true } : {}),
+      ...(timings ? { onTiming: (step, ms) => timings.mark(step, ms) } : {}),
+    });
     if (!dryRun) assertProvenance(build.distDir, { mode, projectKey });
     if (!dryRun && fast) {
       const method = build.cacheMethod ? `, restored as ${build.cacheMethod === 'link' ? 'junction' : 'copy'}` : '';
@@ -463,21 +558,19 @@ export function runWithConcurrency(items, limit, worker, { weight = () => 0, max
   });
 }
 
-//! Is `rel` a library catalog? The default `deferUntilLast` predicate (plan-508 F2b).
-export function isCatalogFile(rel) {
-  return /(^|\/)catalog\.json$/i.test(String(rel).replace(/\\/g, '/'));
-}
-
 //! The catalogued binaries under `localDir` whose hash changed against the
 //! catalogs currently published under `remotePrefix` (plan-508 F2b) — fed to
 //! `uploadDirectory` as `alwaysUploadRel`, so a same-size GLB / splat whose
 //! bytes changed is uploaded even though the size diff would skip it. Called
 //! INSIDE the publish lock: another deploy's catalog must not slip in between.
 //! A remote catalog that is missing (first deploy) forces every catalogued file.
+//! plan-778: library PROJECT manifests carry the same hashes (`library/project.json`,
+//! a hosted deploy's `p/libraries/<id>/project.json`) and are diffed the same way —
+//! the bundled catalog.json they replaced is gone.
 export async function catalogHashDiff(client, localDir, remotePrefix) {
   const prefix = (remotePrefix || '').replace(/^\/+|\/+$/g, '');
   const changed = new Set();
-  for (const rel of findCatalogFiles(localDir)) {
+  for (const rel of [...findCatalogFiles(localDir), ...findLibraryProjectFiles(localDir)]) {
     const remotePath = prefix ? `${prefix}/${rel}` : rel;
     const remote = await client.getFileIfExists(remotePath);
     for (const bin of catalogChangedBinaries(localDir, rel, remote)) changed.add(bin);
@@ -671,6 +764,26 @@ async function acquireDeployLock(cfg, remotePrefix, { startedAt, now, acquire, p
 
 // ─── Public deploy ───────────────────────────────────────────────────────
 
+//! Writes `generated/features.json` in this (canonical) tree before a `--demo` staging, so the
+//! staged build ships `<prefix>/features.json` (plan-646 F3b/F3c). The staging never regenerates
+//! it. A missing manifest or a catalog mismatch aborts the deploy. `generate` is a test seam.
+export function generateDemoFeatures({ generate = generateFeatures, write = writeFileSync, out = FEATURES_JSON_FILE } = {}) {
+  let result;
+  try {
+    result = generate();
+  } catch (error) {
+    throw new Error(`features.json generation failed - deploy aborted.\n${error?.message ?? error}`);
+  }
+  if (!result.available) {
+    throw new Error(`features.json generation failed - deploy aborted: ${result.manifestPath} not found `
+      + '(a --demo deploy needs the private sibling realvirtual-WebViewer-Private~ next to this tree).');
+  }
+  mkdirSync(dirname(out), { recursive: true });
+  write(out, result.json);
+  log(`${DIM}features.json generated: ${out}${RESET}`);
+  return out;
+}
+
 //! Public deploy entry. `deps.stageAndBuild` and `deps.sleep` are test seams; everything after staging runs
 //! inside a `try/finally` that owns the staging directory (plan-487, gate round 2 finding 1):
 //! the manifest guard, an upload that finally fails and the purge can all still throw.
@@ -697,7 +810,21 @@ export async function deployPublic(cfg, opts, deps = {}) {
   const phase = deps.reportPhase ?? reportDeployPhase;
   phase('build');
   const fast = fastBuildForPublicTarget(remotePrefix, { root: opts.root });
-  const filtered = (deps.stageAndBuild ?? stageAndBuild)({ mode, base: opts.base, dryRun: opts.dryRun, fast });
+  assertDevFastAllowed({ devFast: opts.devFast, root: opts.root, path: remotePrefix });
+  const timings = deps.timings ?? createTimings();
+  if (opts.devFast) log(`${DIM}dev-fast build profile: on (RV_DEV_FAST_BUILD=1)${RESET}`);
+  const demoWelcome = demoWelcomeForTarget({ demo: mode === 'demo', remotePrefix, root: opts.root });
+  if (mode === 'demo') {
+    log(`${DIM}demo welcome window: ${demoWelcome ? 'on' : 'off'} (target ${normalizeRemotePrefix(remotePrefix) || '(root)'})${RESET}`);
+  }
+  // plan-646: features.json comes from the original manifest, so it is generated here, not staged.
+  // A stubbed staging (test seam) builds nothing, so it gets no generator unless one is passed.
+  const generate = deps.generateFeatures ?? (deps.stageAndBuild ? null : generateDemoFeatures);
+  if (mode === 'demo' && generate) timings.time('features', () => generate());
+  const filtered = (deps.stageAndBuild ?? stageAndBuild)({
+    mode, base: opts.base, dryRun: opts.dryRun, fast, demoWelcome,
+    ...(opts.devFast ? { devFast: true } : {}), timings,
+  });
   try {
     await publishPublicBuild(cfg, opts, filtered, {
       mode,
@@ -707,9 +834,11 @@ export async function deployPublic(cfg, opts, deps = {}) {
       lock: { startedAt, now, acquire: deps.acquireLock ?? acquirePublishLock, pollMs: deps.lockPollMs ?? null },
       runSmoke: deps.runSmoke ?? runDemoSmoke,
       reportPhase: phase,
+      timings,
     });
   } finally {
     releaseStaging(filtered.workspaceRoot);
+    timings.mark('total', now() - startedAt);
   }
 }
 
@@ -797,12 +926,13 @@ async function runPostDeploySmoke(distDir, remotePrefix, runSmoke) {
   return result;
 }
 
-async function publishPublicBuild(cfg, opts, filtered, { mode, remotePrefix, sleep, probe, lock: lockOptions, runSmoke, reportPhase = reportDeployPhase }) {
+async function publishPublicBuild(cfg, opts, filtered, { mode, remotePrefix, sleep, probe, lock: lockOptions, runSmoke, reportPhase = reportDeployPhase, timings = createTimings(() => {}) }) {
   const distDir = filtered.distDir;
   if (opts.dryRun) {
     log(`${DIM}[dry-run] filtered ${mode} source staged; no build/upload performed${RESET}`);
     return;
   }
+  const postprocessStarted = Date.now();
   if (!existsSync(distDir)) throw new Error(`Filtered build output not found: ${distDir}`);
   assertNoDevArtifacts(distDir);
   assertNoPublishableSource(distDir);
@@ -948,7 +1078,8 @@ async function publishPublicBuild(cfg, opts, filtered, { mode, remotePrefix, sle
   // root robots.txt PUT included. Two publishers to the same target interleaving here corrupt
   // it — the second one's listing sees the first one's fresh assets and its stale-delete removes
   // them. Nothing above this line touched the remote.
-  const lock = await acquireDeployLock(cfg, remotePrefix, lockOptions);
+  timings.mark('postprocess', Date.now() - postprocessStarted);
+  const lock = await timings.time('lock-wait', () => acquireDeployLock(cfg, remotePrefix, lockOptions));
   let uploaded;
   let skipped;
   try {
@@ -958,11 +1089,11 @@ async function publishPublicBuild(cfg, opts, filtered, { mode, remotePrefix, sle
     // half-published target behind, so the phase file stops saying `build`.
     reportPhase('upload');
     const alwaysUploadRel = opts.force ? [] : await catalogHashDiff(client, distDir, remotePrefix);
-    ({ uploaded, skipped } = await uploadDirectory(client, distDir, remotePrefix, {
+    ({ uploaded, skipped } = await timings.time('upload', () => uploadDirectory(client, distDir, remotePrefix, {
       ...opts,
       alwaysUploadGlbs: !!signing,
       alwaysUploadRel,
-    }));
+    })));
 
     // Crawlers only honor /robots.txt at the DOMAIN ROOT — when the canonical
     // deploy lives under a sub-path (demo/), a root copy referencing the absolute
@@ -972,7 +1103,7 @@ async function publishPublicBuild(cfg, opts, filtered, { mode, remotePrefix, sle
       await client.putFile(Buffer.from(seo.robots, 'utf8'), 'robots.txt');
     }
 
-    await maybePurge(client, uploaded, opts);
+    await timings.time('purge', () => maybePurge(client, uploaded, opts));
     // plan-587 F4: the bytes are up and the cache is purged — the build IS live. Everything
     // after this point only CHECKS it, which is exactly why a timeout must not kill it.
     reportPhase('published');
@@ -981,7 +1112,7 @@ async function publishPublicBuild(cfg, opts, filtered, { mode, remotePrefix, sle
     // HTML, that the catalog arrived byte-for-byte and that the first asset
     // hashes to its catalog entry. Still inside the lock — what is probed is
     // exactly what this run published.
-    await runPublishProbe(distDir, remotePrefix, opts, probe);
+    await timings.time('probe', () => runPublishProbe(distDir, remotePrefix, opts, probe));
 
     // plan-503: the demo smoke runs after the purge and the plan-508 probe, INSIDE the
     // publish lock, so no second publisher changes the target while it is being checked.
@@ -992,7 +1123,7 @@ async function publishPublicBuild(cfg, opts, filtered, { mode, remotePrefix, sle
     } else {
       info('uploaded', `${uploaded} uploaded, ${skipped} unchanged — the build is live; running the demo smoke`);
       reportPhase('smoke');
-      await runPostDeploySmoke(distDir, remotePrefix, runSmoke ?? runDemoSmoke);
+      await timings.time('smoke', () => runPostDeploySmoke(distDir, remotePrefix, runSmoke ?? runDemoSmoke));
     }
   } finally {
     await lock.release();
@@ -1073,7 +1204,10 @@ async function deployPrivate(cfg, opts) {
   // than noticed afterwards.
   assertValidProject(projectDir, `project "${opts.project}"`);
   const project = loadProject(projectDir); // validates code + name (R6)
-  const filtered = stageAndBuild({ mode: 'private', projectDir, base: opts.base, dryRun: opts.dryRun });
+  // plan-778 F15: library projects are found by id in --projects-dir, or named by --library <id>=<folder>.
+  const librarySources = { projectsDir, libraries: opts.libraries ?? {} };
+  opts.librarySources = librarySources;
+  const filtered = stageAndBuild({ mode: 'private', projectDir, base: opts.base, dryRun: opts.dryRun, demoWelcome: false, librarySources });
   try {
     await publishPrivateBuild(cfg, opts, { project, projectDir, filtered });
   } finally {
@@ -1150,6 +1284,8 @@ async function publishPrivateBuild(cfg, opts, { project, projectDir, filtered })
         projectDir: filteredProjectDir,
         encryption,
         signing,
+        librarySources: opts.librarySources ?? null,
+        onLog: (line) => log(`${DIM}${line}${RESET}`),
         onReport: (report) => {
           encryptedRels = report.encrypted ?? [];
           printHostedPreflight(report, project);
@@ -1175,13 +1311,15 @@ async function publishPrivateBuild(cfg, opts, { project, projectDir, filtered })
       // plan-596 SOL #1: every file the staging encrypted (GLB AND project
       // AASX / aasx/index.json) is uploaded regardless of size — p/-relative
       // report paths become staging-relative here and join the catalog diff.
+      // plan-778 review D14: p/project.json is deferred too — it names the libraries
+      // under p/libraries/, so it must not go live before their manifests and GLBs.
       const p1 = await uploadDirectory(client, stagingDir, project.code, {
         ...opts,
         alwaysUploadGlbs: !!encryption || !!signing,
         alwaysUploadRel: opts.force
           ? []
           : hostedForcedUploadRels(encryptedRels, await catalogHashDiff(client, stagingDir, project.code)),
-        deferUntilLast: (rel) => isCatalogFile(rel) || /^settings\.json$/i.test(rel),
+        deferUntilLast: (rel) => isCatalogFile(rel) || /^settings\.json$/i.test(rel) || /^p\/project\.json$/i.test(rel),
         uploadFirst: (rel) => rel.startsWith('p/'),
       });
       totalUploaded += p1.uploaded;
@@ -1209,10 +1347,13 @@ async function publishPrivateBuild(cfg, opts, { project, projectDir, filtered })
   if (encryption) {
     // The fragment secret is HALF the key — it must travel in the link. The
     // password is the other half; send it via a SEPARATE channel (never log it).
-    info('url', `https://web.realvirtual.io/${project.code}/#k=${fragmentB64}`);
+    info('url', `${publicBaseUrlFor(project.code)}#k=${fragmentB64}`);
     log(`${DIM}Encrypted deploy: send the link and the password through separate channels.${RESET}`);
   } else {
-    info('url', `https://web.realvirtual.io/${project.code}/`);
+    // plan-603 D7: a partner publishing into HIS OWN zone must get HIS url printed, or
+    // he forwards dead links to his customers. `publicBaseUrlFor` honours
+    // RV_PUBLIC_BASE_URL, which the public path has used all along.
+    info('url', publicBaseUrlFor(project.code));
   }
 }
 
@@ -1342,8 +1483,12 @@ async function main() {
     noPurge: hasFlag('no-purge'),
     skipProbe: hasFlag('skip-probe'),
     noSmoke: hasFlag('no-smoke'),
+    devFast: hasFlag('dev-fast'),
+    // plan-778 F15: repeatable --library <projectId>=<folder> (private deploys).
+    libraries: parseLibrarySourceArgs(args).libraries,
   };
   assertSaneBase(opts.base);
+  assertDevFastAllowed(opts);
   if (opts.private && opts.demo) {
     throw new Error('--demo and --private are different deploy forms: --demo publishes the '
       + 'commercial code on the PUBLIC demo content, --private publishes one customer project. '
@@ -1371,25 +1516,4 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     console.error(`${RED}Error:${RESET} ${e?.message ?? e}`);
     process.exit(exitCodeFor(e));
   });
-}
-
-//! What a hosted publish leaves on the CDN: exactly the staging listing (F9).
-//! Deriving this from the staged tree — not from a second walk of the project
-//! with its own deny rule — is what keeps the reconciler from deleting a file
-//! the upload just wrote.
-export function expectedHostedSnapshot(stagingDir) {
-  return new Set(collectLocalFiles(stagingDir).map((file) => file.rel.replace(/\\/g, '/').toLowerCase()));
-}
-
-//! Deletes every remote file that is absent from the validated local snapshot manifest.
-export async function reconcileRemoteSnapshot(client, remotePrefix, expectedPaths) {
-  const entries = await client.listRecursive(remotePrefix);
-  const prefix = remotePrefix.replace(/^\/+|\/+$/g, '');
-  let deleted = 0;
-  for (const entry of entries) {
-    if (expectedPaths.has(entry.rel.replace(/\\/g, '/').toLowerCase())) continue;
-    await client.deleteFile(prefix ? `${prefix}/${entry.rel}` : entry.rel);
-    deleted++;
-  }
-  return deleted;
 }

@@ -14,7 +14,8 @@
  * `_shared/surface-occupancy.ts`; the surface-based PUBLICATION of
  * `Flow.Occupied` stays in the behavior, not here.
  */
-import type { Object3D } from 'three';
+import { Vector3, type Object3D } from 'three';
+import type { RVSink } from '../../core/engine/rv-sink';
 import type { RVBindContext, SignalOpts } from '../../core/behavior-runtime';
 import { findOutputPairings, listOwnSnaps, type OutputPairing, type PortConnection } from './snap-graph-helpers';
 import { RVTransportSurface } from '../../core/engine/rv-transport-surface';
@@ -137,12 +138,39 @@ export interface InterlockHost {
  * change on snap connect/disconnect. The signal VALUES are read fresh on every
  * call — occupancy can flip between two reads of the same tick (and tests tick
  * behaviors without a transport manager advancing the tick id).
+ * `sinkAtOutput` lets continuous conveyors discharge through an unpaired output
+ * inside an unconditional sink's world AABB. Other callers keep snap-only semantics.
  */
-export function createDownstreamInterlock(rv: InterlockHost): { occupied(): boolean } {
+export function createDownstreamInterlock(
+  rv: InterlockHost,
+  options: { sinkAtOutput?: boolean } = {},
+): { occupied(): boolean } {
   let memoTickId = Number.NEGATIVE_INFINITY;
   let memoHasPairing = false;
   let memoRootSig = '';
   let memoPerPort = '';
+  const outputPosition = new Vector3();
+  // Continuous Conveyor opt-in only. Use the real consumer volume, not a
+  // nearest-node/radius guess. Paired successors always retain precedence.
+  const sinkAcceptsOutput = (): boolean => {
+    if (!options.sinkAtOutput) return false;
+    const sinks = (rv.viewer as { transportManager?: { sinks: readonly RVSink[] } | null }).transportManager?.sinks;
+    if (!sinks?.length) return false;
+    for (const port of listOwnSnaps(rv.viewer as { getPlugin?(id: string): unknown }, rv.root)) {
+      if (port.flow !== 'out' || port.pairedSnapId) continue;
+      port.object3D.getWorldPosition(outputPosition);
+      for (const sink of sinks) {
+        // No MU is supplied by this interlock: only unconditional acceptance
+        // is safe. A tag-filtered sink must use an explicit connection instead.
+        if (!sink.isOwner || !sink.DeleteMus || sink.DeleteOnlyTag) continue;
+        const { min, max } = sink.aabb;
+        if (outputPosition.x >= min.x && outputPosition.x <= max.x
+          && outputPosition.y >= min.y && outputPosition.y <= max.y
+          && outputPosition.z >= min.z && outputPosition.z <= max.z) return true;
+      }
+    }
+    return false;
+  };
   return {
     occupied(): boolean {
       const tickId = RVTransportSurface.currentTickId;
@@ -157,7 +185,7 @@ export function createDownstreamInterlock(rv: InterlockHost): { occupied(): bool
           memoPerPort = `${memoRootSig}@${pairing.pairedSnap.id}`;
         }
       }
-      if (!memoHasPairing) return true;
+      if (!memoHasPairing) return !sinkAcceptsOutput();
       // Per-port-then-root, always freshly read.
       const name = rv.signals.get(memoPerPort) !== undefined ? memoPerPort : memoRootSig;
       return rv.signals.get<boolean>(name) === true;

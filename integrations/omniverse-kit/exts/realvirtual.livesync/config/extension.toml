@@ -1,0 +1,30 @@
+[package]
+version = "0.2.1"
+title = "realvirtual Live Sync"
+description = "Receives the live simulation of realvirtual WEB (axes and workpieces) as a USD stage - one-way USD live link (plan-637)."
+category = "Simulation"
+authors = ["realvirtual GmbH"]
+keywords = ["realvirtual", "live sync", "digital twin", "websocket"]
+readme = "../../README.md"
+
+[dependencies]
+"omni.usd" = {}
+"omni.ui" = {}
+
+[[python.module]]
+name = "realvirtual.livesync"
+
+# The WebSocket server needs the `websockets` package (>= 12). Isaac Sim ships it
+# (verified with Isaac Sim 4.5.0 / Kit 106.5), so there is no [python.pipapi]
+# entry - with `use_online_index = false` Kit only warns about it.
+
+[settings]
+# Default port; the viewer (USD > Settings) must use the same. 8765 until 2026-10-21 (collided with other local services).
+exts."realvirtual.livesync".port = 8775
+exts."realvirtual.livesync".allowed_origins = [
+    "http://localhost:*",
+    "http://127.0.0.1:*",
+    "https://localhost:*",
+    "https://127.0.0.1:*",
+    "https://*.realvirtual.io",
+]

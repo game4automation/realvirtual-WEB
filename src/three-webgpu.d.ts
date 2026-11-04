@@ -16,7 +16,8 @@ declare module 'three/webgpu' {
     toneMapping: number;
     toneMappingExposure: number;
     info: {
-      render?: { triangles?: number; calls?: number };
+      /** `calls` is cumulative on three/webgpu (never reset); `drawCalls` is per frame. */
+      render?: { triangles?: number; calls?: number; drawCalls?: number; frameCalls?: number };
       memory?: { geometries?: number; textures?: number };
       programs?: unknown[];
     };
@@ -39,6 +40,8 @@ declare module 'three/webgpu' {
     setPixelRatio(ratio: number): void;
     getPixelRatio(): number;
     setClearColor(color: unknown, alpha?: number): void;
+    getClearColor(target: import('three').Color): import('three').Color;
+    getClearAlpha(): number;
     setAnimationLoop(callback: ((time: DOMHighResTimeStamp) => void) | null): void;
     setRenderTarget(target: unknown): void;
     dispose(): void;
@@ -99,6 +102,28 @@ declare module 'three/webgpu' {
     /** Set to true when the output node graph changed. */
     needsUpdate: boolean;
     render(): void;
+    dispose(): void;
+  }
+  /** Scene-to-texture pass node (three/src/nodes/display/PassNode.js) — the
+   *  class behind `pass()` from 'three/tsl'. Minimal surface: what the
+   *  overlay-layer pass subclass in rv-post-processing-tsl.ts overrides. */
+  export class PassNode {
+    static readonly COLOR: string;
+    constructor(
+      scope: string,
+      scene: import('three').Scene,
+      camera: import('three').Camera,
+      options?: { samples?: number },
+    );
+    scene: import('three').Scene;
+    camera: import('three').Camera;
+    /** Restrict the pass render to these layers — replaces the camera's
+     *  layer mask for the duration of the pass (restored afterwards). */
+    setLayers(layers: import('three').Layers): this;
+    getTextureNode(name?: string): unknown;
+    /** Renders the scene into the pass target. Runs once per frame before
+     *  the output quad, in graph order. */
+    updateBefore(frame: { renderer: Renderer }): void;
     dispose(): void;
   }
   /** Fullscreen quad helper (three/src/renderers/common/QuadMesh.js). */

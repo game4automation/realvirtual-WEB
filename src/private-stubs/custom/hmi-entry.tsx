@@ -12,6 +12,7 @@
 import { createRoot } from 'react-dom/client';
 import { RVViewerProvider } from '../../hooks/use-viewer';
 import { App } from '../../core/hmi/App';
+import { RootErrorBoundary } from '../../core/hmi/RootErrorBoundary';
 import type { RVViewer } from '../../core/rv-viewer';
 
 export function initHMI(viewer: RVViewer): void {
@@ -22,8 +23,12 @@ export function initHMI(viewer: RVViewer): void {
   }
   const root = createRoot(container);
   root.render(
-    <RVViewerProvider value={viewer}>
-      <App />
-    </RVViewerProvider>,
+    // One boundary around the whole HMI (plan-2022 P0): a render error shows a rebuild card
+    // instead of unmounting every panel and leaving only the 3D scene.
+    <RootErrorBoundary>
+      <RVViewerProvider value={viewer}>
+        <App />
+      </RVViewerProvider>
+    </RootErrorBoundary>,
   );
 }

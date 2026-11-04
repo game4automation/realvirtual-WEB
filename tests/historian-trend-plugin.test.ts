@@ -3,7 +3,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import mainSource from '../src/main.ts?raw';
-import connectPanelSource from '../src/core/hmi/ConnectPanel.tsx?raw';
+import connectStoreSource from '../src/core/hmi/connect-store.ts?raw';
 import {
   HistorianTrendPlugin,
   historianStatusAllowsPlugin,
@@ -73,7 +73,13 @@ describe('historian trend plugin', () => {
   });
 
   it('keeps flat and ProcessImage record patches on separate interface fields', () => {
-    expect(connectPanelSource).toContain('await updateInterface(iface.id, { topics })');
-    expect(connectPanelSource).toContain('await updateInterface(iface.id, { signals })');
+    // The two hand-written call sites in ConnectPanel collapsed into ONE helper,
+    // `_signalContainerPatch` in connect-store: a patch without a topic goes to
+    // the flat `signals` field, a patch for an MQTT topic rewrites `topics` and
+    // touches that topic's own `signals` list. The separation is what matters —
+    // CONNECT replaces the whole field, so a patch that mixed them would delete
+    // the other container's signals. Pinned where the branch now lives.
+    expect(connectStoreSource).toContain('if (topic === undefined) return { signals: edit([...(iface.signals ?? [])]) };');
+    expect(connectStoreSource).toContain('topics: topics.map(t => (t.topic === topic ? { ...t, signals: edit([...(t.signals ?? [])]) } : t)),');
   });
 });

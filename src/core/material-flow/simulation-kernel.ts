@@ -18,9 +18,9 @@
  * try/catch so a half-finished switch can never wedge the toggle.
  *
  * DES availability is injected, never imported: `registerDesRunnerFactory()`
- * takes the factory the private side provides (the public build's
- * `des-runner-stub` exports `null`), and `hasDesRunner()` reports it. The public
- * UI toggle reads `hasDesRunner()` and hides DES when false — `SimModeToggle`
+ * takes the factory the on-demand DES feature hands over
+ * (`plugins/des/register-des-runner`, plan-680), and `hasDesRunner()` reports it.
+ * The UI toggle reads `hasDesRunner()` and hides DES when false — `SimModeToggle`
  * (P6) never imports `DESRunner` directly (Plan 194 V7).
  */
 
@@ -30,7 +30,9 @@ import type {
   SimulationTopology,
 } from './simulation-executor';
 import type { CoreSubsystems } from '../engine/rv-core-subsystems';
+import type { ScriptHookDispatcher, SdkScheduler } from '../sdk/rv-script-hook';
 import { ContinuousRunner } from './continuous-runner';
+import { setActiveTrafficKernel } from '../engine/rv-traffic-registries';
 
 export type SimulationMode = 'continuous' | 'des';
 
@@ -141,12 +143,57 @@ export interface SimDesStatistics {
 }
 
 /**
+ * DES lifecycle event kinds (plan-645 L2). `bound` = a run is bound and started
+ * (first start, after `reset()` / `rebindScene()`); `reset` = the bound run ends
+ * (reset, rebind, clearMUs, suspend, dispose) — delivered BEFORE the runner tears
+ * its instances down; `restored` = a snapshot restore changed the state (no state
+ * change, but a new generation); `disposed` = the runner is gone (terminal).
+ */
+export type DesLifecycleEventType = 'bound' | 'reset' | 'restored' | 'disposed';
+
+/** One DES lifecycle event. The generation is the runner's own monotone counter (never an entity id, N5). */
+export interface DesLifecycleEvent {
+  readonly type: DesLifecycleEventType;
+  /** Service generation AFTER this event (+1 per event). */
+  readonly generation: number;
+  /** Process-unique id of the emitting runner. */
+  readonly runnerId: number;
+}
+
+/** Listener of {@link SimDesControl.onLifecycle} / {@link SimulationKernel.onDesLifecycle}. */
+export type DesLifecycleListener = (e: DesLifecycleEvent) => void;
+
+/** Handle of a scheduled DES callback (plan-645 Phase 2): generation + callback key. */
+export interface DesCallbackHandle {
+  readonly generation: number;
+  readonly key: number;
+}
+
+/** Reason recorded at the model run's completion edge. */
+export type DesRunCompleteReason = 'duration-reached' | 'queue-drained' | 'queue-empty-before-end';
+
+/** Model events in dispatch order, sampled on demand. */
+export interface DesPeekResult {
+  events: Array<{ time: number; component: string; componentPath: string; action: string; muId: number; priority: number }>;
+  total: number;
+  truncated: boolean;
+}
+
+/**
  * The DES sub-mode / KPI control surface the public UI consumes. The active DES
  * executor (the private `DESRunner`) implements this STRUCTURALLY — the public
  * side only ever sees this interface, never the concrete class (Plan 194 V7). The
  * kernel exposes it via `desControl()`, returning `null` outside DES mode.
  */
 export interface SimDesControl {
+  /** Lifecycle generation, incremented on reset/restart and restore. */
+  readonly lifecycleGeneration?: number;
+  /** Pause state of the DES manager. */
+  readonly paused?: boolean;
+  /** Last completion edge; null while the current run has not completed. */
+  readonly runComplete?: { reason: DesRunCompleteReason; simTime: number } | null;
+  /** Inspect pending model events without advancing the simulation. */
+  peekEvents?(n: number, filter?: { component?: string; action?: string }): DesPeekResult;
   /** Current sub-mode. */
   readonly subMode: SimSubMode;
   /** Switch the sub-mode (Animated / Hybrid / FastForward / Step). */
@@ -162,12 +209,24 @@ export interface SimDesControl {
   setMultiplier(n: number): void;
   /** Canonical sim time in seconds (for displays / KPI). */
   readonly simTime: number;
+  /** Render clock (s): the time-lapsed sim time the tweens interpolate to (plan-629 horizon). */
+  readonly renderClock?: number;
+  /** Time (s) of the next pending event; +Infinity when the queue is empty. Read-only peek (plan-629). */
+  readonly nextEventTime?: number;
+  /**
+   * Observe the event loop (plan-629): `fn(t)` runs once per distinct event time
+   * `t`, BEFORE the first event at `t` is dequeued — every event before `t` is
+   * processed. Survives a DES reset. Returns the unsubscribe function.
+   */
+  addTimeAdvanceListener?(fn: (time: number) => void): () => void;
   /** Process exactly one event (Step mode). Returns false when nothing ran. */
   step(): boolean;
   /** FastForward progress 0–1 when a FF run is in flight; undefined otherwise. */
   readonly ffProgress?: number;
   /** Run FastForward to completion; resolves true when done, false if cancelled. */
   runFastForward?(): Promise<boolean>;
+  /** Run through a temporary sim-time target (or natural end), restore speed and pause. */
+  fastForwardUntil?(seconds: number): Promise<boolean>;
   /** Cancel an in-flight FastForward run. */
   cancelFastForward?(): void;
   /** Current KPI snapshot (throughput / bottleneck / utilization). */
@@ -178,12 +237,17 @@ export interface SimDesControl {
   readonly endTime?: number;
   /** Set the sim end time; pass Infinity for "infinite" (run until the queue empties). */
   setEndTime?(seconds: number): void;
+  /** Continue a finished (end reached) run: end += one more run length, clock runs on, no reset.
+   *  False when there is nothing to continue. Reset restores the original end. */
+  continueRun?(): boolean;
   /** Sim time at which component statistics reset (warmup); 0 = off. */
   readonly statResetTime?: number;
   /** Set the statistics-reset (warmup) time; 0 disables it. */
   setStatResetTime?(seconds: number): void;
   /** Per-component runtime states for inspection / debugging (MCP `web_des_*`). */
   componentStates?(): SimDesComponentState[];
+  /** Runtime counters of the DES components a KPI can read (`TotalProcessed`, numeric prop entries). */
+  kpiRuntimeFields?(): Array<{ address: string; path: string; component: string; field: string; value: number }>;
   /** Per-component utilization statistics + bottleneck (MCP `web_des_stats` /
    *  `web_des_bottleneck`), ordered by material flow. */
   statistics?(): SimDesStatistics;
@@ -191,6 +255,36 @@ export interface SimDesControl {
   snapshotJson?(): string;
   /** Restore the DES manager state from a JSON snapshot (Load Snapshot). */
   restoreJson?(json: string): void;
+
+  // ── Lifecycle service + callback scheduler (plan-645 Phase 2) ──────────
+  // Optional members: an older runner without them stays a valid SimDesControl.
+
+  /**
+   * Subscribe to the runner's lifecycle events (synchronous dispatch over a copy
+   * of the listener list; unsubscribing while it fires is allowed; a throwing
+   * listener is logged and does not stop the others). `replay: true` delivers
+   * `bound` with the current generation at once when the runner is bound.
+   * Prefer {@link SimulationKernel.onDesLifecycle}: it holds `bound` back until
+   * a mode switch has committed. Returns the unsubscribe function.
+   */
+  onLifecycle?(fn: DesLifecycleListener, opts?: { replay?: boolean }): () => void;
+  /**
+   * plan-2212: the DES-clock scheduler for ONE script component - `self.in/at`
+   * become `Script.Hook` events on the DES queue, `now` is the DES clock. Pass
+   * the component's kernel adapter as `dispatcher`. Structural: the web-component
+   * plugin reaches DES through this contract only.
+   */
+  makeScriptScheduler?(dispatcher: ScriptHookDispatcher): SdkScheduler;
+  /**
+   * Run `fn` once at sim time `t` (s, clamped to now) as a DES queue event
+   * (`DES.Callback`) — exact time order with the model events, FastForward too.
+   * Callbacks are NOT persistable: snapshots never contain them, and every
+   * lifecycle event (reset / bound / restored / disposed) drops the pending ones
+   * — after `restored` the consumer plans again.
+   */
+  scheduleCallback?(t: number, fn: () => void, opts: { afterModelEvents?: boolean; origin: { owner: string; kind: 'ui' | 'replan' } }): DesCallbackHandle;
+  /** Cancel a pending callback; a handle of an older generation is ignored. */
+  cancelCallback?(h: DesCallbackHandle | null | undefined): void;
 
   // ── Experiment / snapshot management (plan-261) ────────────────────────
   // REPO-BOUNDARY RULE (plan-261 B3): everything below transports STRINGS and
@@ -206,10 +300,12 @@ export interface SimDesControl {
 
   /** All stored {model, experiment} pairs (optionally filtered by model). */
   listExperiments?(model?: string): Promise<Array<{ model: string; experiment: string }>>;
+  /** Encoded series for selected references belonging to this column's current manifest. */
+  readColumnSeriesJson?(model: string, exp: string, refs: readonly string[]): Promise<string>;
   /** The experiment manifest as a JSON string (null when absent). */
   readManifestJson?(model: string, exp: string): Promise<string | null>;
   /** Snapshot the CURRENT sim state into the store at the current sim time. */
-  saveSnapshot?(scope: { model: string; exp: string; repl: number }, label?: string): Promise<void>;
+  saveSnapshot?(scope: { model: string; exp: string; repl: number; runId?: string }, label?: string): Promise<void>;
   /** Load a stored snapshot and restore the sim to it (synchronous restore). */
   loadSnapshot?(scope: { model: string; exp: string; repl: number; t: number }): Promise<void>;
   /** Delete one stored snapshot. */
@@ -250,16 +346,31 @@ export interface SimDesControl {
                       opts: { replications: number; crn: boolean }): Promise<void>;
   /** Run every ENABLED experiment of a model sequentially, N replications each. */
   runAllExperiments?(model: string, opts: { crn: boolean }): Promise<void>;
+  /** Why an experiment batch cannot start now (LogicSteps, PLC programs or IK paths in the model), as user text; null = it may. */
+  batchBlockReason?(): string | null;
   /** Cancel an in-flight batch; already-finished replications stay archived. */
   cancelBatch?(): void;
   /** JSON of the current batch progress — `{ exp, replIndex, total, phase }` —
    *  or null when no batch is running (drives the per-column running indicator). */
   batchProgressJson?(): string | null;
+  /** JSON array of the final progress of every column of the LAST batch (reset when a batch
+   *  starts), so a caller judges the whole batch, not only its last column (plan-2208). */
+  batchOutcomeJson?(): string | null;
+
+  // ── Planning re-config (plan-630 §2.14, Phase 8) ───────────────────────
+
+  /**
+   * Re-seed every bound instance's configuration from its node's rv_extras, so the next
+   * reset runs with values that were written there. The `component` planning owner calls
+   * it after its one writer, at a standstill, before the structural reset's single runner
+   * reset (`des-extras` re-config path). Idempotent; never touches MU or runtime state.
+   */
+  reconfigureFromExtras?(): void;
 }
 
 /**
- * Factory the private DES side provides; `null` in the public build. Same shape
- * as `private-stubs/des-runner-stub.ts` `CreateDesRunner`. The optional `core`
+ * Factory the DES feature provides (`plugins/des/register-des-runner`); `null`
+ * until the feature is activated. The optional `core`
  * is the viewer's CoreSubsystems pipeline the DES runner composes into its
  * tick (drives/visuals keep running at 60 Hz while the event queue advances).
  */
@@ -318,6 +429,16 @@ export class SimulationKernel {
   /** Lazily-built DES executor (kept so a continuous↔des round-trip reuses it). */
   private _desRunner: SimulationExecutor | null = null;
 
+  // ── DES lifecycle forwarding (plan-645 L1 / R2-1) ──
+  private readonly _lcListeners: DesLifecycleListener[] = [];
+  /** `bound` events held back while `setMode` runs; released after the commit, dropped on rollback. */
+  private readonly _lcPendingBound: DesLifecycleEvent[] = [];
+  /** True while a failed switch rolls back: the failed runner's events are swallowed. */
+  private _lcRollingBack = false;
+  /** Last forwarded `bound` (generation updated by `restored`); null when not bound. */
+  private _lcBound: DesLifecycleEvent | null = null;
+  private _lcUnsubscribeRunner: (() => void) | null = null;
+
   constructor(opts: SimulationKernelOptions) {
     this.continuousRunner = opts.continuousRunner;
     this.topology = opts.topology;
@@ -326,6 +447,8 @@ export class SimulationKernel {
     this.core = opts.core;
     this.onModeChanged = opts.onModeChanged;
     this._active = this.continuousRunner;
+    // plan-648 §2.1: the kernel starts continuous — its vehicle instances own the ids.
+    setActiveTrafficKernel('continuous');
   }
 
   // ─── Read accessors ───────────────────────────────────────────────────
@@ -376,11 +499,78 @@ export class SimulationKernel {
 
   /**
    * Register (or clear) the DES runner factory. Called once at wiring time with
-   * the factory the private side exports (`des-runner-stub` exports `null` in
-   * the public build). Idempotent.
+   * the factory the DES feature hands over (`null` clears it). Idempotent.
    */
   registerDesRunnerFactory(factory: DesRunnerFactory): void {
     this.desRunnerFactory = factory;
+  }
+
+  // ─── DES lifecycle (plan-645 L1 / R2-1) ───────────────────────────────
+
+  /**
+   * Subscribe to the DES runner's lifecycle — the kernel is the emitter (L1).
+   * Ending events (`reset`, `disposed`) arrive synchronously BEFORE the runner
+   * tears its instances down, also inside `setMode`; a listener must not reach
+   * for `desControl()` there (the event carries generation and runner id).
+   * Activating events (`bound`) are held back while a mode switch runs and are
+   * delivered after `_active`/`_mode` committed, so a listener sees
+   * `desControl() !== null` and the new mode; a failed switch drops them.
+   * `replay: true` delivers `bound` with the current generation at once when
+   * the kernel is in DES mode and its runner is bound. A runner without
+   * `onLifecycle` (older private build) never emits — callers keep their
+   * fallback (S9). Returns the unsubscribe function.
+   */
+  onDesLifecycle(fn: DesLifecycleListener, opts?: { replay?: boolean }): () => void {
+    this._lcListeners.push(fn);
+    if (opts?.replay && this._lcBound && this._mode === 'des' && !this._switching) {
+      this._lcDeliver(fn, this._lcBound);
+    }
+    return () => {
+      const i = this._lcListeners.indexOf(fn);
+      if (i >= 0) this._lcListeners.splice(i, 1);
+    };
+  }
+
+  /** True when the DES runner offers the lifecycle service (plan-645). */
+  hasDesLifecycle(): boolean {
+    const r = this._desRunner as unknown as Partial<SimDesControl> | null;
+    return !!r && typeof r.onLifecycle === 'function';
+  }
+
+  private _lcDeliver(fn: DesLifecycleListener, e: DesLifecycleEvent): void {
+    try { fn(e); } catch (err) { console.error('[SimulationKernel] DES lifecycle listener threw:', err); }
+  }
+
+  private _lcEmit(e: DesLifecycleEvent): void {
+    for (const fn of this._lcListeners.slice()) this._lcDeliver(fn, e);
+  }
+
+  /** Runner → kernel: buffer `bound` during a switch, everything else at once. */
+  private _onRunnerLifecycle(e: DesLifecycleEvent): void {
+    if (this._lcRollingBack) return;
+    if (e.type === 'bound') {
+      this._lcBound = e;
+      if (this._switching) { this._lcPendingBound.push(e); return; }
+    } else if (e.type === 'restored') {
+      if (this._lcBound) this._lcBound = { ...this._lcBound, generation: e.generation };
+    } else {
+      this._lcBound = null;
+      // An ending event supersedes a bound that was never delivered.
+      this._lcPendingBound.length = 0;
+    }
+    this._lcEmit(e);
+  }
+
+  private _attachRunnerLifecycle(runner: SimulationExecutor): void {
+    const r = runner as unknown as Partial<SimDesControl>;
+    if (typeof r.onLifecycle !== 'function') return;
+    this._lcUnsubscribeRunner = r.onLifecycle((e) => this._onRunnerLifecycle(e));
+  }
+
+  private _flushPendingBound(): void {
+    if (this._lcPendingBound.length === 0) return;
+    const pending = this._lcPendingBound.splice(0);
+    for (const e of pending) this._lcEmit(e);
   }
 
   // ─── Mode switch (Reset-on-Switch) ────────────────────────────────────
@@ -421,8 +611,20 @@ export class SimulationKernel {
       // Commit `_active`/`_mode` only AFTER `start()` succeeds, so a throwing
       // start() leaves the kernel cleanly in the ORIGINAL mode (not a half-
       // switched target with a broken executor).
-      this._active.clearMUs();
-      incoming.start(this.defs, this.topology);
+      //
+      // plan-648 §2.4 — vehicle ownership is handed over explicitly:
+      // clearMUs → old.suspend (releases its ids) → active traffic kernel = m →
+      // incoming.start (its instances restart from the start pose and acquire).
+      const old = this._active;
+      old.clearMUs();
+      old.suspend?.();
+      setActiveTrafficKernel(m);
+      try {
+        incoming.start(this.defs, this.topology);
+      } catch (e) {
+        this._rollbackSwitch(old, incoming);
+        throw e;
+      }
       this._active = incoming;
       this._mode = m;
       // Notify AFTER the commit so a subscriber that reads `mode`/`desControl()`
@@ -433,6 +635,38 @@ export class SimulationKernel {
       console.error(`[SimulationKernel] setMode("${m}") failed — staying in '${this._mode}':`, e);
     } finally {
       this._switching = false;
+      // plan-645 R2-1: `bound` of the committed (or rolled-back-to) executor is
+      // delivered now that `_active`/`_mode` are final.
+      this._flushPendingBound();
+    }
+  }
+
+  /**
+   * Failed switch (plan-648 §2.4 / G6): the half-started incoming executor gives
+   * up everything it acquired or scheduled, the active traffic kernel goes back
+   * to the old mode (even when that release throws), and the old executor
+   * starts again — a functional restart from the start pose, not a resume (its
+   * MUs and queue were already cleared). Errors of the rollback are logged; the
+   * original start() error is what `setMode` reports.
+   */
+  private _rollbackSwitch(old: SimulationExecutor, incoming: SimulationExecutor): void {
+    // plan-645 R2-1: the failed start's held-back `bound` is dropped, and the
+    // failed runner's own ending events are swallowed (nobody saw it bound).
+    this._lcPendingBound.length = 0;
+    if (incoming === this._desRunner) this._lcBound = null;
+    this._lcRollingBack = incoming === this._desRunner;
+    try {
+      incoming.suspend?.();
+    } catch (e) {
+      console.error('[SimulationKernel] suspend of the failed incoming executor threw:', e);
+    } finally {
+      this._lcRollingBack = false;
+      setActiveTrafficKernel(old.mode);
+    }
+    try {
+      old.start(this.defs, this.topology);
+    } catch (e) {
+      console.error(`[SimulationKernel] restart of '${old.mode}' after the failed switch threw:`, e);
     }
   }
 
@@ -443,6 +677,7 @@ export class SimulationKernel {
     if (this._desRunner) return this._desRunner;
     if (!this.desRunnerFactory) return null;
     this._desRunner = this.desRunnerFactory(this.defs, this.topology, this.core);
+    this._attachRunnerLifecycle(this._desRunner);
     return this._desRunner;
   }
 
@@ -468,6 +703,28 @@ export class SimulationKernel {
     this._active.reset();
   }
 
+  /**
+   * The scene changed under the active executor (deferred placements arrived
+   * after it started): rediscover via `rebindScene()` when the executor offers
+   * it, else `reset()` as before. Not the user's reset — see `reset()`.
+   */
+  rebindScene(): void {
+    const active = this._active;
+    if (active.rebindScene) active.rebindScene();
+    else active.reset();
+  }
+
+  /**
+   * plan-2212 review #2: archive the active executor's open run before the
+   * viewer's plugin / model teardown disposes what the run reads (script KPI
+   * rows). No-op for executors without runs (continuous).
+   */
+  archiveActiveRun(): void {
+    try { this._active.archiveOpenRun?.(); } catch (e) {
+      console.error('[SimulationKernel] archiving the open run failed:', e);
+    }
+  }
+
   /** Tear down both executors (viewer dispose). */
   dispose(): void {
     try { this.continuousRunner.dispose(); } catch { /* ignore */ }
@@ -475,5 +732,10 @@ export class SimulationKernel {
       try { this._desRunner.dispose(); } catch { /* ignore */ }
       this._desRunner = null;
     }
+    // After the runner's `disposed` went out (plan-645).
+    this._lcUnsubscribeRunner?.();
+    this._lcUnsubscribeRunner = null;
+    this._lcBound = null;
+    this._lcPendingBound.length = 0;
   }
 }

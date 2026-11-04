@@ -10,13 +10,16 @@
  * dashboard editor, and answers with the block read back afterwards.
  */
 
+import { executeDelegateValue } from './helpers/execute-value';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { queryValue } from './helpers/query-value';
 import { FakeDir, asDirHandle } from './helpers/fake-fs-handles';
 import { glbWithSceneExtras, seedBlob } from './helpers/glb-scene-extras';
 import { getProjectStore, resetProjectStore } from '../src/core/project/project-store';
 import { documentBase, setOpenDocumentBase } from '../src/core/editor/active-asset-store';
 import { sceneExtrasOfGlbBlob } from '../src/core/project/rv-project-documents';
 import { McpDocumentInfoTools } from '../src/plugins/mcp-bridge/rv-mcp-document-info-tools';
+import type { RVViewer } from '../src/core/rv-viewer';
 
 async function seedProject(): Promise<FakeDir> {
   const root = new FakeDir('mcp-info');
@@ -42,7 +45,10 @@ async function fileInfo(root: FakeDir, name: string) {
 
 describe('plan-506 §9.9 — MCP document info tools', () => {
   let root: FakeDir;
-  const tools = new McpDocumentInfoTools(() => undefined);
+  // plan-641 Nachtrag: the set dispatches `document.infoSet` through the command registry,
+  // which needs a viewer (it reads the active mode) — the read tools never touch it.
+  const viewer = { modes: { activeMode: 'hmi' } } as unknown as RVViewer;
+  const tools = new McpDocumentInfoTools(() => viewer);
 
   beforeEach(async () => {
     localStorage.removeItem('rv-project/last');
@@ -59,22 +65,22 @@ describe('plan-506 §9.9 — MCP document info tools', () => {
   });
 
   it('get without an argument answers for the open document', async () => {
-    const out = JSON.parse(await tools.webDocumentInfoGet());
+    const out = JSON.parse(await queryValue(viewer, 'document.infoGet', { }));
     expect(out.document).toBe('doc-open');
     expect(out.info.summary).toBe('The open one');
     expect(out.source).toBe('manifest');
   });
 
   it('get by path and by id', async () => {
-    const byPath = JSON.parse(await tools.webDocumentInfoGet('models\\closed.glb'));
-    const byId = JSON.parse(await tools.webDocumentInfoGet('doc-closed'));
+    const byPath = JSON.parse(await queryValue(viewer, 'document.infoGet', { document: 'models\\closed.glb' }));
+    const byId = JSON.parse(await queryValue(viewer, 'document.infoGet', { document: 'doc-closed' }));
     expect(byPath.info).toEqual(byId.info);
     expect(byId.info.description).toBe('Kept description');
   });
 
   it('set writes a document that is NOT open, through the store, and reads it back', async () => {
     const spy = vi.spyOn(getProjectStore(), 'setDocumentInfo');
-    const out = JSON.parse(await tools.webDocumentInfoSet('models/closed.glb', 'New summary'));
+    const out = JSON.parse(await executeDelegateValue(tools, 'document.infoSet', { document: 'models/closed.glb', summary: 'New summary' }));
     expect(out.error).toBeUndefined();
     expect(spy).toHaveBeenCalledTimes(1);
     expect(spy.mock.calls[0]![0]).toBe('doc-closed');
@@ -91,11 +97,11 @@ describe('plan-506 §9.9 — MCP document info tools', () => {
   });
 
   it('an empty string removes a field; removing both removes the block', async () => {
-    const one = JSON.parse(await tools.webDocumentInfoSet('doc-closed', undefined, ''));
+    const one = JSON.parse(await executeDelegateValue(tools, 'document.infoSet', { document: 'doc-closed', summary: undefined, description: '' }));
     expect(one.info).toEqual(expect.objectContaining({ summary: 'Old summary' }));
     expect(one.info.description).toBeUndefined();
 
-    const both = JSON.parse(await tools.webDocumentInfoSet('doc-closed', ''));
+    const both = JSON.parse(await executeDelegateValue(tools, 'document.infoSet', { document: 'doc-closed', summary: '' }));
     expect(both.info).toBeNull();
     expect(await fileInfo(root, 'closed.glb')).toBeNull();
   });
@@ -108,15 +114,15 @@ describe('plan-506 §9.9 — MCP document info tools', () => {
       documents: real.documents.map(d => d.id === 'doc-closed' ? { ...d, tier: 'bundled' as const } : d),
     });
     const spy = vi.spyOn(store, 'setDocumentInfo');
-    const out = JSON.parse(await tools.webDocumentInfoSet('doc-closed', 'x'));
+    const out = JSON.parse(await executeDelegateValue(tools, 'document.infoSet', { document: 'doc-closed', summary: 'x' }));
     expect(out.error).toMatch(/read-only/);
     expect(spy).not.toHaveBeenCalled();
     expect((await fileInfo(root, 'closed.glb'))?.summary).toBe('Old summary');
   });
 
   it('refuses an over-long summary and an unknown document', async () => {
-    expect(JSON.parse(await tools.webDocumentInfoSet('doc-closed', 'x'.repeat(201))).error).toMatch(/limit/);
-    expect(JSON.parse(await tools.webDocumentInfoSet('nope', 'x')).error).toMatch(/No document/);
-    expect(JSON.parse(await tools.webDocumentInfoSet('doc-closed')).error).toMatch(/nothing to write/);
+    expect(JSON.parse(await executeDelegateValue(tools, 'document.infoSet', { document: 'doc-closed', summary: 'x'.repeat(201) })).error).toMatch(/limit/);
+    expect(JSON.parse(await executeDelegateValue(tools, 'document.infoSet', { document: 'nope', summary: 'x' })).error).toMatch(/No document/);
+    expect(JSON.parse(await executeDelegateValue(tools, 'document.infoSet', { document: 'doc-closed' })).error).toMatch(/nothing to write/);
   });
 });

@@ -28,6 +28,8 @@
 
 import type { Object3D, Quaternion, Vector3 } from 'three';
 import type { ContextMenuItem } from '../hmi/context-menu-store';
+import type { WaitEdgeSource } from '../diagnostics/rv-wait-registry';
+import { registerBehaviorWaitSource, removeBehaviorWaitSource } from '../diagnostics/rv-behavior-wait-sources';
 import type {
   RVBindContext,
   BindContextDrive,
@@ -36,6 +38,8 @@ import type {
   SignalType,
 } from '../behavior-runtime';
 import type { TransportLink } from '../../behaviors/_shared/transport-links';
+// plan-2051: type-only, erased at build — no runtime edge from core into plugins/des.
+import type { RngStream } from '../rv-rng-distribution';
 import type { StateStatistics } from './rv-state-statistics';
 import {
   createDownstreamInterlock,
@@ -46,15 +50,24 @@ import {
 import {
   classifyConnections,
   findOutputPairings,
+  getComponentRegistry,
   type PortConnection,
   type OutputPairing,
 } from '../../behaviors/_shared/snap-graph-helpers';
+import { getConnectionRegistry } from '../connect/rv-connection-registry';
+import {
+  surfacesFromComponentRegistry,
+  type SurfaceComponentRegistry,
+  type SurfacesOf,
+  type TransportSurfaceLike,
+} from '../connect/rv-connection-resolver';
 import {
   findFirst,
   findAll as findAllNodes,
   NODE_KIND_TESTS,
 } from '../library-component-loader';
 import { RVEventHeap } from '../sdk/rv-event-heap';
+import { scaleSimDt } from '../engine/rv-speed-override';
 
 /** A convention node kind — derived from the finder table, so adding a kind to
  *  `NODE_KIND_TESTS` extends `self.find`/`self.findAll` with no other change. */
@@ -113,12 +126,17 @@ export interface SelfDrive extends BindContextDrive {
   setTo?(target: number, progress: number): void;
 }
 
+/** A completed handover, a refused handover, or a handover pending completion. */
+export type TransferResult = 'moved' | 'blocked' | 'deferred';
+
 /**
  * A movable unit as seen by the material-flow layers. Kept structural and
  * minimal so the public core never has to import the private DES `DESMU`.
  * The DES runner passes its richer `DESMU` (which is assignable to this).
  */
 export interface MU {
+  readonly isBlocked?: boolean;
+  readonly inTransfer?: boolean;
   readonly id: number;
   readonly generation?: number;
   /** The visual moving-unit (RVMovingUnit) — null until/unless rendered. */
@@ -130,6 +148,101 @@ export interface MU {
   carrierType?: string;
   carrierCapacity?: number;
   visualTemplateId?: string;
+}
+
+/**
+ * Take-over pose of an MU handed to a component (plan-631 F1/F2a). The pose is
+ * LOGICAL: the hand-over caller derives it from its own state at event time
+ * (dock pose + lift height, a source's spawn slot) — never from the visual, so
+ * it is valid headless in FastForward too.
+ */
+export interface AcceptPose {
+  /**
+   * World position (metres) of the MU ORIGIN — the same reference point a DES
+   * transit tween writes (for a pallet: the centre of its underside).
+   */
+  readonly position: readonly [number, number, number];
+  /**
+   * Heading (rad) about world +Y; 0 = the MU's local +Z points along world +Z,
+   * +π/2 = along world +X (the `setMuForward` convention, yaw = atan2(fx, fz)).
+   * Informational: a conveyor re-orients the MU to its flow on take-over.
+   */
+  readonly yaw?: number;
+}
+
+/**
+ * Optional 4th argument of the DES `canAccept` / `onAccept` hooks (plan-631 F2).
+ * Present ONLY for an explicit pose hand-over (`transferMUWithPose`); every
+ * legacy call passes three arguments, so a hook that ignores it is unaffected.
+ */
+export interface AcceptContext {
+  /** The pose the MU was set down at — for exactly this MU and this target. */
+  readonly acceptPose?: AcceptPose;
+}
+
+// ─── Pose hand-over of a source (plan-638) ──────────────────────────────────
+
+/**
+ * Why a source does NOT take the pose path (plan-638). The source then uses its
+ * standard transfer, exactly as before the pose path existed.
+ *  - `no-backend`: no pose backend injected (continuous, mocks) — silent
+ *  - `not-contained`: the source has no `contained` link (distance 0) — silent
+ *  - `pose-unsupported`: the contained target does not declare `des.acceptsPose`
+ *  - `async-accept`: the target defers its accept (Processing at `accept`)
+ *  - `source-processing`: the source itself has a Processing attachment at its
+ *    transfer (a delayed pose hand-over is not supported)
+ *  - `no-template-size`: the MU template has no measurable size
+ *  - `pose-refused`: the target refuses the spawn pose but would take the MU
+ *    without it (the pose is off its belt) — standard transfer instead of waiting
+ */
+export type PoseFallbackReason =
+  | 'no-backend' | 'not-contained' | 'pose-unsupported' | 'async-accept'
+  | 'source-processing' | 'no-template-size' | 'pose-refused';
+
+/**
+ * Why a source on the pose path must WAIT (nothing is spawned):
+ *  - `source-disabled` / `quantity-limit`: the engine source cannot spawn
+ *  - `loop-saturated`: the closed-loop fill guard of the source release
+ *  - `target-refused`: the target refuses an MU of the template size at the
+ *    spawn pose right now (occupied, or the pose is off its belt)
+ */
+export type PoseBlockedReason = 'source-disabled' | 'quantity-limit' | 'loop-saturated' | 'target-refused';
+
+/** Typed pre-check of a source's pose hand-over (plan-638 Gate R1 #1). */
+export type PoseReadiness =
+  | {
+      readonly state: 'ready';
+      /** The spawn pose (world origin of the MU at the source node, yaw about +Y). */
+      readonly pose: AcceptPose;
+      /** Template size (m) the pre-check used — the MU gets the same `_bugSize`. */
+      readonly size: readonly [number, number, number];
+    }
+  | { readonly state: 'blocked'; readonly reason: PoseBlockedReason }
+  | { readonly state: 'fallback'; readonly reason: PoseFallbackReason };
+
+/** Result of `self.transferAtPose(mu)` — mirrors the private `PoseTransferResult`. */
+export type PoseTransferOutcome =
+  | { readonly ok: true }
+  | {
+      readonly ok: false;
+      /**
+       * `pose-unsupported` / `async-accept`: the target cannot take a pose (the
+       * caller falls back to the standard transfer); `refused` / `rolled-back`:
+       * the MU stays with the caller; `no-pose`: no `ready` pre-check preceded
+       * the call; `no-target`: the contained target vanished.
+       */
+      readonly reason: 'pose-unsupported' | 'async-accept' | 'refused' | 'rolled-back' | 'no-pose' | 'no-target';
+    };
+
+/**
+ * Pose hand-over backend of a source (plan-638), injected at self creation by
+ * the DES binding. The target is resolved on every call (never cached).
+ */
+export interface PoseTransferBackend {
+  /** Side-effect free pre-check (spawns nothing; a target may report Problems). */
+  readiness(): PoseReadiness;
+  /** Hand `mu` to the target at `pose` (synchronous; the MU is never lost). */
+  transfer(mu: MU, pose: AcceptPose): PoseTransferOutcome;
 }
 
 /** Stable moving-unit reference used by persisted kernel contracts. */
@@ -215,7 +328,8 @@ export interface TweenSpec {
     | {
         readonly kind: 'drive';
         /** The drive to interpolate (a `DriveTweenTarget` wrapper). */
-        readonly drive: unknown | null;
+        readonly drive?: unknown | null;
+        readonly driveRef?: string;
         readonly from: number;
         readonly to: number;
       }
@@ -346,9 +460,20 @@ export interface MaterialFlowSelf<
   readonly node: Object3D;
   /** Opaque viewer handle (== rv.viewer) — the type isSurfaceOccupied accepts. */
   readonly viewer: unknown;
+  /** Pull-only diagnostic source, replaced on setup and removed on unbind. */
+  registerWaitSource(source: WaitEdgeSource): void;
   /** DES integer entity id; -1 in pure continuous. */
   readonly entityId: number;
   readonly mode: SimulationMode;
+  /**
+   * The component's seeded RNG (plan-2051) — derived from the DES master seed and
+   * the entity id ({@link DESManager.createComponentRng}), forwarded from the owning
+   * adapter. Draw from it (e.g. `exponential(self.rng, mean)`) for stochastic
+   * timing; never use `Math.random()`. Null in continuous mode (no DES manager,
+   * no seed) — consumers must fall back to their fixed value.
+   */
+  readonly rng: RngStream | null;
+  rngFor(purpose: string): RngStream | null;
 
   /** Per-instance mutable state slot — behaviours store resolved nodes/handles/flags here. */
   readonly local: S;
@@ -430,6 +555,8 @@ export interface MaterialFlowSelf<
   disable(reason: string): void;
   /** True once `self.disable()` has been called (factory gate). */
   readonly disabled: boolean;
+  /** The reason handed to `self.disable()` — null while enabled (diagnostics, Problems panel). */
+  readonly disabledReason: string | null;
 
   // Scheduling — kernel-agnostic (plan-210 §6b): DES scheduler when injected,
   // continuous event heap (drained by the fixed tick) otherwise.
@@ -499,7 +626,7 @@ export interface MaterialFlowSelf<
   statCycleEnd(): void;
 
   // MU transfer / load.
-  transfer(mu: MU, fromPort?: Port): void;
+  transfer(mu: MU, fromPort?: Port): TransferResult;
   /**
    * Would the downstream accept `mu` right now? DES routing pre-check (Plan 194
    * §2.5 `self.downstream?.canAccept(mu)`): in DES mode it queries the resolved
@@ -516,6 +643,18 @@ export interface MaterialFlowSelf<
    * `{ id }` literal so the model-load flow tracks every part.
    */
   spawn(visualTemplateId?: string): MU;
+  /**
+   * Pre-check of a source's pose hand-over (plan-638): `ready` (pose path —
+   * the pose is kept for the next `transferAtPose`), `blocked` (wait, spawn
+   * nothing) or `fallback` (standard transfer). Without a pose backend
+   * (continuous, mocks) always `{ state: 'fallback', reason: 'no-backend' }`.
+   */
+  poseReadiness(): PoseReadiness;
+  /**
+   * Hand `mu` over at the pose of the last `ready` pre-check (plan-638). The
+   * pose is consumed by the call. Without a preceding `ready` → `no-pose`.
+   */
+  transferAtPose(mu: MU): PoseTransferOutcome;
   readonly mus: ReadonlyArray<MU>;
   readonly currentLoad: number;
   /** Capacity promised to upstream holders but not committed yet. */
@@ -547,18 +686,29 @@ export interface MaterialFlowSelf<
  * not already covered into the result so a plain conveyor (which may only have
  * output snaps modelled) still exposes its downstream port.
  *
- * Fallback (autoConnect by world-distance, V2 §2.6): NOT yet implemented —
- * returns no extra ports. When the snap-graph yields nothing (no snap-point
- * plugin, or unsnapped placement) `resolvePorts` returns `[]`. The autoConnect
- * distance heuristic (OUT-to-IN nearest, role from IN-/OUT- node name) lands
- * with P4/topology-resolver.ts. See the TODO(P5) note below.
+ * Registry and roles come from the connection core (plan-633): the snap-graph
+ * helpers read `getConnectionRegistry(host)` — the snap-point plugin's live
+ * registry, or, without the plugin, the headless registry the DES binding
+ * attached — and classify through `portRoleOf`.
+ *
+ * The typed distance fallback is NOT a port: it lives in the core resolver
+ * (`resolveConnections`, stage 3) and is applied by the DES binding to the
+ * native `nextComponents`. When the snap-graph yields nothing `resolvePorts`
+ * returns `[]`.
+ *
+ * `cache` (plan-644, DES only - see {@link PortResolveCacheScope}): memoises
+ * the STRUCTURAL part of the classification, the transport surfaces of each
+ * partner root, so a DES event no longer traverses the partner subtree. The
+ * roles themselves (`portRoleOf`: world positions, directions) are still
+ * computed on every call. Without a cache the path is exactly the old one.
  */
-export function resolvePorts(rv: RVBindContext): Port[] {
+export function resolvePorts(rv: RVBindContext, cache?: PortResolveCacheScope | null): Port[] {
   const out: Port[] = [];
   const seen = new Set<string>();
 
   // 1. Direction-classified connections (works for routers + bidirectional ports).
-  const conns: PortConnection[] = classifyConnections(rv.viewer, rv.root);
+  const surfaces = cache ? cachedSurfacesOf(rv.viewer, cache) : undefined;
+  const conns: PortConnection[] = classifyConnections(rv.viewer, rv.root, surfaces);
   for (const c of conns) {
     const p = portFromConnection(rv, c);
     if (seen.has(p.id)) continue;
@@ -576,11 +726,85 @@ export function resolvePorts(rv: RVBindContext): Port[] {
     out.push(portFromPairing(rv, pr));
   }
 
-  // 3. TODO(P5): autoConnect distance fallback (no snaps → nearest OUT→IN by
-  //    world distance, role from IN*/OUT* node name). Intentionally a no-op
-  //    for now — documented in resolvePorts() jsdoc above. Returns [] here.
-
   return out;
+}
+
+/**
+ * Validity scope of the DES port cache (plan-644 Phase 2.2). Defined here, owned
+ * and injected by the private DES runner (`createSelf({ portCache })`); the core
+ * imports nothing from it.
+ *
+ * Contract: a cache entry is valid for exactly one (snap registry IDENTITY,
+ * `registry.version`, `generation`, component registry identity). The owner
+ * raises `generation` before the first port query of every start / reset /
+ * scene rebind, so a restart with the SAME registry still sees a fresh entry,
+ * and a swapped registry never hits an old one. Limit (documented, by design):
+ * a transport surface added or replaced DURING a DES run without a registry
+ * mutation and without a restart is seen from the next start / rebind on - the
+ * DES topology is fixed per bind (`wireTopology`).
+ */
+export interface PortResolveCacheScope {
+  readonly generation: number;
+}
+
+/** One cache entry per scope: the key it was filled under plus the memoised surfaces. */
+interface PortCacheEntry {
+  registry: object | null;
+  version: number;
+  generation: number;
+  compReg: SurfaceComponentRegistry | null;
+  readonly surfaces: Map<Object3D, readonly TransportSurfaceLike[]>;
+  /** Stable closure over `surfaces` + the live `compReg` (no allocation per call). */
+  readonly surfacesOf: SurfacesOf;
+}
+
+const _portCaches = new WeakMap<PortResolveCacheScope, PortCacheEntry>();
+
+/**
+ * The memoised surface source of `scope` for `host`, revalidated against the
+ * current key. `null` = no component registry (roles from the authored flow,
+ * as without a cache); `undefined` = not cacheable (a registry without a
+ * `version`) - the caller takes the uncached path.
+ */
+function cachedSurfacesOf(
+  host: RVBindContext['viewer'],
+  scope: PortResolveCacheScope,
+): SurfacesOf | null | undefined {
+  const registry = getConnectionRegistry(host as Parameters<typeof getConnectionRegistry>[0]);
+  const rawVersion = (registry as { version?: unknown } | null)?.version;
+  if (registry && typeof rawVersion !== 'number') return undefined;
+  const version = typeof rawVersion === 'number' ? rawVersion : 0;
+  const compReg = getComponentRegistry(host as Parameters<typeof getComponentRegistry>[0]);
+  let entry = _portCaches.get(scope);
+  if (!entry) {
+    const surfaces = new Map<Object3D, readonly TransportSurfaceLike[]>();
+    const created: PortCacheEntry = {
+      registry, version, generation: scope.generation, compReg,
+      surfaces,
+      surfacesOf: (root) => {
+        let list = surfaces.get(root);
+        if (!list) {
+          list = created.compReg ? surfacesFromComponentRegistry(created.compReg)(root) : [];
+          surfaces.set(root, list);
+        }
+        return list;
+      },
+    };
+    entry = created;
+    _portCaches.set(scope, entry);
+  } else if (
+    entry.registry !== registry
+    || entry.version !== version
+    || entry.generation !== scope.generation
+    || entry.compReg !== compReg
+  ) {
+    entry.registry = registry;
+    entry.version = version;
+    entry.generation = scope.generation;
+    entry.compReg = compReg;
+    entry.surfaces.clear();
+  }
+  return compReg ? entry.surfacesOf : null;
 }
 
 /** A Port built from a direction-classified PortConnection. */
@@ -696,6 +920,14 @@ export interface CreateSelfOptions<
 > {
   /** Simulation mode for this self. Default 'continuous'. */
   mode?: SimulationMode;
+  /**
+   * DES port cache scope (plan-644 Phase 2.2). Honoured only with
+   * `mode === 'des'`: `ports` / `inputs()` / `outputs()` / `freeOutputs()` then
+   * memoise the partner transport surfaces under this scope (see
+   * {@link PortResolveCacheScope}). Absent, or in continuous mode - uncached,
+   * exactly as before.
+   */
+  portCache?: PortResolveCacheScope | null;
   /** DES entity id; -1 in pure continuous (default). */
   entityId?: number;
   /**
@@ -715,6 +947,15 @@ export interface CreateSelfOptions<
    */
   scheduler?: SelfScheduler | null;
   /**
+   * Seeded RNG source for `self.rng` (plan-2051). A THUNK, evaluated on every
+   * access, like `entityId` inside `scheduler` above: the owning adapter does not
+   * exist yet when createSelf() runs (addInstance() assigns it afterwards) and its
+   * RNG is (re)created when the DES manager attaches it. Absent (continuous) →
+   * `self.rng` is null.
+   */
+  rng?: (() => RngStream | null) | null;
+  rngFor?: ((purpose: string) => RngStream | null) | null;
+  /**
    * Continuous hook dispatcher (plan-210 §6b): receives every due timer event
    * (`self.in`/`self.at`) drained by the fixed tick when NO DES scheduler is
    * injected. The SDK adapter (and, later, the library-component factory)
@@ -729,7 +970,7 @@ export interface CreateSelfOptions<
    * to it. Absent (continuous) → `transfer` is the implicit no-op hand-off
    * (the transport manager moves MUs surface→surface).
    */
-  onTransfer?: ((mu: MU, fromPort?: Port) => void) | null;
+  onTransfer?: ((mu: MU, fromPort?: Port) => TransferResult) | null;
   /**
    * DES MU factory (P5). When present, `self.spawn()` mints a real runner-backed
    * MU. Absent (continuous) → `self.spawn()` returns a plain structural MU with a
@@ -742,6 +983,11 @@ export interface CreateSelfOptions<
    * (continuous) → `downstreamCanAccept` returns `true`.
    */
   canAcceptDownstream?: ((mu: MU, port?: Port) => boolean) | null;
+  /**
+   * Pose hand-over backend of a source (plan-638, DES). Absent (continuous,
+   * mocks) → `self.poseReadiness()` is always `fallback`/`no-backend`.
+   */
+  poseTransfer?: PoseTransferBackend | null;
   /** Adapter-owned canonical MU collection (DES); omitted on continuous. */
   mus?: (() => ReadonlyArray<MU>) | null;
   /** Adapter-owned incoming reservation count (DES); omitted on continuous. */
@@ -782,6 +1028,10 @@ export interface CreateSelfOptions<
   onStatOutput?: ((n: number) => void) | null;
 }
 
+/** Shared, frozen results of the backend-less pose path (no allocation per call). */
+const NO_POSE_BACKEND: PoseReadiness = Object.freeze({ state: 'fallback', reason: 'no-backend' } as const);
+const NO_READY_POSE: PoseTransferOutcome = Object.freeze({ ok: false, reason: 'no-pose' } as const);
+
 /** DES scheduling backend the DESRunner injects (P5). */
 export interface SelfScheduler {
   in(delay: number, hook: DesHookName, mu?: MU | null, data?: unknown): number;
@@ -809,11 +1059,15 @@ export function createSelf<
   opts: CreateSelfOptions<S, SIG> = {},
 ): MaterialFlowSelf<S, SIG> {
   const mode: SimulationMode = opts.mode ?? 'continuous';
+  const portCache: PortResolveCacheScope | null = mode === 'des' ? (opts.portCache ?? null) : null;
   const entityId = opts.entityId ?? -1;
   const scheduler = opts.scheduler ?? null;
   const onTransfer = opts.onTransfer ?? null;
   const spawnMU = opts.spawnMU ?? null;
   const canAcceptDownstream = opts.canAcceptDownstream ?? null;
+  const poseTransfer = opts.poseTransfer ?? null;
+  // Pose of the last `ready` pre-check, consumed by `transferAtPose` (plan-638).
+  let readyPose: AcceptPose | null = null;
   const adapterMus = opts.mus ?? null;
   const adapterReservedLoad = opts.reservedLoad ?? null;
   const downstreamFreeCapacity = opts.downstreamFreeCapacity ?? null;
@@ -856,6 +1110,7 @@ export function createSelf<
   const mus: MU[] = [];
   let state = 'idle';
   let disabled = false;
+  let disabledReason: string | null = null;
 
   // Instance scope is fixed for the lifetime of this self (rv.root never
   // re-parents during a bind) — compute the live-control prefix ONCE instead
@@ -907,7 +1162,7 @@ export function createSelf<
         }
       });
       rv.onFixedUpdate((dt) => {
-        continuousNow += dt;
+        continuousNow += scaleSimDt(dt);
         heap.drainUntil(continuousNow);
       });
     }
@@ -920,8 +1175,11 @@ export function createSelf<
     root: rv.root,
     node: rv.root,
     viewer: rv.viewer,
+    registerWaitSource(source) { registerBehaviorWaitSource(rv.viewer, self, source); },
     entityId,
     mode,
+    get rng(): RngStream | null { return opts.rng?.() ?? null; },
+    rngFor(purpose: string): RngStream | null { return opts.rngFor?.(purpose) ?? null; },
 
     local,
 
@@ -992,11 +1250,15 @@ export function createSelf<
     },
     disable(reason: string): void {
       disabled = true;
+      disabledReason = reason;
       (local as Record<string, unknown>).disabled = true;
       console.warn(`[material-flow] ${def.type} disabled: ${reason}`);
     },
     get disabled(): boolean {
       return disabled;
+    },
+    get disabledReason(): string | null {
+      return disabledReason;
     },
 
     in(delay, hook, mu, data): number {
@@ -1071,18 +1333,18 @@ export function createSelf<
     },
 
     get ports(): ReadonlyArray<Port> {
-      return resolvePorts(rv);
+      return resolvePorts(rv, portCache);
     },
     inputs(): Port[] {
-      return resolvePorts(rv).filter(p => p.role === 'input');
+      return resolvePorts(rv, portCache).filter(p => p.role === 'input');
     },
     outputs(): Port[] {
-      return resolvePorts(rv).filter(p => p.role === 'output');
+      return resolvePorts(rv, portCache).filter(p => p.role === 'output');
     },
     freeOutputs(_mu?: MU): Port[] {
       // A free output = one whose downstream is NOT occupied (Plan 196:
       // `outputs().filter(p => !linkOf(rv,p).occupied())`).
-      return resolvePorts(rv).filter(p => p.role === 'output' && !p.occupied());
+      return resolvePorts(rv, portCache).filter(p => p.role === 'output' && !p.occupied());
     },
     downstreamOccupied(port?: Port): boolean {
       // Per-port when given (multi-output routers); else the conveyor's
@@ -1116,11 +1378,11 @@ export function createSelf<
       statistics?.cycleEnd();
     },
 
-    transfer(mu: MU, fromPort?: Port): void {
+    transfer(mu: MU, fromPort?: Port): TransferResult {
       // DES: delegate the blocking handshake (canAccept → accept → release /
       // block) to the runner-injected backend. Continuous: implicit no-op
       // hand-off (the transport manager moves MUs surface→surface).
-      if (onTransfer) onTransfer(mu, fromPort);
+      return onTransfer ? onTransfer(mu, fromPort) : 'deferred';
     },
     spawn(visualTemplateId?: string): MU {
       // DES: a real runner-backed MU (manager-tracked, global id, visual). Else
@@ -1133,6 +1395,21 @@ export function createSelf<
       // DES: probe the resolved downstream adapter; continuous/mock: always true
       // (the transport surface gates the flow, not a handshake).
       return canAcceptDownstream ? canAcceptDownstream(mu, port) : true;
+    },
+    poseReadiness(): PoseReadiness {
+      if (!poseTransfer) {
+        readyPose = null;
+        return NO_POSE_BACKEND;
+      }
+      const r = poseTransfer.readiness();
+      readyPose = r.state === 'ready' ? r.pose : null;
+      return r;
+    },
+    transferAtPose(mu: MU): PoseTransferOutcome {
+      const pose = readyPose;
+      readyPose = null;
+      if (!poseTransfer || !pose) return NO_READY_POSE;
+      return poseTransfer.transfer(mu, pose);
     },
     get mus(): ReadonlyArray<MU> {
       return adapterMus ? adapterMus() : mus;
@@ -1179,5 +1456,26 @@ export function createSelf<
     }
   }
 
+  rv.onDispose(() => removeBehaviorWaitSource(rv.viewer, self));
+  // plan-2059: the closure-held FSM phase and the statState de-dupe key are run
+  // state — the DES snapshot captures and restores them through this symbol.
+  Object.defineProperty(self, SELF_RUN_STATE, {
+    value: {
+      capture: (): SelfRunState => ({ fsmState: state, lastStat }),
+      restore: (saved: SelfRunState): void => { state = saved.fsmState; lastStat = saved.lastStat; },
+      // A run reset returns to the values createSelf starts with (first run == later run).
+      reset: (): void => { state = 'idle'; lastStat = ''; },
+    },
+  });
   return self;
+}
+
+/** Closure-held run state of a material-flow self (plan-2059 snapshot). */
+export interface SelfRunState { fsmState: string; lastStat: string }
+/** Symbol key of the run-state accessor on a self built by `createSelf`. */
+export const SELF_RUN_STATE: unique symbol = Symbol('rv.material-flow.self-run-state');
+/** The run-state accessor of a self, or null for a hand-built test double. */
+export interface SelfRunStateAccessor { capture(): SelfRunState; restore(s: SelfRunState): void; reset(): void }
+export function selfRunStateOf(self: object): SelfRunStateAccessor | null {
+  return (self as { [SELF_RUN_STATE]?: SelfRunStateAccessor })[SELF_RUN_STATE] ?? null;
 }

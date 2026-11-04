@@ -44,7 +44,7 @@ function makeMockViewer(opts?: { instancePick?: boolean }) {
     rebuildGroupedBvh,
     refitRaycastSubtrees() {},
     // Truthy = editor instance-pick backend installed (no merged groups exist,
-    // so no rebuild may be requested — doc-render-picking.md §2.5).
+    // so no rebuild may be requested — contract-bake-picking.md §2.5).
     instancePickIndex: opts?.instancePick
       ? { addSubtree() {}, removeSubtree() {}, bumpResolutionEpoch() {} }
       : undefined,
@@ -258,7 +258,11 @@ describe('reparentNodesBatch — cost per top-level op', () => {
     doc.dispose();
   });
 
-  it('the per-node path still costs one event per node — the contrast this replaces', async () => {
+  it('the per-node path is ONE composite too since plan-610 — one event, one undo step', async () => {
+    // Until plan-610 `reparentNodes` emitted one top-level op per node (≥ 20
+    // structure events here — the contrast `reparentNodesBatch` was built
+    // against). The reference-safe rewrite plans every move up front and
+    // applies ONE composite, so the sequential path pays a single event now.
     const { viewer, model, register, events } = makeMockViewer({ instancePick: true });
     const parts = buildAssembly(model, 20);
     const target = new Group(); target.name = 'Link'; model.add(target);
@@ -267,10 +271,11 @@ describe('reparentNodesBatch — cost per top-level op', () => {
     const doc = scratchAssetDocument(viewer);
 
     events.length = 0;
-    await doc.reparentNodes(parts.map((p) => NodeRegistry.computeNodePath(p)), 'Asset/Link');
-    // 20 reparents + the pre-renames for the repeated Part_N names.
-    expect(events.filter((e) => e === 'editor-structure-changed').length)
-      .toBeGreaterThanOrEqual(20);
+    const moved = await doc.reparentNodes(parts.map((p) => NodeRegistry.computeNodePath(p)), 'Asset/Link');
+    expect(moved).toHaveLength(20);
+    expect(target.children).toHaveLength(20);
+    expect(events.filter((e) => e === 'editor-structure-changed')).toHaveLength(1);
+    expect(doc.getSnapshot().opCount).toBe(1);
     doc.dispose();
   });
 });

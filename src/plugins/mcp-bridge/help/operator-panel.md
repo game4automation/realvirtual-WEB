@@ -1,5 +1,8 @@
 # Operator panel (WebOperatorPanel)
 
+> Dotted names like `editor.setField(…)` / `sim.playPause` are registry commands: run them with
+> `web_execute(command="<id>", args={…})` (or `web_batch`). Their old alias tools are not in tools/list.
+
 An operator panel is a window of IEC control-box devices — illuminated push buttons,
 two-position selector switches, emergency stops, a stack light, title-bar chips and a
 status line — described entirely as **JSON data** in a `WebOperatorPanel` component on
@@ -13,9 +16,9 @@ shows signal states.
 1. `web_signal_list` — the signal NAMES the panel will read and write (inputs for buttons,
    selectors, E-stops; outputs for lamps, stack light, status rules). Every name must exist.
 2. `web_editor_open` — open the document in the asset editor (`source=library`).
-3. `web_editor_create_empty(name="OperatorPanel")` — a dedicated node (any node works).
-4. `web_editor_add_component(path="OperatorPanel", type="WebOperatorPanel")`
-5. `web_editor_set_field(path="OperatorPanel", componentType="WebOperatorPanel",
+3. `editor.createEmpty(name="OperatorPanel")` — a dedicated node (any node works).
+4. `editor.addComponent(path="OperatorPanel", type="WebOperatorPanel")`
+5. `editor.setField(path="OperatorPanel", componentType="WebOperatorPanel",
    fieldName="Config", valueJson=<the config as a JSON STRING>)` — `valueJson` is parsed as
    JSON, so pass the config **string-encoded** (`"{\"version\":1,…}"`, i.e.
    `JSON.stringify(JSON.stringify(config))`). A raw object is tolerated, but the string is the
@@ -23,6 +26,10 @@ shows signal states.
 6. Check: the window appears at once; a config problem shows in the window, in the
    Problems panel and in `web_component_get(path, "WebOperatorPanel")`. Fix and set again.
 7. `web_editor_save` — stored in the GLB; after a reload the window is back.
+8. After saving, read back with `web_component_get(path, 'WebOperatorPanel')` and
+   `web_query` for `problems.list`: `Config` must be non-empty and panel problems
+   must be empty. Reload the saved asset and repeat both checks before declaring
+   the panel finished; an `editor.setField` success alone does not verify persistence.
 
 ## Component fields
 
@@ -48,6 +55,10 @@ shows signal states.
   "estops":     [ EStop ],      required (may be [])
   "stackLight": [ Segment ],    required (may be []), top to bottom
   "chips":      [ Chip ],       optional
+  "sliders":    [ Slider ],     optional; setpoint dials (write a NUMBER)
+  "readouts":   [ Readout ],    optional; numeric displays (read a number)
+  "density": "compact",         optional; "comfortable" (default) | "compact"
+  "keyLegend": { "title": "...", "keys": [ KeyRow ], "note": "..." },   optional
   "status":     [ StatusRule ], required; the first rule whose "when" holds wins
   "restart": { "hint": "...", "steps": ["...", "..."] },   optional
   "headerEstop": 0              E-stop index kept in the collapsed title bar
@@ -56,6 +67,14 @@ shows signal states.
 
 Every device has a grid cell `row`, `col` (1-based, `col` <= `columns`). Devices with the
 same cell stack in it (e.g. a key switch above a mode knob), separated by a hairline.
+
+The layout is automatic — no position hints are needed or read. All columns are equally
+wide; a push button and a selector have the same face footprint (lamp ring reserved, so a
+lit lamp moves nothing) and a two-line legend box, and the devices of a row stand on one
+line, so faces share a centre line and legends one baseline. A selector's two position
+marks sit up-left / up-right of its knob. A row holding a stacked cell is centred instead.
+A slider shows its caption and live value on one line above the track. Keep position
+legends short (`0`/`I`, `Off`/`On`, `Hand`/`Auto`) on panels with four or more columns.
 
 - **Button** — `label` (accessible name), `legend` (plate text, default label), `signal`
   (input: true while held, false on release), `capColor`, optional `lamp`, optional
@@ -69,7 +88,18 @@ same cell stack in it (e.g. a key switch above a mode knob), separated by a hair
   `simDriven: false` = the simulation never writes this lamp (drawn "not driven" in
   Simulation mode). `flashWhen` flashes it (2 Hz) while the condition holds.
 - **Segment** (stack light) — `name`, `signal`, `color`, optional `simDriven`.
+- **Slider** (analog input) — `label`, `caption` (default label), `signal` (a float input it
+  writes live while dragged), `min`, `max`, optional `step` (default 1), `unit`, `decimals`,
+  `span` (columns, default 1).
+- **Readout** (analog output) — `label`, and either `signal` or `signals` (2 to 4, shown as
+  one vector instrument, with optional `componentLabels`), optional `unit`, `decimals`,
+  `scale` (raw × scale, m → mm: 1000), `span`.
 - **Chip** — `label`, `text`, `when`: Condition, `tone`: `warn` (default) | `neutral`.
+- **KeyRow** (`keyLegend.keys`) — `key` (e.g. `"W / S"`; a `/` draws each key as its own
+  cap), `text` (what they do). The legend is the printed card of the plate: text only, no
+  signals, drawn under the devices. Give it to a panel that is ALSO driven by keys — a key
+  binding is the one thing a plate of devices cannot show by itself — and omit it on a panel
+  operated by pointer alone.
 - **StatusRule** — `kind` (stable id, e.g. `fault-estop`), `tone`: `ok` | `neutral` |
   `action` | `fault`, `text`, optional `icon` (`check`, `hourglass`, `play`, `error`,
   `warning`, `info`; default by tone), optional `step` (1-based index into `restart.steps`,

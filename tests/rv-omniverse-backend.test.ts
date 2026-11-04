@@ -141,7 +141,7 @@ describe('OmniverseBackend', () => {
     await expect(backend.mount()).resolves.toBeUndefined();
     expect(statuses.at(-1)).toEqual({
       status: 'error',
-      detail: 'Omniverse-Stream nicht bereit – keine Messaging-Verbindung',
+      detail: 'Omniverse stream not ready – no messaging connection',
     });
     backend.dispose();
   });

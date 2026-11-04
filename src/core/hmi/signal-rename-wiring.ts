@@ -12,7 +12,7 @@
  *     everywhere else it is the `SceneStore`. Read on every apply / undo, so a rename follows the
  *     mode the user is in, not the mode the coordinator was created in.
  *  2. **History interception.** {@link installSignalRenameWiring} makes the coordinator the history
- *     interceptor of the scene document and of every asset document the editor opens — at OPEN
+ *     interceptor of the planner's document and of every document the editor opens — at OPEN
  *     time, not only when a rename writes. A tagged entry (`meta.journalId`) whose journal is gone
  *     (the page was reloaded) is then refused instead of being undone model-only, which would leave
  *     CONNECT, planner and historian on the new name.
@@ -53,7 +53,7 @@ export type SignalRenameWiringViewer = RVViewer | RenameViewer;
 // ─── Environment / coordinator ───────────────────────────────────────────
 
 /**
- * The rename environment of `viewer` right now: the asset document in the editor (no overlay), the
+ * The rename environment of `viewer` right now: the document open in the editor (no overlay), the
  * scene store otherwise. CONNECT, planner, historian and Problems come from the default wiring.
  */
 export function signalRenameEnvironmentFor(wiringViewer: SignalRenameWiringViewer): SignalRenameEnvironment {
@@ -125,8 +125,8 @@ function watchRefusals(coordinator: SignalRenameCoordinator, doc: RvDocument): (
 const _installed = new WeakMap<object, () => void>();
 
 /**
- * Make the coordinator of `viewer` the history interceptor of the scene document and of every
- * asset document the editor opens, and toast refused moves. Idempotent per viewer; returns the
+ * Make the coordinator of `viewer` the history interceptor of the planner's document and of every
+ * document the editor opens, and toast refused moves. Idempotent per viewer; returns the
  * uninstall function.
  */
 export function installSignalRenameWiring(viewer: RVViewer): () => void {

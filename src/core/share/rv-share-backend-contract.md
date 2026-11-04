@@ -255,3 +255,19 @@ behaviour assumes it exists.
 server rejects a `create` whose `terms.version` is not the current one, and the
 client asks again when it changes — including for a restored draft, because
 consent to a text that has since changed is not consent.
+
+
+## 7. Limits before upload
+
+### `GET /limits` (auth optional)
+
+Returns `200` `{ "maxFileBytes": 104857600, "quotaBytes": 1073741824,
+"usedBytes": 0, "expiries": ["never", "7d", "30d", "90d"] }`.
+Without a session, omit `usedBytes`; with a session, all values belong to that
+account. Invalid supplied credentials return `401 unauthenticated`. Errors use
+the existing error envelope and codes. Deployments without this endpoint return `404`.
+
+The client refreshes on opening, session changes, upload and deletion, discarding
+stale responses. Unknown expiries are ignored; an empty supported selection disables
+upload. Errors/404 use the neutral limits notice and four standard expiry options.
+Limits are informational: the server still enforces file size and quota before storing.

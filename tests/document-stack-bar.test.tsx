@@ -141,7 +141,7 @@ describe('DocumentStackBar', () => {
     stack.top!.suppressedOverrides = 3;
     mount(stack);
     expect(screen.getByTestId('stack-status-line').textContent)
-      .toBe('editing Filler — isolated — 3 Overrides dieser Instanz sind ausgeblendet');
+      .toBe('editing Filler — isolated — 3 overrides of this instance are hidden');
   });
 
   it('offers Back, and Back pops one frame', async () => {
@@ -192,18 +192,18 @@ describe('statusLine', () => {
 
   it('appends the suppression notice when there is one', () => {
     expect(statusLine('Gripper.glb', false, describeSuppressedOverrides(3)))
-      .toBe('editing Gripper.glb — isolated — 3 Overrides dieser Instanz sind ausgeblendet');
+      .toBe('editing Gripper.glb — isolated — 3 overrides of this instance are hidden');
   });
 
   it('counts one override in the singular', () => {
     const ref = new Object3D();
-    setAssetOverrides(ref, { byNodeId: { n1: { Drive: { TargetSpeed: 1 } } } });
+    setAssetOverrides(ref, { byAddress: { '#n1': { Drive: { TargetSpeed: 1 } } } });
     expect(countInstanceOverrides(ref)).toBe(1);
-    expect(describeSuppressedOverrides(1)).toBe('1 Override dieser Instanz ist ausgeblendet');
+    expect(describeSuppressedOverrides(1)).toBe('1 override of this instance is hidden');
   });
 
   it('says nothing extra when nothing is hidden', () => {
     expect(describeSuppressedOverrides(0)).toBeNull();
-    expect(statusLine('X', false, null)).not.toContain('ausgeblendet');
+    expect(statusLine('X', false, null)).not.toContain('hidden');
   });
 });

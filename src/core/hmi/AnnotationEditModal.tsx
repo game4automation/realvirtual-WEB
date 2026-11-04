@@ -101,7 +101,7 @@ export function AnnotationEditModal() {
           maxWidth: '90vw',
           bgcolor: 'rgba(18,22,30,0.98)',
           border: '1px solid rgba(255,255,255,0.1)',
-          borderRadius: 2,
+          borderRadius: 1,
           overflow: 'hidden',
         }}
       >

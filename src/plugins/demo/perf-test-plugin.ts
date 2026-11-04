@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage } from '../../core/rv-safe-storage';
+
 /**
  * PerfTestPlugin — Automated performance test triggered via `?perf` URL param.
  *
@@ -665,9 +667,24 @@ export class PerfTestPlugin implements RVViewerPlugin {
 
     // The probe is a DEV-only global installed near the end of `main.ts init()`;
     // on a cold Vite server that can be later than this plugin's first arming.
-    await this.waitForHooks(180_000, aborted);
+    // In a BUILT bundle it can never appear (`main.ts` installs it behind
+    // `import.meta.env.DEV`), so waiting three minutes for it is pointless —
+    // and publishing the run anyway was worse: `frame.p50 ?? 0` turned the
+    // missing probe into `frameTime 0/0/0` while `pass` still came out of the
+    // structural checks alone, i.e. a green report with a frame time nobody
+    // measured. Refused by name instead, exactly like the line scenario above.
+    if (import.meta.env.DEV) await this.waitForHooks(180_000, aborted);
     const probe = this.probeHook();
-    probe?.start();
+    if (!probe) {
+      this.publish(viewer, {
+        scenario: 'cells', mode: params.mode, pass: false, env,
+        cellMatrix: stats,
+        reason: 'dev-only perf probe is missing — the cells scenario needs a DEV build',
+      });
+      this._cellsRunning = false;
+      return;
+    }
+    probe.start();
     this._probeRunning = !!probe;
 
     // FORCE A CONTINUOUS FRAME RATE for the measurement window. The viewer
@@ -976,7 +993,7 @@ export class PerfTestPlugin implements RVViewerPlugin {
     let modelName: string;
     if (modelUrl.startsWith('blob:')) {
       const titleMatch = document.title.match(/^(.+?) - realvirtual/i);
-      modelName = titleMatch?.[1] ?? localStorage.getItem('rv-webviewer-last-model')?.split('/').pop()?.replace(/\.glb$/i, '') ?? 'demo';
+      modelName = titleMatch?.[1] ?? readLocalStorage('rv-webviewer-last-model')?.split('/').pop()?.replace(/\.glb$/i, '') ?? 'demo';
     } else {
       modelName = (modelUrl.split('/').pop() ?? modelUrl).split('?')[0].replace(/\.glb$/i, '');
     }

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 
+import { testAddressRegistry } from './test-address-registry';
+
 /**
  * Shared headless AGV harness (plan-558): signal host, Agv roots (optionally
  * with a body mesh and an off-centre root), continuous + DES binding of the
@@ -18,19 +20,15 @@ import { BoxGeometry, Mesh, MeshBasicMaterial, Object3D, Vector3 } from 'three';
 import { EventEmitter } from '../../src/core/rv-events';
 import { ContextMenuStore } from '../../src/core/hmi/context-menu-store';
 import {
-  createBindContext, applyKinematicsSpec,
+  createBindContext, applyKinematicsSpec, iterateFixedUpdate,
   type BindContextHost, type BindContextHandle, type KinematicsSpec, type RVBindContext,
 } from '../../src/core/behavior-runtime';
 import { createSelf, type MaterialFlowSelf } from '../../src/core/material-flow/material-flow-self';
 import type { MaterialFlowDefinition } from '../../src/core/material-flow/define-material-flow';
-import { getDefaultPathNetwork } from '../../src/core/engine/rv-path-network';
-import { getDefaultSpacingController } from '../../src/core/engine/rv-spacing-controller';
-import { getDefaultZoneRegistry } from '../../src/core/engine/rv-zone-registry';
 import { getDefaultAgvFleet } from '../../src/core/engine/rv-agv-fleet';
-import { getDefaultPathDockRegistry } from '../../src/core/engine/rv-path-dock';
 import { clearLiveControl } from '../../src/core/engine/rv-live-control';
-import { getDefaultMovementAuthority } from '../../src/core/engine/rv-movement-authority';
-import AgvBehavior, { AgvFlow } from '../../src/behaviors/Agv';
+import { resetTrafficRegistries } from '../../src/core/engine/rv-traffic-registries';
+import AgvBehavior, { AgvFlow, resetMergeEntryCheckStats, resetAgvFleetStepDiagnostics } from '../../src/behaviors/Agv';
 
 /** The real Agv material-flow definition (DES binding). */
 export const AGV_DEF = AgvFlow as unknown as MaterialFlowDefinition;
@@ -38,7 +36,26 @@ export const AGV_DEF = AgvFlow as unknown as MaterialFlowDefinition;
 /** Fixed render / sim tick (s). */
 export const TICK = 1 / 60;
 
-export interface AgvTestHost extends BindContextHost { values: Map<string, boolean | number> }
+export interface AgvTestHost extends BindContextHost {
+  values: Map<string, boolean | number>;
+  /**
+   * Fixed-step key (plan-632, `BindContextHost.fixedStepCount`). Undefined until
+   * {@link stepFleet} runs the first step: hosts stepped by direct
+   * `iterateFixedUpdate` calls stay on the restricted fallback heuristic.
+   */
+  fixedStepCount?: number;
+}
+
+/**
+ * One fixed step of a continuous fleet, as a real host runs it (plan-632): the
+ * step key `host.fixedStepCount` is incremented ONCE, then every handle is
+ * iterated. Use this for new continuous tests instead of iterating handles
+ * directly (which exercises the restricted fallback heuristic).
+ */
+export function stepFleet(host: AgvTestHost, handles: Iterable<BindContextHandle>, dt: number = TICK): void {
+  host.fixedStepCount = (host.fixedStepCount ?? 0) + 1;
+  for (const h of handles) iterateFixedUpdate(h, dt);
+}
 
 /** In-memory signal store + event host for headless binding. */
 export function makeHost(): AgvTestHost {
@@ -58,7 +75,7 @@ export function makeHost(): AgvTestHost {
     on: (e, cb) => events.on(e, cb as never),
     contextMenu: new ContextMenuStore(),
     drives: [],
-    registry: null,
+    registry: null, desAddresses: testAddressRegistry(),
   };
 }
 
@@ -108,7 +125,7 @@ export function bindContinuous(root: Object3D, host: AgvTestHost): BindContextHa
 /** The part of the private DESRunner the binding needs (structural — no private import here). */
 export interface DesRunnerLike {
   makeScheduler(def: MaterialFlowDefinition, getEntityId: () => number): unknown;
-  addInstance(def: MaterialFlowDefinition, self: MaterialFlowSelf, root: Object3D): unknown;
+  addInstance(def: MaterialFlowDefinition, self: MaterialFlowSelf, root: Object3D, scene?: undefined, identity?: { desId: string }): unknown;
 }
 
 /**
@@ -128,20 +145,24 @@ export function bindDes(
     onStatState: (name) => adapter?.setState(name),
     onStatOutput: (n) => adapter?.recordOutput(n),
   });
-  adapter = runner.addInstance(def, self, root) as unknown as typeof adapter;
+  adapter = runner.addInstance(def, self, root, undefined, { desId: root.name + '@' + def.type }) as unknown as typeof adapter;
   return self;
 }
 
-/** Reset every shared engine singleton the AGV stack uses (test isolation). */
+/**
+ * Reset every shared engine singleton the AGV stack uses (test isolation).
+ * Delegates to the production reset point `resetTrafficRegistries()` (plan-647
+ * D1 — the SAME function `RVViewer.clearModel()` and the embed use), then
+ * drops what only tests want gone: the fleet SUBSCRIBERS (`AgvFleet.clear()`),
+ * the live-control gate and the Agv diagnostics (a suite without a viewer has
+ * no reset hook registered for them).
+ */
 export function clearShared(): void {
-  getDefaultPathNetwork().clear();
-  getDefaultSpacingController().clear();
-  getDefaultZoneRegistry().clear();
+  resetTrafficRegistries();
   getDefaultAgvFleet().clear();
-  getDefaultPathDockRegistry().clear();
-  getDefaultMovementAuthority('des').clear();
-  getDefaultMovementAuthority('continuous').clear();
   clearLiveControl();
+  resetMergeEntryCheckStats(); // plan-618
+  resetAgvFleetStepDiagnostics(); // plan-632
 }
 
 // ── Oriented footprint SAT (XZ plane) ─────────────────────────────────────

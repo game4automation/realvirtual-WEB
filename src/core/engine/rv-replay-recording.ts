@@ -28,6 +28,7 @@ export class RVReplayRecording {
   private signalStore: SignalStore;
   private signalWriter: SignalWriter;
   private isReplaying = false;
+  get isActive(): boolean { return this.isReplaying; }
   private oldStartOnSignal = false;
 
   constructor(

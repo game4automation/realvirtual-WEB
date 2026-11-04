@@ -59,11 +59,16 @@ describe('plan-590 — renamed signal survives save / reload', () => {
     expect(field(r, 'Asset/Start', 'PLCInputBool', 'Name')).toBe('DB.Go');
     // By-name reference: rewritten and persisted.
     expect(field(r, 'Asset/Sensor', 'WebSensor', 'SignalBool')).toBe('DB.Go');
-    // By-path reference: untouched, and it still lands on the renamed signal node.
-    const ref = field(r, 'Asset/Lamp', 'WebVisibility', 'Signal') as typeof PATH_REF;
-    expect(ref).toEqual(PATH_REF);
-    const target = r.registry.getNode(ref.path)!;
+    // The reference (plan-769 Phase 3a: written as the target's ADDRESS, not its path)
+    // still lands on the renamed signal node.
+    const ref = field(r, 'Asset/Lamp', 'WebVisibility', 'Signal') as { type: string; componentType: string; address: string };
+    expect(ref).toEqual({ type: 'ComponentReference', componentType: PATH_REF.componentType, address: expect.stringMatching(/^#/) });
+    let target: Object3D | null = null;
+    r.registry.forEachNode((_p, n) => {
+      if ((n.userData.realvirtual as Record<string, unknown> | undefined)?.NodeId === ref.address.slice(1)) target = n;
+    });
+    expect(target).toBe(r.registry.getNode('Asset/Start'));
     expect(target).toBeTruthy();
-    expect((target.userData.realvirtual as Record<string, Record<string, unknown>>).PLCInputBool.Name).toBe('DB.Go');
+    expect((target!.userData.realvirtual as Record<string, Record<string, unknown>>).PLCInputBool.Name).toBe('DB.Go');
   });
 });

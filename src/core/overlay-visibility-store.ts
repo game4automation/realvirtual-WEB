@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from './rv-safe-storage';
+
 /**
  * overlay-visibility-store.ts — central registry for 3D-overlay category
  * visibility in the WebViewer.
@@ -42,7 +44,9 @@ export type OverlayCategory =
   | 'connections' // typed-connection cables (plan-259 link-line gizmos)
   | 'ribbon-preview' // editor-only ribbon definition overlays
   | 'labels'      // authored WebLabel text, Billboard + Plate (plan-529)
-  | 'safety-fields'; // AGV scanner warning / protective fields (plan-558) — default OFF
+  | 'safety-fields' // AGV scanner warning / protective fields (plan-558) — default OFF
+  | 'trace-blocked'   // congestion trace: blocked share along the path network (plan-629) — default OFF
+  | 'trace-utilization'; // congestion trace: occupied share along the path network (plan-629) — default OFF
 
 export interface OverlayCategoryMeta {
   id: OverlayCategory;
@@ -64,6 +68,8 @@ export const OVERLAY_CATEGORIES: readonly OverlayCategoryMeta[] = [
   { id: 'ribbon-preview', label: 'Ribbon preview' },
   { id: 'labels', label: 'Labels' },
   { id: 'safety-fields', label: 'Safety fields', defaultHidden: true },
+  { id: 'trace-blocked', label: 'Blockage trace', defaultHidden: true },
+  { id: 'trace-utilization', label: 'Utilization trace', defaultHidden: true },
 ];
 
 const VALID_IDS = new Set<OverlayCategory>(OVERLAY_CATEGORIES.map((c) => c.id));
@@ -136,7 +142,7 @@ export function resolveStoredHidden(raw: string | null): OverlayCategory[] {
 
 function loadHidden(): OverlayCategory[] {
   try {
-    return resolveStoredHidden(localStorage.getItem(STORAGE_KEY));
+    return resolveStoredHidden(readLocalStorage(STORAGE_KEY));
   } catch {
     return [...DEFAULT_HIDDEN];
   }
@@ -145,7 +151,7 @@ function loadHidden(): OverlayCategory[] {
 function persist(): void {
   try {
     const shown = DEFAULT_HIDDEN.filter((id) => !hidden.has(id));
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ hidden: [...hidden], shown }));
+    writeLocalStorage(STORAGE_KEY, JSON.stringify({ hidden: [...hidden], shown }));
   } catch {
     /* ignore quota / unavailable */
   }

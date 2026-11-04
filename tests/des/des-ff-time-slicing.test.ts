@@ -22,7 +22,7 @@
  * The yield utility is MOCKED so the tests control exactly when the drain
  * loop resumes (deferred mode) — deterministic interleaving, no timing races.
  *
- * Runs only in the private build (imports `@rv-private/plugins/des/*`).
+ * Imports `@rv/plugins/des/*` — DES is core code since plan-680.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -45,6 +45,13 @@ const yieldCtl = vi.hoisted(() => ({
 }));
 
 vi.mock('../../src/core/engine/rv-des-yield', () => ({
+  yieldToTimers: (): Promise<void> => {
+    yieldCtl.calls++;
+    if (yieldCtl.manual) {
+      return new Promise<void>((resolve) => { yieldCtl.pending.push(resolve); });
+    }
+    return new Promise<void>((resolve) => setTimeout(resolve, 0));
+  },
   yieldToBrowser: (): Promise<void> => {
     yieldCtl.calls++;
     if (yieldCtl.manual) {
@@ -54,9 +61,9 @@ vi.mock('../../src/core/engine/rv-des-yield', () => ({
   },
 }));
 
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
-import { _resetDesHookCache } from '@rv-private/plugins/des/des-hook-adapter';
-import { resetDESMUCounter } from '@rv-private/plugins/des/rv-des-mu';
+import { DESRunner } from '@rv/plugins/des/des-runner';
+import { _resetDesHookCache } from '@rv/plugins/des/des-hook-adapter';
+import { resetDESMUCounter } from '@rv/plugins/des/rv-des-mu';
 import {
   createSelf,
   type MaterialFlowSelf,
@@ -132,7 +139,7 @@ function buildRunner(def: MaterialFlowDefinition, durationSeconds?: number): DES
     mode: 'des',
     scheduler: runner.makeScheduler(def, () => adapter.entityId),
   });
-  const adapter = runner.addInstance(def, self, node);
+  const adapter = runner.addInstance(def, self, node, undefined, { desId: node.name + '@' + def.type });
   runner.start([def], { root: node });
   return runner;
 }
@@ -292,10 +299,10 @@ describe('DES FastForward time slicing (plan-262 Phase 1)', () => {
     runner = buildRunner(makeInfiniteDef(), 1e9);
     runner.setSubMode('fastforward');        // NO runFastForward() — tick drives
 
-    runner.tick(0.016);
-    // Old behavior: exactly ONE fixed 2000-event batch per frame. New: a 12 ms
-    // deadline loop of 2000-event inner batches — a trivial-handler stream
-    // processes well beyond a single batch inside one tick.
+    // Control the budget clock: even a slow CI worker gets two batches before
+    // the deadline expires. This checks slicing, not host throughput.
+    const clock = vi.spyOn(performance, 'now').mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValue(1000);
+    try { runner.tick(0.016); } finally { clock.mockRestore(); }
     expect(runner.getManager().totalEventsProcessed).toBeGreaterThan(2000);
   });
 });

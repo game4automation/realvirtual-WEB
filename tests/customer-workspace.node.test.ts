@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { closeSync, existsSync, ftruncateSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+// Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
+import { closeSync, existsSync, ftruncateSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -14,6 +15,8 @@ import {
   assertWorkspaceGuards,
   collectPrivateSourceInventory,
   copyDemoRealvirtualFolder,
+  coreCapabilities,
+  coreCapabilityProse,
   createDeliveryManifest,
   deliveryChangelog,
   gitProvenance,
@@ -50,6 +53,11 @@ const alwaysDeliveredDocs = [
   // Added to ALWAYS_DELIVERED_DOCS by "ship doc-node-paths.md to customers"; the generated
   // workspace guide links it, so a fixture core without it produces a broken-link failure.
   'doc-node-paths.md',
+  // Same case, plan-2059: shipped docs link the DES snapshot developer contract.
+  'doc-des-snapshot.md',
+  // Same case, plan-2061: shipped docs link the DES randomness contract.
+  'doc-des-randomness.md',
+  'doc-des-scripting.md',
   // Same case, added to ALWAYS_DELIVERED_DOCS by "ship doc-ui-visibility.md, which a delivered
   // doc links to": without it in the fixture core the generated guide links a file that the
   // staged workspace does not carry.
@@ -60,7 +68,13 @@ const alwaysDeliveredDocs = [
   // And again, from the 6.3.19 release branch: doc-webviewer.md sends the reader here for the
   // path/AGV task primitive, so the delivered guide links a file the staged workspace must carry.
   'doc-path-fleet-control.md',
+  // And again: doc-extending-webviewer.md links the entity stream guide for plugin authors.
+  'doc-entity-stream.md',
+  // Experiment manager documentation belongs to the private commercial module.
   'doc-getting-started.md', 'doc-projects.md', 'doc-project-plugin-example.md',
+  // And again, plan-604: the publish guide. The generated workspace guide links it, so a
+  // fixture core without the file stages a workspace whose own index points at nothing.
+  'doc-publishing.md',
   'doc-embedding.md', 'doc-migration.md',
   // Moved out of CONDITIONAL_DELIVERED_DOCS by plan-739: the layout planner is statically
   // imported by src/main.ts and the multiuser connection modes live in src/core/hmi, so both
@@ -194,7 +208,7 @@ function fixture() {
   write(join(core, 'DESIGN.md'), '# Customer UI design system\n');
   write(join(core, 'doc-layout-planner.md'), '# Layout planner\n\n![Planner](docs/images/screenshot-layout-planner.jpg)\n');
   write(join(core, 'doc-multiuser-system.md'), '# Multiuser\n');
-  for (const name of ['doc-deploy.md', 'doc-plc-programming.md', 'doc-render-picking.md', 'PRODUCT.md']) {
+  for (const name of ['doc-deploy.md', 'doc-plc-programming.md', 'contract-bake-picking.md', 'PRODUCT.md']) {
     write(join(core, name), `# forbidden ${name}\n`);
   }
   write(join(core, 'schema', 'v1', 'rv-odt.json'), '{"title":"rv-odt fixture"}');
@@ -373,6 +387,34 @@ describe('customer workspace generator', () => {
     expect(hit.cacheStatus).toBe('hit');
     expect(calls).toHaveLength(1);
     expect(state.ciCalls).toBe(1);
+  });
+
+  it('keeps the private package dependencies in the profile and restores them by copy on the next hit', () => {
+    const { workspaceRoot, cacheRoot, state } = buildFixture();
+    const proRoot = join(workspaceRoot, 'realvirtual-web-pro');
+    write(join(proRoot, 'package.json'), '{"name":"pro","version":"1.0.0"}');
+    write(join(proRoot, 'package-lock.json'), '{"lockfileVersion":3,"packages":{}}');
+    let installs = 0;
+    const privateDepsRunner = (root: string) => {
+      installs++;
+      write(join(root, 'realvirtual-web-pro', 'node_modules', 'pro-dep', 'marker.txt'), `install-${installs}`);
+    };
+    withBuildCache(cacheRoot, () => runBuild(workspaceRoot, { fast: true, npmRunner: state.runner, privateDepsRunner })); // miss
+    withBuildCache(cacheRoot, () => runBuild(workspaceRoot, { fast: true, npmRunner: state.runner, privateDepsRunner })); // hit, installs, caches
+    expect(installs).toBe(1);
+    const profile = readdirSync(join(cacheRoot, 'rv-build-cache')).find((n) => /^[0-9a-f]{64}$/.test(n))!;
+    expect(readFileSync(join(cacheRoot, 'rv-build-cache', profile, 'private', 'node_modules', 'pro-dep', 'marker.txt'), 'utf8')).toBe('install-1');
+
+    rmSync(join(proRoot, 'node_modules'), { recursive: true, force: true });
+    const steps: string[] = [];
+    const hit = withBuildCache(cacheRoot, () => runBuild(workspaceRoot, {
+      fast: true, npmRunner: state.runner, privateDepsRunner, onTiming: (step: string) => steps.push(step),
+    })) as ReturnType<typeof runBuild> & { cacheStatus: string };
+    expect(hit.cacheStatus).toBe('hit');
+    expect(installs).toBe(1); // restored, not installed
+    expect(readFileSync(join(proRoot, 'node_modules', 'pro-dep', 'marker.txt'), 'utf8')).toBe('install-1');
+    expect(lstatSync(join(proRoot, 'node_modules')).isSymbolicLink()).toBe(false); // a copy, never a junction
+    expect(steps).toEqual(['private-deps', 'deps', 'vite-build', 'provenance']);
   });
 
   it('the default private-deps step is a no-op without a staged private package', () => {
@@ -591,7 +633,7 @@ describe('customer workspace generator', () => {
     // DESIGN.md joined PRODUCT.md on the not-from-here list: brand and strategy live in the
     // private sibling and are not published on the public mirror, so this tree cannot deliver
     // them. The customer's authority for the visual system is the code (src/core/hmi/theme.ts).
-    for (const name of ['DESIGN.md', 'doc-deploy.md', 'doc-plc-programming.md', 'doc-render-picking.md', 'PRODUCT.md']) {
+    for (const name of ['DESIGN.md', 'doc-deploy.md', 'doc-plc-programming.md', 'contract-bake-picking.md', 'PRODUCT.md']) {
       expect(existsSync(join(first.coreRoot, name)), name).toBe(false);
     }
     for (const name of [
@@ -683,12 +725,14 @@ describe('customer workspace generator', () => {
     expect(featuresMatrix).toContain('## Core (AGPL) - always included');
     expect(featuresMatrix).toContain('## Licensed features');
     expect(featuresMatrix).toContain('## Your project');
-    expect(featuresMatrix).toContain('- Drives (linear and rotational motion)');
+    // The core list is the community rows of features.catalog.json (plan-646).
+    expect(featuresMatrix).toContain('- Transport simulation (drives, sensors, conveyors');
     // The layout planner lives in the AGPL core and is registered from src/main.ts, so it
     // ships with every delivery. The asset editor does NOT belong in this list: it is a
     // commercial feature and moves into the private repository.
     expect(featuresMatrix).toContain('- Layout planner');
     expect(featuresMatrix).not.toContain('- Asset editor');
+    expect(featuresMatrix).not.toContain('- Asset and kinematics editor');
     // In an own repository the delivery is named by its display name - that is the case the
     // shared repository deliberately departs from.
     expect(featuresMatrix).toContain('| Feature | Tier | Status | ACME |');
@@ -766,15 +810,19 @@ describe('customer workspace generator', () => {
     const { core, privateRoot, delivery } = fixture();
     write(join(core, 'src', 'plugins', 'layout-planner', 'index.ts'), 'export const LayoutPlannerPlugin = null;');
     const projectRoot = join(core, 'public');
-    write(join(projectRoot, 'library', 'catalog.json'), JSON.stringify({
-      version: '1.0',
+    // plan-778 Phase 4: the bundled library is a PROJECT (its catalog.json is gone).
+    write(join(projectRoot, 'library', 'project.json'), JSON.stringify({
+      schemaVersion: 2,
+      id: 'prj_realvirtual_library',
       name: 'realvirtual Library',
-      entries: [
-        { id: 'pallethandling-roll-conveyor-1m', name: 'Roll Conveyor 1m', category: 'Pallet Handling', glbUrl: 'PalletHandling/RollConveyor-1m.glb' },
-        { id: 'custom-other-customer', name: 'Other Customer', category: 'Custom', glbUrl: 'Custom/other-customer.glb' },
+      kind: 'demo',
+      documents: [
+        { id: 'pallethandling-roll-conveyor-1m', name: 'Roll Conveyor 1m', path: 'PalletHandling/RollConveyor-1m.glb', collections: ['Pallet Handling'], thumbnail: 'PalletHandling/.thumbnails/pallethandling-roll-conveyor-1m.3fa9c2d1.webp' },
+        { id: 'custom-other-customer', name: 'Other Customer', path: 'Custom/other-customer.glb', collections: ['Custom'] },
       ],
     }));
     write(join(projectRoot, 'library', 'PalletHandling', 'RollConveyor-1m.glb'), 'fixture:roll');
+    write(join(projectRoot, 'library', 'PalletHandling', '.thumbnails', 'pallethandling-roll-conveyor-1m.3fa9c2d1.webp'), 'fixture:webp');
     write(join(projectRoot, 'library', 'Custom', 'other-customer.glb'), 'fixture:custom');
     trackPublicModels(core, ['public/models/tests.glb']);
 
@@ -797,10 +845,17 @@ describe('customer workspace generator', () => {
     // appear, not even as an empty directory.
     expect(existsSync(join(models, 'tests.glb'))).toBe(false);
     expect(existsSync(join(library, 'Custom'))).toBe(false);
-    // Delivering the project catalog verbatim would 404 on the undelivered entries and expose
+    // Delivering the library manifest verbatim would 404 on the undelivered rows and expose
     // their names in the planner library UI.
-    const catalog = JSON.parse(readFileSync(join(library, 'catalog.json'), 'utf8'));
-    expect(catalog.entries.map((entry: { id: string }) => entry.id)).toEqual(['pallethandling-roll-conveyor-1m']);
+    const libraryProject = JSON.parse(readFileSync(join(library, 'project.json'), 'utf8'));
+    expect(libraryProject.id).toBe('prj_realvirtual_library');
+    expect(libraryProject.documents.map((row: { id: string }) => row.id)).toEqual(['pallethandling-roll-conveyor-1m']);
+    // No catalog.json is delivered any more (plan-778 Phase 4).
+    expect(existsSync(join(library, 'catalog.json'))).toBe(false);
+    // The saved preview (plan-776 §9.6) travels with its category, and the reduced manifest
+    // keeps the pointer — otherwise every customer sees "NO PREVIEW" in the library panel.
+    expect(existsSync(join(library, 'PalletHandling', '.thumbnails', 'pallethandling-roll-conveyor-1m.3fa9c2d1.webp'))).toBe(true);
+    expect(libraryProject.documents[0].thumbnail).toBe('PalletHandling/.thumbnails/pallethandling-roll-conveyor-1m.3fa9c2d1.webp');
     // …and the delivered library is under the LFS filter. This line used to name
     // `realvirtual-web/public/models/*.glb`, a path nothing stages — see T7 below for why that
     // mattered and what it cost (plan-739 F12).
@@ -2127,8 +2182,10 @@ describe('projectless customer workspace', () => {
     // into the private repository, so the core list must not promise it.
     expect(features).not.toContain('- Asset editor');
     // The README's inline enumeration is the same list in prose and must agree with it.
-    expect(readme).toContain('and the layout planner)');
-    expect(readme).toMatch(/AGPL core \(10 capabilities/);
+    // Since plan-646 both are the community rows of features.catalog.json.
+    expect(readme).toContain('layout planner, ');
+    expect(readme).toContain(`AGPL core (${coreCapabilities().length} capabilities: ${coreCapabilityProse()})`);
+    expect(readme).not.toMatch(/AGPL core \([^)]*asset/i);
   });
 
   it('writes a README that tells the customer to create a project, and never to open a pull request', () => {
@@ -2652,9 +2709,9 @@ describe('T6/T7/T8: the delivered workspace carries no placeholder licence, trac
   //! planner has to be present too — `copyLibraryIntoCore()` skips the library without it.
   function withLibrary(core: string) {
     write(join(core, 'src', 'plugins', 'layout-planner', 'index.ts'), 'export const LayoutPlannerPlugin = null;');
-    write(join(core, 'public', 'library', 'catalog.json'), JSON.stringify({
-      version: '1.0',
-      entries: [{ id: 'pallethandling-roll-conveyor-1m', name: 'Roll Conveyor 1m', category: 'Pallet Handling', glbUrl: 'PalletHandling/RollConveyor-1m.glb' }],
+    write(join(core, 'public', 'library', 'project.json'), JSON.stringify({
+      schemaVersion: 2, id: 'prj_realvirtual_library', name: 'realvirtual Library', kind: 'demo',
+      documents: [{ id: 'pallethandling-roll-conveyor-1m', name: 'Roll Conveyor 1m', path: 'PalletHandling/RollConveyor-1m.glb' }],
     }));
     write(join(core, 'public', 'library', 'PalletHandling', 'RollConveyor-1m.glb'), 'fixture:roll');
   }
@@ -2883,5 +2940,18 @@ describe('third-party notices in the customer workspace (plan-544)', () => {
     });
     expect(envs.length).toBeGreaterThan(0);
     for (const env of envs) expect(env.RV_NOTICES_RELEASE_BUILD).toBe('1');
+  });
+});
+
+// plan-646 Phase 2: generated/features.json may be stale outside the --demo deploy (the only
+// path that regenerates it), so a customer workspace never carries it.
+describe('generated/features.json stays out of customer workspaces (plan-646)', () => {
+  it('a customer staging skips it even when the canonical tree has one', () => {
+    const { core, privateRoot, delivery } = fixture();
+    write(join(core, 'generated', 'features.json'), '{"version":1}\n');
+    const staged = stageFilteredSourceTree({ coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery });
+    temporary.push(staged.workspaceRoot);
+    expect(existsSync(join(staged.coreRoot, 'generated', 'features.json'))).toBe(false);
+    expect(existsSync(join(staged.coreRoot, 'generated'))).toBe(false);
   });
 });

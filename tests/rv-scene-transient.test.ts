@@ -28,6 +28,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { nodeRegistryDouble } from './fixtures/node-registry-double';
 
 vi.mock('../src/core/hmi/scene/rv-scene-glb-io', () => ({
   readSceneGlbBody: vi.fn(async () => null),
@@ -97,7 +98,7 @@ function makeViewer(): FakeViewer {
     currentScene: null,
     currentModelUrl: 'https://files.example.test/cell.glb',
     currentModelRoot: null,
-    registry: { getGltfNodeNames: () => [], getGltfNodeIndex: () => -1 },
+    registry: nodeRegistryDouble(),
     lastLoadResult: null,
     modes: { has: () => true, setMode: vi.fn() },
     loadScene: vi.fn(async (s: RvScene) => {

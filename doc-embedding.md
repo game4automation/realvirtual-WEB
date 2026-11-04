@@ -136,8 +136,10 @@ from sub-assemblies) is loaded like in the main viewer: the loader leaves every
 reference node empty and the facade's own placement instancer fills it in through
 the same recipe, recursively, one bake per asset. `loadModel` resolves only when
 the scene is complete (every reference materialised or failed into a labelled
-placeholder); the placed drives, signals and LogicSteps join the load result the
-call returns, and `viewer.placementInstancer` exposes the live state (`progress`,
+placeholder); the placed drives and signals join the load result the call returns,
+the LogicSteps — the placements' and, once the scene is complete, the model's own
+(plan-769 Phase 6, so a step addressed into placed content finds its target) — run
+in the facade's one logic engine, and `viewer.placementInstancer` exposes the live state (`progress`,
 `getBakeStats()`) for diagnostics. The embed has no Problems panel, so a missing
 or refused reference is a `console.warn` line. Relative `path`s in a reference
 resolve against the containing file's url; ids resolve through the library

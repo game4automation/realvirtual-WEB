@@ -44,6 +44,13 @@ describe('follow-agent-store', () => {
     expect(getFollowAgent()).toBe(false);
   });
 
+  it('keeps the session choice when only the write fails', () => {
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('quota'); });
+    setFollowAgent(false);
+    expect(getFollowAgent()).toBe(false);
+    expect(localStorage.getItem(MCP_FOLLOW_AGENT_KEY)).toBeNull();
+  });
+
   it('is listed in ALL_RV_STORAGE_KEYS (reset clears it)', () => {
     expect((ALL_RV_STORAGE_KEYS as readonly string[]).includes('rv-mcp-follow-agent')).toBe(true);
   });

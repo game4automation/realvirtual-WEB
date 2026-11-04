@@ -17,7 +17,7 @@
  * 2. **May this KIND of op be applied from this projection?** ({@link requireOpOrigin})
  *
  * The second is not pedantry. `RV_OP_ORIGIN` (rv-unified-ops.ts) classifies all
- * 26 op kinds, and exactly four are `'both'` — `setField`, `unsetField`,
+ * 27 op kinds, and exactly four are `'both'` — `setField`, `unsetField`,
  * `composite`, `transformNode`. Every other content op is asset-lineage. Once
  * one instance backs both projections, a naive "one toolset" would let an agent
  * in planner mode fire `renameNode` at it: the op is well-formed, the document

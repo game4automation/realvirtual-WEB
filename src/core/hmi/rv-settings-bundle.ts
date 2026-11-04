@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage, listLocalStorageKeys, readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * rv-settings-bundle.ts — Centralized settings export/import/auto-load.
  *
@@ -80,12 +82,11 @@ export function getModelBasename(url: string | null): string {
 export function collectSettingsBundle(modelUrl: string | null): RVSettingsBundle {
   // Collect per-model camera start presets from localStorage (rv-camera-start:<modelKey>)
   const cameraStart: Record<string, ModelCameraStart> = {};
-  for (let i = 0; i < localStorage.length; i++) {
-    const key = localStorage.key(i);
+  for (const key of listLocalStorageKeys()) {
     if (!key) continue;
     if (key.startsWith(CAMERA_START_LS_PREFIX)) {
       try {
-        const val = JSON.parse(localStorage.getItem(key)!);
+        const val = JSON.parse(readLocalStorage(key)!);
         if (isValidPreset(val)) {
           cameraStart[key.substring(CAMERA_START_LS_PREFIX.length)] = val;
         }
@@ -189,7 +190,7 @@ export function applySettingsBundle(bundle: RVSettingsBundle): void {
     for (const [modelKey, preset] of Object.entries(s.cameraStart)) {
       if (!isValidPreset(preset)) continue;
       try {
-        localStorage.setItem(`${CAMERA_START_LS_PREFIX}${modelKey}`, JSON.stringify(preset));
+        writeLocalStorage(`${CAMERA_START_LS_PREFIX}${modelKey}`, JSON.stringify(preset));
       } catch { /* quota exceeded — skip */ }
     }
   }
@@ -205,7 +206,7 @@ export function applySettingsBundle(bundle: RVSettingsBundle): void {
 export async function loadModelSettingsConfig(modelUrl: string): Promise<void> {
   try {
     // Guard: only auto-load if no visual settings exist (first visit)
-    if (localStorage.getItem('rv-visual-settings')) return;
+    if (getLocalStorage()!.getItem('rv-visual-settings')) return;
 
     const settingsUrl = modelUrl.replace(/\.glb$/i, '.settings.json');
     const resp = await fetch(settingsUrl);

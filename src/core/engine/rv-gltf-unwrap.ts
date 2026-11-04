@@ -22,7 +22,7 @@ import type { Object3D, Camera, Light } from 'three';
  * - `auxscene`  — three.js `GLTFExporter`'s wrapper. When `parse()` is handed an
  *   Object3D rather than a Scene (which is what `objectToGlb` always does), it
  *   invents `new Scene()` named `AuxScene` to satisfy the glTF format. Every
- *   browser-authored GLB — STEP/USD conversions, editor asset saves — therefore
+ *   browser-authored GLB — STEP/USD conversions, editor saves — therefore
  *   carries one. Missing it here would leave an extra level in every imported
  *   hierarchy AND, worse, strand the content root's transform one level down:
  *   `importCad` would record the wrapper's identity transform, and

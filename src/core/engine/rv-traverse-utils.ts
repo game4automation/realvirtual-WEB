@@ -9,10 +9,12 @@
  * eliminates the `as Mesh` cast boilerplate at every call site.
  */
 
-import { Box3, Vector3, type Material, type Object3D } from 'three';
+import { Box3, Matrix4, Vector3, type Material, type Object3D } from 'three';
 import { Mesh } from 'three';
-import { chunkMetaOf } from './rv-bake-chunk';
+import { bakedKeepGeometries, chunkMetaOf } from './rv-bake-chunk';
 import { sharedVizGeometries } from './rv-shared-viz-geometry';
+import type { BakedChunk } from './rv-bake-chunk';
+import { segmentBoxUnion } from './rv-pick-structure';
 
 // ─── Runtime-rig markers (plan-362, EnergyChain) ─────────────────
 //
@@ -149,6 +151,26 @@ export function findByNameInSubtree(
 }
 
 /**
+ * The node at the relative path `path` (`Lift/ForkAnchor`) below `root`: the
+ * first node of the subtree (pre-order, `root` included) named like the first
+ * segment whose child chain matches the remaining segments exactly. Unlike
+ * {@link findByNameInSubtree} every segment counts — a `ForkAnchor` elsewhere
+ * in the subtree is no match. Null when no chain matches.
+ */
+export function findPathInSubtree(root: Object3D, path: string): Object3D | null {
+  const segs = path.split('/').filter((s) => s.length > 0);
+  if (segs.length === 0) return null;
+  let found: Object3D | null = null;
+  root.traverse((n) => {
+    if (found || n.name !== segs[0]) return;
+    let cur: Object3D | undefined = n;
+    for (let i = 1; cur && i < segs.length; i++) cur = cur.children.find((c) => c.name === segs[i]);
+    if (cur) found = cur;
+  });
+  return found;
+}
+
+/**
  * Traverse `root` and invoke `cb` for every descendant (and `root` itself,
  * if it is a `Mesh`). Skips non-Mesh nodes.
  *
@@ -275,6 +297,12 @@ export interface ChunkBoundsSource {
   /** Union the world-space chunk geometry of `node`'s subtree into `target`;
    *  `false` = this node has none (not baked, or no live placement). */
   chunkBoundsOf(node: Object3D, target: Box3): boolean;
+  placementOf?(node: Object3D): Object3D | null;
+  visitChunkGeometry?(
+    node: Object3D,
+    onWhole: (mesh: Mesh) => void,
+    onRange: (mesh: Mesh, chunk: BakedChunk, first: number, last: number) => void,
+  ): void;
 }
 
 let _chunkBounds: ChunkBoundsSource | null = null;
@@ -287,6 +315,13 @@ let _chunkBounds: ChunkBoundsSource | null = null;
  */
 export function setChunkBoundsSource(source: ChunkBoundsSource | null): void {
   _chunkBounds = source;
+}
+
+/** Clear the installed source, but only when it is still `source` (a later viewer may have
+ *  replaced it): a module-level reference to a disposed viewer's registry keeps its whole
+ *  geometry alive. */
+export function clearChunkBoundsSource(source: ChunkBoundsSource): void {
+  if (_chunkBounds === source) _chunkBounds = null;
 }
 
 /** Union the baked chunk geometry of `node`'s subtree into `target` through
@@ -351,6 +386,92 @@ export function computeSubtreeAABB(
   return { box, size, center };
 }
 
+// Shared scratch: synchronous, non-reentrant, like the bake bounds visitor.
+// One stamp per mesh avoids Set.clear()/refill allocations on every query.
+const _frameVisit = Symbol('rvFrameVisit');
+type FrameMesh = Mesh & { [_frameVisit]?: number };
+let _frameGeneration = 0;
+const _frameInverse = new Matrix4();
+const _frameMatrix = new Matrix4();
+const _frameBox = new Box3();
+const _framePoint = new Vector3();
+const _frameRange = new Float64Array(6);
+let _frameTarget: Box3;
+
+function addFrameBox(mesh: Mesh, box: Box3): void {
+  if (box.isEmpty()) return;
+  mesh.updateWorldMatrix(true, false);
+  _frameMatrix.multiplyMatrices(_frameInverse, mesh.matrixWorld);
+  for (let i = 0; i < 8; i++) {
+    _framePoint.set(
+      i & 1 ? box.max.x : box.min.x,
+      i & 2 ? box.max.y : box.min.y,
+      i & 4 ? box.max.z : box.min.z,
+    ).applyMatrix4(_frameMatrix);
+    _frameTarget.expandByPoint(_framePoint);
+  }
+}
+
+function addFrameWhole(mesh: FrameMesh): void {
+  if (mesh[_frameVisit] === _frameGeneration) return;
+  mesh[_frameVisit] = _frameGeneration;
+  const geometry = mesh.geometry;
+  // Do not lazily allocate geometry.boundingBox in the sampling path.
+  if (geometry.boundingBox) addFrameBox(mesh, geometry.boundingBox);
+  else {
+    const position = geometry.getAttribute('position');
+    if (position) {
+      _frameBox.makeEmpty();
+      for (let i = 0; i < position.count; i++) {
+        _framePoint.fromBufferAttribute(position, i);
+        _frameBox.expandByPoint(_framePoint);
+      }
+      addFrameBox(mesh, _frameBox);
+    }
+  }
+}
+
+function addFrameRange(mesh: FrameMesh, chunk: BakedChunk, first: number, last: number): void {
+  if (mesh[_frameVisit] === _frameGeneration) return;
+  mesh[_frameVisit] = _frameGeneration;
+  if (!segmentBoxUnion(chunk.pick, first, last, _frameRange)) return;
+  _frameBox.min.set(_frameRange[0], _frameRange[1], _frameRange[2]);
+  _frameBox.max.set(_frameRange[3], _frameRange[4], _frameRange[5]);
+  addFrameBox(mesh, _frameBox);
+}
+
+function visitFrameChunks(node: Object3D, parentPlacement: Object3D | null, root: boolean): void {
+  const placement = _chunkBounds?.placementOf?.(node) ?? null;
+  if (root || placement !== parentPlacement) {
+    _chunkBounds?.visitChunkGeometry?.(node, addFrameWhole, addFrameRange);
+  }
+  for (let i = 0; i < node.children.length; i++) {
+    visitFrameChunks(node.children[i], placement, false);
+  }
+}
+
+function visitFrameMeshes(node: Object3D): void {
+  if ((node as Mesh).isMesh) addFrameWhole(node as Mesh);
+  for (let i = 0; i < node.children.length; i++) visitFrameMeshes(node.children[i]);
+}
+
+/**
+ * Bounds of the live subtree in the caller's frame, including merged segments
+ * and attached placements. Writes an empty box and returns false without geometry.
+ * Caller-owned result; no per-call objects, callbacks or geometry-box caches.
+ * Chunk discovery precedes real meshes so a partial chunk is never added whole.
+ * Not reentrant: the installed source must invoke its visitors synchronously.
+ */
+export function computeSubtreeBoxInFrame(node: Object3D, frameInverse: Matrix4, target: Box3): boolean {
+  _frameGeneration++;
+  _frameInverse.copy(frameInverse);
+  _frameTarget = target;
+  target.makeEmpty();
+  visitFrameChunks(node, null, true);
+  visitFrameMeshes(node);
+  return !target.isEmpty();
+}
+
 /**
  * Dispose geometry and materials on all Mesh nodes in a subtree.
  * Uses a Set to prevent double-dispose of shared resources.
@@ -369,7 +490,8 @@ export function disposeSubtree(root: Object3D): void {
     // box + edges): refcounted and released by `RVSensor.dispose()`, never by
     // a tree walk that may only be tearing down ONE of their users.
     if (m.geometry && sharedVizGeometries.has(m.geometry)) return;
-    if (m.geometry && !disposed.has(m.geometry)) {
+    // plan-774 R8: a keep clone shares its template's geometry — the asset's.
+    if (m.geometry && !disposed.has(m.geometry) && !bakedKeepGeometries.has(m.geometry)) {
       disposed.add(m.geometry);
       m.geometry.dispose();
     }

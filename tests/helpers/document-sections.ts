@@ -30,22 +30,21 @@ import {
   type DocumentSection,
 } from '../../src/core/project/rv-project-documents';
 import type {
+  RvDocumentEntry,
   RvProject,
-  RvProjectAssetEntry,
-  RvProjectSceneEntry,
 } from '../../src/core/project/rv-project-types';
 
 /** The documents whose PATH files them under `scenes/` (or `*.scene.glb`). */
 export function sceneDocumentsOf(
   project: RvProject | null | undefined,
-): RvProjectSceneEntry[] {
-  return documentsInSection(project, 'scenes') as unknown as RvProjectSceneEntry[];
+): RvDocumentEntry[] {
+  return documentsInSection(project, 'scenes');
 }
 
 /** The documents whose PATH files them under `models/` or anywhere else. */
 export function assetDocumentsOf(
   project: RvProject | null | undefined,
   section: Exclude<DocumentSection, 'scenes'>,
-): RvProjectAssetEntry[] {
-  return documentsInSection(project, section) as unknown as RvProjectAssetEntry[];
+): RvDocumentEntry[] {
+  return documentsInSection(project, section);
 }

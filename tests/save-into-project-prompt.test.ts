@@ -42,12 +42,10 @@ vi.mock('../src/core/editor/rv-asset-glb-export', async (original) => {
   };
 });
 
-vi.mock('../src/core/thumbnails/thumbnail-renderer', () => ({
-  ThumbnailRenderer: class {
-    render(): string | null { return null; }
-    dispose(): void {}
-  },
-}));
+// plan-776: the save reaches the renderer only through the thumbnail writer —
+// one shared stand-in for it (tests/helpers/mock-thumbnail-write.ts).
+vi.mock('../src/core/thumbnails/rv-thumbnail-write', async () =>
+  (await import('./helpers/mock-thumbnail-write')).mockThumbnailWriteModule());
 
 const writes: string[] = [];
 
@@ -137,7 +135,7 @@ beforeEach(() => {
 
 describe('save into project — the ONE prompt (plan-719 F2)', () => {
   it('still announces the copy on the button before the click', () => {
-    const decision = decideSaveVerb({ lineage: 'asset', base: builtin, name: 'Demo' }, backend as never);
+    const decision = decideSaveVerb({ lineage: 'editor', base: builtin, name: 'Demo' }, backend as never);
     expect(decision.verb).toBe('save-into-project');
     // The MCP `_saveVerb.copies` contract is unchanged (§4 Phase 4 task 1).
     expect(decision.copies).toBe(true);

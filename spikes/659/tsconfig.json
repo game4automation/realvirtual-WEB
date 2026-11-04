@@ -1,0 +1,11 @@
+{
+  "//": "plan-659 spike typecheck: npx tsc -p spikes/659/tsconfig.json --noEmit (from W root). The project tsconfig deliberately does NOT include spikes/, so this is the only thing that checks these files.",
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "types": ["node", "vitest/globals", "vite/client"],
+    "resolveJsonModule": true
+  },
+  "//include": "The private mujoco folder is listed so its ambient stub (mujoco-lib.d.ts) is part of the program — an unimported .d.ts is not pulled in by the imports alone.",
+  "include": [".", "../../../realvirtual-WebViewer-Private~/src/mujoco"],
+  "exclude": []
+}

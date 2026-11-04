@@ -22,6 +22,8 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const GUARDED = [
   'src/core/engine/rv-prepare-and-bake.ts',
   'src/core/engine/rv-init-context.ts',
+  // plan-610 F9: the reference audit hands the viewer a list; the viewer reports it.
+  'src/core/engine/rv-reference-audit.ts',
 ];
 
 /** Import specifiers that mean "the viewer shell", relative to `src/core/engine/`. */

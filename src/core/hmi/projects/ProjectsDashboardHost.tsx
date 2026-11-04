@@ -31,6 +31,7 @@ import { fileGlyphOf } from '../../library/AssetCard';
 import { debug } from '../../engine/rv-debug'; // TEMP open-perf instrumentation
 import {
   getLibrarySourcesSnapshot,
+  listBrowsableLibrarySources,
   listLibrarySources,
   subscribeLibrarySources,
 } from '../../library/library-source-registry';
@@ -58,6 +59,7 @@ import {
   type RvDocumentEntry,
 } from '../../project/rv-project-types';
 import { probeAddTarget } from '../../project/rv-project-add';
+import { locateProjectFolder } from '../../project/rv-project-locate';
 // The rules of Add / Open / Locate / Drop live in their own module for the same
 // reason `dashboard-documents` does: this file cannot be rendered by a test, so
 // a rule kept inside it is a rule with no test.
@@ -83,13 +85,16 @@ import {
 import type { RecentDocumentEntry } from '../../project/rv-project-recents';
 import { useRecentDocuments } from '../../../hooks/use-recent-documents';
 import { isRecentDocumentsShortcut } from '../recent-documents-shortcut';
-import { getRecentDocumentsHoverOpened, getRecentDocumentsOpen, subscribeRecentDocumentsOpen, setRecentDocumentsOpen, toggleRecentDocumentsOpen } from './projects-dashboard-store';
+import { documentForSelectedPath, getRecentDocumentsHoverOpened, getRecentDocumentsOpen, subscribeRecentDocumentsOpen, setRecentDocumentsOpen, toggleRecentDocumentsOpen } from './projects-dashboard-store';
 import { RecentDocumentsPopover } from './RecentDocumentsPopover';
+import { ProjectOperationDialog } from './ProjectOperationDialog';
+import { RegenerateThumbnailsDialog } from './RegenerateThumbnailsDialog';
+import { resetProjectOpProgress, startProjectOp } from '../../project/project-op-progress';
 import {
   isOpeningRecent, openProjectDocument, openRecentEntry,
   type OpenChainBaseDeps, type OpenRecentResult,
 } from './open-recent-entry';
-import { documentModeKey, effectiveOpenMode, handoffParkMode, type DocumentModeRecord } from '../../project/rv-document-mode';
+import { allowedModesOf, documentModeKey, effectiveOpenMode, handoffParkMode, isModeAllowedForRow, type DocumentModeRecord } from '../../project/rv-document-mode';
 import {
   loadDocumentModes, readDocumentMode, subscribeDocumentModes,
 } from '../../project/rv-document-mode-store';
@@ -144,16 +149,27 @@ import {
   sceneDocumentBase,
   setOpenDocumentBase,
 } from '../../editor/active-asset-store';
-import { NO_PROJECT } from '../../thumbnails';
-import type { ThumbnailKeyParts } from '../../thumbnails/thumbnail-key';
-import { documentThumbnailVersion } from '../../thumbnails/thumbnail-key';
-import { AddLibraryDialog } from '../../library/AddLibraryDialog';
-import { getLibraryStore } from '../../library/library-store-singleton';
+import { useThumbnailUrl } from '../../thumbnails/rv-thumbnail-url-store';
+import { AddLibraryDialog, type AddLibraryProjectsOptions } from '../../library/AddLibraryDialog';
+import { readProjectLibraries } from '../../library/project-libraries';
+import { countOpenLibraryPlacements, ensureLibraryCommandsRegistered } from '../../library/library-commands';
+import { LIBRARY_PROJECTS_PROVIDER_ID, REALVIRTUAL_LIBRARY_PROJECT_ID } from '../../library/library-origin';
+import { getLibraryProjectLoader } from '../../library/library-project-loader';
+import { isLibraryProjectSource } from '../../library/library-projects-provider';
+import { libraryStateBadge, runLibraryRepair } from '../../library/library-project-ui';
+import { attachedLibraryProjectIdsOf, detachConfirmationMessage, libraryRemovalKeepsAvailable } from '../../library/project-library-attach';
+// plan-776 #20: registered and dispatched BY ID — the loop, the writer and the
+// renderer stay out of the dashboard (guard 9.5); the descriptor is light.
 import {
-  readProjectLibraries,
-  withProjectLibraries,
-} from '../../library/project-libraries';
-import { setPendingAssetOpen } from '@rv-private/plugins/asset-editor/pending-open-store';
+  dispatchRegenerateThumbnails,
+  ensureThumbnailCommandsRegistered,
+  regenerateThumbnailsMenuState,
+} from '../../thumbnails/rv-thumbnail-regenerate-commands';
+// At import, not while a menu renders: a first registration notifies the
+// registry's subscribers, which must not happen inside a render.
+ensureThumbnailCommandsRegistered();
+import { commandRegistry } from '../rv-command-registry';
+import { setPendingAssetOpen } from '@rv-private/plugins/asset-editor/shared/pending-open-store';
 import { useViewer } from '../../../hooks/use-viewer';
 import { getSceneStore } from '../scene/scene-store-singleton';
 import { SceneConfirmDialog } from '../scene/rv-scene-confirm-dialog';
@@ -247,6 +263,7 @@ import { DocumentInfoEditor } from './DocumentInfoEditor';
 // their own module because this file cannot be rendered by a test.
 import {
   documentById,
+  documentCardPicture,
   documentPickOptions,
   documentRoleBadge,
   documentsUsingRef,
@@ -380,7 +397,7 @@ function libraryRelPathOf(entry: LibraryCatalogEntry): string | null {
  * detail pane looks the row up by.
  */
 interface DocumentRow extends ClassifiedRow {
-  /** `scene:<id>` or `model:<path>`. */
+  /** `document:<id>` — one key shape for every row (plan-777 F8). */
   key: string;
   /** The manifest document, when this row has one. Absent for a bare example. */
   doc?: TieredDocumentEntry;
@@ -390,7 +407,22 @@ interface DocumentRow extends ClassifiedRow {
 export interface WorkingSceneOpenModes {
   activeMode: string | null;
   list(): readonly { id: string }[];
+  /** The modes the open document allows (`ModeManager.available`). Optional for test doubles. */
+  available?(): readonly { id: string }[];
+  /**
+   * Lift the LEAVING document's mode restriction (`documents[].modes`) before a
+   * switch made on the way to another document - see case (a) of
+   * `runDecidedHandoff`. The load installs the new document's own restriction.
+   */
+  setRestriction?(restriction: null): void;
   setMode(id: string): void;
+  /**
+   * The awaited switch (plan-652): resolves once the mode is committed, after its
+   * on-demand feature loaded. Optional so test doubles without it keep working.
+   */
+  setModeAsync?(id: string): Promise<boolean>;
+  /** Sync when nothing has to load, a promise otherwise (plan-652 Phase 4). Optional like setModeAsync. */
+  switchMode?(id: string): boolean | Promise<boolean>;
   /**
    * `token` is the workspace switch lock of the caller that owns this open
    * (plan-478 R3-2). Absent for an ordinary double-click, which owns nothing;
@@ -401,9 +433,28 @@ export interface WorkingSceneOpenModes {
 }
 
 /**
+ * `setMode` that WAITS for the switch (plan-652 section 2.4.4). The handoff's next step -
+ * `openScene`, or the pending asset the editor's activation reads - assumes the
+ * mode has changed; a lazy target (the Editor) would otherwise switch later, outside
+ * the `withOpenIntentMode` scope (plan-478 F1b).
+ */
+function setModeAwaited(modes: WorkingSceneOpenModes, id: string): Promise<unknown> | undefined {
+  // An ordinary switch (no feature to load) stays SYNCHRONOUS - no promise, so the caller
+  // adds no turn between leaving the editor and `openScene` (plan-478 ordering,
+  // recent-documents-open-chain R3-3/4). Only a lazy target hands back a promise.
+  if (typeof modes.switchMode === 'function') {
+    const result = modes.switchMode(id);
+    return typeof result === 'boolean' ? undefined : result;
+  }
+  if (typeof modes.setModeAsync === 'function') return modes.setModeAsync(id);
+  modes.setMode(id);
+  return undefined;
+}
+
+/**
  * Open a document row as the working scene — including the EDITOR handoff.
  *
- * Exported (and separated from the host's `openScene` callback) so the handoff
+ * Exported (and separated from the host's `openDocumentRow` callback) so the handoff
  * contract is testable; the host wraps it in its dirty guard and dashboard
  * dismissal, which stay UI concerns.
  *
@@ -438,7 +489,10 @@ export interface WorkingSceneOpenModes {
  * depart to — and two spellings of "the first non-editor mode" is how the
  * guard check and the actual departure start to disagree.
  */
-export function handoffExitTarget(modes: { list(): readonly { id: string }[] }): string {
+export function handoffExitTarget(modes: {
+  list(): readonly { id: string }[];
+  available?: () => readonly { id: string }[];
+}): string {
   // The one spelling lives beside the chain's guard rule (plan-513).
   return handoffParkMode(modes);
 }
@@ -506,7 +560,7 @@ async function runHandoff(
   // down would stamp the transitional mode onto the document being LEFT, which
   // is still the ring's head until the new one is recorded (SOL R2 F4).
   await withOpenIntentMode(wasEditor ? 'editor' : null, async () => {
-    if (wasEditor) modes.setMode(handoffExitTarget(modes));
+    if (wasEditor) { const pending = setModeAwaited(modes, handoffExitTarget(modes)); if (pending) await pending; }
     await sceneStore.openScene(id);
     const sceneRow = documentById(documents, id);
     if (sceneRow) setOpenDocumentBase(sceneDocumentBase(id, sceneRow.name));
@@ -567,25 +621,36 @@ async function runDecidedHandoff(
   };
   return withOpenIntentMode(target, async () => {
     if (wasEditor && target === 'editor') {                       // (c)
-      modes.setMode(handoffExitTarget(modes));
+      { const pending = setModeAwaited(modes, handoffExitTarget(modes)); if (pending) await pending; }
       await sceneStore.openScene(id, { modeDecidedByCaller: true });
       publishIdentity();
       pendAsset();
       return (await modes.requestMode('editor', switchToken)) !== false;
     }
     if (wasEditor) {                                              // (a)
-      modes.setMode(target);
+      // The switch happens BEFORE the load, i.e. while the document being LEFT
+      // still restricts the modes: its restriction must not refuse the mode the
+      // NEXT document opens in (the chain already checked `target` against that
+      // document's own `modes`). The load installs the new restriction.
+      modes.setRestriction?.(null);
+      { const pending = setModeAwaited(modes, target); if (pending) await pending; }
       await sceneStore.openScene(id, { modeDecidedByCaller: true });
       publishIdentity();
+      // A store notification during a deferred departure can reinstall the old
+      // restriction and refuse it; the new document's restriction is in place
+      // now and `target` was checked against it, so settle it here.
+      if (modes.activeMode !== target) {
+        const pending = setModeAwaited(modes, target); if (pending) await pending;
+      }
       return true;
     }
     await sceneStore.openScene(id, { modeDecidedByCaller: true });
     publishIdentity();
     if (target === 'editor') {                                    // (b)
       pendAsset();
-      modes.setMode('editor');
+      { const pending = setModeAwaited(modes, 'editor'); if (pending) await pending; }
     } else if (modes.activeMode !== target) {                     // (d)
-      modes.setMode(target);
+      { const pending = setModeAwaited(modes, target); if (pending) await pending; }
     }
     return true;
   });
@@ -677,11 +742,15 @@ export function ProjectsDashboardHost() {
       // list must be readable before any of this resolves, and a `prompt` here
       // would raise a browser dialog the user never asked for.
       const states = new Map<string, LinkedRowState>();
+      // plan-778 (review Stab 9): a linked project that is a LIBRARY of the open
+      // project is only ever read (Decision 3) — probing it for readwrite would
+      // show "needs grant" for a folder the library loader reads just fine.
+      const libraryIds = new Set(attachedLibraryProjectIdsOf(store.getProject()));
       await Promise.all(rows.map(async (row) => {
         try {
           const handle = await getHandle(projectHandleKey(row.id));
           if (!handle) { states.set(row.id, 'missing'); return; }
-          const perm = await handle.queryPermission({ mode: 'readwrite' });
+          const perm = await handle.queryPermission({ mode: libraryIds.has(row.id) ? 'read' : 'readwrite' });
           states.set(row.id, perm === 'granted' ? 'ready' : 'needs-grant');
         } catch {
           // A stale handle throws here; the click will tell the two apart.
@@ -693,7 +762,14 @@ export function ProjectsDashboardHost() {
     return () => { alive = false; };
   }, [dash.open, dash.view]);
 
-  const sources = useMemo(() => listLibrarySources(), [registryVersion]);
+  // `hidden` sources are resolver-only (service unreachable) — not browsable.
+  // plan-778: plus the TRANSITIVE library projects (hidden — not placeable), so
+  // the tree can show them as "needed by <B>" roots with their state and repair.
+  const sources = useMemo(() => [
+    ...listBrowsableLibrarySources(),
+    ...listLibrarySources().filter(({ providerId, source }) => providerId === LIBRARY_PROJECTS_PROVIDER_ID
+      && source.hidden === true && isLibraryProjectSource(source) && source.neededBy.length > 0),
+  ], [registryVersion]);
   // Kiosk gate (§2.13): a locked mode means the user may browse the project
   // they were given but must not open a different one. Only the PROJECTS group
   // is hidden - hiding the whole rail would leave an empty shell.
@@ -854,14 +930,14 @@ export function ProjectsDashboardHost() {
     setMessage(null);
     setOperationLabel(label.replace(/^Rename/, 'Renaming').replace(/^Delete/, 'Deleting'));
     setBusy(true);
-    const tVerb = performance.now();   // TEMP verb-timing
+    startProjectOp();
     try {
       await fn();
-      console.warn(`[verb-timing] "${label}" total ${Math.round(performance.now() - tVerb)} ms`);
       if (/^(Rename|Delete)/.test(label)) setSuccessMessage(`${label} completed.`);
     } catch (e) {
       setMessage(e instanceof Error ? e.message : `${label} failed: ${String(e)}`);
     } finally {
+      resetProjectOpProgress();
       setBusy(false);
       setOperationLabel(null);
       operationRef.current = false;
@@ -1044,17 +1120,21 @@ export function ProjectsDashboardHost() {
     void runVerb('Locate project', async () => {
       const dir = await pickFolder('rv-project-pick');
       if (!dir) return;
+      // The pre-778 refusal stays first (review U6): a folder whose project.json
+      // is missing or broken is refused here, exactly as before — whatever a
+      // lenient manifest read might still make of it.
       const probe = await probeAddTarget(dir);
       if (!probe.hasManifest || probe.manifestBroken) {
         setMessage(`"${dir.name}" does not hold a readable project.json.`);
         return;
       }
-      const manifest = (await readManifest(dir))?.project;
-      if (!manifest) {
-        setMessage(`"${dir.name}" does not hold a readable project.json.`);
+      // plan-778: the verdict is shared with the library Locate (Problems panel).
+      const verdict = await locateProjectFolder(id, dir, entry?.name);
+      if (verdict.kind === 'unreadable') {
+        setMessage(verdict.message);
         return;
       }
-      if (manifest.id === id) {
+      if (verdict.kind === 'ok') {
         await relinkProject(id, dir);
         await refreshLinked();
         setRowState(id, 'ready');
@@ -1062,7 +1142,7 @@ export function ProjectsDashboardHost() {
         return;
       }
       const replace = window.confirm(
-        `This folder holds project "${manifest.name}". `
+        `This folder holds project "${verdict.found.name}". `
         + `Replace the list entry for "${entry?.name ?? id}"?`);
       if (!replace) return;
       await unlinkProject(id);
@@ -1155,6 +1235,54 @@ export function ProjectsDashboardHost() {
     });
   }, [runVerb, store, project.project?.name]);
 
+  /**
+   * Pack with libraries (plan-778 F15, Decision 5): the open folder project plus
+   * TRIMMED copies of the library projects it uses (`libraries/<id>/`) into a
+   * folder the user picks — the browser half of what every delivery does, same
+   * algorithm (`rv-library-trim-core.mjs`). The picker is the FIRST statement of
+   * the click (user activation); the pack module loads lazily afterwards.
+   */
+  const handlePackWithLibraries = useCallback(() => {
+    const picker = (window as Window & {
+      showDirectoryPicker?: (opts?: { mode?: 'read' | 'readwrite' }) => Promise<FileSystemDirectoryHandle>;
+    }).showDirectoryPicker;
+    if (!picker) return;
+    // Review U5: a running verb would make `runVerb` return without awaiting the
+    // pick — ask BEFORE opening a picker whose result nobody would use.
+    if (operationRef.current) {
+      setMessage('Another project operation is still running — try again when it has finished.');
+      return;
+    }
+    const picked = picker({ mode: 'readwrite' }).catch((e: unknown) => {
+      if (e instanceof DOMException && e.name === 'AbortError') return null;   // cancelled — not an error
+      throw e;
+    });
+    // Terminal handler: the verb below reports a failed pick; this only keeps a
+    // rejection that no verb awaited from becoming an unhandled one.
+    picked.catch(() => {});
+    void runVerb('Pack with libraries', async () => {
+      const target = await picked;
+      if (!target) return;
+      const dir = store.getProjectDir();
+      if (!dir) throw new Error('Only a project folder can be packed.');
+      const { packProjectWithLibraries, packLibrariesFromNodes } = await import('../../project/rv-library-pack');
+      const nodes = getLibraryProjectLoader()?.getNodes() ?? [];
+      const builtin = nodes.find((n) => n.projectId === REALVIRTUAL_LIBRARY_PROJECT_ID);
+      const result = await packProjectWithLibraries({
+        projectDir: dir,
+        target,
+        openLibrary: packLibrariesFromNodes(nodes),
+        realvirtualLibrary: builtin?.state.kind === 'ready' && builtin.state.project
+          ? (builtin.state.project as unknown as Record<string, unknown>)
+          : null,
+      });
+      if (result.kind !== 'packed') throw new Error(result.message);
+      const libs = result.libraries.map((l) => `${l.projectId} (${l.documentIds.length})`).join(', ');
+      setSuccessMessage(`Packed ${result.files.length} files into "${target.name}"`
+        + (libs ? ` with libraries ${libs}.` : ' (no libraries needed).'));
+    });
+  }, [runVerb, store]);
+
   /** Unpack a .rvproject into a folder the user picks. */
   const handleImportProject = useCallback(() => {
     void runVerb('Import project', async () => {
@@ -1208,7 +1336,7 @@ export function ProjectsDashboardHost() {
     // `renameNode` is Lauf 13's card rename: `relPath` is a TREE path, not a
     // library-relative one, and it goes through the tree's move/rename write
     // path rather than through the library asset ops.
-    { kind: 'renameAsset' | 'collections' | 'renameNode'; relPath: string; value: string } | null
+    { kind: 'renameAsset' | 'collections' | 'renameNode' | 'newDocument'; relPath: string; value: string } | null
   >(null);
 
   /**
@@ -1226,13 +1354,9 @@ export function ProjectsDashboardHost() {
    * no rescan touches.
    */
   const refreshListings = useCallback(async () => {
-    const t0 = performance.now();   // TEMP verb-timing
     await store.rescanDocuments();
-    const t1 = performance.now();
     await listLibrarySources()
       .find(s => s.providerId === PROJECT_LIBRARY_PROVIDER_ID)?.source.refresh?.();
-    console.warn(`[verb-timing] refreshListings: rescan ${Math.round(t1 - t0)} ms, `
-      + `library refresh ${Math.round(performance.now() - t1)} ms`);
   }, [store]);
 
   /** Run an asset op, surfacing its typed failure rather than swallowing it. */
@@ -1528,6 +1652,12 @@ export function ProjectsDashboardHost() {
   }, [openAssetInEditor, runAssetOp, handleDeleteAsset, transferActionsFor, documentByPath, store]);
 
   const [addLibraryOpen, setAddLibraryOpen] = useState(false);
+  // plan-655 F2: "Manage libraries…" in the planner asks for the dialog itself
+  // (`openAddLibraryDialog`), not just for the dashboard behind it.
+  const addLibraryRequest = dash.addLibraryRequest;
+  useEffect(() => {
+    if (addLibraryRequest > 0) setAddLibraryOpen(true);
+  }, [addLibraryRequest]);
   /**
    * Is the compact layout's detail sheet up? (plan-458 §2.3)
    *
@@ -1637,6 +1767,28 @@ export function ProjectsDashboardHost() {
       },
     });
   }, [linked, project.project?.id, runVerb, refreshLinked]);
+
+  // ── Regenerate thumbnails (plan-776 #20) ──────────────────────────────
+  // ONE registry command; this host only asks its rule (the menu item's
+  // disabled state + tooltip) and dispatches it by id. Progress, Cancel and the
+  // result are the command's progress store, shown by RegenerateThumbnailsDialog.
+  const regenerateThumbnailsState = useCallback(
+    (id: string) => regenerateThumbnailsMenuState(id, viewer),
+    [viewer],
+  );
+
+  const handleRegenerateThumbnails = useCallback((id: string) => {
+    // Dispatched in the click's tick: a linked folder may ask for access again,
+    // and that prompt needs the user activation of this click.
+    void dispatchRegenerateThumbnails(id, viewer)
+      .then(async (r) => {
+        // A refusal before the run started (the rule changed between menu and
+        // click) has no dialog to say it; a failed run already shows its error.
+        if (!r.ok && r.kind !== 'threw') setMessage(r.reason);
+        // A linked project may have been opened on the way.
+        await refreshLinked();
+      });
+  }, [viewer, refreshLinked]);
 
   // ── Scene actions (§3.6) ──────────────────────────────────────────────
   // The dashboard is the only scene browser after Phase 13, so it must carry
@@ -1833,11 +1985,14 @@ export function ProjectsDashboardHost() {
     documentId: string,
     declaredMode: string | null | undefined,
     isDemo: boolean,
+    /** The row's `modes` restriction - the chip must not name a mode the click would refuse. */
+    allowedModes: string[] | null = null,
   ): string | null => effectiveOpenMode({
     lastMode: documentModes.get(documentModeKey(backend, projectId, documentId))?.mode ?? null,
     declaredMode,
     isDemo,
     has: (m) => viewer.modes.has(m),
+    isAllowed: (m) => isModeAllowedForRow(allowedModes, m, (id) => viewer.modes.descriptor(id)?.runtime),
   }), [documentModes, viewer]);
 
   /**
@@ -1845,7 +2000,7 @@ export function ProjectsDashboardHost() {
    * detail pane's Open, a row of the project search (plan-513: through the
    * chain, below it because it uses the chain's deps).
    */
-  const openScene = useCallback((id: string) => {
+  const openDocumentRow = useCallback((id: string) => {
     if (!sceneStore) return;
     // Opening the document that is ALREADY open means one thing: the dashboard
     // is the only thing between the user and it. Close it and touch nothing —
@@ -1947,7 +2102,7 @@ export function ProjectsDashboardHost() {
    * The dashboard STAYS OPEN and drills into the new project. Creating a project
    * is not the same gesture as opening a document: the user asked for a project,
    * and dropping them into the viewport would hide the very screen they need to
-   * add to it. This is why the scene load here does not go through `openScene` —
+   * add to it. This is why the scene load here does not go through `openDocumentRow` —
    * that verb closes the dashboard, which is exactly right for a click on a
    * document card and exactly wrong here.
    *
@@ -2017,7 +2172,7 @@ export function ProjectsDashboardHost() {
     sourceUrl?: string,
   ) => {
     if (!sceneStore) return;
-    // Same rule as `openScene`: the already-open model just closes the
+    // Same rule as `openDocumentRow`: the already-open model just closes the
     // dashboard. Compared through the path-derived id this verb itself records
     // below, so the two sides of the comparison can only agree or genuinely
     // differ.
@@ -2027,7 +2182,7 @@ export function ProjectsDashboardHost() {
       return;
     }
     trySwitch(async () => {
-      // Open IN PLACE — same choreography as `openScene` above.
+      // Open IN PLACE — same choreography as `openDocumentRow` above.
       const seq = ++openSeqRef.current;
       beginProjectsOpening(label);
       try {
@@ -2040,7 +2195,7 @@ export function ProjectsDashboardHost() {
       }
       // Say WHAT is now open, so a mode that takes over later opens the same
       // thing instead of starting from nothing.
-      // This one STAYS, unlike `openScene`'s (plan-702 Phase 3). The funnel
+      // This one STAYS, unlike `openDocumentRow`'s (plan-702 Phase 3). The funnel
       // covers only what reaches `openDocument`, and this verb reaches it for
       // exactly one of its outcomes: a manifest path that HAS a document row. A
       // model path without a row stays a `builtin` base and does not pass the
@@ -2052,7 +2207,7 @@ export function ProjectsDashboardHost() {
     });
   }, [sceneStore, trySwitch, store, project.project?.id, viewer]);
 
-  const deleteScene = useCallback((id: string, name: string) => {
+  const deleteDocumentRow = useCallback((id: string, name: string) => {
     if (!sceneStore) return;
     // A destructive, irreversible action always asks first.
     setConfirmReq({
@@ -2073,7 +2228,7 @@ export function ProjectsDashboardHost() {
     });
   }, [sceneStore, runVerb, store]);
 
-  const duplicateScene = useCallback((id: string) => {
+  const duplicateDocumentRow = useCallback((id: string) => {
     if (!sceneStore) return;
     void runVerb('Duplicate scene', async () => {
       await sceneStore.duplicate(id);
@@ -2146,6 +2301,9 @@ export function ProjectsDashboardHost() {
     // contents, one row below the folder that already holds them. It is
     // dropped here rather than at the provider because the planner and the
     // asset picker still need the source.
+    // plan-778 provider-filter decision: ONLY the open project is dropped —
+    // a library project (`library-projects`) is another project and gets its
+    // own root, with its state in the label and its repair on the row.
     if (providerId === PROJECT_LIBRARY_PROVIDER_ID) return false;
     return true;
   }).map(({ providerId, source }) => {
@@ -2156,6 +2314,17 @@ export function ProjectsDashboardHost() {
       // One broken provider must not blank the whole tree (plan-702 §5.1 R4).
       entries = [];
     }
+    // plan-778: a library project's root says its state ("Access needed", "Not
+    // found", …) and, when transitive, which library needs it.
+    let label = source.error ? `${source.label} — ${source.error}` : source.label;
+    if (isLibraryProjectSource(source)) {
+      const badge = libraryStateBadge(source.state, source.id);
+      const neededByLabels = source.neededBy
+        .map(id => sources.find(s => s.providerId === LIBRARY_PROJECTS_PROVIDER_ID && s.source.id === id)?.source.label ?? id);
+      label = source.label
+        + (source.direct ? '' : ` — needed by ${neededByLabels.join(', ')}`)
+        + (badge.attention ? ` — ${badge.text}` : '');
+    }
     return {
       providerId,
       sourceId: source.id,
@@ -2165,7 +2334,7 @@ export function ProjectsDashboardHost() {
       // no children, indistinguishable from an empty library. The tree model
       // has no error channel of its own, so the reason rides in the label —
       // the one field that is guaranteed to reach the user's eye.
-      label: source.error ? `${source.label} — ${source.error}` : source.label,
+      label,
       // **Never writable, whatever the source says.** `writable` on a
       // `LibrarySource` means "assets can be written into it"; in the tree it
       // means "its folder structure can be rearranged", and no provider offers
@@ -2200,37 +2369,62 @@ export function ProjectsDashboardHost() {
    * person who opens it. Returns the reason to show, or null on success.
    */
   const attachLibraryToProject = useCallback(async (url: string): Promise<string | null> => {
-    const libStore = getLibraryStore();
-    const wasAttached = libStore.catalogUrls.includes(url);
-    await libStore.addCatalog(url, 'projectManifest');
-    // `addCatalog` resolves on a failed fetch and records the reason instead.
-    const failure = libStore.catalogErrors.get(url);
-    if (failure) {
-      if (!wasAttached) libStore.removeCatalog(url);
-      return failure;
-    }
+    // plan-655 F1: the UI view of `library.attach` — the one sequence in
+    // `project-library-attach.ts` (catalog first, project identity re-check,
+    // manifest write, rollback on any failure) that `web_library_attach` runs.
+    ensureLibraryCommandsRegistered();
+    const r = await commandRegistry.execute('library.attach', { url, label: null }, { origin: 'ui', viewer });
+    return r.ok ? null : r.reason;
+  }, [viewer]);
 
-    // `applyManifestDelta` returns null on a project it cannot write — a
-    // read-only backend, or none at all. Roll the subscription back rather
-    // than leave a library that is attached but not recorded anywhere.
-    const next = await store.applyManifestDelta(current =>
-      withProjectLibraries(current, [...readProjectLibraries(current), url]));
-    if (!next) {
-      if (!wasAttached) libStore.removeCatalog(url);
-      return 'This project is read-only, so a library cannot be added to it.';
-    }
-
-    // Re-declare the project level from what was just written, so the store's
-    // `_projectUrls` matches the manifest and the next project switch can swap
-    // it out again.
-    await libStore.applyProjectLibraries(readProjectLibraries(next));
-    return null;
-  }, [store]);
+  /**
+   * plan-778: the Add library… **Projects** tab — attach another project BY ID
+   * through `library.attach {projectId,label,hint}` (the same command MCP runs).
+   * Memoised: the dialog reads its candidate list once per open.
+   */
+  const libraryProjectsOptions = useMemo<AddLibraryProjectsOptions>(() => ({
+    openProjectId: project.project?.id ?? null,
+    attachedIds: attachedLibraryProjectIdsOf(project.project),
+    attach: async (ref) => {
+      ensureLibraryCommandsRegistered();
+      const r = await commandRegistry.execute('library.attach', ref, { origin: 'ui', viewer });
+      return r.ok ? null : r.reason;
+    },
+  }), [project.project, viewer]);
 
   /** Detach a library through whatever route its provider exposes. */
   const handleRemoveLibrary = useCallback((rootId: string, label: string) => {
     const registered = sourceOfRoot(rootId);
     const source = registered?.source;
+    // plan-778 Decision D: a DIRECT library project is removed from
+    // `libraries[]` through `library.detach {projectId}` after a confirmation
+    // that names how many placements will show as missing. Nothing is deleted.
+    if (registered && source && registered.providerId === LIBRARY_PROJECTS_PROVIDER_ID
+      && isLibraryProjectSource(source) && source.direct) {
+      const projectId = source.id;
+      const placements = countOpenLibraryPlacements(viewer, projectId);
+      setConfirmReq({
+        title: `Remove library '${source.label}'?`,
+        // Review U1: the realvirtual library and a library another one still
+        // needs stay resolvable — their placements do not go missing.
+        message: detachConfirmationMessage(source.label, placements,
+          libraryRemovalKeepsAvailable(getLibraryProjectLoader(), projectId)),
+        confirmLabel: 'Remove',
+        onConfirm: () => {
+          void runVerb('Remove library', async () => {
+            ensureLibraryCommandsRegistered();
+            const r = await commandRegistry.execute('library.detach', { projectId }, { origin: 'ui', viewer });
+            if (!r.ok) throw new Error(r.reason);
+            const group = { providerId: registered.providerId, sourceId: projectId };
+            if (selectionPointsIntoGroup(dash.selection, group)
+              || (dash.selection.kind === 'folder' && dash.selection.rootId === rootId)) {
+              setProjectsSelection({ kind: 'none' });
+            }
+          });
+        },
+      });
+      return;
+    }
     if (!registered || !source?.remove) return;
     setConfirmReq({
       title: 'Remove library',
@@ -2238,16 +2432,16 @@ export function ProjectsDashboardHost() {
       confirmLabel: 'Remove',
       onConfirm: () => {
         void runVerb('Remove library', async () => {
-          await source.remove!();
-          // A project library lives in `project.json`, so detaching it from
-          // the store alone would bring it straight back on the next open.
+          // A project library lives in `project.json`: detach it MANIFEST FIRST
+          // through `library.detach` (plan-655 F1), so a failed write leaves
+          // it attached instead of gone-now-but-back-on-reopen.
           if (registered.providerId === GLOBAL_LIBRARY_PROVIDER_ID
             && readProjectLibraries(store.getProject()).includes(source.id)) {
-            await store.applyManifestDelta(current => withProjectLibraries(
-              current,
-              readProjectLibraries(current).filter(u => u !== source.id),
-            ));
+            ensureLibraryCommandsRegistered();
+            const r = await commandRegistry.execute('library.detach', { url: source.id }, { origin: 'ui', viewer });
+            if (!r.ok) throw new Error(r.reason);
           }
+          await source.remove!();
           // A selection pointing into the library that just went away would
           // leave the detail pane describing a dead source (plan-702 §2.7/R5).
           const group = { providerId: registered.providerId, sourceId: source.id };
@@ -2258,7 +2452,7 @@ export function ProjectsDashboardHost() {
         });
       },
     });
-  }, [sourceOfRoot, runVerb, dash.selection, store]);
+  }, [sourceOfRoot, runVerb, dash.selection, store, viewer]);
 
   /** Re-scan a library that offers it. */
   const handleRefreshLibrary = useCallback((rootId: string) => {
@@ -2285,12 +2479,13 @@ export function ProjectsDashboardHost() {
    * (`folderRows` below) — this list is what the detail pane and the
    * classification editor read.
    *
-   * The rows come from `snapshot.documents`, the list phase 2 published. What
-   * used to be two lists here — `project.models` and `project.scenes` — are two
-   * sections of that one list, and the selection kinds stay `model` and `scene`
-   * because they still name what the detail pane can DO with a row (a scene can
-   * be renamed and deleted; a base model is opened and nothing else). The kinds
-   * are internal identifiers; nothing the user reads says either word.
+   * The rows come from `snapshot.documents`, the only list the snapshot carries.
+   * What used to be two lists here — a `models` view and a `scenes` view — are
+   * gone (plan-716 Phase 6, plan-777 P3). The selection kinds were renamed to
+   * `document` (by id) and `documentPath` (by path) in plan-720: they name
+   * which key a selection holds, never a kind of document. The rail-group kinds
+   * `'scenes'`/`'models'` survive only as persisted deep-link values that fold
+   * back to the one list (see `ProjectsRailGroup`).
    *
    * Library documents ARE here since plan-703 Phase 6, unlike under the tabs:
    * the tree shows the project folder as it is, and `library/` is an ordinary
@@ -2307,11 +2502,11 @@ export function ProjectsDashboardHost() {
         classification: doc.classification,
         doc,
         // One key shape for every document — the row is addressed by its id,
-        // wherever the file sits (placeless, plan-716/717). 'scene:' is the
-        // historical prefix and is now the ONLY one: the 'published:' keys that
-        // used to sit beside it were the second identity space plan-731 melted
-        // into this very list.
-        key: 'scene:' + doc.id,
+        // wherever the file sits (placeless, plan-716/717). It was 'scene:' until
+        // plan-777 — the historical prefix of the scene list — and the only one
+        // left: the 'published:' keys that used to sit beside it were the second
+        // identity space plan-731 melted into this very list.
+        key: 'document:' + doc.id,
       });
     }
 
@@ -2422,21 +2617,13 @@ export function ProjectsDashboardHost() {
   }, [dash.open, store, project.project?.id, project.documents, listingBump]);
 
   /**
-   * Per-document stats — the content VERSION of every card preview, and the
-   * on-disk size the detail pane shows.
+   * Per-document stats — the on-disk size the detail pane shows.
    *
-   * The thumbnail cache is persistent and keyed by identity; without a
-   * version segment the first render ever made was served forever, saves
-   * included (defect 2026-08-19). The mtime is the honest version: it changes
-   * exactly when the bytes do. Re-statted on every dashboard open and
-   * whenever a save lands (`document-saved`), so the very next card render
-   * misses the old cache entry and draws the new bytes.
-   *
-   * The size rides along in the same map because it comes out of the same
-   * `statDocuments()` call — a second stat pass for the pane would walk the
-   * whole folder again for a number the first pass already had. A backend
-   * that cannot size a body reports 0, which is kept OUT of the map so the
-   * pane omits the row rather than printing a GLB as empty.
+   * Re-statted on every dashboard open and whenever a save lands
+   * (`document-saved`). Card pictures no longer depend on it (plan-776): a
+   * save writes a new hashed sidecar and a new row pointer, which is the
+   * version. A backend that cannot size a body reports 0, which is kept OUT
+   * of the map so the pane omits the row rather than printing a GLB as empty.
    */
   const [docStats, setDocStats] = useState<ReadonlyMap<string, DocumentStatEntry>>(new Map());
   const [statsBump, setStatsBump] = useState(0);
@@ -2607,9 +2794,9 @@ export function ProjectsDashboardHost() {
     // type (plan-716/717), so where the file sits must not decide what a
     // double-click means. `openModel` is left for what has no row at all.
     const doc = documentByPath.get(ref.path);
-    if (doc) openScene(doc.id);
+    if (doc) openDocumentRow(doc.id);
     else openModel(ref.path, node.name);
-  }, [tree.refs, sources, documentByPath, openAssetInEditor, openScene, openModel]);
+  }, [tree.refs, sources, documentByPath, openAssetInEditor, openDocumentRow, openModel]);
 
   // ── The folder's contents, as cards (Lauf 13) ─────────────────────────
   /**
@@ -2654,11 +2841,18 @@ export function ProjectsDashboardHost() {
    * what survives the rename the user very often does next.
    */
   const handleNewDocument = useCallback(() => {
+    // Ask for the name FIRST (user report 2026-10-20): the document is born
+    // under the name the user means, instead of as "Untitled" plus a rename.
+    // The folder is decided NOW, at the click, so navigating while the dialog
+    // is up cannot move the create somewhere the user did not click in.
     const folder = newDocumentFolderFor(project.project?.id, selectedFolderPath);
+    setAssetDialog({ kind: 'newDocument', relPath: folder, value: newDocumentNameFor(folder) });
+  }, [project.project?.id, selectedFolderPath]);
+
+  /** Confirm handler of the new-document name prompt — the create itself. */
+  const createNamedDocument = useCallback((folder: string, name: string) => {
     void runVerb('New document', async () => {
-      const tCreate = performance.now();   // TEMP verb-timing
-      const created = await createDocument(store, newDocumentNameFor(folder), { folder });
-      console.warn(`[verb-timing] createDocument ${Math.round(performance.now() - tCreate)} ms`);
+      const created = await createDocument(store, name, { folder });
       // Two listings have to learn about the newborn before it can be shown:
       // the document scan (tree rows + folder cards) and the project-library
       // catalog (thumbnails, drag-into-scene). The row itself is already in the
@@ -2669,7 +2863,7 @@ export function ProjectsDashboardHost() {
       // reload right after the click cannot lose the row.
       await store.flush();
     });
-  }, [runVerb, store, project.project?.id, selectedFolderPath]);
+  }, [runVerb, store]);
 
   /** The folder's direct document/attachment rows, with what each one is. */
   const folderRows = useMemo(() => folderContents(treeRoots, selectedFolderPath).map(node => {
@@ -2801,12 +2995,13 @@ export function ProjectsDashboardHost() {
    */
   const recentModeOf = useCallback((entry: RecentDocumentEntry) => {
     const open = project.project?.id === entry.projectId && project.backendKind === entry.backend;
+    const openRow = open ? project.documents.find(d => d.id === entry.documentId) : undefined;
     const declared = open
-      ? project.documents.find(d => d.id === entry.documentId)?.mode
+      ? openRow?.mode
       : modelSnapshots.find(s => s.backend === entry.backend && s.projectId === entry.projectId)
         ?.docs.find(d => d.id === entry.documentId)?.mode;
     return openModeOf(entry.backend, entry.projectId, entry.documentId, declared,
-      open && project.project?.kind === 'demo');
+      open && project.project?.kind === 'demo', allowedModesOf(openRow));
   }, [openModeOf, project.project, project.backendKind, project.documents, modelSnapshots]);
 
   /** Announce a card drag to the tree, which owns every drop. */
@@ -2831,15 +3026,12 @@ export function ProjectsDashboardHost() {
           ? sources.find(s => s.providerId === ref.providerId && s.source.id === ref.sourceId)
             ?.source.getEntry(ref.assetId) ?? null
           : null;
-        // A project document is not a catalog entry and never will be; the
-        // card only ever reads `name`/`thumbnailUrl`/`category` off it, so the
-        // honest thing is a minimal stand-in rather than a fake catalog row.
-        const entry: LibraryCatalogEntry = catalogEntry ?? {
-          id: path,
-          name: node.name,
-          category: 'custom',
-          ...(doc?.thumbnail ? { thumbnailUrl: doc.thumbnail } : {}),
-        };
+        // The entry + saved-thumbnail pointer (plan-776 F9) — a pure rule in
+        // `dashboard-documents.ts`, so it has a test. A card shows the picture
+        // a SAVE wrote, or its type placeholder; nothing is rendered here.
+        const { entry, thumbnailPointer } = documentCardPicture({
+          path, name: node.name, doc, catalogEntry,
+        });
         // A CONNECT config / knowledge file is what its ENDING says (plan-718):
         // it gets the stated glyph tile instead of a preview, and no Open verb
         // — the detail pane is where it is inspected, double-click opens
@@ -2881,65 +3073,11 @@ export function ProjectsDashboardHost() {
             onClick: () => setAssetDialog({ kind: 'renameNode', relPath: path, value: node.name }),
           });
         }
-        // A card shows a picture only when one already exists — a catalog that
-        // ships thumbnails, or a document with a saved `thumbnail`. Everything
-        // else stayed blank because the generator `ProjectCard` already owns
-        // was never armed: it needs an identity to cache under and a way to
-        // fetch the bytes, and the grid passed neither. Both are cheap here.
-        // A catalog asset resolves through its own source (the same call the
-        // library grid used); a project document has no source, so it resolves
-        // through the backend and is keyed in a namespace of its own — its
-        // path is unique within the project, which is all the key needs.
-        const backend = store.getBackend();
-        const docVersion = documentThumbnailVersion(docStats.get(node.relPath), doc);
-        const thumbnailKey: ThumbnailKeyParts | undefined = ref?.kind === 'catalogAsset'
-          ? {
-            projectId: project.project?.id ?? NO_PROJECT,
-            providerId: ref.providerId,
-            sourceId: ref.sourceId,
-            assetId: ref.assetId,
-          }
-          : node.kind === 'document' && backend
-            ? {
-              projectId: project.project?.id ?? NO_PROJECT,
-              providerId: 'project-document',
-              sourceId: node.rootId,
-              assetId: path,
-              // The content version (file mtime, else the manifest's sha256 /
-              // mtimeMs for a backend without stats): a changed document gets
-              // a NEW key, so the persistent cache misses and re-renders
-              // instead of serving the old picture forever.
-              ...(docVersion !== undefined ? { version: docVersion } : {}),
-            }
-            : undefined;
-        const resolveThumbnail = ref?.kind === 'catalogAsset'
-          ? async () => {
-            const source = sources.find(
-              s => s.providerId === ref.providerId && s.source.id === ref.sourceId)?.source;
-            if (!source) return null;
-            const resolved = await source.resolveAsset(ref.assetId, 'thumbnail');
-            return { url: resolved.url, release: resolved.revokeUrl };
-          }
-          : node.kind === 'document' && backend
-            ? async () => backend.readDocumentUrl(node.relPath)
-            : undefined;
-        // The PERSISTED preview, keyed by document id (plan-744 F5) — tried
-        // before the GLB is decoded and rendered. Only a real document has
-        // one; a catalog asset's picture comes from its own source.
-        const resolveThumbnailSidecar = doc?.id && backend && ref?.kind !== 'catalogAsset'
-          ? async () => {
-            const { resolveDocumentThumbnail } = await import(
-              '../../library/resolve-document-thumbnail');
-            const found = await resolveDocumentThumbnail(backend, doc);
-            return found ? { url: found.url, release: found.release } : null;
-          }
-          : undefined;
         return {
           key: path,
           entry,
-          thumbnailKey,
-          resolveThumbnail,
-          resolveThumbnailSidecar,
+          thumbnailPointer,
+          thumbnailBackend: thumbnailPointer ? store.getBackend() : null,
           ...(isConnectConfig ? { glyph: 'connect' as const } : {}),
           ...(isKnowledgeFile ? { glyph: 'knowledge' as const } : {}),
           // Every other plain file of the folder — PDF, slides, video, … —
@@ -2970,7 +3108,7 @@ export function ProjectsDashboardHost() {
           // (catalog asset, attachment, plain file) shows no chip.
           openMode: doc?.id && ref?.kind !== 'catalogAsset' && project.project && project.backendKind
             ? openModeOf(project.backendKind, project.project.id, doc.id, doc.mode,
-              project.project.kind === 'demo')
+              project.project.kind === 'demo', allowedModesOf(doc))
             : null,
           // A config/knowledge card is draggable even when its FILE may not
           // move (a reserved-folder row): the drag then carries only the
@@ -3006,7 +3144,7 @@ export function ProjectsDashboardHost() {
         };
       }),
     [folderRows, documentFilter, sources, selectedTreePath, project.project?.id,
-      store, docStats, handleTreeSelect, handleTreeActivate, treeRoots,
+      store, handleTreeSelect, handleTreeActivate, treeRoots,
       openModeOf, project.project, project.backendKind],
   );
 
@@ -3505,6 +3643,11 @@ export function ProjectsDashboardHost() {
     if (!assetDialog) return;
     const { kind, relPath, value } = assetDialog;
     setAssetDialog(null);
+    if (kind === 'newDocument') {
+      const name = value.trim();
+      if (name) createNamedDocument(relPath, name);
+      return;
+    }
     if (kind === 'collections') {
       // The store, not the backend: collections live on the manifest row now
       // (§2.4). `runAssetOp` still wraps it — the writable check and the two
@@ -3513,7 +3656,7 @@ export function ProjectsDashboardHost() {
       return;
     }
     renameLibraryAsset(relPath, value);
-  }, [assetDialog, runAssetOp, renameLibraryAsset, store]);
+  }, [assetDialog, runAssetOp, renameLibraryAsset, store, createNamedDocument]);
 
   /**
    * "Rename…" on a card — the tree's F2 for a row that is no longer in the tree.
@@ -3771,6 +3914,15 @@ export function ProjectsDashboardHost() {
     };
   }, [selectedMdPath, mdFile, project.writable, saveMarkdown]);
 
+  // The selected document's saved preview for the detail pane (plan-776 F9):
+  // the row's pointer read through the backend — the same URL the card holds.
+  const selectedDocumentThumbnail = useThumbnailUrl(
+    dash.selection.kind === 'document' ? store.getBackend() : null,
+    dash.selection.kind === 'document'
+      ? documentById(project.documents, dash.selection.documentId)?.thumbnail ?? null
+      : null,
+  );
+
   // ── Detail pane for the current selection (§3.6) ──────────────────────
   const detail = useMemo(() => {
     const sel = dash.selection;
@@ -3780,23 +3932,23 @@ export function ProjectsDashboardHost() {
       // projection of exactly this array, so the lookup is the same lookup
       // against a superset — a selection that names a `library/` document now
       // gets the pane it always should have had instead of an empty column.
-      const scene = documentById(project.documents, sel.documentId);
-      if (!scene) return { title: null };
-      const bundled = scene.tier === 'bundled';
+      const doc = documentById(project.documents, sel.documentId);
+      if (!doc) return { title: null };
+      const bundled = doc.tier === 'bundled';
       const fields: DetailField[] = [];
-      if (scene.modifiedAt) fields.push({ label: 'Modified', value: scene.modifiedAt });
+      if (doc.modifiedAt) fields.push({ label: 'Modified', value: doc.modifiedAt });
       // The GLB's size on disk, from the same stat pass that versions the
       // thumbnails. Absent (not "0 B") when the backend cannot size a body.
-      const size = formatDocumentSize(docStats.get(scene.path)?.size);
+      const size = formatDocumentSize(docStats.get(doc.path)?.size);
       if (size) fields.push({ label: 'Size', value: size });
       if (project.project?.name) fields.push({ label: 'Project', value: project.project.name });
       // The document's CONNECT binding (`documents[].connectRef`, plan-718 §3).
       // Shown whenever set — and marked when the file it names is not in the
       // config listing, because a dead reference is exactly what this row
       // exists to surface.
-      fields.push(...refFields(scene, connectConfigs, knowledgeFiles));
+      fields.push(...refFields(doc, connectConfigs, knowledgeFiles));
       const actions: DetailAction[] = [
-        { key: 'open', label: 'Open', primary: true, onClick: () => openScene(scene.id) },
+        { key: 'open', label: 'Open', primary: true, onClick: () => openDocumentRow(doc.id) },
         // Same document in a fresh tab: the `?doc=<id>` deep link is the one
         // open verb, and the new tab restores the active project on its own
         // (`restoreLastProject`, no prompt). Every other parameter of the
@@ -3805,51 +3957,51 @@ export function ProjectsDashboardHost() {
           key: 'open-tab',
           label: 'Open in new tab',
           onClick: () => {
-            window.open(sceneUrlToDocumentUrl(window.location.href, scene.id), '_blank', 'noopener,noreferrer');
+            window.open(sceneUrlToDocumentUrl(window.location.href, doc.id), '_blank', 'noopener,noreferrer');
           },
         },
       ];
-      // A bundled scene is offered a duplicate rather than five greyed-out
+      // A bundled document is offered a duplicate rather than five greyed-out
       // buttons — telling the user the way forward beats disabling (§3.6).
       if (bundled) {
         actions.push({
           key: 'dup',
           label: 'Duplicate to this project',
-          onClick: () => duplicateScene(scene.id),
+          onClick: () => duplicateDocumentRow(doc.id),
         });
       } else {
         // No "Rename" entry here either: the pane derives it from `onRename`
-        // below (plan-450 §2.2), so a writable scene gets the button without
+        // below (plan-450 §2.2), so a writable document gets the button without
         // this list restating the permission — and a bundled one, which never
         // supplies `onRename`, gets no button at all rather than a dead one.
-        actions.push({ key: 'dup', label: 'Duplicate', onClick: () => duplicateScene(scene.id) });
-        // `scene` IS the document row now — the second lookup that used to
+        actions.push({ key: 'dup', label: 'Duplicate', onClick: () => duplicateDocumentRow(doc.id) });
+        // `doc` IS the document row now — the second lookup that used to
         // stand here asked the same array for the same id.
-        actions.push(...transferActionsFor(scene));
+        actions.push(...transferActionsFor(doc));
         actions.push({
           key: 'delete',
           label: 'Delete',
           destructive: true,
-          onClick: () => deleteScene(scene.id, scene.name),
+          onClick: () => deleteDocumentRow(doc.id, doc.name),
         });
       }
-      const row = documentRows.find(r => r.key === 'scene:' + scene.id);
+      const row = documentRows.find(r => r.key === 'document:' + doc.id);
       return {
-        title: scene.name,
+        title: doc.name,
         // The subtitle says only what nothing else shows: writability. The
         // word "Document" said nothing the row's presence did not already say
         // — what the file IS is the type badge, where it LIVES is the place
         // badge, and the root earns no place chip at all.
         ...(bundled ? { subtitle: 'Read-only' } : {}),
         badge: bundled ? 'Sample' : null,
-        badges: [documentTypeBadge(scene), documentRoleBadge(scene)],
-        thumbnailUrl: scene.thumbnail ?? null,
+        badges: [documentTypeBadge(doc), documentRoleBadge(doc)],
+        thumbnailUrl: selectedDocumentThumbnail,
         fields,
         actions,
         extra: documentExtraFor(row),
         // The title edits in place — the same commit the Rename action makes.
         ...(bundled || !sceneStore ? {} : {
-          onRename: (name: string) => { renameDocumentRow(scene.id, name); },
+          onRename: (name: string) => { renameDocumentRow(doc.id, name); },
         }),
       };
     }
@@ -3859,22 +4011,15 @@ export function ProjectsDashboardHost() {
       // path selection is a path selection: an example is an ordinary document
       // row and answers through `documentByPath` like every other one.
       //
-      // `models[]` paths can carry a leading slash (the bundled manifest
-      // declares them URL-style, `/models/x.glb`) while the tree's document
-      // paths never do — compare with it stripped, or a bundled project's
-      // model row answers with an empty detail pane.
-      const model = project.models.find(m => m.path.replace(/^\/+/, '') === sel.path);
-      // `models[]` carries only the `models/` section — a document in
-      // `library/` (or anywhere else) is still a selectable asset and answers
-      // through the one document list instead of an empty pane.
-      const doc = documentByPath.get(sel.path);
-      const label = (model && (model.label ?? baseNameOf(model.path)))
-        ?? doc?.name ?? baseNameOf(sel.path);
+      // One lookup over the one list (plan-777 F3). A bundled manifest declares
+      // its paths URL-style (`/models/x.glb`) while the tree's paths never carry
+      // the leading slash — the helper strips it on both sides, or a bundled
+      // project's row answers with an empty detail pane.
+      const doc = documentForSelectedPath(project.documents, sel.path);
+      const label = doc?.name ?? baseNameOf(sel.path);
       if (!label) return { title: null };
-      const row = documentRows.find(
-        r => r.key === (doc ? 'scene:' + doc.id : 'model:' + sel.path),
-      );
-      const readOnly = (model?.tier ?? doc?.tier) === 'bundled';
+      const row = doc ? documentRows.find(r => r.key === 'document:' + doc.id) : undefined;
+      const readOnly = doc?.tier === 'bundled';
       return {
         title: label,
         // Same rule as the branch above: the subtitle carries only what no
@@ -3893,7 +4038,7 @@ export function ProjectsDashboardHost() {
             primary: true,
             onClick: () => openModel(sel.path, label),
           },
-          ...(readOnly ? [] : transferActionsFor(documentByPath.get(sel.path))),
+          ...(readOnly ? [] : transferActionsFor(doc)),
         ] as DetailAction[],
         extra: documentExtraFor(row),
         // Inline title rename runs the SAME gate and write path as F2 on the
@@ -4035,12 +4180,12 @@ export function ProjectsDashboardHost() {
     // repeated them here would make "no selection" look like a selection.
     return { title: null };
   }, [dash.selection, project, sources, store, runVerb, connectConfigs, knowledgeFiles,
-      openScene, duplicateScene, deleteScene, buildAssetActions, openModel,
-      project.models, documentRows, documentExtraFor,
+      openDocumentRow, duplicateDocumentRow, deleteDocumentRow, buildAssetActions, openModel,
+      project.documents, documentRows, documentExtraFor,
       transferActionsFor, documentByPath, sourceOfRoot, treeRoots, catalogRoots,
       handleRefreshLibrary, handleRemoveLibrary,
       sceneStore, selectedTreePath, runTreeEdit, renameLibraryAsset, renameDocumentRow,
-      tree.refs, markdownPane, docStats]);
+      tree.refs, markdownPane, docStats, selectedDocumentThumbnail]);
 
 
   /**
@@ -4053,12 +4198,32 @@ export function ProjectsDashboardHost() {
     const registered = sourceOfRoot(node.rootId);
     if (!registered) return null;
     const src = registered.source;
+    // plan-778: a library project's repair (Grant / Locate folder…) and its
+    // Remove (direct only — a transitive library belongs to the library that
+    // names it). The repair is dispatched straight from the click (activation).
+    const libProject = registered.providerId === LIBRARY_PROJECTS_PROVIDER_ID && isLibraryProjectSource(src) ? src : null;
+    const badge = libProject ? libraryStateBadge(libProject.state, libProject.id) : null;
+    const removable = !!src.remove || !!libProject?.direct;
     return (
       <Box
         onClick={(e) => e.stopPropagation()}
         onDoubleClick={(e) => e.stopPropagation()}
         sx={{ display: 'flex', alignItems: 'center', flexShrink: 0, ml: 0.5 }}
       >
+        {libProject && badge?.repairLabel && (
+          <Button
+            size="small"
+            data-library-repair={libProject.id}
+            onClick={() => {
+              ensureLibraryCommandsRegistered();
+              void runLibraryRepair(libProject.id, libProject.state, viewer)
+                ?.then((r) => { if (!r.ok) setMessage(r.reason); });
+            }}
+            sx={{ fontSize: 11, textTransform: 'none', minWidth: 0, py: 0, px: 0.75 }}
+          >
+            {badge.repairLabel}
+          </Button>
+        )}
         {src.refresh && (
           <Tooltip title="Refresh library">
             <IconButton
@@ -4071,7 +4236,7 @@ export function ProjectsDashboardHost() {
             </IconButton>
           </Tooltip>
         )}
-        {src.remove && (
+        {removable && (
           <Tooltip title="Remove library">
             <IconButton
               size="small"
@@ -4085,7 +4250,7 @@ export function ProjectsDashboardHost() {
         )}
       </Box>
     );
-  }, [sourceOfRoot, handleRefreshLibrary, handleRemoveLibrary]);
+  }, [sourceOfRoot, handleRefreshLibrary, handleRemoveLibrary, viewer]);
 
   // ── Header menus (project verbs + folder create) ──────────────────────
   // The project's verbs moved from the detail pane's no-selection fallback
@@ -4184,6 +4349,7 @@ export function ProjectsDashboardHost() {
         open={addLibraryOpen}
         onClose={() => setAddLibraryOpen(false)}
         onAttach={attachLibraryToProject}
+        projects={project.project ? libraryProjectsOptions : undefined}
         attachHint={'Added to this project ' + '—' + ' the reference is stored in project.json and travels with the project.'}
         onConnectAssetManager={cloudStore
           ? (req) => cloudStore.addConnection(req.label, {
@@ -4302,17 +4468,8 @@ export function ProjectsDashboardHost() {
           reject?.(false);
         }}
       />
-      <Dialog open={operationLabel !== null} disableEscapeKeyDown maxWidth="xs" fullWidth
-        onKeyDown={e => e.stopPropagation()}
-        aria-labelledby="project-operation-title" aria-describedby="project-operation-description">
-        <DialogTitle id="project-operation-title">{operationLabel}…</DialogTitle>
-        <DialogContent>
-          <Typography id="project-operation-description" sx={{ mb: 2 }}>
-            Please wait while the project is updated.
-          </Typography>
-          <LinearProgress aria-label={operationLabel ?? 'Updating project'} />
-        </DialogContent>
-      </Dialog>
+      <ProjectOperationDialog label={operationLabel} />
+      <RegenerateThumbnailsDialog />
       <Snackbar open={successMessage !== null} autoHideDuration={4000}
         onClose={() => setSuccessMessage(null)}
         anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}>
@@ -4432,6 +4589,23 @@ export function ProjectsDashboardHost() {
                   secondaryTypographyProps={{ fontSize: 10 }}
                 />
               </MenuItem>
+              {/* plan-778: hidden where no folder can be picked (Firefox/Safari). */}
+              {typeof window !== 'undefined' && 'showDirectoryPicker' in window && (
+                <MenuItem
+                  disabled={project.backendKind !== 'folder'}
+                  data-testid="pack-with-libraries"
+                  onClick={() => { handlePackWithLibraries(); setProjectMenuAnchor(null); }}
+                >
+                  <ListItemText
+                    primary="Pack with libraries…"
+                    secondary={project.backendKind !== 'folder'
+                      ? 'Only a project folder can be packed.'
+                      : 'Copy the project and the library parts it uses into a folder.'}
+                    primaryTypographyProps={{ fontSize: 13 }}
+                    secondaryTypographyProps={{ fontSize: 10 }}
+                  />
+                </MenuItem>
+              )}
               <MenuItem
                 onClick={() => { setProjectMenuAnchor(null); handleImportProject(); }}
                 sx={{ fontSize: 13 }}
@@ -4681,7 +4855,7 @@ export function ProjectsDashboardHost() {
               </Menu>
             </Box>
 
-            <Box sx={{ flex: 1, minWidth: 8 }} />
+            <Box sx={{ flex: 1, minWidth: 8, ...(compactLayout ? { display: 'none' } : {}) }} />
 
             {/* The classification chips live in a drawer under this bar,
                 behind the same filter icon the hierarchy browser and the
@@ -4698,7 +4872,7 @@ export function ProjectsDashboardHost() {
                 sx={{
                   // One control height for the whole bar (24px) — icon, search
                   // field and button sit on a shared cap and base line.
-                  p: 0, width: 24, height: 24,
+                  p: 0, width: compactLayout ? 44 : 24, height: compactLayout ? 44 : 24,
                   flexShrink: 0,
                   color: filtersOpen || hasActiveFilters ? 'primary.main' : 'text.secondary',
                   bgcolor: filtersOpen ? 'rgba(79, 195, 247, 0.12)' : 'transparent',
@@ -4732,11 +4906,11 @@ export function ProjectsDashboardHost() {
                   ),
                   // 16px on a coarse pointer, whatever the layout: below it
                   // iOS zooms the page on focus and never zooms back.
-                  sx: { fontSize: touchInput ? 16 : 12, height: touchInput ? 36 : 24 },
+                  sx: { fontSize: touchInput ? 16 : 12, height: compactLayout ? 44 : touchInput ? 36 : 24 },
                 },
               }}
               sx={compactLayout
-                ? { flex: '1 1 140px', minWidth: 0 }
+                ? { flex: '1 1 calc(100% - 52px)', minWidth: 0 }
                 : { width: 200, flexShrink: 0 }}
             />
             {/*
@@ -4944,8 +5118,8 @@ export function ProjectsDashboardHost() {
 
   // ── Screen one: which project ─────────────────────────────────────────
   // The kiosk gate is a statement about the DEPLOYMENT, not about the model
-  // that happens to be open. A project plugin may lock the mode — Mauser and
-  // Toray both do, to make their model a single-purpose 3D-HMI — while the very
+  // that happens to be open. A project plugin may lock the mode — the large CAD line and
+  // a CAD-import showcase model both do, to make their model a single-purpose 3D-HMI — while the very
   // same build sits next to a dozen other linked projects. Reading `modeLocked`
   // alone told that developer "This deployment opens a single fixed project"
   // and took the list away. So the screen closes only when the lock is backed
@@ -5008,6 +5182,8 @@ export function ProjectsDashboardHost() {
               onRemove={handleRemove}
               onRenameProject={handleRenameProject}
               onDeleteProject={handleDeleteProject}
+              onRegenerateThumbnails={handleRegenerateThumbnails}
+              regenerateThumbnailsState={regenerateThumbnailsState}
             />
           )}
       </Box>

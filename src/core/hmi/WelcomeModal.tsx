@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 import { useEffect } from 'react';
 import { Box, Modal, Typography, Button } from '@mui/material';
 import SlideshowOutlinedIcon from '@mui/icons-material/SlideshowOutlined';
@@ -16,6 +18,7 @@ import { DEMO_PROJECT_SLUG } from '../project/backends/bundled-backend';
 import { documentsOf, findStartDocument, stableDocumentId } from '../project/rv-project-documents';
 import { projectStartDocument } from '../project/rv-project-open';
 import type { RvProject } from '../project/rv-project-types';
+import { hasTermsConsent } from './terms-consent-store';
 
 /** Primary use cases, shown as a compact list. */
 const USE_CASES: Array<[string, string]> = [
@@ -157,23 +160,22 @@ const TERMS_ACCEPTED_KEY = 'rv-terms-accepted';
 // the answer until the page is reloaded.
 let sessionAccepted = false;
 
-/** True once the user accepted the beta note + license terms in this browser. */
+/**
+ * True once the user accepted the beta note + license terms in this browser.
+ *
+ * Public demo build (plan-2209): a current acceptance of the demo terms in the
+ * pre-boot terms gate already covers this — the demo never asks twice. The
+ * define folds this branch away in every other build.
+ */
 export function hasAcceptedTerms(): boolean {
   if (sessionAccepted) return true;
-  try {
-    return localStorage.getItem(TERMS_ACCEPTED_KEY) === '1';
-  } catch {
-    return false;
-  }
+  if (__RV_TERMS_GATE__ === 'demo' && hasTermsConsent('demo')) return true;
+  return readLocalStorage(TERMS_ACCEPTED_KEY) === '1';
 }
 
 function recordTermsAccepted(): void {
   sessionAccepted = true;
-  try {
-    localStorage.setItem(TERMS_ACCEPTED_KEY, '1');
-  } catch {
-    // Storage unavailable — sessionAccepted carries the answer.
-  }
+  writeLocalStorage(TERMS_ACCEPTED_KEY, '1');
 }
 
 interface WelcomeModalProps {

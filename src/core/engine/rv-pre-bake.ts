@@ -30,6 +30,7 @@ import { preBakeHookOf, type PreBakeContext, type PreBakeHook } from './rv-compo
 import { NodeRegistry, isSignalComponentTypeKey } from './rv-node-registry';
 import { registerNodeAliasesInRegistry } from './rv-node-aliases';
 import { resolveReferencePath, scopeOf, type ReferenceScope } from './rv-reference-resolver';
+import { createFileReferenceLookup, type FileIdentity } from './rv-decode-identity';
 
 /**
  * Types whose hook must run before the rest, in this order. Everything not
@@ -69,7 +70,7 @@ export interface PreBakeResult {
  *
  * It must resolve what the RUNTIME registry resolves, or the survival model
  * (`computeSurvival`) reports references as unresolved that are perfectly fine
- * at runtime — on the Mauser that was 2422 "unresolved" against 46, purely
+ * at runtime — on the large CAD line that was 2422 "unresolved" against 46, purely
  * because this registry lacked the layers below (plan-754 Phase 1c). Two of
  * them matter, and both only for models whose references are ROOT-RELATIVE and
  * therefore resolve through the registry's SUFFIX stage:
@@ -195,16 +196,28 @@ export function createPreBakeContext(
   root: Object3D,
   resolver?: { getNode(path: string): Object3D | null },
   rootNames?: Iterable<string | undefined | null>,
+  identity?: FileIdentity | null,
 ): PreBakeSession {
   const index = resolver ?? buildPreBakeRegistry(root);
   const scope = prepareScopeOf(root, rootNames);
   const materials = new Map<string, Material>();
   const reparented: PreBakeReparent[] = [];
+  const resolvePath = (path: string): Object3D | null => resolveReferencePath(index, path, scope).node;
+  // plan-769 Phase 1b: a stored reference of the file is read by the file's verdict
+  // (the same one survival and the runtime registry read), never by the stages above.
+  const fileRefs = createFileReferenceLookup(root, identity);
   const ctx: PreBakeContext = {
     root,
     // THE resolver (rv-reference-resolver.ts): as written inside the asset,
     // then root-stripped, else null — same rule the runtime applies.
-    resolvePath: (path) => resolveReferencePath(index, path, scope).node,
+    resolvePath,
+    resolveStored: (value) => {
+      // plan-769 Phase 3: any stored form — a path (the file's verdict, else the
+      // resolver), an address of this file (by id), a kept path (no node).
+      const hit = fileRefs.stored(value);
+      if (hit !== undefined) return hit;
+      return typeof value === 'string' ? resolvePath(value) : null;
+    },
     localBounds: (node) => localSourceBounds(node),
     keepMaterial: (id, material) => {
       if (!materials.has(id)) materials.set(id, material);

@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { testAddressRegistry } from '../helpers/test-address-registry';
+
+import { componentState } from './snapshot-test-utils';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ArcSegment, RVPath } from '../../src/core/engine/rv-path';
 import { getDefaultPathNetwork } from '../../src/core/engine/rv-path-network';
 import { Object3D, Vector3 } from 'three';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
-import { bindSceneToRunner } from '@rv-private/plugins/des/des-scene-binding';
-import { MaterialFlowAdapter } from '@rv-private/plugins/des/material-flow-adapter';
-import { DESComponent } from '@rv-private/plugins/des/rv-des-component';
-import { _resetDesHookCache } from '@rv-private/plugins/des/des-hook-adapter';
-import { resetDESMUCounter } from '@rv-private/plugins/des/rv-des-mu';
+import { DESRunner } from '@rv/plugins/des/des-runner';
+import { bindSceneToRunner } from '@rv/plugins/des/des-scene-binding';
+import { MaterialFlowAdapter } from '@rv/plugins/des/material-flow-adapter';
+import { DESComponent } from '@rv/plugins/des/rv-des-component';
+import { _resetDesHookCache } from '@rv/plugins/des/des-hook-adapter';
+import { resetDESMUCounter } from '@rv/plugins/des/rv-des-mu';
 import {
   createSelf,
   type MaterialFlowSelf,
@@ -30,6 +33,7 @@ import {
 } from '../../src/core/behavior-runtime';
 import { EventEmitter } from '../../src/core/rv-events';
 import { ContextMenuStore } from '../../src/core/hmi/context-menu-store';
+import { getProblems } from '../../src/core/hmi/problems-store';
 
 function testHost(): BindContextHost {
   const values = new Map<string, boolean | number>();
@@ -43,7 +47,7 @@ function testHost(): BindContextHost {
     on: (event, callback) => events.on(event, callback as never),
     contextMenu: new ContextMenuStore(),
     drives: [] as never,
-    registry: null,
+    registry: null, desAddresses: testAddressRegistry(),
     getPlugin: () => undefined,
   };
 }
@@ -89,7 +93,7 @@ function bind(runner: DESRunner, def: MaterialFlowDefinition, name: string): Bou
     onTransfer: (mu) => runner.makeTransfer(adapter)(mu),
     spawnMU: () => runner.createMU(),
   });
-  adapter = runner.addInstance(def, self, node);
+  adapter = runner.addInstance(def, self, node, undefined, { desId: node.name + '@' + def.type });
   return { def, self, adapter, node };
 }
 
@@ -189,10 +193,9 @@ describe('unified kernel contracts (plan-297 phase 0)', () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       expect(bindSceneToRunner(new DESRunner(), invalidScene, testHost())).toBe(0);
-      expect(error).toHaveBeenCalledWith(
-        expect.stringContaining('bind error'),
-        expect.objectContaining({ message: expect.stringContaining('invalid numeric config') }),
-      );
+      // plan-2006 #22: an invalid capacity is a Problems entry, not a console error.
+      expect(getProblems().some((p) => p.code === 'des-invalid-capacity')).toBe(true);
+      expect(error).not.toHaveBeenCalled();
     } finally {
       error.mockRestore();
     }
@@ -295,17 +298,18 @@ describe('unified kernel contracts (plan-297 phase 0)', () => {
       onProcessComplete(_self, _mu, data) { completed.push(data); },
     });
     const station = bind(runner, def, 'Frozen');
+    // The path network is model (fingerprint pathGraph): register it before the run starts.
+    const p = path(); getDefaultPathNetwork().register(p);
     runner.start([def], { root: station.node });
     const mu = runner.createMU();
     station.adapter.acceptMU(mu);
-    const p = path(); getDefaultPathNetwork().register(p);
     station.self.in(10, 'ProcessComplete', mu as unknown as MU, {
       phase: 'transit', tween: { kind: 'path', pathRef: p.id, muId: mu.id, fromS: 0, toS: p.length },
     });
     runner.getManager().processAnimated(4);
     station.adapter.setFailure(true);
     const snapshot = runner.fullSnapshot();
-    const frozen = (snapshot.components.Frozen as unknown as { frozen: unknown[] }).frozen;
+    const frozen = (componentState(snapshot, 'Frozen') as unknown as { frozen: unknown[] }).frozen;
     expect(() => JSON.stringify(frozen)).not.toThrow();
     expect(frozen).toEqual([expect.objectContaining({ action: 'MF.FrozenStation.ProcessComplete', remaining: 6 })]);
     runner.restoreFull(JSON.parse(JSON.stringify(snapshot)));
@@ -379,7 +383,7 @@ describe('unified kernel contracts (plan-297 phase 0)', () => {
     const identity = holder.self.prop;
     const snapshot = runner.fullSnapshot();
     (holder.self.prop.slots as Array<{ id: number }>)[0].id = 9;
-    expect((snapshot.components.Holder.prop.slots as Array<{ id: number }>)[0].id).toBe(1);
+    expect((componentState(snapshot, 'Holder').prop.slots as Array<{ id: number }>)[0].id).toBe(1);
     runner.restoreFull(snapshot);
     expect(holder.self.prop).toBe(identity);
     expect((holder.self.prop.slots as Array<{ id: number }>)[0].id).toBe(1);

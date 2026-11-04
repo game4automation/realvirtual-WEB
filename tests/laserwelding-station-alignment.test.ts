@@ -37,7 +37,8 @@ describe('plan-569 — every station tool axis sits on its nest axis', () => {
     expect(hits.length, `${name}: ${hits.length} nodes`).toBe(1);
     return hits[0];
   };
-  // every node used here is a scene root, so its local x IS its world x
+  // every node used here sits on the top level or in identity groups (Kinematics/…, Plant/…,
+  // plan-610), so its local x IS its world x
   const xOf = (name: string): number => { const n = node(name); return n.matrix ? n.matrix[12] : (n.translation?.[0] ?? 0); };
   const zOf = (name: string): number => { const n = node(name); return n.matrix ? n.matrix[14] : (n.translation?.[2] ?? 0); };
   // lower edge x of a pallet held by an index stopper, from the stopper's Block zone
@@ -122,16 +123,16 @@ describe('plan-569 — every station tool axis sits on its nest axis', () => {
     // deliberately small: a larger radius would find FG03_LeftSeat (104 mm away) and snap the
     // turned valve back into the upright pose
     expect(grip.Grip.GripTargetSearchRadius).toBe(50);
-    expect(grip.Grip.SignalPick.path).toBe('PLC/Simulation/SIM_FG03_Grip1Pick');
-    expect(grip.Grip.SignalPlace.path).toBe('PLC/FG03/FG03_Y_Gripper1_InHome');
+    expect(grip.Grip.SignalPick.path).toBe('Signals/Simulation/SIM_FG03_Grip1Pick');
+    expect(grip.Grip.SignalPlace.path).toBe('Signals/FG03/FG03_Y_Gripper1_InHome');
     // ONE cycle anchor, then a LEVEL check — never a chain of edges. Arming on the pallet-arrival
     // edge and then consuming two further edges let the three drift into different station cycles,
     // and Gripper1 turned the already-turned valve of a Typ-4 pallet back (plan-569 § Wendeeinheit).
     const arm = node('FT2_ArmOnTransferClose').extras.realvirtual.LogicStep_WaitForSignalBool;
     expect([arm.Signal.path, arm.WaitForTrue, arm.Edge], 'arms on Gripper2 CLOSE COMMAND, once per cycle')
-      .toEqual(['PLC/FG03/FG03_Y_Gripper2_WorkPos', true, 'Rising']);
+      .toEqual(['Signals/FG03/FG03_Y_Gripper2_WorkPos', true, 'Rising']);
     const disarm = node('FT3_DisarmIfNestEmpty').extras.realvirtual.LogicStep_JumpOnSignal;
     expect([disarm.Signal.path, disarm.JumpOn, disarm.JumpToStep], 'level check: no valve in the right nest -> disarm')
-      .toEqual(['PLC/Simulation/SIM_FG03_RightNestValve', false, 'FT1_PickOff']);
+      .toEqual(['Signals/Simulation/SIM_FG03_RightNestValve', false, 'FT1_PickOff']);
   });
 });

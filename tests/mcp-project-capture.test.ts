@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { queryValue } from './helpers/query-value';
+
 /**
  * plan-709 §2.6.2 / §9.9 — the MCP tools write into the PROJECT, not a work folder.
  *
@@ -18,7 +20,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { saveCanvasToProject, CAPTURES_FOLDER } from '../src/plugins/mcp-bridge/rv-frame-capture';
-import { McpEditorTools } from '../src/plugins/mcp-bridge/rv-mcp-editor-tools';
+import { McpEditorTools, readProjectFile } from '../src/plugins/mcp-bridge/rv-mcp-editor-tools';
 import { getProjectStore } from '../src/core/project/project-store';
 import type { ProjectBackend } from '../src/core/project/backends/project-backend';
 
@@ -103,16 +105,15 @@ describe('savePath resolution for the capture tools', () => {
   });
 });
 
-describe('web_editor_import_glb source file', () => {
+describe('web_execute("editor.importGlb", …) source file', () => {
   let tools: McpEditorTools;
   /** The private reader both import tools share. */
   let read: (relPath: string) => Promise<{ bytes: ArrayBuffer; name: string } | { error: string }>;
 
   beforeEach(() => {
     tools = new McpEditorTools(() => undefined);
-    read = (relPath) => (tools as unknown as {
-      _readProjectFile: (p: string) => Promise<{ bytes: ArrayBuffer; name: string } | { error: string }>;
-    })._readProjectFile(relPath);
+    // plan-2007 Phase 4A: the shared reader became the exported module function.
+    read = (relPath) => readProjectFile(relPath);
   });
 
   afterEach(() => setBackend(null));
@@ -169,8 +170,7 @@ describe('web_editor_project_info', () => {
     } as never);
 
     try {
-      const tools = new McpEditorTools(() => viewer as never);
-      const info = JSON.parse(await tools.webEditorProjectInfo()) as Record<string, unknown>;
+      const info = JSON.parse(await queryValue(viewer as never, 'editor.projectInfo', {})) as Record<string, unknown>;
 
       expect(info.projectOpen).toBe(true);
       expect(info.projectName).toBe('Line 2');

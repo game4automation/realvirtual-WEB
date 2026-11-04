@@ -75,10 +75,12 @@ function buildCylinder(opts: { min?: number; max?: number; startPosition?: numbe
 /** Narrow fake viewer for the production resetSimulation (pattern: logic-step-reset-restart.test.ts). */
 function resetVia(rig: Rig, logicEngine: RVLogicEngine | null = null, order?: string[]): void {
   const fake = {
+    _structuralEditHolds: () => false, // plan-681: resetSimulation asks whether a structural transaction withholds it
     _simTime: 5,
     drives: [rig.drive],
     chainManager: { resetAll() {} },
     ribbonManager: { resetAll() {} },
+    blockageWatch: { reset() {} }, // plan-2038: resetSimulation clears the blockage watch
     transportManager: { reset() {} },
     logicEngine,
     _kernel: null,

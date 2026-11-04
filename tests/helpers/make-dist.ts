@@ -41,6 +41,9 @@ export function makeDist(root: string, opts: MakeDistOptions = {}): string {
     writeFileSync(join(root, 'scenes', 'index.json'), '[]');
     mkdirSync(join(root, 'library'), { recursive: true });
     writeFileSync(join(root, 'library', 'catalog.json'), '{"entries":[]}');
+    // plan-778: the realvirtual library is also a project (app-level, never trimmed).
+    writeFileSync(join(root, 'library', 'project.json'),
+      '{"schemaVersion":2,"id":"prj_realvirtual_library","name":"realvirtual Library","kind":"demo","documents":[]}');
   }
   return root;
 }

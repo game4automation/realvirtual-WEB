@@ -39,12 +39,19 @@ describe('engine/ import topology (plan-182 Phase 2)', () => {
 
   it('no engine/* file imports from rv-viewer', () => {
     const violations: string[] = [];
+    // A type-only import (`import type { X } from '../rv-viewer'`) is erased at build time —
+    // no runtime module-graph edge, so no cycle. Scanning per line, not per match, so a
+    // type-only import of rv-viewer stays allowed even when the file ALSO has an unrelated
+    // value import elsewhere.
+    const RV_VIEWER_IMPORT = /from\s+['"][./]+rv-viewer['"]/;
+    const TYPE_ONLY_IMPORT = /^\s*import\s+type\b/;
     for (const file of files) {
       const src = readFileSync(file, 'utf-8');
-      // Match: from '../rv-viewer' or '../../rv-viewer' etc — quoted import only.
-      // Allow rv-viewer-events and rv-viewer-host (they have different module names).
-      if (/from\s+['"][./]+rv-viewer['"]/.test(src)) {
-        violations.push(file);
+      for (const line of src.split('\n')) {
+        if (RV_VIEWER_IMPORT.test(line) && !TYPE_ONLY_IMPORT.test(line)) {
+          violations.push(file);
+          break;
+        }
       }
     }
     expect(violations).toEqual([]);

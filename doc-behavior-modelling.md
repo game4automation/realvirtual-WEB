@@ -1,6 +1,6 @@
 # Behavior Modelling — Continuous & DES (a beginner's guide)
 
-> **Applies to:** Continuous behaviors are in Community. DES execution requires the commercial beta DES feature.
+> **Applies to:** Continuous behaviors and DES execution are in Community (AGPL).
 > **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
 > See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
 
@@ -87,7 +87,7 @@ export default defineLibraryComponent(def);         // the runnable Behavior —
 | `logic` | the **shared brain**: flow decisions + state-machine transitions. Touches only `self` — never time or geometry | both |
 | `setup(self)` | **mode-agnostic init**, run by BOTH simulations before their adapter: resolve nodes, set signal defaults, stamp the inspector badge, build the right-click menu | both |
 | `continuous` | the **physics adapter**: `setup` wires triggers (sensor subscription, drive handles); `fixedUpdate(self, dt)` reads triggers and applies physical effects (jog belt, move drive) | continuous only |
-| `des` | the **event adapter**: hooks (`onAccept`, `onArrival`, `onDownstreamReady`, …) react to scheduled events and schedule effects (`self.in(delay, 'Arrival', mu)`) | DES only |
+| `des` | the **event adapter**: hooks (`onAccept`, `onArrival`, `onDownstreamReady`, …) react to scheduled events and schedule effects (`self.in(delay, 'Arrival', mu)`). Hooks are **synchronous** — a hook that returns a Promise (an `async` hook) fails its event | DES only |
 | `reset(self)` | **mode-agnostic** — fired when the simulation is reset: restore `self.local` / state-machine / counters / timers to the start (like a reload). Don't re-resolve nodes (`setup` already did). | both |
 | `start(self)` | **mode-agnostic** — fired right after a reset, to (re)start from the clean state (e.g. re-assert `Run = true`). | both |
 | `resetStat(self)` | **mode-agnostic** — fired on a statistics-only reset: clear stat accumulators without changing simulation state. Mostly a DES concern. | both |
@@ -211,7 +211,7 @@ Every block receives the same per-instance `self`, a facade over the runtime:
 | `self.outputs() / inputs() / freeOutputs(mu?)` | port connections from the snap graph. `freeOutputs(mu?: MU): Port[]` takes the MU being routed as an optional argument, so a router can pick a port that fits *this* part (see `ChainTransfer.ts`, `self.freeOutputs(mu)[0]`) |
 | `self.transfer(mu, port?)` | hand a MU downstream (DES handshake; continuous: inert) |
 | `self.spawn()` | mint a new MU (Source) |
-| `self.in(delay, hook, mu?) / at(time, hook, mu?)` | schedule a DES event (continuous: inert) |
+| `self.in(delay, hook, mu?) / at(time, hook, mu?)` | schedule a DES event (continuous: inert); a time earlier than `self.now`, NaN or Infinity throws — the DES clock never runs backwards |
 | `self.stamp(type, fields)` | write the inspector/hierarchy badge |
 | `self.contextMenu(target, items)` | right-click actions |
 

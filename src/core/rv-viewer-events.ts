@@ -48,7 +48,14 @@ export interface ViewerEvents {
   'placements-state-changed': { state: PlacementsState };
   /** Geometry/HMI lifecycle remains on model-loaded; executable model logic
    *  binds only when this event fires (immediately for none/valid, or after an
-   *  explicit late activation for invalid/unverifiable signatures). */
+   *  explicit late activation for invalid/unverifiable signatures).
+   *
+   *  What binds HERE is the component logic (drives, sensors, sources, …). The
+   *  document's OWN LogicSteps are NOT guaranteed to exist yet: in a document
+   *  that places references they are built after its placements materialised
+   *  (plan-769 Phase 6, D20), i.e. possibly after this event. Whoever needs
+   *  them (`viewer.logicEngine.roots`, suppressing a root) awaits
+   *  `viewer.whenModelLogicBuilt()`. */
   'model-logic-activated': { result: LoadResult };
   'signature-state-changed': {
     signatureState: SignatureState;
@@ -342,6 +349,13 @@ export interface ViewerEvents {
    *  components added/removed. Listeners rebuild caches (hierarchy panel
    *  editableNodes etc.) and should coalesce — one emit per top-level op. */
   'editor-structure-changed': { source: 'asset-editor' };
+  /**
+   * Fired when a fire-and-forget editor edit was refused AFTER it had started
+   * mutating and was rolled back (plan-614 F1: a `ReferenceRebindError` of the
+   * void `AssetDocument.renameNode`). The editor layer only reports; the HMI
+   * (`installEditRefusalWiring`) shows the toast. `reason` is the error class.
+   */
+  'editor-edit-refused': { verb: string; nodePath: string; reason: string; message: string };
   /** Fired after a scalar Inspector edit has reached its live component. */
   'component-field-changed': { nodePath: string; componentType: string; fieldName: string };
   /**
@@ -356,10 +370,11 @@ export interface ViewerEvents {
   /** Fired when Group memberships changed through editing (Group component
    *  added/removed/renamed, grouped node deleted/restored — both op directions,
    *  undo/redo included). Listeners re-read `viewer.groups`. */
-  /** The viewer-wide GroupRegistry changed: an editor op, or a placement merged its groups (plan-757). */
-  'groups-changed': { source: 'editor' | 'placement' };
+  /** The viewer-wide GroupRegistry changed: an editor op, a placement merged its groups (plan-757),
+   *  or the path visualizer registered its layer group (plan-628). */
+  'groups-changed': { source: 'editor' | 'placement' | 'path-network' };
 
-  /** Fired at the START of every asset save/export flow, BEFORE the scene is
+  /** Fired at the START of every editor save/export flow, BEFORE the scene is
    *  cloned for GLB export. Listeners must restore any ephemeral live-preview
    *  state they hold (e.g. the Kinematics window's drive-jog pose) so preview
    *  poses never bake into the saved GLB. Any future export path MUST emit

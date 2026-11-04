@@ -14,9 +14,11 @@ describe('SimControllerPlugin — lifecycle', () => {
     //     (hidden in DES/HMI modes via a visibility rule, plan-194)
     //   • 'overlay' — ModeSwitchNotice, always mounted, warns that switching
     //     workspace clears MUs.
+    // (The one-time "Run finished" notice was removed: the DES toolbar chip is the only
+    // indicator, its tooltip carries the explanation.)
     expect(plugin.slots.length).toBe(2);
     expect(plugin.slots.some(s => s.slot === 'toolbar-button-leading')).toBe(true);
-    expect(plugin.slots.some(s => s.slot === 'overlay')).toBe(true);
+    expect(plugin.slots.filter(s => s.slot === 'overlay').length).toBe(1);
   });
 
   test('exposes a stable plugin id', () => {

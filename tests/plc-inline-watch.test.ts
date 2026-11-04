@@ -243,3 +243,43 @@ describe('lookupWatchIdentifier — catalog enrichment (full signal info)', () =
     expect(info).toEqual({ identifier: 'tDelay', kind: 'fb', stType: 'TON', valueText: 'Q=TRUE' });
   });
 });
+
+
+describe('Phase 1 initialized declarations and constants', () => {
+  const code = `PROGRAM Main
+VAR_EXTERNAL
+  Sensor : BOOL;
+END_VAR
+VAR
+  x : INT := 5;
+  tDelay : TON := (PT := T#2s);
+END_VAR
+VAR CONSTANT
+  K : INT := 4 * 2;
+  Duration : TIME := T#2s;
+END_VAR
+END_PROGRAM`;
+
+  it('keeps scalar and FB ghost values and hover live after initialization', () => {
+    const watch = watchOf({ Sensor: true, x: 9, 'tDelay.Q': false, 'tDelay.ET': 500 });
+    expect(computeInlineWatchSpecs(code, watch)).toEqual([
+      { lineNumber: 3, text: GHOST_ARROW + 'TRUE' },
+      { lineNumber: 6, text: GHOST_ARROW + '9' },
+      { lineNumber: 7, text: GHOST_ARROW + 'Q=FALSE ET=0.5s' },
+      { lineNumber: 10, text: GHOST_ARROW + '4 * 2' },
+      { lineNumber: 11, text: GHOST_ARROW + 'T#2s' },
+    ]);
+    expect(lookupWatchIdentifier(code, watch, 'X')).toMatchObject({ kind: 'var', stType: 'INT', valueText: '9' });
+    expect(lookupWatchIdentifier(code, watch, 'tDelay')).toMatchObject({ kind: 'fb', stType: 'TON', valueText: 'Q=FALSE ET=0.5s' });
+  });
+
+  it('shows constant source text with an empty watch and ignores runtime entries', () => {
+    const expected = [
+      { lineNumber: 10, text: GHOST_ARROW + '4 * 2' },
+      { lineNumber: 11, text: GHOST_ARROW + 'T#2s' },
+    ];
+    expect(computeInlineWatchSpecs(code, new Map())).toEqual(expected);
+    expect(computeInlineWatchSpecs(code, watchOf({ K: 999 }))).toEqual(expected);
+    expect(lookupWatchIdentifier(code, new Map(), 'k')).toMatchObject({ valueText: '4 * 2' });
+  });
+});

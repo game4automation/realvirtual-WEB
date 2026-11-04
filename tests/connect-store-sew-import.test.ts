@@ -129,7 +129,8 @@ describe('connect-store.importSewSymbolTable', () => {
     expect(body.topics!.map(t => t.topic)).toEqual(['SEW/SimOUT', 'rv/other', 'SEW/SimIN']);
     expect(body.topics!.find(t => t.topic === 'SEW/SimOUT')!.encoding).toBe('Auto');
     expect(body.topics!.find(t => t.topic === 'SEW/SimIN')!.publishIntervalMs).toBe(50);
-    expect(calls.some(c => c.method === 'POST')).toBe(false);
+    // plan-2025 F10: the /config/ops probe of this (older, non-ops) stub is a POST too; no INTERFACE was posted.
+    expect(calls.some(c => c.method === 'POST' && c.url.endsWith('/config/interfaces'))).toBe(false);
   });
 });
 

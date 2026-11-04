@@ -7,7 +7,7 @@
  * Validates overlay merge semantics (RFC 7396), localStorage persistence,
  * missing node handling, null-delete, and field query.
  */
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   loadOverlay,
   saveOverlay,
@@ -37,6 +37,17 @@ function makeOverlay(
 }
 
 describe('rv-extras-overlay-store', () => {
+  it('propagates quota and unavailable storage errors before follow-up actions', () => {
+    const write = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('quota'); });
+    try {
+      expect(() => saveOverlay('test', makeOverlay({}))).toThrow('quota');
+    } finally { write.mockRestore(); }
+    const getter = vi.spyOn(window, 'localStorage', 'get').mockImplementation(() => { throw new Error('denied'); });
+    try {
+      expect(() => saveOverlay('test', makeOverlay({}))).toThrow('Storage is unavailable');
+    } finally { getter.mockRestore(); }
+  });
+
   beforeEach(() => {
     localStorage.clear();
   });

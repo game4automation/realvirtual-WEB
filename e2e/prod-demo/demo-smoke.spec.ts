@@ -24,7 +24,7 @@ for (const [key, docId] of Object.entries(EXPECTED_DEMOS)) {
     const notFound = collectNotFound(page);
     await blockAnalytics(page);
     const t0 = Date.now();
-    await page.goto(`?doc=${encodeURIComponent(docId)}`, { waitUntil: 'domcontentloaded' });
+    await page.goto(`?doc=${encodeURIComponent(docId)}&welcome=0`, { waitUntil: 'domcontentloaded' });
     const { modelUrl, dismissed } = await waitForViewerReady(page);
     const readyMs = Date.now() - t0;
     // A planner document is an empty shell — boot is only done when its placements are.
@@ -38,7 +38,7 @@ for (const [key, docId] of Object.entries(EXPECTED_DEMOS)) {
       body: JSON.stringify({ docId, modelUrl, readyMs, dismissed, notFound, rawErrors: errors }, null, 2),
       contentType: 'application/json',
     });
-    expect(disallowedNotFound(notFound, LIVE_BASE_URL), '404 outside the allowlist (root project.json/models.json, optional *.kin.json and aasx/index.json)').toEqual([]);
+    expect(disallowedNotFound(notFound, LIVE_BASE_URL), '404 outside the allowlist (root project.json/models.json, optional *.kin.json and aasx/index.json, same-origin /health)').toEqual([]);
     expect(criticalErrors(errors), 'page/console errors on the live demo').toEqual([]);
   });
 }

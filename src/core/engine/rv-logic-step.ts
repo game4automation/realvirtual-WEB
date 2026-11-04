@@ -11,6 +11,7 @@ import type { RVSensor } from './rv-sensor';
 import type { RVGrip } from './rv-grip';
 import type { RVZone } from './rv-zone';
 import { debug } from './rv-debug';
+import { scaleSimDt } from './rv-speed-override';
 import { isSignalLiveControlled } from './rv-slot-authority';
 
 // ─── Step State ──────────────────────────────────────────────────
@@ -322,7 +323,7 @@ export class RVDelay extends RVLogicStep {
 
   fixedUpdate(dt: number): void {
     if (this.state !== StepState.Active) return;
-    this.elapsed += dt;
+    this.elapsed += scaleSimDt(dt);
     if (this.elapsed >= this.duration) {
       this.finish();
     }
@@ -564,19 +565,58 @@ export class RVWaitForZone extends RVLogicStep {
   }
 }
 
-/** DriveTo - moves a drive to a target position, finishes when reached */
+/**
+ * DriveTo - moves a drive to a target position, finishes when reached.
+ *
+ * `destinationSignal` mirrors Unity `LogicStep_DriveTo.DestinationFromPLCOutput`
+ * (plan-2016 S3): when the drive and the signal are set and the signal's value
+ * at construction (= Unity `Awake`, signals already initialised) is not 0, the
+ * signal becomes the destination source (`valueBySignal`) and `destination`
+ * follows it on every start and every fixed update. As in Unity, a change during
+ * a running move updates `destination` but does not re-command that move; it
+ * takes effect on the next start. A signal that is 0 at construction is never
+ * followed — `Destination` stays the target.
+ */
 export class RVDriveTo extends RVLogicStep {
   drive: RVDrive | null;
   destination: number;
   relative: boolean;
+  /** Signal address of `DestinationFromPLCOutput`, or null. */
+  readonly destinationSignal: string | null;
+  /** True when the destination is taken from `destinationSignal` (Unity `ValueBySignal`). */
+  readonly valueBySignal: boolean;
+  private readonly signalStore: SignalStore | null;
   private startPosition = 0;
   private targetPosition = 0;
 
-  constructor(drive: RVDrive | null, destination: number, relative: boolean) {
+  constructor(
+    drive: RVDrive | null,
+    destination: number,
+    relative: boolean,
+    destinationSignal: string | null = null,
+    signalStore: SignalStore | null = null,
+  ) {
     super();
     this.drive = drive;
     this.destination = destination;
     this.relative = relative;
+    this.destinationSignal = destinationSignal;
+    this.signalStore = signalStore;
+    let bySignal = false;
+    if (drive && destinationSignal && signalStore) {
+      const v = signalStore.getFloatByPath(destinationSignal);
+      if (v !== 0) {
+        this.destination = v;
+        bySignal = true;
+      }
+    }
+    this.valueBySignal = bySignal;
+  }
+
+  /** Unity FixedUpdate parity: follow the destination signal while `valueBySignal`. */
+  private syncDestinationFromSignal(): void {
+    if (!this.valueBySignal) return;
+    this.destination = this.signalStore!.getFloatByPath(this.destinationSignal!);
   }
 
   get progress(): number {
@@ -599,6 +639,7 @@ export class RVDriveTo extends RVLogicStep {
       return;
     }
 
+    this.syncDestinationFromSignal();
     this.startPosition = this.drive.currentPosition;
 
     let dest = this.relative
@@ -622,6 +663,7 @@ export class RVDriveTo extends RVLogicStep {
   }
 
   fixedUpdate(_dt: number): void {
+    this.syncDestinationFromSignal();
     if (this.state !== StepState.Active || !this.drive) return;
     if (this.drive.liveControlled) {
       this.finishSuppressedLive();

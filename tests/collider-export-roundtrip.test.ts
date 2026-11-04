@@ -63,9 +63,12 @@ describe('BoxCollider / WebPhysicsZone save round trip (plan-525 T3)', () => {
     const collider2 = find(gltf.scene, 'Collider')!;
     const station2 = find(gltf.scene, 'Station')!;
     expect(plate2.children).toHaveLength(0);
-    expect(rvOf(plate2)).toEqual(authored.plate);
-    expect(rvOf(collider2)).toEqual(authored.collider);
-    expect(rvOf(station2)).toEqual(authored.station);
+    // plan-769 Phase 3a: the export adds each node's id — everything else unchanged.
+    const noId = (rv: Record<string, unknown>): Record<string, unknown> => { const { NodeId: _id, ...rest } = rv; return rest; };
+    expect(typeof rvOf(plate2).NodeId).toBe('string');
+    expect(noId(rvOf(plate2))).toEqual(noId(authored.plate));
+    expect(noId(rvOf(collider2))).toEqual(noId(authored.collider));
+    expect(noId(rvOf(station2))).toEqual(noId(authored.station));
     expect(collider2.parent?.name).toBe('Chute');
 
     // Save the reloaded asset again: the same bytes. (Plain GLTFLoader copies

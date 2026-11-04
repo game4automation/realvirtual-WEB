@@ -53,13 +53,10 @@ test.describe('plan-386 §9.7 — shared GLB link', () => {
     await page.goto(shareLink(baseURL), { waitUntil: 'domcontentloaded' });
     await waitForViewer(page);
 
-    // The card is the visible contract: it appears, and it names where the
-    // bytes came from. The origin line is the security measure, so it is the
-    // one thing asserted rather than the decoration around it.
+    // The card is the visible contract: it appears and names the shared model.
+    // (The "loaded from <host>" row was dropped from the display.)
     const card = page.locator('[data-testid="shared-glb-info-card"]');
     await expect(card).toBeVisible({ timeout: 20_000 });
-    await expect(page.locator('[data-testid="shared-glb-origin"]'))
-      .toContainText(new URL(sharedGlbUrl(baseURL)).host);
     await expect(page.locator('[data-testid="shared-glb-error"]')).toHaveCount(0);
 
     // Escalation is offered — Phase 3 wired it, and a card without it would be

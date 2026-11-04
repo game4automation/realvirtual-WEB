@@ -50,7 +50,7 @@
  * hatch a migrator needs and the exact mistake an editor must not make.
  */
 
-import type { RvProjectSceneEntry } from './rv-project-types';
+import type { RvDocumentEntry } from './rv-project-types';
 
 // ─── Revision ───────────────────────────────────────────────────────────
 
@@ -99,7 +99,7 @@ export interface SceneRecord {
   /** The scene body as GLB bytes. */
   glb: Uint8Array;
   /** Manifest metadata for this scene (id, name, path, timestamps, …). */
-  meta: RvProjectSceneEntry;
+  meta: RvDocumentEntry;
   /** Revision of what was read. Hand it back as {@link SceneWrite.expectedRevision}. */
   revision: SceneRevision;
 }
@@ -109,7 +109,7 @@ export interface SceneWrite {
   /** The GLB body. */
   glb: Uint8Array;
   /** Metadata the manifest should carry for this scene. */
-  meta: RvProjectSceneEntry;
+  meta: RvDocumentEntry;
   /** See the table in the file header. */
   expectedRevision?: SceneRevision | null;
 }
@@ -176,7 +176,7 @@ export function assertRevisionPrecondition(
  */
 export async function glbSceneRecord(
   glb: Uint8Array,
-  meta: Partial<RvProjectSceneEntry> & { path: string },
+  meta: Partial<RvDocumentEntry> & { path: string },
   revision?: SceneRevision,
 ): Promise<SceneRecord> {
   return {

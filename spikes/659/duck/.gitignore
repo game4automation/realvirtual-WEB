@@ -1,0 +1,19 @@
+# plan-659: Artefakte werden erzeugt, nicht versioniert.
+#
+# `build-duck.mjs` ist ein deterministischer Generator — er liest die Apache-2.0-Zahlen aus
+# `../fixtures/microduck/mjcf/robot_allcollisions.xml` und `rig/kinematics.json` und baut daraus
+# Geometrie und GLB. Das Ergebnis ist reproduzierbar, also gehoert es nicht ins Repo: dieses
+# Repo hat ein `public`-Remote (ungefilterter GitHub-Mirror), und 1 MB GLB plus 3 MB PNG je
+# Iteration summieren sich dort dauerhaft.
+#
+# Erzeugen:   node spikes/659/duck/build-duck.mjs
+# Rendern:    node spikes/659/duck/render-duck.mjs
+#
+# Versioniert bleiben die Quellen: build-duck.mjs, render-duck.mjs, preview.html.
+#
+# Lizenzlage (unveraendert, siehe Kopf von build-duck.mjs): die Geometrie ist EIGENES Werk,
+# abgeleitet ausschliesslich aus den Apache-2.0-Textdateien. Die CC BY-NC-SA-Meshes des
+# Originals wurden nie geoeffnet. Wandert das Modell spaeter in ein Demo-Projekt, wird das
+# GLB DORT als Projekt-Asset versioniert (project.json -> documents[]), nicht hier.
+*.glb
+*.png

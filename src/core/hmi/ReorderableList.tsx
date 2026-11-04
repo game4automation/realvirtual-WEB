@@ -95,7 +95,7 @@ export function ReorderableList({
             <Typography
               sx={{
                 fontSize: 9, fontWeight: 600, lineHeight: 1.5, color: 'text.disabled',
-                px: 0.5, borderRadius: 4, bgcolor: 'rgba(255,255,255,0.06)',
+                px: 0.5, borderRadius: 0.5, bgcolor: 'rgba(255,255,255,0.06)',
               }}
             >
               {items.length}

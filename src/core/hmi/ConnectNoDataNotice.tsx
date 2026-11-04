@@ -25,8 +25,10 @@ import { Close, InfoOutlined } from '@mui/icons-material';
 import type { UISlotProps } from '../rv-ui-plugin';
 import { useUIVisible } from './ui-context-store';
 import { getConnectSnapshot, subscribeConnectStore, type ConnectSnapshot } from './connect-store';
+import { getDriveSpeedOverride, subscribeDriveSpeedOverride } from '../engine/rv-speed-override';
 import {
   connectNoDataWatch,
+  SimRunningClock,
   NO_DATA_REASON_TEXT,
   type NoDataHit,
   type NoDataInterfaceInput,
@@ -89,6 +91,9 @@ const CARD_SX = {
   boxShadow: 6,
 } as const;
 
+/** simTime → running seconds at 1× pace (the simulation speed must not shorten the window). */
+const noDataRunningClock = new SimRunningClock();
+
 export function ConnectNoDataNotice({ viewer }: UISlotProps) {
   const visible = useUIVisible(CONNECT_NO_DATA_NOTICE_ID);
   const snap = useSyncExternalStore(subscribeConnectStore, getConnectSnapshot);
@@ -97,11 +102,16 @@ export function ConnectNoDataNotice({ viewer }: UISlotProps) {
   const [dismissals, setDismissals] = useState(0);
 
   useEffect(() => { ensureConnectCommandsRegistered(); }, []);
+  // Fold the running clock at every speed change, so one step never mixes two factors.
+  useEffect(
+    () => subscribeDriveSpeedOverride(() => { noDataRunningClock.advance(viewer.simTime ?? 0, getDriveSpeedOverride()); }),
+    [viewer],
+  );
 
   const connected = snap.state === 'connected' && !snap.gatewayUnreachable;
   const hits = useMemo(
     () => connectNoDataWatch.update({
-      simTime: viewer.simTime ?? 0,
+      simTime: noDataRunningClock.advance(viewer.simTime ?? 0, getDriveSpeedOverride()),
       connected,
       interfaces: noDataWatchInterfaces(snap),
     }),

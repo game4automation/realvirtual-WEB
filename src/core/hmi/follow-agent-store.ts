@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * follow-agent-store — Settings > AI Bridge > "Follow agent" (plan-520).
  *
@@ -33,7 +35,7 @@ function subscribe(listener: () => void): () => void {
 
 function readStored(): boolean | null {
   try {
-    const raw = localStorage.getItem(MCP_FOLLOW_AGENT_KEY);
+    const raw = readLocalStorage(MCP_FOLLOW_AGENT_KEY);
     if (raw === '1') return true;
     if (raw === '0') return false;
     return null;
@@ -50,13 +52,7 @@ export function getFollowAgent(): boolean {
 
 /** Switch "Follow agent" on or off for this device. */
 export function setFollowAgent(value: boolean): void {
-  try {
-    localStorage.setItem(MCP_FOLLOW_AGENT_KEY, value ? '1' : '0');
-    sessionValue = null;
-  } catch {
-    // Storage refused: the session value carries the choice until reload.
-    sessionValue = value;
-  }
+  sessionValue = writeLocalStorage(MCP_FOLLOW_AGENT_KEY, value ? '1' : '0') ? null : value;
   notify();
 }
 

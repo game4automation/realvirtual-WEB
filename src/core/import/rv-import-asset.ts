@@ -6,7 +6,7 @@
  *
  * Editor mode always edits ONE library object (untitled until saved). It has no
  * scene, so "Open as new scene" is meaningless there and an import is always an
- * ADDITION to the current asset document: an undoable `importCad` op.
+ * ADDITION to the editor's current document: an undoable `importCad` op.
  *
  * Every provider already resolved to GLB bytes, so this sink only has to make
  * sure each item carries a `CADLinkExtras` — the provenance record that keys the

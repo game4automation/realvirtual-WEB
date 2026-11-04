@@ -15,7 +15,6 @@
  *   - index.ts                — Plugin class (lifecycle, public API, event wiring, slot registration)
  *   - model-cache.ts          — GLB loading, caching, wrapper removal, pivot helpers
  *   - ghost-manager.ts        — Transparent 3D preview during placement
- *   - thumbnail-renderer.ts   — Offscreen thumbnail generation for library icons
  *   - rv-layout-store.ts      — Reactive state management
  *   - LayoutLibraryPanel.tsx   — React UI (library panel + toolbar button)
  */
@@ -33,12 +32,15 @@ import {
   Vector3,
 } from 'three';
 import type { Object3D, WebGLRenderer, PerspectiveCamera } from 'three';
+import { placementRootOf, setStoredSignalMappingConverter, toStoredMapping } from '../../core/engine/rv-signal-mapping-address';
 import { BakeRegistry } from '../../core/engine/rv-bake-registry';
 import type { BakedAsset } from '../../core/engine/rv-bake-chunk';
 
 import type { ComponentType } from 'react';
 import type { RVViewerPlugin } from '../../core/rv-plugin';
 import type { ModeId } from '../../core/rv-mode-manager';
+import { AUTHORING_LIVE_CONTEXT, AUTHORING_MODES, AUTHORING_TOOL_RULE, isAuthoringMode } from './authoring-modes';
+import { TOOL_GROUP } from '../../core/hmi/button-panel-sections';
 import type { LoadResult } from '../../core/engine/rv-scene-loader';
 import type { ProcessExtrasResult } from '../../core/engine/rv-scene-loader';
 import type { RVViewer } from '../../core/rv-viewer';
@@ -54,11 +56,11 @@ import {
   type SignalMapping,
 } from './rv-layout-store';
 import { getLibraryStore } from '../../core/library/library-store-singleton';
-import { listLibrarySources } from '../../core/library/library-source-registry';
+import { listLibrarySources, subscribeLibrarySources } from '../../core/library/library-source-registry';
 // plan-410 F1: a tiny one-way registry module (same shape/direction as the
 // `pending-open-store` import in LayoutLibraryPanel) — the planner ANSWERS the
 // editor's question; it never imports the editor plugin itself.
-import { registerSelectionAssetResolver } from '@rv-private/plugins/asset-editor/selection-asset-resolver';
+import { registerSelectionAssetResolver } from '@rv-private/plugins/asset-editor/shared/selection-asset-resolver';
 import type { AssetBase } from '../../core/editor/rv-asset-document';
 import { libraryDocumentBase } from '../../core/editor/active-asset-store';
 import { getConnectSnapshot, subscribeConnectStore } from '../../core/hmi/connect-store';
@@ -77,7 +79,8 @@ import {
   type PlacementRef,
 } from '../../core/engine/rv-placement-instancer';
 import {
-  placeMissingPlacement, registerMaterializedPlacement, type PlacementHost,
+  placeMissingPlacement, registerMaterializedPlacement, unseatMaterializedPlacement,
+  type PlacedRootDisposeHost, type PlacementHost,
 } from '../../core/engine/rv-placement-integrate';
 import { GhostManager, buildVirtualNode } from './ghost-manager';
 import { FloorGizmo } from './floor-gizmo';
@@ -100,6 +103,8 @@ import {
   type PlacementNaming,
   type PlacementTiming,
   placementTakenNames as smPlacementTakenNames,
+  planCopiedOverrides,
+  type CopiedOverrideEdit,
 } from './scene-mutations';
 import { copyName, siblingNames, uniqueName } from '../../core/engine/rv-node-naming';
 import {
@@ -125,6 +130,25 @@ import {
   findRegistryOrigin,
   PROJECT_PLACEMENT_PREFIX,
 } from './planner-persistence';
+import { entryOriginOf, isQualifiedRef, originFields } from '../../core/library/library-origin';
+
+/**
+ * The placement reference of a catalog entry — with the library qualifier the
+ * entry carries (plan-778 F4: `entryOriginOf`, the ONE origin derivation).
+ */
+function refOfEntry(entry: LibraryCatalogEntry): PlacementRef {
+  return { catalogId: entry.id, glbUrl: entry.glbUrl ?? '', ...originFields(entryOriginOf(entry)) };
+}
+
+/** The placement reference of a planner record — its stored qualifier included (plan-778). */
+function refOfRecord(p: Pick<PlacedComponent, 'catalogId' | 'glbUrl' | 'providerId' | 'sourceId'>, url?: string): PlacementRef {
+  return {
+    catalogId: p.catalogId,
+    glbUrl: p.glbUrl,
+    ...(url !== undefined ? { url } : {}),
+    ...originFields({ providerId: p.providerId, sourceId: p.sourceId }),
+  };
+}
 
 import { LAYOUT_PANEL_WIDTH } from '../../core/hmi/layout-constants';
 import { isCompactWidth } from '../../hooks/use-mobile-layout';
@@ -134,18 +158,20 @@ import { CanvasInteractionManager, type CanvasInteractionDeps } from './canvas-i
 import { MuReconciler } from './mu-reconciler';
 import { MultiSelectPivot, type MultiSelectPivotDeps } from './multi-select-pivot';
 import { BoxSelectController } from './box-select-controller';
+import type { BoxSelectHitProvider } from './box-select-hit';
 
 // UI components for slot registration
 // The library panel is code-split (plan-344 Phase 4); the host is the tiny
 // always-mounted gate that pulls its chunk on the first open.
 import { LayoutLibraryPanelHost } from './LayoutLibraryPanelHost';
-import { plannerThumbnailKey } from './planner-thumbnail-key';
 import { PendingLoadMessage } from './PendingLoadMessage';
-import { PlannerGridButton, PlannerDropToSurfaceButton, PlannerDeleteButton, PlannerSnapButton, PlannerChainModeButton, PlannerVanishMUsButton, PlannerDocModeButton, PlannerUndoButton, PlannerRedoButton, PlannerLibraryButton } from './PlannerToolbarButtons';
+import { PlannerSnapFlyout, PlannerDeleteButton, PlannerVanishMUsButton, PlannerDocModeButton, PlannerUndoButton, PlannerRedoButton, PlannerLibraryButton, PlannerAlignButton } from './PlannerToolbarButtons';
+import { AlignPanelHost } from './align/AlignPanelHost';
+import { alignClose } from './align/align-state';
 import { SignalBadgeController } from '../signal-bind/SignalBadgeController';
 import { BboxSnapController } from './bbox-snap';
 import { showInfoOverlay, hideInfoOverlay } from '../../core/hmi/info-overlay-store';
-import { freshOpId as opId } from '../../core/hmi/scene/rv-scene-edits';
+import { freshOpId as opId, materialise } from '../../core/hmi/scene/rv-scene-edits';
 import type { RvScenePrimitiveOp } from '../../core/ops/rv-unified-ops';
 import { getSceneStore } from '../../core/hmi/scene/scene-store-singleton';
 import { ensurePlannerCommandsRegistered } from './planner-commands';
@@ -416,7 +442,6 @@ import type {
 // Re-export everything that tests and UI components need
 export { ModelCache, unwrapGltfRoot, pivotToFloorCenter, alignToFloor, dropToSurface, dropPivotToSurface } from './model-cache';
 export { GhostManager } from './ghost-manager';
-export { ThumbnailRenderer } from '../../core/thumbnails/thumbnail-renderer';
 export {
   LayoutStore,
   snapToGrid,
@@ -451,16 +476,25 @@ import { tooltipStore } from '../../core/hmi/tooltip/tooltip-store';
 import type { RVMovingUnit } from '../../core/engine/rv-mu';
 import {
   buildMissingReferencePlaceholder,
-  missingReferenceLabel,
+  missingPlacementLabel,
   referenceBoundsFromSubtree,
 } from '../../core/engine/rv-missing-reference-placeholder';
 import {
+  getAssetOverrides,
   getAssetReference,
   getDeferredPlacement,
+  setAssetOverrides,
+  type AssetOverrides,
   type RvReferenceBounds,
 } from '../../core/engine/rv-asset-reference';
 import { collectPlacementNodes } from '../../core/hmi/scene/rv-scene-glb-read';
 import { describeLoadError, reportMissingReference } from '../../core/hmi/problems-store';
+import {
+  PARAMETRIC_COMPONENT_TYPE,
+  canRegenerate,
+  stampParametricBuiltKey,
+  type StandstillView,
+} from '../../core/engine/rv-parametric-component';
 
 // ─── Placement bounds (plan-703 §2.8) ───────────────────────────────────
 
@@ -505,6 +539,18 @@ export interface LayoutPlannerOptions {
   matchMedia?: MatchMediaFn;
 }
 
+/**
+ * plan-628 8.1: placer of procedural path-block library entries
+ * (`LibraryCatalogEntry.pathBlock`), installed by the path network UI.
+ * `pick` = a click on the card, `beginDrag` / `endDrag` = a card drag (the
+ * drop itself lands on the path network's canvas listener).
+ */
+export interface PathBlockEntryHandler {
+  pick(entry: LibraryCatalogEntry): void;
+  beginDrag(entry: LibraryCatalogEntry): void;
+  endDrag(): void;
+}
+
 /** True when any node in `root`'s subtree carries the given realvirtual
  *  component in its rv_extras (`userData.realvirtual[type]`). Used to detect a
  *  Source on a freshly dragged draft without a registry path lookup. */
@@ -518,33 +564,9 @@ function subtreeHasComponent(root: Object3D, type: string): boolean {
   return found;
 }
 
-/**
- * The modes in which layout AUTHORING is available — the single place this set
- * is written down.
- *
- * `'planner'` is the dedicated authoring workspace; `'des'` joined it because
- * DES is where material-flow layouts are actually built, and everything that
- * makes authoring work hangs off this plugin: the TransformControls drag, the
- * `layout-drag-start/tick/end` broadcast that arms magnetic snap
- * (snap-point/index.ts), the placement ops, the grid and the library panel.
- * Without the plugin participating there is no drag in a mode, and therefore
- * nothing for the snap system to attach to — gating the snap system alone
- * would have been dead code.
- *
- * Note the two INDEPENDENT gates that both resolve from here (doc-ui-visibility.md):
- *  - participation — `modes` → `pluginParticipatesInMode`, and the UI registry
- *    turns it into `shownOnlyInAny: ['mode:planner', 'mode:des']` on every slot;
- *  - the legacy `'planner'` UI CONTEXT, set by {@link LayoutPlannerPlugin.setActive}
- *    and read by the toolbar slots, by snap-point's `_applyMode`, its magnetic
- *    arming and its chain preview. It is a statement about "authoring is live",
- *    not about which mode is selected, which is why it needs no per-mode variant.
- */
-export const AUTHORING_MODES: readonly ModeId[] = ['planner', 'des'];
-
-/** True while `mode` is one of the layout-authoring workspaces. */
-export function isAuthoringMode(mode: ModeId | null | undefined): boolean {
-  return mode != null && AUTHORING_MODES.includes(mode);
-}
+// The authoring-mode set lives in its own dependency-free module so core code
+// (the mode-owned panel reconciler) can read it without importing this plugin.
+export { AUTHORING_MODES, isAuthoringMode };
 
 export class LayoutPlannerPlugin implements RVViewerPlugin {
   readonly id = 'layout-planner';
@@ -562,6 +584,8 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
    *  setActive — and the new 'mode:planner' context injected by the registry). */
   readonly slots: UISlotEntry[] = [
     { slot: 'overlay', component: LayoutLibraryPanelHost as ComponentType<UISlotProps>, order: 100 },
+    // Align tool window (plan-779) — renders nothing until opened.
+    { slot: 'overlay', component: AlignPanelHost as ComponentType<UISlotProps>, order: 101 },
     // Pending-load status line (plan-371). Planner-only: the UI registry merges
     // `shownOnlyInAny: ['mode:planner']` into every slot entry of this plugin,
     // and MessagePanel evaluates that rule — so outside planner mode this tile
@@ -572,58 +596,46 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       order: 5,
       visibilityRule: { shownOnlyIn: ['planner'] },
     },
-    // Left-toolbar buttons — visible ONLY while the 'planner' UI context is
-    // active. ButtonPanel filters entries by visibilityRule; non-planner
-    // toolbar buttons (Drives, Sensors, …) are hidden in planner mode so the
-    // user gets a focused layout-editing workspace.
+    // Left-toolbar tools (plan-2010) — visible while layout authoring is live in
+    // planner AND des (AUTHORING_TOOL_RULE; the legacy 'planner' context means
+    // "authoring is live", not "Planner mode selected"). ButtonPanel sections them
+    // by `group`; non-authoring toolbar buttons (Drives, Sensors, …) are hidden so
+    // the user gets a focused layout-editing workspace.
     {
       slot: 'button-group',
-      component: PlannerGridButton as ComponentType<UISlotProps>,
+      component: PlannerSnapFlyout as ComponentType<UISlotProps>,
       order: 200,
-      visibilityRule: { shownOnlyIn: ['planner'] },
-    },
-    {
-      slot: 'button-group',
-      component: PlannerDropToSurfaceButton as ComponentType<UISlotProps>,
-      order: 210,
-      visibilityRule: { shownOnlyIn: ['planner'] },
-    },
-    {
-      slot: 'button-group',
-      component: PlannerSnapButton as ComponentType<UISlotProps>,
-      order: 230,
-      visibilityRule: { shownOnlyIn: ['planner'] },
-    },
-    {
-      slot: 'button-group',
-      component: PlannerChainModeButton as ComponentType<UISlotProps>,
-      order: 240,
-      visibilityRule: { shownOnlyIn: ['planner'] },
+      group: TOOL_GROUP.model,
+      visibilityRule: { ...AUTHORING_TOOL_RULE },
     },
     {
       slot: 'button-group',
       component: PlannerVanishMUsButton as ComponentType<UISlotProps>,
       order: 245,
-      visibilityRule: { shownOnlyIn: ['planner'] },
+      group: TOOL_GROUP.analysis,
+      visibilityRule: { ...AUTHORING_TOOL_RULE },
     },
-    // Edit-history + delete, grouped at the end of the toolbar.
+    // Edit-history + delete: the Editing block.
     {
       slot: 'button-group',
       component: PlannerUndoButton as ComponentType<UISlotProps>,
       order: 250,
-      visibilityRule: { shownOnlyIn: ['planner'] },
+      group: TOOL_GROUP.editing,
+      visibilityRule: { ...AUTHORING_TOOL_RULE },
     },
     {
       slot: 'button-group',
       component: PlannerRedoButton as ComponentType<UISlotProps>,
       order: 260,
-      visibilityRule: { shownOnlyIn: ['planner'] },
+      group: TOOL_GROUP.editing,
+      visibilityRule: { ...AUTHORING_TOOL_RULE },
     },
     {
       slot: 'button-group',
       component: PlannerDeleteButton as ComponentType<UISlotProps>,
       order: 270,
-      visibilityRule: { shownOnlyIn: ['planner'] },
+      group: TOOL_GROUP.editing,
+      visibilityRule: { ...AUTHORING_TOOL_RULE },
     },
     // Library toggle — makes the right-docked parts catalog optional in planner
     // mode (closing it stays in planner; see the lpm subscription below).
@@ -631,14 +643,28 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       slot: 'button-group',
       component: PlannerLibraryButton as ComponentType<UISlotProps>,
       order: 280,
-      visibilityRule: { shownOnlyIn: ['planner'] },
+      group: TOOL_GROUP.model,
+      visibilityRule: { ...AUTHORING_TOOL_RULE },
     },
-    // Documentation mode — pinned to the very bottom of the toolbar.
+    // Align tool (plan-779) — Planner only, not DES. The Planner gate goes into
+    // the AND-list `shownOnlyIn`: `UIRegistry.register()` REPLACES any
+    // `shownOnlyInAny` with this plugin's modes (planner + des), so a
+    // `shownOnlyInAny: ['mode:planner']` here is lost and the button would
+    // show in DES too. 'mode:planner' === modeContext('planner').
+    {
+      slot: 'button-group',
+      component: PlannerAlignButton as ComponentType<UISlotProps>,
+      order: 290,
+      group: TOOL_GROUP.model,
+      visibilityRule: { shownOnlyIn: [AUTHORING_LIVE_CONTEXT, 'mode:planner'] },
+    },
+    // Documentation mode — a view switch, last in the toolbar.
     {
       slot: 'button-group',
       component: PlannerDocModeButton as ComponentType<UISlotProps>,
       order: 300,
-      visibilityRule: { shownOnlyIn: ['planner'] },
+      group: TOOL_GROUP.view,
+      visibilityRule: { ...AUTHORING_TOOL_RULE },
     },
     // Signal-linking mode (plan-226) — at the very bottom. Self-hides unless the
     // viewer's `plannerSignalLinking` flag created a binding manager.
@@ -690,11 +716,19 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
   /** Set synchronously in onDrop so the dragend-fired `setDragEntry(null)`
    *  knows the draft was committed (keep it) vs cancelled (remove it). */
   private _dropCommitted = false;
-  // ── Preview generation ───────────────────────────────────────────────
-  // The renderer, the cache and the queue moved to the viewer-owned
-  // `ThumbnailService` (plan-372 §2.7). The planner no longer sweeps the whole
-  // catalog on every store change — cards pull their own preview when they
-  // become visible (§2.8), so a large library costs only what is looked at.
+  /**
+   * plan-628 8.1: who places a procedural path-block entry (`entry.pathBlock`).
+   * Such an entry has no GLB — a click or drag of it is handed to the path
+   * network UI (`layout.path.place` / `layout.path.junction`), never to the
+   * draft / ghost placement below. Null = path blocks are not placeable here.
+   */
+  private _pathBlockEntryHandler: PathBlockEntryHandler | null = null;
+  /** plan-628 8.11a: further selection holders the marquee feeds (path blocks). */
+  private readonly _boxSelectProviders = new Set<BoxSelectHitProvider>();
+  /** A library drag of a path-block entry is in flight (handed to the handler). */
+  private _pathBlockDragActive = false;
+  // Library previews are written by the SAVE path and read by the cards
+  // (plan-776); the planner neither renders nor invalidates them.
   private _objectMap = new Map<string, Object3D>();
   private _unsubs: (() => void)[] = [];
   private _options: LayoutPlannerOptions;
@@ -819,6 +853,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       bakeRegistry: () => this._bakeRegistry,
       uber: () => this._viewer?.placementUberMaterial ?? null,
       isWebGPU: () => this._viewer?.isWebGPU ?? false,
+      canRunParametricGenerator: () => canRegenerate(this._viewer as unknown as StandstillView),
       applyRenderMode: (root) => this._viewer?.applyRenderModeToSubtree?.(root),
       // plan-757 Phase 2b: a NESTED reference inside a placed asset is never
       // registered through this plugin's hook (it is content, not a record) —
@@ -842,7 +877,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
   /** The placement reference of a catalog entry, or null for virtual / splat entries. */
   private _refOfEntry(entry: LibraryCatalogEntry): PlacementRef | null {
     if (entry.virtual === true || entry.splatUrl) return null;
-    return { catalogId: entry.id, glbUrl: entry.glbUrl ?? '' };
+    return refOfEntry(entry);
   }
 
   /**
@@ -851,7 +886,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
    * get the cached asset synchronously after the await.
    */
   async loadEntryBaked(entry: LibraryCatalogEntry, signal?: AbortSignal): Promise<BakedAsset> {
-    return this._placements.resolveBaked({ catalogId: entry.id, glbUrl: entry.glbUrl ?? '' }, { signal });
+    return this._placements.resolveBaked(refOfEntry(entry), { signal });
   }
 
   /**
@@ -865,12 +900,71 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     id: string,
     label: string,
     catalogId: string,
-    opts?: { skipAutoAlign?: boolean },
+    opts?: { skipAutoAlign?: boolean; overrides?: AssetOverrides | null },
   ): Group {
     const placements = this._placements;
     const root = placements.createRoot(baked);
-    placements.materialize(root, baked, { id, label, catalogId, pivot: !opts?.skipAutoAlign });
+    placements.materialize(root, baked, {
+      id, label, catalogId, pivot: !opts?.skipAutoAlign,
+      ...(opts?.overrides ? { overrides: opts.overrides } : {}),
+    });
+    // plan-650: the parametric request this instance was built for (the swap compares it).
+    if (opts?.overrides) stampParametricBuiltKey(root, opts.overrides);
     return root;
+  }
+
+  /**
+   * plan-650 Phase 5: the parametric overrides a COPY of `comp` inherits — the
+   * live family values of the source placement (parametric part only), or the
+   * record's when the source is gone (paste of a deleted original). Null for
+   * every non-parametric placement (cheap traversal, no import).
+   */
+  private async _parametricOverridesForCopy(comp: PlacedComponent): Promise<AssetOverrides | null> {
+    const src = this._objectMap.get(comp.id);
+    if (!src) return comp.assetOverrides ?? null;
+    let parametric = false;
+    src.traverse((n) => { if (n.userData?.realvirtual?.[PARAMETRIC_COMPONENT_TYPE]) parametric = true; });
+    if (!parametric) return null;
+    const { liveParametricOverrides } = await import('./planner-parametric');
+    return liveParametricOverrides(src, true);
+  }
+
+  /**
+   * plan-650 Phase 5 (F17): rebuild placement `id` in place with `overrides` —
+   * the parametric variant swap behind `layout.setParams` and its undo / redo.
+   * The new variant is baked FIRST, so the old instance stays in the scene
+   * until it is ready and also when it fails (the rejection propagates). Then
+   * the ONE remove + restore pair of every undo replaces the instance; the
+   * record carries the overrides from here on (copy / restore / undo).
+   * `isCurrent` is the caller's sequence check — false = superseded, nothing
+   * is touched. Returns false when the placement is gone.
+   */
+  async rematerializePlacement(
+    id: string,
+    overrides: AssetOverrides | null,
+    isCurrent: () => boolean = () => true,
+  ): Promise<boolean> {
+    const rec = this.store.getSnapshot().placed.find((c) => c.id === id);
+    const old = this._objectMap.get(id);
+    if (!rec || !old || rec.splatUrl) return false;
+    await this._placements.resolveBaked(refOfRecord(rec), { overrides });
+    if (!isCurrent() || this._objectMap.get(id) !== old) return false;
+    // The saved overrides of a reloaded reference node (its extras) travel with the placement.
+    const saved = getAssetOverrides(old);
+    const wasSelected = this.store.getSnapshot().selectedId === id;
+    const nextRec: PlacedComponent = { ...rec };
+    if (overrides) nextRec.assetOverrides = overrides; else delete nextRec.assetOverrides;
+    this._removePlacedFromScene(id);
+    this.store.updateAssetOverrides(id, nextRec.assetOverrides);
+    const node = await this._buildPlacementFromRecord(nextRec);
+    if (!node) return false;
+    if (saved) setAssetOverrides(node, saved);
+    this._scheduleSnapPairingRebuild();
+    this._refreshHierarchy();
+    if (wasSelected) this._selectObject(id);
+    this._viewer?.markRenderDirty();
+    await this._placements.whenMaterialized();
+    return true;
   }
 
   /**
@@ -957,10 +1051,19 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
 
   onModelLoaded(result: LoadResult, viewer: RVViewer): void {
     this._attachToViewer(viewer);
+    // plan-769 F15 (Phase 3b): a stored placement mapping names its component by
+    // ADDRESS (layout file, autosave, the scene GLB's PlacementMeta) — converted
+    // against the live placement root, which only this plugin can name.
+    setStoredSignalMappingConverter((placementId, mapping) => {
+      const registry = this._viewer?.registry ?? null;
+      const root = registry ? placementRootOf(registry, placementId) : null;
+      return toStoredMapping(mapping, root, registry, this._viewer?.signalStore ?? null);
+    });
     this._installLayoutTransformListener(viewer);
     this._installLayoutDeleteListener(viewer);
     this._installNestedContentListener(viewer);
     this._installSplatSceneStoreListener(viewer);
+    this._installLiveQualifiedWatch();
     // Reload = shared instances (plan-753): the loader deferred every saved GLB
     // placement (`deferPlacements`). Claim them HERE, before the viewer's own
     // post-load pass would materialise them without planner bookkeeping — the plugin hook runs for every
@@ -1000,6 +1103,38 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
         if (obj.userData?._isSplat) applySplatTransformFromUserData(obj, viewer);
       }
     });
+  }
+
+  /**
+   * plan-778 Decision D for placements made in THIS session. A drop, a copy, a
+   * snap place, an undo restore or MCP `layout.place` never passes the
+   * instancer's `materializeDeferred`, so on its own the instancer would not
+   * know to turn it into a placeholder when its library goes away (detach,
+   * error, permission lost). On every library-registry change the planner hands
+   * its standing qualified placements to the instancer (`watchQualified`,
+   * idempotent; a placement whose source is already gone is unseated right
+   * there), with the SAME hooks a reloaded placement gets — only the record is
+   * read from the store instead of from a load's map. From then on "source
+   * gone → placeholder, back → restored in place" is one path for both.
+   */
+  private _liveQualifiedUnsub: (() => void) | null = null;
+  private _liveQualifiedHooks: import('../../core/engine/rv-placement-instancer').DeferredPlacementHooks | null = null;
+  private _installLiveQualifiedWatch(): void {
+    this._liveQualifiedUnsub?.();
+    this._liveQualifiedUnsub = subscribeLibrarySources(() => this._watchLiveQualifiedPlacements());
+  }
+
+  private _watchLiveQualifiedPlacements(): void {
+    let instancer: PlacementInstancer | null = null;
+    for (const p of this.store.getSnapshot().placed) {
+      if (!isQualifiedRef(p)) continue;
+      const node = this._objectMap.get(p.id);
+      if (!node) continue;
+      instancer ??= this._placements;
+      if (instancer.isWatchingQualified(p.id)) continue;
+      this._liveQualifiedHooks ??= this._deferredHooks((id) => this.store.getSnapshot().placed.find((c) => c.id === id));
+      instancer.watchQualified({ node, id: p.id, label: p.label, occurrence: p.id, ref: refOfRecord(p) }, this._liveQualifiedHooks);
+    }
   }
 
   // ── Auto-bind: exact 1:1 CONNECT↔model signal links (no user action) ──
@@ -1202,6 +1337,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
    *  still valid). setActive(false) tears down raycast filter, OutlinePass,
    *  selection subscription, gizmo, etc. (see setActive). */
   onModeDeactivate(_mode: ModeId | null, viewer: RVViewer): void {
+    alignClose(); // plan-779: the Align tool never outlives planner mode
     this.setActive(false);
     if (viewer.leftPanelManager.isOpen?.('layout-planner')) {
       viewer.leftPanelManager.close('layout-planner');
@@ -1286,6 +1422,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
         viewer.renderer as unknown as WebGLRenderer,
         viewer.scene,
       );
+      this._transformControls.pickBlocked = () => viewer.pointerPickBlocked;
       viewer.scene.add(this._transformControls.root);
       // Register as a sceneFixture so clearModel skips it on every model
       // switch — the gizmo persists across loads and must not look like a
@@ -1492,6 +1629,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
         // Spawned MUs participate in the marquee too (read lazily — the
         // reconciler is built just below and its map mutates as MUs spawn).
         getMuMap: () => this._muReconciler?.objectMap.values() ?? null,
+        getHitProviders: () => this._boxSelectProviders,
       });
       this._boxSelect.attach();
 
@@ -1637,20 +1775,15 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
         for (const entry of entries) {
           if (!wanted.has((entry.localPath ?? '').toLowerCase())) continue;
           this._placements.modelCache.invalidate(resolvedCacheKey(providerId, source.id, entry.id));
-          viewer.thumbnails?.forget(plannerThumbnailKey(entry.id));
-          this.store.setEntryThumbnail(entry.id, '');
         }
       }
 
       for (const catalog of this.store.getSnapshot().catalogs.values()) {
         for (const entry of catalog.entries ?? []) {
           if (!wanted.has((entry.localPath ?? '').toLowerCase())) continue;
-          if (entry.glbUrl) this._placements.invalidate({ catalogId: entry.id, glbUrl: entry.glbUrl });
-          // The PREVIEW of the saved asset is as stale as its geometry was:
-          // forget the persistent cache entry and drop the stored picture, so
-          // the panel card re-enqueues and renders the new bytes.
-          viewer.thumbnails?.forget(plannerThumbnailKey(entry.id));
-          this.store.setEntryThumbnail(entry.id, '');
+          if (entry.glbUrl) this._placements.invalidate(refOfEntry(entry));
+          // The picture needs nothing here (plan-776): the save wrote a new
+          // hashed sidecar and a new row pointer, which the card reads.
           return;
         }
       }
@@ -1658,6 +1791,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
   }
 
   onModelCleared(_viewer: RVViewer): void {
+    alignClose(); // plan-779: picked meshes belong to the cleared model
     // Decoded masters are DOCUMENT-scoped since plan-752 (S1): each one has
     // been baked onto the session's uber material and shares that baked
     // geometry with every placement of it. The next document may not use the
@@ -1665,9 +1799,13 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     // geometry the previous one mutated. The BLOB cache underneath keeps the
     // bytes, so this costs a re-parse and not a re-download.
     // The viewer's `clearModel` does this for its own instancer right after the
-    // plugin hooks; the call here covers hosts without `viewer.placements`
-    // (idempotent — it also abandons the deferred materialisation queue).
-    this._placements.clearDocument();
+    // plugin hooks; the call here covers hosts without `viewer.placements` —
+    // the only hosts that ever get a fallback instancer (idempotent — it also
+    // abandons the deferred materialisation queue).
+    // plan-774 F6: ONLY that fallback — the viewer's own clear decides whether
+    // the bakes are kept for the next load (a planner → editor switch on the
+    // same document re-instantiates them); clearing first would retire them.
+    this._ownPlacements?.clearDocument();
     this._claimedDeferred.clear();
     // Abandon in-flight placeholder swaps (plan-371 H4). `prepPlacedVisual`
     // parents placements under `getModelRoot()` = `viewer.currentModel`, so a
@@ -1696,6 +1834,8 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     this._nestedContentUnsub = null;
     this._splatSceneStoreUnsub?.();
     this._splatSceneStoreUnsub = null;
+    this._liveQualifiedUnsub?.();
+    this._liveQualifiedUnsub = null;
     // Signal-badge controller is bound to the just-cleared binding manager;
     // drop it. onModelLoaded recreates it against the fresh manager.
     this._signalBadges?.dispose();
@@ -1759,6 +1899,9 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
   }
 
   dispose(): void {
+    setStoredSignalMappingConverter(null);
+    this._liveQualifiedUnsub?.();
+    this._liveQualifiedUnsub = null;
     // Selection→asset resolver first: it closes over `this`, so it must not
     // outlive the plugin (plan-410 F1).
     this._unregisterAssetResolver?.();
@@ -1830,8 +1973,6 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     // placements must release first.
     this._ghost.dispose();
 
-    // The thumbnail renderer, cache and queue belong to the viewer now
-    // (plan-372 §2.7) and outlive this plugin — nothing to tear down here.
     if (this._gridHelper) {
       disposeSubtree(this._gridHelper);
       this._gridHelper = null;
@@ -2027,6 +2168,14 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       let lastDts = this.store.dropToSurface;
       let lastPlacing = this.store.getSnapshot().placementMode !== null;
       this._storeUnsub = this.store.subscribe(() => {
+        // plan-628 8.1: a click on a path-block entry arms the path network's
+        // tool instead of the GLB placement mode.
+        const pathEntry = this.store.getSnapshot().placementMode !== null ? this._getPlacementEntry() : null;
+        if (pathEntry?.pathBlock) {
+          this.store.setPlacementMode(null);
+          this._pathBlockEntryHandler?.pick(pathEntry);
+          return;
+        }
         const dts = this.store.dropToSurface;
         if (dts !== lastDts) {
           lastDts = dts;
@@ -2227,6 +2376,24 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     if (this.store.selectedId !== id) this.store.selectComponent(id);
   }
 
+  /**
+   * plan-628 8.1: install (or clear with null) the placer of procedural
+   * path-block library entries. Returns the uninstall function.
+   */
+  setPathBlockEntryHandler(handler: PathBlockEntryHandler | null): () => void {
+    this._pathBlockEntryHandler = handler;
+    return () => { if (this._pathBlockEntryHandler === handler) this._pathBlockEntryHandler = null; };
+  }
+
+  /**
+   * plan-628 8.11a (E57): let the rubber-band marquee also feed `provider`
+   * (path blocks keep their own selection). Returns the uninstall function.
+   */
+  registerBoxSelectHitProvider(provider: BoxSelectHitProvider): () => void {
+    this._boxSelectProviders.add(provider);
+    return () => { this._boxSelectProviders.delete(provider); };
+  }
+
   /** Whether a library drag-in gesture currently holds an edit-pause. */
   private _dragEntryEditActive = false;
 
@@ -2234,6 +2401,18 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
    *  registers the live draft (the real placed object) and pauses the simulation
    *  for the duration of the drag; on dragend, keeps-or-tears-down the draft. */
   setDragEntry(entry: LibraryCatalogEntry | null): void {
+    // plan-628 8.1: a path-block entry is no GLB draft — its drag belongs to the path network UI.
+    if (entry?.pathBlock) {
+      this._pathBlockDragActive = true;
+      this._dragEntry = null;
+      this._pathBlockEntryHandler?.beginDrag(entry);
+      return;
+    }
+    if (!entry && this._pathBlockDragActive) {
+      this._pathBlockDragActive = false;
+      this._pathBlockEntryHandler?.endDrag();
+      return;
+    }
     this._dragEntry = entry;
     if (entry) {
       // Dragging an asset in from the library is an edit gesture — auto-stop
@@ -2369,6 +2548,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     const gen = this._pending.begin(id, entry);
     this._pulse.start(id, node, resolvePlaceholderSizeMm(entry));
     void this._runPendingLoad(id, entry, gen);
+    if (ref) this._trackPreparing(entry, ref);
   }
 
   /**
@@ -2404,7 +2584,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
   }
 
   async loadEntryModel(entry: LibraryCatalogEntry, signal?: AbortSignal): Promise<Group> {
-    return this._placements.loadModel({ catalogId: entry.id, glbUrl: entry.glbUrl ?? '' }, { signal });
+    return this._placements.loadModel(refOfEntry(entry), { signal });
   }
 
   /**
@@ -2418,9 +2598,44 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
    */
   prefetchEntry(entry: LibraryCatalogEntry, opts?: { bake?: boolean }): void {
     const ref = this._refOfEntry(entry);
+    if (!ref) return;
+    const bake = opts?.bake ?? true;
     // `bake: true` (plan-753 Phase 3): the drag that follows a rested hover
     // finds the CHUNKS ready, not just the decoded master.
-    if (ref) this._placements.prefetch(ref, { bake: opts?.bake ?? true });
+    this._placements.prefetch(ref, { bake });
+    // A bake started (or joined) — the card shows it is preparing. A
+    // decode-only warm-up is not tracked: it is not the wait the user feels.
+    if (bake) this._trackPreparing(entry, ref);
+  }
+
+  /**
+   * Entry ids whose decode + bake is in flight, with the joined bake promise.
+   * Feeds `store.preparingEntryIds` → the library card's "preparing" state.
+   */
+  private _preparing = new Map<string, Promise<unknown>>();
+
+  /**
+   * Show `entry` as preparing until ITS bake settles.
+   *
+   * Keyed on the shared bake job, not on a pending placement: a cancelled
+   * drag stops caring about the result, but the bake keeps running in the
+   * cache, and the next drag still waits for it — so the card must too.
+   * Only called where a bake is being started anyway (prefetch with bake, a
+   * cold drag), so joining it here never starts work of its own.
+   */
+  private _trackPreparing(entry: LibraryCatalogEntry, ref: PlacementRef): void {
+    if (this._preparing.has(entry.id)) return;
+    if (this._placements.peekBaked(ref)) return;
+    if (!this._placements.sourceOf(ref)) return; // nothing was started for it
+    const job = this._placements.resolveBaked(ref)
+      .catch(() => { /* the placement's own load reports failures */ })
+      .finally(() => {
+        if (this._preparing.get(entry.id) !== job) return;
+        this._preparing.delete(entry.id);
+        this.store.setPreparingEntries([...this._preparing.keys()]);
+      });
+    this._preparing.set(entry.id, job);
+    this.store.setPreparingEntries([...this._preparing.keys()]);
   }
 
   /**
@@ -2661,6 +2876,8 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       id,
       catalogId: entry.id,
       glbUrl: entry.glbUrl ?? '',
+      // plan-778 F4: the library qualifier of the entry (`entryOriginOf`); empty for a legacy entry.
+      ...originFields(entryOriginOf(entry)),
       // The ONE name (plan-758): registration already gave the root its
       // sibling-unique name; the record carries exactly that.
       label: node.name,
@@ -2723,11 +2940,13 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
   /** Place a component in the scene from a catalog entry.
    *
    *  `opts.skipAutoAlign` (plan-238) skips the AABB floor-center pivot +
-   *  floor align for multi-part CAD imports with a functional origin. */
+   *  floor align for multi-part CAD imports with a functional origin.
+   *  `opts.locked` (plan-741) places it as a locked layout instance — a
+   *  reference underlay such as an imported DXF hall floor plan. */
   async placeComponent(
     entry: LibraryCatalogEntry,
     position: [number, number, number],
-    opts?: { skipAutoAlign?: boolean },
+    opts?: { skipAutoAlign?: boolean; locked?: boolean },
   ): Promise<string> {
     if (!this._viewer) throw new Error('Viewer not initialized');
 
@@ -2814,6 +3033,8 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       id,
       catalogId: entry.id,
       glbUrl: entry.glbUrl ?? '',
+      // plan-778 F4: the library qualifier of the entry (`entryOriginOf`); empty for a legacy entry.
+      ...originFields(entryOriginOf(entry)),
       // The ONE name (plan-758): `label === node.name` on every creation path.
       label: node.name,
       position: [node.position.x, node.position.y, node.position.z],
@@ -2920,6 +3141,42 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     const known = ids.filter(id => this._objectMap.has(id));
     await this._removeByPlacementIds(known);
     return known;
+  }
+
+  /**
+   * Point placement `id` at another catalog entry (plan-778 Phase 5, Copy into
+   * project): the placement is removed and `entry` placed at the SAME
+   * position / rotation / scale, both inside ONE scene transaction — a single
+   * Undo puts the original placement (and its library qualifier) back. The new
+   * placement gets a new id; per-placement signal mappings and snap pairings
+   * of the old one are not carried over. Returns the new id, or null when `id`
+   * is unknown.
+   */
+  async repointPlacement(id: string, entry: LibraryCatalogEntry, label = 'Replace asset'): Promise<string | null> {
+    const rec = this.store.getSnapshot().placed.find(c => c.id === id);
+    if (!rec || !this._objectMap.has(id)) return null;
+    const position: [number, number, number] = [...rec.position];
+    const rotation: [number, number, number] = [...rec.rotation];
+    const scale: [number, number, number] = [...rec.scale];
+    const run = async (): Promise<string> => {
+      await this._removeByPlacementIds([id]);
+      const next = await this.placeComponent(entry, position, { skipAutoAlign: true });
+      const sceneStore = getSceneStore();
+      if (sceneStore) {
+        await sceneStore.applyOp({
+          id: opId(), ts: Date.now(), schemaV: 1,
+          kind: 'transformPlacement', placementId: next,
+          position, rotation, scale,
+          prev: { position: [...position], rotation: [0, 0, 0], scale: [1, 1, 1] },
+        });
+      } else {
+        this.applyTransformById(next, position, rotation, scale);
+      }
+      this.store.autoSave();
+      return next;
+    };
+    const sceneStore = getSceneStore();
+    return sceneStore ? sceneStore.withTransaction(label, run) : run();
   }
 
   /**
@@ -3061,6 +3318,8 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     // (splat / virtual DES / GLB). Falls back to the record when it is gone.
     const entry = this._findCatalogEntryById(comp.catalogId);
     let node: Object3D;
+    // plan-650: the source's family values (null for every non-parametric copy).
+    let copyOverrides: AssetOverrides | null = null;
 
     if (isSplat) {
       // Splat duplicate — create a new viewer instance. Resolve the file
@@ -3096,7 +3355,11 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
             : `[LayoutPlanner] Cannot copy "${comp.label}" — no glbUrl and no virtual catalog entry.`);
           return null;
         }
-        node = this._materializeNew(await this._placements.resolveBaked(comp), newId, label, comp.catalogId);
+        copyOverrides = await this._parametricOverridesForCopy(comp);
+        node = this._materializeNew(
+          await this._placements.resolveBaked(comp, { overrides: copyOverrides }), newId, label, comp.catalogId,
+          { overrides: copyOverrides },
+        );
       }
       // `createRoot` named the root after the TEMPLATE (and the virtual branch
       // after the catalog entry); the copy's name is the one computed above.
@@ -3124,6 +3387,8 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       id: newId,
       catalogId: comp.catalogId,
       glbUrl: comp.glbUrl,
+      // plan-778: a copy keeps the original's reference form (qualified or legacy).
+      ...originFields({ providerId: comp.providerId, sourceId: comp.sourceId }),
       label: node.name,
       position: [node.position.x, node.position.y, node.position.z],
       rotation: [...comp.rotation],
@@ -3136,6 +3401,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       // both placements point at the same asset, so a second answer could only
       // be noise from a subtree that is mid-load.
       ...(comp.bounds ? { bounds: { min: [...comp.bounds.min], max: [...comp.bounds.max] } } : {}),
+      ...(copyOverrides ? { assetOverrides: copyOverrides } : {}),
     };
     this.store.addComponent(newComp);
     // Bind the copy's slots to the inherited mappings (component instances were
@@ -3144,12 +3410,56 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       this._applyElementBindings(newId, node, newComp.signalMappings ?? []);
     }
 
-    emitPlannerOp(this._viewer, {
+    // plan-769 Phase 2 (F11, D9 — Unity Ctrl+D): the copy inherits the source's
+    // overrides (its field edits in the scene op log, re-addressed under the copy;
+    // a reference into the source placement follows the copy), in ONE undo step
+    // with the placement itself. The copy's identity is its new record id
+    // (`integrateSubtree`), its content keeps the asset's ids under that occurrence.
+    const sceneStore = getSceneStore();
+    // plan-650: a parametric copy records its family values itself (below, the LIVE
+    // values the copy was built with) — the source's overlay `Values` edits are not
+    // copied a second time.
+    const overrideEdits = (!isSplat ? this._copiedOverrideEdits(comp.id, node) : [])
+      .filter((e) => !(copyOverrides && e.componentType === PARAMETRIC_COMPONENT_TYPE && e.fieldName === 'Values'));
+    const viewer = this._viewer;
+    // plan-650: the copy's family values persist like any edit inside a placement — a
+    // routed setField per family (value = prev: the instance already is that variant).
+    const recordFamilyValues = copyOverrides && viewer
+      ? async (): Promise<void> => {
+        const { recordCopiedFamilyValues } = await import('./planner-parametric');
+        await recordCopiedFamilyValues(viewer, node);
+      }
+      : null;
+    const addOp: RvScenePrimitiveOp = {
       id: opId(), ts: Date.now(), schemaV: 1,
       kind: 'addPlacement', placement: { ...newComp },
-    });
+    };
+    if (sceneStore && (overrideEdits.length > 0 || recordFamilyValues)) {
+      await sceneStore.withTransaction(`Duplicate ${newComp.label}`, async () => {
+        await sceneStore.applyOp(addOp);
+        for (const edit of overrideEdits) {
+          await sceneStore.applyOp({ id: opId(), ts: Date.now(), schemaV: 1, ...edit } as RvScenePrimitiveOp);
+        }
+        if (recordFamilyValues) await recordFamilyValues();
+      });
+    } else {
+      emitPlannerOp(viewer, addOp);
+      if (recordFamilyValues) await recordFamilyValues();
+    }
 
     return newId;
+  }
+
+  /** The field edits a copy of placement `sourceId` inherits — see {@link planCopiedOverrides}. */
+  private _copiedOverrideEdits(sourceId: string, copyRoot: Object3D): CopiedOverrideEdit[] {
+    const reg = this._viewer?.registry;
+    const store = getSceneStore();
+    const source = this._objectMap.get(sourceId);
+    if (!reg || !store || !source) return [];
+    const from = reg.getPathForNode(source);
+    const to = reg.getPathForNode(copyRoot);
+    if (!from || !to) return [];
+    return planCopiedOverrides(materialise(store.document.ops).overlay.nodes, from, to, (p) => reg.getNode(p));
   }
 
   /** Duplicate the currently selected component. */
@@ -3312,7 +3622,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
   /**
    * Take ownership of placements that are already in the loaded tree.
    *
-   * The GLB-scene counterpart of {@link applyPlacements}. A scene saved since
+   * The GLB-scene counterpart of {@link applyPlacements}. A document saved since
    * plan-397 phase 6 carries its placements as `AssetReference` nodes in its
    * own file, so by the time this runs the geometry is loaded, composed and
    * fully registered — there is nothing to build and nothing to fetch. See
@@ -3365,7 +3675,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
         deferred.push({
           node, id: placement.id, label: placement.label,
           occurrence: mark.occurrence || placement.id,
-          ref: { catalogId: placement.catalogId, glbUrl: placement.glbUrl },
+          ref: refOfRecord(placement),
         });
         continue;
       }
@@ -3378,7 +3688,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       // id via the manager's dedupe), exactly like a live placement does.
       this._viewer.behaviors?.dispatchPlaced(node);
     }
-    if (deferred.length > 0) instancer.materializeDeferred(deferred, this._deferredHooks(records));
+    if (deferred.length > 0) instancer.materializeDeferred(deferred, this._deferredHooks((id) => records.get(id)));
 
     this.store.setComponents(placements);
     // The floor tracks intent, not count — `loadScene` overrules it right
@@ -3413,18 +3723,20 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
    * signal bindings. No `alignToFloor` (the saved `position.y` is final), no
    * re-parenting, no rename (the file's names are unique by construction).
    */
-  private _deferredHooks(records: ReadonlyMap<string, PlacedComponent>): import('../../core/engine/rv-placement-instancer').DeferredPlacementHooks {
+  private _deferredHooks(recordOf: (id: string) => PlacedComponent | undefined): import('../../core/engine/rv-placement-instancer').DeferredPlacementHooks {
     return {
       resolveUrl: async (entry) => {
-        const p = records.get(entry.id);
+        const p = recordOf(entry.id);
         return p ? this._resolvePlacementUrl(p) : null;
       },
+      // plan-778: a live parametric placement keeps its values in the record only.
+      overridesOf: (entry) => recordOf(entry.id)?.assetOverrides ?? null,
       isLive: (node) => {
         const modelRoot = this._getModelRoot();
         return !!modelRoot && this._isUnder(node, modelRoot);
       },
       register: (entry) => {
-        const p = records.get(entry.id);
+        const p = recordOf(entry.id);
         const node = entry.node;
         // Record-driven (plan-758): the root keeps the file's name. A duplicate
         // is reported, never renamed — a rename here would depend on the order
@@ -3437,8 +3749,16 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
         this._refreshHierarchy();
         this._viewer?.markRenderDirty();
       },
+      // plan-778 Decision D: the library of this (qualified) placement went away while
+      // it stands — undo the runtime registration (drives, behaviours, snap ports, signal
+      // links), keep the node; `missing` draws the placeholder right after.
+      lost: (entry) => {
+        if (this._viewer) unseatMaterializedPlacement(this._viewer as unknown as PlacedRootDisposeHost, entry, { bindingId: entry.id });
+        this._scheduleSnapPairingRebuild();
+        this._refreshHierarchy();
+      },
       missing: (entry, err) => {
-        const p = records.get(entry.id);
+        const p = recordOf(entry.id);
         if (p) this._placeMissingPlaceholder(entry.node, p, entry.occurrence, err);
         console.warn(`[LayoutPlanner] Cannot restore "${entry.label}" (${entry.ref.catalogId}): ${err}`);
       },
@@ -3452,9 +3772,11 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
    */
   private _placeMissingPlaceholder(node: Object3D, p: PlacedComponent, occurrence: string, error?: unknown): void {
     const ref = getAssetReference(node);
-    const label = missingReferenceLabel({ assetId: p.catalogId, path: p.glbUrl });
+    // plan-778 §3.2: a qualified placement names its library in the label.
+    const label = missingPlacementLabel({ assetId: p.catalogId, path: p.glbUrl, providerId: p.providerId, sourceId: p.sourceId });
     node.add(buildMissingReferencePlaceholder({
-      label, bounds: ref?.bounds, assetId: p.catalogId, path: p.glbUrl,
+      // A live-dropped root carries no AssetReference yet — its record measured the bounds.
+      label, bounds: ref?.bounds ?? p.bounds, assetId: p.catalogId, path: p.glbUrl,
     }));
     smAdoptPlacedNode(this._sceneMutDeps, node, p.id, p.label, p.catalogId);
     reportMissingReference({
@@ -3525,8 +3847,10 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     // stays reference + transform (Decision 11), the visual payload is the
     // shared chunk set of the asset. Warm from the restore prefetch when it
     // ran — same key derivation as the deferred reload path and a live drop.
-    const baked = await this._placements.resolveBaked({ catalogId: p.catalogId, glbUrl: p.glbUrl, url });
-    return this._materializeNew(baked, p.id, p.label, p.catalogId);
+    // plan-650: the record's parametric overrides pick the SAME variant on undo / redo.
+    const overrides = p.assetOverrides ?? null;
+    const baked = await this._placements.resolveBaked(refOfRecord(p, url), { overrides });
+    return this._materializeNew(baked, p.id, p.label, p.catalogId, { overrides });
   }
 
   /**
@@ -3665,8 +3989,22 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
   }
 
   /**
-   * Apply a transform (position / rotation / scale, all in mm + degrees as
-   * stored on `PlacedComponent`) to an existing placement.
+   * The node whose frame a placement record's position/rotation live in: the
+   * layout root or model root — NOT a multi-select pivot that holds the node
+   * for the duration of a group drag (see `applyTransformById`). Null when the
+   * id is unknown. Used by the Align tool (plan-779) to convert a world delta
+   * into record values.
+   */
+  recordParentOf(id: string): Object3D | null {
+    const obj = this._objectMap.get(id);
+    if (!obj) return null;
+    return this._multiSelectPivot?.getOriginalParent(obj) ?? obj.parent;
+  }
+
+  /**
+   * Apply a transform (position in metres and rotation in degrees, in the
+   * record's parent frame, plus scale — as stored on `PlacedComponent`) to an
+   * existing placement.
    * Idempotent: silent no-op if id not found.
    */
   applyTransformById(
@@ -3809,10 +4147,11 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     const warmable = resolved.filter(r => !r.isSplat && r.url != null);
     const warmRefs = new Map<string, PlacementRef>();
     for (const r of warmable) {
-      const ref: PlacementRef = { catalogId: r.comp.catalogId, glbUrl: r.comp.glbUrl, url: r.url as string };
+      const ref: PlacementRef = refOfRecord(r.comp, r.url as string);
       const source = this._placements.sourceOf(ref);
       if (source && !warmRefs.has(source.key)) warmRefs.set(source.key, ref);
     }
+    // Warms the BASE bake; a parametric record bakes its variant in `_loadPlacementGeometry`.
     await Promise.all([...warmRefs.values()].map(ref => this._placements.resolveBaked(ref).catch(() => null)));
     // Per-item `try/catch` is FAILURE ISOLATION, not placement code: without
     // it a single rejected promise aborts the whole restore loop and every
@@ -3854,7 +4193,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
         // not an address, and writing it into `glbUrl` would persist a string
         // no loader can read.
         if (!isSplat && url && url !== comp.glbUrl
-            && !comp.catalogId.startsWith(PROJECT_PLACEMENT_PREFIX)) {
+            && !comp.catalogId.startsWith(PROJECT_PLACEMENT_PREFIX) && !isQualifiedRef(comp)) {
           this.store.updateGlbUrl(comp.id, url);
         }
       } catch (e) {
@@ -3955,62 +4294,6 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     // back to a baked GLB). The Scene window calls clearLayout() in that path.
     this.setLayoutFloorVisible(false);
     if (this._viewer) this._viewer.markRenderDirty();
-  }
-
-  /**
-   * Generate a thumbnail PNG data URL for a catalog entry.
-   * Uses the viewer's WebGL renderer with an offscreen target.
-   * Returns `null` under a WebGPURenderer (plan-271) — thumbnails need the
-   * classic WebGLRenderer; the skip is warned once by ThumbnailRenderer.
-   */
-  async generateThumbnail(glbUrl: string, size = 512): Promise<string | null> {
-    const viewer = this._viewer;
-    if (!viewer) return null;
-    // Manual (button-triggered) generation deliberately bypasses the service
-    // queue and the persistent cache: the user pressed "regenerate" precisely
-    // because they do not want the cached picture. It still goes through the
-    // service so both paths share one renderer instance, and `render()` is
-    // synchronous, so it cannot interleave with a queued job mid-render.
-    const model = await this._placements.loadModel({ catalogId: '', glbUrl });
-    return viewer.thumbnails.renderNow(model, size);
-  }
-
-  /**
-   * Generate and save a thumbnail.
-   *
-   * Posts to the Vite dev-server middleware (`POST /api/library-thumbnail`),
-   * which writes into `public/`. The other branch — a PNG written into a
-   * working folder's `library/.thumbnails/` over the File System Access API —
-   * went with the working folder itself (plan-709 §2.6); project-library
-   * thumbnails are written by the save path, not here.
-   *
-   * Returns the persisted URL on success, or `null` if only the
-   * in-memory data URL could be set.
-   */
-  async saveThumbnail(entryId: string, glbUrl: string): Promise<string | null> {
-    const dataUrl = await this.generateThumbnail(glbUrl);
-    // null = generation skipped (WebGPURenderer, plan-271) — nothing to persist.
-    if (!dataUrl) return null;
-    // Immediately show the generated thumbnail as data URL — the user
-    // gets feedback even if the persistence step fails or is skipped.
-    this.store.setEntryThumbnail(entryId, dataUrl);
-
-    // ── Dev-server fallback (catalog/URL libraries) ────────────────
-    try {
-      const resp = await fetch('/api/library-thumbnail', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ catalogId: entryId, dataUrl }),
-      });
-      if (resp.ok) {
-        const result = await resp.json();
-        const savedUrl = result.url ?? null;
-        // Update to file URL so it persists after rebuild
-        if (savedUrl) this.store.setEntryThumbnail(entryId, savedUrl);
-        return savedUrl;
-      }
-    } catch { /* dev server not available — data URL still shows */ }
-    return null;
   }
 
   /** Resolve an entry's glbUrl by id across all catalogs (queue items are ids). */
@@ -4116,7 +4399,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     id: string,
     label: string,
     catalogId: string,
-    opts?: { skipAutoAlign?: boolean; mode?: PlacementRegistrationMode; naming?: PlacementNaming },
+    opts?: { skipAutoAlign?: boolean; mode?: PlacementRegistrationMode; naming?: PlacementNaming; locked?: boolean },
   ): ProcessExtrasResult | null {
     return smAddPlacedToScene(this._sceneMutDeps, clone, id, label, catalogId, opts);
   }
@@ -4139,7 +4422,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     // null for every project document, which read as "the snap picker does
     // nothing". `loadEntryModel` resolves those; a genuinely unloadable entry
     // throws and surfaces to the caller instead of vanishing.
-    if (!this._placements.sourceOf({ catalogId: entry.id, glbUrl: entry.glbUrl ?? '' })) return null;
+    if (!this._placements.sourceOf(refOfEntry(entry))) return null;
 
     const snapPlugin = this._viewer.getPlugin<SnapPointPlugin>('snap-point');
     const snapRegistry = snapPlugin?.getRegistry();
@@ -4174,6 +4457,8 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       // Empty for a registry entry, exactly as `placeComponent` records it: the
       // identity of such a placement is its `catalogId`, never a URL.
       glbUrl: entry.glbUrl ?? '',
+      // plan-778 F4: the library qualifier of the entry (`entryOriginOf`); empty for a legacy entry.
+      ...originFields(entryOriginOf(entry)),
       // The ONE name (plan-758): the snap registration above already named the root.
       label: node.name,
       position: [node.position.x, node.position.y, node.position.z],

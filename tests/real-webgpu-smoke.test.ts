@@ -7,9 +7,10 @@
  * the complete demo model. CI environments without an adapter skip the suite.
  */
 
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, expect, afterEach, vi, it } from 'vitest';
 import { createTestViewer, type TestViewerHandle } from './helpers/create-test-viewer';
 import { getDefaultVisualSettings } from '../src/core/hmi/visual-settings-store';
+import { skipEachWithoutAdapter } from './helpers/webgpu-adapter-skip';
 
 const adapter = navigator.gpu ? await navigator.gpu.requestAdapter() : null;
 let handle: TestViewerHandle | null = null;
@@ -20,7 +21,8 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe.skipIf(!adapter)('real WebGPU smoke', () => {
+describe('real WebGPU smoke', () => {
+  skipEachWithoutAdapter(adapter); // skipped with the note NO_WEBGPU_ADAPTER from helpers/webgpu-adapter-skip.ts (the [test-skips] line)
   it('renders the complete demo with standard AO and antialiasing', async () => {
     const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
     handle = await createTestViewer('webgpu', { antialias: true, initTimeoutMs: 30_000 });

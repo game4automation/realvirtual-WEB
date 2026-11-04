@@ -19,6 +19,7 @@
  */
 
 import type { CADLinkExtras } from './rv-asset-ops';
+import type { Object3D } from 'three';
 
 /** Result of a fresh CAD file import. */
 export interface CadImportResult {
@@ -43,7 +44,22 @@ export interface CadImportOptions {
   converter?: 'connect' | 'browser';
 }
 
+/**
+ * What the replaying document knows when it asks for a rebuild (plan-650): a provider whose
+ * geometry derives from the document itself (a parametric family's base parts) needs the tree.
+ */
+export interface CadRetessellateContext {
+  /** Root of the asset being replayed, or null. */
+  modelRoot: Object3D | null;
+}
+
 export interface CadGeometryProvider {
+  /**
+   * True for a provider that only REBUILDS geometry derived from the document (plan-650:
+   * parametric variants) and imports no files. It never counts as "CAD import available"
+   * and is never returned by the format-less lookup.
+   */
+  derived?: boolean;
   /** Convert a fresh CAD file to GLB (used by import and CADLink re-import). */
   importFile(file: File, quality: string, opts?: CadImportOptions): Promise<CadImportResult>;
 
@@ -57,7 +73,7 @@ export interface CadGeometryProvider {
    * reach the converter recorded in `cadlink.Converter` THROWS (with a user-facing message)
    * instead of switching converters — the replay records the message as the miss reason.
    */
-  retessellate?(cadlink: CADLinkExtras): Promise<ArrayBuffer | null>;
+  retessellate?(cadlink: CADLinkExtras, ctx?: CadRetessellateContext): Promise<ArrayBuffer | null>;
 }
 
 // Providers are keyed by CAD format ('step', 'jt', …) — a re-import must re-convert with the
@@ -78,12 +94,14 @@ export function registerCadProvider(format: string, provider: CadGeometryProvide
  */
 export function getCadProvider(format?: string): CadGeometryProvider | null {
   if (format) return _providers.get(format.toLowerCase()) ?? null;
-  return _providers.values().next().value ?? null;
+  for (const p of _providers.values()) if (!p.derived) return p;
+  return null;
 }
 
 /** Whether any CAD geometry provider is registered (menu-visibility check). */
 export function hasCadProvider(): boolean {
-  return _providers.size > 0;
+  for (const p of _providers.values()) if (!p.derived) return true;
+  return false;
 }
 
 /** Map a CAD file name to its provider format key ('step' | 'jt' | …). */

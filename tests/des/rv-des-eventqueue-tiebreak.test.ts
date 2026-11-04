@@ -11,10 +11,10 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { DESEventQueue } from '@rv-private/plugins/des/rv-des-event-queue';
-import { DESManager } from '@rv-private/plugins/des/rv-des-manager';
-import { registerAction, ACTION_INDEX } from '@rv-private/plugins/des/rv-des-named-actions';
-import type { ActionContext } from '@rv-private/plugins/des/rv-des-event';
+import { DESEventQueue } from '@rv/plugins/des/rv-des-event-queue';
+import { DESManager } from '@rv/plugins/des/rv-des-manager';
+import { registerAction, ACTION_INDEX } from '@rv/plugins/des/rv-des-named-actions';
+import type { ActionContext } from '@rv/plugins/des/rv-des-event';
 
 describe('DES event queue — tie-break determinism over snapshot/restore (B1)', () => {
   it('snapshot() returns events in dispatch order (time ASC, priority DESC, id ASC)', () => {

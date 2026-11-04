@@ -58,6 +58,22 @@ const OUT_OF_SCOPE_EXACT = new Set([
   // plan-529 — WEB-only, no rv-ODT interchange: a 3D text label authored in the
   // browser, no Unity counterpart. Inline schema in src/core/engine/rv-web-label.ts.
   'WebLabel',
+  // plan-522 — WEB-only maintenance procedure, authored in the web editor, no
+  // Unity counterpart. Inline schemas in src/core/engine/rv-maintenance-components.ts.
+  'LogicStep_MaintenanceProcedure', 'LogicStep_MaintenanceStep', 'LogicStep_AnimateTransform',
+  'LogicStep_SetTransparency', 'LogicStep_Effect', 'LogicStep_Arrow', 'LogicStep_MaintenanceTrigger',
+  // plan-664 Phase 2 — the ray sensor family, WEB-only by the plan's own
+  // decision ("Authoring? Nur im WEB-Editor"): there is no Unity `Rangefinder`,
+  // `LaserScanner` or `RayTarget`, so an rv-ODT `$def` would assert an
+  // interchange contract that does not exist. The Unity counterparts
+  // (`WebRangefinder` / `WebLaserScanner`) and their GLB export are a plan of
+  // their own; when they land, these three move INTO rv-ODT and out of this
+  // list. Inline schemas in src/core/engine/rv-rangefinder.ts,
+  // rv-laser-scanner.ts and rv-ray-target.ts.
+  'Rangefinder', 'LaserScanner', 'RayTarget',
+  // plan-559 Phase 3 — the fleet scene layer, WEB-only (no Unity fleet core):
+  // inline schemas in src/core/fleet/scene/fleet-components.ts.
+  'Fleet', 'TransferStation', 'Charger', 'WaitPoint', 'ForkliftProfile', 'BatteryProfile',
 ]);
 function isInScope(name: string): boolean {
   if (name.startsWith('DES')) return false;

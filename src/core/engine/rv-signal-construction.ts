@@ -11,6 +11,7 @@
  * subtree came from.
  */
 
+import { getActiveStatsRegistry } from '../stats/rv-stats-registry';
 import { Object3D } from 'three';
 import type { Scene } from 'three';
 import { RVDrive } from './rv-drive';
@@ -31,10 +32,17 @@ import { RVDriveUniDriveMotor } from './rv-drive-unidrive-motor';
 import { RVDriveProportionalValve } from './rv-drive-proportional-valve';
 import { applySchema, getSchemaDefaults, resolveComponentRefs, type RVComponent, type ComponentSchema, type ComponentContext, type PlcSignalType } from './rv-component-registry';
 import type { SignalStore } from './rv-signal-store';
-import { reportSignalNameCollision as reportSignalNameCollisionProblem } from '../hmi/problems-store';
+import {
+  clearProblem,
+  getProblem,
+  instanceSignalCollisionProblemId,
+  reportInstanceSignalCollision as reportInstanceSignalCollisionProblem,
+  reportSignalNameCollision as reportSignalNameCollisionProblem,
+  signalNameCollisionProblemId,
+} from '../hmi/problems-store';
 import type { RVTransportManager } from './rv-transport-manager';
 import { NodeRegistry } from './rv-node-registry';
-import { instanceScope, instanceScopeNode, scopeSignalName } from './rv-instance-scope';
+import { instanceScope, instanceScopeNode, placementScopeNode, scopeSignalName } from './rv-instance-scope';
 import { getActiveSignalReapplyRegistry } from './rv-signal-reapply-registry';
 
 /** Pending component awaiting resolveComponentRefs + init() in the caller's Step 2 phase. */
@@ -183,6 +191,27 @@ export function resolveSignalName(
   return { local, runtime, generated };
 }
 
+/**
+ * Does the SIGNAL NAME of `node` hang on its node name (plan-610 F6)? True when
+ * the node carries a PLC signal component whose `Name` is missing or empty —
+ * then {@link resolveSignalName} falls back to the node name (a glTF
+ * original-name override only lasts until the next save, which writes the new
+ * node name as the original), so renaming the node silently renames the
+ * signal under every PLC/CONNECT binding. Such a rename belongs to
+ * `web_editor_signal_rename`, never to a node rename.
+ */
+export function signalNameFollowsNodeName(node: Object3D): boolean {
+  const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
+  if (!rv) return false;
+  for (const key of Object.keys(rv)) {
+    if (!SIGNAL_TYPES.includes(key.replace(/_\d+$/, ''))) continue;
+    const data = rv[key] as Record<string, unknown> | null | undefined;
+    const name = data?.['Name'];
+    if (typeof name !== 'string' || name.length === 0) return true;
+  }
+  return false;
+}
+
 /** What a signal node is registered as — the snapshot the editor sync diffs against. */
 export interface TrackedSignal {
   type: string;
@@ -271,6 +300,9 @@ export function freeSignalName(
  *   original name of a glTF-deduplicated node — `initSubtree` supplies the map
  *   for every entry point (the parser's for a load, the `_rvOrigName` stamps
  *   for a placed clone).
+ * @param opts.reportCollision `false` skips the collision report — for the
+ *   editor sync, which registers a moved node's NEW path while its OLD one is
+ *   still owned and reports once the old path is released.
  * @returns `true` if a signal was registered, `false` if `sigType` was not
  *          recognized as Bool/Float/Int (defensive: no-op on unknown types).
  */
@@ -282,6 +314,7 @@ export function registerSignal(
   signalStore: SignalStore,
   registry: NodeRegistry,
   signalNameOverride?: string,
+  opts?: { reportCollision?: boolean },
 ): boolean {
   const status = sigData['Status'] as { Value?: boolean | number } | undefined;
   const resolved = resolveSignalName(node, sigData, signalNameOverride);
@@ -342,7 +375,7 @@ export function registerSignal(
     signalStore.clearSignalMetaField(signalName, 'originDataType');
   }
 
-  reportSignalNameCollision(signalStore, node, signalName, path);
+  if (opts?.reportCollision !== false) reportSignalNameCollision(signalStore, node, signalName, path);
 
   return true;
 }
@@ -362,26 +395,91 @@ export function registerSignal(
  * ONE funnel every model-side registration goes through and the only one that
  * has the node — so the rule lives here, and `rv-signal-store.ts` stays free of
  * both placement knowledge and the problems store.
+ *
+ * plan-559 Phase 2a: OUTSIDE a placement the same situation — two embedded
+ * copies of an asset in one document, neither carrying an `InstanceScope`
+ * marker — is reported as `instance-signal-collision` (one entry per name,
+ * every claiming node path). Report only (decision D7/A1): nothing is renamed,
+ * nothing is refused — the copies keep sharing the signal exactly as before.
  */
 function reportSignalNameCollision(
   store: SignalStore, node: Object3D, name: string, path: string,
+): void {
+  reportSignalCollisionAt(store, node, name, path, true);
+}
+
+/** Store owner paths that are bookkeeping, not model nodes (interface placeholder, DES claims). */
+function isSyntheticOwnerPath(p: string): boolean {
+  return p.startsWith('__iface__/') || p.startsWith('__des-owner__/') || p.startsWith('__des-rebind__/');
+}
+
+/**
+ * The collision rule of a just-registered signal `name` at `path` (owned by
+ * `node`), shared by {@link registerSignal} and the behavior-signal
+ * registration (`behaviors.ts`). Inside a placement → `signal-name-collision`
+ * (only when `includePlacements` — the behavior path never reported it, and
+ * keeps not doing so); elsewhere → `instance-signal-collision`. Load / bind
+ * time only, allocation-free unless the name really has a second owner.
+ */
+export function reportSignalCollisionAt(
+  store: SignalStore, node: Object3D, name: string, path: string, includePlacements: boolean,
 ): void {
   // Allocation-free early-out: the overwhelming majority of registrations have
   // exactly one owner, and this runs for every signal of every load.
   if (store.ownerPathCount(name) < 2) return;
   // `__iface__/<name>` is the interface placeholder, not a model path (the
-  // literal avoids a value import of the store into this module).
-  const owners = store.registeredPaths(name).filter((p) => !p.startsWith('__iface__/'));
+  // literal avoids a value import of the store into this module). The same
+  // holds for the DES runner's lifetime claims (`__des-owner__/…`, plan-645 L6)
+  // and its release helper (`__des-rebind__/…`): bookkeeping of the SAME
+  // instance, never a second node — counting them reported every placed
+  // vehicle's own signals as `signal-name-collision` (plan-612 #149).
+  const owners = store.registeredPaths(name).filter((p) => !isSyntheticOwnerPath(p));
   if (owners.length < 2) return;
-  const scopeNode = instanceScopeNode(node);
-  if (!scopeNode) return;                       // not inside a placement — nothing to warn about
   const local = (node.userData?.realvirtual as Record<string, Record<string, unknown>> | undefined);
   // A `/`-global authored declaration is intentionally shared.
   for (const key of SIGNAL_TYPES) {
     const data = local?.[key];
     if (data && typeof (data['Name']) === 'string' && (data['Name'] as string).startsWith('/')) return;
   }
-  reportSignalNameCollisionProblem(name, owners, path);
+  if (placementScopeNode(node)) {
+    if (includePlacements) reportSignalNameCollisionProblem(name, owners, path);
+    return;
+  }
+  reportInstanceSignalCollisionProblem(name, owners, path);
+}
+
+/**
+ * Bring an ALREADY REPORTED collision of `name` in line with the store as it is
+ * now — the counterpart of {@link reportSignalCollisionAt} for the moment an
+ * owner went away (rename, delete, reparent in the editor). The report side
+ * only ever ran when a second owner arrived, so a collision resolved by the user
+ * stayed in the Problems panel until the next model load.
+ *
+ *  - fewer than two model owners left (synthetic owners do not count) → both
+ *    collision ids of the name are cleared;
+ *  - still two or more → an existing entry is re-reported with the current
+ *    owner list (its `nodePath` kept when that node still owns the name).
+ *
+ * Never CREATES an entry: whether a collision is worth reporting (placement vs.
+ * instance, the `/`-global exemption) needs the node, and that decision stays
+ * with the registration that brought the second owner.
+ */
+export function reconcileSignalCollision(store: SignalStore, name: string): void {
+  const placementId = signalNameCollisionProblemId(name);
+  const instanceId = instanceSignalCollisionProblemId(name);
+  const placement = getProblem(placementId);
+  const instance = getProblem(instanceId);
+  if (!placement && !instance) return;
+  const owners = store.registeredPaths(name).filter((p) => !isSyntheticOwnerPath(p));
+  if (owners.length < 2) {
+    clearProblem(placementId);
+    clearProblem(instanceId);
+    return;
+  }
+  const keepNode = (nodePath: string | undefined): string | undefined =>
+    nodePath !== undefined && owners.includes(nodePath) ? nodePath : owners[0];
+  if (placement) reportSignalNameCollisionProblem(name, owners, keepNode(placement.nodePath));
+  if (instance) reportInstanceSignalCollisionProblem(name, owners, keepNode(instance.nodePath));
 }
 
 /** Render-free signal container name under a drive node (parity with GLB `Signals`). */
@@ -837,6 +935,7 @@ export function attachDriveBehaviorByCode(
   // Loader STEP 2 parity: resolve explicitly wired refs
   // then init() so the feedback callback + input subscriptions are wired.
   const ctx: ComponentContext = {
+    statsRegistry: getActiveStatsRegistry() ?? undefined,
     registry,
     signalStore,
     scene: viewer.scene,

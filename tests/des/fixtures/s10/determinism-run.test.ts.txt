@@ -1,0 +1,152 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
+// Browser fixture; the Node harness injects RV_DET_INPUT and persists DET_RESULT to RV_DET_OUT.
+import { expect, it } from 'vitest';
+import { Object3D } from 'three';
+import { DESRunner } from '@rv/plugins/des/des-runner';
+import '@rv/behaviors/Conveyor';
+import '@rv/behaviors/Source';
+import '@rv/behaviors/Sink';
+import '@rv/behaviors/Agv';
+import { bindDesYard, startDesRuntime } from '@rv/plugins/models/PalletYard';
+import { applyYardLive } from '@rv/plugins/models/PalletYard/yard-runtime';
+import { DEFAULT_YARD } from '@rv/plugins/models/PalletYard/yard-compose';
+import { PALLET_YARD_OWNER, palletYardParams, palletYardKpis, validatePalletYard } from '@rv/plugins/models/PalletYard/parameters';
+import { yardMeanOrderSec } from '@rv/plugins/models/PalletYard/yard-order-kpis';
+import { createPlanningRegistry } from '@rv/core/planning/rv-planning-registry';
+import type { PlanningChange } from '@rv/core/planning/rv-planning-registry';
+import type { TaktSource } from '@rv/core/fleet/core/order-sources';
+import { registerMaterialFlow } from '@rv/core/material-flow/registry';
+import Downtime from '@rv/plugins/des/material-flow/Downtime';
+import { expectNoWaitTimeouts } from '__PUBLIC_ROOT__/tests/fleet/expect-no-wait-timeouts';
+import { loadPalletYardScene } from '__PUBLIC_ROOT__/tests/des/pallet-yard-scene-load';
+
+declare const RV_DET_INPUT: {
+  simSec: number;
+  protocol: Array<{ simTime: number; key: string; to: number }>;
+  replay: PlanningChange[] | null;
+  /** DES audit (seed/disturbance inventory): vehicle ids set Active=false before bind. */
+  activeOff: string[];
+  /**
+   * plan-2053 Phase 0: a `Downtime` node (fixed MTBF/MTTR, non-stochastic) added
+   * before bind, `TargetComponentPath` resolved to the real vehicle's DES path.
+   * `null`/absent = no fault injected (control run / untouched by other callers).
+   */
+  downtime?: { mtbf: number; mttr: number; targetName: string } | null;
+};
+
+/** Mirrors `DESComponent.path` (rv-des-component.ts): ancestor names from just
+ *  below the true scene root down to `node`, joined with '/'. Computed here
+ *  (rather than guessed) so the injected Downtime targets whatever path the
+ *  DES manager will actually assign the real vehicle at bind time. */
+function desPathOf(node: Object3D): string {
+  const parts: string[] = [];
+  let current: Object3D | null = node;
+  while (current && current.parent) {
+    parts.unshift(current.name);
+    current = current.parent;
+    if (!current.parent) break;
+  }
+  return parts.join('/');
+}
+
+it('one PalletYard determinism measurement per process', async () => {
+  const { simSec, protocol, replay, activeOff, downtime } = RV_DET_INPUT;
+  expect(Number.isFinite(simSec) && simSec > 0).toBe(true);
+  const y = await loadPalletYardScene();
+  const runner = new DESRunner({ subMode: 'fastforward', durationSeconds: simSec });
+  let cleanup = () => {};
+  try {
+    for (const id of activeOff ?? []) {
+      const node = y.root.getObjectByName(id);
+      if (!node) throw new Error('activeOff: no such vehicle node: ' + id);
+      node.userData.realvirtual.Agv.Active = false;
+    }
+    if (downtime) {
+      const target = y.root.getObjectByName(downtime.targetName);
+      if (!target) throw new Error('downtime: no such vehicle node: ' + downtime.targetName);
+      registerMaterialFlow(Downtime);
+      const downNode = new Object3D();
+      downNode.name = 'FaultDowntime_' + downtime.targetName;
+      downNode.userData.realvirtual = {
+        Downtime: { MTBF: downtime.mtbf, MTTR: downtime.mttr, TargetComponentPath: desPathOf(target) },
+      };
+      y.root.add(downNode);
+    }
+    runner.start([], { root: y.root, host: y.host as never });
+    const bound = bindDesYard({ runner, root: y.root, drives: y.drives });
+    if (!bound.ok) throw new Error('bind: ' + bound.missing.join(', '));
+    const rt = startDesRuntime(bound.backend, () => {});
+    const registry = createPlanningRegistry({ simTime: () => rt.clock.now() });
+    const handle = registry.declare({
+      owner: PALLET_YARD_OWNER, title: 'Planning · PalletYard',
+      params: palletYardParams(DEFAULT_YARD), validate: validatePalletYard,
+      kpis: palletYardKpis({ counters: () => rt.counters, simSeconds: () => rt.simSeconds,
+        meanOrderSec: () => yardMeanOrderSec(rt) }),
+      // Same live bridge as FleetPlugin: UI/MCP set queues at planning priority;
+      // registry replay has already scheduled at that priority and applies directly.
+      onLive(change, applied, valid, opts) {
+        const apply = () => {
+          if (valid && !valid()) return;
+          if (!applyYardLive(rt, change.key, change.to)) throw new Error('Unsupported live key: ' + change.key);
+          applied(rt.clock.now());
+        };
+        if (opts?.alreadyScheduled) apply();
+        else rt.scheduleNow(apply, valid, { afterModelEvents: true });
+      },
+    });
+    const orders: Array<{ id: number; source: string; destination: string | null; created: number; done: number; vehicle: string | null }> = [];
+    const off = rt.dispatcher.orders.onComplete((o, now) => {
+      // Retain by creation id, not completion order; assignment is still on the order.
+      if (o.id <= 50) orders.push({ id: o.id, source: o.source, destination: o.destination,
+        created: o.times.created, done: now, vehicle: o.vehicle });
+    });
+    cleanup = () => { off(); handle.dispose(); rt.dispose(); };
+    // Read-only access to the actual controller distinguishes BLOCKED from merely occupied.
+    const state = () => (rt as unknown as { takt: TaktSource }).takt.states[0];
+    const releases: number[] = [];
+    const produce = rt.handover.produce.bind(rt.handover);
+    rt.handover.produce = (output) => {
+      const produced = produce(output);
+      if (produced && output === 'A1') releases.push(rt.clock.now());
+      return produced;
+    };
+    let freeAt: number | null = null, blockedAt: number | null = null;
+    const probe = () => {
+      const now = rt.clock.now();
+      if (freeAt === null && rt.handover.headFree('A1') && !state().blocked) freeAt = now;
+      if (blockedAt === null && state().blocked) blockedAt = now;
+      if ((freeAt === null || blockedAt === null) && now + 1 < simSec) {
+        rt.clock.schedule(now + 1, probe, { afterModelEvents: true });
+      }
+    };
+    rt.clock.schedule(1, probe, { afterModelEvents: true });
+    const submissions: Array<{ simTime: number; free: boolean; blocked: boolean }> = [];
+    if (replay) registry.replayChanges(replay, (at, apply, opts) => { rt.clock.schedule(at, apply, opts); });
+    else for (const row of protocol) {
+      expect(row.simTime >= 0 && row.simTime < simSec).toBe(true);
+      rt.clock.schedule(row.simTime, () => {
+        submissions.push({ simTime: rt.clock.now(), free: rt.handover.headFree('A1'), blocked: state().blocked });
+        expect(registry.set(row.key, row.to, 'ui').ok).toBe(true);
+      }, { afterModelEvents: true });
+    }
+    const mgr = runner.getManager() as unknown as { currentTime: number; isComplete: boolean; totalEventsProcessed: number };
+    let idle = 0;
+    while (!mgr.isComplete) {
+      const before = mgr.totalEventsProcessed;
+      runner.tick(1 / 60); runner.lateTick(1 / 60); rt.frame();
+      idle = mgr.totalEventsProcessed === before ? idle + 1 : 0;
+      if (idle >= 3) throw new Error('stall at sim t=' + mgr.currentTime);
+    }
+    expectNoWaitTimeouts(rt as never);
+    expect(mgr.currentTime).toBeGreaterThanOrEqual(simSec - 1);
+    expect(orders.length).toBe(50);
+    const result = {
+      counters: { ...rt.counters },
+      kpis: Object.fromEntries(registry.kpis().map(k => [k.key, k.value])),
+      changeLog: registry.changeLog(), orders: orders.sort((a, b) => a.id - b.id),
+      releases, freeAt, blockedAt, submissions,
+    };
+    console.log('DET_RESULT ' + JSON.stringify(result));
+  } finally { cleanup(); runner.dispose(); y.dispose(); }
+}, 900_000);

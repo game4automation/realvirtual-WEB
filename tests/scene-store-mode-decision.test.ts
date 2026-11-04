@@ -150,8 +150,15 @@ describe('the direct paths do not opt in (F12)', () => {
   it('main.ts: the ?doc= route opens without the option', () => {
     const route = MAIN_SOURCE.slice(MAIN_SOURCE.indexOf('await sceneStore.openDocument(urlDoc'));
     expect(route.slice(0, route.indexOf(';'))).toBe('await sceneStore.openDocument(urlDoc)');
-    // The only opt-in in main.ts is the remembered-pair resume (F9).
-    expect(MAIN_SOURCE.match(/modeDecidedByCaller/g)).toHaveLength(1);
+    // Exactly two deliberate opt-ins in main.ts: the remembered-pair resume
+    // (F9) and — the second one, plan-640 — the hosted start document, whose
+    // mode the boot's mode chain decides (`settings.start.mode`). A third one
+    // would be a new decision and must re-pin this count on purpose.
+    expect(MAIN_SOURCE.match(/modeDecidedByCaller/g)).toHaveLength(2);
+    expect(MAIN_SOURCE).toContain(
+      'await sceneStore.openDocument(doc.id, { name: doc.name, modeDecidedByCaller: true });');
+    expect(MAIN_SOURCE).toContain(
+      'await sceneStore.openDocument(hostedBoot.docId, { name: hostedBoot.docName, modeDecidedByCaller: true });');
   });
 
   it('MCP project tools and the CONNECT embed never set it', () => {

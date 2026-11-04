@@ -33,6 +33,7 @@ import {
 import { pluginParticipatesInMode } from '../src/core/rv-mode-manager';
 import { UIPluginRegistry } from '../src/core/rv-ui-registry';
 import { modeContext } from '../src/core/rv-mode-manager';
+import { PlannerAlignButton } from '../src/plugins/layout-planner/PlannerToolbarButtons';
 
 describe('AUTHORING_MODES', () => {
   it('is the planner and DES workspaces', () => {
@@ -101,7 +102,10 @@ describe('UI slot gating follows the same set', () => {
     const legacy = plugin.slots.filter((s) => s.visibilityRule?.shownOnlyIn);
     expect(legacy.length).toBeGreaterThan(0);
     for (const entry of legacy) {
-      expect(entry.visibilityRule?.shownOnlyIn).toEqual(['planner']);
+      // Align is planner-only: shownOnlyIn is an AND gate (context AND mode),
+      // and register() leaves it alone — unlike shownOnlyInAny, which it replaces.
+      const expected = entry.component === PlannerAlignButton ? ['planner', 'mode:planner'] : ['planner'];
+      expect(entry.visibilityRule?.shownOnlyIn).toEqual(expected);
     }
   });
 });

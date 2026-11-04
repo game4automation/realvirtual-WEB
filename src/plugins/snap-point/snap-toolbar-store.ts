@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, removeLocalStorage, writeLocalStorage } from '../../core/rv-safe-storage';
+
 /**
  * snap-toolbar-store — Persisted "Show all snap-points" toggle.
  *
@@ -17,7 +19,7 @@ interface SnapToolbarState {
 
 function _readInitial(): SnapToolbarState {
   try {
-    const v = localStorage.getItem(LS_KEY);
+    const v = readLocalStorage(LS_KEY);
     return { showAllSnaps: v === 'true' };
   } catch {
     return { showAllSnaps: false };
@@ -44,14 +46,14 @@ export const snapToolbarStore = {
   setShowAllSnaps(show: boolean): void {
     if (_state.showAllSnaps === show) return;
     _state = { showAllSnaps: show };
-    try { localStorage.setItem(LS_KEY, show ? 'true' : 'false'); } catch { /* ignore */ }
+    try { writeLocalStorage(LS_KEY, show ? 'true' : 'false'); } catch { /* ignore */ }
     _notify();
   },
 
   /** Test-only: reset state and clear localStorage. */
   _reset(): void {
     _state = { showAllSnaps: false };
-    try { localStorage.removeItem(LS_KEY); } catch { /* ignore */ }
+    try { removeLocalStorage(LS_KEY); } catch { /* ignore */ }
     _notify();
   },
 };

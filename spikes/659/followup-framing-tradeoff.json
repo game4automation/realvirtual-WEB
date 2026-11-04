@@ -1,0 +1,23 @@
+[
+  {
+    "distanceM": 1.1,
+    "robotHeightPx": 187,
+    "pushScreenPx": 216,
+    "inFramePct": 25,
+    "leftFrameAtS": 10
+  },
+  {
+    "distanceM": 2.2,
+    "robotHeightPx": 87,
+    "pushScreenPx": 199,
+    "inFramePct": 83,
+    "leftFrameAtS": 34
+  },
+  {
+    "distanceM": 3.2,
+    "robotHeightPx": 59,
+    "pushScreenPx": 94,
+    "inFramePct": 100,
+    "leftFrameAtS": null
+  }
+]

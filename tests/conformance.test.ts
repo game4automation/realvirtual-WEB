@@ -35,6 +35,8 @@ import exp06 from '../schema/v1/conformance/06-source-with-aliases.expected.json
 
 interface ExpectedFile {
   description: string;
+  /** Why this file is hand-written and how to extend it (plan-2047). Optional. */
+  maintenance?: string;
   nodes: Record<string, Record<string, Record<string, unknown>>>;
 }
 
@@ -73,6 +75,45 @@ describe('rv-ODT conformance suite', () => {
     });
 
     expect(actualNodes).toEqual(expected.nodes);
+  });
+
+  /**
+   * plan-2047 Fall 6 — the recurring cause, not the symptom.
+   *
+   * The `*.expected.json` fixtures are maintained BY HAND on purpose: an
+   * expectation generated from the parser or the schema this suite checks would
+   * be a mirror and would turn a real parser defect green. The price is that a
+   * new rv-odt property with a default silently breaks the comparison above,
+   * which is exactly how `7a7b64b7` (three new Grip defaults) left
+   * 05-grip-with-enum red for three days with a diff nobody could place.
+   *
+   * This test makes that moment legible instead of generating the answer: it
+   * only asserts that each default-carrying property is PRESENT in the fixture
+   * of a type the fixture covers, and names the ones that are not. The expected
+   * VALUE stays hand-written — the assertion says "decide about this field",
+   * never "the parser's output is correct".
+   */
+  it('a new schema property with a default is named, not silently dropped', () => {
+    const defs = (rvOdt as unknown as {
+      $defs: Record<string, { properties?: Record<string, { default?: unknown }> }>;
+    }).$defs;
+    const missing: string[] = [];
+    for (const [name, , expected] of CASES) {
+      for (const [node, components] of Object.entries(expected.nodes)) {
+        for (const [type, state] of Object.entries(components)) {
+          for (const [field, prop] of Object.entries(defs[type]?.properties ?? {})) {
+            if (prop.default === undefined) continue;
+            if (field in state) continue;
+            missing.push(`${name} ${node}.${type}.${field} (schema default ${JSON.stringify(prop.default)})`);
+          }
+        }
+      }
+    }
+    expect(
+      missing,
+      'these schema properties carry a default but no conformance fixture states it — ' +
+      'add each to its *.expected.json by hand, with the commit that introduced it',
+    ).toEqual([]);
   });
 
   it('every conformance GLB carries _formatVersion 1.0 (except the empty scene)', async () => {

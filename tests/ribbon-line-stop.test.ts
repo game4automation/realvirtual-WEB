@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { Scene } from 'three';
 import { loadGLB } from '../src/core/engine/rv-scene-loader';

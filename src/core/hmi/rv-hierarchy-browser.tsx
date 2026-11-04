@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * HierarchyBrowser — the scene graph, as a tree.
  *
@@ -56,7 +58,6 @@ import type { ContextMenuTarget } from './context-menu-store';
 import { HIERARCHY_MIN_WIDTH, HIERARCHY_MAX_WIDTH, type RvExtrasEditorPlugin } from './rv-extras-editor';
 import { LeftPanel } from './LeftPanel';
 import { getSceneStore } from './scene/scene-store-singleton';
-import { requestDescend } from '../editor/rv-descend-request';
 import { isInsideReference } from '../engine/rv-reference-scope';
 import { isModelRoot } from '../engine/rv-model-root';
 import { useVirtualizer } from '@tanstack/react-virtual';
@@ -104,6 +105,12 @@ import {
   subscribeActiveDocumentView,
 } from '../editor/active-document-view';
 import { useUIVisible } from './ui-context-store';
+import { showInstruction } from './instruction-store';
+import { referencedDocumentId, referencedLibraryDocument } from './hierarchy-reference-open';
+import { getLibraryProjectLoader } from '../library/library-project-loader';
+import { openReferencedDocument } from './document-nav';
+import { createDocumentNavHost } from './document-nav-host';
+import { getProjectStore } from '../project/project-store';
 
 // Re-exports for backwards compatibility — external callers (and tests) may
 // import these symbols from `rv-hierarchy-browser`.
@@ -164,17 +171,17 @@ export const LS_KEY_SHOW_BAKED = 'rv-hierarchy-show-baked';
 
 /** Is baked geometry hidden? True unless the user switched it on. */
 export function loadHideBaked(): boolean {
-  try { return localStorage.getItem(LS_KEY_SHOW_BAKED) !== 'true'; } catch { return true; }
+  return readLocalStorage(LS_KEY_SHOW_BAKED) !== 'true';
 }
 
 /** Persist the baked-geometry toggle (stored as its SHOW state). */
 export function persistHideBaked(hide: boolean): void {
-  try { localStorage.setItem(LS_KEY_SHOW_BAKED, String(!hide)); } catch { /* */ }
+  try { writeLocalStorage(LS_KEY_SHOW_BAKED, String(!hide)); } catch { /* */ }
 }
 
 function loadTreeExpanded(): Set<string> {
   try {
-    const raw = localStorage.getItem(LS_KEY_TREE_EXPANDED);
+    const raw = readLocalStorage(LS_KEY_TREE_EXPANDED);
     return raw ? new Set(JSON.parse(raw) as string[]) : new Set();
   } catch { return new Set(); }
 }
@@ -185,13 +192,39 @@ let expandPersistTimer: ReturnType<typeof setTimeout> | null = null;
 function persistTreeExpandedSet(expanded: Set<string>): void {
   if (expandPersistTimer) clearTimeout(expandPersistTimer);
   expandPersistTimer = setTimeout(() => {
-    localStorage.setItem(LS_KEY_TREE_EXPANDED, JSON.stringify([...expanded]));
+    writeLocalStorage(LS_KEY_TREE_EXPANDED, JSON.stringify([...expanded]));
   }, 300);
 }
 
 /** Component search text (AAS description, Metadata, …) — the extra input of
  *  the shared search predicate, module-level so memos need not depend on it. */
 const searchableText = (obj: Object3D): readonly string[] => tooltipRegistry.getSearchableText(obj);
+
+/** Instruction id of the refused-move toast (a second refusal replaces it). */
+export const HIERARCHY_MOVE_REFUSED_TOAST_ID = 'hierarchy-move-refused';
+
+/**
+ * Tell the user why a drag & drop move did not happen (plan-610). Two kinds
+ * of refusal reach here, and in neither is anything left changed:
+ * - BEFORE the first mutation: a `RenameRefusedError` from the signal-node or
+ *   reference guard, a document lock error — nothing was touched.
+ * - AFTER the mutation: a `ReferenceRebindError` (plan-614 F1) — the move was
+ *   applied, a referrer could not be re-bound to its own target, and the
+ *   whole composite was ROLLED BACK before the promise rejected.
+ * So there is only something to say. Uses the shared instruction toast.
+ */
+export function reportHierarchyMoveFailure(err: unknown): void {
+  const message = err instanceof Error && err.message ? err.message : String(err ?? 'unknown error');
+  console.warn('[hierarchy] move refused:', err);
+  showInstruction({
+    id: HIERARCHY_MOVE_REFUSED_TOAST_ID,
+    text: `Move refused: ${message}`,
+    anchor: { kind: 'edge', edge: 'bottom' },
+    style: 'toast',
+    autoClearAfterMs: 6000,
+    source: 'hierarchy',
+  });
+}
 
 /** The scene object behind a row, or null for a synthetic group row. */
 function objectOf(node: TreeNode): Object3D | null {
@@ -274,12 +307,12 @@ function HierarchyBrowserPanel({ viewer, plugin }: HierarchyBrowserProps & { plu
   // the known categories here; whether it has hits in the MODEL is checked after
   // each load (validation effect below).
   const [typeFilter, setTypeFilterRaw] = useState<HierarchyFilterId>(() => {
-    try { return migrateLegacyFilter(localStorage.getItem('rv-hierarchy-type-filter')); } catch { return 'all'; }
+    try { return migrateLegacyFilter(readLocalStorage('rv-hierarchy-type-filter')); } catch { return 'all'; }
   });
   const signalsView = isSignalsFilter(typeFilter);
   const setTypeFilter = useCallback((v: HierarchyFilterId) => {
     setTypeFilterRaw(v);
-    try { localStorage.setItem('rv-hierarchy-type-filter', v); } catch { /* */ }
+    writeLocalStorage('rv-hierarchy-type-filter', v);
   }, []);
   /**
    * Hide what the document does not own (plan-754 D2).
@@ -289,12 +322,12 @@ function HierarchyBrowserPanel({ viewer, plugin }: HierarchyBrowserProps & { plu
    * a search ignores the toggle, and the footer says how many rows it hides.
    */
   const [hideRuntime, setHideRuntimeRaw] = useState<boolean>(() => {
-    try { return localStorage.getItem(LS_KEY_SHOW_RUNTIME) !== 'true'; } catch { return true; }
+    return readLocalStorage(LS_KEY_SHOW_RUNTIME) !== 'true';
   });
   const toggleHideRuntime = useCallback(() => {
     setHideRuntimeRaw((prev) => {
       const next = !prev;
-      try { localStorage.setItem(LS_KEY_SHOW_RUNTIME, String(!next)); } catch { /* */ }
+      try { writeLocalStorage(LS_KEY_SHOW_RUNTIME, String(!next)); } catch { /* */ }
       return next;
     });
   }, []);
@@ -342,11 +375,11 @@ function HierarchyBrowserPanel({ viewer, plugin }: HierarchyBrowserProps & { plu
   }, [filtersOpen]);
 
   const [signalSort, setSignalSortRaw] = useState<SignalSort>(() => {
-    try { const v = localStorage.getItem('rv-hierarchy-signal-sort'); return (v as SignalSort) ?? 'name'; } catch { return 'name'; }
+    try { const v = readLocalStorage('rv-hierarchy-signal-sort'); return (v as SignalSort) ?? 'name'; } catch { return 'name'; }
   });
   const setSignalSort = useCallback((v: SignalSort) => {
     setSignalSortRaw(v);
-    try { localStorage.setItem('rv-hierarchy-signal-sort', v); } catch { /* */ }
+    writeLocalStorage('rv-hierarchy-signal-sort', v);
   }, []);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const rowHeight = usePointerRowHeight();
@@ -516,7 +549,7 @@ function HierarchyBrowserPanel({ viewer, plugin }: HierarchyBrowserProps & { plu
   // ── Filter validation after a model load (plan-597 §2.3) ──
   // A persisted filter on a category the freshly loaded model does not have
   // falls back to All — ONCE per load, counted fresh after whenSceneReady(),
-  // never while an asset document is active or still opening (draft replay),
+  // never while a document is open in the editor or still opening (draft replay),
   // never on an in-session edit. Read through refs so the subscription is made
   // once per viewer, not per render.
   const validationRef = useRef({ rootObject, rowCtx, typeFilter });
@@ -787,12 +820,36 @@ function HierarchyBrowserPanel({ viewer, plugin }: HierarchyBrowserProps & { plu
     plugin.updateOverlayField(node.path, 'LayoutObject', 'Locked', false);
   }, [plugin]);
 
+  /** Open the asset a reference row places, in this tab: its document opens in
+   *  its last mode, with a Back to here (`document-nav.ts`) — in every mode,
+   *  the editor included. */
+  const onOpenReference = useCallback((node: TreeNode) => {
+    const object = objectOf(node);
+    const documentId = object ? referencedDocumentId(object, getProjectStore().getProject()) : null;
+    if (!documentId) {
+      // plan-778: a library part is edited through the Inspector's library actions.
+      const library = object ? referencedLibraryDocument(object) : null;
+      showInstruction({
+        id: 'hierarchy-open-reference',
+        text: library
+          ? `From library '${getLibraryProjectLoader()?.getNode(library.libraryProjectId)?.label ?? library.libraryProjectId}' — see the Inspector`
+          : 'The referenced asset is not a document of the open project',
+        anchor: { kind: 'edge', edge: 'bottom' },
+        style: 'toast',
+        autoClearAfterMs: 5000,
+        source: 'hierarchy',
+      });
+      return;
+    }
+    void openReferencedDocument(createDocumentNavHost(viewer), documentId);
+  }, [viewer]);
+
   // ── Drag & drop reorder / reparent (asset editor only) ──
   // Unity-style: drag a row and drop it BETWEEN two rows to reorder it as a
   // sibling, or ONTO a row to reparent it as that node's child (world transform
   // preserved). Enabled only in the plain tree view (no type filter / search,
-  // where sibling order and indices are unambiguous) while an asset document is
-  // active, and only for rows the document owns.
+  // where sibling order and indices are unambiguous) while a document is open
+  // in the editor, and only for rows the document owns.
   useSyncExternalStore(subscribeActiveAsset, getActiveAssetVersion);
   const dndEnabled = typeFilter === 'all' && !deferredTerm && !!getActiveAssetContext();
 
@@ -906,7 +963,13 @@ function HierarchyBrowserPanel({ viewer, plugin }: HierarchyBrowserProps & { plu
     if (!res || paths.length === 0) return;
     const ctx = getActiveAssetContext();
     if (!ctx) return;
-    void ctx.doc.reparentNodes(paths, res.parentPath, res.index !== undefined ? { index: res.index } : undefined);
+    // plan-610 / plan-614 F1: a refused move rejects with nothing left changed —
+    // the signal-node guard, reference guard and document lock refuse BEFORE
+    // mutating; a re-bind refusal (ReferenceRebindError) comes AFTER the
+    // mutation and the composite is rolled back first. Say why instead of
+    // leaving an unhandled rejection behind.
+    ctx.doc.reparentNodes(paths, res.parentPath, res.index !== undefined ? { index: res.index } : undefined)
+      .catch(reportHierarchyMoveFailure);
   }, [resolveDrop, clearDrag]);
 
   const displayCount = flatFiltered !== null ? flatFiltered.length : visibleRows.length;
@@ -1041,12 +1104,13 @@ function HierarchyBrowserPanel({ viewer, plugin }: HierarchyBrowserProps & { plu
     (node: TreeNode) => {
       const object = objectOf(node);
       if (!object) return;
-      // On a resolvable AssetReference the double-click is a DESCEND, not an
-      // inspector toggle (plan-703 §3.4): the reference node itself has almost
-      // nothing to inspect, and the gesture the user means is "open this".
-      // `requestDescend` answers false when there is no editor stack or the node
-      // is not descendable, so the ordinary behaviour below stays the default.
-      if (node.path && requestDescend(node.path)) return;
+      // In the editor a double-click on a reference row means "open this", as
+      // it did when it descended in place (plan-703 §3.4). It now opens the
+      // asset's document in its last mode, exactly like the row's link glyph.
+      if (viewer.modes.activeMode === 'editor' && node.reference) {
+        onOpenReference(node);
+        return;
+      }
 
       // Double click is the gesture that opens the property inspector. The node
       // is already selected by the preceding click of the double-click sequence,
@@ -1054,7 +1118,7 @@ function HierarchyBrowserPanel({ viewer, plugin }: HierarchyBrowserProps & { plu
       plugin.selectObject(object, true, false);
       viewer.fitToNodes([object]); // viewer auto-applies panel offset
     },
-    [viewer, plugin],
+    [viewer, plugin, onOpenReference],
   );
 
   // Keyboard navigation for the tree (WAI-ARIA tree pattern). The container
@@ -1474,6 +1538,7 @@ function HierarchyBrowserPanel({ viewer, plugin }: HierarchyBrowserProps & { plu
                     onToggleVisible={canToggleVisibility ? onToggleVisible : undefined}
                     eyeDisabledReason={eyeDisabledReason}
                     onUnlock={onUnlock}
+                    onOpenReference={onOpenReference}
                     dndEnabled={dndEnabled}
                     dropZone={dropTarget && dropTarget.key === row.rowKey ? dropTarget.zone : null}
                     onRowDragStart={handleRowDragStart}

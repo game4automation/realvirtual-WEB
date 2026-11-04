@@ -228,6 +228,9 @@ export class FloorGizmo {
     return this._getCamera();
   }
 
+  /** plan-2215 2.6: true while a screen pick is invalid (`viewer.pointerPickBlocked`). */
+  pickBlocked: (() => boolean) | null = null;
+
   private _target: Object3D | null = null;
   private _enabled = true;
   private _yAxisEnabled = false;
@@ -637,6 +640,7 @@ export class FloorGizmo {
 
   private _handlePointerDown(e: PointerEvent): void {
     if (!this._enabled || !this._target || e.button !== 0) return;
+    if (this.pickBlocked?.()) return;
     const handle = this._raycastHandle(e);
     if (!handle) return;
     e.preventDefault();
@@ -646,6 +650,12 @@ export class FloorGizmo {
 
   private _handlePointerMove(e: PointerEvent): void {
     if (!this._enabled || !this._target) return;
+    if (this.pickBlocked?.()) {
+      // A render strategy took over: the drag ends where it is, the hover goes.
+      if (this._dragging) this._endDrag();
+      this._setHovered(null);
+      return;
+    }
 
     // Always record the cursor position — `_sync` re-reads it every frame to
     // drive proximity-based expansion, even when the cursor is stationary and

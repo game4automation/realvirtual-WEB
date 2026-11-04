@@ -21,7 +21,8 @@
 import type { Object3D } from 'three';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
 import { registerComponent, loadSchemaFromSpec } from './rv-component-registry';
-import type { ComponentRef } from './rv-node-registry';
+import type { NodeRegistry, ComponentRef } from './rv-node-registry';
+import { isComponentReference } from './rv-node-path-rewrite.mjs';
 import {
   createSignalWriter,
   type SignalStore,
@@ -93,16 +94,22 @@ export class RVIKTarget implements RVComponent {
     const raw = (this.node.userData?.realvirtual as Record<string, Record<string, unknown>> | undefined)?.['IKTarget'];
     if (raw) {
       if (Array.isArray(raw['AxisPos'])) this.AxisPos = (raw['AxisPos'] as unknown[]).map((v) => Number(v));
-      // gripTarget (RVGrip) takes priority over fixer for pick/place.
-      const gt = raw['gripTarget'];
-      const fx = raw['fixer'];
-      if (isRef(gt) && typeof gt.path === 'string') {
-        this.gripTarget = context.registry.getByPath<RVGrip>('Grip', gt.path);
-      }
-      if (!this.gripTarget && isRef(fx) && typeof fx.path === 'string') {
-        // RVFixer has no WebViewer pendant yet — fall back to a Grip at the same path.
-        this.gripTarget = context.registry.getByPath<RVGrip>('Grip', fx.path);
-      }
+    }
+    this.refreshGrip(context.registry);
+  }
+
+  /** Re-read raw references after an edit or undo; schema application cannot restore them. */
+  refreshGrip(registry: NodeRegistry): void {
+    const raw = this.node.userData?.realvirtual?.IKTarget ?? {};
+    this.gripTarget = isRef(raw.gripTarget) ? registry.storedComponent<RVGrip>(this.node, raw.gripTarget, 'Grip', {
+      // Picker paths have no file identity yet; resolve them in this occurrence.
+      legacy: path => {
+        const node = registry.resolvePath(path, this.node);
+        return node ? registry.componentOn<RVGrip>(node, 'Grip') : null;
+      },
+    }) : null;
+    if (!this.gripTarget && isRef(raw.fixer)) {
+      this.gripTarget = registry.storedComponent<RVGrip>(this.node, raw.fixer, 'Grip');
     }
   }
 
@@ -129,9 +136,8 @@ export class RVIKTarget implements RVComponent {
 }
 
 function isRef(v: unknown): v is ComponentRef {
-  return !!v && typeof v === 'object'
-    && (v as Record<string, unknown>).type === 'ComponentReference'
-    && typeof (v as Record<string, unknown>).path === 'string';
+  // plan-769 Phase 3: THE guard — every stored form (path, address, kept path).
+  return isComponentReference(v);
 }
 
 registerComponent({

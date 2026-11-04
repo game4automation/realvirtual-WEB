@@ -5,6 +5,7 @@ import { describe, it, expect } from 'vitest';
 import { Object3D } from 'three';
 import {
   findDesManager,
+  readDesManagerSettings,
   DES_MANAGER_NODE,
   DES_MANAGER_COMPONENT,
   DES_END_TIME_FIELD,
@@ -24,6 +25,11 @@ function sceneWithDesManager(endTime: number, statReset: number): Object3D {
 }
 
 describe('findDesManager — DES clock settings as a scene component', () => {
+  it('reads a one-day live default without a node', () => {
+    const settings = readDesManagerSettings({ scene: new Object3D(), registry: null });
+    expect(settings.endTime).toBe(86400);
+    expect(settings.rawEndTime).toBe(86400);
+  });
   it('returns null when no DESManager node exists', () => {
     const root = new Object3D();
     root.add(new Object3D());
@@ -38,11 +44,11 @@ describe('findDesManager — DES clock settings as a scene component', () => {
     expect(ds!.rawEndTime).toBe(86400);
   });
 
-  it('maps EndTime <= 0 to infinite (run until the queue empties)', () => {
-    const ds = findDesManager(sceneWithDesManager(0, 0));
+  it.each([0, -1])('maps EndTime %s to infinite (run until the queue empties)', (endTime) => {
+    const ds = findDesManager(sceneWithDesManager(endTime, 0));
     expect(ds!.endTime).toBe(Infinity);
     expect(ds!.statResetTime).toBe(0);
-    expect(ds!.rawEndTime).toBe(0); // the JSON-safe "infinite" sentinel
+    expect(ds!.rawEndTime).toBe(endTime); // the JSON-safe "infinite" sentinel
   });
 
   it('treats a non-positive StatisticsResetTime as off (0)', () => {

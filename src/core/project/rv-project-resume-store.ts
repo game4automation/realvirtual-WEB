@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, removeLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * rv-project-resume-store — the persisted half of the resume rule
  * (plan-703 §2.6.3, decision 24).
@@ -42,7 +44,7 @@ export function readRememberedSession(
 ): RememberedSession | null {
   if (!projectId) return null;
   try {
-    return parseRememberedSession(localStorage.getItem(resumeStorageKey(projectId)));
+    return parseRememberedSession(readLocalStorage(resumeStorageKey(projectId)));
   } catch {
     return null;
   }
@@ -66,7 +68,7 @@ export function rememberSession(
 ): void {
   if (!projectId || !asset) return;
   try {
-    localStorage.setItem(
+    writeLocalStorage(
       resumeStorageKey(projectId),
       JSON.stringify(rememberedSessionOf(asset, mode)),
     );
@@ -82,7 +84,5 @@ export function rememberSession(
  */
 export function forgetRememberedSession(projectId: string | null | undefined): void {
   if (!projectId) return;
-  try {
-    localStorage.removeItem(resumeStorageKey(projectId));
-  } catch { /* nothing to forget, then */ }
+  removeLocalStorage(resumeStorageKey(projectId));
 }

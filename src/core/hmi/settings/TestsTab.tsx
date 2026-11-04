@@ -5,6 +5,8 @@ import { useState, useCallback } from 'react';
 import { Typography, Box, Button, CircularProgress } from '@mui/material';
 import { PlayArrow, CheckCircle, Error as ErrorIcon } from '@mui/icons-material';
 import { SettingsSection } from './settings-helpers';
+import { DevApiUnavailableError, TESTS_RUN, readDevApiJson } from '../../rv-dev-api';
+import { useDevTestApi } from '../use-dev-test-api';
 
 interface TestResult {
   numPassedTests?: number;
@@ -17,25 +19,41 @@ interface TestResult {
   }>;
 }
 
+/**
+ * What the user is told when the route is not served here — one sentence that
+ * names the state, in place of the JSON parser's message. Same contract as the
+ * preset note in `VisualTab` ("Saved in this browser only…"): say what is,
+ * rather than failing in the vocabulary of whatever happened to break.
+ */
+const API_ABSENT =
+  'The test API is not available in this delivery — tests run on a development server only.';
+
 export function TestsTab() {
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<TestResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The same capability the tab itself is gated on (SettingsPanel). Read again
+  // here because this tab is directly reachable (a remembered tab index), and
+  // because an origin can lose the route between two clicks.
+  const devTestApi = useDevTestApi();
 
   const runTests = useCallback(async () => {
     setRunning(true);
     setError(null);
     setResult(null);
     try {
-      const res = await fetch('/__api/tests/run', { method: 'POST' });
-      const json = await res.json();
+      const res = await fetch(TESTS_RUN, { method: 'POST' });
+      // Not `res.json()`: a static deploy answers this route with `index.html`
+      // and HTTP 200, and the parser's "Unexpected token '<'" named neither the
+      // state nor the cure.
+      const json = await readDevApiJson<TestResult & { error?: string }>(res, TESTS_RUN);
       if (json.error) {
         setError(json.error);
       } else {
         setResult(json);
       }
     } catch (e) {
-      setError(String(e));
+      setError(e instanceof DevApiUnavailableError ? API_ABSENT : String(e));
     } finally {
       setRunning(false);
     }
@@ -101,7 +119,10 @@ export function TestsTab() {
 
       {!result && !error && !running && (
         <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-          Click "Run Tests" to execute vitest browser tests. Only available on the Vite dev server.
+          {devTestApi === null
+            ? API_ABSENT
+            : `Click "Run Tests" to execute the ${devTestApi.files.length} vitest test ` +
+              `${devTestApi.files.length === 1 ? 'file' : 'files'} this server offers.`}
         </Typography>
       )}
       </SettingsSection>

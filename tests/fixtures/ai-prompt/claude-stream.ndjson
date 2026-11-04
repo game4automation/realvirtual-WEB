@@ -1,0 +1,8 @@
+{"type":"system","subtype":"init","cwd":"C:/workspace","session_id":"fixture-claude-session"}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool-status","name":"mcp__realvirtual-CONNECT__web_status","input":{}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-status","content":[{"type":"text","text":"{\"connected\":true,\"mode\":\"hmi\"}"}]}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool-shot","name":"mcp__realvirtual-CONNECT__web_screenshot","input":{}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-shot","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}},{"type":"text","text":"{\"width\":1,\"height\":1}"}]}]}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"WebViewer is connected."}}}
+{"type":"result","is_error":false,"duration_ms":9000,"session_id":"fixture-claude-session"}
+{"type":"connect_exit","code":0}

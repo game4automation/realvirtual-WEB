@@ -17,6 +17,13 @@ import { ActionSegment } from './action-group';
 import { getActiveAssetContext } from '../editor/active-asset-store';
 import { isEditableTarget } from './search-shortcut';
 import { INK_HIGH, INK_LOW, SUCCESS } from './shared-sx';
+import { ensureCameraCommandsRegistered } from './camera-commands';
+import { ensureSelectionCommandsRegistered } from './selection-commands';
+import { ensureUiPanelCommandsRegistered } from './ui-panel-commands';
+
+ensureCameraCommandsRegistered();
+ensureSelectionCommandsRegistered();
+ensureUiPanelCommandsRegistered();
 
 const LONG_PRESS_MS = 500;
 const FLASH_MS = 800;
@@ -240,11 +247,12 @@ function useCameraFollowState(): { mode: 'follow' | 'siton' | null; canFollow: b
   const [canFollow, setCanFollow] = useState(false);
   useEffect(() => {
     const plugin = () => viewer.getPlugin<CameraFollowPluginAPI>('camera-follow');
-    const onMode = (e: { mode: 'follow' | 'siton' | null }) => setMode(e.mode);
+    const onMode = () => setMode(plugin()?.mode ?? null);
     const onSel = () => setCanFollow(!!plugin()?.canFollow());
     viewer.on('camera-mode-changed', onMode);
     viewer.on('selection-changed', onSel);
     onSel(); // initial state
+    onMode();
     return () => {
       viewer.off('camera-mode-changed', onMode);
       viewer.off('selection-changed', onSel);
@@ -281,7 +289,10 @@ export function useFollowSegments(): ReactElement[] {
       title="Follow selected part"
       active={mode === 'follow'}
       icon={<GpsFixed />}
-      onClick={() => viewer.getPlugin<CameraFollowPluginAPI>('camera-follow')?.toggle('follow')}
+      command={{
+        id: 'camera.follow', viewer, buttonKey: 'follow',
+        args: () => ({ mode: viewer.getPlugin<CameraFollowPluginAPI>('camera-follow')?.mode === 'follow' ? 'off' : 'follow' }),
+      }}
       sx={enterSx}
       buttonProps={{ 'data-testid': 'camera-follow', 'aria-pressed': mode === 'follow' }}
     />,
@@ -290,7 +301,10 @@ export function useFollowSegments(): ReactElement[] {
       title="Sit on selected part (right-drag to look)"
       active={mode === 'siton'}
       icon={<EventSeat />}
-      onClick={() => viewer.getPlugin<CameraFollowPluginAPI>('camera-follow')?.toggle('siton')}
+      command={{
+        id: 'camera.follow', viewer, buttonKey: 'siton',
+        args: () => ({ mode: viewer.getPlugin<CameraFollowPluginAPI>('camera-follow')?.mode === 'siton' ? 'off' : 'siton' }),
+      }}
       sx={enterSx}
       buttonProps={{ 'data-testid': 'camera-siton', 'aria-pressed': mode === 'siton' }}
     />,

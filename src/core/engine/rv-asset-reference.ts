@@ -36,8 +36,11 @@
 
 import type { Object3D } from 'three';
 import type { ModelCameraStart } from '../hmi/camera-startpos-types';
-import { getNodeId } from './rv-node-id';
-import { RV_DRIVE_HOME_KEY, type DriveHomePose } from './rv-pre-bake-keys';
+import { childOccurrence, getNodeId } from './rv-node-id';
+import { isUnsafeObjectKey, ownExtrasOf, ownValue } from './rv-safe-keys';
+
+/** Occurrence segment of a reference node without identity — no override key can contain NUL. */
+const UNADDRESSABLE_OCCURRENCE = '\u0000unaddressable';
 
 // ─── Component keys ──────────────────────────────────────────────────────
 
@@ -126,140 +129,35 @@ export function parseReferenceBounds(raw: unknown): RvReferenceBounds | null {
 export type ComponentPatch = Record<string, Record<string, unknown>>;
 
 /**
- * A local transform this file gives one node of the referenced subtree.
+ * On the same reference node: what this file changes in the referenced subtree
+ * (plan-769 Phase 4, F13/F14). Component VALUES only — a structural edit or a part
+ * move has no vocabulary here (D11: `trsByNodeId` was removed; a part move inside a
+ * placement is refused with `nested-transform-refused`).
  *
- * glTF-native local TRS of the TARGET node, in the referenced file's own frame
- * — exactly the numbers the editor produces when the user drags a part, so
- * applying it is a `set`, never a conversion. Every field is optional and
- * independent: an override that only moves a part leaves its rotation and
- * scale as the asset authored them.
- */
-export interface TrsOverride {
-  position?: [number, number, number];
-  quaternion?: [number, number, number, number];
-  scale?: [number, number, number];
-}
-
-/**
- * On the same reference node: what this file changes in the referenced subtree.
- *
- * `trsByNodeId` is a SIBLING of `byNodeId`, not a key inside it, and that is a
- * correctness point rather than a layout preference: `byNodeId[nodeId]` IS the
- * flat `ComponentPatch` map, so a `trs` key living in there would be handed to
- * {@link applyComponentPatch} as a component type and written into the target's
- * `extras.realvirtual.trs` — a fake component in every file we save. A sibling
- * field is invisible to the patch path by construction, which is what makes the
- * addition genuinely additive (proven by `rv-asset-override-compat.test.ts`,
- * not asserted here).
+ * Keys are ADDRESSES relative to the referenced asset (§ 2.3): `#<id>` = a node of
+ * that asset, `<b>#<id>` = a node inside its nested reference `b`. The patch is an
+ * RFC 7396 merge patch over the target's `extras.realvirtual`.
  */
 export interface AssetOverrides {
-  /** NodeId within the referenced file → patch. The primary addressing. */
-  byNodeId: Record<string, ComponentPatch>;
-  /** Fallback: path RELATIVE TO THE REFERENCE NODE → patch. */
-  byPath?: Record<string, ComponentPatch>;
+  /** Address relative to the referenced asset → patch. The only addressing a writer produces. */
+  byAddress: Record<string, ComponentPatch>;
   /**
-   * NodeId within the referenced file → local transform (plan-444 F3/F4).
-   *
-   * The answer to "I moved a part after importing CAD and could not save".
-   * A transform is glTF-native data on `nodes[i]` rather than an
-   * `extras.realvirtual` component, so it could not ride in a `ComponentPatch`
-   * and used to be refused outright (`UnwritableTransformError`). It is stored
-   * on the reference node, so the referenced asset still stays untouched and
-   * ten instances of the same assembly still move independently.
-   *
-   * Absent in every file written before this existed — which is the default,
-   * and means "no override" (F6).
+   * Read-only bridge for a file written before ids existed (`byPath`): path RELATIVE
+   * TO THE REFERENCE NODE → patch. Resolved when applied and migrated to
+   * {@link byAddress} in memory; an entry that resolves nowhere stays here (an orphan,
+   * reported, and written back as it was — never dropped).
    */
-  trsByNodeId?: Record<string, TrsOverride>;
+  legacyByPath?: Record<string, ComponentPatch>;
+  /**
+   * How many part moves (`trsByNodeId`) an old file carried. They are not applied any
+   * more (F14) and never written again; the count is what the load reports.
+   */
+  droppedTransforms?: number;
 }
 
-/**
- * A scale component this close to zero collapses the node's matrix.
- *
- * A zero scale makes `matrixWorld` singular: raycasting inverts it, and the
- * NaNs that come back poison every picking test for the rest of the session
- * with no error anywhere near the cause. A degenerate scale in a file is a
- * writer bug, so the scale is REJECTED (the asset's own stays) rather than
- * clamped to a number nobody asked for — see {@link parseTrsOverride}.
- */
-const MIN_ABS_SCALE = 1e-6;
-
-function readQuad(v: unknown): [number, number, number, number] | null {
-  if (!Array.isArray(v) || v.length !== 4) return null;
-  const out = v.map(n => (typeof n === 'number' && Number.isFinite(n) ? n : NaN));
-  if (out.some(Number.isNaN)) return null;
-  return [out[0], out[1], out[2], out[3]];
-}
-
-/**
- * Parse one `trsByNodeId` entry, or null when nothing usable is in it.
- *
- * Per-field defence, not all-or-nothing: a malformed rotation must not throw
- * away a perfectly good position, because the two were written by the same
- * save and the position is what the user actually moved. A quaternion of
- * length ~0 is rejected — normalising it would invent a rotation, and applying
- * it verbatim produces a NaN matrix.
- */
-export function parseTrsOverride(raw: unknown): TrsOverride | null {
-  if (!isPlainObject(raw)) return null;
-  const out: TrsOverride = {};
-
-  const position = readTriple(raw.position);
-  if (position) out.position = position;
-
-  const quaternion = readQuad(raw.quaternion);
-  if (quaternion) {
-    const lengthSq = quaternion[0] ** 2 + quaternion[1] ** 2 + quaternion[2] ** 2 + quaternion[3] ** 2;
-    if (lengthSq > 1e-12) out.quaternion = quaternion;
-  }
-
-  const scale = readTriple(raw.scale);
-  if (scale && scale.every(s => Math.abs(s) >= MIN_ABS_SCALE)) out.scale = scale;
-
-  return out.position || out.quaternion || out.scale ? out : null;
-}
-
-/** Parse a whole `trsByNodeId` block, dropping entries that carry nothing. */
-function parseTrsByNodeId(raw: unknown): Record<string, TrsOverride> | undefined {
-  if (!isPlainObject(raw)) return undefined;
-  const out: Record<string, TrsOverride> = {};
-  for (const [nodeId, value] of Object.entries(raw)) {
-    const trs = parseTrsOverride(value);
-    if (trs) out[nodeId] = trs;
-  }
-  return Object.keys(out).length > 0 ? out : undefined;
-}
-
-/**
- * Apply one `TrsOverride` to a node's LOCAL transform.
- *
- * `updateMatrix` right here rather than leaving it to the render loop: the
- * composition hands the tree to bounds computation, auto-align and the node
- * registry before a frame is ever drawn, and each of those reads `matrix`.
- *
- * @returns true when anything was set.
- */
-export function applyTrsOverride(node: Object3D, trs: TrsOverride): boolean {
-  let changed = false;
-  if (trs.position) { node.position.set(trs.position[0], trs.position[1], trs.position[2]); changed = true; }
-  if (trs.quaternion) {
-    node.quaternion.set(trs.quaternion[0], trs.quaternion[1], trs.quaternion[2], trs.quaternion[3]);
-    changed = true;
-  }
-  if (trs.scale) { node.scale.set(trs.scale[0], trs.scale[1], trs.scale[2]); changed = true; }
-  if (changed) node.updateMatrix();
-  // plan-757 §2.4 / R11 — a shift of a node shifts its home stamp. A baked
-  // asset's Drive node carries the `Drive` hook's home pose (JSON-cloned into
-  // every instance) and `initDrive()` prefers that stamp over the live
-  // transform; without this the first `applyToNode()` would silently undo the
-  // saved move (found by tests/placement-content-edit-roundtrip.test.ts).
-  const home = changed ? node.userData?.[RV_DRIVE_HOME_KEY] as DriveHomePose | undefined : undefined;
-  if (home) {
-    if (trs.position) home.p = [trs.position[0], trs.position[1], trs.position[2]];
-    if (trs.quaternion) home.q = [trs.quaternion[0], trs.quaternion[1], trs.quaternion[2], trs.quaternion[3]];
-    if (trs.scale) home.s = [trs.scale[0], trs.scale[1], trs.scale[2]];
-  }
-  return changed;
+/** Address key of a node id of the referenced asset (`#<id>`). */
+export function overrideAddressOf(nodeId: string): string {
+  return `#${nodeId}`;
 }
 
 /**
@@ -281,13 +179,12 @@ export interface SceneCamera {
 // ─── extras access ───────────────────────────────────────────────────────
 
 function extrasOf(node: Object3D): Record<string, unknown> | undefined {
-  return (node.userData as Record<string, unknown> | undefined)?.['realvirtual'] as
-    Record<string, unknown> | undefined;
+  return ownExtrasOf(node.userData);
 }
 
 function ensureExtras(node: Object3D): Record<string, unknown> {
   const ud = node.userData as Record<string, unknown>;
-  let rv = ud['realvirtual'] as Record<string, unknown> | undefined;
+  let rv = ownExtrasOf(ud);
   if (!rv) {
     rv = {};
     ud['realvirtual'] = rv;
@@ -363,52 +260,144 @@ export function collectReferenceNodes(root: Object3D): Array<{ node: Object3D; r
 // ─── AssetOverrides ──────────────────────────────────────────────────────
 
 /**
- * The `AssetOverrides` on a node, or null when it carries none.
+ * The `AssetOverrides` on a node, or null when it carries none (plan-769 Phase 4).
  *
- * "Carries none" counts all THREE blocks: a node whose only override is a
- * transform still has overrides. Answering null there is what would make the
- * compose hook skip the block entirely and a moved part snap back on reload.
+ * Reads every form a file may carry: `byAddress` (since 769), the legacy
+ * `byNodeId` (read as `#<id>` — the address of that id in the asset; a `byAddress`
+ * entry for the same key wins field by field), the legacy `byPath` (kept as
+ * {@link AssetOverrides.legacyByPath}) and the removed `trsByNodeId` (counted only).
  */
 export function getAssetOverrides(node: Object3D): AssetOverrides | null {
-  const raw = extrasOf(node)?.[RV_ASSET_OVERRIDES_KEY];
-  if (!isPlainObject(raw)) return null;
-  const byNodeId = isPlainObject(raw.byNodeId) ? (raw.byNodeId as Record<string, ComponentPatch>) : {};
-  const byPath = isPlainObject(raw.byPath) ? (raw.byPath as Record<string, ComponentPatch>) : undefined;
-  const trsByNodeId = parseTrsByNodeId(raw.trsByNodeId);
-  if (Object.keys(byNodeId).length === 0
-    && (!byPath || Object.keys(byPath).length === 0)
-    && !trsByNodeId) return null;
+  return readAssetOverridesRecord(extrasOf(node)?.[RV_ASSET_OVERRIDES_KEY]);
+}
 
-  const out: AssetOverrides = { byNodeId };
-  if (byPath) out.byPath = byPath;
-  if (trsByNodeId) out.trsByNodeId = trsByNodeId;
+/**
+ * {@link getAssetOverrides} over a raw `AssetOverrides` record — a node's extras, a
+ * glTF JSON node, or an override set handed around in memory (a layout record of an
+ * older session). Idempotent: the in-memory form normalises to itself.
+ */
+export function readAssetOverridesRecord(raw: unknown): AssetOverrides | null {
+  if (!isPlainObject(raw)) return null;
+  const byAddress: Record<string, ComponentPatch> = {};
+  if (isPlainObject(raw.byNodeId)) {
+    for (const [id, patch] of Object.entries(raw.byNodeId)) {
+      // Content-safe (rv-safe-keys.ts): no prototype-slot keys at any level.
+      if (isUnsafeObjectKey(id) || !isPlainObject(patch)) continue;
+      byAddress[overrideAddressOf(id)] = clonePatch(patch as ComponentPatch);
+    }
+  }
+  if (isPlainObject(raw.byAddress)) {
+    for (const [address, patch] of Object.entries(raw.byAddress)) {
+      if (isUnsafeObjectKey(address) || !isPlainObject(patch)) continue;
+      byAddress[address] = mergePatches(
+        ownValue(byAddress, address) as ComponentPatch | undefined, patch as ComponentPatch);
+    }
+  }
+  // The stored `byPath` and the in-memory `legacyByPath` (this reader is idempotent:
+  // a record already in the in-memory form — e.g. a layout record — normalises to itself).
+  const legacySource = isPlainObject(raw.legacyByPath) ? raw.legacyByPath
+    : isPlainObject(raw.byPath) ? raw.byPath : null;
+  let legacyByPath: Record<string, ComponentPatch> | undefined;
+  if (legacySource) {
+    const kept: Record<string, ComponentPatch> = {};
+    for (const [path, patch] of Object.entries(legacySource)) {
+      if (!isUnsafeObjectKey(path) && isPlainObject(patch)) kept[path] = clonePatch(patch as ComponentPatch);
+    }
+    if (Object.keys(kept).length > 0) legacyByPath = kept;
+  }
+  const droppedTransforms = isPlainObject(raw.trsByNodeId) ? Object.keys(raw.trsByNodeId).length
+    : typeof raw.droppedTransforms === 'number' && raw.droppedTransforms > 0 ? raw.droppedTransforms : 0;
+  if (Object.keys(byAddress).length === 0 && !legacyByPath && droppedTransforms === 0) return null;
+  const out: AssetOverrides = { byAddress };
+  if (legacyByPath) out.legacyByPath = legacyByPath;
+  if (droppedTransforms > 0) out.droppedTransforms = droppedTransforms;
+  return out;
+}
+
+/** A copy of a component patch (componentType → { field → value }). */
+function clonePatch(patch: ComponentPatch): ComponentPatch {
+  const out: ComponentPatch = {};
+  for (const [componentType, fields] of Object.entries(patch)) {
+    if (!isUnsafeObjectKey(componentType) && isPlainObject(fields)) out[componentType] = ownFieldsOf(fields);
+  }
+  return out;
+}
+
+/** The OWN, safe-keyed fields of a component record (rv-safe-keys.ts). */
+function ownFieldsOf(fields: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(fields)) if (!isUnsafeObjectKey(k)) out[k] = v;
+  return out;
+}
+
+/** `base` ⊕ `over` per component, field by field (`over` wins). */
+export function mergeComponentPatches(base: ComponentPatch | undefined, over: ComponentPatch): ComponentPatch {
+  return mergePatches(base, over);
+}
+
+function mergePatches(base: ComponentPatch | undefined, over: ComponentPatch): ComponentPatch {
+  const out = base ? clonePatch(base) : {};
+  for (const [componentType, fields] of Object.entries(over)) {
+    if (isUnsafeObjectKey(componentType) || !isPlainObject(fields)) continue;
+    // OWN reads only: an inherited record must never be copied into an own entry.
+    const prev = ownValue(out, componentType);
+    out[componentType] = { ...(isPlainObject(prev) ? prev : {}), ...ownFieldsOf(fields) };
+  }
   return out;
 }
 
 /**
  * Write `AssetOverrides` onto a node; an empty override set removes the key.
  *
- * Every read-modify-write in the codebase runs through this pair, so a block
- * missing HERE is a block silently dropped on the next unrelated field edit
- * ({@link writeOverride} in rv-reference-guard is exactly that pattern) — which
- * is why `trsByNodeId` is carried through both halves and not only the reader.
+ * Writes the 769 form only: `byAddress`, plus the legacy `byPath` entries that did not
+ * resolve (kept so an orphan is never silently dropped). Never `byNodeId`, never
+ * `trsByNodeId` (F14).
  */
 export function setAssetOverrides(node: Object3D, overrides: AssetOverrides | null): void {
   const rv = ensureExtras(node);
-  const empty = !overrides
-    || (Object.keys(overrides.byNodeId ?? {}).length === 0
-      && Object.keys(overrides.byPath ?? {}).length === 0
-      && Object.keys(overrides.trsByNodeId ?? {}).length === 0);
-  if (empty) {
-    delete rv[RV_ASSET_OVERRIDES_KEY];
-    return;
-  }
-  const out: Record<string, unknown> = { byNodeId: overrides!.byNodeId ?? {} };
-  if (overrides!.byPath && Object.keys(overrides!.byPath).length > 0) out.byPath = overrides!.byPath;
-  if (overrides!.trsByNodeId && Object.keys(overrides!.trsByNodeId).length > 0) {
-    out.trsByNodeId = overrides!.trsByNodeId;
-  }
-  rv[RV_ASSET_OVERRIDES_KEY] = out;
+  const record = assetOverridesRecordOf(overrides);
+  if (record) rv[RV_ASSET_OVERRIDES_KEY] = record;
+  else delete rv[RV_ASSET_OVERRIDES_KEY];
+}
+
+/** The stored record of `overrides` (the 769 form), or null when nothing is left to store. */
+function assetOverridesRecordOf(overrides: AssetOverrides | null): Record<string, unknown> | null {
+  const byAddress = overrides?.byAddress ?? {};
+  const legacy = overrides?.legacyByPath ?? {};
+  if (Object.keys(byAddress).length === 0 && Object.keys(legacy).length === 0) return null;
+  // An empty `byAddress` is not stored: a file with only unresolved legacy paths keeps
+  // exactly its `byPath` record.
+  const out: Record<string, unknown> = {};
+  if (Object.keys(byAddress).length > 0) out.byAddress = byAddress;
+  if (Object.keys(legacy).length > 0) out.byPath = legacy;
+  return out;
+}
+
+/**
+ * Bring one stored `AssetOverrides` record into the 769 form in place (plan-769 F14):
+ * `byNodeId` → `byAddress['#id']`, `trsByNodeId` dropped, unresolved `byPath` kept.
+ * The save writers call it on the extras they write, so no file is written with
+ * `trsByNodeId` or `byNodeId` again, even for a reference node that was never applied.
+ * Returns true when the record changed.
+ */
+export function canonicalizeAssetOverridesIn(rv: Record<string, unknown>): boolean {
+  const raw = rv[RV_ASSET_OVERRIDES_KEY];
+  if (raw === undefined) return false;
+  const record = assetOverridesRecordOf(readAssetOverridesRecord(raw));
+  if (record && JSON.stringify(record) === JSON.stringify(raw)) return false;
+  if (record) rv[RV_ASSET_OVERRIDES_KEY] = record;
+  else delete rv[RV_ASSET_OVERRIDES_KEY];
+  return true;
+}
+
+/** {@link canonicalizeAssetOverridesIn} over every node of a tree. Returns how many records changed. */
+export function canonicalizeAssetOverridesInTree(root: Object3D): number {
+  let changed = 0;
+  root.traverse((node) => {
+    const rv = extrasOf(node);
+    if (rv && canonicalizeAssetOverridesIn(rv)) changed++;
+  });
+  return changed;
 }
 
 // ─── Patch application (RFC 7396) ────────────────────────────────────────
@@ -428,13 +417,15 @@ export function applyComponentPatch(node: Object3D, patch: ComponentPatch): bool
   const rv = ensureExtras(node) as Record<string, Record<string, unknown>>;
 
   for (const [componentType, fields] of Object.entries(patch)) {
-    if (!isPlainObject(fields)) continue;
-    if (!rv[componentType]) rv[componentType] = {};
+    // Content-safe (rv-safe-keys.ts): no prototype-slot keys, OWN records only.
+    if (isUnsafeObjectKey(componentType) || !isPlainObject(fields)) continue;
+    if (!isPlainObject(ownValue(rv, componentType))) rv[componentType] = {};
     const target = rv[componentType];
 
     for (const [fieldName, value] of Object.entries(fields)) {
+      if (isUnsafeObjectKey(fieldName)) continue;
       if (value === null) {
-        if (fieldName in target) {
+        if (Object.prototype.hasOwnProperty.call(target, fieldName)) {
           delete target[fieldName];
           changed = true;
         }
@@ -497,26 +488,78 @@ export function applyOverrideLayers(node: Object3D, layers: OverrideLayer[]): bo
   });
   let changed = false;
   for (const layer of ordered) {
+    // plan-774 F1: what the OPEN file's patch replaces is the asset's own value
+    // (inner layers already applied) — kept so a Revert can put it back live.
+    if (layer.strength === OVERRIDE_STRENGTH.OUTER_REFERENCE) recordOverrideBases(node, layer.patch);
     if (applyComponentPatch(node, layer.patch)) changed = true;
   }
   return changed;
+}
+
+// ─── The asset's own value under an instance override (plan-774 F1) ─────
+
+/**
+ * Runtime key (never saved — `_` keys are stripped on export) holding, per
+ * component field, the value a node of placed content had BEFORE the open file's
+ * override replaced it: `{ [componentType]: { [fieldName]: OverrideBase } }`.
+ */
+export const RV_OVERRIDE_BASE_KEY = '_rvOverrideBase';
+
+/** The asset's own value of one field: `has: false` = the asset does not set it. */
+export interface OverrideBase { has: boolean; value?: unknown }
+
+function cloneJsonValue<T>(v: T): T {
+  return v === undefined || v === null || typeof v !== 'object' ? v : JSON.parse(JSON.stringify(v)) as T;
+}
+
+/**
+ * The asset's own value of `componentType.fieldName` on `node` — recorded when
+ * the open file's override was first applied (load) or first written (editor
+ * session) — or null when it was never recorded.
+ */
+export function overrideBaseOf(node: Object3D, componentType: string, fieldName: string): OverrideBase | null {
+  const all = node.userData?.[RV_OVERRIDE_BASE_KEY] as Record<string, Record<string, OverrideBase>> | undefined;
+  const base = all?.[componentType]?.[fieldName];
+  return base ? { has: base.has, ...(base.has ? { value: cloneJsonValue(base.value) } : {}) } : null;
+}
+
+/**
+ * Record the asset's own value of one field, unless one is recorded already —
+ * the FIRST recording is the asset's value; a later one would capture an
+ * override or a session edit.
+ */
+export function recordOverrideBase(node: Object3D, componentType: string, fieldName: string, base: OverrideBase): void {
+  if (isUnsafeObjectKey(componentType) || isUnsafeObjectKey(fieldName)) return;
+  const ud = node.userData as Record<string, unknown>;
+  const all = (ud[RV_OVERRIDE_BASE_KEY] ??= {}) as Record<string, Record<string, OverrideBase>>;
+  if (!isPlainObject(ownValue(all, componentType))) all[componentType] = {};
+  const fields = all[componentType]!;
+  if (ownValue(fields, fieldName)) return;
+  fields[fieldName] = base.has ? { has: true, value: cloneJsonValue(base.value) } : { has: false };
+}
+
+/** {@link recordOverrideBase} for every field a patch is about to replace on `node`. */
+function recordOverrideBases(node: Object3D, patch: ComponentPatch): void {
+  const rv = extrasOf(node) as Record<string, Record<string, unknown> | undefined> | undefined;
+  for (const [componentType, fields] of Object.entries(patch)) {
+    if (!isPlainObject(fields)) continue;
+    if (isUnsafeObjectKey(componentType)) continue;
+    const current = ownValue(rv, componentType) as Record<string, unknown> | undefined;
+    for (const fieldName of Object.keys(fields)) {
+      if (isUnsafeObjectKey(fieldName)) continue;
+      const has = !!current && typeof current === 'object' && Object.prototype.hasOwnProperty.call(current, fieldName);
+      recordOverrideBase(node, componentType, fieldName, has ? { has, value: current[fieldName] } : { has: false });
+    }
+  }
 }
 
 // ─── Override application with orphan reporting ──────────────────────────
 
 /** An override whose target no longer exists. Reported, never silently dropped. */
 export interface OrphanedOverride {
-  /**
-   * How it addressed its target.
-   *
-   * `'trs'` is a NodeId-addressed TRANSFORM override (plan-444) and is kept
-   * apart from `'nodeId'` on purpose: the two orphan for the same reason but
-   * read completely differently to a user. "Drive.TargetSpeed no longer has a
-   * target" is a setting that will not apply; "the part you moved is gone" is a
-   * hole in the layout. One shared label would have described neither.
-   */
-  addressing: 'nodeId' | 'path' | 'trs';
-  /** The NodeId or relative path that did not resolve. */
+  /** How it addressed its target: an address (`byAddress` / legacy `byNodeId`) or a legacy path. */
+  addressing: 'address' | 'path';
+  /** The address or relative path that did not resolve. */
   key: string;
   /** Occurrence address of the reference node the override sits on. */
   occurrence: string;
@@ -524,6 +567,33 @@ export interface OrphanedOverride {
   assetId: string;
   /** Component types the override would have touched. */
   componentTypes: string[];
+  /**
+   * plan-769 Phase 4b: why, when it is more than "no such node" —
+   * `ambiguous` (the id names two nodes of the asset, none is guessed) or the
+   * flush reason of a nested override whose occurrence never materialised.
+   */
+  reason?: OrphanReason;
+}
+
+/** Why an override found no target (absent = the node is not in the asset). */
+export type OrphanReason = 'ambiguous' | 'missing' | 'placement-missing' | 'placement-cap' | 'placement-refused';
+
+/**
+ * plan-769 Phase 4b (F13): one override aimed past the referenced asset into one
+ * of ITS references — `<b>#<id>` / `<b>/<c>#<id>`, or a legacy path that leads
+ * through a reference node. The caller routes it to that nested occurrence.
+ */
+export interface NestedOverride {
+  /** Occurrence segments below the reference node (identity ids of the nested reference nodes). */
+  segments: string[];
+  /** The remainder inside the nested occurrence's asset: an address (`#<id>`) … */
+  address?: string;
+  /** … or a legacy path relative to the nested reference node. */
+  path?: string;
+  patch: ComponentPatch;
+  /** The key exactly as the outer reference node stores it (problem ids, reports). */
+  key: string;
+  addressing: 'address' | 'path';
 }
 
 export interface ApplyOverridesResult {
@@ -532,59 +602,213 @@ export interface ApplyOverridesResult {
   /** Overrides that found no target. Never empty-and-ignored — F9. */
   orphaned: OrphanedOverride[];
   /**
-   * How many of `applied` were TRANSFORM overrides (plan-444).
-   *
-   * Reported separately because the caller has to do something extra for
-   * exactly these: a component patch changes data, a transform changes the
-   * matrix, and the grafted subtree's `matrixWorld` has to be refreshed before
-   * anything measures it. Zero means the caller can skip that walk entirely.
+   * plan-769 9.22: legacy `byPath` keys that resolved, with the address they now have
+   * (`#<id>`, `<b>#<id>`). The caller migrates the reference node's overrides in memory
+   * ({@link migrateLegacyOverridePaths}); the next save writes `byAddress` only.
    */
-  transformsApplied: number;
+  migratedPaths: Record<string, string>;
+  /** The old file's part moves that were not applied (F14) — the caller reports them. */
+  droppedTransforms: number;
+  /** Overrides aimed into a nested occurrence that this subtree does not hold (4b) — the caller routes them. */
+  nested: NestedOverride[];
+}
+
+/** One resolved override: the node and the patch for it. */
+export interface OverrideHit {
+  target: Object3D;
+  patch: ComponentPatch;
+}
+
+/** {@link resolveAssetOverrides}: the hits plus everything {@link ApplyOverridesResult} reports. */
+export interface ResolvedOverrides extends Omit<ApplyOverridesResult, 'applied'> {
+  hits: OverrideHit[];
 }
 
 /** How a target is looked up inside one referenced subtree. */
 export interface OverrideResolvers {
-  byNodeId: (nodeId: string) => Object3D | null;
+  /**
+   * An address relative to the referenced asset (`#<id>`, `<b>#<id>`). A resolver
+   * that holds the nested content (composition grafts it) answers nested addresses
+   * too; one that does not (a placement instance) answers null and the override is
+   * routed as {@link NestedOverride}.
+   */
+  byAddress: (address: string) => Object3D | null;
+  /** A legacy path relative to the reference node. */
   byPath: (relativePath: string) => Object3D | null;
+  /** The address a resolved node has in the referenced asset (for the `byPath` migration). */
+  addressOf: (node: Object3D) => string | null;
+  /** True when `address` names more than one node (reported as `ambiguous`, never guessed). */
+  isAmbiguous?: (address: string) => boolean;
+}
+
+/** True for a node that opens another asset's content (an `AssetReference` that is not embedded). */
+function isOpeningReference(node: Object3D): boolean {
+  const ref = extrasOf(node)?.[RV_ASSET_REFERENCE_KEY];
+  return isPlainObject(ref) && ref.embedded !== true;
+}
+
+/**
+ * plan-769 Phase 4b — the override address of `node` relative to the asset that
+ * `referenceNode` opens: the identity ids of the reference nodes between the two
+ * (outermost first) as occurrence segments, then `#<id>` of the node itself.
+ * `''` segments = a node of that asset directly. Null when `node` is not below
+ * `referenceNode` or an id on the way is missing.
+ */
+export function overrideAddressInReference(
+  referenceNode: Object3D,
+  node: Object3D,
+  identityOf: (node: Object3D) => string | null,
+): string | null {
+  if (node === referenceNode) return null;
+  const id = identityOf(node);
+  if (!id) return null;
+  const segments: string[] = [];
+  let cur = node.parent;
+  while (cur && cur !== referenceNode) {
+    if (isOpeningReference(cur)) {
+      const seg = identityOf(cur);
+      if (!seg) return null;
+      segments.unshift(seg);
+    }
+    cur = cur.parent;
+  }
+  if (!cur) return null;
+  return `${segments.join('/')}#${id}`;
 }
 
 /**
  * Resolvers that search a single parsed subtree, with no registry involved.
  *
- * Enough for composition, which applies a subtree's overrides right after
- * parsing it and before anything global exists. Paths are relative to
- * `subtreeRoot`, which is the reference node's content — the same frame the
- * `byPath` keys were written in.
+ * Enough for composition, which applies a subtree's overrides once the subtree —
+ * its own nested references grafted — is complete. Paths are relative to
+ * `subtreeRoot`, the reference node's content — the frame the `byPath` keys were
+ * written in. Ids are the nodes' IDENTITY (`identityOf`): the authored NodeId,
+ * else the seed of the decode — a Unity asset has no authored ids.
+ *
+ * plan-769 Phase 4b: addresses are SCOPED. `#<id>` is a node of this asset; the
+ * content of a nested reference node `b` answers only as `b#<id>` (F13) — an id
+ * deeper down never answers the flat form. A duplicated id within one scope is
+ * ambiguous (reported, not "first wins").
  */
-export function makeSubtreeResolvers(subtreeRoot: Object3D): OverrideResolvers {
-  const byId = new Map<string, Object3D>();
+export function makeSubtreeResolvers(
+  subtreeRoot: Object3D,
+  identityOf: (node: Object3D) => string | null = getNodeId,
+): OverrideResolvers {
+  const byAddress = new Map<string, Object3D>();
+  const ambiguous = new Set<string>();
+  const addressOfNode = new Map<Object3D, string>();
   const byPath = new Map<string, Object3D>();
 
-  const walk = (node: Object3D, prefix: string): void => {
+  // `occurrence` is the node-address occurrence chain (`<refId>/<refId>`), NOT a
+  // signal-symbol scope — it is built by `childOccurrence`, the one producer.
+  const walk = (node: Object3D, prefix: string, occurrence: string): void => {
     if (prefix) byPath.set(prefix, node);
-    const id = getNodeId(node);
-    // First registration wins, matching NodeRegistry: a duplicated id in a
-    // malformed file must not make the resolution order depend on traversal.
-    if (id && !byId.has(id)) byId.set(id, node);
+    const id = identityOf(node);
+    if (id) {
+      const address = `${occurrence}#${id}`;
+      if (byAddress.has(address)) ambiguous.add(address);
+      else byAddress.set(address, node);
+      addressOfNode.set(node, address);
+    }
+    // The content below a nested reference node is another occurrence (F13).
+    // A reference node without an identity opens an occurrence no key can name.
+    let childOcc = occurrence;
+    if (node !== subtreeRoot && isOpeningReference(node)) {
+      childOcc = childOccurrence(occurrence, identityOf(node) || UNADDRESSABLE_OCCURRENCE);
+    }
     for (const child of node.children) {
-      walk(child, prefix ? `${prefix}/${child.name}` : child.name);
+      walk(child, prefix ? `${prefix}/${child.name}` : child.name, childOcc);
     }
   };
-  walk(subtreeRoot, '');
+  walk(subtreeRoot, '', '');
 
   return {
-    byNodeId: (id) => byId.get(id) ?? null,
+    byAddress: (address) => (ambiguous.has(address) ? null : byAddress.get(address) ?? null),
     byPath: (p) => byPath.get(p) ?? null,
+    addressOf: (node) => addressOfNode.get(node) ?? null,
+    isAmbiguous: (address) => ambiguous.has(address),
   };
 }
 
+/** `<occ>#<id>` → its occurrence segments and the local `#<id>`; null for a malformed key. */
+function splitOverrideAddress(address: string): { segments: string[]; local: string } | null {
+  const hash = address.lastIndexOf('#');
+  if (hash < 0 || hash === address.length - 1) return null;
+  const occ = address.slice(0, hash);
+  return { segments: occ ? occ.split('/').filter(Boolean) : [], local: address.slice(hash) };
+}
+
 /**
- * Apply a reference node's `AssetOverrides` to the subtree grafted under it.
- *
- * Resolution order is the plan's: `NodeId` first, then the relative-path
- * fallback, then orphan. `byPath` is tried for a `byNodeId` key too — a file
- * written before ids existed may address the same node either way, and falling
- * through costs one map lookup.
+ * Resolve a reference node's `AssetOverrides` against one subtree WITHOUT applying
+ * them (plan-769 Phase 4b): the hits, the orphans, the legacy paths that migrated,
+ * the overrides that go into a nested occurrence this subtree does not hold.
+ * Precedence between several override sets is the caller's — {@link applyOverrideLayers}.
+ */
+export function resolveAssetOverrides(
+  overrides: AssetOverrides,
+  resolvers: OverrideResolvers,
+  context: { occurrence: string; assetId: string },
+): ResolvedOverrides {
+  const hits: OverrideHit[] = [];
+  const orphaned: OrphanedOverride[] = [];
+  const nested: NestedOverride[] = [];
+  const migratedPaths: Record<string, string> = {};
+  const orphan = (addressing: 'address' | 'path', key: string, patch: ComponentPatch, reason?: OrphanReason): void => {
+    orphaned.push({
+      addressing, key, occurrence: context.occurrence, assetId: context.assetId,
+      componentTypes: Object.keys(patch ?? {}), ...(reason ? { reason } : {}),
+    });
+  };
+
+  for (const [address, patch] of Object.entries(overrides.byAddress ?? {})) {
+    const target = resolvers.byAddress(address);
+    if (target) { hits.push({ target, patch }); continue; }
+    if (resolvers.isAmbiguous?.(address)) { orphan('address', address, patch, 'ambiguous'); continue; }
+    const split = splitOverrideAddress(address);
+    if (split && split.segments.length > 0) {
+      nested.push({ segments: split.segments, address: split.local, patch, key: address, addressing: 'address' });
+      continue;
+    }
+    orphan('address', address, patch);
+  }
+
+  for (const [relPath, patch] of Object.entries(overrides.legacyByPath ?? {})) {
+    const target = resolvers.byPath(relPath);
+    if (target) {
+      hits.push({ target, patch });
+      const address = resolvers.addressOf(target);
+      if (address) migratedPaths[relPath] = address;
+      continue;
+    }
+    // A path through a nested reference node (`Cell_1/Slide` with a reference `Cell_1`):
+    // the remainder belongs to that occurrence — routed, no longer refused (4b).
+    const segs = relPath.split('/').filter(Boolean);
+    let routed = false;
+    for (let n = segs.length - 1; n >= 1; n--) {
+      const node = resolvers.byPath(segs.slice(0, n).join('/'));
+      if (!node || !isOpeningReference(node)) continue;
+      const own = resolvers.addressOf(node);
+      const split = own ? splitOverrideAddress(own) : null;
+      if (!split) break;
+      nested.push({
+        segments: [...split.segments, split.local.slice(1)],
+        path: segs.slice(n).join('/'), patch, key: relPath, addressing: 'path',
+      });
+      routed = true;
+      break;
+    }
+    if (!routed) orphan('path', relPath, patch);
+  }
+
+  return { hits, orphaned, migratedPaths, droppedTransforms: overrides.droppedTransforms ?? 0, nested };
+}
+
+/**
+ * Apply a reference node's `AssetOverrides` to the subtree grafted under it — ONE
+ * set, so {@link applyOverrideLayers} with a single layer per target. `byAddress`
+ * first, then the legacy `byPath` bridge (each resolved key reported in
+ * `migratedPaths` with its address), then orphan. Part moves of an old file are NOT
+ * applied (F14) — their count comes back for the caller to report.
  *
  * Orphans are RETURNED, not logged away: the user decided a verwaister Override
  * must be visible, and swallowing it here is what would make that impossible
@@ -595,74 +819,103 @@ export function applyAssetOverrides(
   resolvers: OverrideResolvers,
   context: { occurrence: string; assetId: string },
 ): ApplyOverridesResult {
-  const orphaned: OrphanedOverride[] = [];
-  let applied = 0;
-  let transformsApplied = 0;
+  const { hits, ...rest } = resolveAssetOverrides(overrides, resolvers, context);
+  const [applied] = applyResolvedOverrideSets([{ hits, depth: 0 }]);
+  return { applied: applied ?? 0, ...rest };
+}
 
-  for (const [nodeId, patch] of Object.entries(overrides.byNodeId ?? {})) {
-    const target = resolvers.byNodeId(nodeId);
-    if (!target) {
-      orphaned.push({
-        addressing: 'nodeId',
-        key: nodeId,
-        occurrence: context.occurrence,
-        assetId: context.assetId,
-        componentTypes: Object.keys(patch ?? {}),
-      });
-      continue;
+/** The strength class of an override set whose record lives in a file at `depth` (0 = the document). */
+export function overrideStrengthAt(depth: number): OverrideStrength {
+  return depth <= 0 ? OVERRIDE_STRENGTH.OUTER_REFERENCE : OVERRIDE_STRENGTH.INNER_REFERENCE;
+}
+
+/**
+ * Apply several resolved override sets in precedence order — THE precedence point
+ * of composition and placements (plan-769 Phase 4b, F13): hits are grouped per
+ * target node and each group goes through {@link applyOverrideLayers}, so the
+ * outer file wins whatever order the sets arrived in.
+ * @returns per set, how many of its hits changed their node.
+ */
+export function applyResolvedOverrideSets(
+  sets: ReadonlyArray<{ hits: readonly OverrideHit[]; depth: number }>,
+): number[] {
+  const byTarget = new Map<Object3D, Array<OverrideLayer & { set: number }>>();
+  sets.forEach((s, set) => {
+    for (const hit of s.hits) {
+      let layers = byTarget.get(hit.target);
+      if (!layers) { layers = []; byTarget.set(hit.target, layers); }
+      layers.push({ strength: overrideStrengthAt(s.depth), depth: s.depth, patch: hit.patch, set });
     }
-    if (applyComponentPatch(target, patch)) applied++;
+  });
+  const applied = sets.map(() => 0);
+  for (const [target, layers] of byTarget) {
+    if (!applyOverrideLayers(target, layers)) continue;
+    for (const set of new Set(layers.map((l) => l.set))) applied[set]!++;
   }
+  return applied;
+}
 
-  for (const [relPath, patch] of Object.entries(overrides.byPath ?? {})) {
-    const target = resolvers.byPath(relPath);
-    if (!target) {
-      orphaned.push({
-        addressing: 'path',
-        key: relPath,
-        occurrence: context.occurrence,
-        assetId: context.assetId,
-        componentTypes: Object.keys(patch ?? {}),
-      });
-      continue;
-    }
-    if (applyComponentPatch(target, patch)) applied++;
+/**
+ * plan-769 9.22 — `overrides` with every legacy `byPath` key that resolved moved to its
+ * address (merged under an existing `byAddress` entry, which wins). Unresolved paths stay.
+ */
+export function migrateLegacyOverridePaths(overrides: AssetOverrides, migrated: Record<string, string>): AssetOverrides {
+  if (Object.keys(migrated).length === 0) return overrides;
+  const byAddress: Record<string, ComponentPatch> = { ...overrides.byAddress };
+  const legacy: Record<string, ComponentPatch> = { ...(overrides.legacyByPath ?? {}) };
+  for (const [relPath, address] of Object.entries(migrated)) {
+    const patch = legacy[relPath];
+    if (!patch) continue;
+    byAddress[address] = byAddress[address] ? mergePatches(patch, byAddress[address]!) : clonePatch(patch);
+    delete legacy[relPath];
   }
+  const out: AssetOverrides = { byAddress };
+  if (Object.keys(legacy).length > 0) out.legacyByPath = legacy;
+  return out;
+}
 
-  // Transforms LAST, and NodeId-addressed only. Last because a component patch
-  // must never be able to overwrite the position the user dragged a part to;
-  // NodeId-only because `byPath` exists as a bridge for files written before
-  // ids existed, and no such file can carry a transform override.
-  for (const [nodeId, trs] of Object.entries(overrides.trsByNodeId ?? {})) {
-    const target = resolvers.byNodeId(nodeId);
-    if (!target) {
-      orphaned.push({
-        addressing: 'trs',
-        key: nodeId,
-        occurrence: context.occurrence,
-        assetId: context.assetId,
-        componentTypes: [],
-      });
-      continue;
-    }
-    if (applyTrsOverride(target, trs)) { applied++; transformsApplied++; }
-  }
+/** Runtime key (never saved — `_` keys are stripped on export) of {@link recordOverridePathMigration}. */
+export const RV_OVERRIDE_PATH_MIGRATION_KEY = '_rvOverridePathMigration';
 
-  return { applied, orphaned, transformsApplied };
+/**
+ * plan-769 9.22 — remember on the reference node which legacy `byPath` keys of ITS
+ * FILE resolved to which address. The planner save works on the file's JSON, not on
+ * the live tree; it reads this to write those keys as `byAddress` (never `byPath`).
+ */
+export function recordOverridePathMigration(node: Object3D, migrated: Readonly<Record<string, string>>): void {
+  if (Object.keys(migrated).length === 0) return;
+  const ud = node.userData as Record<string, unknown>;
+  const prior = isPlainObject(ud[RV_OVERRIDE_PATH_MIGRATION_KEY]) ? ud[RV_OVERRIDE_PATH_MIGRATION_KEY] as Record<string, string> : {};
+  ud[RV_OVERRIDE_PATH_MIGRATION_KEY] = { ...prior, ...migrated };
+}
+
+/** The migrations {@link recordOverridePathMigration} remembered on `node`, or null. */
+export function overridePathMigrationOf(node: Object3D): Readonly<Record<string, string>> | null {
+  const m = (node.userData as Record<string, unknown> | undefined)?.[RV_OVERRIDE_PATH_MIGRATION_KEY];
+  return isPlainObject(m) ? m as Record<string, string> : null;
+}
+
+/**
+ * The same migration over a STORED record (glTF JSON extras): every `byPath` key in
+ * `migrated` moves under its address (an existing `byAddress` entry wins field by
+ * field); the rest stays. Returns true when the record changed.
+ */
+export function migrateStoredOverridePaths(rv: Record<string, unknown>, migrated: Readonly<Record<string, string>>): boolean {
+  const current = readAssetOverridesRecord(rv[RV_ASSET_OVERRIDES_KEY]);
+  if (!current?.legacyByPath) return false;
+  const relevant: Record<string, string> = {};
+  for (const k of Object.keys(current.legacyByPath)) if (migrated[k]) relevant[k] = migrated[k]!;
+  if (Object.keys(relevant).length === 0) return false;
+  const record = assetOverridesRecordOf(migrateLegacyOverridePaths(current, relevant));
+  if (record) rv[RV_ASSET_OVERRIDES_KEY] = record; else delete rv[RV_ASSET_OVERRIDES_KEY];
+  return true;
 }
 
 /** One line per orphan, for the non-blocking status row (§3.2 of the plan). */
 export function describeOrphanedOverride(o: OrphanedOverride): string {
   const where = o.occurrence ? ` in occurrence ${o.occurrence}` : '';
-  if (o.addressing === 'trs') {
-    // Said as a fact about the layout, not about the storage: the user moved a
-    // part, the part is no longer in the asset, and the move therefore has
-    // nowhere to land. Naming the asset is what makes it actionable.
-    return `moved part → node "${o.key}" no longer exists in asset "${o.assetId}"${where}`
-      + ' — its saved position was dropped';
-  }
   const what = o.componentTypes.length > 0 ? o.componentTypes.join(', ') : 'override';
-  return `${what} → ${o.addressing === 'nodeId' ? 'node' : 'path'} "${o.key}" no longer exists `
+  return `${what} → ${o.addressing === 'address' ? 'node' : 'path'} "${o.key}" no longer exists `
     + `in asset "${o.assetId}"${where}`;
 }
 
@@ -786,6 +1039,12 @@ export interface PlacementMeta {
    * create two sources of truth for the same fact.
    */
   catalogId?: string;
+  /**
+   * The library qualifier of a SPLAT placement (plan-778): written, like
+   * `catalogId`, only when the node carries no `AssetReference` to hold it.
+   */
+  providerId?: string;
+  sourceId?: string;
   /** Set when the placement's geometry is a Gaussian splat, not a GLB. */
   splatUrl?: string;
   /** False when the user hid the placement. Absent means visible. */
@@ -801,6 +1060,8 @@ export function getPlacementMeta(node: Object3D): PlacementMeta | null {
 
   const meta: PlacementMeta = {};
   if (typeof raw.catalogId === 'string' && raw.catalogId) meta.catalogId = raw.catalogId;
+  if (typeof raw.providerId === 'string' && raw.providerId) meta.providerId = raw.providerId;
+  if (typeof raw.sourceId === 'string' && raw.sourceId) meta.sourceId = raw.sourceId;
   if (typeof raw.splatUrl === 'string' && raw.splatUrl) meta.splatUrl = raw.splatUrl;
   if (raw.visible === false) meta.visible = false;
   if (Array.isArray(raw.signalMappings)) {
@@ -819,6 +1080,8 @@ export function setPlacementMeta(node: Object3D, meta: PlacementMeta | null): vo
   }
   const out: Record<string, unknown> = {};
   if (meta.catalogId) out.catalogId = meta.catalogId;
+  if (meta.providerId) out.providerId = meta.providerId;
+  if (meta.sourceId) out.sourceId = meta.sourceId;
   if (meta.splatUrl) out.splatUrl = meta.splatUrl;
   if (meta.visible === false) out.visible = false;
   if (meta.signalMappings && meta.signalMappings.length > 0) out.signalMappings = meta.signalMappings;
@@ -870,6 +1133,32 @@ export function getDeferredPlacement(node: Object3D): DeferredPlacementMark | nu
   const mark: DeferredPlacementMark = { occurrence: typeof raw.occurrence === 'string' ? raw.occurrence : '' };
   if (typeof raw.resolvedPath === 'string' && raw.resolvedPath) mark.resolvedPath = raw.resolvedPath;
   return mark;
+}
+
+/**
+ * plan-774 F5: runtime key on a deferred reference node — the `LayoutObject`
+ * record the FILE wrote on it (a JSON copy), or `false` when it wrote none.
+ * The instancer stamps its own record on every placement root it materialises
+ * (`stampPlacementMarkers`, overwriting `Label` / `CatalogId` / `Locked`); the
+ * asset editor's save writes back what the file had, never that runtime stamp.
+ * `_`-prefixed, so it never reaches a file itself.
+ */
+export const RV_AUTHORED_LAYOUT_OBJECT_KEY = '_rvAuthoredLayoutObject';
+
+/**
+ * plan-774 review fix E2: runtime key on a placement root — the PURE
+ * `LayoutObject` stamp of `stampPlacementMarkers` (`{ Label, CatalogId, Locked }`),
+ * before any authored record is merged in. The editor's save drops exactly the
+ * fields whose live value is still this stamp and the file did not author.
+ */
+export const RV_LAYOUT_OBJECT_STAMP_KEY = '_rvLayoutObjectStamp';
+
+/** Record whether the file wrote a `LayoutObject` on this reference node (before any stamp). */
+export function recordAuthoredLayoutObject(node: Object3D): void {
+  if (RV_AUTHORED_LAYOUT_OBJECT_KEY in node.userData) return;
+  const rv = node.userData.realvirtual as Record<string, unknown> | undefined;
+  const authored = rv && typeof rv === 'object' ? rv.LayoutObject : undefined;
+  node.userData[RV_AUTHORED_LAYOUT_OBJECT_KEY] = authored === undefined ? false : JSON.parse(JSON.stringify(authored));
 }
 
 /** Remove the deferred mark — the planner owns the node from here on. */

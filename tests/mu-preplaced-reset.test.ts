@@ -74,10 +74,12 @@ function expectAuthored(tm: RVTransportManager, before: Map<RVMovingUnit, Author
 /** Run the production `RVViewer.prototype.resetSimulation` on a narrow fake. */
 function resetViaViewer(tm: RVTransportManager, kernel: SimulationKernel | null = null): void {
   const fakeViewer = {
+    _structuralEditHolds: () => false, // plan-681: resetSimulation asks whether a structural transaction withholds it
     _simTime: 0,
     drives: [] as { reset(): void }[],
     chainManager: { resetAll() {} },
     ribbonManager: { resetAll() {} },
+    blockageWatch: { reset() {} }, // plan-2038: resetSimulation clears the blockage watch
     transportManager: tm,
     logicEngine: null,
     logicRunState: 'active',

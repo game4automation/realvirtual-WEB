@@ -25,7 +25,7 @@ import { getDefaultZoneRegistry } from '../../src/core/engine/rv-zone-registry';
 import { getDefaultAgvFleet } from '../../src/core/engine/rv-agv-fleet';
 import { getDefaultMovementAuthority } from '../../src/core/engine/rv-movement-authority';
 import { iterateFixedUpdate } from '../../src/core/behavior-runtime';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
+import { DESRunner } from '@rv/plugins/des/des-runner';
 import {
   TICK, makeHost, makeAgvRoot, bindDes, bindContinuous, clearShared, runAnimated, centredBody, sig,
 } from '../helpers/agv-harness';

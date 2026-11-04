@@ -26,7 +26,7 @@ import { ContextMenuStore, type ContextMenuItem, type ContextMenuTarget } from '
 import { ContextMenuLayer } from '../src/core/hmi/ContextMenuLayer';
 import { RVViewerProvider } from '../src/hooks/use-viewer';
 import { commandRegistry } from '../src/core/hmi/rv-command-registry';
-import { buildSelectMenuItems } from '@rv-private/plugins/asset-editor/select-actions';
+import { buildSelectMenuItems } from '@rv-private/plugins/asset-editor/shared/select-actions';
 import { buildKinematicMenuItems } from '@rv-private/plugins/asset-editor/group-actions';
 import { setActiveAssetContext, type ActiveAssetContext } from '../src/core/editor/active-asset-store';
 

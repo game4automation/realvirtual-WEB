@@ -1,0 +1,23 @@
+[
+  { "name": "plain execute", "tool": "web_execute", "arguments": { "command": "plc.deploy" }, "ids": ["plc.deploy"] },
+  { "name": "kwargs execute", "tool": "web_execute", "arguments": { "kwargs": "{\"command\":\"plc.deploy\"}" }, "ids": ["plc.deploy"] },
+  { "name": "trim execute id", "tool": "web_execute", "arguments": { "command": " plc.deploy " }, "ids": ["plc.deploy"] },
+  { "name": "batch JSON string", "tool": "web_batch", "arguments": { "steps": "[{\"command\":\"editor.setField\"},{\"command\":\" document.delete \"}]" }, "ids": ["editor.setField", "document.delete"] },
+  { "name": "batch array", "tool": "web_batch", "arguments": { "steps": [{ "command": "editor.setField" }, { "command": " plc.deploy " }] }, "ids": ["editor.setField", "plc.deploy"] },
+  { "name": "kwargs batch", "tool": "web_batch", "arguments": { "kwargs": "{\"steps\":[{\"command\":\" plc.deploy \"}]}" }, "ids": ["plc.deploy"] },
+  { "name": "unparseable steps", "tool": "web_batch", "arguments": { "steps": "[broken" }, "ids": null },
+  { "name": "steps object", "tool": "web_batch", "arguments": { "steps": { "command": "plc.deploy" } }, "ids": null },
+  { "name": "step missing command", "tool": "web_batch", "arguments": { "steps": [{ "args": {} }] }, "ids": null },
+  { "name": "step is null", "tool": "web_batch", "arguments": { "steps": [null] }, "ids": null },
+  { "name": "step is array", "tool": "web_batch", "arguments": { "steps": [[]] }, "ids": null },
+  { "name": "empty steps", "tool": "web_batch", "arguments": { "steps": [] }, "ids": null },
+  { "name": "empty command", "tool": "web_execute", "arguments": { "command": "   " }, "ids": null },
+  { "name": "numeric command", "tool": "web_execute", "arguments": { "command": 42 }, "ids": null },
+  { "name": "blank batch command", "tool": "web_batch", "arguments": { "steps": [{ "command": " " }] }, "ids": null },
+  { "name": "malformed kwargs", "tool": "web_execute", "arguments": { "kwargs": "{broken" }, "ids": null },
+  { "name": "kwargs is not object JSON", "tool": "web_execute", "arguments": { "kwargs": "[]" }, "ids": null },
+  { "name": "kwargs with extra key is not unwrapped", "tool": "web_execute", "arguments": { "kwargs": "{\"command\":\"plc.deploy\"}", "extra": true }, "ids": null },
+  { "name": "kwargs with command uses outer command", "tool": "web_execute", "arguments": { "kwargs": "{\"command\":\"plc.deploy\"}", "command": "editor.setField" }, "ids": ["editor.setField"] },
+  { "name": "query", "tool": "web_query", "arguments": { "command": " plc.status " }, "ids": ["plc.status"] },
+  { "name": "non-command tool", "tool": "web_status", "arguments": {}, "ids": [] }
+]

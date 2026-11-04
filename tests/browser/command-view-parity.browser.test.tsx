@@ -25,6 +25,7 @@
  * the hover/press choreography is the no-op stub and only the afterglow shows).
  */
 
+import { bridgeExecuteValue } from '../helpers/execute-value';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.setConfig({ hookTimeout: 60_000, testTimeout: 30_000 });
 import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react';
@@ -108,7 +109,8 @@ function makeWorld() {
 
   let n = 0;
   const catalogs = new Map([['test', { entries: [SPLAT] }]]);
-  let storeSnap = { catalogs, placed: placements, thumbnailPending: new Set<string>() };
+  // `preparingEntryIds`: the library card reads it since plan-776 (386b6dcf).
+  let storeSnap = { catalogs, placed: placements, preparingEntryIds: [] as string[] };
   const storeSubs = new Set<() => void>();
   const planner = {
     store: {
@@ -116,8 +118,6 @@ function makeWorld() {
       subscribe: (l: () => void) => { storeSubs.add(l); return () => { storeSubs.delete(l); }; },
       getSnapshot: () => storeSnap,
       setPlacementMode: vi.fn(),
-      setThumbnailPending: vi.fn(),
-      setEntryThumbnail: vi.fn(),
     },
     snapshotPlacements: () => ({ placements }),
     getPlacedRootById: (id: string) => nodes.get(`Layout/${id}`) ?? null,
@@ -174,7 +174,6 @@ function makeWorld() {
     getPlugin: (id: string) => (id === 'layout-planner' ? planner : undefined),
     leftPanelManager: { isOpen: () => true, open() {}, close() {}, subscribe: () => () => {}, getSnapshot: () => ({ right: {} }) },
     on, emit, markRenderDirty() {}, markShadowsDirty() {},
-    thumbnails: undefined,
   } as unknown as RVViewer;
 
   return { viewer, planner, drive, placements, tm, setSelection };
@@ -185,6 +184,8 @@ type World = ReturnType<typeof makeWorld>;
 /** The bridge with the bridge TEST TRANSPORT — every tool call goes through `_handleCall`. */
 function makeBridge(viewer: RVViewer) {
   const plugin = new McpBridgePlugin();
+  // plan-668: the test transport stands for a tab with AI control on.
+  (plugin as unknown as { _aiEnabled: boolean })._aiEnabled = true;
   (plugin as unknown as { viewer: RVViewer }).viewer = viewer;
   (plugin as unknown as { _dispatcher: ReturnType<typeof buildMultiDispatcher> })._dispatcher =
     buildMultiDispatcher(plugin.mcpToolInstances);
@@ -275,11 +276,13 @@ describe('sim toolbar — ActionSegment views of sim.playPause / sim.reset', () 
     spy.mockClear();
     let res: Record<string, unknown> = {};
     const phases = await watchPhases(SIM_PLAY_PAUSE_KEY, async () => {
-      res = await call('web_sim_play_pause', { paused: false });
+      res = await bridgeExecuteValue(call, 'sim.playPause', { paused: false });
     });
     expect(spy).toHaveBeenCalledTimes(1);
     expect(spy.mock.calls[0].slice(0, 2)).toEqual(['sim.playPause', { paused: false }]);
-    expect(spy.mock.calls[0][2]).toMatchObject({ origin: 'mcp', buttonKey: SIM_PLAY_PAUSE_KEY });
+    // plan-2007: web_execute lets the registry derive the button (no explicit buttonKey option).
+    expect(spy.mock.calls[0][2]).toMatchObject({ origin: 'mcp' });
+    expect(commandRegistry.buttonKeyOf('sim.playPause', { paused: false })).toBe(SIM_PLAY_PAUSE_KEY);
     expect(res).toMatchObject({ wasPaused: true, paused: false, userPaused: false });
     expect(world.viewer.simulationPauseReasons).not.toContain('user');
     expect(phases).toEqual(EXPECTED_PHASES);
@@ -291,7 +294,7 @@ describe('sim toolbar — ActionSegment views of sim.playPause / sim.reset', () 
 
   it('web_sim_reset: the Reset segment glows, the effect equals the click', async () => {
     mount(<SimControllerToolbar viewer={world.viewer} />);
-    const res = await call('web_sim_reset', {});
+    const res = await bridgeExecuteValue(call, 'sim.reset', {});
     expect(res).toMatchObject({ ok: true, before: { mus: 3 }, after: { mus: 0 } });
     expect(world.viewer.resetSimulation).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(glows(byKey(SIM_RESET_KEY))).toBe(true));
@@ -303,10 +306,10 @@ describe('sim toolbar — ActionSegment views of sim.playPause / sim.reset', () 
     _setAiTouchMsForTest(400);
     mount(<SimControllerToolbar viewer={world.viewer} />);
     const seg = () => byKey(SIM_RESET_KEY);
-    await call('web_sim_reset', {});
+    await bridgeExecuteValue(call, 'sim.reset', {});
     await waitFor(() => expect(glows(seg())).toBe(true));
     const first = getComputedStyle(seg()).animationName;
-    await call('web_sim_reset', {});
+    await bridgeExecuteValue(call, 'sim.reset', {});
     await waitFor(() => expect(getComputedStyle(seg()).animationName).not.toBe(first)); // restarted
     await waitFor(() => expect(glows(seg())).toBe(false), { timeout: 3000 }); // expired
   });
@@ -319,7 +322,7 @@ describe('sim toolbar — ActionSegment views of sim.playPause / sim.reset', () 
     })) as unknown as typeof window.matchMedia;
     try {
       mount(<SimControllerToolbar viewer={world.viewer} />);
-      await call('web_sim_play_pause', { paused: true });
+      await bridgeExecuteValue(call, 'sim.playPause', { paused: true });
       await waitFor(() => expect(glows(byKey(SIM_PLAY_PAUSE_KEY))).toBe(true));
       expectAfterglowStyle(byKey(SIM_PLAY_PAUSE_KEY));
     } finally {
@@ -341,7 +344,7 @@ describe('planner Delete — IconButton view of layout.remove', () => {
 
     const spy = vi.spyOn(commandRegistry, 'execute');
     let res: Record<string, unknown> = {};
-    const phases = await watchPhases(PLANNER_DELETE_KEY, async () => { res = await call('web_layout_remove', { id: 'nope' }); });
+    const phases = await watchPhases(PLANNER_DELETE_KEY, async () => { res = await bridgeExecuteValue(call, 'layout.remove', { id: 'nope' }); });
     const reason = commandRegistry.enabled('layout.remove', { id: 'nope' }, world.viewer);
     expect(res).toEqual({ error: (reason as { reason: string }).reason });
     expect(spy).toHaveBeenCalledTimes(1);
@@ -366,10 +369,12 @@ describe('planner Delete — IconButton view of layout.remove', () => {
 
     spy.mockClear();
     let res: Record<string, unknown> = {};
-    const phases = await watchPhases(PLANNER_DELETE_KEY, async () => { res = await call('web_layout_remove', { id: 'p2' }); });
-    expect(res).toMatchObject({ id: 'p2', removed: true, persisted: true });
+    const phases = await watchPhases(PLANNER_DELETE_KEY, async () => { res = await bridgeExecuteValue(call, 'layout.remove', { id: 'p2' }); });
+    // plan-2007: web_execute answers with the command's own value (the retired alias reshaped it).
+    expect(res).toMatchObject({ removed: ['p2'] });
     expect(spy).toHaveBeenCalledTimes(1);
-    expect(spy.mock.calls[0][2]).toMatchObject({ origin: 'mcp', buttonKey: PLANNER_DELETE_KEY });
+    expect(spy.mock.calls[0][2]).toMatchObject({ origin: 'mcp' });
+    expect(commandRegistry.buttonKeyOf('layout.remove', { id: 'p2' })).toBe(PLANNER_DELETE_KEY);
     expect(world.placements).toEqual([]);
     // The button is disabled again (nothing selected) — the afterglow still marks it.
     expect(phases).toEqual(__RV_HAS_PRIVATE__ ? ['hover', 'pressed', 'afterglow'] : ['afterglow']);
@@ -382,7 +387,7 @@ describe('planner Delete — IconButton view of layout.remove', () => {
 
 describe('library entry — the card is the view of layout.place', () => {
   it('UI click (splat = direct place) and web_layout_place: same command and effect; afterglow on the entry', async () => {
-    mount(<ThumbnailCard entry={SPLAT} isPlacing={false} isPending={false} plugin={world.planner as never} />);
+    mount(<ThumbnailCard entry={SPLAT} isPlacing={false} plugin={world.planner as never} />);
     const card = () => byKey(libraryEntryKey(SPLAT.id));
     expect(card()).not.toBeNull();
     expect(card().getAttribute('data-rv-command-id')).toBe('layout.place');
@@ -397,7 +402,7 @@ describe('library entry — the card is the view of layout.place', () => {
     spy.mockClear();
     let res: Record<string, unknown> = {};
     const phases = await watchPhases(libraryEntryKey(SPLAT.id), async () => {
-      res = await call('web_layout_place', { catalogId: SPLAT.id, x: 2, y: 0, z: 1 });
+      res = await bridgeExecuteValue(call, 'layout.place', { catalogId: SPLAT.id, x: 2, y: 0, z: 1 });
     });
     expect(spy).toHaveBeenCalledTimes(1);
     expect(res).toMatchObject({ id: 'placed-2', catalogId: SPLAT.id, position: [2, 0, 1] });
@@ -409,8 +414,8 @@ describe('library entry — the card is the view of layout.place', () => {
   });
 
   it('refusal: an unknown catalog id answers the command reason and places nothing', async () => {
-    mount(<ThumbnailCard entry={SPLAT} isPlacing={false} isPending={false} plugin={world.planner as never} />);
-    const res = await call('web_layout_place', { catalogId: 'cat:nope', x: 0, y: 0, z: 0 });
+    mount(<ThumbnailCard entry={SPLAT} isPlacing={false} plugin={world.planner as never} />);
+    const res = await bridgeExecuteValue(call, 'layout.place', { catalogId: 'cat:nope', x: 0, y: 0, z: 0 });
     const reason = commandRegistry.enabled('layout.place', { catalogId: 'cat:nope', x: 0, y: 0, z: 0 }, world.viewer);
     expect(res).toEqual({ error: (reason as { reason: string }).reason });
     expect(world.planner.placeComponent).not.toHaveBeenCalled();
@@ -445,7 +450,7 @@ describe('inspector Drive action — ComponentAction.command view of drive.jog',
     spy.mockClear();
     const backKey = driveJogKey('Conveyor', false);
     let res: Record<string, unknown> = {};
-    const phases = await watchPhases(backKey, async () => { res = await call('web_drive_jog', { name: 'Conveyor', forward: false }); });
+    const phases = await watchPhases(backKey, async () => { res = await bridgeExecuteValue(call, 'drive.jog', { name: 'Conveyor', forward: false }); });
     expect(spy).toHaveBeenCalledTimes(1);
     expect(res).toMatchObject({ name: 'Conveyor', jogForward: false, jogBackward: true });
     expect(world.drive.jogBackward).toBe(true);
@@ -457,7 +462,7 @@ describe('inspector Drive action — ComponentAction.command view of drive.jog',
 
   it('refusal: an unknown drive answers the command reason, nothing moves, no glow', async () => {
     section();
-    const res = await call('web_drive_jog', { name: 'Ghost', forward: true });
+    const res = await bridgeExecuteValue(call, 'drive.jog', { name: 'Ghost', forward: true });
     expect(res).toEqual({ error: 'Drive "Ghost" not found' });
     expect(commandRegistry.enabled('drive.jog', { name: 'Ghost', forward: true }, world.viewer))
       .toEqual({ reason: 'Drive "Ghost" not found' });

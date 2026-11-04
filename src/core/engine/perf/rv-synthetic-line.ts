@@ -34,6 +34,7 @@
  * listeners, geometry and the `maxLiveMUs` override (SOL #8).
  */
 
+import { getActiveStatsRegistry } from '../../stats/rv-stats-registry';
 import { BoxGeometry, Group, Mesh, MeshStandardMaterial, Object3D, Vector3 } from 'three';
 import type { BufferGeometry, Material, Scene } from 'three';
 import { AABB } from '../rv-aabb';
@@ -45,6 +46,7 @@ import { RVSource } from '../rv-source';
 import { RVTransportSurface } from '../rv-transport-surface';
 import type { RVTransportManager } from '../rv-transport-manager';
 import type { ComponentContext } from '../rv-component-registry';
+import { NodeRegistry } from '../rv-node-registry';
 import type { SignalStore, SignalWriter } from '../rv-signal-store';
 import { createSignalWriter } from '../rv-signal-store';
 import {
@@ -55,6 +57,7 @@ import {
 import type { SyntheticMuAsset } from './rv-synthetic-assets';
 export type { SyntheticMuAsset } from './rv-synthetic-assets';
 import type { ConveyorPlacement, ConveyorVisualHandle, RobotFarmHandle } from './rv-synthetic-assets';
+import { mulberry32 } from '../rv-prng';
 
 /** Signal-name prefix owned by the synthetic line. `dispose()` removes exactly this. */
 export const SYNTHETIC_LINE_PREFIX = 'LINE/';
@@ -274,17 +277,12 @@ export interface SyntheticLineHost {
   fixedTimeStep?: number;
 }
 
-/** Deterministic 32-bit PRNG (mulberry32) — no `Math.random` anywhere in the builder. */
-function makeRandom(seed: number): () => number {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
+/**
+ * Deterministic 32-bit PRNG — no `Math.random` anywhere in the builder.
+ * plan-664 consolidated the identical local mulberry32 copy into `rv-prng`;
+ * the stream is bit-identical (pinned by `tests/rv-ray-noise.node.test.ts`).
+ */
+const makeRandom = mulberry32;
 
 /** Signal names the builder registers for a given configuration (also used by the plan). */
 function signalNamesFor(cfg: SyntheticLineConfig): string[] {
@@ -420,6 +418,11 @@ export function buildSyntheticLine(
   const random = makeRandom(cfg.seed);
   const tm = host.transportManager;
   const store = host.signalStore;
+  // plan-769 Phase 1b: `RVSource.init` reads its stored `ThisObjectAsMU` through
+  // `registry.storedNode`. The line is built outside any decoded document, so an
+  // empty real registry is the honest context: every stored read answers `legacy`
+  // (`no-document`) and the source's own subtree lookup runs — no fake to drift.
+  const sourceRegistry = new NodeRegistry();
   const writer: SignalWriter = createSignalWriter(store, 'perf:synthetic-line', 'component');
 
   const root = new Group();
@@ -646,8 +649,9 @@ export function buildSyntheticLine(
     // falls back to the permissive "always spawn" path and stops honouring the
     // occupancy gate — the very behaviour a jam measurement depends on.
     source.init({
+      statsRegistry: getActiveStatsRegistry() ?? undefined,
       root: laneGroup,
-      registry: { getNode: () => null } as unknown as ComponentContext['registry'],
+      registry: sourceRegistry,
       signalStore: store,
       scene: host.scene as Scene,
       transportManager: tm,

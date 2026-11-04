@@ -1,0 +1,137 @@
+{
+  "$schema": "rv-tutorial/1",
+  "id": "connect-setup-activate",
+  "title": "realvirtual WEB - Set up CONNECT (part 2: connect, register the community license, ask the AI)",
+  "url": "/?doc=doc_demorealvirtualweb_7l7hfw&mode=hmi",
+  "connect": "live",
+  "viewport": { "width": 1920, "height": 1080 },
+  "welcome": "dismiss",
+  "ready": "#rv-viewport",
+  "minStepSec": 2,
+  "setup": [
+    { "type": "waitFor", "scene": true, "doc": "rvproject:DemoRealvirtualWeb.glb", "timeoutMs": 120000 }
+  ],
+  "steps": [
+    {
+      "id": "open-connect-panel",
+      "holdSec": 2,
+      "actions": [
+        { "type": "click", "target": { "selector": "button[aria-label=\"realvirtual CONNECT\"]" } },
+        { "type": "waitFor", "selector": "button:has-text(\"Connect...\")", "timeoutMs": 10000 }
+      ]
+    },
+    {
+      "id": "connect",
+      "holdSec": 3,
+      "actions": [
+        { "type": "click", "target": { "selector": "button:has-text(\"Connect...\")" } },
+        { "type": "waitFor", "selector": "button:text-is(\"Connect\")", "timeoutMs": 10000 },
+        { "type": "click", "target": { "selector": "button:text-is(\"Connect\")" } },
+        { "type": "waitFor", "selector": "[data-testid=\"license-status-line\"]", "timeoutMs": 30000 }
+      ]
+    },
+    {
+      "id": "open-license-dialog",
+      "holdSec": 2,
+      "actions": [
+        { "type": "click", "target": { "selector": "button:has-text(\"Activate license...\")" } },
+        { "type": "waitFor", "selector": "[role=\"dialog\"]:has-text(\"Activate realvirtual CONNECT\")", "timeoutMs": 10000 }
+      ]
+    },
+    {
+      "id": "enter-email",
+      "holdSec": 2,
+      "actions": [
+        {
+          "type": "type",
+          "target": { "selector": "[role=\"dialog\"] input[type=\"email\"]" },
+          "text": "info@realvirtual.io",
+          "delayMs": 60
+        }
+      ]
+    },
+    {
+      "id": "send-confirmation",
+      "holdSec": 3,
+      "actions": [
+        { "type": "click", "target": { "selector": "[role=\"dialog\"] button:has-text(\"Send confirmation link\")" } },
+        { "type": "waitFor", "selector": "[aria-label=\"License pending\"]", "timeoutMs": 60000 }
+      ]
+    },
+    {
+      "id": "license-confirmed",
+      "holdSec": 3,
+      "actions": [
+        { "type": "waitFor", "selector": "[aria-label=\"License active\"]", "timeoutMs": 900000 },
+        { "type": "press", "key": "Escape" }
+      ]
+    },
+    {
+      "id": "enable-ai-control",
+      "holdSec": 2,
+      "actions": [
+        { "type": "press", "key": "Escape" },
+        { "type": "click", "target": { "selector": "button[aria-label^=\"AI control\"]" } },
+        { "type": "waitFor", "selector": "[data-rv-ai=\"panel\"]", "timeoutMs": 10000 },
+        { "type": "click", "target": { "selector": "[data-rv-ai=\"settings\"]" } },
+        { "type": "waitFor", "selector": "[data-testid=\"ai-consent-dialog\"]", "timeoutMs": 10000 },
+        { "type": "click", "target": { "selector": "[data-testid=\"ai-consent-dialog\"] button:has-text(\"Got it\")" } },
+        { "type": "waitFor", "selector": "[data-testid=\"ai-consent-dialog\"]", "state": "hidden", "timeoutMs": 10000 }
+      ]
+    },
+    {
+      "id": "reconnect-channel",
+      "holdSec": 2,
+      "actions": [
+        { "type": "waitFor", "selector": "[data-testid=\"connect-channel-row\"] button:has-text(\"Retry Now\")", "timeoutMs": 10000 },
+        { "type": "click", "target": { "selector": "[data-testid=\"connect-channel-row\"] button:has-text(\"Retry Now\")" } },
+        { "type": "waitFor", "selector": "[data-testid=\"connect-channel-row\"]:has-text(\"Connected\")", "timeoutMs": 30000 }
+      ]
+    },
+    {
+      "id": "switch-ai-control-on",
+      "holdSec": 2,
+      "actions": [
+        { "type": "click", "target": { "selector": "[data-testid=\"ai-control-switch\"]" } },
+        { "type": "waitFor", "selector": "[data-testid=\"ai-control-switch\"] input:checked", "timeoutMs": 10000 }
+      ]
+    },
+    {
+      "id": "open-ai-prompt",
+      "holdSec": 2,
+      "actions": [
+        { "type": "click", "target": { "selector": "button[aria-label=\"Settings\"]" } },
+        { "type": "click", "target": { "selector": "button[aria-label^=\"AI control\"]" } },
+        { "type": "waitFor", "selector": "[data-rv-ai=\"panel\"]", "timeoutMs": 10000 }
+      ]
+    },
+    {
+      "id": "ask-question",
+      "holdSec": 2,
+      "actions": [
+        {
+          "type": "type",
+          "target": { "selector": "[data-rv-ai=\"input\"]" },
+          "text": "What do you see in the demo scene?",
+          "delayMs": 60
+        }
+      ]
+    },
+    {
+      "id": "send-question",
+      "holdSec": 2,
+      "actions": [
+        { "type": "click", "target": { "selector": "[data-rv-ai=\"send\"]" } },
+        { "type": "waitFor", "selector": "[data-rv-ai-state=\"running\"]", "timeoutMs": 10000 }
+      ]
+    },
+    {
+      "id": "show-answer",
+      "holdSec": 6,
+      "tailSec": 0.4,
+      "actions": [
+        { "type": "waitFor", "selector": "[data-rv-ai-state=\"idle\"]", "timeoutMs": 600000 }
+      ]
+    }
+  ]
+}

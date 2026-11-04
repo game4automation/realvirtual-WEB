@@ -201,6 +201,50 @@ export function getPlcRuntime(): PlcRuntime | null {
   return currentPlcRuntime;
 }
 
+// ─── Code persistence (deploy → PLCProgram.Code) ──────────────────────────
+
+/** Outcome of persisting a deployed program's source into its scene node. */
+export interface PlcCodePersistResult {
+  /** True only when `PLCProgram.Code` of the node holds the code after the write. */
+  persisted: boolean;
+  /** Scene path of the node the code was written to. */
+  nodePath?: string;
+  /** Which document carries the write: the open asset (editor) or the scene. */
+  document?: 'asset-doc' | 'scene-doc';
+  /** True when the PLC node had to be created first. */
+  created?: boolean;
+  /** Why nothing (or not everything) was persisted. */
+  error?: string;
+  /** Saved, but something the user should know (e.g. the PLC editor kept unsaved edits). */
+  warning?: string;
+}
+
+/**
+ * Writes deployed ST source into `PLCProgram.Code` through the same undoable
+ * scene ops the PLC editor uses (carrier node ensured, `setField`). Registered
+ * by the private PLC plugin; without it a deploy runs but is not persisted.
+ */
+export interface PlcPersistence {
+  /**
+   * Persists `code` into `program` — a scene path (`''` = the node-less editor
+   * buffer) or a name; undefined = the selected program. Callers resolve the
+   * target BEFORE deploying so a selection change meanwhile cannot redirect it.
+   */
+  persistCode(code: string, program?: string): Promise<PlcCodePersistResult>;
+}
+
+let currentPlcPersistence: PlcPersistence | null = null;
+
+/** Registers the code persistence (pass null to unregister, e.g. on plugin dispose). */
+export function registerPlcPersistence(persistence: PlcPersistence | null): void {
+  currentPlcPersistence = persistence;
+}
+
+/** The code persistence, or null without the private PLC plugin. */
+export function getPlcPersistence(): PlcPersistence | null {
+  return currentPlcPersistence;
+}
+
 // ─── Mini registry (private runner registers, public UI/MCP read) ──────────
 
 let currentPlcControl: PlcControl | null = null;

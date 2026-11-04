@@ -18,6 +18,7 @@
 import type { Object3D } from 'three';
 import type { NodeRegistry } from './rv-node-registry';
 import { tagIsolateSubtree, untagIsolateSubtree } from './rv-group-registry';
+import { ArenaCaptureLatch, arenaSinkOf } from './rv-arena-sink';
 import { getRegisteredCapabilities } from './rv-component-registry';
 import { getAutoFilterNodesByType } from './rv-visibility-owners';
 
@@ -111,6 +112,7 @@ export class AutoFilterRegistry {
     for (const node of filter.nodes) {
       node.visible = visible;
     }
+    this._arenaBump(filter.nodes[0]);
   }
 
   /**
@@ -138,6 +140,8 @@ export class AutoFilterRegistry {
     this._dimDesaturate = opts?.dimDesaturate ?? false;
     // Raycast restriction is enforced centrally by RVViewer's isolation gate
     // — see RaycastManager.setIsolationGate().
+    this._arenaBump(target.nodes[0]);
+    this._syncArenaCapture();
   }
 
   /**
@@ -174,6 +178,8 @@ export class AutoFilterRegistry {
     this._isolateActiveName = '__multi:' + targets.map(t => t.type).join('+');
     this._dimOpacity = opts?.dimOpacity ?? null;
     this._dimDesaturate = opts?.dimDesaturate ?? false;
+    this._arenaBump(this._isolatedNodes[0]);
+    this._syncArenaCapture();
   }
 
   /** True iff a multi-type isolate is currently active. */
@@ -192,12 +198,15 @@ export class AutoFilterRegistry {
    */
   showAll(): void {
     this._clearIsolateState();
+    let first: Object3D | undefined;
     for (const filter of this._filters.values()) {
       filter.visible = true;
       for (const node of filter.nodes) {
         node.visible = true;
+        first ??= node;
       }
     }
+    this._arenaBump(first);
   }
 
   /** Clear the layer tag and visibility overrides from the last isolate(). */
@@ -209,11 +218,13 @@ export class AutoFilterRegistry {
     for (const entry of this._priorVisibility) {
       entry.node.visible = entry.visible;
     }
+    this._arenaBump(this._priorVisibility[0]?.node);
     this._isolatedNodes = [];
     this._priorVisibility = [];
     this._isolateActiveName = null;
     this._dimOpacity = null;
     this._dimDesaturate = false;
+    this._syncArenaCapture();
   }
 
   /**
@@ -255,5 +266,32 @@ export class AutoFilterRegistry {
   clear(): void {
     this._clearIsolateState();
     this._filters.clear();
+    this._arenaLatch.release();
+  }
+
+  // ─── editor arenas (plan-766 F11 / §2.4.5) — null checks without arenas ──
+
+  /** Capture held while a filter isolate is active. */
+  private readonly _arenaLatch = new ArenaCaptureLatch();
+
+  /** A `.visible` was written without an op — arenas recompute next frame. */
+  private _arenaBump(node: Object3D | undefined): void {
+    arenaSinkOf(node)?.bumpVisibility();
+  }
+
+  /** Isolate tags layer bits on the SOURCES: arenas must step aside meanwhile. */
+  private _syncArenaCapture(): void {
+    this._arenaLatch.sync(arenaSinkOf(this._isolatedNodes[0]), this.isIsolateActive);
+  }
+
+  /**
+   * Re-take the isolate capture from scratch — called by the editor right after
+   * it (re)installed its arenas (plan-766 Schritt 5). An isolate that was already
+   * active when the arenas were built held no capture on them (or one on a
+   * manager that has since been disposed and rebuilt).
+   */
+  resyncArenaCapture(): void {
+    this._arenaLatch.release();
+    this._syncArenaCapture();
   }
 }

@@ -7,6 +7,7 @@ import { RVCustomRuntimeInstruction, parseSteps } from '../src/core/engine/rv-cu
 import { InstructionRuntimeStore } from '../src/core/engine/rv-instruction-runtime-store';
 import { applySchema } from '../src/core/engine/rv-component-registry';
 import type { ComponentContext } from '../src/core/engine/rv-component-registry';
+import { legacyRegistry } from './helpers/legacy-registry-fake';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -54,7 +55,7 @@ function makeCtx(signalMock: ReturnType<typeof makeSignalMock>, store: Instructi
   return {
     signalStore: signalMock as never,
     instructionStore: store,
-    registry: { getNode: () => null } as never,
+    registry: legacyRegistry(() => null) as never,
     scene: {} as never,
     transportManager: {} as never,
     root: new Object3D(),

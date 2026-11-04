@@ -47,6 +47,7 @@ import {
   bakeRequiresFullPath,
   bakeIsEmpty,
   makeRegistryBakeResolver,
+  NestedTransformRefusedError,
   ReferencedFileWriteError,
   SaveReferenceCycleError,
   type BakeResolver,
@@ -323,7 +324,16 @@ describe('Bake-Round-Trip über alle 7 Kategorien', () => {
     expect(baked.connections).toBe(1);
 
     const reloaded = await load(baked.glb);
-    expect(collectConnections(reloaded.root).connections).toEqual([edge]);
+    // plan-769 Phase 3b: the edge's ends are stored as ADDRESSES — the same two nodes.
+    const [stored] = collectConnections(reloaded.root).connections as unknown as Array<Record<string, unknown>>;
+    expect({ ...stored, source: 0, target: 0 }).toEqual({ ...edge, source: 0, target: 0 });
+    const nodeOf = (v: unknown): string | null => {
+      const r = reloaded.registry.readStoredRef(reloaded.root, v as never);
+      return r.status === 'resolved' ? r.node.name : null;
+    };
+    expect(stored!.source).toMatchObject({ address: expect.stringMatching(/^#/) });
+    expect(nodeOf(stored!.source)).toBe('Floor');
+    expect(nodeOf(stored!.target)).toBe('Motor');
   });
 
   it('Kategorie 7 connectionTypes: die Signatur steht im selben Block', async () => {
@@ -486,10 +496,13 @@ describe('Overrides auf referenzierte Knoten', () => {
     };
     const referenceJson = json.nodes.find((n) => n.name === 'Press_0')!;
     const rv = referenceJson.extras!.realvirtual as Record<string, Record<string, unknown>>;
-    const byNodeId = rv.AssetOverrides.byNodeId as Record<string, Record<string, unknown>>;
-    const ids = Object.keys(byNodeId);
+    // plan-769: `byAddress`, key `#<id>` — never `byNodeId` again.
+    expect(rv.AssetOverrides.byNodeId).toBeUndefined();
+    const byAddress = rv.AssetOverrides.byAddress as Record<string, Record<string, unknown>>;
+    const ids = Object.keys(byAddress);
     expect(ids).toHaveLength(1);
-    expect(byNodeId[ids[0]]).toEqual({ Drive: { TargetSpeed: 999 } });
+    expect(ids[0].startsWith('#')).toBe(true);
+    expect(byAddress[ids[0]]).toEqual({ Drive: { TargetSpeed: 999 } });
   });
 
   it('der Override kommt beim Reload am richtigen Knoten an', async () => {
@@ -507,12 +520,11 @@ describe('Overrides auf referenzierte Knoten', () => {
     expect(reloaded.orphanedOverrides).toHaveLength(0);
   });
 
-  // Plan-444 F3 turned this case around. It used to throw; refusing it was the
-  // reason "import a STEP and drag a part into place" could not be saved, and
-  // the move is now recorded as a transform override on the reference node.
-  // The refusal that REMAINS is the nested case — see
-  // rv-scene-glb-bake-move-in-reference.test.ts, which owns both halves.
-  it('schreibt eine Verschiebung INNERHALB eines referenzierten Assets als trs-Override', async () => {
+  // plan-769 D11/F14 turned plan-444 F3 around again: inside placed content only
+  // component values are overridable, a move is refused by name and nothing is
+  // written (`trsByNodeId` is gone). rv-scene-glb-bake-move-in-reference.test.ts
+  // owns the nested half.
+  it('verweigert eine Verschiebung INNERHALB eines referenzierten Assets (nested-transform-refused)', async () => {
     const h = await harness();
     const edits = materialise([op({
       kind: 'transformNode', nodePath: h.pathOf('Ram'),
@@ -520,18 +532,10 @@ describe('Overrides auf referenzierte Knoten', () => {
       prev: { position: [0, 0, 0], quaternion: [0, 0, 0, 1] },
     })]);
 
-    const baked = await bakeIntoGlb(plantBytes, edits, h.resolver, {});
-    expect(baked.referenceTransforms).toBe(1);
-    // Not written as one of THIS file's own node transforms.
-    expect(baked.transforms).toBe(0);
-
-    const json = parseGlbChunks(baked.glb).json as {
-      nodes: Array<{ name?: string; extras?: Record<string, unknown> }>;
-    };
-    const referenceJson = json.nodes.find((n) => n.name === 'Press_0')!;
-    const rv = referenceJson.extras!.realvirtual as Record<string, Record<string, unknown>>;
-    const trs = rv.AssetOverrides.trsByNodeId as Record<string, { position: number[] }>;
-    expect(Object.values(trs)[0].position).toEqual([1, 2, 3]);
+    let error: unknown;
+    try { await bakeIntoGlb(plantBytes, edits, h.resolver, {}); } catch (e) { error = e; }
+    expect(error).toBeInstanceOf(NestedTransformRefusedError);
+    expect((error as NestedTransformRefusedError).paths).toEqual([h.pathOf('Ram')]);
   });
 
   it('verweigert einen Override, dessen Referenzknoten selbst aus einer fremden Datei stammt', async () => {

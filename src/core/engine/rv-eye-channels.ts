@@ -48,6 +48,7 @@
 import {
   Box3,
   Color,
+  DoubleSide,
   Group,
   LineBasicMaterial,
   LinearFilter,
@@ -56,6 +57,7 @@ import {
   MeshBasicMaterial,
   OrthographicCamera,
   PerspectiveCamera,
+  PlaneGeometry,
   Scene,
   SRGBColorSpace,
   UnsignedByteType,
@@ -68,10 +70,12 @@ import {
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { Pass } from 'three/addons/postprocessing/Pass.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
-import { OVERLAY_LAYERS } from './rv-group-registry';
+import { ISOLATE_FOCUS_LAYER, OVERLAY_LAYERS } from './rv-group-registry';
 import { DEFAULT_SELECTION_STYLE, cachedEdgesGeometry } from './rv-highlight-manager';
-import { OffscreenCapture, guardWebGL, type OffscreenPass } from './rv-offscreen-capture';
+import { OffscreenCapture, captureSupported, type OffscreenPass } from './rv-offscreen-capture';
+import { sceneArenaSink } from './rv-arena-sink';
 import {
   IDMASK_GROUP_CAP,
   idmaskColor,
@@ -210,6 +214,25 @@ export interface EyeRenderResult {
   legend: IdmaskLegendEntry[];
   /** The crop actually applied, as fractions of the uncropped frame. */
   crop?: { x: number; y: number; w: number; h: number };
+  /**
+   * True when the viewport's isolate was active for this frame: beauty shows
+   * the non-isolated parts dimmed the way the viewport does, and idmask/xray
+   * draw the isolated subtrees ALONE — a dimmed part has no identity.
+   */
+  isolate?: boolean;
+}
+
+/**
+ * One isolate channel of the viewer — the shape `GroupRegistry` and
+ * `AutoFilterRegistry` share. The eye reads it, never writes it: the isolate
+ * is document state the viewport owns (plan-740 D-U3).
+ */
+export interface EyeIsolateSource {
+  readonly isIsolateActive: boolean;
+  /** Re-tag dynamically added descendants with the focus layer (idempotent). */
+  refreshIsolateLayer(): void;
+  /** Caller override of the dim opacity, `null`/absent for the default. */
+  readonly dimOpacity?: number | null;
 }
 
 /** Minimal viewer surface — keeps this module off the RVViewer god-node. */
@@ -218,6 +241,98 @@ export interface EyeChannelHost {
   readonly renderer: unknown;
   readonly registry?: IdmaskRegistry;
   readonly currentModelRoot?: Object3D | null;
+  /**
+   * The viewport's two isolate channels (`RVViewer.groups` / `.autoFilters`).
+   * Optional: a host without them renders no isolation, which is what a host
+   * that cannot isolate anything should get.
+   */
+  readonly groups?: EyeIsolateSource | null;
+  readonly autoFilters?: EyeIsolateSource | null;
+}
+
+/** The viewport's default dim opacity (`_renderIsolateMode`'s fallback). */
+const ISOLATE_DIM_OPACITY = 0.9;
+
+/** What one isolate-aware frame needs to know, resolved once per render. */
+interface EyeIsolate {
+  /** Everything the frame may draw EXCEPT objects that live on the focus layer only. */
+  backdropMask: number;
+  /** The focus layer alone — the isolated subtrees, drawn crisp on top. */
+  focusMask: number;
+  /** Opacity of the tint quad between backdrop and focus. */
+  opacity: number;
+}
+
+/**
+ * Run `fn` with every light of `scene` carrying the focus bit.
+ *
+ * three tests LIGHTS against the camera's layer mask like any other object
+ * (`WebGLRenderer.projectObject`), and the viewer's lights live on layer 0 —
+ * so a focus-only camera would draw the isolated part lit by the environment
+ * map alone, or not at all without one. The bit is taken back afterwards; a
+ * light that already had it is left alone.
+ */
+function withFocusLights<T>(scene: Scene, fn: () => T): T {
+  const tagged: Object3D[] = [];
+  scene.traverse((o) => {
+    if ((o as { isLight?: boolean }).isLight && !o.layers.isEnabled(ISOLATE_FOCUS_LAYER)) {
+      o.layers.enable(ISOLATE_FOCUS_LAYER);
+      tagged.push(o);
+    }
+  });
+  try {
+    return fn();
+  } finally {
+    for (const o of tagged) o.layers.disable(ISOLATE_FOCUS_LAYER);
+  }
+}
+
+/**
+ * The eye's counterpart of the viewport's isolate passes 2 + 3
+ * (`RVViewer._renderIsolateMode`): over the dimmed backdrop the composer has
+ * already produced in `readBuffer`, draw the tint quad and then the focus
+ * layer with a cleared depth buffer, so an isolated part that is physically
+ * buried still shows through the dimmed shell around it.
+ *
+ * Sits BEFORE the `OutputPass`, so both the quad and the focus pass are blended
+ * in linear space and encoded once, together with the backdrop. A plain
+ * `RenderPass` would not do: the live scene's `background` is a `Color`, and a
+ * Color background forces a clear on every `renderer.render()` (the same
+ * `forceClear` gate the viewport works around), which would wipe the backdrop
+ * the pass is supposed to draw over.
+ */
+class IsolateCompositePass extends Pass {
+  layerMask = 0;
+  constructor(
+    private readonly scene: Scene,
+    public camera: Camera,
+    private readonly tintScene: Scene,
+    private readonly tintCamera: Camera,
+  ) {
+    super();
+    this.needsSwap = false;
+    this.clear = false;
+  }
+
+  override render(renderer: WebGLRenderer, _writeBuffer: WebGLRenderTarget, readBuffer: WebGLRenderTarget): void {
+    const prevAutoClear = renderer.autoClear;
+    const prevMask = this.camera.layers.mask;
+    const prevBackground = this.scene.background;
+    renderer.autoClear = false;
+    this.scene.background = null;
+    try {
+      renderer.setRenderTarget(this.renderToScreen ? null : readBuffer);
+      renderer.clearDepth();
+      renderer.render(this.tintScene, this.tintCamera);
+      renderer.clearDepth();
+      this.camera.layers.mask = this.layerMask;
+      withFocusLights(this.scene, () => renderer.render(this.scene, this.camera));
+    } finally {
+      this.camera.layers.mask = prevMask;
+      this.scene.background = prevBackground;
+      renderer.autoClear = prevAutoClear;
+    }
+  }
 }
 
 // ─── The renderer ───────────────────────────────────────────────────────
@@ -250,7 +365,12 @@ export class EyeChannels {
   private _aoComposer: EffectComposer | null = null;
   private _aoScenePass: RenderPass | null = null;
   private _aoGtao: GTAOPass | null = null;
+  private _aoIsolatePass: IsolateCompositePass | null = null;
   private _aoOverlayPass: RenderPass | null = null;
+  /** The isolate tint quad (viewport pass 2), shared by both renderer branches. */
+  private _tintScene: Scene | null = null;
+  private _tintCam: OrthographicCamera | null = null;
+  private _tintMat: MeshBasicMaterial | null = null;
   /** Camera kind the GTAO pass was BUILT for — its `PERSPECTIVE_CAMERA` define
    *  is baked in the constructor, while every camera uniform refreshes per
    *  render, so only a persp/ortho switch forces a rebuild. */
@@ -275,9 +395,9 @@ export class EyeChannels {
     this._colorCapture = new OffscreenCapture(renderer);
   }
 
-  /** `null` when a capture can run, otherwise the WebGPU refusal (D-U11). */
+  /** `null` when a capture can run, otherwise the agent-facing refusal. */
   guard(tool = 'This tool'): string | null {
-    return guardWebGL(this.host.renderer, tool);
+    return captureSupported(this.host.renderer, tool);
   }
 
   /**
@@ -288,6 +408,21 @@ export class EyeChannels {
   async renderChannels(req: EyeRenderRequest): Promise<EyeRenderResult | { error: string }> {
     const guard = this.guard('web_eye');
     if (guard) return { error: guard };
+    // plan-766 F10: with editor arenas the agent captures (ID mask built from
+    // the source meshes, beauty of the live scene) run in arena CAPTURE mode —
+    // sources on their real layers, arenas masked out — for the whole capture,
+    // so every channel describes the authored tree itself. No arenas = no-op.
+    const arena = sceneArenaSink(this.host.scene);
+    if (!arena) return this._renderChannels(req);
+    arena.enterCapture();
+    try {
+      return await this._renderChannels(req);
+    } finally {
+      arena.leaveCapture();
+    }
+  }
+
+  private async _renderChannels(req: EyeRenderRequest): Promise<EyeRenderResult | { error: string }> {
     const renderer = this.host.renderer as WebGLRenderer;
     const registry = this.host.registry;
     const root = req.root ?? this.host.currentModelRoot ?? null;
@@ -298,6 +433,10 @@ export class EyeChannels {
     const camera = this._camera(req.pose, W / H);
 
     const layerMask = AGENT_LAYER_MASK;
+    // The viewport's isolate, read once for the whole frame so every channel
+    // sees the same focus set (a `refreshIsolateLayer` between two channels
+    // could otherwise tag a freshly spawned MU into one and not the other).
+    const isolate = this._isolate(layerMask);
 
     const wanted = dedupeChannels(req.channels);
 
@@ -329,7 +468,7 @@ export class EyeChannels {
     let built: { scene: Scene; colors: Color[]; edges: Group } | null = null;
     if (wanted.includes('idmask') || wanted.includes('xray')) {
       const b = await this._buildIdmaskScene(
-        root, registry, req.idmask ?? {}, wantsLegend ? legend : [],
+        root, registry, req.idmask ?? {}, wantsLegend ? legend : [], isolate !== null,
       );
       if ('error' in b) return b;
       built = b;
@@ -353,19 +492,17 @@ export class EyeChannels {
         clearColor: IDMASK_BACKGROUND, clearAlpha: 1,
         background: new Color(IDMASK_BACKGROUND),
       };
-      // Pass 1 — ground truth. `_renderPass` hands back the capture's REUSED
-      // buffer, so it is decoded here and now, before pass 2 overwrites it.
+      // Pass 1 — ground truth; pass 2 — the picture. Both readbacks are
+      // ISSUED synchronously (each into its own buffer) and awaited together
+      // once the renderer state is back to the viewport's.
       built.edges.visible = false;
-      idBuffer = paletteToIds(
-        this._renderPass(this._colorCapture, idPass, built.scene, camera, renderer),
-        built.colors,
-      );
-      // Pass 2 — the picture.
+      const truthRead = this._renderPass(this._colorCapture, idPass, built.scene, camera, renderer);
       built.edges.visible = true;
-      idPixels = this._renderPass(
-        this._colorCapture, idPass, built.scene, camera, renderer,
-      ).slice();
+      const pictureRead = this._renderPass(this._colorCapture, idPass, built.scene, camera, renderer);
       built.edges.visible = false;
+      const [truth, picture] = await Promise.all([truthRead, pictureRead]);
+      idBuffer = paletteToIds(truth, built.colors);
+      idPixels = picture;
     }
 
     // ── xray (the subject's overlay alone, on a near-black ground) ──
@@ -377,7 +514,7 @@ export class EyeChannels {
     let xrayPixels: Uint8Array | undefined;
     if (wanted.includes('xray') && built) {
       const overlay = this._buildXrayScene(built.scene, xrayByGroup);
-      xrayPixels = this._renderPass(
+      xrayPixels = await this._renderPass(
         this._colorCapture,
         {
           width: W, height: H, layerMask, colorSpace: SRGBColorSpace,
@@ -386,15 +523,15 @@ export class EyeChannels {
           background: new Color(XRAY_BACKGROUND),
         },
         overlay, camera, renderer,
-      ).slice();
+      );
     }
 
     // ── beauty (LIVE scene, private camera) ──
     let beautyPixels: Uint8Array | undefined;
     if (wanted.includes('beauty')) {
-      beautyPixels = this._renderBeautyAO(
-        W, H, camera, renderer, layerMask, aoRadius, null,
-      ).slice();
+      beautyPixels = await this._renderBeautyAO(
+        W, H, camera, renderer, layerMask, aoRadius, null, isolate,
+      );
     }
 
     // ── Encode in the REQUESTED order ──
@@ -413,14 +550,76 @@ export class EyeChannels {
       width: W, height: H,
       camera: cameraInfo(req.pose, camera),
       channels, legend,
+      ...(isolate ? { isolate: true } : {}),
     };
     return req.crop ? cropResult(result, req.crop, camera, W, H) : result;
+  }
+
+  /**
+   * The viewport's isolate state for ONE frame, or `null` when nothing is
+   * isolated. Refreshes the focus layer first, exactly as the viewport does per
+   * frame, so a descendant added since the isolate began (a spawned MU, async
+   * geometry) carries the focus bit before any channel looks at it.
+   */
+  private _isolate(layerMask: number): EyeIsolate | null {
+    const groups = this.host.groups ?? null;
+    const autoFilters = this.host.autoFilters ?? null;
+    if (!groups?.isIsolateActive && !autoFilters?.isIsolateActive) return null;
+    groups?.refreshIsolateLayer();
+    autoFilters?.refreshIsolateLayer();
+    // Same precedence as the viewport: autoFilters over groups over the default.
+    const opacity = autoFilters?.dimOpacity ?? groups?.dimOpacity ?? ISOLATE_DIM_OPACITY;
+    return {
+      backdropMask: layerMask & ~(1 << ISOLATE_FOCUS_LAYER),
+      focusMask: 1 << ISOLATE_FOCUS_LAYER,
+      opacity,
+    };
+  }
+
+  /**
+   * The tint quad between backdrop and focus (viewport pass 2), coloured like
+   * the scene background so the dimmed parts fade towards the sky rather than
+   * towards white. Built once; `dispose()` frees it.
+   */
+  private _tintQuad(renderer: WebGLRenderer, opacity: number): { scene: Scene; camera: Camera } {
+    if (!this._tintScene) {
+      const scene = new Scene();
+      scene.background = null; // a Color here would force-clear the backdrop away
+      const mat = new MeshBasicMaterial({
+        color: 0xffffff,
+        transparent: true,
+        opacity,
+        depthTest: false,
+        depthWrite: false,
+        side: DoubleSide,
+        toneMapped: false,
+      });
+      const quad = new Mesh(new PlaneGeometry(2, 2), mat);
+      quad.frustumCulled = false;
+      scene.add(quad);
+      this._tintScene = scene;
+      this._tintCam = new OrthographicCamera(-1, 1, 1, -1, 0, 1);
+      this._tintMat = mat;
+    }
+    const mat = this._tintMat as MeshBasicMaterial;
+    mat.opacity = opacity;
+    const bg = this.host.scene.background;
+    if (bg && (bg as Color).isColor) mat.color.copy(bg as Color);
+    else renderer.getClearColor(mat.color);
+    return { scene: this._tintScene, camera: this._tintCam as Camera };
   }
 
   /** Free the render target and every channel material. */
   dispose(): void {
     this._colorCapture.dispose();
     this._disposeAo();
+    if (this._tintScene) {
+      for (const o of this._tintScene.children) (o as Mesh).geometry?.dispose();
+      this._tintScene = null;
+    }
+    this._tintMat?.dispose();
+    this._tintMat = null;
+    this._tintCam = null;
     this._xrayFillMat?.dispose();
     this._xrayFillMat = null;
     this._xrayEdgeMat?.dispose();
@@ -561,7 +760,55 @@ export class EyeChannels {
   private _renderBeautyAO(
     W: number, H: number, camera: Camera, renderer: WebGLRenderer,
     layerMask: number, aoRadius: number, overlay: Scene | null,
-  ): Uint8Array {
+    isolate: EyeIsolate | null = null,
+  ): Promise<Uint8Array> {
+    // With an isolate active the frame is composited the way the viewport
+    // does it (`_renderIsolateMode`): the backdrop is everything that is not
+    // on the focus layer alone, then a tint quad, then the focus layer crisp
+    // on top with the depth cleared. The eye used to render the plain scene
+    // here and show every part bright — so `web_view_isolate` dimmed the
+    // user's viewport while `web_eye` kept photographing the whole machine.
+    const sceneMask = isolate ? isolate.backdropMask : layerMask;
+    // WebGPURenderer (plan-763): the EffectComposer + GTAOPass chain below is
+    // WebGL-only, so the beauty channel is the plain lit scene without
+    // ambient occlusion there (documented reduced look). The overlay, when
+    // given, is drawn on top without clearing — same as the composer's
+    // non-clearing overlay pass.
+    if ((renderer as { isWebGPURenderer?: boolean }).isWebGPURenderer) {
+      return this._colorCapture.withPass(
+        { width: W, height: H, layerMask: sceneMask, colorSpace: SRGBColorSpace, scene: this.host.scene, camera },
+        (ctx) => {
+          renderer.clear();
+          renderer.render(this.host.scene, camera);
+          if (isolate) {
+            const tint = this._tintQuad(renderer, isolate.opacity);
+            const prevAutoClear = renderer.autoClear;
+            const prevBackground = this.host.scene.background;
+            renderer.autoClear = false;
+            // A Color background forces a clear per render (Background.js);
+            // the focus pass must draw OVER the tinted backdrop.
+            this.host.scene.background = null;
+            try {
+              renderer.clearDepth();
+              renderer.render(tint.scene, tint.camera);
+              renderer.clearDepth();
+              camera.layers.mask = isolate.focusMask;
+              withFocusLights(this.host.scene, () => renderer.render(this.host.scene, camera));
+            } finally {
+              camera.layers.mask = sceneMask;
+              this.host.scene.background = prevBackground;
+              renderer.autoClear = prevAutoClear;
+            }
+          }
+          if (overlay) {
+            const prevAutoClear = renderer.autoClear;
+            renderer.autoClear = false;
+            try { renderer.render(overlay, camera); } finally { renderer.autoClear = prevAutoClear; }
+          }
+          return this._colorCapture.readPixels(ctx.target, ctx.width, ctx.height);
+        },
+      );
+    }
     const perspective = (camera as PerspectiveCamera).isPerspectiveCamera === true;
     if (this._aoComposer && this._aoPerspective !== perspective) this._disposeAo();
 
@@ -597,13 +844,20 @@ export class EyeChannels {
       const overlayPass = new RenderPass(this.host.scene, camera);
       overlayPass.clear = false;
       overlayPass.enabled = false;
+      // Isolate composite (tint + focus) between AO and the x-ray overlay:
+      // the focus pass has no AO, exactly like the viewport's pass 3.
+      const tint = this._tintQuad(renderer, ISOLATE_DIM_OPACITY);
+      const isolatePass = new IsolateCompositePass(this.host.scene, camera, tint.scene, tint.camera);
+      isolatePass.enabled = false;
       composer.addPass(scenePass);
       composer.addPass(gtao);
+      composer.addPass(isolatePass);
       composer.addPass(overlayPass);
       composer.addPass(new OutputPass());
       this._aoComposer = composer;
       this._aoScenePass = scenePass;
       this._aoGtao = gtao;
+      this._aoIsolatePass = isolatePass;
       this._aoOverlayPass = overlayPass;
       this._aoPerspective = perspective;
       this._aoW = 0;
@@ -635,9 +889,17 @@ export class EyeChannels {
       overlayPass.camera = camera;
     }
 
+    const isolatePass = this._aoIsolatePass as IsolateCompositePass;
+    isolatePass.enabled = isolate !== null;
+    if (isolate) {
+      this._tintQuad(renderer, isolate.opacity); // refresh colour + opacity
+      isolatePass.camera = camera;
+      isolatePass.layerMask = isolate.focusMask;
+    }
+
     return this._colorCapture.withPass(
       {
-        width: W, height: H, layerMask, colorSpace: SRGBColorSpace,
+        width: W, height: H, layerMask: sceneMask, colorSpace: SRGBColorSpace,
         scene: this.host.scene, camera,
       },
       () => {
@@ -654,19 +916,22 @@ export class EyeChannels {
     this._aoComposer = null;
     this._aoScenePass = null;
     this._aoGtao = null;
+    this._aoIsolatePass = null;
     this._aoOverlayPass = null;
     this._aoPerspective = null;
     this._aoW = 0;
     this._aoH = 0;
   }
 
+  /** Render one pass and ISSUE its readback; the promise resolves to a fresh
+   *  top-down buffer. The renderer state is already restored when it resolves. */
   private _renderPass(
     capture: OffscreenCapture,
     pass: OffscreenPass,
     scene: Scene,
     camera: Camera,
     renderer: WebGLRenderer,
-  ): Uint8Array {
+  ): Promise<Uint8Array> {
     return capture.withPass(pass, (ctx) => {
       renderer.clear();
       renderer.render(scene, camera);
@@ -683,10 +948,28 @@ export class EyeChannels {
    */
   private async _buildIdmaskScene(
     root: Object3D, registry: IdmaskRegistry, grouping: IdmaskGrouping,
-    legend: IdmaskLegendEntry[],
+    legend: IdmaskLegendEntry[], focusOnly = false,
   ): Promise<{ scene: Scene; colors: Color[]; edges: Group } | { error: string }> {
     const resolved = await resolveIdmaskGroups(root, registry, grouping);
     if ('error' in resolved) return resolved;
+    // Under an isolate only the focus set has an identity: the viewport's
+    // raycast gate refuses a dimmed part, and a mask that labelled one would
+    // hand the agent a mark on something it can neither see nor select. The
+    // meshes are dropped here, BEFORE the empty-group filter below, so a group
+    // left without a mesh takes no palette slot and no legend row.
+    if (focusOnly) {
+      for (const g of resolved.groups) {
+        const keep = g.meshes.map((m) => m.layers.isEnabled(ISOLATE_FOCUS_LAYER));
+        if (keep.every(Boolean)) continue;
+        g.meshes = g.meshes.filter((_, i) => keep[i]);
+        if (g.paths) {
+          g.paths = g.paths.filter((_, i) => keep[i]);
+          // The label names the first copy; keep it a copy that survived.
+          if (g.paths.length > 0) g.path = g.paths[0];
+        }
+        if (g.count != null) g.count = g.meshes.length;
+      }
+    }
     this._disposeIdmaskScene();
     const scene = new Scene();
     scene.background = new Color(IDMASK_BACKGROUND);

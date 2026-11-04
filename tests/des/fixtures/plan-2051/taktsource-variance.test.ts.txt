@@ -1,0 +1,73 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
+// plan-2051 §9.3 - TaktSource seed variance proof on the REAL PalletYard scene (8 h, plan-559 M3
+// configuration), with production.stochastic turned on. Browser child process (needs GLB/WebGL),
+// spawned ONCE PER SEED by tests/des/des-randomness-taktsource.node.test.ts - exactly one
+// loadPalletYardScene()/DESRunner/dispose() cycle per process, the same discipline
+// tests/des/pallet-yard-s10-compare.node.test.ts uses for its two (soak, M3) measurements.
+// plan-2056: this fixture originally disposed only `runner`/`y`, forgetting `rt.dispose()` before
+// them - the exact harness bug already found and fixed in plan-645/648 for
+// pallet-yard-des-two-runs.test.ts (see that file's header): the Fleet runtime's constructor
+// subscribes to the process-wide zone registry, and ZoneRegistry.clear() does not remove
+// listeners, so an undisposed runtime kept reacting into the next run/process state and could
+// throw ("Fleet DES clock: disposed") on a rapid dispose+reload cycle. Fixed now by disposing
+// `rt` first, in the same order as the correct pallet-yard-des-two-runs.test.ts. Nothing here
+// points to a production Fleet/AGV lifecycle bug - see tests/des/agv-replan-reload-cycle.node.test.ts
+// (plan-2056) for the dedicated regression coverage. Still deliberately ONE run per process (not
+// ten): the "spawned ONCE PER SEED" convention above is unrelated to the fixed bug and is kept as
+// documented - a fresh browser child process per seed, matching pallet-yard-s10-compare.node.test.ts.
+// Throwaway: lives outside tests/, read-only on pallet-yard/**. Sim time only; wall clock informative.
+import { describe, expect, it } from 'vitest';
+import { DESRunner } from '@rv/plugins/des/des-runner';
+import '@rv/behaviors/Conveyor';
+import '@rv/behaviors/Source';
+import '@rv/behaviors/Sink';
+import '@rv/behaviors/Agv';
+import { bindDesYard, startDesRuntime } from '__PUBLIC_ROOT__/src/plugins/models/PalletYard/index';
+import { DEFAULT_YARD } from '__PUBLIC_ROOT__/src/plugins/models/PalletYard/yard-compose';
+import { deriveFleetRng } from '__PUBLIC_ROOT__/src/plugins/fleet-plugin';
+import { expectNoWaitTimeouts } from '__PUBLIC_ROOT__/tests/fleet/expect-no-wait-timeouts';
+import { loadPalletYardScene } from '__PUBLIC_ROOT__/tests/des/pallet-yard-scene-load';
+
+const SIM_SEC = 8 * 3600;
+// Substituted literally by the outer node test (browser code has no process.env).
+const SEED = __RV_TAKT_SEED__;
+
+async function runOnce(masterSeed: number) {
+  const y = await loadPalletYardScene();
+  const runner = new DESRunner({ subMode: 'fastforward', durationSeconds: SIM_SEC, masterSeed });
+  let rt: ReturnType<typeof startDesRuntime> | null = null;
+  try {
+    runner.start([], { root: y.root, host: y.host as never });
+    const cfg = structuredClone(DEFAULT_YARD.config);
+    cfg.production.stochastic = true;
+    const r = bindDesYard({ runner, root: y.root, drives: y.drives, cfg });
+    if (!r.ok) throw new Error('bind: ' + r.missing.join(', '));
+    const rng = deriveFleetRng('pallet-yard', runner, y.root);
+    rt = startDesRuntime(r.backend, () => {}, { cfg, rng });
+    const live = rt;
+    const mgr = runner.getManager() as unknown as { currentTime: number; isComplete: boolean; totalEventsProcessed: number };
+    let idle = 0;
+    while (!mgr.isComplete) {
+      const before = mgr.totalEventsProcessed;
+      runner.tick(1 / 60); runner.lateTick(1 / 60); live.frame();
+      idle = mgr.totalEventsProcessed === before ? idle + 1 : 0;
+      if (idle >= 600) throw new Error('stall at sim t=' + mgr.currentTime.toFixed(0));
+    }
+    expectNoWaitTimeouts(live as never);
+    const c = live.counters;
+    return {
+      seed: masterSeed, simTimeSec: mgr.currentTime,
+      produced: c.produced, delivered: c.delivered, blocked: c.blockedTakts,
+      picks: c.picks, stored: c.stored, retrieved: c.retrieved,
+    };
+  } finally { rt?.dispose(); runner.dispose(); y.dispose(); }
+}
+
+describe('plan-2051: TaktSource seed variance on PalletYard (production.stochastic)', () => {
+  it(`one run, seed ${SEED}`, async () => {
+    const a = await runOnce(SEED);
+    console.log('TAKT_RUN_RESULT ' + JSON.stringify(a));
+    expect(a.simTimeSec).toBeGreaterThanOrEqual(SIM_SEC - 1);
+  }, 1_800_000);
+});

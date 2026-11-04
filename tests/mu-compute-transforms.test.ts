@@ -28,6 +28,7 @@ import {
   type TslMaterialsModule,
 } from '../src/core/engine/materials/material-factory';
 import { MUInstancePool } from '../src/core/engine/rv-mu';
+import { skipEachWithoutAdapter } from './helpers/webgpu-adapter-skip';
 import type { MuComputeTransforms } from '../src/core/engine/materials/rv-mu-compute-tsl';
 
 const adapter = typeof navigator !== 'undefined' && navigator.gpu
@@ -84,13 +85,15 @@ function fillRandom(positions: Float32Array, quaternions: Float32Array, count: n
   }
 }
 
-describe.skipIf(!adapter)('MU compute transforms — plan-271 Phase 4 spike (test 9.5, real WebGPU)', () => {
+describe('MU compute transforms — plan-271 Phase 4 spike (test 9.5, real WebGPU)', () => {
   let handle: TestViewerHandle | null = null;
   let renderer: unknown;
   let tsl: TslMaterialsModule;
   let computeReady = false;
+  skipEachWithoutAdapter(adapter); // skipped with the note NO_WEBGPU_ADAPTER from helpers/webgpu-adapter-skip.ts (the [test-skips] line)
 
   beforeAll(async () => {
+    if (!adapter) return; // every test skips in the beforeEach above — no viewer without an adapter
     handle = await createTestViewer('webgpu');
     renderer = handle.viewer.renderer;
     if (!handle.viewer.hasCompute) {
@@ -109,7 +112,7 @@ describe.skipIf(!adapter)('MU compute transforms — plan-271 Phase 4 spike (tes
   });
 
   it('GPU-composed matrices match the CPU path within 1e-5 for 1k instances', async (ctx) => {
-    if (!computeReady) return ctx.skip();
+    if (!computeReady) return ctx.skip('WebGPU adapter without compute');
     const n = 1000;
     const cap = 1024;
     const positions = new Float32Array(cap * 3);
@@ -137,7 +140,7 @@ describe.skipIf(!adapter)('MU compute transforms — plan-271 Phase 4 spike (tes
   }, 30_000);
 
   it('ensureCapacity() growth re-binds and explicitly destroys the replaced GPU buffers', async (ctx) => {
-    if (!computeReady) return ctx.skip();
+    if (!computeReady) return ctx.skip('WebGPU adapter without compute');
     const backend = (renderer as { backend?: BackendLike }).backend;
     if (!backend?.destroyAttribute) throw new Error('WebGPU backend without destroyAttribute');
     const spy = vi.spyOn(backend, 'destroyAttribute');
@@ -179,7 +182,7 @@ describe.skipIf(!adapter)('MU compute transforms — plan-271 Phase 4 spike (tes
   }, 30_000);
 
   it('dispose() detaches from the mesh and destroys all GPU buffers (idempotent)', async (ctx) => {
-    if (!computeReady) return ctx.skip();
+    if (!computeReady) return ctx.skip('WebGPU adapter without compute');
     const backend = (renderer as { backend?: BackendLike }).backend!;
     const spy = vi.spyOn(backend, 'destroyAttribute');
 
@@ -212,7 +215,7 @@ describe.skipIf(!adapter)('MU compute transforms — plan-271 Phase 4 spike (tes
   }, 30_000);
 
   it('MUInstancePool.updateInstanceMatrix(renderer) uses the compute path and lazily re-syncs CPU matrices for raycast', async (ctx) => {
-    if (!computeReady) return ctx.skip();
+    if (!computeReady) return ctx.skip('WebGPU adapter without compute');
     const geo = new BoxGeometry(0.1, 0.1, 0.1);
     const mat = new MeshStandardMaterial();
     const pool = new MUInstancePool(geo, mat, 'computeTest', new Vector3(0.05, 0.05, 0.05), undefined, 16);

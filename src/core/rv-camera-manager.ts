@@ -26,13 +26,10 @@ import type { ProjectionType } from './hmi/visual-settings-store';
 import type { LeftPanelManager } from './hmi/left-panel-manager';
 import type { FollowSource } from './engine/rv-follow-source';
 import { chunkBoundsOfNode } from './engine/rv-traverse-utils';
-// Value import (not `type`): the animateCameraTo guard needs the constructor
-// for its `instanceof` check. Same direction as the FollowSource import above —
-// core → core/engine — so no cycle (plan-740 D-A6).
-import { AgentEyeFollowSource } from './engine/rv-agent-eye-follow-source';
 
 /** Follow/Sit-On tracking mode. */
 export type CameraFollowMode = 'off' | 'follow' | 'siton';
+export type CameraFollowOwner = 'selection' | 'agent-eye';
 
 /**
  * Distance a camera with `fovDeg` / `aspect` needs so `maxDim` fits BOTH axes,
@@ -109,6 +106,8 @@ export interface CameraAnimation {
   easing: CameraEasing;
   /** Who started the flight (plan-520) — lets a user gesture cancel only the MCP follow flight. */
   tag?: string;
+  /** Refresh moving destinations immediately before each interpolation step. */
+  updateEndpoint?: (position: Vector3, target: Vector3) => void;
 }
 
 /** Camera-flight easing. `easeOut` = snappy response to a user click (default);
@@ -144,6 +143,8 @@ export class CameraManager {
 
   // ─── Follow / Sit-On state ────────────────────────────────────────
   private _followMode: CameraFollowMode = 'off';
+  private _followOwner: CameraFollowOwner | null = null;
+  onFollowModeChanged?: (mode: CameraFollowMode) => void;
   private _source: FollowSource | null = null;
   /** Sit-On seat offset in the target's local frame. */
   private _seatLocalOffset = new Vector3();
@@ -161,6 +162,7 @@ export class CameraManager {
   private _tmpOffset = new Vector3();        // rotated seat offset
   private _tmpQuat = new Quaternion();
   private _lookQuat = new Quaternion();      // mouse-look quaternion
+  private _seatYaw180 = new Quaternion(0, 1, 0, 0);
   private _tmpEuler = new Euler(0, 0, 0, 'YXZ');
   private _tmpBox = new Box3();
 
@@ -297,18 +299,13 @@ export class CameraManager {
    * Smoothly animate the camera to a new position and orbit target.
    * `tag` names the flight's owner so {@link cancelCameraAnimation} can target it.
    */
-  animateCameraTo(position: Vector3, target: Vector3, duration = 0.6, easing: CameraEasing = 'easeOut', tag?: string): void {
+  animateCameraTo(position: Vector3, target: Vector3, duration = 0.6, easing: CameraEasing = 'easeOut', tag?: string, updateEndpoint?: (position: Vector3, target: Vector3) => void): void {
     const xr = (this.state.renderer as unknown as Record<string, unknown>).xr as Record<string, unknown> | undefined;
     if (xr?.isPresenting) return;
     this._cameraEpoch++;
-    // plan-740 D-A6(b): a viewport riding the AI agent's eye must let go when
-    // anything else flies the camera — a bookmark, a view preset, fitToNodes, a
-    // focus double-click. None of those fire an OrbitControls `'start'` event,
-    // so the (a) auto-detach would never see them and `tickFollow` would fight
-    // the animation frame by frame. Not re-entrant: `stopFollowMode` sets
-    // `_followMode = 'off'` BEFORE its own restore call, so the restore flight
-    // re-enters here with the guard already false.
-    if (this._followMode === 'follow' && this._source instanceof AgentEyeFollowSource) {
+    // Release any follow before flying. stopFollowMode clears the mode before
+    // its restore flight re-enters here, so this guard prevents recursion.
+    if (this._followMode !== 'off') {
       this.stopFollowMode(false);
     }
     // In ortho the visible scale must follow camera distance (the frustum is
@@ -324,12 +321,14 @@ export class CameraManager {
       duration,
       easing,
       tag,
+      updateEndpoint,
     };
   }
 
   /** Advance camera animation by frame delta. */
   tickCameraAnimation(dtSec: number): void {
     if (!this.cameraAnim) return;
+    this.cameraAnim.updateEndpoint?.(this.cameraAnim.endPos, this.cameraAnim.endTgt);
     this.cameraAnim.elapsed += dtSec;
     // duration 0 = jump (plan-520 reduced motion) — never 0/0 = NaN on a zero-dt frame.
     const t = this.cameraAnim.duration > 0 ? Math.min(this.cameraAnim.elapsed / this.cameraAnim.duration, 1) : 1;
@@ -354,19 +353,24 @@ export class CameraManager {
 
   /** Current follow/sit-on tracking mode. */
   get followMode(): CameraFollowMode { return this._followMode; }
+  get followOwner(): CameraFollowOwner | null { return this._followOwner; }
+  get followSource(): FollowSource | null { return this._source; }
 
   /**
    * Start orbit-follow: the camera keeps its relative offset to the target as
    * the target moves. OrbitControls stays ENABLED so the user can keep
    * orbiting/zooming around the moving target (delta-pattern in tickFollow).
    */
-  startFollow(src: FollowSource): void {
+  startFollow(src: FollowSource, owner: CameraFollowOwner = 'selection'): void {
+    this.stopFollowMode(false);
     this._cameraEpoch++;
     this.cancelCameraAnimation();
     this._source = src;
     this._followMode = 'follow';
+    this._followOwner = owner;
     this._savedCamPos.copy(this.state._activeCamera.position);
     this._savedCamTarget.copy(this.state.controls.target);
+    this.onFollowModeChanged?.(this._followMode);
     // OrbitControls stays active — target is carried along each tick.
   }
 
@@ -375,12 +379,14 @@ export class CameraManager {
    * follow it) and the user can look around with the mouse. Only meaningful in
    * perspective — if currently orthographic, switch to perspective first.
    */
-  startSitOn(src: FollowSource, seatLocalOffset?: Vector3): void {
+  startSitOn(src: FollowSource, seatLocalOffset?: Vector3, owner: CameraFollowOwner = 'selection'): void {
+    this.stopFollowMode(false);
     if (this.projection === 'orthographic') this.projection = 'perspective';
     this._cameraEpoch++;
     this.cancelCameraAnimation();
     this._source = src;
     this._followMode = 'siton';
+    this._followOwner = owner;
     this._savedCamPos.copy(this.state._activeCamera.position);
     this._savedCamTarget.copy(this.state.controls.target);
     this.state.controls.enabled = false;       // same as FPV — we own the camera
@@ -393,6 +399,8 @@ export class CameraManager {
       src.getWorldPosition(this._tmpPos); // node origin (world) → top-relative seat
       this._defaultSeatOffset(this._tmpBox, this._tmpPos, this._seatLocalOffset);
     }
+    if (src.seatHeight !== undefined) this._seatLocalOffset.y = src.seatHeight;
+    this.onFollowModeChanged?.(this._followMode);
   }
 
   /**
@@ -404,10 +412,11 @@ export class CameraManager {
     const stopped = this._source;
     this._cameraEpoch++;
     this._followMode = 'off';
+    this._followOwner = null;
     this._source = null;
     this.state.controls.enabled = true;
     // Tell the source it is no longer being followed (plan-740). Follow can now
-    // end from inside this class — `animateCameraTo` releases an agent-eye
+    // end from inside this class — `animateCameraTo` releases any active
     // follow before flying — and no OrbitControls event announces that, so an
     // owner watching only `'start'` would keep a stale "attached" flag and a
     // hidden gizmo. Fired with the mode already off, so a handler calling
@@ -415,6 +424,7 @@ export class CameraManager {
     // the restore.
     try { stopped?.onFollowStopped?.(); } catch { /* a faulty owner is not our problem */ }
     if (restore) this.animateCameraTo(this._savedCamPos, this._savedCamTarget, 0.4);
+    this.onFollowModeChanged?.(this._followMode);
   }
 
   /** Apply a Sit-On mouse-look delta (pixels). No-op outside Sit-On. */
@@ -455,10 +465,12 @@ export class CameraManager {
       // Camera position = part position + seat offset (rotated into part frame).
       this._tmpOffset.copy(this._seatLocalOffset).applyQuaternion(this._tmpQuat);
       cam.position.copy(this._tmpPos).add(this._tmpOffset);
-      // Camera orientation = part orientation × mouse-look (Euler YXZ), GC-free.
+      // Apply the forward-axis correction only to the view, not the seat offset.
       this._tmpEuler.set(this._lookPitch, this._lookYaw, 0, 'YXZ');
       this._lookQuat.setFromEuler(this._tmpEuler);
-      cam.quaternion.copy(this._tmpQuat).multiply(this._lookQuat);
+      cam.quaternion.copy(this._tmpQuat);
+      if (this._source.seatForward === 'posZ') cam.quaternion.multiply(this._seatYaw180);
+      cam.quaternion.multiply(this._lookQuat);
     }
     this.state._renderDirty = true;   // keep rendering while the mode is active
   }

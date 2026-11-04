@@ -228,12 +228,14 @@ describe('plan-538 F1 — per-root Active gating', () => {
     const out = w.signal('Out');
     const writes: unknown[] = [];
     w.store.subscribeByPath(out, (v) => writes.push(v));
-    const asset = nd('Asset', null);
+    const asset = nd('Asset', w.scene);
     root(asset, 'Virtual', 'Disconnected', [['Set', setBool(out)], ['W', delay(10)]]);
-    w.add(asset);
+    asset.traverse((n) => w.registry.registerNode(NodeRegistry.computeNodePath(n), n));
 
     // The production load start: RVViewer._attachLogicSystems with the viewer
-    // already connected.
+    // already connected. plan-769 Phase 6: the loader builds no engine — the
+    // viewer merges the model root's steps itself (a document without
+    // placements: at once, through `mergePlacedLogic`).
     const fake = {
       drives: [] as RVDrive[],
       connectionState: 'Connected' as const,
@@ -244,17 +246,20 @@ describe('plan-538 F1 — per-root Active gating', () => {
       registry: w.registry,
       logicEngine: null as RVLogicEngine | null,
       playback: null,
+      _attachMainLogic: (RVViewer.prototype as unknown as { _attachMainLogic: unknown })._attachMainLogic,
     };
     const result = {
-      drives: [], transportManager: null, playback: null, replayRecordings: [],
-      logicEngine: w.engine, registry: { getAll: () => [] }, recorderSettings: undefined,
+      root: asset, drives: [], transportManager: null, playback: null, replayRecordings: [],
+      registry: { getAll: () => [] }, recorderSettings: undefined,
     };
     (RVViewer.prototype as unknown as { _attachLogicSystems(this: typeof fake, r: typeof result): void })
       ._attachLogicSystems.call(fake, result);
 
-    expect(w.engine.isStarted).toBe(true);
-    expect(rootStep(w.engine, 'Virtual').state).toBe(StepState.Idle);
-    w.tick(10);
+    const engine = fake.logicEngine!;
+    expect(engine).toBeInstanceOf(RVLogicEngine);
+    expect(engine.isStarted).toBe(true);
+    expect(rootStep(engine, 'Virtual').state).toBe(StepState.Idle);
+    for (let i = 0; i < 10; i++) engine.fixedUpdate(DT);
     expect(writes).toEqual([]);
     expect(w.store.getBoolByPath(out)).toBe(false);
   });
@@ -756,10 +761,12 @@ describe('plan-538 F6 — simulation reset I/O contract (production resetSimulat
 
     const order: string[] = [];
     const fake = {
+      _structuralEditHolds: () => false, // plan-681: resetSimulation asks whether a structural transaction withholds it
       _simTime: 3,
       drives: Object.values(w.drives),
       chainManager: { resetAll() {} },
       ribbonManager: { resetAll() {} },
+      blockageWatch: { reset() {} }, // plan-2038: resetSimulation clears the blockage watch
       transportManager: tm,
       logicEngine: w.engine,
       logicRunState: 'active',

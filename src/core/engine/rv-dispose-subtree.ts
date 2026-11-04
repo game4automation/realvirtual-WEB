@@ -27,7 +27,7 @@
  */
 
 import type { BufferGeometry, Material, Object3D } from 'three';
-import { chunkMetaOf } from './rv-bake-chunk';
+import { bakedKeepGeometries, chunkMetaOf } from './rv-bake-chunk';
 import { sharedVizGeometries } from './rv-shared-viz-geometry';
 
 export interface DisposeModelSubtreeOptions {
@@ -63,7 +63,12 @@ export function disposeModelSubtree(
     // Shared sensor viz geometries (rv-shared-viz-geometry) follow the same
     // contract: refcounted, released only by `RVSensor.dispose()`.
     if (mesh.geometry && sharedVizGeometries.has(mesh.geometry as unknown as BufferGeometry)) return;
-    if (mesh.geometry) {
+    // plan-774 review round 2 (R8): a KEEP mesh of a placement is a clone that
+    // SHARES its template's geometry; the BakedAsset owns that geometry (a kept
+    // asset is re-instantiated by the next load) and frees it in its own
+    // dispose(). Skip the geometry only — the clone's material is its own.
+    const keepShared = !!mesh.geometry && bakedKeepGeometries.has(mesh.geometry as unknown as BufferGeometry);
+    if (mesh.geometry && !keepShared) {
       // Free the three-mesh-bvh tree explicitly — geometry.dispose() only
       // releases GPU buffers, the CPU-side BVH would otherwise linger as long
       // as anything still references the geometry object.

@@ -140,7 +140,7 @@ export function ProjectsDetailSheet({ open, onClose, detail }: ProjectsDetailShe
         height: MOBILE_SHEET_HEIGHT, maxHeight: MOBILE_SHEET_MAX_HEIGHT,
         backgroundColor: `${WINDOW_DARK_BG} !important`,
         borderTop: '1px solid rgba(255,255,255,0.08)',
-        borderRadius: '8px 8px 0 0',
+        borderRadius: '4px 4px 0 0',
         display: 'flex', flexDirection: 'column',
         // No safe-area padding of its own: unlike `MobileSelectionSheet` this
         // sheet is absolute INSIDE the dashboard shell, and the shell already

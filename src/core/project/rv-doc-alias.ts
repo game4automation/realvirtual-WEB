@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage, listLocalStorageKeys, readLocalStorage, removeLocalStorage } from '../rv-safe-storage';
+
 /**
  * rv-doc-alias — the permanent `sceneId → documentId` map (plan-716 §2.4, F4).
  *
@@ -53,6 +55,7 @@
  * (walked by `listSceneGlbIds`), not `rv-scenes-retired/` (the migration's own
  * graveyard, which a later release purges — and an alias must survive that).
  */
+// Persisted name — do not rename (plan-777 P1).
 export const LS_KEY_DOC_ALIAS_PREFIX = 'rv-doc-alias/';
 
 function aliasKey(sceneId: string): string {
@@ -88,7 +91,7 @@ export function readDocumentAlias(sceneId: string): DocumentAlias | null {
   if (!sceneId) return null;
   let raw: string | null;
   try {
-    raw = localStorage.getItem(aliasKey(sceneId));
+    raw = readLocalStorage(aliasKey(sceneId));
   } catch {
     return null;
   }
@@ -151,7 +154,7 @@ export function writeDocumentAlias(
   }
   const record: DocumentAlias = { documentId, at: now() };
   try {
-    localStorage.setItem(aliasKey(sceneId), JSON.stringify(record));
+    getLocalStorage()!.setItem(aliasKey(sceneId), JSON.stringify(record));
   } catch (e) {
     // The one throw of this module — see the file header. "Document written,
     // link dead" is the state this refuses to reach silently.
@@ -222,8 +225,7 @@ export function sceneUrlToDocumentUrl(href: string, documentId: string): string 
 export function listDocumentAliasIds(): string[] {
   const out: string[] = [];
   try {
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
+    for (const k of listLocalStorageKeys()) {
       if (k && k.startsWith(LS_KEY_DOC_ALIAS_PREFIX)) {
         out.push(k.slice(LS_KEY_DOC_ALIAS_PREFIX.length));
       }
@@ -250,9 +252,7 @@ export function readAllDocumentAliases(): Record<string, string> {
  */
 export function clearDocumentAlias(sceneId: string): void {
   if (!sceneId) return;
-  try {
-    localStorage.removeItem(aliasKey(sceneId));
-  } catch { /* ignore */ }
+  removeLocalStorage(aliasKey(sceneId));
 }
 
 /** Drop every alias. Tests and "clear site data" only. */

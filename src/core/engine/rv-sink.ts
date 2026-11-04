@@ -97,7 +97,7 @@ registerComponent({
     // were listed together; the OLD pipelines keep the `keep` behaviour via
     // `LEGACY_KEEP_OVERRIDE` (rv-freeze-static.ts) until plan-753 Phase 4b removed it.
     bake: 'merge',
-    ui: { badge: '#ef5350' },
+    ui: { badge: '#ef5350', tooltip: 'des-component' },
   },
   create: (node, aabb) => new RVSink(node, aabb!),
 });

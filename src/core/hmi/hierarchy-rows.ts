@@ -53,6 +53,7 @@ import type { Material, Mesh, Object3D } from 'three';
 import type { RVExtrasOverlay } from '../engine/rv-extras-overlay-store';
 import { isChunkMesh, isRuntimeNode } from '../engine/rv-node-classification';
 import { RV_SYNTHETIC_KEY } from '../engine/rv-bake-chunk';
+import { RV_ASSET_REFERENCE_KEY } from '../engine/rv-asset-reference';
 import { chunkRowLabel, chunkTriangles, foldRowLabel } from './chunk-row-labels';
 import { extractComponentTypes } from './rv-inspector-helpers';
 import { matchesFilter, parseFilterId, snapLabel, type HierarchyFilterId, type TreeNode, type VisibleTreeRow } from './hierarchy-utils';
@@ -224,7 +225,20 @@ export function sceneRow(object: Object3D, ctx: SceneRowContext): SceneTreeNode 
     expandKey: object.uuid,
     isModelRoot: isRoot || undefined,
     locked: isLockedLayoutObject(object) || undefined,
+    reference: (!isRoot && hasAssetReference(object)) || undefined,
   };
+}
+
+/** THIS object places another asset: `AssetReference` extras (embedded or not)
+ *  or a placement root's runtime marker (`_layoutId` / `_layoutNestedOf`, the
+ *  same reading as `isPlacementRoot`). Plain field reads, kept local so the row
+ *  adapter does not pull the instancer into core HMI. */
+function hasAssetReference(object: Object3D): boolean {
+  const ud = object.userData as Record<string, unknown> | undefined;
+  if (typeof ud?._layoutId === 'string' || typeof ud?._layoutNestedOf === 'string') return true;
+  const rv = ud?.realvirtual as Record<string, unknown> | undefined;
+  const ref = rv?.[RV_ASSET_REFERENCE_KEY];
+  return typeof ref === 'object' && ref !== null;
 }
 
 /** `LayoutObject.Locked` on THIS object — the same field the planner's
@@ -588,7 +602,7 @@ export interface FilterValidationOptions {
   getFilter(): HierarchyFilterId;
   /** Called when the persisted filter has no hits in the freshly loaded model. */
   onInvalid(): void;
-  /** True while an asset document is active OR still opening (draft replay):
+  /** True while a document is open in the editor OR still opening (draft replay):
    *  its ops may add exactly the nodes the filter is waiting for. */
   isAssetBusy(): boolean;
 }
@@ -603,7 +617,7 @@ export interface FilterValidationOptions {
  * animation frame behind). A generation counter drops a validation that a
  * newer load or a clear overtook. On mount it runs once if a model is already
  * loaded; before the first load it does nothing (the empty scene would reset
- * every filter). While an asset document is active or opening it never resets
+ * every filter). While a document is open in the editor or opening it never resets
  * (a draft replay runs after `whenSceneReady`). Any other structural change
  * does NOT validate: an active filter is never pulled away under the user.
  * Returns the unsubscribe.

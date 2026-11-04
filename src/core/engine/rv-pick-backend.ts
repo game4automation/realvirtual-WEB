@@ -29,7 +29,7 @@
  *     WORLD AABB (geometry bounding box × `matrixWorld`) before any ray is
  *     transformed. That is what keeps a ≥ 50-placement planner layout cheap, and
  *     it is recomputed per ray instead of cached, so a moving mover chunk is
- *     always correct (same rule as the editor backend, doc-render-picking §2.4).
+ *     always correct (same rule as the editor backend, doc-bake-picking-internals §2.4).
  *
  *  2. **Narrow phase** — the world ray is transformed into CHUNK space through
  *     the inverse `matrixWorld` (pre-allocated temporaries, no allocation per

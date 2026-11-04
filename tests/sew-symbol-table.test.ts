@@ -14,6 +14,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildJsonTopicsFromRows,
+  buildUdpSignalsFromSewRows,
   detectFormat,
   parseSewSymbolTable,
 } from '../src/core/import/sew-symbol-table';
@@ -148,5 +149,165 @@ describe('detectFormat', () => {
     expect(detectFormat('Name;Type;Address;Dir\nMotor;Bool;%I0.0;PLC_IN')).toBe('s7');
     // No direction column at all → s7.
     expect(detectFormat('Name;Type\nSpeed;INT')).toBe('s7');
+  });
+});
+
+// Mirrored from the CONNECT repo: tests/Connect.Tests/Protocols/Udp/TestData/udp-symbols.csv
+// (plan-2228 Phase 1, including the two appended reserved-name rows).
+const UDP_SYMBOLS = `Name;Type;Direction
+SpeedSetpoint;REAL;PLC_IN
+CurrentSpeed;REAL;PLC_OUT
+StartButton;BOOL;PLC_IN
+RunningStatus;bool;PLC_OUT
+
+ErrorCode;INT;PLC_OUT
+Message;STRING;PLC_OUT
+TargetPosition;INT;plc_in
+Sideways;BOOL;PLC_BOTH
+Short;BOOL
+;INT;PLC_IN
+SpeedSetpoint;BOOL;PLC_OUT
+`;
+
+describe('buildUdpSignalsFromSewRows (plan-2228)', () => {
+  it('(a) matches the C# fixture addresses and reports reserved and unsupported rows', () => {
+    const parsed = parseSewSymbolTable(UDP_SYMBOLS);
+    const before = structuredClone(parsed);
+    const { signals, skipped } = buildUdpSignalsFromSewRows(parsed);
+    expect(signals.map(s => [s.name, s.protocolAddress, s.type])).toEqual([
+      ['SpeedSetpoint', '0:REAL', 'PLCInputFloat'],
+      ['CurrentSpeed', '0:REAL', 'PLCOutputFloat'],
+      ['StartButton', '4:BOOL', 'PLCInputBool'],
+      ['RunningStatus', '4:BOOL', 'PLCOutputBool'],
+      ['ErrorCode', '5:INT', 'PLCOutputInt'],
+      ['TargetPosition', '5:INT', 'PLCInputInt'],
+    ]);
+    expect(signals.every(s => s.record === false)).toBe(true);
+    expect(signals.map(s => s.dataType)).toEqual(['REAL', 'REAL', 'BOOL', 'BOOL', 'INT', 'INT']);
+    expect(skipped).toEqual([
+      { line: 8, name: 'Message', reason: 'no fixed size in a UDP telegram' },
+      { line: 12, name: '', reason: 'missing name — bytes reserved' },
+      { line: 13, name: 'SpeedSetpoint', reason: 'duplicate name — bytes reserved' },
+    ]);
+    expect(parsed.errors.map(e => e.line)).toEqual([10, 11, 12]);
+    expect(parsed).toEqual(before);
+  });
+
+  it('(b) TEXT aliases and invalid rows consume no bytes or names', () => {
+    const { signals, skipped } = buildUdpSignalsFromSewRows(parseSewSymbolTable([
+      'Name;Type;Direction',
+      'A;TEXT;PLC_IN',
+      'B;STRING;PLC_OUT',
+      'C;WSTRING;PLC_IN',
+      'Bad;LREAL;PLC_IN',
+      'WrongDirection;INT;PLC_BOTH',
+      'Short;BOOL',
+      'A;int;plc_in',
+      'B;real;plc_out',
+    ].join('\n')));
+    expect(signals.map(s => [s.name, s.protocolAddress])).toEqual([['A', '0:INT'], ['B', '0:REAL']]);
+    expect(skipped.map(s => s.line)).toEqual([2, 3, 4]);
+    expect(skipped.every(s => s.reason.includes('no fixed size'))).toBe(true);
+  });
+
+  it('(c) reserves empty fixed-size names in file order only with valid directions', () => {
+    const parsed = parseSewSymbolTable([
+      'Name;Type;Direction',
+      ';BOOL;PLC_IN',
+      'Send;REAL;PLC_IN',
+      ';INT;PLC_OUT',
+      ';TEXT;PLC_IN',
+      ';STRING;PLC_IN',
+      ';WSTRING;PLC_OUT',
+      ';UNKNOWN;PLC_IN',
+      ';INT;PLC_BOTH',
+      'Receive;BOOL;PLC_OUT',
+      ';REAL;PLC_IN',
+      'SendNext;INT;PLC_IN',
+    ].join('\n'));
+    expect(parsed.reservedRows).toEqual([
+      { line: 2, name: '', type: 'BOOL', direction: 'PLC_IN' },
+      { line: 4, name: '', type: 'INT', direction: 'PLC_OUT' },
+      { line: 11, name: '', type: 'REAL', direction: 'PLC_IN' },
+    ]);
+    expect(parsed.errors.map(e => e.line)).toEqual([2, 4, 5, 6, 7, 8, 9, 11]);
+    const { signals, skipped } = buildUdpSignalsFromSewRows(parsed);
+    expect(signals.map(s => [s.name, s.protocolAddress])).toEqual([
+      ['Send', '1:REAL'], ['Receive', '4:BOOL'], ['SendNext', '9:INT'],
+    ]);
+    expect(skipped.map(s => s.line)).toEqual([2, 4, 11]);
+  });
+
+  it('(d) reserves duplicates across directions using C# Ordinal case sensitivity', () => {
+    const { signals, skipped } = buildUdpSignalsFromSewRows(parseSewSymbolTable([
+      'Name;Type;Direction',
+      'A;INT;PLC_OUT',
+      'A;REAL;PLC_OUT',
+      'B;BOOL;PLC_OUT',
+      'A;INT;PLC_IN',
+      'a;BOOL;PLC_IN',
+      'C;REAL;PLC_IN',
+    ].join('\n')));
+    expect(signals.map(s => [s.name, s.protocolAddress])).toEqual([
+      ['A', '0:INT'], ['B', '8:BOOL'], ['a', '4:BOOL'], ['C', '5:REAL'],
+    ]);
+    expect(skipped).toEqual([
+      { line: 3, name: 'A', reason: 'duplicate name — bytes reserved' },
+      { line: 5, name: 'A', reason: 'duplicate name — bytes reserved' },
+    ]);
+  });
+
+  it('(e) accepts end 65507, filters larger fields, and still reserves their bytes and names', () => {
+    const parsed = parseSewSymbolTable([
+      'Name;Type;Direction',
+      ...Array.from({ length: 16376 }, (_, i) => `Padding${i};INT;PLC_IN`),
+      'LastThree;BOOL;PLC_IN',
+      'LastTwo;BOOL;PLC_IN',
+      'LastByte;BOOL;PLC_IN',
+      'Overflow;INT;PLC_IN',
+      'AfterOverflow;BOOL;PLC_IN',
+      'Overflow;INT;PLC_OUT',
+      'Receive;REAL;PLC_OUT',
+    ].join('\n'));
+    const { signals, skipped } = buildUdpSignalsFromSewRows(parsed);
+    expect(signals).toHaveLength(16380);
+    expect(signals.slice(-4).map(s => [s.name, s.protocolAddress])).toEqual([
+      ['LastThree', '65504:BOOL'], ['LastTwo', '65505:BOOL'], ['LastByte', '65506:BOOL'],
+      ['Receive', '4:REAL'],
+    ]);
+    expect(skipped).toEqual([
+      { line: 16381, name: 'Overflow', reason: 'beyond the largest UDP datagram (65507 bytes)' },
+      { line: 16382, name: 'AfterOverflow', reason: 'beyond the largest UDP datagram (65507 bytes)' },
+      { line: 16383, name: 'Overflow', reason: 'duplicate name — bytes reserved' },
+    ]);
+  });
+
+  it('(f) keeps MQTT rows and errors unchanged, including missing-name error precedence', () => {
+    const parsed = parseSewSymbolTable([
+      'Name;Type;Direction',
+      'Message;STRING;PLC_IN',
+      ';INT;PLC_IN',
+      ';TEXT;PLC_OUT',
+      ';UNKNOWN;PLC_BOTH',
+      'Bad;LREAL;PLC_IN',
+      'Wrong;INT;SIDEWAYS',
+      'Short;BOOL',
+      'Enable;BOOL;PLC_OUT',
+    ].join('\n'));
+    expect(parsed.rows).toEqual([
+      { line: 2, name: 'Message', type: 'TEXT', direction: 'PLC_IN' },
+      { line: 9, name: 'Enable', type: 'BOOL', direction: 'PLC_OUT' },
+    ]);
+    expect(parsed.errors).toEqual([
+      { line: 3, reason: 'Missing signal name' },
+      { line: 4, reason: 'Missing signal name' },
+      { line: 5, reason: 'Missing signal name' },
+      { line: 6, reason: 'Unknown data type "LREAL"' },
+      { line: 7, reason: 'Unknown direction "SIDEWAYS" (expected PLC_IN or PLC_OUT)' },
+      { line: 8, reason: 'Row has 2 column(s), expected at least 3 (Name;Type;Direction)' },
+    ]);
+    const topics = buildJsonTopicsFromRows(parsed.rows);
+    expect(topics[0].signals[0]).toMatchObject({ name: 'Enable', type: 'PLCOutputBool', protocolAddress: '' });
+    expect(topics[1].signals[0]).toMatchObject({ name: 'Message', type: 'PLCInputText', protocolAddress: '' });
   });
 });

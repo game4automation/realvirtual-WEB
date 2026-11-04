@@ -30,7 +30,7 @@ import { materialise } from '../hmi/scene/rv-scene-edits';
 import { loadMultiuserSettings } from '../hmi/multiuser-settings-store';
 import type { ProjectBackend } from './backends/project-backend';
 import { normaliseDocumentInfo, type DocumentInfo } from './rv-document-info';
-import type { RvDocumentEntry, RvProjectSceneEntry } from './rv-project-types';
+import type { RvDocumentEntry } from './rv-project-types';
 import type { SceneRevision } from './rv-scene-record';
 
 /** A resolver that locates nothing — there are no node edits to place. */
@@ -47,6 +47,12 @@ export interface DocumentInfoWriteResult {
 }
 
 export interface DocumentInfoWriteOptions {
+  /**
+   * Keep a newly imported path-addressed blob in its existing storage. The
+   * browser backend interprets ref.meta as intent to create an id-addressed
+   * scene. The caller remains responsible for recording the manifest row.
+   */
+  addressByPath?: boolean;
   /** Clock for the `updatedAt` stamp — injectable for tests. */
   now?: () => Date;
   /**
@@ -104,11 +110,11 @@ export async function writeDocumentInfo(
     documentInfo: next,
     self: { assetId: doc.id, path: doc.path },
   });
-  const meta: Record<string, unknown> = { ...doc, extrasScan: 2 };
+  const meta: RvDocumentEntry = { ...doc, extrasScan: 2 };
   if (next) meta.documentInfo = next;
   else delete meta.documentInfo;
   const { revision } = await backend.writeDocument(
-    { path: doc.path, id: doc.id, meta: meta as unknown as RvProjectSceneEntry },
+    opts.addressByPath ? doc.path : { path: doc.path, id: doc.id, meta },
     baked.glb,
     // The revision of what was just read: whoever replaced it in the meantime
     // wrote a description of their own, and overwriting it silently is the

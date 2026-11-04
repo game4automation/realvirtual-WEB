@@ -95,16 +95,16 @@ for (const mode of ['webgl', 'webgpu'] as const) {
         return { skipped: 'planner or BatchTable unavailable (static merging off?)', backend };
       }
 
-      const catalog = await (await fetch('/library/catalog.json')).json() as {
-        entries: Array<{ id: string; glbUrl?: string }>;
+      const manifest = await (await fetch('/library/project.json')).json() as {
+        documents: Array<{ id: string; name?: string; path?: string }>;
       };
       // A conveyor: real internals (drive + transport + snaps) and enough
       // meshes to actually produce arenas — the first catalog entry is a
       // two-mesh box that the bucket minimum leaves individual.
-      const entry = catalog.entries.find((e) => e.id.includes('rollconveyor-2m') && e.glbUrl)
-        ?? catalog.entries.find((e) => !!e.glbUrl);
-      if (!entry) return { skipped: 'no usable catalog entry', backend };
-      const withUrl = { ...entry, glbUrl: `/library/${entry.glbUrl}` };
+      const entry = manifest.documents.find((d) => d.id.includes('rollconveyor-2m') && d.path)
+        ?? manifest.documents.find((d) => !!d.path);
+      if (!entry) return { skipped: 'no usable library document', backend };
+      const withUrl = { id: entry.id, name: entry.name, glbUrl: `/library/${entry.path}` };
 
       // Two placements of the SAME asset: the second one JOINS the arena the
       // first one created, which is the code path that has to work on both

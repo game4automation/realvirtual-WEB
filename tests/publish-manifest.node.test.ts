@@ -119,7 +119,7 @@ describe('generateHostedSettings merges settings/project-settings.json (B14 / pl
     const withNone = JSON.parse(generateHostedSettings());
     const withNull = JSON.parse(generateHostedSettings({ projectSettings: null }));
     expect(withNull).toEqual(withNone);
-    expect(Object.keys(withNone)).toEqual(['projectUrl', 'projectAssetsPath', 'analytics', 'generated']);
+    expect(Object.keys(withNone)).toEqual(['projectUrl', 'projectAssetsPath', 'hostedDeploy', 'analytics', 'generated']);
   });
 
   it('survives a malformed project-settings file rather than failing a deploy', () => {

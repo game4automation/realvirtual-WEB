@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readSessionStorage, removeSessionStorage, writeSessionStorage } from '../core/rv-safe-storage';
+
 /**
  * order-manager-plugin.tsx — Order Manager (Warenkorb) for the realvirtual WebViewer.
  *
  * Allows users to add components with AAS data into an order cart,
  * adjust quantities, and export the cart as CSV, email, or online order.
- * The plugin is optional and must be explicitly registered via viewer.use().
+ * Registered as a core plugin in main.ts (plan-682); its UI gates itself on
+ * the cart gate (cart-gate.ts) and on resolvable AAS links in the document.
  *
  * Follows the established annotation-plugin pattern:
  * - Module-level Pub/Sub store with subscribe/getSnapshot
@@ -49,7 +52,14 @@ import type {
 } from '../core/types/plugin-types';
 import { loadAasxById, type AasParsedData } from './aas-link-parser';
 import { getActiveAasSource } from '../core/aas/rv-aas-source';
-import { isAasNodeVisible } from './aas-resolution';
+import { collectAasNodes, getAasResolutionVersion, isAasNodeVisible, subscribeAasResolution } from './aas-resolution';
+import { isCartAvailable, useCartAvailable } from '../core/hmi/cart-gate';
+import type { Object3D } from 'three';
+
+export { isCartAvailable, useCartAvailable } from '../core/hmi/cart-gate';
+
+/** Reused scratch array for the button's AAS count (no garbage per render). */
+const _countScratch: Object3D[] = [];
 import {
   parseTags,
   findValueByLabels,
@@ -100,7 +110,7 @@ export function getOrderSnapshot(): OrderSnapshot {
 
 function _saveToSession(): void {
   try {
-    sessionStorage.setItem(SS_KEY, JSON.stringify(_items));
+    writeSessionStorage(SS_KEY, JSON.stringify(_items));
   } catch {
     // SecurityError in Private Mode — gracefully ignore
   }
@@ -108,7 +118,7 @@ function _saveToSession(): void {
 
 function _loadFromSession(): OrderItem[] {
   try {
-    const raw = sessionStorage.getItem(SS_KEY);
+    const raw = readSessionStorage(SS_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -125,7 +135,7 @@ function _loadFromSession(): OrderItem[] {
 
 function _clearSession(): void {
   try {
-    sessionStorage.removeItem(SS_KEY);
+    removeSessionStorage(SS_KEY);
   } catch {
     // SecurityError — ignore
   }
@@ -316,12 +326,19 @@ function _exportCsv(): string {
 export class OrderManagerPlugin implements RVViewerPlugin, OrderManagerPluginAPI {
   readonly id = 'order-manager';
   readonly order = 60;
+  /**
+   * plan-682: a core plugin (main.ts), so the cart exists in every delivery
+   * with AAS links, the hosted project ones included. Its UI gates itself.
+   */
+  readonly core = true;
 
   readonly slots: UISlotEntry[] = [
     { slot: 'button-group', component: OrderManagerButton, order: 50 },
   ];
 
   private _config: OrderManagerConfig;
+  /** Per-document config (`pluginConfig['order-manager']`), merged over the constructor config. */
+  private _modelConfig: OrderManagerConfig = {};
   private _viewer: RVViewer | null = null;
   private _undoTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -339,8 +356,9 @@ export class OrderManagerPlugin implements RVViewerPlugin, OrderManagerPluginAPI
     nodePath?: string,
   ): void {
     _addItem(aasId, displayName, manufacturer, articleNumber, nodePath);
-    // Auto-open the order panel when an item is added
-    if (this._viewer) {
+    // Auto-open the order panel when an item is added - only where the panel
+    // can render (plan-682 2.7, one gate for every cart entry).
+    if (this._viewer && isCartAvailable()) {
       this._viewer.leftPanelManager.open('order-manager', ORDER_PANEL_WIDTH);
     }
   }
@@ -371,13 +389,16 @@ export class OrderManagerPlugin implements RVViewerPlugin, OrderManagerPluginAPI
   }
 
   get config(): OrderManagerConfig {
-    return this._config;
+    return { ...this._config, ...this._modelConfig };
   }
 
   // ── RVViewerPlugin Lifecycle ────────────────────────────────────────
 
-  onModelLoaded(_result: LoadResult, viewer: RVViewer): void {
+  onModelLoaded(result: LoadResult, viewer: RVViewer): void {
     this._viewer = viewer;
+    // plan-682: the plugin is core now (no constructor config from a model
+    // pack), so a delivery configures its shop per document instead.
+    this._modelConfig = (result.modelConfig?.pluginConfig?.['order-manager'] as OrderManagerConfig | undefined) ?? {};
 
     // Restore from sessionStorage
     const restored = _loadFromSession();
@@ -387,9 +408,10 @@ export class OrderManagerPlugin implements RVViewerPlugin, OrderManagerPluginAPI
     }
 
     // Register context menu
-    const artLabels = this._config.metadataArticleLabels ?? DEFAULT_ARTICLE_LABELS;
-    const descLabels = this._config.metadataDescriptionLabels ?? DEFAULT_DESCRIPTION_LABELS;
-    const mfgLabels = this._config.metadataManufacturerLabels ?? DEFAULT_MANUFACTURER_LABELS;
+    const cfg = this.config;
+    const artLabels = cfg.metadataArticleLabels ?? DEFAULT_ARTICLE_LABELS;
+    const descLabels = cfg.metadataDescriptionLabels ?? DEFAULT_DESCRIPTION_LABELS;
+    const mfgLabels = cfg.metadataManufacturerLabels ?? DEFAULT_MANUFACTURER_LABELS;
 
     viewer.contextMenu.register({
       pluginId: 'order-manager',
@@ -400,6 +422,7 @@ export class OrderManagerPlugin implements RVViewerPlugin, OrderManagerPluginAPI
           order: 55,
           dividerBefore: true,
           condition: (target) => {
+            if (!isCartAvailable()) return false;
             // Show if node has AAS data OR RuntimeMetadata with article number.
             // An AAS the deployment cannot resolve is NOT orderable — offering it
             // here would contradict the tooltip that already hides it, and the
@@ -486,10 +509,18 @@ function OrderManagerButton({ viewer }: UISlotProps) {
   const lpm = viewer.leftPanelManager;
   const panelSnap = useSyncExternalStore(lpm.subscribe, lpm.getSnapshot);
   const isActive = panelSnap.activePanel === 'order-manager';
+  const cartAvailable = useCartAvailable();
+  // Re-render when a resolution pass finishes: the AAS count can change.
+  useSyncExternalStore(subscribeAasResolution, getAasResolutionVersion, getAasResolutionVersion);
 
   const handleClick = useCallback(() => {
     lpm.toggle('order-manager', ORDER_PANEL_WIDTH);
   }, [lpm]);
+
+  // plan-682 F2: same gate as the panel; and only while there is something to
+  // order - a resolvable AAS part in the document or positions in the cart.
+  if (!cartAvailable) return null;
+  if (snap.totalPositions === 0 && collectAasNodes(viewer.scene, _countScratch).length === 0) return null;
 
   return (
     <NavButton
@@ -934,10 +965,12 @@ function OrderDemoDialog({ open, onClose }: { open: boolean; onClose: () => void
             border: '1px solid rgba(255,255,255,0.1)',
           }}
         >
-{`viewer.use(new OrderManagerPlugin({
-  orderUrl: 'https://your-shop/api/order',
-  orderEmail: 'orders@company.com'
-}));`}
+{`"pluginConfig": {
+  "order-manager": {
+    "orderUrl": "https://your-shop/api/order",
+    "orderEmail": "orders@company.com"
+  }
+}`}
         </Box>
       </DialogContent>
       <DialogActions>

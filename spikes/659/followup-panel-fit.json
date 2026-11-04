@@ -1,0 +1,38 @@
+{
+  "width": 290,
+  "height": 288,
+  "gridBottomOverflowPx": -11,
+  "scrollerOverflowPx": [
+    5,
+    5,
+    6,
+    6,
+    18,
+    15,
+    2,
+    6,
+    6,
+    18,
+    15,
+    2
+  ],
+  "lastLegendText": "Get-ups",
+  "lastLegendClippedPx": -11,
+  "markCollisions": [],
+  "selectorLabels": [
+    {
+      "label": "Drive, lamp on",
+      "marks": [
+        "Off",
+        "Run"
+      ]
+    },
+    {
+      "label": "Camera follow",
+      "marks": [
+        "Off",
+        "On"
+      ]
+    }
+  ]
+}

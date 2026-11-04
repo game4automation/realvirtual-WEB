@@ -4,7 +4,7 @@
 /**
  * RobotContactForceAlarm — The FANUC CRX SYST-320 alarm tile.
  *
- * A red (error) TileCard with a prominent "Ask AI" button and a History icon
+ * A red (error) TileCard with an "Ask AI" button and a History icon
  * button (badge = note count). "Ask AI" opens the simulated assistant; the
  * history icon opens the operator-note dialog. Clicking the card body pulses the
  * robot red in 3D and frames it. The "see manual" sub-link opens the bundled PDF
@@ -13,7 +13,7 @@
 
 import { useEffect, useState, useCallback } from 'react';
 import { Button, IconButton, Badge } from '@mui/material';
-import { AutoAwesome, History } from '@mui/icons-material';
+import { ChatBubbleOutline, History } from '@mui/icons-material';
 import { TileCard } from '../../../core/hmi/TileCard';
 import { pulseSeverityOutline } from '../../../core/hmi/severity-pulse';
 import { openPdfViewer } from '../../../core/hmi/pdf-viewer-store';
@@ -91,9 +91,9 @@ export function RobotContactForceAlarm({ viewer }: UISlotProps) {
         actions={
           <>
             <Button
-              variant="contained"
+              variant="outlined"
               size="small"
-              startIcon={<AutoAwesome sx={{ fontSize: 16 }} />}
+              startIcon={<ChatBubbleOutline sx={{ fontSize: 16 }} />}
               disabled={askOpen}
               onClick={(e) => { e.stopPropagation(); setAskOpen(true); }}
             >

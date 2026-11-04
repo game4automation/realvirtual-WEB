@@ -191,3 +191,37 @@ function hitKey(interfaceId: string, workerGeneration: number): string {
 
 /** The one watch the no-data notice reads. */
 export const connectNoDataWatch = new ConnectNoDataWatch();
+
+/**
+ * Turns `viewer.simTime` into "seconds the simulation was running" at 1× pace.
+ *
+ * The simulation speed (rv-speed-override.ts) makes `simTime` advance by
+ * `factor × dt`; the PLC answers in wall time, so at 10× a 10 s sim-time window
+ * would be 1 s of real traffic and accuse a healthy interface during its first
+ * reads. Dividing each simTime step by the current factor keeps the window at
+ * 10 s of running time while it still stands still on pause. A simTime that
+ * jumps back (reset) resets the running clock, so the watch still sees the reset.
+ *
+ * The step since the last fold is divided by the factor that was in force
+ * DURING it; call {@link advance} on every factor change as well (the notice
+ * subscribes to the speed store), so a step never mixes two factors.
+ */
+export class SimRunningClock {
+  private lastSim = 0;
+  private running = 0;
+  private factor = 1;
+
+  /** Fold the current simTime in (at the factor in force since the last fold),
+   *  adopt `speedFactor` for the next step and return the running seconds. */
+  advance(simTime: number, speedFactor: number): number {
+    const d = simTime - this.lastSim;
+    this.lastSim = simTime;
+    if (d < 0) {
+      this.running = 0;
+    } else if (d > 0 && this.factor > 0) {
+      this.running += d / this.factor;
+    }
+    this.factor = speedFactor;
+    return this.running;
+  }
+}

@@ -86,16 +86,18 @@ describe('build-local-library-catalog', () => {
     expect(belt).toMatchObject({ id: 'pallethandling-belt-1m', name: 'Belt 1m', category: 'Pallet Handling' });
   });
 
-  it('the checked-in public/library/catalog.json is stamped for every entry and matches the files', () => {
+  // plan-778 Phase 4: the bundled catalog.json is gone; the checked-in artefact that
+  // carries the hashes is the library PROJECT manifest. Same assertion, every row.
+  it('the checked-in public/library/project.json is stamped for every row and matches the files', () => {
     const root = join(__dirname, '..', 'public', 'library');
-    const catalog = JSON.parse(readFileSync(join(root, 'catalog.json'), 'utf8')) as {
-      entries: Array<{ glbUrl: string; sha256?: string; sizeBytes?: number }>;
+    const project = JSON.parse(readFileSync(join(root, 'project.json'), 'utf8')) as {
+      documents: Array<{ path: string; sha256?: string; sizeBytes?: number }>;
     };
-    expect(catalog.entries.length).toBeGreaterThan(0);
-    for (const e of catalog.entries) {
-      const bytes = readFileSync(join(root, ...e.glbUrl.split('/')));
-      expect(e.sizeBytes, e.glbUrl).toBe(bytes.byteLength);
-      expect(e.sha256, e.glbUrl).toBe(createHash('sha256').update(bytes).digest('hex'));
+    expect(project.documents.length).toBeGreaterThan(0);
+    for (const d of project.documents) {
+      const bytes = readFileSync(join(root, ...d.path.split('/')));
+      expect(d.sizeBytes, d.path).toBe(bytes.byteLength);
+      expect(d.sha256, d.path).toBe(createHash('sha256').update(bytes).digest('hex'));
     }
   }, 120_000); // hashes the whole bundled library (tens of MB)
 });

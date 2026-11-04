@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../../core/rv-safe-storage';
+
 /**
  * UnifiedImportDialog.tsx — the one Import dialog for all providers
  * (plan-238 §3.1). Tabs are rendered DYNAMICALLY from the provider registry;
@@ -117,7 +119,7 @@ function useProviders(open: boolean): CadImportProvider[] {
 const LAST_PROVIDER_KEY = 'rv.import.lastProvider';
 
 function loadLastProviderId(): string | null {
-  try { return localStorage.getItem(LAST_PROVIDER_KEY); } catch { return null; }
+  try { return readLocalStorage(LAST_PROVIDER_KEY); } catch { return null; }
 }
 
 export function UnifiedImportDialog({ viewer, open, onClose }: UnifiedImportDialogProps) {
@@ -165,7 +167,7 @@ export function UnifiedImportDialog({ viewer, open, onClose }: UnifiedImportDial
 
   const selectTab = useCallback((id: string) => {
     setActiveId(id);
-    try { localStorage.setItem(LAST_PROVIDER_KEY, id); } catch { /* private mode */ }
+    try { writeLocalStorage(LAST_PROVIDER_KEY, id); } catch { /* private mode */ }
     dismissImportOutcome();
     setHasInput((inputsRef.current.get(id) ?? null) !== null);
   }, []);
@@ -175,9 +177,19 @@ export function UnifiedImportDialog({ viewer, open, onClose }: UnifiedImportDial
     const input = inputsRef.current.get(active.id);
     if (!input) return;
     dismissImportOutcome();
+    // A tab may ask for its result to be LOCKED once placed — the DXF tab does,
+    // because a hall floor plan is a reference to build on, not something to
+    // nudge (plan-741 §2.7). The intent travels in the tab's own input rather
+    // than through the provider, which knows nothing about sinks. Editor mode
+    // has no layout objects, so the flag is planner-only.
+    const lockedReference = input.kind === 'custom'
+      ? Boolean((input.data as { options?: { lockedReference?: boolean } } | undefined)?.options?.lockedReference)
+      : false;
     // The dialog stays open and blocks the workspace while the job runs —
     // progress renders below, Cancel aborts.
-    startImportJob(viewer, active, input, { isEditor, alignToFloor });
+    startImportJob(viewer, active, input, {
+      isEditor, alignToFloor, locked: !isEditor && lockedReference,
+    });
   }, [active, isEditor, alignToFloor, viewer]);
 
   // Cancel a running import (keeps the dialog open WITH the selection and

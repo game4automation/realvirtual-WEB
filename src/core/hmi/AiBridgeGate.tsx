@@ -15,7 +15,7 @@
  *   `AiBridgeDownloadInfo`  the "no CONNECT answered" state: realvirtual CONNECT
  *                           is the MCP server, so without it there is nothing to
  *                           configure — this states that and offers the download,
- *                           reusing `ConnectDownloadLinks` from ConnectPanel.
+ *                           reusing `ConnectDownloadLinks` from connect-panel-shared.
  *
  * Design: MUI `Dialog` (a Modal — the overlay stacking contract, never a
  * z-index bump), elevation 0 glass, 13px body, one Instrument Blue primary.
@@ -27,7 +27,7 @@ import {
 } from '@mui/material';
 import { AI_BRIDGE_CONSENT_VERSION, grantAiBridgeConsent, useAiBridgeConsent } from './ai-consent-store';
 import { requestSettingsTab } from './settings-tab-store';
-import { ConnectDownloadLinks } from './ConnectPanel';
+import { ConnectDownloadLinks } from './connect-panel-shared';
 
 /** AI tab id in SettingsPanel — the one place `Configure…` can land. */
 const SETTINGS_TAB_AI = 5;

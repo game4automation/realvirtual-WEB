@@ -141,6 +141,7 @@ describe('connect-store.importTagTable', () => {
     expect(body.topics!.some(t => t.topic === 'rv/other')).toBe(true);
 
     // No POST was issued.
-    expect(calls.some(c => c.method === 'POST')).toBe(false);
+    // plan-2025 F10: the /config/ops probe of this (older, non-ops) stub is a POST too; no INTERFACE was posted.
+    expect(calls.some(c => c.method === 'POST' && c.url.endsWith('/config/interfaces'))).toBe(false);
   });
 });

@@ -90,6 +90,34 @@ describe('rendering precedence invariant (plan-325 S3/S4)', () => {
     expect(onFieldReset).not.toHaveBeenCalled();
   });
 
+  it('renders every stored slot-value form read-only without crashing; only wiring forms show linked', () => {
+    const cases: Array<[unknown, string]> = [
+      ['Axis/Signals/Fwd', 'Axis/Signals/Fwd'],
+      [{ type: 'ComponentReference', path: 'Axis/Signals/Fwd', componentType: 'PLCOutputBool' }, 'Fwd'],
+      [{ type: 'ComponentReference', address: '#n1', componentType: 'PLCOutputBool' }, 'not linked'],
+      [{ type: 'ComponentReference', unresolvedPath: 'Gone/Fwd', reason: 'missing', componentType: 'PLCOutputBool' }, 'not linked'],
+      [{ path: 'Axis/Signals/Fwd' }, 'not linked'],
+      [7, 'not linked'],
+    ];
+    for (const [value, expected] of cases) {
+      render(<ComponentSection
+        nodePath="Axis"
+        componentType="Drive_Simple"
+        data={{ Forward: value, ScaleSpeed: 1 }}
+        overriddenFields={new Set<string>()}
+        consumedOnly
+        onFieldEdit={vi.fn()}
+        onFieldReset={vi.fn()}
+        onResetComponent={vi.fn()}
+        viewer={null}
+        signalStore={null}
+      />);
+      const row = screen.getByTestId('slot-row-.-mapped-signal-Forward');
+      expect(row.textContent).toContain(expected);
+      cleanup();
+    }
+  });
+
   it('keeps ordinary fields on the FieldRow pipeline', () => {
     render(<ComponentSection
       nodePath="Axis"

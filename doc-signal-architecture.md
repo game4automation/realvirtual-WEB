@@ -51,9 +51,44 @@ writer.
 Slot resolution is per slot, so one authored reference does not hide empty
 slots on the same component. An empty PLC output slot becomes
 `direct-property` when its component implements matching command and neutralize
-methods. An empty PLC input slot becomes `direct-feedback` when its component
-implements the feedback-source contract. A declared slot without its required
-runtime contract remains visible as `unavailable` with a diagnostic reason.
+methods; an empty PLC input slot becomes `direct-feedback` when its component
+implements the feedback-source contract. Components whose command logic IS that
+contract (`Drive_Simple`, `Drive_Cylinder`, `Drive_DestinationMotor`,
+`Drive_FollowPosition`) keep it.
+
+Every other component uses SlotIO (`rv-slot-io.ts`): it declares its slots at
+init with `slotDeclare(instance, field, 'setter' | 'poll' | 'feedback')`, and the
+resolver offers a declared field as `direct-property` / `direct-feedback`. SlotIO
+keeps, per component instance, the directly commanded values and the last
+feedback values outside the `SignalStore` — binding never creates a store signal
+and never writes an address into the field. Components read a command slot with
+`slotRead` / `slotReadBool` / `slotTryRead` (the wired signal when the field holds
+an address, else the direct value, else the unbound default) and publish feedback
+with `slotWrite` (into the wired signal, and into the cache whose listeners fire
+on every value change, standing or moving). The wiring helpers
+`wireBoolSignal` / `wireValueSignal` / `wireNumberSignal` declare a `setter` slot
+when called with an empty address and a slot reference. Neutralize removes the
+direct value, so the slot returns to its unbound default: a polled slot reads its
+fallback (e.g. Profidrive override 100 %), a bool setter applies `false`, a
+numeric setter keeps the authored value. A setter slot declared with a re-apply
+registry replays its last direct value after a reset. A declared slot with
+neither an own contract nor a SlotIO declaration remains visible as
+`unavailable` with a diagnostic reason.
+
+The SlotIO key is the component that owns the schema field, even when another
+object does the reading or writing: a 3D button wrapper (`PushButton3D`,
+`EmergencyButton3D`, `HandleSwitch3D`) owns `stateSignal` and its
+`SceneButtonBase` publishes each click flank to it; a `MachiningVolume` declares
+its slots and the `MachiningManager` polls and writes them. Flags that used to
+follow address presence follow `slotBound()` (wired OR directly bound) and are
+re-evaluated when a direct binding commands or releases the slot: Source
+`unityControls` / `AutomaticGeneration`, the PushButton3D light (`autoLight`),
+the Zone signal activation. A slot the component ignores in its configuration is
+refused with `slotRefuse(instance, field, reason)` and stays `unavailable` with
+that reason (Zone `ActivationSignal` unless `Activation = Signal`).
+`LogicStep_MaintenanceProcedure` is the one schema type without a runtime
+instance — its outputs are written by the maintenance plugin — so its slots are
+not bindable directly.
 
 Only the first authored `Drive_*` behavior on a drive is active. Additional
 drive behaviors are reported and skipped. Attaching the same behavior again is
@@ -425,8 +460,9 @@ and they receive the same simulation-time hold when the source vanishes
 connect store and "Model signals" from the SignalStore (provider-less
 entries), excluding the slot's own target signal.
 
-The persisted Slot → Signal record is identified by `componentPath`, `kind`,
-and `slot`; its `signal` field names the assigned source and `sourceKind`
+The persisted Slot → Signal record is identified by its component — in memory
+`componentPath`, persisted as `componentAddress` since plan-769 (doc-persistence §1.5) —
+`kind`, and `slot`; its `signal` field names the assigned source and `sourceKind`
 defines how that name is resolved. For a `mapped-signal` row, `targetName`
 continues to identify the authored model-side destination. Assigning another
 internal signal therefore adds a runtime relay instead of replacing the
@@ -645,6 +681,25 @@ share the raw name, so the second registration meets a name that already has a m
 reported — one `signal-name-collision` warning per name in the Problems panel, with the paths in its
 detail — instead of being silently renamed.
 
+**Embedded copies: the `InstanceScope` marker (plan-559 Phase 2a).** Copies of an asset that are
+part of the document itself — not placements — have no placement root, so their generated signals
+are not scoped and every copy registers the same name (eight embedded AGVs, one `Agv.Run`). An
+`InstanceScope` component on the root of each copy opens the same kind of scope a placement root
+does: `instanceScope()` (`rv-instance-scope.ts`) adds the NAME of the marker's `PrefixNode` — the
+marker node itself when the field is empty — as one more link of the scope chain, so generated names
+become `<prefix>.<name>`. `PrefixNode` is resolved without a registry (signals are named during the
+load traversal): as written or root-inclusive, relative to the marker node and then each ancestor,
+innermost hit first, `_N`-deduplicated names accepted; unresolved falls back to the node's own name
+with a console warning. Authored names stay raw here too, and without a marker nothing changes. Two
+report-only warnings come with it (they never rename or refuse anything): **`instance-signal-collision`**
+— one Problems entry per name that several nodes OUTSIDE any placement register, with every node
+path (raised in `registerSignal` and in `registerBehaviorSignals`, at load / bind time only, behind
+the same allocation-free `ownerPathCount < 2` early-out); and **`path-id-collision`** — two path
+nodes registering the same path id (raised in `RVPathComponent.init` / `reapplyConfig` right before
+`register()`; ids stay global, the last registration keeps winning). Both entries are dropped when
+another document starts loading; a path's entry also when the path leaves the scene. Inside a
+placement the existing `signal-name-collision` rule is unchanged.
+
 > **The name is not a plain field.** `editor.signalSetField` still refuses `Name`: the store
 > registration, every by-name reference and every CONNECT entry couple by it. A rename is a
 > refactoring with preview, journal and undo — `editor.signalRename` (§2.6, plan-590).
@@ -795,7 +850,7 @@ nothing by itself — taking a rename back is always the reverse phase.
 
 **3 — Undo / redo.** The coordinator is the **history interceptor** of every document it writes to
 (`RvDocument.setHistoryInterceptor`). `installSignalRenameWiring(viewer)` (called once in
-`main.ts`) also attaches it to the scene document and to every asset document the editor OPENS, so
+`main.ts`) also attaches it to the planner's document and to every document the editor OPENS, so
 a tagged entry from a reloaded session — whose journal is gone — is **refused** instead of being
 undone model-only. Undoing a tagged entry from any of its documents runs the reverse phase as a
 whole (CONNECT, all documents, placements, historian) after checking that every involved document
@@ -1369,8 +1424,129 @@ Repairs are explicit commands, each with its MCP tool:
 | `editor.signalSetField` | `web_editor_signal_set_field` | `Comment`, `OriginDataType`, type — never `Name` |
 | `editor.signalSetBinding` | `web_editor_signal_set_binding` | set, change or remove the address/dataType of one slot, written into that slot's own container |
 | `editor.signalsCreateFromInterface` | `web_editor_signals_create_from_interface` | creates model signals for `plc-only` rows, taking the CONNECT name **verbatim** as an authored signal, so the result is exactly `mapped`. A CONNECT Text/String place the model cannot register is marked `unsupported type` and not created |
-| — | `web_signal_reconcile` | read-only: the report itself, per interface or for all of them |
-| "Adopt legacy addresses" (`applyAutoMap`) | `web_signal_automap` (`mode: apply`) | the legacy behaviour as an explicit, merge-only action: addresses proposed from a `Comment` prefix (`"<address> · <text>"`) or the Unity `Metadata`, never overwriting an existing CONNECT entry, offered only on the interface types where it applies |
+| — | `web_query("signal.reconcile", {})` | read-only: the report itself, per interface or for all of them |
+| "Adopt legacy addresses" (`applyAutoMap`) | `web_execute("signal.automapApply", {interfaceId})` (`mode: apply`) | the legacy behaviour as an explicit, merge-only action: addresses proposed from a `Comment` prefix (`"<address> · <text>"`) or the Unity `Metadata`, never overwriting an existing CONNECT entry, offered only on the interface types where it applies (`legacyAdoptProtocolOf`: S7, PLCSIM). Since plan-2025 ONE batch of `signal.upsert{fillEmpty}` (plus the PLCSIM data block filter as `interface.patch`) |
+| "Fill addresses from controller" (plan-2025 F11) | — (CONNECT MCP: `interface_signals_apply`) | browses the controller and couples each model signal whose runtime name is **exactly** a discovered `symbolKey`; writes the discovery's `protocolAddress` with `fillEmpty`. Quoting / case variants are only suggested (`name-variant`), a different configured address is `kept`. Offered by capability (`supportsDiscovery`), not by protocol. Pure part: `src/core/import/rv-fill-addresses.ts` |
+| "Import address table" (plan-2025 F12) | — (CONNECT MCP: `interface_signals_apply`) | CSV / TSV `name;address[;dataType[;topic]]` for every interface; container per row (topic column) or one for the whole import; unknown, missing or ambiguous containers, address-rule violations, protocol-invalid addresses (`/signals/validate`, ProcessImage locally), disallowed data types and unknown directions are rejected per row in the preview; accepted rows go as ONE batch. Pure part: `src/core/import/rv-address-table-import.ts` |
+
+### K1, K2 and K3: three separate couplings
+
+| Coupling | Identity and persistence | Configuration path |
+|---|---|---|
+| K1: model signal ↔ interface signal | Exact model runtime name = CONNECT signal `name`; the controller address lives only in CONNECT `protocolAddress` | Browser signal edits, fill and import → `/config/ops`; automation uses CONNECT `interface_signal_list` / `interface_signals_apply` |
+| K2: interface ↔ interface | Mirror rule `id`, or mapping `(sourceSignal, destSignal)` pair; stored in CONNECT | Browser bridge editor → `/config/ops`; automation uses CONNECT `bridge_list` / `bridges_apply` |
+| K3: component slot ↔ signal | `targetId`, `componentPath`, `slot`; persisted through the viewer binding path | Viewer binding UI or `web_execute` with `signal.bind`; unchanged by the CONNECT write core |
+| K3, model connector: model signal → model signal (plan-2227) | A `SignalConnector` (or the older `ConnectSignal`) is a component with two slots: one source (`SourceBool`/`SourceInt`/`SourceFloat`, a PLC output) and one target (`TargetBool`/`TargetInt`/`TargetFloat`, a PLC input), stored as `ComponentReference` addresses in `rv_extras`; writer `component:SignalConnector:<occurrence>#<NodeId>`, a word built from bits by `component:SignalConnector.word:<target address>` | Inspector / `editor.addComponent` + `editor.setField` / `signal.bind` on the slots. Runs in the model (Unity, WEB standalone, WEB with CONNECT), not in the gateway. Which controller is behind each signal stays K1 |
+
+K1 configures where a named signal gets its values; K3 assigns that signal to a component slot.
+A model connector is K3, not K2: it couples two **model** signals inside the model and works
+without CONNECT; K2 couples two interfaces inside the gateway and works without a model.
+Conversion semantics (signed 32-bit INT storage, float32 REAL targets, rounding, the bit
+aggregator) and the problem codes live in `src/core/engine/rv-signal-conversion.ts` and
+`src/core/engine/rv-signal-connector.ts`; the shared vectors are
+`tests/fixtures/signal-conversion-vectors.json`. Since plan-2227 the WEB `ConnectSignal`
+follows the Unity rule (INT → BOOL is `> 0`, BOOL → INT is 1/0, everything else raw).
+Neither K1 nor K2 stores controller addresses in the model or in comments. Discovery uses
+`symbolKey` for exact matching, `displayName` for presentation and `protocolAddress` for the
+address. A name variant is only a suggestion. Fill never replaces a non-empty address; table
+import can overwrite it when explicitly selected. The dialogs require the ops endpoint; their
+actions are not exposed as `signal.fillAddresses` or `signal.importAddressTable` commands.
+
+### 6.w Browser writes through the CONNECT write core (plan-2025 F10)
+
+Signal and bridge edits covered here go through `POST /config/ops` (CONNECT's atomic write
+core) instead of replacing whole interfaces: the inspector binding (`applySignalBinding`), the signal
+dialog, the record switch, bulk delete, tag-table imports (`container.replace`), the interface form and
+the Enabled switch (`interface.patch` with only the fields that differ from the shown snapshot —
+`interfacePatchOf`), auto-map / legacy adopt, and the mirror / mapping editor (`mirror.*` by rule id,
+`mapping.*` by `(source, dest)` pair, diffed against the shown list by `mirrorOpsFor` /
+`mappingOpsFor`).
+
+- **Revision.** Every `GET /config*` answer carries `X-Config-Revision` / `X-Config-Instance`; the store
+  keeps the revision of the interface list and of the bridges it SHOWS (also while an open edit holds a
+  push) and sends it as `expectedRevision` / `expectedInstance`. `409 revision-conflict` reloads
+  interfaces and bridges and throws `ConnectConfigConflictError` with an operator sentence; nothing was
+  written. `400 ops-rejected` throws `ConnectConfigOpsRejectedError` with the gateway's per-op errors.
+- **Feature detection.** The first write to a gateway probes `/config/ops`. Only a gateway whose write
+  core was never seen is taken for an older CONNECT (`getConnectOpsSupport() === false`, until the
+  target changes): a 404 / 405, or a 200 that is unmistakably something else (an HTML page, JSON
+  without `outcome`, and no `X-Config-Revision` header). Each write then takes its pre-ops route (PUT
+  of the merged interface, PUT of the whole bridge list). Once one valid ops answer was seen, no answer
+  takes that back. An answer that breaks off after the status line (or a 5xx / unreadable answer of a
+  known write core) is an UNKNOWN outcome: the store reloads and throws
+  `ConnectConfigOutcomeUnknownError` ("Result unknown — check") and never retries or falls back to the
+  PUT. Fill and table import need the write core and say so. This fallback applies to the
+  configuration edits listed here; profile activation, the dedicated write-gate endpoint and
+  the rename protocol retain their own contracts.
+- **Size limits** (`connect-ops-limits.ts`): CONNECT's `MaxOps` (10000), `MaxSignalsPerOp` (20000) and
+  `MaxBodyBytes` (4 MiB UTF-8) are checked before a batch is sent (`ConnectConfigLimitError`, nothing
+  sent, never split) on the batch actually built. The table import only has an input guard on raw rows
+  (`CONNECT_IMPORT_MAX_RAW_ROWS`, 200000) before the per-row check, and checks only rows that would write.
+  Discovery (`startDiscovery`, fill from controller) is bound to the gateway + epoch it started on; a late answer
+  of another gateway is dropped (`ConnectConfigPlanStaleError` for plans).
+- **Plans** (fill / table import) carry `base` = interface-list revision + instance + gateway
+  (`getConnectConfigPlanBase`). Apply sends exactly that revision; a plan whose base is no longer the
+  shown one (`isConnectConfigPlanCurrent`) is refused with `ConnectConfigPlanStaleError` before
+  sending, and the dialogs require a new preview after a 409, a reload or a gateway change. The table
+  dialog also keys its preview to the input version (text, separator, columns, container, mode,
+  direction): Apply stays locked until the matching check is done.
+- **Multi-Tab import** (`importMultiTabTagTable`) is one batch on the held revision
+  (`multiTabImportOps`: `interface.add` or `interface.patch` + one `container.replace` per topic, same
+  replacing topic semantics as the old PUT); the PUT is only the fallback for an older CONNECT.
+- **Signal dialog rename** is a resumable two-step (`saveSignalFromDialog`): `/config/signals/rename`
+  (preview + operation id), then `signal.upsert` under the new name on the rename's `storeRevision`.
+  A failing second step answers "Renamed to X — other changes not saved", keeps the draft and turns
+  Save into Retry, which repeats only the upsert (idempotent). A lost rename answer is recovered by
+  operation id: `GET /config/signals/rename/{operationId}` for the status, then the SAME apply again
+  (same id and `renameRevision`), which CONNECT answers with the remembered outcome including the
+  commit's `storeRevision` — step 2 is based on that, never on the current revision of a GET. When
+  CONNECT no longer has the result, step 2 is not run (`rename-unverified`: reloaded, the user checks).
+- **OPC UA acquisition fields** (`subscribeValue`, `pollValue`, `pollCycleMs`) are part of
+  `ConnectInterfaceSignal` and travel unchanged through every edit.
+- **Discovery** reads `symbolKey` / `protocolAddress` (`mapDiscoveredSignal`); `name` / `browsePath` are
+  only the fallback for an older CONNECT (`contract: 'legacy'`).
+
+### 6.x Configuration live (plan-2024)
+
+CONNECT pushes `{type:'config', instance, revision}` over the `/webviewer` channel after every
+configuration change (REST, tray, profile switch, rename; see `doc-connect.md`, *Live configuration
+push*). `McpBridgePlugin` hands the frame to `handleConnectConfigPush()` in `connect-store.ts`. The
+push is only an invalidation: the tab re-reads interfaces, mirrors and mappings through the normal
+REST endpoints.
+
+**`refreshConfig` protocol** (`_runConfigRefresh`):
+
+- A push for an already applied revision of the known instance, a malformed frame, or a push while the
+  store is not `connected`, is ignored.
+- One refresh runs at a time. Pushes that arrive meanwhile are merged into exactly one follow-up round
+  (the newest demand wins; a different `instance` replaces the older demand).
+- A round loads interfaces and bridges together and is all-or-nothing. The applied revision
+  (`getConnectConfigAppliedRevision()`) moves only after a successful load.
+- A transient failure keeps the last valid cache and retries after 1 s, 2 s, then 5 s. After that the
+  tab logs a warning and waits for the next push.
+- A new `instance` (gateway restart) means a push demand like any other, so the tab reloads.
+- A bridge-channel reconnect calls `requestConnectConfigRefresh()` once (not on the first connect):
+  pushes sent while the channel was down are lost, so the tab reloads without waiting for a push.
+- `_configEpoch` is bumped by reset, disconnect and every gateway URL change. The running round is
+  aborted through its `AbortController`, the retry timer is cleared, and anything still in flight for
+  the old target writes nothing.
+
+**Result loaders.** `fetchInterfacesResult()` and `fetchBridgesResult()` return a
+`ConfigLoadResult`: `ok`, `transient-error` or `unsupported` (only a 404 of the endpoint). They write
+nothing to the store.
+
+**One write counter.** The push refresh, the explicit loaders (`fetchInterfaces()`,
+`reloadConnectBridges()`) and local mutations (POST / PUT) draw a sequence number from one counter when
+they start. A part is written only when its number is newer than the last one written for that
+part, so an older answer never overwrites a newer one. If a refresh answer turns out to be older than
+the cache, the round runs once more.
+
+**Holds.** While an edit surface is open (`holdConnectConfigEditing()`, used by the `ConnectPanel`
+dialogs through `useConfigEditHold` and by `SignalEditDialog`), a loaded snapshot is held instead of
+written. Only the newest snapshot is kept, and it is dropped when it equals the cache. The panel shows
+"Configuration changed outside" with a **Reload** button (`applyHeldConnectConfig()`); the
+`SignalEditDialog` shows "Configuration changed outside. Your input is kept; the change loads when this
+dialog closes." Releasing the last hold applies the held snapshot. Explicit loads are not held.
 
 ---
 

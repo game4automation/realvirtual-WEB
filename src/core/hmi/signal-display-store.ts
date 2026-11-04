@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * signal-display-store.ts — user preferences for how signal chips + tooltips render.
  *
@@ -67,7 +69,7 @@ const listeners = new Set<() => void>();
 
 function loadInitial(): SignalDisplaySettings {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = readLocalStorage(STORAGE_KEY);
     if (!raw) return DEFAULTS;
     const parsed = JSON.parse(raw) as Partial<SignalDisplaySettings> & { chipTypeLabel?: unknown };
     return {
@@ -80,7 +82,7 @@ function loadInitial(): SignalDisplaySettings {
 }
 
 function persist() {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch { /* ignore */ }
+  try { writeLocalStorage(STORAGE_KEY, JSON.stringify(state)); } catch { /* ignore */ }
 }
 
 function notify() {

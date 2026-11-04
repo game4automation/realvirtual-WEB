@@ -101,10 +101,12 @@ Rules:
 - **Container:** glTF 2.0, typically binary (`.glb`). JSON `.gltf` is equally valid.
 - **Attachment point:** `node.extras.realvirtual` (object). rv-ODT v1 does not define
   a glTF extension (`extensionsUsed`); it uses only the `extras` mechanism.
-- **Node identity:** components reference other nodes by **scene path** — the
-  slash-joined chain of node names from the scene root to the node
-  (e.g. `"Cell/Conveyor1/Drive"`). Writers MUST produce unique node names within a
-  parent so paths are unambiguous.
+- **Node identity:** a node is identified by its `NodeId` (Section 5a). A
+  **scene path** — the slash-joined chain of node names from the scene root to the
+  node (e.g. `"Cell/Conveyor1/Drive"`) — is the input form and the stored form of
+  files without `idVersion`; a file with `idVersion` 1 stores ADDRESSES
+  (`#<NodeId>`, Section 5a). Writers MUST produce unique node names within a parent
+  so paths are unambiguous.
 - **Coordinate systems:** glTF is right-handed (+Y up, +Z forward); Unity is
   left-handed. Scalar positions/speeds are in Unity component conventions
   (millimeters, mm/s) regardless of the glTF unit (meters). Vector-valued fields
@@ -117,48 +119,96 @@ Rules:
   `extras.realvirtual`, carrying a stable identity for the node it sits on. See
   Section 5a.
 
-### 5a. Stable node identity (`NodeId`)
+### 5a. Stable node identity (`NodeId`) and addresses
 
 Scene paths (above) identify a node by the chain of names leading to it. That is
-enough inside one file, and not enough across files: renaming a node in a
-referenced asset silently invalidates every reference written by whoever
-references it. `NodeId` is the second addressing axis and exists for exactly that
-case. Both remain valid; a consumer that finds both prefers `NodeId`.
+enough inside one file, and not enough over time: renaming or moving a node
+silently invalidates every reference written against its path. `NodeId` is the
+stable identity, and since **`idVersion` 1** a writer stores references as
+ADDRESSES built from it; paths remain the input form and the form every producer
+without ids (Unity) writes.
 
 ```json
-{ "extras": { "realvirtual": { "NodeId": "3f9a1c02b7d4e5f6", "Drive": { "TargetSpeed": 100 } } } }
+{ "extras": { "realvirtual": { "NodeId": "9b2f6c1e-3a4d-5e6f-8a7b-0c1d2e3f4a5b", "Drive": { "TargetSpeed": 100 } } } }
 ```
 
-Rules:
+**Identity rules.**
 
 - `NodeId` is a **string**, unique **within its own file**. It is deliberately NOT
   globally unique: a file that is referenced ten times contributes ten nodes
   carrying the same `NodeId`, and telling those ten apart is the job of the
   *occurrence address* (Section 5b), not of the id.
-- A writer that owns a file (its own scenes and assets) SHOULD stamp a random
-  `NodeId` (UUID v4 or equivalent) on every node it writes and MUST carry an
-  existing `NodeId` through unchanged on re-save. Regenerating ids on save
-  orphans every override anyone wrote against that file.
-- A consumer reading a file that carries **no** `NodeId` — every glTF written
-  before this section existed — MUST NOT invent a random one. Such a file may be
-  read-only (a library asset that must stay untouched), so a generated id could
-  never be written back and would differ on the next load. It MUST instead
-  **derive** the id deterministically from data that does not change while the
-  file does not change: the hex SHA-256 of the file's bytes and the node's index
-  in the glTF `nodes[]` array. The derivation is normative so two independent
-  consumers agree:
+- A writer that owns a file SHOULD stamp a `NodeId` on every node it writes and
+  MUST carry an existing `NodeId` through unchanged on re-save. Regenerating ids on
+  save orphans every reference and override written against that file. A
+  duplicated id in the input MUST be re-minted on every node but the first, and
+  the re-mint MUST be deterministic (the same input yields the same ids).
+- A consumer reading a file that carries **no** `NodeId` (every glTF written by a
+  producer without ids) MUST NOT invent a random one: such a file may be read-only,
+  so a generated id could never be written back and would differ on the next load.
+  It MUST instead **seed** the id deterministically from the node's canonical
+  AUTHORED path in that file (the names as written, Section 5 rules), so the same
+  file yields the same ids independent of node order:
 
   ```
-  NodeId = first 16 hex chars of SHA-256( <file sha256, lowercase hex> ":" <node index, decimal> )
+  NodeId = UUIDv5( 7ca1fd38-357d-572c-ae1e-dc902c5ea089, <canonical authored path> )
   ```
 
-- When the referenced file changes, its derived ids change with it. This is
-  correct and intended: it is the same situation as a renamed node, and it
-  surfaces through the orphaned-override report (Section 5b) rather than by
-  silently retargeting an override at whatever node inherited the index.
+  The namespace is `UUIDv5(NAMESPACE_URL, "https://realvirtual.io/rv-odt/node-id")`.
+  The **canonical authored path** is built from `nodes[].name` of the scene
+  `scene ?? 0` (its root nodes are the first segments). Per segment: a backslash
+  becomes two backslashes, `/` becomes backslash + `/`, `[` becomes backslash + `[`,
+  and a LEADING `#` becomes backslash + `#`; the k-th (k ≥ 1, glTF child order) of
+  several siblings with the same raw name gets `[k]` appended; an empty or missing
+  name is `#<index in the parent's child list>`. Seeding runs in two passes: first
+  every `NodeId` the file carries is reserved, then the nodes without one take their
+  seed in ascending glTF node index — or, when it is taken, the seed of the path
+  followed by U+0000 and `n`, for the smallest free n ≥ 1. The reference
+  implementation is `src/core/engine/rv-node-id-seed.mjs`.
+
+  Seeds are a consumer's runtime state; a writer that saves the file adopts them as
+  its `NodeId`s, so the ids a file had when it was loaded are the ids it has after
+  the save. (rv-ODT drafts before `idVersion` 1 derived ids from the file's
+  SHA-256 and the glTF node index; that derivation is withdrawn — it changed with
+  every byte of the file.)
 - `NodeId` MUST NOT be written with a leading underscore. Consumers commonly
   strip `_`-prefixed keys on export as runtime bookkeeping; `NodeId` is authored
   data and must survive an export/import round-trip unchanged.
+
+**Addresses.** An address names a node relative to the **document that holds the
+reference**:
+
+| Address | Target |
+|---|---|
+| `#<id>` | a node of the same file |
+| `<p>#<id>` | a node inside the placement (reference node) whose `NodeId` is `p` |
+| `<p>/<b>#<id>` | a node inside the nested reference `b` of that placement, and so on per level |
+
+An address is split at its **last** `#`. `AssetOverrides` keys use the same form
+relative to the referenced asset (Section 5b, 7d.9).
+
+**`idVersion`.** A writer that stores addresses stamps
+`scenes[0].extras.realvirtual.idVersion = 1`. In such a file:
+
+- a `ComponentReference` is `{ "type", "address", "componentType", "componentIndex"? }`,
+  or — when the writer could not resolve its target — `{ "type", "unresolvedPath",
+  "reason", "componentType" }` with `reason` one of `missing`, `ambiguous`,
+  `synthetic-target` (the path kept verbatim, never guessed);
+- a declared path-string field and a NAME field (`$defs/StoredPathValue`) is
+  `{ "address" }` or `{ "unresolvedPath", "reason" }`;
+- `AssetOverrides` carries `byAddress` only.
+
+A file **without** `idVersion` stores paths. A consumer MUST read all forms. It
+MUST migrate a stored path ONCE, on load, through the file's own authored index —
+the path as written, relative to the content root, root-stripped — and MUST NOT
+resolve a stored path by a guessing stage (suffix, sanitised spelling, name in
+scope); a path that names two nodes is `ambiguous` and stays unresolved. A
+consumer that meets `idVersion` greater than it implements SHOULD warn and read
+the references unchanged.
+
+**Interoperability.** A producer that reads paths only (the realvirtual Unity
+importer) cannot read a file with `idVersion` 1. Files flow from such a producer
+to an address-writing consumer, not back.
 
 ### 5b. Composition: references, overrides and strength ordering
 
@@ -188,10 +238,15 @@ so the chain is globally unique without any file needing to know where it is
 installed. The occurrence address is computed during composition and is **never
 written into a file**.
 
-**Overrides.** A referencing file changes values in a referenced subtree through
-`AssetOverrides` (Section 7d.9) on the reference node. The referenced file is
-never modified. Because the overrides sit on the reference node, their `byNodeId`
-keys are unambiguous by construction.
+**Overrides.** A referencing file changes component VALUES in a referenced subtree
+through `AssetOverrides` (Section 7d.9) on the reference node. The referenced file
+is never modified. Keys are addresses relative to the referenced asset — `#<id>`
+for its own nodes, `<b>#<id>` for content of its nested reference `b`, at any
+depth — so they are unambiguous by construction. An override is stored on the
+OUTERMOST reference node the writing file holds. Transforms are not overridable:
+a part inside referenced content keeps the transform its asset gives it, and a
+writer MUST refuse to save a move of such a part rather than drop it. (`byNodeId`
+and `byPath` of earlier drafts are read, `trsByNodeId` is withdrawn — 7d.9.)
 
 **Strength ordering.** When more than one layer sets the same field, the
 following order applies, **weakest first**:
@@ -204,7 +259,10 @@ following order applies, **weakest first**:
 In short: **the outer file always wins.**
 
 **Orphaned overrides.** An override whose target node no longer exists in the
-resolved asset MUST be reported to the user and MUST NOT be dropped silently.
+resolved asset MUST be reported to the user and MUST NOT be dropped silently. An
+override (or a reference) aimed into a nested occurrence that is resolved later
+waits for it; it is orphaned only once nothing is pending any more, or when that
+occurrence fails to resolve.
 
 **Trust is transitive and per subtree.** Where a consumer gates behaviour on a
 file's signature, the gate MUST be evaluated **per referenced file**, and the
@@ -232,16 +290,19 @@ Component fields use the following types. The machine-readable definition in
 
 ### ComponentReference
 
+EXACTLY ONE of three stored forms (Section 5a):
+
 ```json
-{
-  "type": "ComponentReference",
-  "path": "Cell/PLC/StartSignal",
-  "componentType": "PLCOutputBool",
-  "componentIndex": 0
-}
+{ "type": "ComponentReference", "address": "#9b2f6c1e-3a4d-5e6f-8a7b-0c1d2e3f4a5b", "componentType": "PLCOutputBool", "componentIndex": 0 }
+{ "type": "ComponentReference", "unresolvedPath": "Cell/PLC/Gone", "reason": "missing", "componentType": "PLCOutputBool" }
+{ "type": "ComponentReference", "path": "Cell/PLC/StartSignal", "componentType": "PLCOutputBool" }
 ```
 
-- `path` — scene path of the referenced node (Section 5).
+- `address` — the target's address relative to the document holding the
+  reference (Section 5a). Written by files with `idVersion` 1.
+- `unresolvedPath` + `reason` — a path the writer could not resolve, kept verbatim.
+- `path` — scene path of the referenced node (Section 5). Written by producers
+  without ids and by every file without `idVersion`; migrated on load.
 - `componentType` — the component (or PLC signal type) expected at that node.
   PLC signal types follow the Unity/PLC convention: `PLCOutputBool|Int|Float` are
   written by the PLC and read by the twin; `PLCInputBool|Int|Float` are written by
@@ -745,17 +806,21 @@ Presence sensor: AABB overlap (collision mode) or raycast mode.
 **Authoring rules:**
 - In collision mode (`UseRaycast` false) the detection volume is the node's geometry; a node without geometry needs a `BoxCollider` entry.
 - In raycast mode `RayCastDirection` is given in Unity local coordinates and `RayCastLength` in millimeters.
+- `AdditionalRayCastLayers` names Unity layers. A node's layer is the index stored as extras.realvirtual.layer; the index-to-name table is the realvirtual standard (Unity built-in 0-5, rvMUSensor = 13 up to rvCollissionCheck = 23) plus the file's own table scenes[0].extras.realvirtual.layerNames (array of up to 32 names, index = layer, empty string = unused) for project-specific layers. A part without a layer is never filtered out.
 - `SensorOccupied` / `SensorNotOccupied` are signal references (`ComponentReference` to a `PLCInputBool` node) that the sensor writes.
 
 **Reference implementation notes (informative):**
 - realvirtual WEB takes the mesh bounds of the node and its subtree as the collision volume and falls back to `BoxCollider` only when the node draws nothing.
 - Only MUs (spawned by a `Source`) are detected; `LimitSensorToTag` narrows that to one tag or name.
+- Raycast mode follows one Unity `Physics.Raycast`: the nearest collider on a layer in the mask wins and blocks everything behind it, MU or not (an MU's colliders as oriented boxes, a MeshCollider as the box of its mesh). A collider that contains the ray origin is not hit. A non-MU collider occupies the sensor (no MU enter) unless its node carries a `Sensor` or `LimitSensorToTag` is set; an MU that `LimitSensorToTag` rejects blocks without occupying. When the beam moves to another collider of the same MU, the MU enters again.
+- `SensorOccupied` / `SensorNotOccupied` are written on every change and once at the first detection after load or reset.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `UseRaycast` | boolean | false | If true the sensor uses raycast mode instead of collider (AABB overlap) mode. |
 | `RayCastDirection` | Vector3 | - | Raycast direction vector in Unity local coordinates (readers negate X in glTF space). |
 | `RayCastLength` | number | 1000 | Raycast length in millimeters. |
+| `AdditionalRayCastLayers` | string[] | [] | Layer names the raycast hits (Unity layers); the sensor's own layer is added. Empty, or no known name, hits every layer. Only the nearest hit counts. Collision mode ignores it. |
 | `SensorOccupied` | ComponentReference | - | Boolean PLC input for the sensor signal; true when the sensor is occupied. |
 | `SensorNotOccupied` | ComponentReference | - | Boolean PLC input for the sensor; true when the sensor is NOT occupied. |
 | `AutoRay` | boolean | false | Derives the ray beam from the node bounding box (naming-convention sensors). |
@@ -771,6 +836,51 @@ Raw fields (`rawFields`):
 
 ```json
 { "Sensor": { "UseRaycast": true, "RayCastDirection": { "x": 0, "y": -1, "z": 0 }, "RayCastLength": 500 } }
+```
+
+#### 7a.77 MUSwitcher
+
+Switches the visible variant of an MU when the MU enters the `Sensor` on the same node.
+
+**Authoring rules:**
+- The node carries a `Sensor`; the switch happens once per MU entry (also for an MU that enters right after another one without a free state in between). Leaving the sensor does nothing.
+- Inside the entering MU (its root included), every node with a `Group` named `SwitchToGroup` becomes visible and every node with any other `Group` becomes hidden; nodes without a `Group` are left alone. A node with several `Group` entries follows the last one.
+- Variant nodes that are hidden at first are authored with activeSelf false; readers load such a node hidden.
+
+**Reference implementation notes (informative):**
+- realvirtual WEB keeps the group names of a spawned MU clone after its extras are stripped, so a switch works on every spawned MU; an instanced MU has no node subtree and is not switched.
+- A `MUSwitcher` without a `Sensor` on its node is reported as a muswitcher-no-sensor problem.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `SwitchToGroup` | string | "" | Name of the group to show in an MU entering the sensor; all other groups of that MU are hidden. |
+
+```json
+{ "Sensor": { "UseRaycast": false }, "MUSwitcher": { "SwitchToGroup": "Tube" } }
+```
+
+#### 7a.78 MUPusher
+
+Pushes the MU standing in a station out in front of the MU a grip carries in — position-based, without contact detection or physics.
+
+**Authoring rules:**
+- `Drive` is the axis of the push, `Pusher` the grip that carries the pushing MU, `Sensor` reports the standing MU (empty = the `Sensor` on the same node). Several pushers may share one drive and grip (one per station); only the one whose MU lies in the path of the carried MU acts.
+- A move of `Drive` to `ReleasePosition` arms the push when the grip holds an MU and the sensor reports a free MU whose box overlaps the carried MU's box across the push direction. An empty sensor means nothing is pushed.
+- The couple position is computed at that moment: world travel of the grip per drive mm (the drive plus every `Drive_Gear` slave of it on the grip's parent chain) and the gap between the front of the carried MU and the back of the standing MU along the push. Passing it attaches the standing MU at the exact contact pose to the grip; reaching `ReleasePosition` (or a new target of the drive) releases it at its world pose, where the transport surface below takes it over.
+
+**Reference implementation notes (informative):**
+- realvirtual WEB logs the computed couple position once per pusher and shows it in the live state as CouplePosition; a release beside `ReleaseSurface` is warned about once.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Drive` | ComponentReference | - | Axis whose position decides coupling and release. |
+| `Pusher` | ComponentReference | - | Grip that carries the pushing MU. |
+| `Sensor` | ComponentReference | - | Sensor reporting the MU to be pushed (empty = Sensor on the same node). |
+| `ReleasePosition` | number | 0 | Drive position at which the pushed MU is released; a move to it arms the push. |
+| `ReleaseSurface` | ComponentReference | - | Optional surface that should take the released MU over. |
+
+```json
+{ "Sensor": { "UseRaycast": false }, "MUPusher": { "Drive": { "type": "ComponentReference", "address": "#<axis>", "componentType": "realvirtual.Drive" }, "Pusher": { "type": "ComponentReference", "address": "#<gripper>", "componentType": "realvirtual.Grip" }, "ReleasePosition": 358 } }
 ```
 
 #### 7a.11 TransportSurface
@@ -797,10 +907,36 @@ Conveyor surface that moves MUs along a direction at the referenced Drive's spee
 | `DriveReference` | ComponentReference | - | Optional drive reference for special cases; normally empty to use the auto-detected parent drive. |
 | `Accumulate` | boolean | true | If true MUs on this surface accumulate: each MU clamps its advance to the free distance up to the next MU in move direction (no penetration). Ignored on Radial surfaces. |
 | `MinGap` | number | 0 | Minimum front gap in millimeters kept between accumulated MUs. |
+| `VerticalReach` | number | 0 | How far above its top the surface still takes over an MU, in millimeters; 0 = the transport default (100 mm). A part hanging higher - let go by a gripper in mid-air - is not caught, stays where it is and is reported by a DropDetection, which uses the same value to decide whether the surface carries a part. |
 | `PhysicsMode` | boolean | false | If true and the surface lies fully inside a physics zone, the surface runs in physics mode: a kinematic conveyor body carries MUs via friction and jams/stacking are simulated physically. Ignored on Radial surfaces (v1 exclusion) and when the deployment switch simulation.physicsSurfaceDefault is false. |
 
 ```json
 { "TransportSurface": { "TransportDirection": { "x": 1, "y": 0, "z": 0 }, "DriveReference": { "type": "ComponentReference", "path": "Cell/Conveyor1", "componentType": "Drive" } } }
+```
+
+#### 7a.11b TransportGuided
+
+Guided conveyor that leads MUs along a straight line or a circular arc at the linear speed of the `Drive` on the same node.
+
+**Authoring rules:**
+- The path starts at the node origin along local +X (Unity convention). An arc bends around the centre `-forward * sign(Angle) * Radius`.
+- The belt speed comes from the `Drive` on the same node.
+- `Length` applies to a straight guide (`Circular` false); `Radius` and `Angle` apply to an arc (`Circular` true).
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Circular` | boolean | false | If true the MUs follow a circular arc (Radius, Angle); otherwise a straight line of Length. |
+| `Length` | number | 1 | Length of the straight guide in meters (only when Circular is off). |
+| `Radius` | number | 1 | Radius of the arc in meters (only when Circular is on). |
+| `Angle` | number | 90 | Arc angle in degrees; positive bends counter-clockwise, negative clockwise (Unity convention). 0 disables the arc. |
+| `Height` | number | 0.5 | Height of the contact box below the transport plane in meters. |
+| `Width` | number | 0.5 | Width of the contact box of a straight guide in meters. |
+| `ColliderBorderX` | number | 0.2 | Additional contact-box border along X of an arc in meters. |
+| `ColliderBorderZ` | number | 0.2 | Additional contact-box border along Z of an arc in meters. |
+| `DistanceCollider` | number | 0.005 | Offset of the straight guide's contact box below the transport plane in meters. |
+
+```json
+{ "TransportGuided": { "Circular": true, "Radius": 1.2, "Angle": 90 } }
 ```
 
 #### 7a.12 Source
@@ -811,6 +947,7 @@ Spawns new MU (Movable Unit) instances at intervals or by distance.
 - `ThisObjectAsMU` is a node NAME or scene path string (not a `ComponentReference`) of the MU prototype; empty, or the source node's own name, makes the source node itself the prototype.
 - A separate prototype node should carry an `MU` marker; it is a template, not a part of the running scene.
 - `SourceGenerate` and `SourceGenerateOnDistance` are signal references (`ComponentReference` to a `PLCOutputBool` node).
+- `Destination` is a scene path string (Unity form, relative to the asset root) or, in a web-saved file, the address record of the target node (rv-ODT §5a); empty spawns new MUs at the scene root.
 
 **Reference implementation notes (informative):**
 - A separate prototype is looked up in the source's own asset subtree first, then globally, and is hidden at load; the source shows a ghost preview of it.
@@ -823,6 +960,7 @@ Spawns new MU (Movable Unit) instances at intervals or by distance.
 | `GenerateIfDistance` | number | 300 | Distance in millimeters from the source at which new MUs are generated. |
 | `PlaceOnTransportSurface` | boolean | true | If true newly spawned MUs are placed onto the transport surface below the source. |
 | `ThisObjectAsMU` | string | "" | Name of the GameObject used as the MU prototype; defaults to this node when empty. |
+| `Destination` | string | "" | Scene path of the node new MUs are parented to; they start at the source pose and then move with it. Empty = scene root. |
 | `CollisionRoleForMUs` | enum(None, Tool, Workpiece, Machine, Robot, Environment, Cutter) | "None" | Collision role assigned to every MU spawned by this source; `None` keeps spawned MUs out of every collision check. |
 | `Enabled` | boolean | true | Enables MU generation. |
 | `GenerateMU` | boolean | true | Generates one MU on a false-to-true transition, including an initial true value. |
@@ -868,6 +1006,8 @@ Gripper for pick-and-place operations.
 - The `Grip` node is the gripping point: picked MUs are attached to it and move with it (put it below the drive or kinematic that carries the gripper).
 - `PartToGrip` references a `Sensor` (`componentType` `Sensor`) whose occupying MU is picked; when empty, the nearest MU within `GripRange` millimeters is picked.
 - `SignalPick` / `SignalPlace` are signal references (`ComponentReference` to a PLC signal node); with `OneBitControl` only `SignalPick` is used (rising edge picks, falling edge places).
+- With `DirectlyGrip` every MU entering the `PartToGrip` sensor is gripped at once, without a pick signal, even when another grip or a `Source.Destination` still carries it; placing stays with `SignalPlace`.
+- `PickAlignWithObject` is a scene path string (Unity form, relative to the asset root) or, in a web-saved file, the address record of the target node (rv-ODT §5a); a picked MU takes over its world position, and with `AlignRotation` its world rotation.
 
 **Reference implementation notes (informative):**
 - The realvirtual WEB asset editor refuses to add a `Grip` below a `TransportSurface`.
@@ -881,6 +1021,9 @@ Gripper for pick-and-place operations.
 | `SignalPick` | ComponentReference | - | Signal that triggers picking. |
 | `SignalPlace` | ComponentReference | - | Signal that triggers placing. |
 | `PartToGrip` | ComponentReference | - | Sensor identifying the MU to be gripped; when empty, auto-detection uses GripRange. |
+| `DirectlyGrip` | boolean | false | If true every MU entering PartToGrip is gripped immediately, without a pick signal, also when another grip holds it. |
+| `PickAlignWithObject` | string | "" | Scene path of the node a picked MU is aligned to (world position, and rotation when AlignRotation is set). Empty = no alignment. |
+| `AlignRotation` | boolean | true | If true a pick with PickAlignWithObject also takes over the node's world rotation. |
 
 ```json
 { "Grip": { "PlaceMode": "Auto", "GripRange": 80 } }
@@ -916,6 +1059,36 @@ One-way signal bridge: copies the referenced source signal onto this node's own 
 { "ConnectSignal": { "ConnectedSignal": { "type": "ComponentReference", "path": "PLC/MotorOn", "componentType": "PLCOutputBool" } } }
 ```
 
+#### 7a.16b SignalConnector
+
+Couples one source signal (a PLC output) to one target signal (a PLC input) with an explicit conversion (plan-2227). Exactly one source and one target slot are active per `Mode`; a set inactive slot is reported as `signal-connector-slot-mismatch` (warning). INT values are signed 32 bit; a REAL target has float32 semantics. `BitToWord` connectors writing the same target form one word (bits nobody writes are 0). Problem codes: `signal-connector-unresolved`, `signal-connector-slot-mismatch`, `signal-connector-direction`, `signal-connector-fan-in`, `signal-connector-cycle`, `signal-connector-width`, `signal-connector-nonfinite`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Mode` | enum(Copy, IntToBool, BoolToInt, BitFromWord, BitToWord, Scale) | "Copy" | Conversion; selects the active source/target slot pair. |
+| `Enabled` | boolean | true | When false the connector writes nothing and takes part in no check. |
+| `SourceBool` | ComponentReference | - | BOOL source (PLCOutputBool): Copy BOOL, BoolToInt, BitToWord. |
+| `SourceInt` | ComponentReference | - | INT source (PLCOutputInt): Copy INT and INT to REAL, IntToBool, BitFromWord, Scale. |
+| `SourceFloat` | ComponentReference | - | REAL source (PLCOutputFloat): Copy REAL, Scale. |
+| `TargetBool` | ComponentReference | - | BOOL target (PLCInputBool): Copy BOOL, IntToBool, BitFromWord. |
+| `TargetInt` | ComponentReference | - | INT target (PLCInputInt): Copy INT, BoolToInt, BitToWord, Scale. |
+| `TargetFloat` | ComponentReference | - | REAL target (PLCInputFloat): Copy INT to REAL and REAL, Scale. |
+| `Condition` | enum(NotZero, Equals, GreaterOrEqual) | "NotZero" | IntToBool: not 0 (negative counts), equal to CompareValue, or at least CompareValue. |
+| `CompareValue` | number | 0 | IntToBool: comparison value for Equals and GreaterOrEqual. |
+| `TrueValue` | number | 1 | BoolToInt: INT written for true. |
+| `FalseValue` | number | 0 | BoolToInt: INT written for false. |
+| `Bit` | number | 0 | BitFromWord / BitToWord: bit number 0..31, below the Width. |
+| `Width` | enum(Byte, Word, DWord) | "Word" | INT width: range of Bit, how Scale reads an INT source, clamp range of an INT target. |
+| `Signed` | boolean | true | Interpret and clamp the INT as signed at Width. |
+| `Factor` | number | 1 | Scale: multiplier (dimensionless). |
+| `Offset` | number | 0 | Scale: added after the multiplication (dimensionless). |
+| `Rounding` | enum(Round, Truncate) | "Round" | Scale to INT: half away from zero, or towards zero. |
+| `Invert` | boolean | false | Inverts the BOOL result (Copy BOOL, IntToBool, BitFromWord) or the contributed bit (BitToWord). |
+
+```json
+{ "SignalConnector": { "Mode": "BitFromWord", "Bit": 5, "Width": "Word", "SourceInt": { "type": "ComponentReference", "address": "#a1b2" }, "TargetBool": { "type": "ComponentReference", "address": "#c3d4" } } }
+```
+
 #### 7a.17 Lamp
 
 Signal lamp: drives the emissive color of its first eligible mesh from PLC signals or a static state. `OnColor` is a raw Unity color object and is therefore shown in the JSON example rather than the schema-backed field table.
@@ -937,6 +1110,32 @@ Raw fields (`rawFields`):
 
 ```json
 { "Lamp": { "OnColor": { "r": 1, "g": 0.1, "b": 0, "a": 1 }, "Intensity": 2, "LampOn": true, "SignalLampOn": { "type": "ComponentReference", "path": "PLC/BeaconOn", "componentType": "PLCOutputBool" } } }
+```
+
+#### 7a.79 Sound
+
+Procedural drive sound: makes the `Drive` on the same node audible as an electric motor, a pneumatic cylinder or a hydraulic axis. The component selects only the kind, the type and the volume; speed, stroke times and end positions come from the `Drive` / `Drive_Cylinder` on the node.
+
+**Authoring rules:**
+- A `Drive` component MUST exist on the same node; without it the sound stays inert.
+- `Kind` `Auto` resolves to `Cylinder` when the node carries a `Drive_Cylinder`, otherwise to `Drive`. `Hydraulic` is never derived; it applies to a `Drive_Cylinder` and to a plain `Drive` alike.
+- `Variant` must fit the resolved kind: `Large` / `Medium` / `Small` for `Drive`, `Hard` / `Cushioned` for `Cylinder`, `Auto` only for `Hydraulic`. `Auto` resolves to `Medium` (Drive) or `Cushioned` (Cylinder).
+- `SoundType` and `Mode` are the fields of the historic Unity component. Readers use them only when BOTH `Kind` and `Variant` are absent: `Robot1` / `Robot2` → Drive/Medium, `SmallElectric1` / `SmallElectric2` → Drive/Small, `AirPressure` → Cylinder/Cushioned. `Mode` `Pick` is ignored.
+
+**Reference implementation notes (informative):**
+- realvirtual WEB synthesizes the sound with Web Audio (no sample files) and places it at the node's world position; the pitch follows the speed that is visible on screen, including the simulation speed factor.
+- Sound is globally off by default; the viewer's sound switch in the view cluster turns it on. A variant that does not fit its kind falls back to `Auto` and is listed in the Problems panel as sound-variant-mismatch; a `Sound` without a `Drive` is listed as sound-without-drive.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Kind` | enum(Auto, Drive, Cylinder, Hydraulic) | "Auto" | What the sound models; Auto derives Cylinder or Drive from the node. |
+| `Variant` | enum(Auto, Large, Medium, Small, Hard, Cushioned) | "Auto" | Type of the sound: motor size or end-stop style. |
+| `Volume` | number | 1 | Relative volume of this sound from 0 to 1. |
+| `SoundType` | enum(Robot1, Robot2, SmallElectric1, SmallElectric2, AirPressure) | - | Legacy Unity sound clip, read only when Kind and Variant are absent. |
+| `Mode` | enum(Drive, Pick) | - | Legacy Unity playback mode, read for compatibility only. |
+
+```json
+{ "Sound": { "Kind": "Cylinder", "Variant": "Hard", "Volume": 0.8 } }
 ```
 
 #### 7a.18 WebSensor
@@ -1131,9 +1330,16 @@ Pure metadata on an imported CAD root: original file reference plus import param
 | `Quality` | string | "standard" | Tessellation quality preset used at import. |
 | `ImportScaleFactor` | number | 0.001 | Scale factor applied at import (CAD units to meters). |
 | `ZIsUpVector` | boolean | true | If true the CAD source used Z-up orientation. |
+| `Converter` | enum(connect, browser, solidcraft) | - | Optional. What produced the geometry; absent means `browser`. Unknown values are ignored. |
+| `SolidCraft` | object | - | Optional. Identity of a node mirrored live from a SolidCraft design: `Role` (`root`, `occurrence`, `body`, `joint`) plus `DesignPath`/`DesignName` (root), `OccurrenceId` (occurrence, body), `BodyKey`/`BodyName` (body), `JointId` (joint). Matched by id only. |
 
 ```json
 { "CADLink": { "File": "gripper-v3.step", "Sha256": "9f2c...", "Quality": "standard" } }
+```
+
+```json
+{ "CADLink": { "File": "Arm.3mf", "Sha256": "4be1...", "Quality": "source", "Converter": "solidcraft",
+  "SolidCraft": { "Role": "body", "OccurrenceId": 7, "BodyKey": "2", "BodyName": "Arm" } } }
 ```
 
 #### 7a.36 JTData
@@ -1276,6 +1482,51 @@ creates no VM; the component stays inactive but remains editable.
 { "WebComponent": { "Active": true, "ApiVersion": 1, "TypeId": "Gate", "Code": "function setup(self){ return { continuous: {} }; }" } }
 ```
 
+#### 7a.67 ParametricComponent
+
+WEB-only parametric part family. The family node carries the base parts in a
+hidden child (`PartsRoot`, default `_Parts`), a parameter schema (`Params`) and a
+JavaScript rule (`Code`, defining `generate(values, parts)`). The rule maps the
+parameter values onto three operations on the base parts — duplicate, stretch,
+place — and runs as a pure function without scene or signal access. The variant
+for `Values` is stored baked as plain geometry under `GeneratedRoot` (default
+`_Generated`), so loading with the stored values runs no code. A viewer without
+support shows that baked variant and MUST NOT show `_Parts` (it is hidden).
+Parameters can never be bound to signals.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `ApiVersion` | number | 1 | Contract version of the rule API; only 1 is defined. |
+| `Params` | object[] | [] | Parameter schema (one entry per parameter, see below). |
+| `Values` | object | {} | Parameter values of the baked variant (name to number, boolean or string). |
+| `Code` | string | "" | JavaScript source defining `generate(values, parts)`. |
+| `CodeHash` | string | "" | SHA-256 of `Code` (hex); shown in the inspector, part of the variant cache key. |
+| `PartsRoot` | string | "_Parts" | Name of the hidden child holding the base parts. |
+| `GeneratedRoot` | string | "_Generated" | Name of the child holding the baked variant. |
+| `BakedInputHash` | string | - | Input fingerprint (ApiVersion, CodeHash, normalized Values, parts hash) of the baked variant. |
+| `DesignResource` | string | - | SHA-256 of the embedded SolidCraft design of the base parts (optional). |
+
+Each `Params` entry:
+
+| Key | Type | Required | Description |
+|---|---|---|---|
+| `Name` | string | yes | Unique parameter name; key in `Values`. |
+| `Label` | string | no | Display label. |
+| `Type` | enum(number, int, bool, enum) | yes | Value type; any signal-bound type is rejected. |
+| `Unit` | enum(mm, deg, "") | no | Display unit of number/int parameters. |
+| `Min` / `Max` | number | no | Bounds of number/int parameters; `Min` ≤ `Max`. |
+| `Step` | number | no | Grid step of number/int parameters, measured from `Min` (or 0); > 0. |
+| `Enum` | (number \| string)[] | enum only | Allowed values; non-empty. |
+| `Default` | number \| boolean \| string | yes | Inside `Min`/`Max` on the `Step` grid, or one of `Enum`. |
+
+Values are normalized before the rule runs: a missing value takes `Default`,
+`int` values are rounded, number/int values snap to the `Step` grid and are
+clamped to `Min`/`Max`; an `enum` value outside `Enum` is an error, never clamped.
+
+```json
+{ "ParametricComponent": { "ApiVersion": 1, "Params": [ { "Name": "BF", "Type": "enum", "Unit": "mm", "Enum": [420, 620, 840], "Default": 420 }, { "Name": "ML", "Type": "number", "Unit": "mm", "Min": 0, "Max": 4320, "Step": 10, "Default": 2160 } ], "Values": { "BF": 420, "ML": 2160 }, "Code": "function generate(values, parts){ return { instances: [] }; }", "CodeHash": "3f9a1c…" } }
+```
+
 #### 7a.33 WebDiagnostics
 
 3D-HMI marker: couples a PLC error signal to the AI error diagnosis. A rising
@@ -1316,6 +1567,7 @@ fields and documents the structure here.
 | `align` | array | [0,1,0] | Up vector for the traveler pose, applied as `lookRotation(tangent, align)`. |
 | `zone` | string | - | Control-point zone id for mutual exclusion at crossings. Empty or absent = unzoned. |
 | `zoneCapacity` | number | - | Explicit zone capacity (>= 0; 0 = never enterable). Absent = the default capacity of 1. |
+| `connectCheck` | boolean | true | Takes part in the load-time successor check. `false` marks a deliberate crossing or bridge whose ends touch other paths without being connected; no `path-successor-mismatch` / `path-end-near-miss` is reported for it. |
 
 Structured field shapes — the fields above whose value is a structured JSON
 payload, plus the `type` discriminator, which is not a `$def` property. The
@@ -1348,8 +1600,10 @@ bounding box is used instead. Not to be confused with AGV path zones
 | `WholeScene` | boolean | false | If true the box volume is ignored and the whole scene bounding box becomes the physics zone. |
 | `Friction` | number | 0.8 | Default friction coefficient for MUs inside the zone. |
 | `Restitution` | number | 0 | Bounciness of MUs inside the zone (0 = none). |
+| `SoftCcdPrediction` | number | 0.03 | Look-ahead distance in meters (0 to 0.2) against tunnelling through thin floors; 0 = off. Applies to every MU that becomes a dynamic body in the zone. |
 | `RemoveBelowY` | number | -10 | MUs falling below this world Y (meters) are removed. |
 | `ShowGizmo` | boolean | true | Shows the zone as a wireframe box in the viewer. |
+| `LimitToLayers` | string[] | [] | MU filter by Unity layer name: only MUs whose layer (extras `layer` of the MU root, resolved through the layer table of `Sensor.AdditionalRayCastLayers`) is listed become rigid bodies; every other MU passes the zone kinematically. An MU without a layer does not match a set filter. Empty, or no known name, = every MU. |
 
 Raw fields (`rawFields`):
 
@@ -1359,6 +1613,238 @@ Raw fields (`rawFields`):
 
 ```json
 { "WebPhysicsZone": { "ZoneEnabled": true, "Friction": 0.8, "StaticColliders": ["Container/WallLeft"] }, "BoxCollider": { "center": { "x": 0, "y": 0, "z": 0 }, "size": { "x": 1.5, "y": 1.5, "z": 2.5 } } }
+```
+
+#### 7a.69 WebPhysicsZone2D
+
+2D interaction zone (plan-661): box volume on a conveyor line inside which MUs
+are simulated in the plane by Box2D — accumulation fronts (`Jam`), free buffer
+tables (`BufferTable`), diverters and merges with moving switch bodies. Unlike
+`WebPhysicsZone` an MU never falls or tips here; it keeps its height and only
+moves in x/z and rotates about the vertical axis. The zone volume comes from
+the node's `BoxCollider` extras (Section 7d.4). Each MU has exactly one owner
+(transport, Rapier or Box2D); the zone takes MUs over at its edge and hands
+them back to `Surface`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Kind` | enum(Jam, BufferTable, Diverter, Merge) | "Jam" | What the zone simulates: Jam (accumulation front), BufferTable (free table with run-out), Diverter or Merge (moving switch bodies). |
+| `Surface` | ComponentReference | - | Destination / discharge transport surface the MUs return to when they leave the zone. |
+| `KinematicDrives` | ComponentReference[] | [] | Diverter / merge: drives whose pose the zone follows as moving 2D bodies. |
+| `Damping` | number | 0 | Linear damping of MUs inside the zone (buffer-table run-out); 0 = none. |
+| `SleepThreshold` | number | 0.05 | Speed below which a resting MU may fall asleep. |
+| `ForceReturnAfter` | number | 0 | Returns an MU to transport after this time ONLY for a detected faulty pose (tipped / outside the guides) at an allowed exit; never dissolves a standing jam. 0 = never. |
+| `ShowGizmo` | boolean | true | Shows the zone as a wireframe box in the viewer. |
+
+Raw fields (`rawFields`):
+
+| Raw field | Type | Notes |
+|---|---|---|
+| `Guides` | array | Node references (ComponentReference array) of guide rails; their BoxCollider extras become static Box2D shapes; read raw |
+
+```json
+{ "WebPhysicsZone2D": { "Kind": "Jam", "Surface": { "type": "ComponentReference", "path": "Line/Outfeed", "componentType": "realvirtual.TransportSurface" }, "Guides": [{ "type": "ComponentReference", "path": "Line/GuideLeft" }] }, "BoxCollider": { "center": { "x": 0, "y": 0.05, "z": 0 }, "size": { "x": 0.4, "y": 0.1, "z": 2 } } }
+```
+
+#### 7a.70 WebMuJoCoRegion
+
+Detail-physics region (plan-673): the subtree below this node is simulated by
+MuJoCo instead of the standard engine — soft regulated contacts
+(`solref`/`solimp`), separate slide / torsional / rolling friction (`friction`
+plus `condim`) and force-limited actuators, which is what gives a dynamic axis
+an honest following error. The region volume (where MUs change engine) is the
+node's own `BoxCollider` extras (Section 7d.4), the same rule as
+`WebPhysicsZone`. The WASM locations are deliberately not model content: they
+are resolved at runtime, because a delivered GLB that points into
+`node_modules` is wrong after every bundler or deploy change.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `RegionEnabled` | boolean | true | Switches the region off without removing it; a disabled region loads no MuJoCo runtime. |
+| `TimestepS` | number | 0.002 | MuJoCo integration step; must match the training timestep of any policy in the region. |
+| `ExitBandM` | number | 0.5 | Hysteresis band outside the volume an MU must clear before it is handed back. |
+| `LoadTreeMode` | enum(composite, separate) | "composite" | Carrier and load enter as one rigid body or as separate bodies. |
+| `MjcfSource` | string | "" | Project-relative path of a hand-maintained MJCF that wins over the generated model; empty = generate. |
+| `MeshBase` | string | "" | Base folder the MJCF resolves its meshes against; only with `MjcfSource`. |
+| `Contract` | string | "" | Project-relative path of the contract document carrying the trained numbers. |
+| `TrunkBody` | string | "" | MJCF name of the floating base body — a name, never an index. |
+| `TrunkFreeJoint` | string | "" | MJCF name of the free joint of `TrunkBody`. |
+| `GyroSensor` | string | "" | MJCF name of the gyro sensor that feeds the `base_ang_vel` observation segment. |
+| `ShowGizmo` | boolean | true | Shows the region volume as a wireframe box. |
+
+```json
+{ "WebMuJoCoRegion": { "RegionEnabled": true, "TimestepS": 0.002, "LoadTreeMode": "composite" }, "BoxCollider": { "center": { "x": 0, "y": 0.5, "z": 0 }, "size": { "x": 2, "y": 1, "z": 2 } } }
+```
+
+#### 7a.71 DynamicAxis
+
+Marks the `Drive` on this node as dynamic (plan-673): its setpoint becomes the
+`ctrl` of a force-limited MuJoCo actuator, the solver moves the body, and the
+resulting joint position is written back as the drive's actual position. A
+kinematic axis has structurally no following error; a dynamic one has, and on a
+real machine that error is the overload signal. `ctrlrange` is not a field — it
+follows from `Drive.LowerLimit` / `Drive.UpperLimit`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `SetpointSource` | enum(planner, signal, operator, policy) | "planner" | Who writes the setpoint, and therefore whether the axis is claimed. |
+| `ActuatorKind` | enum(position, velocity, motor) | "position" | MuJoCo actuator type. |
+| `Kp` | number | 80000 | Proportional gain of the position servo. |
+| `Kv` | number | 0 | Derivative gain of the servo. |
+| `ForceRangeMin` | number | 0 | Lower force / torque limit; min = max = 0 means unlimited. |
+| `ForceRangeMax` | number | 0 | Upper force / torque limit. |
+| `Gear` | number | 1 | Transmission ratio between actuator and joint. |
+| `Armature` | number | 0.1 | Reflected rotor inertia added to the joint — a declared starting assumption. |
+| `Damping` | number | 0 | Viscous joint damping. |
+| `FrictionLoss` | number | 0 | Constant friction torque to overcome before the joint moves. |
+| `BaseFollowingError` | number | 0 | Declared structural share of the following error (the P+D gravity sag torque/Kp) that an overload model must subtract — in the drive's own unit, i.e. **degrees** for a rotary axis. |
+| `FollowingErrorLimit` | number | 0 | Window on the **net** error (raw minus base); 0 = monitoring off. |
+| `FollowingErrorTimeMs` | number | 200 | How long the net error must stay outside the window before the axis is reported. |
+| `ArrivalTolerance` | number | 0 | Arrival tolerance for LogicStep / IK path waits; 0 = derived from base + window, never below 0.01. |
+
+The unit of `BaseFollowingError` is the drive's own (millimetres for a linear
+axis, **degrees** for a rotary one — the `Drive.LowerLimit` convention). The
+Phase-1 gate measured 1.07 deg of axis sag at the Menagerie stock gain, which is
+14.9 mm at the tool, against 0.10 deg (0.92 mm) at `Kp` 80000. Declaring the
+millimetre figure on a rotary axis would subtract 14.9 degrees and mask every
+real overload.
+
+```json
+{ "DynamicAxis": { "SetpointSource": "planner", "Kp": 80000, "Armature": 0.1, "ForceRangeMin": -370, "ForceRangeMax": 370, "BaseFollowingError": 0.1, "FollowingErrorLimit": 0.5, "FollowingErrorTimeMs": 200 } }
+```
+
+#### 7a.71b GripLoad
+
+Declares how the `Grip` on this node holds a part, and measures whether it still
+does (plan-673 Phase 4, F7). The Phase-1 gate measured that a jam becomes
+visible **at the gripper**, not at the axes: in two of three failure cases the
+axis following error was 0.07–0.08 deg, identical to the successful run, while
+the part slid 17–20 mm between the jaws. An overload model that knows only
+following error and torque shows nothing in two of three failure cases.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Mode` | enum(formfit, forcefit) | "formfit" | `formfit` = the Grip parents the part (no slip by construction); `forcefit` = the physics contact holds it and the Grip only reports. |
+| `GripForce` | number | 0 | Declared clamping force per jaw in N; 0 = not declared, only the measured actuator force is shown. |
+| `SlipLimit` | number | 0 | Travel of the part inside the jaws (mm) before it counts as slipping; 0 = off. |
+| `SlipTimeMs` | number | 200 | How long the slip must stay above the limit before it is reported. |
+
+```json
+{ "GripLoad": { "Mode": "forcefit", "GripForce": 100, "SlipLimit": 3, "SlipTimeMs": 200 } }
+```
+
+#### 7a.72 ContactProfile
+
+Contact role of the collision geometry on this node (plan-673): a named profile
+from the project profile library rather than a loose set of numbers. MuJoCo
+maximises `friction` element-wise between two geoms and averages
+`solref`/`solimp` weighted by `solmix`, so a pairing table built from per-geom
+profiles is not representable — the rougher side always wins and one grippy pad
+pulls every other pairing up with it. The expressible form is `Priority` on the
+side that sets the tone, which is why `Priority` is a field here.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Profile` | enum(Pallet, Workpiece, BeltSurface, StopperFace, GripperJaw, MachineFrame, FixtureBore, Custom) | "Workpiece" | Role this surface plays; every role but `Custom` takes its numbers from the profile library. |
+| `Priority` | number | 0 | Geom priority: the higher-priority side supplies friction and compliance for the whole pairing. |
+| `Solmix` | number | 1 | Weight when `solref`/`solimp` are averaged; no effect on friction. |
+| `FrictionSlide` | number | 1 | Sliding friction coefficient; read only with `Profile` `Custom`. |
+| `FrictionSpin` | number | 0.005 | Torsional friction coefficient; needs `CondDim` `SlidingTorsional` or above. |
+| `FrictionRoll` | number | 0.0001 | Rolling friction coefficient; needs `CondDim` `Full`. |
+| `CondDim` | enum(Frictionless, Sliding, SlidingTorsional, Full) | "SlidingTorsional" | Contact dimensionality (MuJoCo `condim` 1/3/4/6); deliberately not MuJoCo's own default. |
+| `SolrefTimeConst` | number | 0.02 | Time constant of the contact reference spring-damper. |
+| `SolrefDampRatio` | number | 1 | Damping ratio of the contact reference spring-damper. |
+
+```json
+{ "ContactProfile": { "Profile": "GripperJaw", "Priority": 1, "FrictionSlide": 0.7, "CondDim": "SlidingTorsional" } }
+```
+
+#### 7a.73 CollisionShapeSet
+
+Collision geometry of this node as an arrangement of convex primitives
+(plan-673). MuJoCo convexifies every collision mesh, so any concave shape whose
+behaviour relies on its concavity is silently ineffective — a part with a hole
+and the board it should pass through are both concave. The decomposition is
+authored content, not something a solver derives: a convexified part is a
+construction error, not a numerical problem. `Shapes[].Size` is read
+type-dependently and as half extents, unlike the full metre sizes of the
+`colliders[]` extras (Section 7d.4).
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Shapes` | object[] | [] | The convex primitives in author order; each entry has `Kind`, `Center` (mm), `Size` (mm, type-dependent half extents) and `Rotation` (deg). |
+| `ReplacesMesh` | boolean | false | true = the visual mesh does not collide and the primitives are the only collision geometry. |
+
+```json
+{ "CollisionShapeSet": { "Shapes": [{ "Kind": "box", "Center": { "x": 0, "y": 0, "z": 25 }, "Size": { "x": 10, "y": 17.5, "z": 25 }, "Rotation": { "x": 0, "y": 0, "z": 0 } }], "ReplacesMesh": false } }
+```
+
+#### 7a.74 FreeBody
+
+This node is a free rigid body in a detail-physics region (plan-673): a block, a
+pallet, an obstacle — something the simulation moves rather than a mechanism. It
+fills the gap in `KinematicJointType`, which knows `Revolute`, `Prismatic`,
+`Spherical` and `Universal` but no free joint. The physical quantities of such a
+body are properties with a unit and a default on the object itself, not entries
+in a central list inside a generator: a list entry is neither clickable in the
+viewer, nor addressable over MCP, nor movable by the user.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Enabled` | boolean | true | Switches the free body off without removing it. |
+| `MassKg` | number | 0 | Mass of the body; 0 = derive it from the node's `MechanismBody`. |
+| `CondDim` | enum(Frictionless, Sliding, SlidingTorsional, Full) | "SlidingTorsional" | Contact dimensionality; deliberately not MuJoCo's own default, which has no spin friction. |
+| `FrictionSlide` | number | 1 | Sliding friction coefficient; a `ContactProfile` on the same node wins. |
+| `LinearDamping` | number | 0 | Linear velocity damping. |
+| `AngularDamping` | number | 0 | Angular velocity damping. |
+| `Restitution` | number | 0 | Bounciness, 0 = fully damped; expressed through the contact solver reference. |
+
+```json
+{ "FreeBody": { "Enabled": true, "MassKg": 1.77, "CondDim": "SlidingTorsional", "FrictionSlide": 0.25 } }
+```
+
+#### 7a.75 Movable
+
+This node may be grabbed and moved by the user in the viewer (plan-673). It is
+the honest replacement for the `Drive` with `Direction` `Virtual` that obstacles
+used to carry only so the destructive bake would keep their node: a `Movable`
+claims its own node, and an obstacle is not a drive. `Movable` describes who may
+move the node by hand, `FreeBody` whether the physics moves it; both may sit on
+the same node.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Enabled` | boolean | true | Switches the move mode off without removing it. |
+| `Axes` | enum(XZ, XYZ, X, Y, Z) | "XZ" | Which directions the user may drag the node along; `XZ` is the floor plane. |
+| `SnapMm` | number | 0 | Grid the drag snaps to; 0 = free movement. |
+| `ResetOnStop` | boolean | false | true = the node returns to its authored position when the simulation stops. |
+
+```json
+{ "Movable": { "Enabled": true, "Axes": "XZ", "SnapMm": 10, "ResetOnStop": true } }
+```
+
+#### 7a.76 LocomotionPolicy
+
+A trained locomotion policy on the root node of a legged robot (plan-673): the
+counterpart of `RobotIK` one level deeper in the physics — `RobotIK` computes a
+pose from geometry, `LocomotionPolicy` computes joint setpoints from a state.
+The observation layout is data, not code: a named profile here, the ordered
+segment list in the contract document, and no third place. The point of the
+component is that the robot needs no script of its own.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Enabled` | boolean | true | Switches the policy off without removing it. |
+| `Policy` | string | "" | Project-relative path of the trained policy document. |
+| `FallbackPolicy` | string | "" | Project-relative path of the policy that takes over after a fall. |
+| `Observation` | string | "" | Name of the expected observation profile, checked against the contract on load. |
+| `Contract` | string | "" | Project-relative contract document; empty = the one of the enclosing region. |
+| `Decimation` | number | 4 | Physics steps per policy step; with the region timestep it determines the policy rate. |
+| `ActionScale` | number | 1 | Factor applied to the policy output before it becomes a joint setpoint. |
+| `Axes` | ComponentReference[] | [] | The driven drives in policy order — `Axes[i]` is the drive of the i-th policy actuator; the order is the contract. |
+
+```json
+{ "LocomotionPolicy": { "Policy": "policies/walking.onnx", "Observation": "microduck_61", "Decimation": 4, "ActionScale": 1, "Axes": [{ "type": "ComponentReference", "path": "Robot/LeftHipYaw", "componentType": "realvirtual.Drive" }] } }
 ```
 
 #### 7a.37 EnergyChain
@@ -1376,7 +1862,7 @@ and reports the reason — it is never worse than an unrigged part.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `Anchor` | ComponentReference | - | Node the fixed chain end is attached to; empty = auto. Read-only in the inspector, corrected via `web_editor_set_field`. |
+| `Anchor` | ComponentReference | - | Node the fixed chain end is attached to; empty = auto. Read-only in the inspector, corrected via the command `editor.setField`. |
 | `Follower` | ComponentReference | - | Node the moving chain end (the carrier) is attached to; empty = auto. Same correction path as `Anchor`. |
 | `BendRadius` | number | 0 | Centerline bend radius in millimeters; 0 measures it from the rest pose. |
 | `ChainLength` | number | 0 | Total centerline length in millimeters; 0 measures it from the rest pose. |
@@ -1404,6 +1890,39 @@ no check at all, and a body is never checked against a body nested inside it.
 
 ```json
 { "CollisionRole": { "CollisionRole": "Robot" } }
+```
+
+#### 7a.38b DropDetection
+
+Switches on the scene-wide detection of **unsupported parts**. Authored on any
+single node (conventionally the scene root); the effect is scene-wide, and if
+several are present the first registered one wins while the others raise a
+`drop-detection-duplicate` problem.
+
+A part is a candidate while nothing holds it, no transport surface *plausibly*
+carries it (one that could actually reach it from below — a surface assigned
+half a metre lower does not count), it seats on no `GripTarget` and it rests on
+no carrier part. A candidate that outlasts `GraceTime` gets one short ray cast
+straight down: any hit within `SupportProbeDistance` counts as support,
+including opaque geometry that carries no component at all. Only when there is
+demonstrably nothing below it is the part reported. Parts owned by a physics
+engine are never reported — there, falling is the intended behaviour.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Enabled` | boolean | true | Runs the detection. Off keeps the component authored but reports nothing. |
+| `GraceTime` | number | 0.5 | How long a part must be unsupported before it is reported. Bridges the handover moment in which a part belongs to neither of two belts. |
+| `SupportProbeDistance` | number | 50 | How far below the part the support ray looks for geometry. A hit within this distance counts as support - including opaque geometry without any component (a table, a chute, a shelf plate). |
+| `SupportMode` | enum(GeometryBelow, StateOnly) | "GeometryBelow" | GeometryBelow casts the support ray; StateOnly reports on the state conditions alone (no rays) and therefore also reports a part lying on geometry that is not a transport surface. |
+| `SupportRecheckInterval` | number | 0.5 | Shortest interval between two support rays for the same part. Keeps the ray off the per-tick path. |
+| `DeleteUnsupported` | boolean | false | Deletes a reported part after DeleteDelay. Off by default, because deleting destroys the very evidence the report is about; switch it on for long runs in which the part count would otherwise grow without bound. The card stays and names the deleted part. |
+| `DeleteDelay` | number | 1 | Delay between the report and the deletion. Only read while DeleteUnsupported is on. |
+| `SignalDropActive` | ComponentReference | - | Bool signal written true while at least one report is latched. |
+| `SignalDropCount` | ComponentReference | - | Int signal written with the number of latched reports. |
+| `SignalResetDrops` | ComponentReference | - | Bool signal whose rising edge clears every card and silhouette. A part that is still unsupported is reported again on the next tick. |
+
+```json
+{ "DropDetection": { "Enabled": true, "GraceTime": 0.5, "SupportProbeDistance": 50, "SupportMode": "GeometryBelow", "DeleteUnsupported": false } }
 ```
 
 #### 7a.39 MachiningVolume
@@ -2199,11 +2718,55 @@ component invalid and refuses run and playback.
 { "MechanismTrajectory": { "Name": "cycle_404_260", "Samples": [-190, 0, -280, -190, 0, -280], "SampleIntervalMs": 2, "Frame": "z-up", "TcpOffsetMm": { "x": 0, "y": 0, "z": -19 }, "PayloadMassKg": 0.26, "OutputIntervalMs": 4 } }
 ```
 
+#### 7a.68 PathBlock
+
+WEB-only path-network building block (plan-628): an empty node `PN_Block_<n>`
+under the ordering node `PathNetwork` whose child `Path` nodes (Section 7a.34)
+form one straight, curve, diverge, merge or stub. The block pose is data — the
+node transform stays the identity, and moving the block rewrites the absolute
+segments of its paths. Unity has no counterpart and ignores the entry; the
+paths underneath stay valid. `parsePathBlockExtras()` in
+`src/core/engine/rv-path-block.ts` is the executable TS-SSOT.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `version` | number | 1 | PathBlock schema version (migration anchor). |
+| `kind` | enum(straight, curve, diverge, merge, stub) | "straight" | Block kind; diverge, merge and stub are junction blocks set onto a host path. |
+| `params` | object | {} | Block parameters `{ lengthM?, radiusM?, degrees?, side?, stubStraightM?, twin? }` in meters / degrees; absent fields take the catalog defaults. |
+| `pose` | array | [0,0,0] | `[x, z, headingDeg]` of the block origin (input port, or the node on the host for junctions). |
+| `y` | number | 0 | Elevation of the block in meters. |
+| `host` | string | - | Junction block: node name of the host block; empty = a block-free host path. |
+| `hostPathId` | string | - | Junction block: id of the host piece after the node (keeps the original path id). |
+| `frontPathId` | string | - | Junction block: id of the host piece before the node (the new front fragment). |
+
+```json
+{ "PathBlock": { "type": "PathBlock", "version": 1, "kind": "curve", "params": { "radiusM": 1.5, "degrees": 90, "side": "left" }, "pose": [2, 0, 0] } }
+```
+
+#### 7a.99 BlockageBudget
+
+Missing fields inherit from the nearest applicable ancestor, then document defaults. MaxIdleSec must be at least MaxWaitSec. Null explicitly requests inheritance. Numeric fields can be cleared in the inspector to inherit.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| MaxWaitSec | number or null | - | Wait age considered overdue. Inherited default: 60 s. |
+| MaxIdleSec | number or null | - | Minimum time without progress; at least MaxWaitSec. Inherited default: 120 s. |
+| WarmupSec | number or null | - | Run warmup before findings. Inherited default: 30 s. |
+| ExpectedWaits | string[] | - | Expected wait kinds; inherited default: charge, setup, failure, empty. |
+| Exempt | boolean | - | Exclude this subtree from checking. |
+| Scope | enum(node, subtree) | "subtree" | Controls the scope of this declaration. |
+| ExpectFlow | boolean | - | Require sinks in this subtree to consume during an active run. |
+| Severity | enum(error, warning, info) | - | Finding severity; inherited default: warning. |
+| SignalSuppress | ComponentReference | - | True means expected waiting throughout this subtree. |
+| SignalBlockageFound | ComponentReference | - | Reports a finding in the declared scope at a checker sample. |
+
 ### 7b. Logic Steps
 
 Logic steps describe sequential control logic. A node carrying a `LogicStep_*`
 component is one step; **hierarchy order defines execution order** inside a
-container. The top-level `LogicStep_SerialContainer` loops automatically. The
+container. The top-level `LogicStep_SerialContainer` loops automatically; a
+`LogicStep_SerialContainer` nested in a Serial or Parallel container runs once
+per start and then finishes, so its parent continues (as in Unity). The
 `Active` field on every step is an `ActiveOnly` gate (Section 7c table footnote):
 `enum(Always, Connected, Disconnected, Never, DontChange)`, default `"Always"`.
 
@@ -2302,12 +2865,15 @@ Drives a Drive to a destination and waits for arrival.
 
 #### 7b.8 LogicStep_DriveTo
 
-Same semantics as LogicStep_DriveToPosition.
+Same semantics as LogicStep_DriveToPosition, plus an optional destination signal: if `DestinationFromPLCOutput`
+holds a value other than 0 when the logic is built, the step drives to the signal value and follows the
+signal; a change during a running move takes effect on the next start.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `drive` | ComponentReference | - | Drive to move. |
 | `Destination` | number | 0 | Destination position in millimeters or degrees. |
+| `DestinationFromPLCOutput` | ComponentReference | - | Optional PLCOutputFloat (Unity: *Get Position from Signal*). Not 0 at build → destination source; 0 → `Destination` is used. |
 | `Relative` | boolean | false | If true Destination is relative to the current position. |
 | `Direction` | string | - | Reserved; consumed for parity, not evaluated by the v1 reference implementation. |
 | `Active` | ActiveOnly | - | Connection-state gate: whether this step participates depending on the live-connection state. |
@@ -2602,7 +3168,7 @@ Post-load re-structuring directive from the Unity Kinematic tool.
 
 **Reference implementation notes (informative):**
 - realvirtual WEB applies the re-parenting once, before the bake (group integration first, then `KinematicParentEnable`); cycles are skipped.
-- `Kinematic` is not added with `web_editor_add_component`: create it with `web_editor_kinematize` or `web_editor_create_kinematic` and assign parts with `web_editor_assign_to_kinematic`.
+- `Kinematic` is not added with `editor.addComponent`: create it with `editor.kinematize` or `editor.createKinematic` and assign parts with `editor.assignToKinematic` (registry commands, run via `web_execute`).
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -2708,8 +3274,10 @@ reporting are specified in Section 5b.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `byNodeId` | object | - | NodeId of a node in the referenced subtree → merge patch over that node's extras.realvirtual. |
-| `byPath` | object | - | Fallback addressing: node path relative to the reference node → the same merge-patch shape. Consulted only after byNodeId misses. |
+| `byAddress` | object | - | Address relative to the referenced asset (`#<NodeId>`, `<b>#<NodeId>`, …) → merge patch over that node's extras.realvirtual. The only map a writer produces. |
+| `byNodeId` | object | - | LEGACY, read only: NodeId → merge patch, read as `byAddress['#<NodeId>']` (a `byAddress` entry wins field by field). Never written. |
+| `byPath` | object | - | LEGACY, read only: node path relative to the reference node → the same merge-patch shape; resolved when applied and written back as its address, an unresolved path is kept and reported. |
+| `trsByNodeId` | object | - | REMOVED: earlier drafts' part moves (local TRS by NodeId). Readers MUST NOT apply them and SHOULD report how many a file carried; writers MUST NOT write the key. |
 
 #### 7d.10 SceneCamera
 
@@ -2792,16 +3360,27 @@ so a virtual PLC (roots with `Active: Disconnected`) runs; `PLC` starts
 3D-HMI marker: an operator panel window described as JSON. Every
 `WebOperatorPanel` of a model (main model and placements) opens one window with
 IEC control-box devices: illuminated push buttons, two-position selector
-switches, emergency stops, a stack light, title-bar chips and a status line.
+switches, emergency stops, setpoint sliders, numeric readouts, a stack light,
+title-bar chips and a status line.
 Buttons, selectors and E-stops write PLC inputs; lamps show PLC outputs. The
 whole panel is the `Config` string — no code. Pure UI metadata, no Unity
 runtime function.
 
+Two devices are analog (format version 1, added for policy-driven machines
+whose command is a value and not a bit): a `sliders` entry WRITES a number to
+its signal, live while dragged, and a `readouts` entry READS a signal and
+shows its value with a unit. Every other device is boolean, as a control box
+is. Both lists are optional and a panel without them behaves exactly as
+before.
+
 The `Config` JSON (format version 1) carries `version`, `id`, `title`, optional
-`width` / `position` / `columns`, the device lists `buttons`, `selectors`,
-`estops`, `stackLight`, optional `chips`, the ordered `status` rules and an
+`width` / `position` / `columns`, the optional window keys `resizable` and
+`height`, the device lists `buttons`, `selectors`,
+`estops`, `stackLight`, the optional analog lists `sliders` and `readouts`,
+optional `chips`, the ordered `status` rules and an
 optional `restart` sequence. Devices sit on a grid (1-based `row` / `col`);
-devices sharing a cell stack. Conditions are data:
+devices sharing a cell stack, and a device may widen itself across columns
+with `span`. Conditions are data:
 `{ "signal": "S", "is": true }`, `{ "all": [ ... ] }`, `{ "any": [ ... ] }`,
 `{ "not": { ... } }`. The full field list, the IEC colour rules and examples
 are served by the MCP guide `web_help("operator-panel")`.
@@ -2809,21 +3388,52 @@ are served by the MCP guide `web_help("operator-panel")`.
 **Authoring rules:**
 - `Config` must parse as JSON and validate; a reader reports each problem with its JSON path (for example buttons[3].signal 'BT9' not found in model) and renders the window disabled with the messages instead of working controls.
 - Every signal `Config` names must exist in the model; a button writes true while held and false on release, a selector writes the value of its position, an E-stop is normally closed (pressed writes false).
+- A `sliders` entry needs `min` and `max` with `max` greater than `min`, an optional `step` greater than 0, and writes the dial's value to its signal as a number; a non-finite value is never written. A `readouts` entry writes nothing — it shows `signal * scale` with `decimals` digits, and `--` while the panel is not connected or the value is not finite.
+- A `readouts` entry names EITHER `signal` (one value) OR `signals` (a vector of 2 to 4, shown as one instrument with one legend and an optional `componentLabels` caption per component) — never both and never neither. There is no readout that shows an image; a camera view is not expressible in a panel today.
 - Several `WebOperatorPanel` components per model are allowed, one window each; `Dock` places a window only when `Config` has no position, windows in one corner stack.
 
 **Reference implementation notes (informative):**
-- Authoring by MCP: `web_editor_add_component` adds the component, `web_editor_set_field` sets `Config` (valueJson = the JSON as a JSON string), `web_editor_save` stores it in the GLB; a field edit re-renders the window without a reload.
+- Authoring by MCP: the commands `editor.addComponent` (adds the component) and `editor.setField` (sets `Config` valueJson = the JSON as a JSON string) run via `web_execute`, `web_editor_save` stores it in the GLB; a field edit re-renders the window without a reload.
 - The inspector edits `Config` as a monospace JSON field, validated on blur; text that is not JSON is never applied. An unusable panel is also listed in the Problems panel.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `Title` | string | "" | Window title; empty uses the title in Config. |
-| `Config` | string | "" | The operator panel as a JSON string (version, id, title, buttons, selectors, estops, stackLight, chips, status, restart). Must parse and validate; every signal it names must exist in the model. |
+| `Config` | string | "" | The operator panel as a JSON string (version, id, title, buttons, selectors, estops, sliders, readouts, stackLight, chips, status, restart). Must parse and validate; every signal it names must exist in the model. |
 | `Dock` | enum(top-left, top-right, bottom-left, bottom-right) | "top-left" | Screen corner the window first appears in when Config has no position; several panels in one corner stack. |
 | `StartCollapsed` | boolean | false | If true the window starts collapsed to its title bar (chips, stack light and the E-stop stay reachable). |
 
 ```json
 { "WebOperatorPanel": { "Title": "Operator panel", "Dock": "top-left", "StartCollapsed": false, "Config": "{\"version\":1,\"id\":\"cell-panel\",\"title\":\"Cell\",\"buttons\":[{\"label\":\"Start\",\"signal\":\"S_Start\",\"capColor\":\"green\",\"row\":1,\"col\":1}],\"selectors\":[],\"estops\":[],\"stackLight\":[],\"status\":[{\"kind\":\"idle\",\"tone\":\"neutral\",\"text\":\"READY\"}]}" } }
+```
+
+#### 7d.15 InstanceScope
+
+Signal scope of an embedded copy. Two copies of the same asset that are part
+of one document (not placements) would share every signal the runtime
+generates for them (behavior and material-flow signals, a sensor's occupied
+signal), because those names are scoped only by a placement root. An
+`InstanceScope` on the root of each copy gives it its own scope: generated
+signal names below it become `<prefix>.<name>`, where the prefix is the NAME
+of the node `PrefixNode` points at, or of the node carrying the component when
+`PrefixNode` is empty. Authored signal names stay unchanged, exactly as inside
+a placement.
+
+**Authoring rules:**
+- Put one `InstanceScope` on the root node of each embedded copy; inside a placement it adds one more link to the scope chain (placement name, then prefix, then signal name).
+- `PrefixNode` is resolved like `Group.GroupNamePrefix`: its node's name is used, so the prefixes of two copies must differ for their signals to separate.
+- Without the component nothing changes: every signal name stays as it was.
+
+**Reference implementation notes (informative):**
+- Two embedded copies without the component that claim the same signal name are listed in the Problems panel as instance-signal-collision (one entry per name, with every claiming node path). It is a warning only; the copies keep sharing the signal.
+- Two path nodes with the same path id are listed as path-id-collision; path ids stay global and routing is unchanged.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `PrefixNode` | ComponentReference | - | Node whose name is the signal prefix; empty uses the node carrying the component. |
+
+```json
+{ "InstanceScope": { "PrefixNode": { "type": "ComponentReference", "path": "Agv_2/Label" } } }
 ```
 
 ### 7e. Recording

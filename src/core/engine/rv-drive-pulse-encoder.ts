@@ -8,6 +8,7 @@ import { registerComponent, loadSchemaFromSpec } from './rv-component-registry';
 import { NodeRegistry } from './rv-node-registry';
 import { createSignalWriter, type SignalWriter } from './rv-signal-store';
 import { debug } from './rv-debug';
+import { slotDeclare, slotUndeclare, slotWrite } from './rv-slot-io';
 
 /**
  * RVDrivePulseEncoder — TypeScript port of DrivePulseEncoder.cs
@@ -63,6 +64,9 @@ export class RVDrivePulseEncoder implements RVComponent {
       console.warn(`[DrivePulseEncoder] No Drive found at "${path}" — encoder inactive`);
       return;
     }
+    // The unwired slot stays bindable in the viewer (SlotIO, rv-slot-io.ts) —
+    // also while the encoder is inactive; it then reports a steady `false`.
+    slotDeclare(this, 'PulseEncoderSignal', 'feedback', { initial: false });
     if (!(this.PulseIntervall > 0)) {
       console.warn(`[DrivePulseEncoder] PulseIntervall must be > 0 at "${path}" — encoder inactive`);
       return;
@@ -76,7 +80,7 @@ export class RVDrivePulseEncoder implements RVComponent {
     );
     this.nextPulseAt = this.PulseIntervall + this.Offset;
     this.value = false;
-    if (this.PulseEncoderSignal) this.signalWriter.setByPath(this.PulseEncoderSignal, false);
+    slotWrite(this, 'PulseEncoderSignal', this.PulseEncoderSignal, false, this.signalWriter);
 
     this.afterUpdateCb = (d) => this.tick(d);
     drive.addAfterUpdate(this.afterUpdateCb);
@@ -90,11 +94,12 @@ export class RVDrivePulseEncoder implements RVComponent {
     if (drive.currentPosition > this.nextPulseAt) {
       this.nextPulseAt += this.PulseIntervall;
       this.value = !this.value;
-      if (this.PulseEncoderSignal) this.signalWriter?.setByPath(this.PulseEncoderSignal, this.value);
+      slotWrite(this, 'PulseEncoderSignal', this.PulseEncoderSignal, this.value, this.signalWriter);
     }
   }
 
   dispose(): void {
+    slotUndeclare(this);
     if (this.drive && this.afterUpdateCb) this.drive.removeAfterUpdate(this.afterUpdateCb);
     this.afterUpdateCb = null;
     this.drive = null;

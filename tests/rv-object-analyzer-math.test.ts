@@ -13,6 +13,7 @@ import {
   parsePathsParam,
   VIEW_DEFS,
 } from '../src/plugins/mcp-bridge/rv-object-analyzer-math';
+import { serializePathList } from '../src/core/hmi/rv-path-list';
 
 describe('parsePathsParam', () => {
   it('splits single-line input on commas and semicolons and trims', () => {
@@ -38,6 +39,40 @@ describe('parsePathsParam', () => {
 
   it('is defensive about non-string input', () => {
     expect(parsePathsParam(undefined as unknown as string)).toEqual([]);
+  });
+
+  it('reads a JSON array string: commas and semicolons inside a name survive', () => {
+    expect(parsePathsParam('["Asset/LINK,PLATE", "Asset/A;B"]')).toEqual(['Asset/LINK,PLATE', 'Asset/A;B']);
+    expect(parsePathsParam('  ["Asset/LINK,PLATE"]')).toEqual(['Asset/LINK,PLATE']);
+    expect(parsePathsParam('[]')).toEqual([]);
+  });
+
+  it('keeps the historic native-array contract: verbatim strings, invalid elements and empties dropped', () => {
+    expect(parsePathsParam(['Asset/LINK,PLATE', ' B ', ''])).toEqual(['Asset/LINK,PLATE', ' B ']);
+    expect(parsePathsParam(['A', 2, null] as unknown as string[])).toEqual(['A']);
+  });
+
+  it('refuses invalid JSON lists instead of splitting them', () => {
+    expect(() => parsePathsParam('["Asset/LINK,PLATE"')).toThrow(/not valid JSON/);
+    expect(() => parsePathsParam('[1, "A"]')).toThrow(/expected a string/);
+  });
+
+  it('keeps the legacy meaning: "A,B" is two paths', () => {
+    expect(parsePathsParam('A,B')).toEqual(['A', 'B']);
+  });
+
+  it('a serialised singleton with a comma round-trips intact (parse → serialise → parse)', () => {
+    const once = parsePathsParam('["Asset/LINK,PLATE"]');
+    expect(parsePathsParam(serializePathList(once))).toEqual(['Asset/LINK,PLATE']);
+  });
+
+  it('serialises ordinary names in the legacy plain form, JSON only where needed', () => {
+    expect(serializePathList(['A/B', 'C'])).toBe('A/B,C');
+    expect(serializePathList(['A/B', 'C'], '\n')).toBe('A/B\nC');
+    expect(serializePathList([])).toBe('');
+    expect(serializePathList(['A;B'])).toBe('["A;B"]');
+    expect(serializePathList(['[x]'])).toBe('["[x]"]');
+    expect(parsePathsParam(serializePathList(['[x]']))).toEqual(['[x]']);
   });
 });
 

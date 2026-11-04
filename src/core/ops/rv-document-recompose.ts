@@ -27,7 +27,7 @@
  * Two of those three have **no incremental API at all** — they are constructed
  * singletons. Building one would mean new merge paths through the group
  * registry, the arena planner and the batch table, i.e. exactly the do-not-touch
- * surface of `doc-render-picking.md` (§5.1). The full reload costs one parse of
+ * surface of `contract-bake-picking.md` (§5.1). The full reload costs one parse of
  * a file that is already in the blob cache and buys the phases verbatim,
  * because it IS the normal load path. So that is what ships, and the plan's
  * "Erwartungshaltung nach Runde 2" is confirmed rather than overridden.
@@ -53,7 +53,7 @@ import type { Object3D } from 'three';
 import { getAssetReference, isUnresolvedReferenceNode } from '../engine/rv-asset-reference';
 import { isMissingReferencePlaceholder } from '../engine/rv-missing-reference-placeholder';
 import { getNodeId } from '../engine/rv-node-id';
-import { recomposeProjection } from './rv-document-projection';
+import { isSupersededReload, recomposeProjection, type RvReplayGate } from './rv-document-projection';
 import {
   countInstanceOverrides,
   type RvDocumentStack,
@@ -94,6 +94,12 @@ export interface RvReloadedFrame {
    * the frame recorded on its way in are detached objects now.
    */
   isolatedRoots: Object3D[];
+  /**
+   * plan-774 F3: the authoring join's replay gate, when the placed references
+   * were not all materialised within its budget — ops that target placed
+   * content wait for the late settle.
+   */
+  replayGate?: RvReplayGate;
 }
 
 /** A reason the stack could not do what was asked, for the Problems panel. */
@@ -134,6 +140,12 @@ export interface RvRecomposeHost {
    * unions in — see {@link RvPendingOverrideSource}.
    */
   pendingOverrides?(): RvPendingOverrideSource | null;
+  /**
+   * plan-774 F10: is this reference node a placement the viewer is still
+   * materialising (`viewer.placements.isMaterializing(id)`)? Optional — a host
+   * without placements (test doubles) never answers `materializing`.
+   */
+  isMaterializing?(reference: Object3D): boolean;
   /** Surface a problem instead of throwing. */
   reportProblem?(problem: RvStackProblem): void;
 }
@@ -150,6 +162,12 @@ export type RvDescendRefusal =
   | 'embedded'
   /** A placeholder — composition resolved nothing, so there are no bytes. */
   | 'unresolved'
+  /**
+   * plan-774 F10: the reference is a placement still being materialised (its
+   * baked instance has not arrived yet). Turns into `ok` when it arrives, or
+   * into `unresolved` when it fails into its placeholder — never stays.
+   */
+  | 'materializing'
   /** The reference node carries no NodeId, so no occurrence can be formed. */
   | 'no-node-id'
   /** No root frame yet. */
@@ -167,7 +185,13 @@ export type RvBackOutcome =
   /** The top frame has unsaved work; the caller must run the exit guard. */
   | { status: 'blocked-dirty'; frame: RvStackFrame }
   /** The parent could not be reloaded. The stack was popped anyway. */
-  | { status: 'reload-failed'; frame: RvStackFrame; error: unknown };
+  | { status: 'reload-failed'; frame: RvStackFrame; error: unknown }
+  /**
+   * Review round 2 (R4): another document took the viewer while the parent was
+   * rebuilt (its reload or its replay was superseded). Not done and not an
+   * error — the stack was popped, but the parent is not what is on screen.
+   */
+  | { status: 'superseded'; frame: RvStackFrame };
 
 // ─── Controller ─────────────────────────────────────────────────────────
 
@@ -198,6 +222,11 @@ export class RvDescendController {
     // stand-in. The emptiness test alone would now wave a placeholder through;
     // the marker test alone would miss a composition run before Phase 8 (a
     // recompose against a cached tree, a fixture). Both stay.
+    // plan-774 F10: an editor load defers its references, so an EMPTY reference
+    // node is usually a placement on its way — `materializing` while the
+    // instancer still holds it, `unresolved` once it settled without content
+    // (a failed placement shows the placeholder, which the second test catches).
+    if (this.host.isMaterializing?.(reference)) return { ok: false, reason: 'materializing' };
     if (reference.children.length === 0) return { ok: false, reason: 'unresolved' };
     if (reference.children.every(isMissingReferencePlaceholder)) {
       return { ok: false, reason: 'unresolved' };
@@ -238,6 +267,9 @@ export class RvDescendController {
         occurrence,
       });
     } catch (e) {
+      // plan-774 F3: another document took the viewer while the child loaded —
+      // not a failure of the child, nothing to report.
+      if (isSupersededReload(e)) throw e;
       this.host.reportProblem?.({
         kind: 'child-missing',
         message: `The referenced asset could not be opened: ${String(e)}`,
@@ -281,6 +313,8 @@ export class RvDescendController {
     const parent = this.stack.top!;
     try {
       const roots = await recomposeFrame(parent, this.host);
+      // R4: superseded — nothing to isolate, and NOT an "ok".
+      if (roots === null) return { status: 'superseded', frame: parent };
       this.stack.reisolate(roots);
     } catch (e) {
       this.host.reportProblem?.({
@@ -308,7 +342,7 @@ export class RvDescendController {
 export async function recomposeFrame(
   frame: RvStackFrame,
   host: RvRecomposeHost,
-): Promise<Object3D[]> {
+): Promise<Object3D[] | null> {
   let reloaded: RvReloadedFrame = { isolatedRoots: [] };
   // The four steps live in `recomposeProjection` since plan-711 Phase 2+3 —
   // freeze, (switch projection), reload, replay without recording, restore.
@@ -322,11 +356,21 @@ export async function recomposeFrame(
   //    done. A frame stays in ONE projection, so its log is single-origin by
   //    construction and the projection filter would be a no-op here — stating
   //    it is cheaper than making the next reader prove it.
-  await recomposeProjection({
+  //  - plan-774 F3: the host's reload is the authoring join; its replay gate
+  //    (placements not ready in time) holds back the ops that target placed
+  //    content, and a SUPERSEDED reload (another document took the viewer)
+  //    ends the recompose without a replay — nothing to isolate then.
+  const outcome = await recomposeProjection({
     doc: frame.doc.document,
     replay: 'all',
     label: frame.name,
-    reload: async () => { reloaded = await host.reloadFrame(frame); },
+    reload: async () => {
+      reloaded = await host.reloadFrame(frame);
+      return { replayGate: reloaded.replayGate };
+    },
   });
+  // Review round 2 (R4): `null` = superseded (reload or replay) — the caller
+  // must not answer "done".
+  if (outcome.status === 'superseded') return null;
   return reloaded.isolatedRoots;
 }

@@ -284,6 +284,6 @@ describe('web_eye under WebGPU', () => {
     } as unknown as RVViewer;
     const tools = new McpObserveTools(() => stub);
     expect(parse(await tools.webEye('beauty')).error)
-      .toMatch(/classic WebGL renderer \(Settings → Visual → Renderer\)/);
+      .toMatch(/web_eye needs a renderer that can read pixels back/);
   });
 });

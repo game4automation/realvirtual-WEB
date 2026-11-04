@@ -19,6 +19,12 @@ import type { RVViewerPlugin } from '../../src/core/rv-plugin';
 import { RVViewer, type PluginOrigin } from '../../src/core/rv-viewer';
 import { UIPluginRegistry } from '../../src/core/rv-ui-registry';
 
+/**
+ * The field list (ViewerInternals + Object.assign) is intentionally maintained by hand.
+ * When plugin paths read a new RVViewer field, add it here. This known risk is
+ * documented in .docs/planfeature/plan-2100-webviewer-shared-fake-viewer.md;
+ * the guard/census is deferred there.
+ */
 export interface ViewerInternals {
   _plugins: RVViewerPlugin[];
   _pluginOrigins: Map<string, PluginOrigin>;
@@ -26,6 +32,7 @@ export interface ViewerInternals {
   _prePlugins: RVViewerPlugin[];
   _postPlugins: RVViewerPlugin[];
   _renderPlugins: RVViewerPlugin[];
+  _beforeFramePlugins: RVViewerPlugin[];
   _prePluginsSnapshot: readonly RVViewerPlugin[] | null;
   _postPluginsSnapshot: readonly RVViewerPlugin[] | null;
   _disabledIds: Set<string>;
@@ -56,6 +63,7 @@ export function createCoreViewer() {
     _prePlugins: [],
     _postPlugins: [],
     _renderPlugins: [],
+    _beforeFramePlugins: [],
     _prePluginsSnapshot: null,
     _postPluginsSnapshot: null,
     _disabledIds: new Set(),

@@ -114,6 +114,31 @@ describe('visual presets — apply / match', () => {
     expect(matchPreset(presets)).toBe('Partial');
   });
 
+  it('a three-mode preset file (predates raytraced) still yields full settings for all four modes (plan-762)', () => {
+    const old = makePreset('Old');
+    const modes = old.settings.modeSettings as unknown as Record<string, Record<string, unknown>>;
+    delete modes.raytraced;
+    modes.toon.lightIntensity = 0.33;
+    let applied: { modeSettings: Record<string, Record<string, unknown>> } | null = null;
+    const recorder = {
+      applyVisualSettings(s: typeof applied) { applied = s; },
+    } as unknown as RVViewer;
+    applyVisualPreset(recorder, old);
+    expect(applied).not.toBeNull();
+    expect(Object.keys(applied!.modeSettings).sort()).toEqual(['default', 'raytraced', 'simple', 'toon']);
+    expect(applied!.modeSettings.toon.lightIntensity).toBe(0.33);
+    expect(applied!.modeSettings.raytraced.shadowEnabled).toBe(false);
+    expect(loadVisualSettings().modeSettings.raytraced.shadowEnabled).toBe(false);
+  });
+
+  it('a preset that carries raytraced per-mode values applies them (plan-762)', () => {
+    const p = makePreset('RT');
+    const modes = p.settings.modeSettings as unknown as Record<string, Record<string, unknown>>;
+    modes.raytraced = { ...modes.raytraced, dirLightIntensity: 3.5 };
+    applyVisualPreset(viewer, p);
+    expect(loadVisualSettings().modeSettings.raytraced.dirLightIntensity).toBe(3.5);
+  });
+
   it('marks an environment override so model-load env presets do not clobber it on reload', () => {
     // Regression: applying a visual preset must set the env-user-modified flag,
     // else rv-model-plugin-manager re-applies the model default environment preset

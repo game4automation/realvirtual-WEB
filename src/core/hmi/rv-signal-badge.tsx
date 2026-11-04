@@ -1031,8 +1031,6 @@ export function SignalBadge({
     />
   );
 
-  if (!fc.enabled) return chip;
-
   // Interaction hint — rendered as the last tooltip line so both gestures are
   // discoverable: click = force, Shift+drag = create a signal link (plan-246).
   const hint = (fc.forced
@@ -1052,7 +1050,7 @@ export function SignalBadge({
     let topic: string | undefined;
     let nodePath: string | undefined;
     let usedBy: number | undefined;
-    if (tipOpen && viewer && signalName) {
+    if (fc.enabled && tipOpen && viewer && signalName) {
       // plan-566 F7: read from the lazily built usage index — never per tick.
       usedBy = ensureSignalUsageWiring(viewer)?.count(signalName);
       const store = viewer.signalStore;
@@ -1083,7 +1081,7 @@ export function SignalBadge({
     // silently overridden; the channel authority lookup stays tip-gated.
     const authorityNote = buildAuthorityNote({
       forced: fc.forced,
-      channelAuthority: tipOpen && signalName
+      channelAuthority: fc.enabled && tipOpen && signalName
         ? describeChannelAuthority(makeSignalChannelId(signalName))
         : undefined,
       remoteOverridesForce: remoteWriteOverridesForce(),
@@ -1109,6 +1107,7 @@ export function SignalBadge({
     // shown/fc.forced/meta are display inputs; tipOpen gates the heavy lookup.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
+    fc.enabled,
     tipOpen,
     viewer,
     signalName,
@@ -1124,6 +1123,9 @@ export function SignalBadge({
     dragSource?.interfaceId,
     dragSource?.topic,
   ]);
+
+  // All hooks must run before this early return; model clear can disable a mounted badge (customer field finding: crash).
+  if (!fc.enabled) return chip;
 
   // The tooltip is only worth keeping open (interactive + leaveDelay) when it
   // actually contains something clickable: a navigable signal node title or

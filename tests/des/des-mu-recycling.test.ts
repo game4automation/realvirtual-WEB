@@ -14,14 +14,14 @@
  * the free is DEFERRED until the last one fires or is cancelled — a queued
  * event never resolves to a wrong, recycled MU.
  *
- * Runs only in the private build (imports `@rv-private/plugins/des/*`).
+ * Imports `@rv/plugins/des/*` — DES is core code since plan-680.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Object3D } from 'three';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
-import { _resetDesHookCache } from '@rv-private/plugins/des/des-hook-adapter';
-import { resetDESMUCounter } from '@rv-private/plugins/des/rv-des-mu';
+import { DESRunner } from '@rv/plugins/des/des-runner';
+import { _resetDesHookCache } from '@rv/plugins/des/des-hook-adapter';
+import { resetDESMUCounter } from '@rv/plugins/des/rv-des-mu';
 import {
   createSelf,
   type MaterialFlowSelf,

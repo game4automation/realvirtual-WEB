@@ -50,7 +50,7 @@ import {
   getMechanismUiBridge,
   type MechanismForcesSnapshot,
 } from '../core/engine/rv-kinematic-registry';
-import { getTestSessionState, subscribeTestSession } from '@rv-private/plugins/asset-editor/test-session-store';
+import { getTestSessionState, subscribeTestSession } from '@rv-private/plugins/asset-editor/shared/test-session-store';
 
 /** Plugin id — the panel looks the recorder up under this. */
 export const MECHANISM_FORCE_RECORDER_ID = 'mechanism-force-recorder';

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { isInactiveWithin, hasInactiveDescendant } from './rv-authored-inactive';
+import { groupLabelsOf } from './rv-mu-group-labels';
+import { computeMUDetectionFrameBox, type DetectPartObb } from './rv-mu-collider-bounds';
+import { layerOfNode } from './rv-layers';
 import {
   Object3D, Vector3, Quaternion, Matrix4, Box3, Sphere,
   InstancedMesh, DynamicDrawUsage,
@@ -14,6 +18,7 @@ import type { RVTransportSurface } from './rv-transport-surface';
 import type { MUDissolve, MUGrow } from './rv-mu-dissolve';
 import { getTslMaterials } from './materials/material-factory';
 import type { MuComputeTransforms } from './materials/rv-mu-compute-tsl';
+import type { MuOwner } from './rv-mu-owner';
 
 // Pre-allocated temp vector for getWorldPosition (no GC in hot path)
 const _tmpWorldPos = new Vector3();
@@ -33,8 +38,9 @@ export function nextEngineMuId(): number {
 /** Subsystems that may hold an MU in place (plan-259 O1b owner tag).
  *  'grip' = RVGrip fix/unfix; 'connection' = typed connection (StopOnExit);
  *  'zone' = a Zone with the Hold effect (plan-521);
- *  'user' = the commissioning drag gesture holds it while the pointer is down (plan-567). */
-export type MuHolder = 'grip' | 'connection' | 'zone' | 'user';
+ *  'user' = the commissioning drag gesture holds it while the pointer is down (plan-567);
+ *  'pusher' = an `MUPusher` carries a pushed MU in front of the pushing one (plan-2016 S6b). */
+export type MuHolder = 'grip' | 'connection' | 'zone' | 'user' | 'pusher';
 
 /**
  * IMUAccessor — Unified interface abstracting over clone-based and
@@ -55,8 +61,12 @@ export interface IMUAccessor {
   /** True while the physics provider owns this MU's pose (plan-276 F4) — the
    *  kinematic transport pipeline skips it (like `isGripped`, but provider-
    *  owned). Set by the transport manager at the conveyor-end handover;
-   *  cleared by the physics plugin on the settle return (F7). */
+   *  cleared by the physics plugin on the settle return (F7).
+   *  Compatibility view of {@link owner} (plan-661): true for `'rapier'` or
+   *  `'box2d'`. Writing it is a legacy path — production code uses `setMuOwner`. */
   physicsOwned: boolean;
+  /** Engine that owns the pose (plan-661). Change only via `setMuOwner`. */
+  owner: MuOwner;
   /** Physics-provider body handle (`String(mu.id)`); null while kinematic.
    *  Read by `IPhysicsMUHook.onMUDisposed` to free the body on any dispose
    *  path (F14) — hence part of the accessor interface. */
@@ -121,6 +131,35 @@ export const muPoolGrowth = { count: 0, ms: 0 };
 const _walkPos = new Vector3();
 const _walkQuat = new Quaternion();
 const _walkScale = new Vector3();
+const _refreshScale = new Vector3();
+const _zeroVec = new Vector3();
+const _detectBox = new Box3();
+const _detectHalf = new Vector3();
+const _detectCenter = new Vector3();
+const _detectParts: Box3[] = [];
+const _detectLayers: number[] = [];
+const _detectNodes: Object3D[] = [];
+const _detectObbs: DetectPartObb[] = [];
+
+/** One single collider box of an MU's detection shape, in the MU rotation frame
+ *  (world units): `center +- half` (plan-2016 S5 Codex fix). */
+export interface DetectPartSpec { half: Vector3; center: Vector3 }
+
+type DetectShape = { aabb: AABB; detectAabb?: AABB; detectParts?: readonly AABB[] | null };
+
+/**
+ * Sensor overlap of `box` with an MU's detection shape (plan-2016 S5 Codex fix):
+ * the union `detectAabb` as broadphase, then the single collider boxes when the
+ * MU has several, because the union alone fills the gaps between them.
+ */
+export function muDetectOverlaps(mu: DetectShape, box: AABB): boolean {
+  if (!box.overlaps(mu.detectAabb ?? mu.aabb)) return false;
+  const parts = mu.detectParts;
+  if (!parts) return true;
+  for (let i = 0; i < parts.length; i++) if (box.overlaps(parts[i])) return true;
+  return false;
+}
+
 
 /**
  * Authored pose of a pre-placed MU (plan-516), captured at classification and
@@ -137,6 +176,41 @@ export interface PreplacedSnapshot {
 export class RVMovingUnit implements IMUAccessor {
   readonly node: Object3D;
   readonly aabb: AABB;
+  /** The box SENSORS test against (plan-2016 S5 fix, Unity parity: a Unity sensor
+   *  hits the MU's colliders, not its mesh). Same object as {@link aabb} unless
+   *  {@link setDetectionBox} gave the MU its authored BoxCollider shape; transport,
+   *  accumulation, grid and sinks keep using {@link aabb}. */
+  detectAabb: AABB;
+  /** Local half-extents of a separate detection box (null = shares {@link aabb}). */
+  private _detectLocalHalf: Vector3 | null = null;
+  /** Upper bound (m) of how far {@link detectAabb} can reach beyond {@link aabb} —
+   *  the MU grid indexes `aabb`, so a sensor's grid query widens by this. 0 = shared. */
+  detectMargin = 0;
+  /** The single collider boxes behind {@link detectAabb} when there are two or
+   *  more (plan-2016 S5 Codex fix): the union box fills the gaps between them, so
+   *  sensors use it only as the broadphase and then test these. null = the
+   *  detection box IS the collider. */
+  detectParts: AABB[] | null = null;
+  private _detectPartHalves: Vector3[] = [];
+  /** Unity layer of each {@link detectParts} entry (plan-2016 S6c; null when there
+   *  are no parts). -1 = unknown, never filtered. */
+  detectPartLayers: number[] | null = null;
+  /** Unity layer of the detection box when it has no {@link detectParts}: the one
+   *  collider's node, else (mesh box) the MU root. -1 = unknown, never filtered. */
+  detectLayer = -1;
+  /** Unity layer of the MU root (`extras.layer`, or the clone stash of a spawned
+   *  MU); -1 = unknown. What `WebPhysicsZone.LimitToLayers` filters on (plan-2016 S7). */
+  get layer(): number { return layerOfNode(this.node); }
+  /** The node carrying each {@link detectParts} entry (null when there are no parts,
+   *  or for a pooled template copy): the collider's IDENTITY. A raycast sensor
+   *  fires a new MU-enter when its beam moves from one collider of the MU to
+   *  another (Unity `Sensor.FixedUpdate`: exit + enter on `hit.collider` change). */
+  detectPartNodes: Object3D[] | null = null;
+  /** Node of the ONE collider when the detection box is a single collider (no parts). */
+  private _detectSingleNode: Object3D | null = null;
+  /** Exact oriented box + collider index of every collider part (also of a single
+   *  one); null = mesh box (plan-2016 Codex review). Index = {@link detectParts}. */
+  private _detectObbs: DetectPartObb[] | null = null;
   readonly sourceName: string;
 
   /** True for an MU authored in the scene (no Source spawned it, plan-516).
@@ -165,10 +239,25 @@ export class RVMovingUnit implements IMUAccessor {
   /** Which transport surface is currently moving this MU (null = free) */
   currentSurface: RVTransportSurface | null = null;
 
+  /** Kinematic surface settle state; preallocated for the transport hot path. */
+  settleSpeed = 0;
+  settleSurface: RVTransportSurface | null = null;
+
   /** Most recent surface that drove this MU; survives the MU running off the end
    *  (when `currentSurface` becomes null) so the end-of-line vanish can still
    *  check THAT surface's outgoing-snap connectivity. */
   lastSurface?: RVTransportSurface | null;
+
+  /** Seconds without support — the grace clock of the drop detection
+   *  (plan-2022). Reset the moment one of its four conditions breaks again.
+   *  Diagnostic only, same pattern as {@link offSurfaceTime}. */
+  unsupportedTime?: number;
+  /** True once something held, loaded or carried this MU (plan-2022 E7): only such a part can LOSE its support. */
+  wasCarried?: boolean;
+  /** `unsupportedTime` at the last support ray; gates `SupportRecheckInterval`. */
+  supportProbeAt?: number;
+  /** Result of the last support ray (true = something underneath). */
+  supported?: boolean;
 
   /** Marked for removal by Sink */
   markedForRemoval = false;
@@ -177,9 +266,12 @@ export class RVMovingUnit implements IMUAccessor {
    *  advance this tick (it is jammed behind another MU). Diagnostic only —
    *  reset to false by the transport manager before each transport step. */
   blocked = false;
+  /** Diagnostic accumulation blocker, in the engine-wide MU id space. */
+  blockedBy: number | null = null;
 
-  /** Stable engine-wide numeric MU id (script SDK `mu.id` id space). */
-  readonly id = nextEngineMuId();
+  /** Stable engine-wide numeric MU id (script SDK `mu.id` id space). A clone that
+   *  replaces an instanced MU (plan-2016 S4 promote) keeps the instance's id. */
+  readonly id: number;
 
   /** Owner tag (plan-259 O1b): which subsystem currently holds this MU in
    *  place. `'grip'` = attached to an RVGrip; `'connection'` = held by a typed
@@ -198,9 +290,20 @@ export class RVMovingUnit implements IMUAccessor {
   /** The original parent before gripping (for restoring on ungrip) */
   parentBeforeGrip: Object3D | null = null;
 
+  /** The `Source.Destination` node this MU was spawned under (plan-2016 S1), else null.
+   *  While the MU is still its child, the transport loop leaves it alone so it rides
+   *  with that node; a grip that re-parents it ends that. */
+  destinationParent: Object3D | null = null;
+
   /** True while the physics provider owns this MU's pose (plan-276 F4).
-   *  The kinematic transport loop, accumulation queries and grips skip it. */
-  physicsOwned = false;
+   *  The kinematic transport loop, accumulation queries and grips skip it.
+   *  Compatibility view of {@link owner} (plan-661). */
+  get physicsOwned(): boolean { return this.owner !== 'transport'; }
+  /** Legacy write path (tests, old callers): true = Rapier, false = transport. */
+  set physicsOwned(v: boolean) { this.owner = v ? 'rapier' : 'transport'; }
+
+  /** Engine that owns the pose (plan-661). Change only via `setMuOwner`. */
+  owner: MuOwner = 'transport';
 
   /** Physics-provider body handle (`String(this.id)`); null while kinematic. */
   physicsBodyId: string | null = null;
@@ -255,7 +358,8 @@ export class RVMovingUnit implements IMUAccessor {
    *  a turntable corner keeps a detection box that matches the visible mesh. */
   private readonly _localHalf: Vector3;
 
-  constructor(node: Object3D, sourceName: string, halfSize?: Vector3, localCenter?: Vector3) {
+  constructor(node: Object3D, sourceName: string, halfSize?: Vector3, localCenter?: Vector3, id?: number) {
+    this.id = id ?? nextEngineMuId();
     this.node = node;
     this.sourceName = sourceName;
 
@@ -265,6 +369,165 @@ export class RVMovingUnit implements IMUAccessor {
       this.aabb = AABB.fromNode(node);
     }
     this._localHalf = this.aabb.halfSize.clone();
+    this.detectAabb = this.aabb;
+    this.detectLayer = layerOfNode(node);
+  }
+
+  /**
+   * Give the MU a separate sensor detection box: the authored BoxCollider shape
+   * in the MU's rotation frame (world units, same convention as the constructor's
+   * `halfSize` / `localCenter`). Sensors then detect the collider, not the mesh
+   * (Unity `Physics.Raycast` / trigger overlap against the MU's colliders).
+   */
+  setDetectionBox(halfSize: Vector3, localCenter: Vector3): void {
+    if (this._detectLocalHalf) {
+      this.detectAabb.localCenter.copy(localCenter);
+      this._detectLocalHalf.copy(halfSize);
+      this.detectMargin = localCenter.distanceTo(this.aabb.localCenter) + halfSize.length();
+      this.updateAABB();
+      return;
+    }
+    this.detectAabb = AABB.fromHalfSize(this.node, halfSize, localCenter);
+    this._detectLocalHalf = halfSize.clone();
+    this.detectMargin = localCenter.distanceTo(this.aabb.localCenter) + halfSize.length();
+    this.updateAABB();
+  }
+
+  /**
+   * Re-measure the MU's mesh box from the CURRENTLY active variant (plan-2016 S5
+   * fix): after a MUSwitcher switched groups, transport and grid see the new
+   * shape. Inactive variants and the subtrees of passive loads do not count.
+   * The sensor detection box is re-derived too: the union of the now ACTIVE
+   * colliders (`computeMUDetectionFrameBox`), else the mesh box again.
+   * A pre-placed MU is defined by its colliders and keeps its boxes. Returns
+   * whether the mesh box was re-measured.
+   */
+  refreshShapeFromMeshes(): boolean {
+    const exclude = this.loadedMus.length > 0 ? new Set(this.loadedMus.map((m) => m.node)) : undefined;
+    // A pre-placed MU's transport box comes from its solid colliders and stays;
+    // its SENSOR shape follows the active colliders like every other MU's.
+    if (!this.preplaced) {
+      const info = computeTemplateAABBInfo(this.node, exclude);
+      // An empty mesh box (a variant without render geometry) keeps the old
+      // transport box; the detection shape below is refreshed regardless.
+      if (info.halfSize.lengthSq() > 0) {
+        this.node.getWorldScale(_refreshScale);
+        info.halfSize.multiply(_refreshScale);
+        info.localCenter.multiply(_refreshScale);
+        this._localHalf.copy(info.halfSize);
+        this.aabb.localCenter.copy(info.localCenter);
+      }
+    }
+    this.refreshDetectionShape(exclude);
+    return true;
+  }
+
+  /**
+   * (Re-)derive the sensor detection shape from the MU's currently ACTIVE
+   * colliders (`computeMUDetectionFrameBox`): union box plus, for two or more
+   * colliders, the single boxes. No active collider = sensors use the mesh box.
+   * Used at classification and after a MUSwitcher switch (plan-2016 S5).
+   */
+  refreshDetectionShape(exclude?: ReadonlySet<Object3D>): void {
+    if (computeMUDetectionFrameBox(this.node, _detectBox, exclude, _detectParts, _detectLayers, _detectNodes, _detectObbs)) {
+      this.setDetectionBox(_detectBox.getSize(_detectHalf).multiplyScalar(0.5), _detectBox.getCenter(_detectCenter));
+      this.setDetectionParts(_detectParts, _detectLayers, _detectNodes, _detectObbs);
+    } else {
+      this.detectAabb = this.aabb;
+      this._detectLocalHalf = null;
+      this.detectMargin = 0;
+      this.setDetectionParts(null);
+    }
+    this.updateAABB();
+  }
+
+  /**
+   * Set the single collider boxes behind the detection box (frame boxes in the
+   * MU rotation frame, world units: the `parts` of `computeMUDetectionFrameBox`).
+   * Fewer than two = none kept (the detection box is exact then).
+   */
+  setDetectionParts(
+    parts: readonly Box3[] | null, layers?: readonly number[], nodes?: readonly Object3D[],
+    obbs?: readonly DetectPartObb[],
+  ): void {
+    // plan-2016 S6c: one collider → its node's layer; none (mesh box) → the root's.
+    this.detectLayer = parts && parts.length === 1 && layers && layers.length === 1
+      ? layers[0] : layerOfNode(this.node);
+    this._detectObbs = parts && parts.length > 0 && obbs && obbs.length === parts.length
+      ? obbs.map((o) => ({ rot: o.rot.clone(), half: o.half.clone(), colliderIndex: o.colliderIndex }))
+      : null;
+    if (!parts || parts.length < 2) {
+      this.detectParts = null;
+      this._detectPartHalves = [];
+      this.detectPartLayers = null;
+      this.detectPartNodes = null;
+      this._detectSingleNode = parts && parts.length === 1 && nodes && nodes.length === 1 ? nodes[0] : null;
+      return;
+    }
+    this._detectSingleNode = null;
+    this.detectPartLayers = layers && layers.length === parts.length ? [...layers] : null;
+    this.detectPartNodes = nodes && nodes.length === parts.length ? [...nodes] : null;
+    this.detectParts = parts.map((b) => AABB.fromHalfSize(
+      this.node, b.getSize(new Vector3()).multiplyScalar(0.5), b.getCenter(new Vector3())));
+    this._detectPartHalves = this.detectParts.map((a) => a.halfSize.clone());
+    this.updateAABB();
+  }
+
+  /** Half extents, in the detection frame ({@link detectQuaternion}), of detection
+   *  part `i`, or of the single detection box for `i < 0` (plan-2016 sensor parity:
+   *  the raycast tests the ORIENTED box, not its world enclosure). */
+  detectHalf(i: number): Vector3 {
+    if (i >= 0) return this._detectPartHalves[i];
+    return this._detectLocalHalf ?? this._localHalf;
+  }
+
+  /** World rotation of the detection frame — the MU node's world rotation. */
+  detectQuaternion(out: Quaternion): Quaternion {
+    return this.node.getWorldQuaternion(out);
+  }
+
+  /** Half extents of the EXACT oriented box of part `i` (`i < 0`: the single
+   *  detection box) along its own axes ({@link detectObbRotation}); the frame box
+   *  half ({@link detectHalf}) when no collider OBB is known (mesh box). */
+  detectObbHalf(i: number): Vector3 {
+    const obbs = this._detectObbs;
+    if (obbs) {
+      if (i >= 0 && i < obbs.length) return obbs[i].half;
+      if (i < 0 && obbs.length === 1) return obbs[0].half;
+    }
+    return this.detectHalf(i);
+  }
+
+  /** Rotation of part `i`'s oriented box relative to the detection frame
+   *  ({@link detectQuaternion}); null = aligned with the frame. */
+  detectObbRotation(i: number): Quaternion | null {
+    const obbs = this._detectObbs;
+    if (obbs) {
+      if (i >= 0 && i < obbs.length) return obbs[i].rot;
+      if (i < 0 && obbs.length === 1) return obbs[0].rot;
+    }
+    return null;
+  }
+
+  /** Identity of the collider behind detection part `i` (`i < 0`: the single
+   *  detection box) — the node carrying it; the MU root for a mesh box. Together
+   *  with {@link detectColliderSub} it names ONE collider; the same collider keeps
+   *  its identity when a MUSwitcher re-derives the shape. */
+  detectColliderKey(i: number): unknown {
+    if (i >= 0 && this.detectPartNodes) return this.detectPartNodes[i];
+    if (i < 0 && this._detectSingleNode) return this._detectSingleNode;
+    return this.node;
+  }
+
+  /** Second half of the collider identity ({@link detectColliderKey}): the index of
+   *  the collider in its node's collider list (a node can carry several); -1 for a
+   *  mesh box. */
+  detectColliderSub(i: number): number {
+    const obbs = this._detectObbs;
+    if (!obbs) return -1;
+    if (i >= 0 && i < obbs.length) return obbs[i].colliderIndex;
+    if (i < 0 && obbs.length === 1) return obbs[0].colliderIndex;
+    return -1;
   }
 
   // ─── IMUAccessor implementation (clone mode) ────────────────────
@@ -334,11 +597,31 @@ export class RVMovingUnit implements IMUAccessor {
       this.node.matrixWorld.decompose(_walkPos, _walkQuat, _walkScale);
       this.aabb.setHalfSizeFromRotatedExtents(this._localHalf, _walkQuat);
       this.aabb.updateFrom(_walkPos, _walkQuat);
+      if (this._detectLocalHalf) {
+        this.detectAabb.setHalfSizeFromRotatedExtents(this._detectLocalHalf, _walkQuat);
+        this.detectAabb.updateFrom(_walkPos, _walkQuat);
+      }
+      if (this.detectParts) {
+        for (let i = 0; i < this.detectParts.length; i++) {
+          this.detectParts[i].setHalfSizeFromRotatedExtents(this._detectPartHalves[i], _walkQuat);
+          this.detectParts[i].updateFrom(_walkPos, _walkQuat);
+        }
+      }
       return;
     }
     this.node.getWorldQuaternion(_aabbWorldQuat);
     this.aabb.setHalfSizeFromRotatedExtents(this._localHalf, _aabbWorldQuat);
     this.aabb.update();
+    if (this._detectLocalHalf) {
+      this.detectAabb.setHalfSizeFromRotatedExtents(this._detectLocalHalf, _aabbWorldQuat);
+      this.detectAabb.update();
+    }
+    if (this.detectParts) {
+      for (let i = 0; i < this.detectParts.length; i++) {
+        this.detectParts[i].setHalfSizeFromRotatedExtents(this._detectPartHalves[i], _aabbWorldQuat);
+        this.detectParts[i].update();
+      }
+    }
   }
 
   /**
@@ -384,7 +667,7 @@ export function computeTemplateHalfSize(template: Object3D): Vector3 {
  * pivot at the bottom, mesh extends upward).  Without this, the AABB is displaced
  * and overlap checks (grip, sensor) fail.
  */
-export function computeTemplateAABBInfo(template: Object3D): TemplateAABBInfo {
+export function computeTemplateAABBInfo(template: Object3D, exclude?: ReadonlySet<Object3D>): TemplateAABBInfo {
   template.updateWorldMatrix(true, true);
   const inverse = new Matrix4().copy(template.matrixWorld).invert();
   const relative = new Matrix4();
@@ -392,15 +675,22 @@ export function computeTemplateAABBInfo(template: Object3D): TemplateAABBInfo {
   const box = new Box3();
   // MU.updateAABB applies the spawn's world orientation. Measure the template
   // in its OWN frame here, or a rotated CAD source gets rotated a second time.
-  template.traverse(node => {
+  const visit = (node: Object3D): void => {
+    if (exclude?.has(node)) return;
+    for (const child of node.children) visit(child);
     const mesh = node as Mesh;
     if (!mesh.isMesh || !mesh.geometry) return;
+    // plan-2016 S5: an authored-inactive variant (MUSwitcher group) is not part
+    // of the MU's size — like an inactive GameObject in Unity. The template
+    // root's own flag does not count (a Source activates every clone's root).
+    if (isInactiveWithin(node, template)) return;
     if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
     if (!mesh.geometry.boundingBox) return;
     relative.multiplyMatrices(inverse, node.matrixWorld);
     meshBox.copy(mesh.geometry.boundingBox).applyMatrix4(relative);
     box.union(meshBox);
-  });
+  };
+  visit(template);
   const size = new Vector3();
   box.getSize(size);
   const halfSize = size.multiplyScalar(0.5);
@@ -408,6 +698,25 @@ export function computeTemplateAABBInfo(template: Object3D): TemplateAABBInfo {
   box.getCenter(boxCenter);
   const localCenter = boxCenter;
   return { halfSize, localCenter };
+}
+
+const _cloneScaleTmp = new Vector3();
+
+/**
+ * Local scale a CLONE of `template` needs under `spawnParent` to keep the
+ * template's WORLD size (plan-655 F10, SOL finding 2): template world scale ÷
+ * spawn-parent world scale, per axis. Equals `template.scale` whenever both
+ * hang under the same (or an equally scaled) parent — the case every Source had
+ * before; it differs for a template inside a millimetre SolidCraft body (0.001)
+ * spawning into the unscaled model root. ONE rule for the spawned clone and
+ * for `templateSizeOf` (DES sizing), so the two cannot drift.
+ */
+export function spawnCloneScale(template: Object3D, spawnParent: Object3D, out: Vector3): Vector3 {
+  template.updateWorldMatrix(true, false);
+  spawnParent.updateWorldMatrix(true, false);
+  template.getWorldScale(out);
+  spawnParent.getWorldScale(_cloneScaleTmp);
+  return out.divide(_cloneScaleTmp);
 }
 
 // ─── Pre-allocated temps for InstancedMovingUnit (no GC in hot path) ──
@@ -428,6 +737,23 @@ export class InstancedMovingUnit implements IMUAccessor {
   private _node: InstancedMesh;
   get node(): InstancedMesh { return this._node; }
   readonly aabb: AABB;
+  /** See `RVMovingUnit.detectAabb`: the pool's collider box, else {@link aabb}. */
+  readonly detectAabb: AABB;
+  /** See `RVMovingUnit.detectMargin`. */
+  readonly detectMargin: number;
+  /** See `RVMovingUnit.detectParts`. */
+  readonly detectParts: AABB[] | null;
+  private readonly _detectPartHalves: Vector3[];
+  /** See `RVMovingUnit.detectPartLayers` — the pool's, i.e. the same as a clone of
+   *  the template (plan-2016 S7). */
+  readonly detectPartLayers: number[] | null;
+  /** See `RVMovingUnit.detectLayer` — the pool's (plan-2016 S7). */
+  readonly detectLayer: number;
+  /** See `RVMovingUnit.layer` — the template root's layer, kept by the pool
+   *  (plan-2016 S7): an instance has no node of its own to carry it. */
+  readonly layer: number;
+  /** See `RVMovingUnit.detectPartNodes` — a pooled instance has no nodes. */
+  readonly detectPartNodes: Object3D[] | null = null;
   readonly sourceName: string;
   readonly isInstanced = true;
 
@@ -439,6 +765,10 @@ export class InstancedMovingUnit implements IMUAccessor {
   /** Which transport surface is currently moving this MU (null = free) */
   currentSurface: RVTransportSurface | null = null;
 
+  /** Same settle state as clone MUs (pool positions are world-space). */
+  settleSpeed = 0;
+  settleSurface: RVTransportSurface | null = null;
+
   /** See `RVMovingUnit.lastSurface`. */
   lastSurface?: RVTransportSurface | null;
 
@@ -447,9 +777,15 @@ export class InstancedMovingUnit implements IMUAccessor {
 
   /** See `RVMovingUnit.blocked`. */
   blocked = false;
+  /** Diagnostic accumulation blocker, in the engine-wide MU id space. */
+  blockedBy: number | null = null;
 
-  /** See `RVMovingUnit.physicsOwned` (plan-276 F4). */
-  physicsOwned = false;
+  /** See `RVMovingUnit.physicsOwned` (plan-276 F4, plan-661 compat view). */
+  get physicsOwned(): boolean { return this.owner !== 'transport'; }
+  set physicsOwned(v: boolean) { this.owner = v ? 'rapier' : 'transport'; }
+
+  /** See `RVMovingUnit.owner` (plan-661). */
+  owner: MuOwner = 'transport';
 
   /** See `RVMovingUnit.physicsBodyId`. */
   physicsBodyId: string | null = null;
@@ -468,6 +804,15 @@ export class InstancedMovingUnit implements IMUAccessor {
 
   /** See `RVMovingUnit.offSurfaceTime`. */
   offSurfaceTime?: number;
+
+  /** See `RVMovingUnit.unsupportedTime` (plan-2022). */
+  unsupportedTime?: number;
+  /** See `RVMovingUnit.wasCarried`. */
+  wasCarried?: boolean;
+  /** See `RVMovingUnit.supportProbeAt`. */
+  supportProbeAt?: number;
+  /** See `RVMovingUnit.supported`. */
+  supported?: boolean;
 
   /** Pool that owns this instance */
   private pool: MUInstancePool;
@@ -493,6 +838,9 @@ export class InstancedMovingUnit implements IMUAccessor {
     sourceName: string,
     halfSize: Vector3,
     localCenter?: Vector3,
+    detectHalf?: Vector3,
+    detectCenter?: Vector3,
+    detectParts?: readonly DetectPartSpec[],
   ) {
     this.pool = pool;
     this.slotIndex = slotIndex;
@@ -508,10 +856,79 @@ export class InstancedMovingUnit implements IMUAccessor {
       localCenter,
     );
     this._localHalf = halfSize.clone();
+    if (detectHalf) {
+      this.detectAabb = AABB.fromPositionFn((out: Vector3) => this.getWorldPosition(out), detectHalf, detectCenter);
+      this._detectLocalHalf = detectHalf.clone();
+      this.detectMargin = (detectCenter ?? _zeroVec).distanceTo(localCenter ?? _zeroVec) + detectHalf.length();
+    } else {
+      this.detectAabb = this.aabb;
+      this._detectLocalHalf = null;
+      this.detectMargin = 0;
+    }
+    if (detectHalf && detectParts && detectParts.length > 1) {
+      this.detectParts = detectParts.map((p) => AABB.fromPositionFn((out: Vector3) => this.getWorldPosition(out), p.half, p.center));
+      this._detectPartHalves = detectParts.map((p) => p.half.clone());
+    } else {
+      this.detectParts = null;
+      this._detectPartHalves = [];
+    }
+    // plan-2016 S7: the same layers a clone of the template gets
+    // (`RVMovingUnit.setDetectionParts`) — shared arrays, never mutated.
+    this.layer = pool.layer;
+    const layers = pool.detectPartLayers;
+    this.detectPartLayers = this.detectParts && layers && layers.length === this.detectParts.length ? layers : null;
+    this.detectLayer = !this.detectParts && layers && layers.length === 1 ? layers[0] : pool.layer;
   }
 
   /** MU half-extents in its own local frame (see RVMovingUnit._localHalf). */
   private readonly _localHalf: Vector3;
+  /** Local half-extents of a separate detection box (null = shares `aabb`). */
+  private readonly _detectLocalHalf: Vector3 | null;
+
+  /** See `RVMovingUnit.detectHalf`. */
+  detectHalf(i: number): Vector3 {
+    if (i >= 0) return this._detectPartHalves[i];
+    return this._detectLocalHalf ?? this._localHalf;
+  }
+
+  /** See `RVMovingUnit.detectQuaternion` — the pool stores world rotations. */
+  detectQuaternion(out: Quaternion): Quaternion {
+    return out.copy(this.getQuaternion());
+  }
+
+  /** The pool's per-part OBB for detection part `i` (`i < 0`: a single collider). */
+  private obbOf(i: number): DetectPartObb | null {
+    const obbs = this.pool.detectObbs;
+    if (!obbs || !this._detectLocalHalf) return null;
+    if (i >= 0) return this.detectParts && i < obbs.length ? obbs[i] : null;
+    return !this.detectParts && obbs.length === 1 ? obbs[0] : null;
+  }
+
+  /** See `RVMovingUnit.detectObbHalf`. */
+  detectObbHalf(i: number): Vector3 {
+    return this.obbOf(i)?.half ?? this.detectHalf(i);
+  }
+
+  /** See `RVMovingUnit.detectObbRotation`. */
+  detectObbRotation(i: number): Quaternion | null {
+    return this.obbOf(i)?.rot ?? null;
+  }
+
+  /** See `RVMovingUnit.detectColliderKey` — a pooled instance has no collider
+   *  nodes: the instance itself, with {@link detectColliderSub} naming the collider. */
+  detectColliderKey(_i: number): unknown {
+    return this;
+  }
+
+  /** See `RVMovingUnit.detectColliderSub` — the pool's stable id of the template
+   *  collider behind part `i` (one id per template node + collider index, so the
+   *  render primitives of one MeshCollider share it); -1 = mesh box. */
+  detectColliderSub(i: number): number {
+    const ids = this.pool.detectColliderIds;
+    if (!ids || !this._detectLocalHalf) return -1;
+    if (i >= 0) return this.detectParts && i < ids.length ? ids[i] : -1;
+    return !this.detectParts && ids.length === 1 ? ids[0] : -1;
+  }
 
   /** @internal Called by MUInstancePool._grow() to update the backing mesh after pool resize. */
   _updateNode(mesh: InstancedMesh): void {
@@ -611,6 +1028,11 @@ export class InstancedMovingUnit implements IMUAccessor {
       || qx !== this._aabbQx || qy !== this._aabbQy || qz !== this._aabbQz || qw !== this._aabbQw
     ) {
       this.aabb.setHalfSizeFromRotatedExtents(this._localHalf, this.getQuaternion());
+      if (this._detectLocalHalf) this.detectAabb.setHalfSizeFromRotatedExtents(this._detectLocalHalf, this.getQuaternion());
+      if (this.detectParts) {
+        const q = this.getQuaternion();
+        for (let i = 0; i < this.detectParts.length; i++) this.detectParts[i].setHalfSizeFromRotatedExtents(this._detectPartHalves[i], q);
+      }
       this._aabbQx = qx; this._aabbQy = qy; this._aabbQz = qz; this._aabbQw = qw;
       this._aabbSlot = idx;
       this._aabbCacheValid = true;
@@ -619,6 +1041,8 @@ export class InstancedMovingUnit implements IMUAccessor {
       rvAabbCacheStats.skip++;
     }
     this.aabb.update();
+    if (this._detectLocalHalf) this.detectAabb.update();
+    if (this.detectParts) for (let i = 0; i < this.detectParts.length; i++) this.detectParts[i].update();
   }
 
   dispose(): void {
@@ -641,6 +1065,8 @@ const DEFAULT_MAX_INSTANCES = 128;
  * Bidirectional index mapping: slotIndex <-> InstancedMovingUnit
  */
 export class MUInstancePool {
+  /** Capacity multiplier used when the pool is exhausted. */
+  growthFactor = 2;
   /** The Three.js InstancedMesh (added to scene by caller) */
   instancedMesh: InstancedMesh;
 
@@ -662,6 +1088,28 @@ export class MUInstancePool {
   /** Cached half-size from template */
   readonly halfSize: Vector3;
   readonly localCenter: Vector3 | undefined;
+
+  /** Sensor detection box of every instance (the template's authored BoxCollider,
+   *  plan-2016 S5 fix); unset = sensors use the mesh box. Set before the first spawn. */
+  detectHalf: Vector3 | undefined;
+  detectCenter: Vector3 | undefined;
+  /** The single collider boxes behind `detectHalf`/`detectCenter` (plan-2016 S5 Codex fix). */
+  detectParts: DetectPartSpec[] | undefined;
+  /** Unity layer of the template root (plan-2016 S7) — every instance reports it as
+   *  its `layer`, like a clone's stash; -1 = unknown. Set before the first spawn. */
+  layer = -1;
+  /** Unity layer of each template collider box behind the detection box (one entry
+   *  per collider, also for a single one); undefined = unknown. Set before the first spawn. */
+  detectPartLayers: number[] | undefined;
+  /** Exact oriented box of each template collider part (one entry per part, also
+   *  for a single one; plan-2016 Codex review); undefined = unknown. Set before the first spawn. */
+  detectObbs: DetectPartObb[] | undefined;
+  /** Stable collider id of each part — equal for parts of the same template node
+   *  and collider index (plan-2016 Codex review). Set before the first spawn. */
+  detectColliderIds: number[] | undefined;
+
+  /** True when the geometry is a private baked copy (plan-2016 S6) disposed with the pool. */
+  ownsGeometry = false;
 
   /** slotIndex -> InstancedMovingUnit (null for free slots) */
   private slotToMU: (InstancedMovingUnit | null)[];
@@ -768,10 +1216,18 @@ export class MUInstancePool {
     _tmpMat4.compose(worldPos, quat, _oneVec);
     this.instancedMesh.setMatrixAt(slot, _tmpMat4);
     this._dirty = true;
+    // plan-2016 S6: keep the culling sphere valid NOW — the per-frame refresh in
+    // `updateInstanceMatrix` only runs on a transport tick, and a sphere three.js
+    // computed lazily before this spawn would cull the new instance until then.
+    _spawnSphere.center.copy(worldPos);
+    _spawnSphere.radius = poolGeometryOriginRadius(this.instancedMesh.geometry);
+    if (this.instancedMesh.boundingSphere && slot > 0) this.instancedMesh.boundingSphere.union(_spawnSphere);
+    else this.instancedMesh.boundingSphere = _spawnSphere.clone();
 
     // Create MU wrapper
     const mu = new InstancedMovingUnit(
       this, slot, muId, this.templateName, sourceName, this.halfSize, this.localCenter,
+      this.detectHalf, this.detectCenter, this.detectParts,
     );
     this.slotToMU[slot] = mu;
 
@@ -889,7 +1345,10 @@ export class MUInstancePool {
       }
     }
 
-    this.instancedMesh.instanceMatrix.needsUpdate = true;
+    const instanceMatrix = this.instancedMesh.instanceMatrix;
+    instanceMatrix.clearUpdateRanges();
+    instanceMatrix.addUpdateRange(0, this.activeCount * 16);
+    instanceMatrix.needsUpdate = true;
     this._cpuMatricesStale = false;
     this._dirty = false;
 
@@ -912,9 +1371,7 @@ export class MUInstancePool {
     miX: number, miY: number, miZ: number,
     maX: number, maY: number, maZ: number,
   ): void {
-    const geo = this.instancedMesh.geometry;
-    if (!geo.boundingSphere) geo.computeBoundingSphere();
-    const geoRadius = geo.boundingSphere?.radius ?? 0;
+    const geoRadius = poolGeometryOriginRadius(this.instancedMesh.geometry);
     const hx = (maX - miX) / 2, hy = (maY - miY) / 2, hz = (maZ - miZ) / 2;
     const sphere = this.instancedMesh.boundingSphere ?? new Sphere();
     sphere.center.set(miX + hx, miY + hy, miZ + hz);
@@ -1013,9 +1470,7 @@ export class MUInstancePool {
     }
 
     // Add geometry's own bounding sphere radius
-    const geo = this.instancedMesh.geometry;
-    if (!geo.boundingSphere) geo.computeBoundingSphere();
-    const geoRadius = geo.boundingSphere?.radius ?? 0;
+    const geoRadius = poolGeometryOriginRadius(this.instancedMesh.geometry);
 
     const sphere = this.instancedMesh.boundingSphere ?? new Sphere();
     sphere.center.set(cx, cy, cz);
@@ -1036,7 +1491,7 @@ export class MUInstancePool {
 
   private _growInner(): void {
     const oldMax = this.maxInstances;
-    const newMax = oldMax * 2;
+    const newMax = Math.max(oldMax + 1, Math.ceil(oldMax * this.growthFactor));
     console.warn(`[MUInstancePool] "${this.templateName}" pool exhausted (${oldMax}), growing to ${newMax}`);
 
     // Create new larger InstancedMesh
@@ -1052,6 +1507,8 @@ export class MUInstancePool {
     newMesh.receiveShadow = this.instancedMesh.receiveShadow;
     newMesh.name = this.instancedMesh.name;
     newMesh.userData._muPool = this;
+    // Carry the culling sphere across the swap (plan-2016 S6) — `spawn()` unions into it.
+    if (this.instancedMesh.boundingSphere) newMesh.boundingSphere = this.instancedMesh.boundingSphere.clone();
 
     // Copy existing matrices
     for (let i = 0; i < this.activeCount; i++) {
@@ -1137,7 +1594,9 @@ export class MUInstancePool {
       } catch { /* best effort */ }
       this._compute = null;
     }
-    // Don't dispose geometry/material — shared with template
+    // Don't dispose geometry/material — shared with template (unless the pool
+    // owns a baked copy, plan-2016 S6)
+    if (this.ownsGeometry) this.instancedMesh.geometry.dispose();
     this.activeCount = 0;
     this.slotToMU.fill(null);
   }
@@ -1145,6 +1604,26 @@ export class MUInstancePool {
 
 // Unit scale vector (shared, never modified)
 const _oneVec = new Vector3(1, 1, 1);
+const _analyzeRel = new Matrix4();
+const _spawnSphere = new Sphere();
+
+function isIdentityMatrix(m: Matrix4, eps = 1e-6): boolean {
+  const e = m.elements;
+  for (let i = 0; i < 16; i++) {
+    const want = (i % 5 === 0) ? 1 : 0;
+    if (Math.abs(e[i] - want) > eps) return false;
+  }
+  return true;
+}
+
+/** Radius of a sphere about the instance ORIGIN that encloses the pool geometry.
+ *  The geometry's own bounding sphere is centred on its centre, which is not the
+ *  instance origin once a child offset is baked in (plan-2016 S6). */
+function poolGeometryOriginRadius(geo: BufferGeometry): number {
+  if (!geo.boundingSphere) geo.computeBoundingSphere();
+  const bs = geo.boundingSphere;
+  return bs ? bs.center.length() + bs.radius : 0;
+}
 
 /**
  * Analyze a template node to determine if it can use InstancedMesh.
@@ -1156,7 +1635,20 @@ const _oneVec = new Vector3(1, 1, 1);
 export function analyzeTemplate(template: Object3D): {
   geometry: BufferGeometry;
   material: Material | Material[];
+  /** True when `geometry` is a private copy (child transform baked in) that the
+   *  pool owns and must dispose; false = the template's shared geometry. */
+  ownsGeometry: boolean;
 } | null {
+  // plan-2016 S5 fix: a template with switchable geometry (an authored-inactive
+  // node, or a group variant below the root = a MUSwitcher target) needs a real
+  // node subtree per MU; one InstancedMesh can neither hide nor switch a part.
+  if (hasInactiveDescendant(template)) return null;
+  let hasVariant = false;
+  template.traverse((child) => {
+    if (!hasVariant && child !== template && groupLabelsOf(child).length > 0) hasVariant = true;
+  });
+  if (hasVariant) return null;
+
   // Count mesh children
   let meshCount = 0;
   let firstMesh: InstancedMesh | null = null;
@@ -1170,8 +1662,25 @@ export function analyzeTemplate(template: Object3D): {
 
   // Single mesh -> can instance
   if (meshCount === 1 && firstMesh) {
-    const mesh = firstMesh as unknown as { geometry: BufferGeometry; material: Material | Material[] };
-    return { geometry: mesh.geometry, material: mesh.material };
+    const mesh = firstMesh as unknown as Object3D & { geometry: BufferGeometry; material: Material | Material[] };
+    // plan-2016 S6: an instance matrix carries only the MU ROOT pose, while the
+    // geometry lives in the mesh node's own frame. A mesh below the root with its
+    // own rotation/offset (the blow-moulding line FassMU/FassMU_1: rotated 90 deg) would otherwise
+    // be drawn lying down and offset. Bake the mesh-relative-to-root transform
+    // into a private copy of the geometry — the same frame `computeTemplateAABBInfo`
+    // measures halfSize/localCenter in.
+    template.updateWorldMatrix(true, true);
+    const rel = _analyzeRel.copy(template.matrixWorld).invert().multiply(mesh.matrixWorld);
+    if (isIdentityMatrix(rel)) {
+      return { geometry: mesh.geometry, material: mesh.material, ownsGeometry: false };
+    }
+    // A mirroring transform would need flipped winding — keep the clone path.
+    if (rel.determinant() < 0) return null;
+    const geometry = mesh.geometry.clone();
+    geometry.applyMatrix4(rel);
+    geometry.computeBoundingBox();
+    geometry.computeBoundingSphere();
+    return { geometry, material: mesh.material, ownsGeometry: true };
   }
 
   // Multi-mesh or no mesh -> clone fallback

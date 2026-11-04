@@ -4,7 +4,7 @@
 > **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
 > See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
 
-Start with the runnable [Community project plugin](doc-project-plugin-example.md). This is the detailed extension reference; [Events](doc-events-and-hooks.md) owns the event catalog, [Lifecycle](doc-lifecycle.md) owns execution order, and [UI visibility](doc-ui-visibility.md) owns presentation rules.
+Start with the runnable [Community project plugin](doc-project-plugin-example.md). For objects moved by an external simulation (positions arriving by telegram), see [Entity stream](doc-entity-stream.md). This is the detailed extension reference; [Events](doc-events-and-hooks.md) owns the event catalog, [Lifecycle](doc-lifecycle.md) owns execution order, and [UI visibility](doc-ui-visibility.md) owns presentation rules.
 
 > Ribbon editor overlays use the `ribbon-preview` overlay category and descriptive
 > `GizmoOptions.kind` tags. Extensions should treat these gizmos as transient,
@@ -128,7 +128,7 @@ export class MyPlugin implements RVViewerPlugin {
 The left side has two distinct components:
 
 - **`ActivityBar`** — the left vertical icon strip (slot: `activity-bar`). It holds window-opener buttons; clicking one opens a left-docked window via the `LeftPanelManager`.
-- **`ButtonPanel`** — a floating left tool toolbar (slot: `button-group`). It holds contextual mode tools (grid, snap, measurement) and floats over the 3D view. It also renders the logo + status indicator.
+- **`ButtonPanel`** — a floating left tool toolbar (slot: `button-group`). It holds contextual mode tools (snap, undo/redo, measurement, DES windows) in **groups separated by dividers** (see *Toolbar groups* below) and floats over the 3D view. It also renders the logo + status indicator.
 
 The floating `ButtonPanel` automatically shifts right to clear the activity bar and any open left panel, reading `activePanelWidth` from the `LeftPanelManager`.
 
@@ -607,7 +607,9 @@ deliberate choice with consequences worth knowing before you make it.
 registers the schema (so field descriptors resolve, `getSchemaDefaults` can seed an
 `authorable` "Add Component", and the extras validator stops treating the fields as
 unknown) and the capabilities, without any factory. `Group` (`rv-group-component.ts`),
-`JTData` (`rv-jt-data.ts`) and `NodeKnowledge` (`rv-node-knowledge.ts`) all do this.
+`JTData` (`rv-jt-data.ts`) and `NodeKnowledge` (`rv-node-knowledge.ts`), `NodeKnowledge` (`rv-node-knowledge.ts`)
+and `PathBlock` (`rv-path-block.ts`, the block wrapper of the path network — see
+`doc-path-fleet-control.md` §2.3) all do this.
 
 ```typescript
 // src/core/engine/rv-node-knowledge.ts — one overwritable Markdown note per node
@@ -996,6 +998,303 @@ registration replaces the first; the returned function removes exactly its own
 builder. Add the type to the `CONSUMED` map in `rv-extras-validator.ts` and give
 it an rv-ODT `$def` + `logicSteps` index entry like any other step.
 
+A builder runs once, when its step is built — for the main model after the
+scene is complete (placements materialised, plan-769 Phase 6), for a placed
+asset after its integration — so `ctx.registry.resolve` already sees placed
+content addressed `<p>#<id>`. There is no later re-resolution.
+
+### Binding a plugin to a DES run (plan-645)
+
+`DESRunner` with material-flow behaviours is the only DES engine. Native DES
+components and the `DesHmiSource` seam/override are removed. HMI reads
+`getActiveDesRunner(viewer)` from `src/plugins/des/hmi/des-active-runner.ts`;
+it returns `null` outside DES mode. Extend statistics through the registries below.
+
+Behaviour-local queues participate in snapshots through `des.onSnapshot(self)`
+and `des.onRestore(self, state)`. Return JSON-safe state and store MU references
+as id + generation, never live objects. Restore runs after component and MU state
+is rebuilt; resolve references against the restored MUs and reject stale generations.
+
+`self.transfer(mu, fromPort?)` returns `TransferResult`:
+`'moved' | 'blocked' | 'deferred'`. Only `moved` confirms a committed handover;
+`blocked` retains the MU at the sender for retry, and `deferred` means no handover
+commits in this call (a Processing attachment at the transfer point is still running, or the MU is already in a hand-over).
+
+Do not infer a DES run from `model-loaded`, `simulation-mode-changed`,
+`placements-materialized` & co. Subscribe to the kernel's lifecycle service:
+
+```typescript
+const off = viewer.simulationKernel?.onDesLifecycle((e) => {
+  if (e.type === 'bound') bindRuntime(viewer.simulationKernel!.desControl()!);
+  else if (e.type === 'reset' || e.type === 'disposed') disposeRuntime(); // before the teardown
+  else if (e.type === 'restored') replanCallbacks();                       // callbacks were dropped
+}, { replay: true });
+```
+
+Time-driven plugin work uses `desControl().scheduleCallback(t, fn)` /
+`cancelCallback(h)` — real DES queue events, not persisted in snapshots, dropped on
+every lifecycle event. Event matrix and delivery rules: `doc-lifecycle.md` § 6.5.
+
+### DES statistics: own states and KPI rows (plan-644)
+
+The DES statistics views — the in-scene badges, the hover tooltip and the
+statistics chart (Community DES core plugin, `src/plugins/des/hmi/`) — take additional
+states and KPI rows from two module registries, so a project plugin never edits
+the shared files. Both return their unregister function.
+
+```typescript
+import { registerDesState, desStatePercent } from '@rv/plugins/des/hmi/des-stat-colors';
+import { registerDesKpiRowProvider } from '@rv/plugins/des/hmi/des-stats-gizmos';
+
+// A state your component books with setState('Refill') / self.statState('Refill').
+const offState = registerDesState({ name: 'Refill', color: '#3355aa', label: 'Refilling' });
+
+// Extra rows under the badge and in the tooltip, per component.
+const offRows = registerDesKpiRowProvider({
+  id: 'myproject.temperature',
+  rows: (comp) => {
+    const t = comp.node.userData.temperature;
+    return typeof t === 'number' ? [{ label: 'Temp', value: `${t.toFixed(0)} °C`, color: '#ff8800' }] : [];
+  },
+});
+```
+
+- **States** appear after the built-in stack (`DES_STATE_STACK`) in the badge
+  bar, the chart (series + legend) and the tooltip (a row while the share is
+  above 0), always in the registered color. `desStateNames()` lists stack +
+  registered names; `desStatePercent(comp, name)` reads one share — through the
+  allocation-free `DESComponent.getStatePercent()`, which uses the same window
+  and formula as `getStatistics()`. An unknown or never booked state is `0`.
+- **KPI rows** come from providers in registration order. The battery vehicle's
+  `SOC` row is the first, built-in provider (`des.soc`). Each row adds one band
+  to the default badge; an optional `badgeText` overrides the badge line
+  (default `label value`). With a custom `DesBadgeRendererSpec` installed
+  (`setBadgeRenderer`) the KPI rows are left out — the renderer draws itself.
+- **Duplicates are first-wins:** a second state with a known name (stack or
+  registered) or a second provider with the same `id` changes nothing, warns once
+  in DEV builds, and its returned function is a no-op.
+- **Late registration is live.** Both registries share one version counter:
+  tooltip and chart re-render through `useSyncExternalStore`, the canvas badges
+  listen and refresh; a badge whose row count changed is rebuilt (texture and
+  material disposed). A disposed badge manager no longer listens.
+
+### Planning parameters: the window a model declares itself (plan-630)
+
+In DES, a live planning change is a clock event at the current instant with
+`PLANNING_PRIORITY`: after all model events at that instant and before the
+checkpoint. This deliberately changes the previous ordering among model events
+by frame timing, making runs with the same protocol reproducible. Continuous
+mode applies at the next fixed tick (POST). `FleetPlugin.replayChanges(log)`
+replays a recorded protocol on the active run clock; the underlying
+`PlanningRegistry.replayChanges(log, schedule)` accepts an owner-provided scheduler.
+Rows run in `(simTime, seq)` order, preserve their log fields, and expire on reset.
+Replay calls `onLive` with `alreadyScheduled: true`; owners must apply directly
+without scheduling a second event. Custom DES model priorities must stay above
+`PLANNING_PRIORITY` (the two lowest Int32 priorities are reserved for planning
+and checkpoints).
+
+A plant has settings a planner changes without touching code: the input load per
+output, which stations and vehicles are in, shipping pauses, buffer slots. These
+are not signals (see § Signal Store — a signal is a PLC value), and they are not
+a settings dialog either: each one has a **unit, a range, a default and an
+effect**, and together they are a scenario.
+
+So a model **declares** them, and the viewer renders the window. The declaring
+side knows nothing about the window; the window knows nothing about the model.
+
+```typescript
+import { getPlanningRegistry } from '@rv/plugins/planning-parameters';
+
+const planning = getPlanningRegistry(viewer);          // undefined without the plugin
+const handle = planning?.declare({
+  owner: 'palletYard',                                  // namespace: key = owner + '.' + key
+  title: 'Planung · PalletYard',                        // the window title
+  params: [
+    { key: 'production.A1.ratePerHour', label: 'A1', type: 'number', unit: 'Pal/h',
+      min: 0, max: 120, default: 40, group: 'Eingangslast', apply: 'live' },
+    { key: 'station.V2.active', label: 'V2', type: 'boolean',
+      default: true, group: 'Stationen', apply: 'reset', ui: { chipRow: 'Eingänge' } },
+  ],
+  kpis: [{ key: 'shippedPerHour', label: 'Versand', unit: 'Pal/h', kind: 'sim', read: () => shipped / hours }],
+  validate: (v) => (anyStationActive(v) ? {} : { 'station.V2.active': 'mindestens ein Eingang muss aktiv sein' }),
+  onLive: (change, applied, isValid) => clock.schedule(now(), () => {
+    if (isValid && !isValid()) return;
+    use(change.to);
+    applied(simTime());
+  }),
+  onStructuralReset: async (committed) => { cfg = configFrom(committed); },
+});
+```
+
+`handle.values()` are the **committed** values — never a pending one. The window,
+and the legacy planning MCP tools read this declaration. V1 experiments use variant
+overrides instead; planning declarations are not their input.
+
+**The effect is declared, and it is visible.** `apply: 'live'` means the value
+takes effect at the next instant of the SIM clock: the registry queues it, calls
+`onLive`, and the value appears in `values()` only when the owner reports back
+with `applied(simTime)` — so the change log carries the time it was applied, not
+the time it was typed, and a run is reproducible from scenario + log + seed.
+The callback contract is `onLive(change, applied, isValid?)`. Deferred owners check
+`isValid()` immediately before mutating model state: a superseded or cancelled
+change must not apply. Calling `applied()` alone does not guard that mutation.
+`apply: 'reset'` means the value waits: the window shows it as
+`ausstehend: alt → neu`, and it is taken over by the structural reset below.
+
+**What may be `live`.** Only rates, times and thresholds. The structure of a
+plant never changes while its simulation runs, so everything that changes
+placements, paths, stations, vehicles, slots or a component's configuration is
+`reset`. The registry cannot check this — it does not know what a parameter
+means — so the owner is the one who declares it correctly.
+
+**The structural reset** (`applyPendingAndReset()`, the window's
+*Reset & anwenden* button) is the one path that takes pending values over:
+
+> stop (FastForward cancelled, simulation paused) → commit → every owner's
+> `onStructuralReset` while nothing runs → **exactly one** runner reset → wait
+> for the DES runner's first `bound` → let the simulation go at t = 0
+
+A second call while one runs answers `apply-in-progress`; a document change
+during it answers `document-changed` and does nothing further (the new load binds
+itself). An owner that throws gets `materialize-failed`: the values are pending
+again, the owner is asked to configure the PREVIOUS state back on the same path,
+and the simulation stays paused at t = 0 — see
+`plugins/planning-parameters/structural-reset.ts`. An ordinary toolbar reset is
+NOT an apply: it restarts the structure that is there and leaves pending values
+pending.
+
+`registry.reconcileStructure(owner)` runs the same ritual for ONE owner that has
+nothing pending — the load-time case where a document carries a different
+structure than the stored values describe (plan-681).
+
+**Key figures come in two kinds and never mix.** `kind: 'sim'` is an answer of
+the model and deterministic. `kind: 'measured'` is a property of the machine the
+viewer runs on — frames per second, DES events per wall second, heap size — and
+the window labels that block *Messgrößen (Wanduhr, nicht deterministisch)*.
+A measured figure never enters a determinism or parity test. `read()` returns
+`null` for "not available here" (`performance.memory` outside Chromium), which
+the window shows as `n/v`.
+
+**Where the window comes from.** `PlanningParametersPlugin` owns the one registry
+of the session; the window module is imported the first time something is
+declared, so a document without planning parameters never loads it. The window is
+a `ControlWindow` (§ 1 UI Architecture): floating, movable, collapsible, its
+position remembered, and deliberately not closable. The controls follow from the
+declaration — a bounded number is a slider, an unbounded one a typed field, a
+`ui.chipRow` boolean a chip in a row, a boolean or `enum` a latched group.
+
+**Display switches** (`role: 'display'`) are the exception that owns no value:
+they are an adapter onto the overlay-visibility store, so a layer toggled in the
+Groups panel and the same toggle in the planning window are one truth. They are
+never part of a scenario and never a factor of an experiment.
+
+**Scenarios live in the document** (plan-630 Phase 3). The values are stored in
+the GLB itself, next to `DocumentInfo` in the default scene's extras:
+
+```jsonc
+// scenes[0].extras.realvirtual.PlanningScenarios
+{ "version": 1, "active": "Basis",
+  "scenarios": { "Basis": {}, "High load": { "palletYard.production.A1.ratePerHour": 60 } } }
+```
+
+- A scenario is a flat map of **effective keys** (`<owner>.<key>`) to scalars —
+  nothing in the block knows an owner, so any model (a project plugin, a scene
+  component, a document-level script layer) lands in it under its own prefix.
+- Only **deviations from the declared default** of `factor` parameters are
+  stored; display switches never. A stored value nobody declares (a model that
+  did not run here, or an instance key that only exists after a pending rebuild —
+  a larger yard's stations) is reported, never applied, and written back on save.
+- **Load:** the planning plugin reads the block in its `onModelLoaded` — before
+  any project plugin's — and the active scenario's values become the
+  **committed** start values when the owner declares (`registry.loadScenario`).
+  A reset-class value is therefore not pending: the owner sees it in `values()`
+  at declare time and rebuilds itself as part of its own load (PalletYard
+  compares the committed size with the document's and reconciles). A document
+  without a block starts at the defaults — nothing leaks in from the previous one.
+- **Never silently repaired:** a malformed key, a non-scalar value, a value out
+  of range or against a cross rule is dropped (the default stays) and reported
+  in the Problems panel (`planning-scenario-value-invalid`,
+  `planning-scenario-block-invalid`). A well-formed key nobody declares is
+  reported as `planning-param-orphaned` and kept (see above). A file that held
+  something dropped this way shows as unsaved, so Save can clean it.
+- **Save is explicit:** the window's *Save* / *Save as…* (later the MCP tool
+  `web_scenario_save`) call `plugin.saveScenario(name?)`, which writes through
+  `ProjectStore.setDocumentPlanning` → `writeDocumentPlanning` (JSON chunk only,
+  BIN byte-identical, compare-and-swap). No autosave.
+- **Read-only:** a hosted delivery without a project folder, a read-only project
+  or a bundled document cannot be written; the window says *Not saveable* and
+  both save buttons are disabled — the values last for the session.
+- Switching scenarios (`plugin.switchScenario(name)`) takes the normal paths:
+  `live` values apply at the next sim instant, `reset` values go pending.
+
+Generators that rebuild a document must carry the block over (PalletYard:
+`tools/pallet-yard.mjs` copies `PlanningScenarios` from the existing file).
+
+**Existing component properties** (plan-630 Phase 8, §2.14) need no code and no
+new component: the inspector's field-row toggle *Show in planning window* (the
+`Tune` icon, viewer mode only) selects a property the component schema already
+describes — a `Source.Interval`, any DES material-flow field. The planning
+plugin's owner `component` declares it from the schema; nothing defines the
+parameter a second time.
+
+- **Selection** — document-wide `selection[]` in the same block:
+  `{ address, component, field, label?, group?, min?, max?, step? }`, `address` =
+  the full NodeRegistry address `<occurrence>#<NodeId>` (two placements of one
+  file are two entries). Saved with the scenario (explicit *Save*); taking a
+  property out of the window drops its scenario value too.
+- **Definition** — type, unit and options only from the schema
+  (`ComponentFieldInfo`); `default` (target of *Reset to defaults*) is the value
+  the document carries, `initial` (the start value — committed without pending,
+  log row or write) the current effective value. `min/max/step` narrow a numeric
+  field for display, they never change its type. Allowed: `number | integer |
+  boolean | enum`, not readonly, no signal, no reference; else
+  `planning-selection-invalid`. Always `apply: 'reset'`.
+- **Re-config path** — a type is selectable only with a declared
+  `planningReconfig` capability: `des-extras` (set by `registerMaterialFlow` for
+  every type with a DES block; only fields of that definition's schema — what
+  `SimDesControl.reconfigureFromExtras()` re-reads) or `rebuild` (a handler from
+  `registerComponentRebuild`, plan-2003). Else `planning-selection-unsupported`.
+- **One key format** — `componentParamKey(address, component, field)` →
+  `a<h>.<Component>.<field>`, `h` = the first 20 hex characters of SHA-256 over
+  the address; effective key `component.a<h>.<Component>.<field>`. The only
+  producer of such keys (plan-2003 ScriptComponent parameters use the same
+  function); the declaration carries
+  `target {address, component, field}`, so nothing inverts the hash.
+- **One writer** — `writeComponentField` in the owner's `onStructuralReset`:
+  at a standstill it writes the committed values into
+  `userData.realvirtual[component]` (nested for a dotted path such as
+  `Values.speed`), then runs the re-config path, then the structural reset does
+  its single runner reset. Nothing else writes planning values into rv_extras. A
+  stored scenario value that differs from the reloaded field is written at load
+  (`reconcileStructure('component')`).
+- **On demand** — `plugin.ensureComponentParams(targets)` declares properties
+  that are NOT in the window: same derivation, same key,
+  same writer, `ui.hidden` in the declaration.
+- **Extension seams (plan-2003)** — `registerComponentParamResolver(type, fn)`
+  answers field info per instance (a ScriptComponent's `Values.<key>` from its
+  `Params`); `registerComponentRebuild(type, fn)` re-reads written values;
+  `registerPlanningReconfig(type, 'rebuild')` (or the capability) makes the type
+  selectable.
+
+### Experiment Manager and variants
+
+The **Experiments** matrix uses Base configuration and variants as columns, with
+component-property overrides and KPIs as rows. New experiment inputs belong in
+variant overrides, authored through the shared parameter/variant edit path.
+`paramOverrides` and `paramScript` are legacy manifest data: experiment factors and the
+parametrisation script were removed (plan-2211); old columns that carry them are shown
+read-only and never run.
+
+The experiment manager is a commercial module (realvirtual Commercial), documented in the private repository and at [des/experiments](https://doc.realvirtual.io/web/des/experiments/).
+The core only offers seams for it (`src/plugins/des/des-experiment-seam.ts`):
+`installExperimentBackend(factory)` adds the optional `SimDesControl` experiment methods to
+every runner, and `registerDesExperimentWindowProvider(provider)` registers the window the core
+**Experiments** button opens (toolbar and DES side tools); without a provider the button shows
+`CommercialFeatureNotice` (`src/core/hmi/CommercialFeatureNotice.tsx`, reusable for any
+commercial module: feature name, one sentence, links to the public demo and the editions page).
+KPI recording of a run is core; `registerKpiSourceProvider` (`src/plugins/des/des-kpi-track.ts`)
+lets a module supply a model's KPI sources before anything published them.
+
 ### Signal Store
 
 The `SignalStore` is the central pub/sub store for PLC signals. It mirrors Unity's `PLCInputBool`, `PLCOutputBool`, `PLCInputFloat`, etc.
@@ -1120,6 +1419,34 @@ viewer.setDebugLogging(true);
 viewer.setDebugLogging(false);
 ```
 
+### References: stored as addresses, paths are input (plan-769)
+
+A reference the viewer stores — a `ComponentReference`, a path field, an `AssetOverrides` key, a
+signal mapping — names its target by identity: `#<NodeId>` in the same file, `<p>#<id>` inside the
+placement `p`, `<p>/<b>#<id>` one level deeper ([doc-node-paths.md](doc-node-paths.md) §0). A node
+PATH is what a caller types and what the UI shows. For a plugin that means:
+
+| You want to | Use | Not |
+|---|---|---|
+| read a reference out of your extras | `registry.resolve(ref, scope, referrer)` (component binding), `registry.readStoredRef(referrer, ref)` / `registry.resolveRef(referrer, ref)` (the node) — they read all three stored forms (`address`, `unresolvedPath`, the legacy `path`) | parsing `ref.path` yourself — a web-saved file has no `path` |
+| wait for a target inside a placement that is still loading | `registry.whenResolved(referrer, ref, onResolved, onDropped)` — fires on `layout-content-added`, drops with `missing` / `placement-missing` / `placement-cap` / `unloaded`; `resolveComponentRefs` does this for scalar component fields and calls your `reapplyConfig()` | polling `getNode()` |
+| turn a path somebody typed (UI, URL, plugin config, MCP) into a node | `registry.findNodeForUser(path)` → `{ node, via }` (runtime → authored → legacy spelling → guess with a warning until plan-770) | `getNode()` on user input |
+| WRITE a reference into extras | the address of the node: `addressedReferenceValue(...)` / `referenceTargetForWrite(...)` (`src/core/engine/rv-reference-writer.ts`); the save does the rest (`idVersion: 1`) | storing a path string — it breaks on the next rename and is reported (`reference-saved-from-guess`) when it was guessed |
+| resolve an address relative to a document | `registry.resolveAddressIn(scopeRoot, address)` | string-splitting addresses — always split at the LAST `#` (`parseNodeAddress`) |
+
+**Plugin changelog (plan-769).**
+- `ComponentReference` has three stored forms; `ref.path` is optional now (typing changed).
+- Path fields (`Kinematic.Parent`, CRI `targetObjects`, `WebPhysicsZone.StaticColliders`,
+  connection ends, `LogicStep_Enable.Target`, `Source.ThisObjectAsMU`) may hold `{ address }` / `{ unresolvedPath, reason }`
+  instead of a string — read them through `readStoredRef`.
+- `SignalMapping` persists `componentAddress` / `sourceAddress` (in memory `componentPath` stays,
+  D15). MCP tools accept a path and answer with path + address.
+- `AssetOverrides` is `{ byAddress }`; `byNodeId` / `byPath` are read-only legacy, `trsByNodeId`
+  was removed (part moves inside placements are refused, `nested-transform-refused`).
+- Compose no longer derives sha256 ids; `deriveNodeIdsForSubtree` is deprecated. Use
+  `identityIdOf(node)` for a node's id.
+- A web-saved GLB cannot be imported into Unity (F20).
+
 ### Accessing Components from Plugins
 
 ```typescript
@@ -1151,7 +1478,6 @@ After loading a GLB, `loadModel()` returns a `LoadResult` with:
 | `registry` | `NodeRegistry` | Node path → Object3D lookup |
 | `playback` | `RVDrivesPlayback \| null` | Drive recording playback |
 | `replayRecordings` | `RVReplayRecording[]` | Individual replay recordings |
-| `logicEngine` | `RVLogicEngine \| null` | LogicStep execution engine |
 | `groups` | `GroupRegistry \| null` | Group definitions (for visibility) |
 | `boundingBox` | `Box3` | Scene bounding box |
 | `triangleCount` | `number` | Total triangle count |
@@ -1160,6 +1486,15 @@ This result is passed to all plugins via `onModelLoaded(result, viewer)`. The ta
 fields plugins commonly read; `LoadResult` carries more (`modelConfig`, `recorderSettings`, the
 batching/dedup results, `raycastGeometrySet`, …) — the full shape is in
 [src/core/engine/rv-scene-loader.ts](src/core/engine/rv-scene-loader.ts).
+
+There is no logic engine in the result (plan-769 Phase 6): the LogicSteps are built by the
+viewer, ONCE against the complete scene, into `viewer.logicEngine`. For a document without
+placements that happens before `onModelLoaded`; for a document with placements only on the
+load's `placements-materialized`, so in `onModelLoaded` `viewer.logicEngine` does not hold the
+document's steps yet — a plugin that needs them awaits `viewer.whenModelLogicBuilt()` (per
+load, resolved right after the build and before any `whenSceneReady()` continuation; a
+superseded load releases it without a build, so check your own load generation afterwards;
+details: [doc-lifecycle.md](doc-lifecycle.md) § 3.1).
 
 ### The hierarchy is the scene graph — and `getNode()` may return undefined
 
@@ -1193,6 +1528,21 @@ What this means for a plugin:
   method survives only so an existing external caller does not throw. Delete your
   call.
 
+### Parametric variants in the ModelCache (plan-650)
+
+A placed asset that carries a `ParametricComponent` can bake in several **variants**. Your code
+keeps addressing the base key: `ModelCache` derives the variant key internally as
+`<bakedKey>#param:<inputHash>` (combinable with `#split:`), bakes each variant from its own freshly
+decoded tree and runs generator + assembly before `prepareAndBake` (or takes the result from the
+CAD-GLB cache). Ask for a variant only through `PlacementInstancer.resolveBaked(ref, { overrides })`
+— the values come from the placement's `AssetOverrides`; without overrides you get the default
+variant baked into the file. `_retireBaked`, `_isKnown` and the asset-hash sync treat `#param:`
+derivatives together with their base; unreferenced variants are evicted LRU (16 per asset), the
+scene budget is 64 (`parametric-variant-budget`). A pre-bake hook removes `_Parts` in every bake,
+so a `bakeClaims()` aimed at `_Parts/…` never lands. Placements change their values through the
+command `layout.setParams`, never by writing overrides directly. Full contract:
+[doc-scripting.md](doc-scripting.md) § *Parametric part families*.
+
 ### Placements pick through their chunks
 
 There is no separate pick geometry for placements (the plan-745 placement
@@ -1220,6 +1570,18 @@ What a plugin author needs to know:
 - **Virtual / DES entries** (`buildVirtualNode`) are the one non-baked kind of
   placement: their meshes register as aux raycast targets resolving to the
   placement root — add on register, remove on delete.
+- **The pulsing status outline is CLAIMED, not owned** (`showStatusOutline` /
+  `hideStatusOutline` in `rv-status-outline.ts`, plan-2022). Several persistent
+  owners may hold the channel at the same time: claims asking for the same
+  `(color, pulsePeriod)` are **unioned**, so a second feature no longer erases
+  the first (collision, drop detection and the runtime-instruction step
+  highlight all live here). A claim asking for a *different* style loses to the
+  youngest claim and says so once in the console — the OutlinePass status
+  channel carries exactly one style, so there is nothing to mix. Use the
+  warning orange `0xffa726` with `pulsePeriod: 0.6` for "something is wrong
+  here" and your claim joins the union instead of fighting over it; pick your
+  own `ownerKey` and hide it with that same key. A transient `pulseSeverityOutline`
+  flash still sits on top and restores the union when it ends.
 
 ### Selection sources (`selectNode(path, showInspector, source)`)
 
@@ -1323,6 +1685,7 @@ export class MyAnalyticsPlugin extends RVBehavior {
 | `PLUGIN_ORDER.SIM_DEFAULT` | 100 | Default order if not specified |
 | `PLUGIN_ORDER.DEMO` | 150 | Demo / process-specific plugins |
 | `PLUGIN_ORDER.UI_OVERLAY` | 250 | UI overlays (drive-gizmo, layout-planner, kiosk) |
+| `PLUGIN_ORDER.LIVE_LINK` | 900 | Outgoing live streams that read the finished tick (USD live link, plan-637) |
 | `PLUGIN_ORDER.DEBUG` | 990 | Debug / telemetry endpoints (mcp-bridge, debug-endpoint) |
 | `PLUGIN_ORDER.TEST` | 9999 | Test / perf plugins |
 
@@ -1702,6 +2065,98 @@ interface MultiuserSnapshot {
 - **Incoming**: If the server sends more than 100 messages per second, a `console.warn` is emitted. No messages are silently dropped — this is a monitoring signal only.
 - **Unity side**: The `MultiplayerWEB` component enforces a `MaxMessagesPerSecond` limit per client (default: 100). Excess messages are dropped with a `Logger.Warning`. The client is not disconnected.
 
+### USD live link to Isaac Sim (`UsdLiveLinkPlugin`, plan-637)
+
+`src/plugins/usd-live-link/` adds the **USD** button to the lower group of the activity bar (`activity-bar` with
+`placement: 'bottom'`, next to Problems / Multiuser; own visibility rule `hiddenIn: ['kiosk']`, so it also shows in the editor and the planner)
+and a status pill (`toolbar-status`). The menu offers *Export USD…* / *Import USD…* —
+both call the private providers of plan-764 (`exportProviderRegistry` through the active
+document view, the unified import dialog on its `usd` tab) and are disabled without them —
+and *Sync to Isaac Sim*, a one-way live link into the Kit extension
+`integrations/omniverse-kit/exts/realvirtual.livesync` (installation:
+`integrations/omniverse-kit/README.md`). Sync is open and works without any provider.
+
+| File | Role |
+|------|------|
+| `usd-live-link-plugin.tsx` | Entry-side shell: registration, store, slots; loads the session by dynamic `import()` on the first Sync click |
+| `usd-live-link-session.ts` | Lazy chunk: lifecycle, session generation, mount, reset handling |
+| `runtime-stage-export.ts` | Snapshot of the RUNNING baked tree as `.usdz` (export tree, never the live scene) + node table |
+| `sync-tracker.ts` | Per-sample diff: changed local node matrices, MU spawn / delete / world pose |
+| `kit-link-client.ts` | Browser WebSocket: click-first, `hello`, backoff reconnect, backpressure |
+| `livesync-protocol.ts` | Wire format v1 (twin: `realvirtual/livesync/protocol.py`) |
+| `live-link-store.ts`, `UsdToolButton.tsx`, `LiveLinkPill.tsx` | HMI (entry) |
+| `UsdToolMenu.tsx` | HMI menu + connection settings, lazy chunk loaded on the first button click |
+
+Only the shell, the store, the icon button and the pill are in the entry chunk (≈1.7 kB
+gzip); everything else is reached by dynamic `import()` — keep it that way
+(`tests/usd-live-link-lifecycle.test.ts` fails on a static import of a lazy-only module).
+
+**The sync stage is a runtime snapshot.** `exportRuntimeStage()` builds, in one synchronous
+pass, a separate tree of fresh `Object3D`/`Mesh` nodes that share geometry and materials
+with the live nodes, names them uniquely itself, and runs three's `USDZExporter` on that
+tree. Index *i* of the node table is the live node whose prim is `primPaths[i]` — both come
+from the same traversal, so the prim hierarchy IS the runtime hierarchy and the streamed
+matrices are plain local matrices. Left out: source ghosts / previews / markers, gizmo,
+label and highlight overlays, lines / points / sprites / lights / cameras, every
+`InstancedMesh`, invisible subtrees and the spawned clone MUs. Kept: pre-placed MUs
+(listed in `preplaced`) and the MU templates (exported although hidden; a self-template
+source exports its authored materials via `getSourceTemplateMaterial`). Two text patches
+follow: untextured vertex-colour (uber) materials read `displayColor` through a
+`UsdPrimvarReader_float3`, and `/Materials` moves under `/Root` so material bindings survive
+the Kit-side reference of the default prim.
+
+**MU origin.** `rv-source.ts` records which `RVSource` object spawned an MU
+(`getMuSource(mu)`, a WeakMap — two sources with the same node name stay apart). The
+template index of a spawn is the index of that source's template in the snapshot.
+
+**Session generation.** Every mount is a new session; anything that makes an export stale
+(model cleared / switched, sync off, reconnect, a reset during the export) bumps it and the
+late export result is dropped. A simulation reset while live only marks the link invalid
+inside the `simulation-reset` event (which fires BEFORE drives and MUs are reset); `reset`
+plus the full state go out from a microtask after `resetSimulation()` returned — also when
+the simulation is paused and no tick follows. The plugin runs at `PLUGIN_ORDER.LIVE_LINK`
+(900), after drives, transport and grips.
+
+#### Protocol v1
+
+Text frames are JSON (`hello`, `ack`); binary frames are little endian, byte 0 = type, then
+`u32 session`. Matrices are three's `Matrix4.elements` — identical to a USD `matrix4d` written
+row by row, so nobody transposes.
+
+| Type | Direction | Layout |
+|------|-----------|--------|
+| `hello` | W→K | `{v:1, token, client:"realvirtual-web", rateHz}` — first frame, nothing else before `ready` |
+| `0x01 mountBegin` | W→K | `u32 session, u32 compressedBytes, u32 rawBytes, u32 chunkCount` + JSON `{encoding:"gzip"\|"identity", nodes:[primPath…], templates:[primPath…], preplaced:[{muId,nodeIndex}]}` |
+| `0x02 mountChunk` | W→K | `u32 session, u32 index`, bytes (≤ 512 KB; the client sends 256 KB) |
+| `0x03 frame` | W→K | `u32 session, u32 seq, u32 n, n×(u32 nodeIndex, f32[16] local), u32 m, m×(u32 muId, f32[16] world)` |
+| `0x04 muSpawn` | W→K | `u32 session, u32 muId, u32 templateIndex, f32[16] world` |
+| `0x05 muDelete` | W→K | `u32 session, u32 muId` |
+| `0x06 reset` | W→K | `u32 session` — delete spawned MUs, show pre-placed MUs again; the full state follows |
+| `ack` | K→W | `{type:"ready"\|"mounted"\|"error", session?, message?, appliedHz?}` |
+
+Prim paths are paths inside the uploaded file (`/Root/Scenes/Scene/…`). MU poses are world
+poses in the snapshot's frame; the extension places spawned MUs under
+`/World/realvirtual/MUs` and pre-placed MUs with `!resetXformStack!`. Close codes: 4401
+token, 4402 protocol, 4403 origin, 4408 no `hello` in time, 4409 another client — the client
+stops retrying on 4401 / 4403 only. Both encoders are pinned to
+`integrations/omniverse-kit/tests/golden_v1.json` (`tests/usd-live-link-protocol.test.ts`,
+`tests/test_protocol.py`).
+
+**Port and foreign servers.** Default port `LIVESYNC_DEFAULT_PORT` = 8775 (`live-link-store.ts`,
+`protocol.py` `DEFAULT_PORT`, `extension.toml`); 8765 until extension 0.2.0 collided with
+DeskAgent. A stored settings record without `portChosen` that holds the old default moves to
+8775; a port set in the menu (`plugin.setPort`, which also restarts a running or failed link)
+is stored with `portChosen: true` and kept. A socket that closes before `open` (1006) looks
+the same for "nothing listening" and "another program refused the upgrade", so once per
+failure streak `kit-link-client.ts` probes `GET /realvirtual-livesync` on the same port: CORS
+JSON with `service: "realvirtual.livesync"` → keep retrying; any other answer, or a failed
+CORS request whose `no-cors` retry resolves → foreign → stop with *Port N is used by another
+program…*; both requests rejected or timed out (nothing listening, LNA / mixed content) →
+keep retrying. The extension answers the probe through the `websockets` `process_request`
+hook (`server.py`), without token and before the WebSocket handshake, so the origin and
+token checks stay unchanged. A failed bind logs one line with the owning process
+(`port_owner.py`).
+
 ### Registration Origin and Registry Diagnostics
 
 Registration sites may classify plugins with `viewer.use(plugin, origin)`, where `origin`
@@ -1794,6 +2249,100 @@ moment the plugin is enabled — i.e. on the mode transition that activates it. 
 must therefore not assume `onModelLoaded` has already run by the time `init()` returns; do model-
 dependent setup in `onModelLoaded` / `onModeActivate`, never in `init()`.
 
+### On-demand features — the FeatureLoader (plan-652)
+
+Most private features register at startup. Two do not: the **asset editor** (`asset-editor`) and
+**DES** (`des`) are *declared* at startup and *loaded* the first time they are used, so a plain HMI
+start neither downloads nor parses them (generated demo build: Editor + DES ≈ 0.9 MB less in the boot
+set). The mechanism is generic; any feature can become on demand.
+
+**Activation is manifest data.** A registration in `tier-manifest.json` carries `activation` — a list
+of triggers. Missing means `["startup"]` (eager, as before); an unknown prefix or an empty list is a
+generator error.
+
+| Trigger | Fires when |
+|---|---|
+| `mode:<id>` | the workspace enters the mode — dropdown, `?mode=`, persisted / published / hosted start mode, kiosk lock, `web_execute("workspace.setMode", {mode:"planner"})` |
+| `component:<type>` | a loaded model, an overlay or a placement carries that component type |
+| `command:<id>` | a caller needs the feature for a command (`command:import`, `command:mcp`, `command:sim.discrete`) |
+
+**Stub and body.** The feature's adapter (`features/<id>.register.ts` in the private sibling) is only
+a *stub*: it calls `viewer.features.define({ id, label, activation, origin, load: () => import('./<id>.body') })`
+and imports nothing of the body by value. The body (`features/<id>.body.ts`) exports
+`activate(viewer)`, whose steps are idempotent so a retry after a partial failure continues. On a core
+without `viewer.features` (repo skew) the stub loads the body eagerly and logs it once.
+
+**Using a feature from other code.** `viewer.features` (`src/core/rv-feature-loader.ts`):
+
+```ts
+viewer.features.isDeclared('asset-editor');          // the build ships it (false in Community / restricted profiles)
+viewer.features.isActive('asset-editor');            // its code is running — synchronous, the fast path
+await viewer.features.ensure('asset-editor', 'command:import'); // load + activate; parallel calls share one load
+viewer.features.preload('des');                       // import without activating (prefetch)
+viewer.features.statuses();                           // rows: id, state, trigger, ms, bytes, error
+await ensureFeatureIfDeclared(viewer, 'asset-editor', 'command:mcp'); // no-op when not declared or already active
+```
+
+Rules that keep the bodies out of the boot set (the bundle guard below enforces them):
+
+- **No value import from a body** (`*.body.ts`, `plugins/asset-editor/**`, `plugins/des/**`) in entry or
+  startup code — `import type` only. One static import pulls the whole body back into the entry,
+  transitively and without a build error.
+- `viewer.getPlugin('asset-editor')` / `getPlugin('des-hmi')` returns `undefined` until the feature is
+  active — call `ensure` (or `ensureFeatureIfDeclared`) first. The DES feature installs
+  the runner factory and only the `des-hmi` plugin.
+- The few editor stores public code needs at startup live in `plugins/asset-editor/shared/`
+  (`pending-open-store`, `selection-asset-resolver`, `test-session-store`, `button-sim-store`,
+  `material-stats`, `select-actions`), each with a public stub at the same path under
+  `src/private-stubs/`. A `shared/` module imports nothing from the editor body
+  (`tests/feature-manifest-consistency.node.test.ts`).
+
+**Mode switches wait for the feature.** Each `mode:<id>` trigger installs a ModeManager *enter guard*.
+`requestMode` / `setMode` stay synchronous when the guard answers `true` (feature already active, or no
+feature behind the mode); only a first switch into a lazy mode is deferred: the mode stays as it is,
+the feature loads, and the switch is committed afterwards — unless a newer request arrived meanwhile
+(the newer one wins), the mode is locked elsewhere, or the load failed (the old mode stays). A caller
+that reads `activeMode` right after the switch uses `await modes.setModeAsync(id)`; `modes.switchMode(id)`
+returns a `boolean` when nothing had to load and a promise otherwise, so an ordinary switch gets no
+extra turn. The boot block resolves its start mode first and awaits `features.ensureForMode(target)`;
+a failure falls back to `hmi` with a Problems entry. A plugin of a lazy feature is registered BEFORE
+the switch commits, so its `onModeActivate` and the replayed `onModelLoaded` arrive as usual.
+
+**Models with a lazy component type.** The loader collects the component types of a GLB (extras,
+overlay nodes, placement overrides — `src/core/engine/rv-component-types.ts`) right after the naming
+scan and awaits every feature with a matching `component:` trigger before a single component is built,
+on every load path (`src/core/engine/rv-scene-loader.ts`, the placement instancer for library assets).
+`DESManager` and supported behaviour triggers activate the DES feature; retired native types
+have no activation trigger or component factory. The cost
+of the scan is the `rv:feature.prescan` performance measure. A type that still arrives late (an
+authoring "add component", a path the scan does not see) is caught by a safety net: a warning, a
+Problems entry `feature-late-component:<type>`, the feature activates and the component is built
+afterwards.
+
+**What the user sees.** A user-triggered activation (`mode:` / `command:`) that takes longer than
+**300 ms** shows the info overlay *"Loading Editor …"* / *"Loading DES simulation …"*, kept for at least
+**400 ms** so it never flashes; a fast one shows nothing. Component triggers during a model load show
+nothing extra (the load overlay is already up). A failed load leaves a Problems entry
+`feature-load-failed:<id>` ("Could not load …") with a **Retry** action (command `feature.retry`); a
+failure is never cached, so Retry really reloads. A chunk that disappeared because a newer version was
+deployed (`vite:preloadError`) yields the warning *"New version available — reload"* — there is no
+automatic reload, so an unsaved editor document is never lost.
+
+**Prefetch** (`src/core/rv-feature-prefetch.ts`). Hovering or focusing an on-demand mode in the mode
+dropdown imports its feature after 80 ms (leaving earlier cancels, a press imports at once); opening the
+menu imports the last on-demand mode picked there. After the first model is on screen and the browser
+is idle, a `<link rel="prefetch">` per chunk file of every declared feature downloads it at low priority
+(no parse) — only with a fine pointer, not on Save-Data, not on a `slow-2g`/`2g`/`3g` connection.
+Prefetch never activates anything.
+
+**Diagnostics.** Console `[feature] <id> ← <trigger> · <ms> ms · <KB> KB` per activation (startup
+features as `console.debug`, on-demand ones as `console.info`), one `[boot] features: startup N (…) ·
+deferred M` line per start, `performance.measure('rv:feature.<id>')`; Settings › DevTools › **Features**
+lists every feature with state, trigger, ms and KB; `web_status` carries the same rows as `features`;
+the internal feature matrix shows a declared, inactive feature as **on demand**. Build side:
+`dist/feature-chunks.json` (files + bytes per feature) and `npm run test:bundle-guard` — see
+[doc-web-debugging.md](doc-web-debugging.md#on-demand-features-feature-and-the-bundle-guard).
+
 ### `model-loaded` is not "the scene is complete" — `whenSceneReady()`
 
 `onModelLoaded` / `model-loaded` mean: the document's **own** GLB is parsed, registered and
@@ -1828,8 +2377,9 @@ Rules of thumb for a plugin:
   "does this path resolve", framing, statistics) re-runs on `placements-materialized` or awaits
   `viewer.whenSceneReady()`. The core already does this for: the simulation (held with the pause
   reason `placements-materializing` while the scene is incomplete), one batched `drives-changed`
-  (drive order, recorder, `useDrives`), the DES re-bind, the ground disc and the camera re-fit
-  (only when nobody moved the camera since the load framed it).
+  (drive order, recorder, `useDrives`), the DES re-bind, the ground disc, the camera re-fit
+  (only when nobody moved the camera since the load framed it) and the path successor check
+  (`viewer.pathTopologyCheck`, plan-633 — see [doc-path-fleet-control.md § 2.2](doc-path-fleet-control.md#22-path-topology-successors-written-on-snap-checked-on-load-plan-633)).
 - **Never** hand `viewer.whenSceneReady()` to `viewer.trackLoadingWork()` from `onModelLoaded`:
   `loadModel` drains that queue before it returns, and the join point waits for `loadModel` — a
   deadlock. Use `void viewer.whenSceneReady().then(...)` and re-check that your `LoadResult` is
@@ -1843,6 +2393,70 @@ onModelLoaded(result: LoadResult, viewer: RVViewer): void {
   });
 }
 ```
+
+### One connection system: snaps, material flow and the path network (plan-633)
+
+There is exactly ONE place that decides which component hands parts to which:
+`src/core/connect/` (public, AGPL — the core imports nothing private and nothing from
+`src/plugins`; `tests/connect/core-connect-import-boundary.node.test.ts` guards it). The planner,
+the material-flow self API, the Turntable, the DES material-flow binding
+and the path network all use it.
+
+**Reaching the snap graph — one accessor.** Every consumer asks
+`getConnectionRegistry(host)` (`rv-connection-registry.ts`): with the snap-point plugin present
+it returns the plugin's LIVE registry, unchanged; without it (headless DES, tests, an embed host)
+it returns the registry a binding attached. A binding obtains its registry with
+`acquireBindingConnectionRegistry(host, owners, { drives })` — built per component owner (each
+instance root owns its snaps), paired in the drives' HOME pose — and gives it back with
+`detachHeadlessConnectionRegistry(host, registry)`. Pairing itself is ONE function,
+`pairRegistryByProximity(registry, { epsilon, drives, roots, placedIdOf })`: only unoccupied
+snaps, coincident within `SNAP_PAIR_EPS_M` (30 mm), sampled in the home pose; the planner's
+`SnapPointPlugin.rebuildPairings` calls it too. Never read the plugin registry directly and never
+write a second pairing loop.
+
+**Resolving links — four stages in one pure function.** `resolveConnections(connectables,
+options)` (`rv-connection-resolver.ts`) mutates nothing and returns ordered, directed
+`ConnectionLink { from, to, via: 'snap' | 'distance', distance, contained, snapIds? }`:
+
+| Stage | What it does |
+|---|---|
+| 1. Snap | every paired snap whose partner belongs to another connectable; the port role (input/output) is decided in exactly one place, `portRoleOf(root, snap, partner, surfacesOf)` — the authored flow, refined by the travel direction of the partner's transport surfaces |
+| 2. Roles / conflict | both ends claim `output` → the link stays with the endpoint of the smaller out-degree, a tie keeps the direction from the smaller uuid (the rule `breakTwoCycles` used to apply afterwards; the binding keeps it only as a guard that must break 0). Both ends `input` → no link |
+| 3. Typed distance | only for connectables still without a downstream: same `connectionType` (+ `subType`), emitter → acceptor, nearest within `autoConnect.maxDistance`, tie-break by uuid |
+| 4. `contained` | distance 0 — the source centre lies inside the target's AABB (a source standing ON a belt). The flag is set on the link; the DES binding reads it for the source pose hand-over (below) |
+
+**Distance stage — plan-225 F3 is withdrawn.** There is **no direction check**. The metric is
+**point-to-AABB**: the source's world centre to the candidate's world bounding box (0 when
+inside). Radius `autoConnect.maxDistance`, default 1.0 m; a non-positive radius means 1.0 m for
+material flow (`radiusPolicy: 'typed'`). Ties are broken by uuid, never by
+array order. A line without snaps can therefore still be wired by distance only — give your
+component `Snap-*` ports when the direction matters.
+
+**A source ON its belt hands over at its spawn pose (plan-638, DES).** When a `Source` has a
+contained target — the resolver's `contained` flag, or (in the DES binding) a distance link whose
+source *origin* lies inside the target's AABB, which is the case for a loaded pallet on a roller
+conveyor whose bounds centre sticks out above the conveyor — the generic `Source` no longer lets
+the MU start at the belt entry. It checks first, then spawns, then hands over at the pose:
+
+- `self.poseReadiness()` → `ready` (pose = world origin of the source node, yaw about +Y),
+  `blocked` (spawn nothing, wait: `target-refused`, `loop-saturated`, `source-disabled`,
+  `quantity-limit`) or `fallback` (standard transfer as before). Capability is checked before
+  capacity. Fallback reasons `pose-unsupported` (target without `des.acceptsPose`), `async-accept`,
+  `source-processing` and `no-template-size` report one Problems info `source-pose-unsupported` per
+  source and reason; `not-contained` and `no-backend` (continuous, mocks) are silent.
+- `self.transferAtPose(mu)` hands the MU over at the pose of the last `ready`; on `refused` /
+  `rolled-back` the MU stays `pending` at the source and is retried on the next wake — never a
+  second spawn. A rolled-back hand-over counts no output; a success counts exactly one.
+- The template size for the pre-check is `RVSource.templateSize()` (no spawn, same value as the
+  clone measurement `_bugSize`); the pose MU gets exactly that size. The pose backend is injected
+  at self creation (`createSelf({ poseTransfer })`) and resolves its target on every call.
+
+Sources without a contained target, and every continuous source, keep the standard path unchanged.
+
+**The path network is not snap-paired.** Path ends are snaps for the planner (rastung,
+markers), but path topology is derived from the network geometry by `path-topology.ts`
+(`pairPathEnds`, shared tolerance `PATH_LINK_TOLERANCE`) and stored as `successors` — see
+[doc-path-fleet-control.md § 2.2](doc-path-fleet-control.md#22-path-topology-successors-written-on-snap-checked-on-load-plan-633).
 
 ### Plugin Order
 
@@ -2081,7 +2695,54 @@ interface UISlotEntry {
   label?: string;         // For settings-tab: tab label
   visibilityId?: string;  // Optional context-store element id for hiding
   visibilityRule?: UIVisibilityRule; // Inline visibility rule (hiddenIn / shownOnlyIn)
+  group?: string;         // button-group only: toolbar section (editing | model | analysis | view | own id)
 }
+```
+
+### Toolbar groups (`button-group`)
+
+The floating tool toolbar is split into **sections** with a divider between two non-empty
+sections. An entry joins a section with the optional `group` field; the sections always appear in
+this fixed order, whatever the `order` values say, so a group sits at the same place in every
+workspace mode:
+
+| `group` | Section | Typical members |
+|---|---|---|
+| *(none)* | first, no label | operator buttons (HMI), measure, test axes, third-party buttons |
+| `editing` | Editing | Undo, Redo, Delete |
+| `model` | Model & layout | Snap, Path network, Library, PLC editor, Signal linking |
+| `analysis` | Simulation & analysis | DES statistics / event queue / snapshot / experiments, Vanish MUs |
+| `view` | View | Section / Clip, Documentation mode |
+| any other string | its own section after `view` | |
+
+`order` still sorts the entries **within** a section. The ids are `TOOL_GROUP` in
+`src/core/hmi/button-panel-sections.ts` (`TOOL_GROUP.model`, …). Entries without a group keep
+their place at the top, so existing plugins need no change; set `group` to join a section.
+
+The divider is drawn by CSS on the container, not computed from the entry list: many slot
+components render `null` (no DES runner, no planner plugin, no binding manager), and an empty
+section must neither leave a line at the edge nor a doubled one. Mobile (the bottom tool row)
+uses the same sections with a vertical divider.
+
+**Menu buttons.** When several related tools would crowd the toolbar, fold them into ONE icon
+with the core primitive `ToolFlyout` (`src/core/hmi/ToolFlyout.tsx`): a trigger that opens a
+small menu on click, right-click or press-and-hold, with `ToolFlyoutRow` children (`kind="checkbox"`
+stays open and shows its state, `kind="action"` closes first and then runs) and
+`ToolFlyoutDivider`. It follows the WAI-ARIA menu-button pattern (Enter / Space / ArrowDown open,
+arrows navigate, Escape returns the focus to the trigger). The planner's snap switches and the
+DES snapshot actions use it.
+
+```tsx
+<ToolFlyout title="Snap" icon={<GridOn />} active={anyOn} testId="planner-snap-flyout">
+  <ToolFlyoutRow kind="checkbox" label="Grid snap" checked={grid} onSelect={toggleGrid} />
+  <ToolFlyoutDivider />
+  <ToolFlyoutRow label="Grid snap settings…" onSelect={(trigger) => openSettings(trigger)} />
+</ToolFlyout>
+```
+
+```typescript
+{ slot: 'button-group', component: SnapFlyout, order: 200, group: TOOL_GROUP.model,
+  visibilityRule: { ...AUTHORING_TOOL_RULE } }
 ```
 
 ### Example: Plugin with KPI Card
@@ -2117,6 +2778,42 @@ viewer.use(new EnergyPlugin());
 ```
 
 The component appears automatically in the top KPI bar, sorted after existing cards (order 40).
+
+#### Simulated KPI chips (`SimulatedKpiPlugin`)
+
+For presentation models without live KPI data, `src/plugins/simulated-kpi-plugin.tsx` fills
+the KPI bar from configuration alone: each chip is a deterministic, smoothly drifting value
+(`src/core/hmi/simulated-kpi.ts`, value noise over wall-clock time — no `Math.random`).
+**A click on a chip opens a trend window** of the same source over a shift, with a dashed
+target line at `base` and a tolerance band; the series ends at "now", so its last point is
+the value on the chip. One window per plugin: another chip replaces it; X, Escape or a
+press outside the window closes it. The window opens below the chip (never over the bar).
+
+```typescript
+viewer.use(new SimulatedKpiPlugin({
+  id: 'my-kpis',
+  showInModes: ['commissioning'],      // lift the KPI bar's default hiding in these modes
+  kpis: [
+    { label: 'OEE', base: 95, amplitude: 0.4, period: 40, unit: '%', decimals: 1, seed: 1,
+      historyHours: 8, tolerance: 0.5 },
+  ],
+}));
+```
+
+| Property | Default | Meaning |
+|---|---|---|
+| `label`, `unit` | — | Chip label and unit (also used for the trend window title and axis). |
+| `base` | — | Centre value; also the target line of the trend window. |
+| `amplitude` | `0` | Maximum deviation from `base` (0 = constant). |
+| `period` | `20` | Seconds between two noise lattice points — larger drifts slower. |
+| `decimals`, `seed`, `color`, `secondary` | `0`, `0`, accent, — | Display precision, de-correlation seed, accent colour, second line. |
+| `historyHours` | `8` | Time span of the trend window in hours (one shift). Sampled on an absolute 5-min grid (96 steps per span) plus the "now" point. |
+| `tolerance` | `amplitude` | Half width of the tolerance band `base ± tolerance` in the trend window. |
+| `historySmoothing` | `1` | 0..1: how much the trend shows a calm shift curve (slow wave, ~6 per span, inside ±0.7·tolerance, same seed) instead of the raw chip drift. Over the last 15 minutes the curve ramps smoothly onto the real chip value, so the endpoint is always the chip value. `0` = raw source on the grid. |
+
+Plugin options: `kpis`, `id` (default `simulated-kpi`), `showInModes`, `refreshMs` (chip and
+chart refresh, default 1000), `order` (slot order of the first chip, default 10). The KPI bar
+itself stays hidden on phones/compact layouts, and with it the chips.
 
 ### Example: Plugin with Settings Tab
 
@@ -2182,7 +2879,7 @@ which button the AI just used.
 ```typescript
 commandRegistry.register({
   id: 'sim.reset', label: 'Reset simulation', readOnly: false, shortcut: 'Shift+R',
-  scope: 'none',                 // 'editor' = needs the active asset document (guard texts reused)
+  scope: 'none',                 // 'editor' = needs a document open in the editor (guard texts reused)
   available: true, unavailableReason: 'Not available',
   argsSchema: {},                // COMMAND args (name → 'string' | 'number' | 'boolean' | 'string[]')
   buttonKey: () => 'sim.reset',  // the button the afterglow / choreography targets
@@ -2265,10 +2962,24 @@ completion dispatches the command with the picked point:
 />
 ```
 
-`run()` demands exactly ONE source (`candidateId` from `web_editor_mechanism_snap_list` XOR
+`run()` demands exactly ONE source (`candidateId` from `web_query("mechanism.snapList", {x:0.5, y:0.5})` XOR
 `pickJson`) and throws a `CommandError` before any write otherwise; cancelling the pick dispatches
 nothing. The density select and the jog slider of the same section are control views, the limits
 form commits through its "Apply" button (one undo step per Apply, never per keystroke).
+
+### Recording targets
+
+`registerRecordingTarget(id, resolve)` in `src/core/engine/rv-recording-targets.ts` registers a
+resolver `(key: string) => { x, y } | null` in viewport CSS pixels and returns an unregister
+function; call it when the owning view unmounts. Registration does not require recording mode.
+`DESStatsChart` registers `des-stats-bar` to resolve a component path to its bar's screen position.
+
+The page seam `window.__rvRecording` is installed only with `?recording=1`. It exposes
+`execute(id, args?)`, `target(id, key)`, `nodeScreen(path, anchor?)` (`center` or `top`), and
+`pick('moving-vehicle', among, sampleSec?)` (default 0.3 s, vehicle component nodes only).
+`pickBegin` / `pickEnd` support sampling across recorder-driven frames. For command completion,
+`armCommandWatch()` subscribes to `onExecuted`, `takeCommandWatch()` drains the captured events,
+and `stopCommandWatch()` unsubscribes; stop the watch in cleanup.
 
 ### MCP tool bindings
 
@@ -2308,15 +3019,71 @@ routines). "Not yet migrated" is not a reason. Two tests enforce it:
 - `rv-command-mcp-parity.node.test.ts` (metadata gate): every write tool bound or allow-listed;
   1:1 mirror and annotations match; every multiplexer branch exists, maps to the hand-kept
   expectation table and produces exactly the command's args shape; the counts are pinned
-  (96 write tools: 45 bound, 51 allow-listed — plan-504 bound the eleven Mechanism section tools;
-  `web_editor_mechanism_set_anchor` stays a millimetre field input; the five plan-729 path tools and
-  the two plan-501 trajectory writes are allow-listed with their reasons).
+  (measured 2026-10-23: 144 write tools, 77 bound, 67 allow-listed — plan-504 bound the eleven
+  Mechanism section tools, `web_editor_mechanism_set_anchor` (now `mechanism.setAnchor`) stays a millimetre field input, the
+  five plan-729 path tools and the two plan-501 trajectory writes are allow-listed with their
+  reasons, and plan-773's seven IK authoring writes are views of `ik.*`).
+
+  The allow-list is meant to **shrink** with every migration. A binding buys three things, and
+  the third is the one that is easy to miss: the enablement rule can no longer drift from a
+  button's tooltip, every model change stays reachable through the one command vocabulary — and
+  a bound tool leaves `tools/list` (`listed: false`, rendered as `alias (web_execute)`), so the
+  surface an agent has to read gets smaller instead of larger. That holds even for a command
+  with no UI counterpart at all, which is why plan-773's IK authoring tools are bound rather
+  than allow-listed.
 - `rv-command-bindings-execution.test.ts` (execution gate): every bound tool dispatches exactly ONE
   `execute` with the expected id/args (`EXPECTED_DISPATCH`), serialises the pre-migration result
   shape, and answers a refusal as `{error: reason, ...details}`.
 
 Adding a write tool therefore means: bind it (`command:` + an `EXPECTED_DISPATCH` row) or add it
 to the allow-list with its reason — and bump the counts.
+
+### The generic MCP door and macros (plan-641)
+
+Agents reach EVERY registered command through three generic tools in
+`plugins/mcp-bridge/rv-mcp-command-tools.ts`: `web_commands` (list), `web_execute` (one) and
+`web_batch` (several). A new modelling capability is therefore a new **command**, not a new tool.
+All three — and every bound alias — run through ONE wrapper, `runCommandStep()`, which captures the
+context synchronously, executes via `commandRegistry.execute(…, { origin: 'mcp', context })` and
+classifies the outcome (`classifyCommandOutcome`: `ok` | `partial` | `noop` | `failed` |
+`requires-commercial`).
+
+A command that changes the DOCUMENT may declare `macro: true`. While a macro recording runs
+(`web_macro_record_start`), an MCP call of such a command becomes a macro line. The contract:
+
+- `readOnly: false`, and the implementation provides **`resolveArgs(ctx, args) → args`** — pure,
+  synchronous, turning every selection fallback, default and trim of `run()` into explicit
+  values. The recorder calls it through `commandRegistry.prepare(id, captured, args)` on the
+  EARLY captured context and stores exactly its result; a replay runs that, whatever is selected
+  then. `editor-commands-macro-resolvers.node.test.ts` (private) fails when a `macro: true`
+  command has no resolver.
+- The document change must have landed when the step ends (the wrapper additionally awaits the
+  document queue). The recorder attributes changes through `RvDocument.changeSeq` /
+  `onHistoryChange()` per step window; an undo, redo, history replacement or a change outside a
+  window ends the recording (`recording-interrupted`).
+- Never on undo / redo / selection / view / runtime commands.
+
+Macros are stored per document (`core/editor/rv-macro-store.ts`) and written by both save paths
+as `scenes[0].extras.realvirtual.Macros` (asset export and scene writer).
+
+Registry-only modelling commands (plan-641 Phase 3, no own tool): `editor.clone` (a new asset op
+kind `cloneNode` — deep copy of a live subtree, undo through the trash), `editor.materialDefine`
+(a named `setMaterial`) and `editor.reorder` (a same-parent `reparentNode` with `newIndex`).
+
+**Assertion lines and geometry checks (Phase 4).** A macro line of `kind: 'assert'` names a check
+of the allowlist `gap` | `contact` (`isGeometryCheck`) with `args {a, b, pose?, toleranceMm?}` and
+an `expect`; `web_macro_assert` adds one, the replay measures it through the same
+`runGeometryCheck()` as `web_check_gap` / `web_check_contact` (`plugins/mcp-bridge/rv-mcp-check-tools.ts`).
+The geometry module (`rv-mesh-gap.ts`, lazy) copies the triangles of both targets — editor tree:
+own meshes; runtime tree: `BakeRegistry.chunkTargetsOf` segment ranges plus keep meshes — into
+private world-space buffers and never writes to a scene geometry (render/pick contract 3).
+
+**Pose adapter (`core/engine/rv-pose-adapter.ts`, public).** `withPose(ctx, pose, fn)` sets drive
+axes for the SYNCHRONOUS duration of `fn` and restores every node transform in `finally`, without
+touching drive state: the target transform comes from `RVDrive.computePoseTransform()`, i.e. the
+drive's own formula as the pure function `writeDriveLocalTransform()` (`applyToNode` uses the same
+function). Parents first, `Drive_Gear` slaves follow state-free, other couplings to a posed axis
+throw `pose-dependency-unsupported`, `ctx.editorTree` throws `pose-requires-runtime`.
 
 ---
 
@@ -2660,7 +3427,7 @@ export const RibbonTensionControls = ({ plugin }: { plugin: RibbonTensionControl
 ```
 
 Register it in the `overlay` slot with a `visibilityId` and **no** `visibilityRule`. The
-Mauser HMI hides its window with `hiddenIn: ['viewer']`; copying that rule here hides the
+A customer kiosk 3D-HMI hides its window with `hiddenIn: ['viewer']`; copying that rule here hides the
 operator panel in exactly the mode it exists for.
 
 ### Four rules the lifecycle imposes
@@ -2765,6 +3532,120 @@ MCP verbs `web_editor_group_assign / _remove / _rename / _dissolve` (`webviewer.
 
 ---
 
+## 8e. Statistics contributions (plan-2011)
+
+The hub is one **Statistics** window behind one button in the `analysis` toolbar group.
+Available sections become tabs (the tab bar is hidden with only one section); without any
+available sections the button hides. `StatsHubPlugin` loads the window lazily on first open.
+
+Planning owners' key figures appear as hub sections (`planning.kpis:<owner>`) and no longer in the planning window.
+
+Built-in sections: `des.utilization`, `path.traffic`, `system.performance`, and `scripts`.
+A section may set `description` — a one-line caption at its top; `system.performance` uses it to mark
+its values as measured and not deterministic (FPS, DES events per wall-second, FastForward rate,
+JS heap, draw calls).
+
+```text
+Plugins --------------------> viewer.stats --------------------+
+GLB components -> ctx.statsRegistry -> viewer.componentStats --+-> registry -> Statistics window
+Scripts -> self.statValue -> collector -> "Scripts" section ---+
+```
+
+### Plugin contributions
+
+Register in `init` and call the returned unregister function in `dispose`:
+
+```typescript
+import type { RVViewer } from './core/rv-viewer';
+import type { RVViewerPlugin } from './core/rv-plugin';
+
+export class QueueStatsPlugin implements RVViewerPlugin {
+  readonly id = 'queue-stats';
+  private unregister?: () => void;
+  private detailed = false;
+
+  init(viewer: RVViewer): void {
+    this.unregister = viewer.stats.register({
+      id: 'queue.summary', title: 'Queue', order: 30,
+      isAvailable: () => !!viewer.simulationKernel?.activeExecutor,
+      subscribe: notify => {
+        const offs = ['model-loaded', 'model-cleared', 'simulation-mode-changed']
+          .map(event => viewer.on(event, notify));
+        return () => offs.forEach(off => off());
+      },
+      rows: () => [{ key: 'detail', label: 'Detail', value: this.detailed ? 'Full' : 'Compact' }],
+      settings: [{
+        id: 'queue.detailed', label: 'Detailed values',
+        get: () => this.detailed,
+        set: value => { this.detailed = value; },
+      }],
+    });
+  }
+
+  dispose(): void { this.unregister?.(); }
+}
+```
+
+Paths above assume a module under `src/`; adjust imports to your plugin's location.
+`StatsSectionSpec`, `StatsRow` and `StatsSetting` live in
+`src/core/stats/rv-stats-registry.ts`. Supply **exactly one** of `Body` or `rows`.
+Registering the same id replaces the section; an old unregister handle cannot remove its
+replacement. `isAvailable` plus `subscribe` controls visibility even while the window is
+closed: notify whenever availability might change. Without `isAvailable`, a section is
+always available. Sections sort by `order` (default 100), then registration order.
+
+A custom React `Body` receives `{ viewer, active }`. It must do no polling, chart updates
+or other work while `active` is false; gate effects on `active` and clean up their timers
+and subscriptions. A `rows` callback returns `StatsRow[]` (`key`, `label`, `value`, optional
+`unit`, `group`, `owner`); the hub reads it immediately, then at **1 Hz only on the active
+tab**. Closing the window unmounts it and stops polling.
+
+`StatsSetting` describes a boolean switch with `id`, `label`, `get`, `set`, optional
+`subscribe` (for changes made outside the hub), and `persist`. Settings persist under
+`rv-stats-hub` unless `persist: false`; stored values are re-applied only while the section
+is available, on registration or when it becomes available again. For example, DES's
+`des.badges` switch (**In-scene badges**) waits for DES mode and a runner before restoring
+badges. Path traffic uses `persist: false` because its overlay stores own persistence.
+
+### GLB component contributions
+
+`ComponentContext.statsRegistry` is an optional `StatsSectionRegistrar` backed by the
+viewer's scoped `viewer.componentStats`, which forwards to `viewer.stats`. Guard it in
+headless hosts. Use a stable id `component:<node path>:<name>`, register in `init`, and
+unregister in `dispose`. The scope also drops these sections on `clearModel()`, which does
+not dispose every component.
+
+```typescript
+// Inside a component; nodePath is its stable registry path.
+private unregisterStats?: () => void;
+
+init(ctx: ComponentContext): void {
+  this.unregisterStats = ctx.statsRegistry?.register({
+    id: `component:${this.nodePath}:queue`, title: 'Queue',
+    rows: () => [{ key: 'waiting', label: 'Waiting', value: this.waiting, unit: 'items' }],
+  });
+}
+
+dispose(): void { this.unregisterStats?.(); }
+```
+
+### Opening and persistence
+
+Import `openStatsHub(sectionId?)`, `closeStatsHub()` and `isStatsHubOpen()` from
+`src/core/stats/stats-hub-store.ts`. For example, `openStatsHub('des.utilization')` opens
+Material flow; an unavailable selection falls back to an available section.
+
+| Preference | Storage |
+|---|---|
+| Selected tab, group-by per section, persisted settings | `rv-stats-hub` |
+| Window position and size | `rv-panel-geo:stats-hub` |
+| Open state | Session only; not persisted |
+
+Scripts contribute through [`self.statValue`](doc-scripting.md#selfstatvalue--statistics-window-rows),
+collected into the **Scripts** section.
+
+---
+
 ## 8b. Contributing a Help Topic
 
 > **Internal, not a guaranteed API.** This registry is deliberately unsealed: it may change
@@ -2845,6 +3726,17 @@ const snapshot = useSyncExternalStore(lpm.subscribe, lpm.getSnapshot);
 panel at the same time, so consumers that need exactly ONE window (the context-sensitive help
 does) use it to break the tie. It is re-derived when a panel closes and when `restore()` runs,
 and it is deliberately **not** persisted — it is session state, not a setting.
+
+**An open slot reserves viewport width.** `useViewportInsets` reads the slot widths and
+`ViewportFrame` insets `#rv-viewport` by them, whether or not anything renders the panel. A panel
+rendered by a mode-scoped plugin is therefore listed in `MODE_OWNED_PANELS`
+(`src/core/hmi/mode-owned-panels.ts`: `layout-planner` → planner/DES, `kinematics` and `materials`
+→ editor). `attachModeOwnedPanelReconciler` (wired in `main.ts`) closes such a slot whenever the
+active mode does not own it — after every completed switch and after every manager change outside
+a switch, never while a switch is in flight or before the first mode is chosen. That is what keeps
+the boot `restore()` (the persisted `rv-left-panel-active` is per origin, so every hosted project
+on one host shares it) from reserving 340 px for a planner library in a boot straight into HMI.
+Adding a right-docked panel to a mode-scoped plugin? Add its id there.
 
 ### LeftPanel Component
 
@@ -3139,6 +4031,7 @@ class MockHost {
 
 | Plugin | ID | File | Purpose |
 |--------|----|------|---------|
+| `StatsHubPlugin` | `stats-hub` | [src/core/stats/stats-hub-plugin.tsx](src/core/stats/stats-hub-plugin.tsx) | Shared Statistics button in `analysis` and lazy window; contributor API in §8e |
 | `DriveOrderPlugin` | `drive-order` | [src/plugins/drive-order-plugin.ts](src/plugins/drive-order-plugin.ts) | Topological sort for CAM/Gear master-slave |
 | `SensorMonitorPlugin` | `sensor-monitor` | [src/plugins/sensor-monitor-plugin.ts](src/plugins/sensor-monitor-plugin.ts) | Event-based sensor change tracking |
 | `TransportStatsPlugin` | `transport-stats` | [src/plugins/transport-stats-plugin.ts](src/plugins/transport-stats-plugin.ts) | 10 Hz spawn/consume RingBuffers |
@@ -3162,7 +4055,6 @@ popover.
 | `MultiuserPlugin` | `multiuser` | [src/plugins/multiuser-plugin.ts](src/plugins/multiuser-plugin.ts) | Presence, avatars, signal/drive sync, relay support |
 | `FpvPlugin` | `fpv` | [src/plugins/fpv-plugin.tsx](src/plugins/fpv-plugin.tsx) | First-person WASD + mouse look walkthrough |
 | `AnnotationPlugin` | `annotations` | [src/plugins/annotation-plugin.ts](src/plugins/annotation-plugin.ts) | 3D markers, labels, drawing |
-| `AasLinkPlugin` | `aas-link` | [src/plugins/aas-link-plugin.tsx](src/plugins/aas-link-plugin.tsx) | AAS / AASX linking + tooltip |
 | `DocsBrowserPlugin` | `docs-browser` | [src/plugins/docs-browser-plugin.tsx](src/plugins/docs-browser-plugin.tsx) | PDF / docs browser overlay |
 | `CollisionAlertPlugin` | `collision-alert` | [src/plugins/collision-alert-plugin.tsx](src/plugins/collision-alert-plugin.tsx) | Collision alert tiles in the `messages` slot (order 6), fed by `RVCollisionManager` |
 | `DebugEndpointPlugin` | `debug-endpoint` | [src/plugins/debug-endpoint-plugin.ts](src/plugins/debug-endpoint-plugin.ts) | `/__api/debug` HTTP bridge (dev) — **not** `core` |
@@ -3170,7 +4062,40 @@ popover.
 | `BlueprintPlugin` | `blueprint` | [src/plugins/blueprint-plugin.ts](src/plugins/blueprint-plugin.ts) | Blueprint / 2D plan view |
 | `DriveRecorderPlugin` | `drive-recorder` | [src/plugins/drive-recorder-plugin.ts](src/plugins/drive-recorder-plugin.ts) | Drive recording at runtime |
 | `SensorRecorderPlugin` | `sensor-recorder` | [src/plugins/sensor-recorder-plugin.ts](src/plugins/sensor-recorder-plugin.ts) | Sensor history recording |
-| `OrderManagerPlugin` | `order-manager` | [src/plugins/order-manager-plugin.tsx](src/plugins/order-manager-plugin.tsx) | Production order manager |
+
+### Statistics contributors (plan-2011)
+
+`DESHMIPlugin` contributes **Material flow** (`des.utilization`, order 10) when DES mode
+has a runner. Its toolbar entries are Event Queue, Snapshot and Experiments; the shared
+Statistics button opens the hub, and **In-scene badges** is a switch inside Material flow.
+The former `DESStatsButton` and separate badges button were removed.
+
+`PathTracePlugin` contributes **Path traffic** (`path.traffic`, order 20) when trace paths
+exist. **Blocked share**, **Utilization**, time-range chips, legends and top-10 rows live
+in that section. The trace controls and legends were removed from the Groups window.
+
+### AAS and Order Cart are core plugins (plan-682)
+
+`AasLinkPlugin` (`aas-link`: AAS button / AAS mode, index metadata, datasheet
+hover) and `OrderManagerPlugin` (`order-manager`: the Order Cart) are registered
+**once, in `main.ts`, as core plugins** (`core = true`), so every delivery with
+AAS links — a hosted project without any plugin package included — has them.
+Both gate their own UI: no resolvable AAS link in the document → no AAS button
+and no cart button; the cart (button, "Add to Cart" in the AAS and metadata
+tooltips, the context-menu entry, the auto-open in `addItem()`) reads ONE gate,
+`isCartAvailable()` / `useCartAvailable()` in `src/core/hmi/cart-gate.ts`, the
+same `ORDER_PANEL_GATE` as the panel (hidden in `mode:viewer`).
+
+**A model pack must not register either plugin again** —
+`tests/aas-plugin-core-guard.node.test.ts` fails if one does. Shop settings that
+used to be constructor arguments go into the document config instead:
+`pluginConfig['order-manager'] = { orderUrl, orderEmail, … }`.
+
+**Ordering rule for AAS rewriters:** a pack plugin that rewrites or attaches
+`_rvAasLink` (the demo supplier swap via `ModelOptionPlugin`, a CAD-import showcase model's runtime
+attach) does it in its own `onModelLoaded`. That is always early enough: the AAS
+resolution (`installAasResolution`, main.ts) and the AAS plugin's model work both
+run on `'model-loaded'`, which fires after every plugin's `onModelLoaded`.
 
 ### Demo Model Plugins (loaded for `DemoRealvirtualWeb.glb`)
 
@@ -3285,7 +4210,7 @@ the match is case-SENSITIVE on both sides.
 
 ### How It Works
 
-1. `ModelPluginManager` uses `import.meta.glob` to discover all `plugins/index.ts` files at build time
+1. `ModelPluginManager` uses `import.meta.glob` at build time: public model plugins as `src/plugins/models/*/index.ts(x)`, project plugins as any `.ts`/`.tsx` file at any depth under `projects/*/plugins/**` (private builds only)
 2. When `viewer.loadModel(url)` is called, the manager resolves the document row and reads its `scriptRef`
 3. It finds the matching plugin module (by `scriptRef`; failing a reference, by `models` array or folder name)
 4. Previous model's `unregisterModelPlugins()` is called — all plugins are disposed and removed
@@ -3325,7 +4250,7 @@ src/plugins/models/DemoRealvirtualWeb/index.ts
 
 ### Example: Private Project Plugins
 
-A private project (e.g., Mauser 3D HMI) registers its plugins in `projects/mauser3dhmi/plugins/index.ts`. Only the plugins this specific project needs are loaded:
+A private project (e.g., a customer kiosk 3D-HMI) registers its plugins in `projects/mauser3dhmi/plugins/index.ts`. Only the plugins this specific project needs are loaded:
 
 ```
 projects/mauser3dhmi/plugins/index.ts
@@ -3355,7 +4280,7 @@ export const modelOptions: ModelOptionDef[] = [
 ];
 ```
 
-**2. Apply** — in the model's `index.ts`, write an `apply(viewer, optionId)` that issues rv_extras commands, and register `ModelOptionPlugin` with it. Register the plugin **first** when an option swaps AAS ids, so the swap lands before `AasLinkPlugin` pre-parses the AASX:
+**2. Apply** — in the model's `index.ts`, write an `apply(viewer, optionId)` that issues rv_extras commands, and register `ModelOptionPlugin` with it. Its `onModelLoaded` swaps the AAS ids before the AAS resolution and `AasLinkPlugin`'s model work run (both wait for `'model-loaded'`, plan-682), so the registration order inside the pack no longer matters:
 
 ```typescript
 import { ModelOptionPlugin, remapAasLink, setComponentField } from '../model-option-plugin';
@@ -3631,7 +4556,7 @@ Three things a contributor has to know before touching it:
   cannot photograph its own cone, and neither can the thumbnail renderer or the object analyzer.
   Only the two VIEWPORT cameras enable layer 5.
 - **`userData._agentEyeOverlay = true`** on the gizmo keeps it out of picking. The `RaycastManager`
-  filters through `_excludeFilters`, **not** through layer bits (doc-render-picking §2.4), so the
+  filters through `_excludeFilters`, **not** through layer bits (doc-bake-picking-internals §2.4), so the
   layer alone would leave the cone clickable.
 - **Plugin `agent-eye`** (`src/plugins/agent-eye-plugin.ts`) owns the lifecycle: it creates the
   body and the cone, registers the double-click attach and the three auto-detach paths, exposes the
@@ -3687,7 +4612,7 @@ cannot corrupt an authored document at all. See the invariant section in
 `doc-webviewer.md`.
 
 **Why two signal lookup tables (name + path)?**
-Signals need to be addressed by **name** for communication (plugin API, HMI, interfaces) and by **path** for GLB object references (ComponentRef). The name is the signal's identity (Signal.Name if set, otherwise node name); the path is its location in the scene hierarchy. Both resolve to the same underlying value.
+Signals need to be addressed by **name** for communication (plugin API, HMI, interfaces) and by **location** for GLB object references (ComponentRef — stored as an address since plan-769, typed as a path). The name is the signal's identity (Signal.Name if set, otherwise node name); the path is its location in the scene hierarchy. Both resolve to the same underlying value.
 
 ---
 
@@ -4031,9 +4956,37 @@ physicsRegistry.register(myProvider);   // private side; pass null to unregister
 
 **`IMULifecycleHook`** (`rv-transport-manager.ts`, plan-394) is the second seam of that shape and exists for the opposite direction: `onMUSpawned(mu, role)` fires right after a source pushed a new MU, `onMURemoved(mu)` on every dispose path. It is needed because a spawned MU cannot carry its own configuration — the clone paths call `stripComponentMetadata()`, which deletes `userData.realvirtual` so a clone never resurrects as a live component. Anything an MU should inherit is therefore handed over by its source at spawn time; the collision manager uses it for `Source.CollisionRoleForMUs`.
 
-Read-only diagnostics live in the `physicsDiagnostics` singleton (same module): `{ active, zones, bodies, stepMs }`, mutated in place by the provider's plugin and consumed by the Settings → Simulation line and the `web_transport_status` MCP tool.
+Read-only diagnostics live in the `physicsDiagnostics` singleton (same module): `{ active, zones, bodies, stepMs }`, mutated in place by the provider's plugin and consumed by the Settings → Simulation line and the `web_query("transport.status", {})` MCP tool.
 
 The private reference implementation is `RapierPhysicsProvider` + `PhysicsZonePlugin` (lifecycle owner: world build per model load, step/sync per tick, settle return, DES/multiuser/reset guards) in the private repo.
+
+### 2D interaction-zone provider and MU ownership
+
+[src/core/engine/rv-physics2d-registry.ts](src/core/engine/rv-physics2d-registry.ts) defines `Physics2DProvider` and the `physics2dRegistry` singleton. Register a **factory**, not a shared provider: each `create()` returns one world; without registration it returns `null` and `available` is false.
+
+```ts
+physics2dRegistry.register(() => createMyPhysics2DProvider());
+const provider = physics2dRegistry.create();
+physics2dRegistry.register(null); // unregister the factory
+```
+
+- **Frame and lifecycle:** `createWorld(desc)` builds a world in local metres (`+x` along the belt, `y` across it, angles in radians). The plugin owns the 3D transform. `state`, `capacity` and `simTime` expose its state; `reset()` starts a new epoch and frees all slots, `dispose()` releases resources.
+- **Bodies and drives:** reserve with `allocSlot()` (`-1` when full), then `addBody(slot, spec)`; `removeBody()` queues removal and the slot is reusable only after `removed`. Use `setBeltSpeed` / `setBelt`, `setObstacle`, and `setKinematicPose` (velocity toward a target, not teleportation); `setPose` is an explicit correction.
+- **Simulation and readback:** `step()` records an owed fixed step, with at most one request in flight. The reference provider catches up at most three steps per message and counts skipped steps. `readPose`, `isAlive`, `isAwake`, `isFrozen` and `laneTail` read the last answer at provider-owned `simTime`. `onEvent` reports `sleep`, `wake`, `exit` and `removed`; an `exit` event does not remove a body. `onFailOff` supplies the reason and live slots while preserving their last poses for transport recovery. Both subscriptions return removers; `diagnostics()` exposes timing, body and failure counters.
+
+The Private implementation in `src/physics2d/` uses transferable buffers, epoch checks and watchdogs, with one simulation implementation for Worker and inline boot fallback. `Physics2DZonePlugin` owns world grouping, handover and DES/multiuser teardown. It currently runs as an internal plugin at order 21; commercial/beta promotion is pending. `physics2dRegistry.bindMotion(surfaceNode, driveNode)` lets behaviors identify a platform pivot; `motionOf` searches the surface and its ancestors. Drive commands and routing remain with the behavior.
+
+**MU ownership** is defined in [src/core/engine/rv-mu-owner.ts](src/core/engine/rv-mu-owner.ts): `MuOwner = 'transport' | 'rapier' | 'box2d'`. Use `setMuOwner(mu, next, by)` for handover: it returns false and reports `mu-owner-conflict` unless `by` is the current owner or the MU is being claimed from transport. Same-owner writes succeed without counting a change. `isPhysicsOwned(mu)` and the compatibility getter `physicsOwned` cover both physics engines. `resetMuOwner(mu)` unconditionally restores transport for reset/disposal; `getMuOwnerStats()` exposes changes/conflicts (`resetMuOwnerStats()` is a test helper). Holding stays on `heldBy`. Engine-to-engine transfer must prepare the destination body, confirm ownership, then remove the source body, rolling back the destination on refusal.
+
+**Transport extension hooks** (`rv-transport-manager.ts`):
+
+| Extension point | Contract |
+|---|---|
+| `zone2dHook: IZone2DHook` | `tryClaim(mu, driver)` after driver selection returns `pass` (normal transport), `claimed` (Box2D owns the MU) or `wait` (no movement this tick). |
+| `physicsMUHook` / `addPhysicsMUHook(hook)` | Keep the Rapier compatibility slot; additional `IPhysicsMUHook` listeners run afterward in insertion order. Every removal/reset path calls `onMUDisposed(mu)` before disposal. Registration deduplicates the hook and returns a remover; each engine must guard cleanup by owner. |
+| `muLifecycleHook: IMULifecycleHook` | `onMUSpawned(mu, role)` and `onMURemoved(mu)` observe lifetime independently of physics ownership (see above). |
+
+Unregister additional hooks and clear owned hook slots during plugin teardown. Box2D uses the hook list alongside Rapier rather than replacing its disposal hook.
 
 ## 21c. Machining Provider Registry (CSG material removal)
 
@@ -4181,20 +5134,20 @@ There are two ways to fill them:
 ```js
 // Project script: route by table, reserve a charging bay, dispatch on idle
 function setup(self) {
-  var routeAt = {};                         // 'travelerId@junctionPathId' → chosen successor id
+  const st = self.persist({ routeAt: {} });                         // 'travelerId@junctionPathId' → chosen successor id
   self.paths.claim('ChargingBay');          // zone reservation by id (shared with AGV traffic)
   return {
     routing: {
       selectNextPath: function (ids, ctx) {
         // Pure table lookup — deterministic and repeatable per junction.
-        var want = routeAt[ctx.travelerId + '@' + ctx.currentPathId];
+        var want = st.routeAt[ctx.travelerId + '@' + ctx.currentPathId];
         return want && ids.indexOf(want) >= 0 ? want : ids[0];
       },
       onArrive: function (pathId, agvId) {
         self.log(agvId + ' completed ' + pathId);  // progress tracking
       },
       requestDispatch: function (agvId) {
-        routeAt[agvId + '@M'] = 'B';               // assign the next mission leg(s)
+        st.routeAt[agvId + '@M'] = 'B';               // assign the next mission leg(s)
       },
     },
   };

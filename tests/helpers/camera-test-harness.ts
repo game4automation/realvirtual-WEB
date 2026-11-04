@@ -74,7 +74,9 @@ export interface TestCameraManager {
   readonly renderDirty: boolean;
   readonly followMode: 'off' | 'follow' | 'siton';
   readonly isCameraAnimating: boolean;
-  startFollow(src: FollowSource): void;
+  readonly followOwner: 'selection' | 'agent-eye' | null;
+  readonly followSource: FollowSource | null;
+  startFollow(src: FollowSource, owner?: 'selection' | 'agent-eye'): void;
   startSitOn(src: FollowSource, seat?: Vector3): void;
   stopFollowMode(restore?: boolean): void;
   applyLookDelta(dx: number, dy: number): void;
@@ -110,13 +112,15 @@ export interface FakeFollowSource extends FollowSource {
 
 export function makeFakeSource(
   node: Object3D,
-  opts?: { aliveRef?: { alive: boolean }; label?: string },
+  opts?: { aliveRef?: { alive: boolean }; label?: string; seatForward?: 'negZ' | 'posZ'; seatHeight?: number },
 ): FakeFollowSource {
   const aliveRef = opts?.aliveRef ?? { alive: true };
   const base = new Object3DFollowSource(node, opts?.label);
   return {
     aliveRef,
     label: base.label,
+    seatForward: opts?.seatForward,
+    seatHeight: opts?.seatHeight,
     getWorldPosition: (o) => base.getWorldPosition(o),
     getWorldQuaternion: (o) => base.getWorldQuaternion(o),
     getBounds: (o) => base.getBounds(o),

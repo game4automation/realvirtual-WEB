@@ -129,6 +129,9 @@ function loaderViewer() {
     emit: () => {},
     getPlugin: () => undefined,
     async loadModel(url: string) { loaded.push(url); },
+    // plan-757: the authoring load joins the scene settle before it grafts the
+    // placements. Nothing is in flight in this stub, so the join is immediate.
+    whenSceneReady: async () => {},
   };
 }
 

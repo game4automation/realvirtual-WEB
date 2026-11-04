@@ -18,34 +18,15 @@ import type { SensorHistoryWindow } from './sensor-history-store';
 // ─── PRNG ──────────────────────────────────────────────────────────────
 
 /**
- * mulberry32 PRNG — Tomas R. Public domain.
- * 32-bit state, good distribution, seeds deterministically from uint32.
- * Reference: https://stackoverflow.com/a/47593316
+ * mulberry32 PRNG — re-exported from the shared `rv-prng` module (plan-664
+ * consolidated the two identical production copies there). Same stream, same
+ * bits; `tests/rv-ray-noise.node.test.ts` pins that.
  */
-export function mulberry32(seed: number): () => number {
-  let t = seed >>> 0;
-  return function () {
-    t = (t + 0x6D2B79F5) >>> 0;
-    let r = t;
-    r = Math.imul(r ^ (r >>> 15), r | 1);
-    r ^= r + Math.imul(r ^ (r >>> 7), r | 61);
-    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
-  };
-}
+export { mulberry32, hashString as hashPath } from '../engine/rv-prng';
+import { mulberry32, hashString as hashPath } from '../engine/rv-prng';
 
-/**
- * FNV-1a 32-bit hash of a string. Used to seed the PRNG per sensor path.
- * Returns a non-negative integer in [0, 0xFFFFFFFF].
- */
-export function hashPath(path: string): number {
-  let h = 0x811C9DC5 >>> 0;
-  for (let i = 0; i < path.length; i++) {
-    h ^= path.charCodeAt(i);
-    // FNV prime 16777619 — use Math.imul for 32-bit overflow semantics
-    h = Math.imul(h, 0x01000193) >>> 0;
-  }
-  return h >>> 0;
-}
+// `hashPath` is `rv-prng.hashString` (FNV-1a 32-bit over the sensor's node
+// path), re-exported above under its historic name.
 
 // ─── Generator constants ───────────────────────────────────────────────
 

@@ -719,6 +719,46 @@ describe('parseDocuments', () => {
     });
   });
 
+  it('should keep an http(s) File value as an external url, not a zip path (Festo type AAS)', () => {
+    const xml = DOC_XML_V3
+      .replace('<value>/aasx/docs/quickstart.pdf</value>', '<value>https://festo.com/assets/attachment/en/652885</value>')
+      .replace('<mimeType>application/pdf</mimeType>', '<contentType>application/pdf</contentType>');
+    const data = parseAasXml(xml);
+    expect(data.documents).toEqual([{
+      title: 'Quick Start Guide',
+      mimeType: 'application/pdf',
+      zipPath: '',
+      url: 'https://festo.com/assets/attachment/en/652885',
+    }]);
+  });
+
+  it('should read IDTA 02004 HandoverDocumentation metadata (Title, Language, KeyWords) through DigitalFiles', () => {
+    const mlp = (id: string, pairs: Array<[string, string]>) => `<submodelElement><multiLanguageProperty><idShort>${id}</idShort><value>${
+      pairs.map(([l, t]) => `<langStringTextType><language>${l}</language><text>${t}</text></langStringTextType>`).join('')}</value></multiLanguageProperty></submodelElement>`;
+    const prop = (id: string, v: string) => `<submodelElement><property><idShort>${id}</idShort><value>${v}</value></property></submodelElement>`;
+    const coll = (tag: string, id: string, inner: string) => `<submodelElement><${tag}><idShort>${id}</idShort><value>${inner}</value></${tag}></submodelElement>`;
+    const doc = (id: string, version: string, url: string) => coll('submodelElementCollection', id,
+      coll('submodelElementList', 'DocumentClassifications', coll('submodelElementCollection', 'DocumentClassification01',
+        prop('ClassId', '03-02') + mlp('ClassName', [['en', 'Operation'], ['de', 'Bedienung']])))
+      + coll('submodelElementList', 'DocumentVersions', coll('submodelElementCollection', 'DocumentVersion01', version
+        + coll('submodelElementList', 'DigitalFiles', `<submodelElement><file><idShort>DigitalFile01</idShort><contentType>application/pdf</contentType><value>${url}</value></file></submodelElement>`))));
+    const xml = `<?xml version="1.0"?><environment><assetAdministrationShells><assetAdministrationShell><idShort>T</idShort><id>urn:t</id></assetAdministrationShell></assetAdministrationShells>
+<submodels><submodel><idShort>HandoverDocumentation</idShort><submodelElements>${coll('submodelElementList', 'Documents',
+      doc('Document01_BetriebsanleitungDE', prop('Language', 'de') + mlp('Title', [['de', 'Bedienung EHPS-DE']]) + mlp('KeyWords', [['de', 'Betriebsanleitung']]), 'https://example.com/de/1')
+      + doc('Document02_OperatingInstructionsEN', prop('Language', 'en') + mlp('Title', [['en', 'Operation EHPS-EN']]) + mlp('KeyWords', [['en', 'Operating instructions']]), 'https://example.com/en/1')
+      + doc('Document03_KonformitaetserklaerungDE', prop('Language', 'de'), 'https://example.com/de/2'))
+    }</submodelElements></submodel></submodels></environment>`;
+    const docs = parseAasXml(xml).documents;
+    expect(docs.map(d => d.title)).toEqual([
+      'Bedienung EHPS (DE) · Betriebsanleitung',
+      'Operation EHPS (EN) · Operating instructions',
+      // no Title: idShort without "DocumentNN_", kind from the classification
+      expect.stringMatching(/^Konformitaetserklaerung DE|^Konformitaetserklaerung \(DE\)/),
+    ]);
+    expect(docs[0]).toMatchObject({ language: 'DE', kind: 'Betriebsanleitung', url: 'https://example.com/de/1', zipPath: '' });
+    expect(docs[2].kind).toMatch(/^(Bedienung|Operation)$/);
+  });
+
   it('should fallback to filename when VDI2770_Title is missing', () => {
     const data = parseAasXml(DOC_NO_TITLE_XML);
     expect(data.documents).toHaveLength(1);
@@ -831,5 +871,53 @@ describe('extractFileBlob', () => {
       .mockResolvedValueOnce(new Response(zipBlob, { status: 200 }));
 
     await expect(extractFileBlob('urn:test:001', 'nonexistent/file.pdf')).rejects.toThrow('File not found in AASX');
+  });
+});
+
+// ─── plan-682 §9.4 — IDTA 02004 document parts (synthetic fixtures) ─────
+
+describe('plan-682 document metadata', () => {
+  const mlp = (id: string, pairs: Array<[string, string]>) => `<submodelElement><multiLanguageProperty><idShort>${id}</idShort><value>${
+    pairs.map(([l, t]) => `<langStringTextType><language>${l}</language><text>${t}</text></langStringTextType>`).join('')}</value></multiLanguageProperty></submodelElement>`;
+  const prop = (id: string, v: string) => `<submodelElement><property><idShort>${id}</idShort><value>${v}</value></property></submodelElement>`;
+  const coll = (tag: string, id: string, inner: string) => `<submodelElement><${tag}><idShort>${id}</idShort><value>${inner}</value></${tag}></submodelElement>`;
+  const file = (url: string) => coll('submodelElementList', 'DigitalFiles', `<submodelElement><file><idShort>DigitalFile01</idShort><contentType>application/pdf</contentType><value>${url}</value></file></submodelElement>`);
+  const version = (id: string, inner: string, url: string) => coll('submodelElementCollection', id, inner + file(url));
+  const docColl = (id: string, versions: string) => coll('submodelElementCollection', id, coll('submodelElementList', 'DocumentVersions', versions));
+  const env = (docs: string) => `<?xml version="1.0"?><environment><assetAdministrationShells><assetAdministrationShell><idShort>T</idShort><id>urn:t</id></assetAdministrationShell></assetAdministrationShells>
+<submodels><submodel><idShort>HandoverDocumentation</idShort><submodelElements>${coll('submodelElementList', 'Documents', docs)}</submodelElements></submodel></submodels></environment>`;
+
+  it('should read Subtitle and Version from a DocumentVersion', () => {
+    const d = parseAasXml(env(docColl('Document01_ManualEN', version('DocumentVersion01',
+      prop('Language', 'en') + prop('Version', '2024-07') + mlp('Title', [['en', 'Operation X']]) + mlp('Subtitle', [['en', 'Linear drive']]), 'https://e.x/en/1')))).documents[0];
+    expect(d.baseTitle).toBe('Operation X');
+    expect(d.subtitle).toBe('Linear drive');
+    expect(d.version).toBe('2024-07');
+    expect(d.documentIdShort).toBe('Document01_ManualEN');
+  });
+
+  it('should read Language given as MultiLanguageProperty', () => {
+    const d = parseAasXml(env(docColl('Document01', version('DocumentVersion01',
+      mlp('Language', [['en', 'de']]) + mlp('Title', [['de', 'Anleitung']]), 'https://e.x/de/1')))).documents[0];
+    expect(d.language).toBe('DE');
+  });
+
+  it('should accept a document container named "Document" without digits', () => {
+    const d = parseAasXml(env(docColl('Document', version('DocumentVersion01',
+      prop('Language', 'en'), 'https://e.x/en/9')))).documents[0];
+    expect(d.documentIdShort).toBe('Document');
+  });
+
+  it('should emit one entry per DocumentVersion when a document has several (e.g. DE and EN)', () => {
+    const docs = parseAasXml(env(docColl('Document01', version('DocumentVersion01', prop('Language', 'de') + mlp('Title', [['de', 'Anleitung']]), 'https://e.x/de/1')
+      + version('DocumentVersion02', prop('Language', 'en') + mlp('Title', [['en', 'Manual']]), 'https://e.x/en/1')))).documents;
+    expect(docs.map(d => d.language)).toEqual(['DE', 'EN']);
+  });
+
+  it('should fall back to the document idShort when Title is missing', () => {
+    const d = parseAasXml(env(docColl('Document03_KonformitaetserklaerungDE', version('DocumentVersion01',
+      prop('Language', 'de'), 'https://e.x/de/2')))).documents[0];
+    expect(d.title).toMatch(/Konformitaetserklaerung/);
+    expect(d.documentIdShort).toBe('Document03_KonformitaetserklaerungDE');
   });
 });

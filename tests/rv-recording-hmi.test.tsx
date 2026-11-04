@@ -13,7 +13,7 @@
  *  - underlay, layer mode, panel ids / warnings, and the recording-shell inventory of App.tsx.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, render, screen } from '@testing-library/react';
 import { useEffect, useState } from 'react';
 import { SignalStore } from '../src/core/engine/rv-signal-store';
@@ -30,9 +30,14 @@ import { isContextActive } from '../src/core/hmi/ui-context-store';
 import { PilotLamp } from '../src/core/hmi/operator-devices/PilotLamp';
 import { RecordingFrameProbe, RECORDING_SHELL_INVENTORY, recordingOverlayEntries } from '../src/core/hmi/App';
 import { OperatorPanelController } from '../src/core/hmi/operator-devices/operator-panel-model';
-import { allowRecordingOverlay } from '../src/core/engine/rv-recording-hmi';
+import { allowRecordingOverlay, registerRecordingPanel } from '../src/core/engine/rv-recording-hmi';
 import appSource from '../src/core/hmi/App.tsx?raw';
 import type { UISlotEntry } from '../src/core/rv-ui-plugin';
+import {
+  markConnectPanelPending, markConnectPanelCommitted, markConnectPanelFailed,
+  markConnectPanelIdle, markConnectPanelUnmounted,
+  resetConnectPanelReadinessForTests, whenConnectPanelCommitted,
+} from '../src/core/hmi/connect-panel-readiness';
 
 const host = (over: Partial<RecordingHmiHost> = {}): RecordingHmiHost => {
   const active: Record<'left' | 'right', string | null> = { left: null, right: null };
@@ -48,10 +53,11 @@ const host = (over: Partial<RecordingHmiHost> = {}): RecordingHmiHost => {
   };
 };
 
-beforeEach(() => { _resetRecordingHmi(); });
+beforeEach(() => { _resetRecordingHmi(); resetConnectPanelReadinessForTests(); });
 afterEach(() => {
   cleanup();
   _resetRecordingHmi();
+  resetConnectPanelReadinessForTests();
   document.getElementById('rv-viewport')?.remove();
 });
 
@@ -209,6 +215,23 @@ describe('underlay + layer mode (F5/F6)', () => {
 });
 
 describe('enter / exit (F2/F3)', () => {
+  it('does not overwrite or restore a panel value whose backup could not be read', () => {
+    const key = 'rv-panel-collapsed:op-station';
+    localStorage.setItem(key, '1');
+    const read = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => { throw new Error('denied'); });
+    const h = host();
+    try {
+      enterRecordingHmi(h, { open: ['op-station'] });
+      read.mockRestore();
+      expect(localStorage.getItem(key)).toBe('1');
+      exitRecordingHmi(h);
+      expect(localStorage.getItem(key)).toBe('1');
+    } finally {
+      read.mockRestore();
+      localStorage.removeItem(key);
+    }
+  });
+
   it('activates the recording context, pins UI zoom, expands requested operator panels and restores all of it', () => {
     localStorage.setItem('rv-panel-collapsed:op-station', '1');
     const h = host();
@@ -241,6 +264,28 @@ describe('enter / exit (F2/F3)', () => {
     expect(validateHmiOpen(h, ['op-station', 'connect'])).toBeNull();
     expect(validateHmiOpen(h, ['hierarchy'])).toBe('--hmi-open: unsupported panel id "hierarchy" — supported: op-plugin, op-station, connect.');
   });
+
+  it('--hmi-open <id>:<arg> reaches a registered plugin panel: validated, opened on enter, closed on exit', () => {
+    const h = host();
+    const calls: string[] = [];
+    const off = registerRecordingPanel('plc', {
+      validate: (arg) => (arg === 'Missing' ? 'no PLC program "Missing"' : null),
+      open: (arg) => { calls.push(`open:${arg}`); },
+      close: () => { calls.push('close'); },
+    });
+    try {
+      expect(validateHmiOpen(h, ['plc:Station04', 'connect'])).toBeNull();
+      expect(validateHmiOpen(h, ['plc:Missing'])).toBe('--hmi-open plc:Missing: no PLC program "Missing"');
+      expect(validateHmiOpen(h, ['hierarchy'])).toBe('--hmi-open: unsupported panel id "hierarchy" — supported: op-plugin, op-station, connect, plc.');
+      enterRecordingHmi(h, { open: ['plc:Station04'] });
+      expect(calls).toEqual(['open:Station04']);
+      exitRecordingHmi(h);
+      expect(calls).toEqual(['open:Station04', 'close']);
+    } finally {
+      off();
+    }
+    expect(validateHmiOpen(h, ['plc'])).toBe('--hmi-open: unsupported panel id "plc" — supported: op-plugin, op-station, connect.');
+  });
 });
 
 describe('recording shell inventory (F3)', () => {
@@ -257,6 +302,13 @@ describe('recording shell inventory (F3)', () => {
     expect(missing).toEqual([]);
     expect(RECORDING_SHELL_INVENTORY.TopBar).toBe('hidden');
     expect(RECORDING_SHELL_INVENTORY.ConnectPanel).toBe('kept');
+    expect(RECORDING_SHELL_INVENTORY.ConnectPanelHost).toBe('kept');
+    // plan-615 §9.6: the dev toolbar replaced the banner — its App-root part
+    // (title prefix + delivered-view handle) and its ActivityBar host are both
+    // absent from a recording; the banner entry is gone with the banner.
+    expect(RECORDING_SHELL_INVENTORY.DevSessionHost).toBe('hidden');
+    expect(RECORDING_SHELL_INVENTORY.ActivityBar).toBe('hidden');
+    expect('ServeSessionBadge' in RECORDING_SHELL_INVENTORY).toBe(false);
   });
 
   it('the overlay slot keeps operator panels (model + plugin) and the allow-list, nothing else', () => {
@@ -272,5 +324,109 @@ describe('recording shell inventory (F3)', () => {
     expect(recordingOverlayEntries(entries, viewer).map((e) => e.pluginId)).toEqual(['web-operator-panels', 'op-plugin']);
     allowRecordingOverlay('my-readout');
     expect(recordingOverlayEntries(entries, viewer).map((e) => e.pluginId)).toEqual(['web-operator-panels', 'op-plugin', 'my-readout']);
+  });
+});
+
+describe('CONNECT recording readiness (plan-2035)', () => {
+  it('enter synchronously blocks an immediate capture until CONNECT loads, without a mounted host', async () => {
+    enterRecordingHmi(host(), { open: ['connect'] });
+    await expect(captureHmiSettle(0, { timeoutMs: 20 })).rejects.toThrow(
+      'The CONNECT panel did not load within 0.02 s.',
+    );
+  });
+
+  it('captures after CONNECT commits following enter, without a mounted host', async () => {
+    enterRecordingHmi(host(), { open: ['connect'] });
+    markConnectPanelCommitted();
+    expect((await captureHmiSettle(0, { timeoutMs: 20 })).ackMs).toBe(-1);
+  });
+
+  it.each([false, true])('waits for the panel commit (frame probe registered: %s)', async (withProbe) => {
+    if (withProbe) render(<RecordingFrameProbe />);
+    enterRecordingHmi(host(), { open: ['connect'] });
+    let settled = false;
+    const result = captureHmiSettle(1000).then((value) => { settled = true; return value; });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 30)); });
+    expect(settled).toBe(false);
+    await act(async () => { markConnectPanelCommitted(); await result; });
+    expect(settled).toBe(true);
+    expect((await result).ackMs).toBeGreaterThanOrEqual(withProbe ? 0 : -1);
+    if (!withProbe) expect((await result).ackMs).toBe(-1);
+  });
+
+  it('rejects a pending capture with the import failure as its cause', async () => {
+    markConnectPanelPending();
+    const failure = new Error('CONNECT chunk unavailable');
+    const result = captureHmiSettle(0);
+    const assertion = expect(result).rejects.toMatchObject({
+      message: 'The CONNECT panel failed to load: CONNECT chunk unavailable', cause: failure,
+    });
+    markConnectPanelFailed(failure);
+    await assertion;
+  });
+
+  it('bounds a pending panel by the caller timeout, even without a frame probe', async () => {
+    markConnectPanelPending();
+    await expect(captureHmiSettle(0, { timeoutMs: 20 })).rejects.toThrow(
+      'The CONNECT panel did not load within 0.02 s.',
+    );
+  });
+
+  it('aborts a capture while the panel is pending', async () => {
+    markConnectPanelPending();
+    const controller = new AbortController();
+    const result = captureHmiSettle(0, { signal: controller.signal });
+    const assertion = expect(result).rejects.toThrow('Recording aborted.');
+    controller.abort();
+    await assertion;
+  });
+
+  it('an idle panel adds no barrier and capture works without a frame probe', async () => {
+    let ready = false;
+    void whenConnectPanelCommitted().then(() => { ready = true; });
+    await Promise.resolve();
+    expect(ready).toBe(true);
+    expect((await captureHmiSettle(0)).ackMs).toBe(-1);
+  });
+
+  it('a committed panel stays ready when reopened and ignores late failures', async () => {
+    markConnectPanelCommitted();
+    markConnectPanelPending();
+    await expect(whenConnectPanelCommitted()).resolves.toBeUndefined();
+    const failure = new Error('cached failure');
+    markConnectPanelFailed(failure);
+    await expect(whenConnectPanelCommitted()).resolves.toBeUndefined();
+  });
+
+  it('ignores a late failure after closing a pending panel', async () => {
+    markConnectPanelPending();
+    markConnectPanelIdle();
+    markConnectPanelFailed(new Error('late rejection'));
+    await expect(whenConnectPanelCommitted()).resolves.toBeUndefined();
+  });
+
+  it('unmount clears a committed panel so the next pending mount waits again', async () => {
+    markConnectPanelCommitted();
+    markConnectPanelUnmounted();
+    await expect(whenConnectPanelCommitted()).resolves.toBeUndefined();
+    markConnectPanelPending();
+    let ready = false;
+    const result = whenConnectPanelCommitted().then(() => { ready = true; });
+    await Promise.resolve();
+    expect(ready).toBe(false);
+    markConnectPanelCommitted();
+    await result;
+    expect(ready).toBe(true);
+  });
+
+  it('rejects pending waiters with the cause and retains the failure for later waiters', async () => {
+    markConnectPanelPending();
+    const failure = new Error('CONNECT chunk unavailable');
+    const assertion = expect(whenConnectPanelCommitted()).rejects.toMatchObject({
+      message: 'The CONNECT panel failed to load: CONNECT chunk unavailable', cause: failure,
+    });
+    markConnectPanelFailed(failure);
+    await assertion;
+    await expect(whenConnectPanelCommitted()).rejects.toMatchObject({ cause: failure });
   });
 });

@@ -42,12 +42,30 @@ function extrasByNode(glb: ArrayBuffer): Record<string, unknown> {
     const rv = n.extras?.realvirtual;
     if (!rv || !n.name) continue;
     const copy = structuredClone(rv) as Record<string, Record<string, unknown>>;
+    // plan-769: ids are identity (a seed in an older file, an authored id in a new one), not recipe content.
+    delete (copy as Record<string, unknown>).NodeId;
+    // plan-769: a kept path (`unresolvedPath`, the 769 form for a runtime-created signal) is the
+    // same reference as the path the pre-769 shipped file stores.
+    const normalize = (v: unknown): unknown => {
+      if (Array.isArray(v)) return v.map(normalize);
+      if (!v || typeof v !== 'object') return v;
+      const o = v as Record<string, unknown>;
+      if (o.type === 'ComponentReference' && typeof o.unresolvedPath === 'string') {
+        const { unresolvedPath, reason: _reason, ...rest } = o;
+        void _reason;
+        return { ...rest, path: unresolvedPath };
+      }
+      return Object.fromEntries(Object.entries(o).map(([k, x]) => [k, normalize(x)]));
+    };
+    for (const k of Object.keys(copy)) (copy as Record<string, unknown>)[k] = normalize(copy[k]);
     // bufferView indices depend on the geometry layout; the SHA is the identity.
     if (copy.Fmu?.FmuEmbed) delete (copy.Fmu.FmuEmbed as Record<string, unknown>).bufferView;
     out[n.name] = copy;
   }
   const scene = (json.scenes as Array<{ extras?: { realvirtual?: unknown } }>)[0];
-  out['<scene>'] = scene.extras?.realvirtual ?? null;
+  const sceneRv = scene.extras?.realvirtual ? { ...(scene.extras.realvirtual as Record<string, unknown>) } : null;
+  if (sceneRv) { delete sceneRv.NodeId; delete sceneRv.idVersion; }
+  out['<scene>'] = sceneRv;
   return out;
 }
 
@@ -67,16 +85,20 @@ describe('FMU demo model (plan-498 Phase 4)', () => {
 
     const nodes = json.nodes as Array<{ name: string; extras?: any }>;
     const ballNode = nodes.find((n) => n.name === 'Ball')!;
-    expect(Object.keys(ballNode.extras.realvirtual).sort()).toEqual(['Drive', 'Drive_FollowPosition', 'Fmu']);
+    // plan-769 Phase 3: a web export writes every node's NodeId — identity, not recipe content.
+    expect(Object.keys(ballNode.extras.realvirtual).filter((k) => k !== 'NodeId').sort()).toEqual(['Drive', 'Drive_FollowPosition', 'Fmu']);
     expect(ballNode.extras.realvirtual.Fmu.FmuEmbed.modelName).toBe('BouncingBall');
     // Only the ball carries an FMU; Feedthrough is a test fixture, not part of the demo.
     expect(nodes.some((n) => n.name === 'Panel')).toBe(false);
     // plan-502 F13: the restart sequence (top-level serial container → set Restart, wait).
     const seq = nodes.find((n) => n.name === 'Sequence')!;
-    expect(Object.keys(seq.extras.realvirtual)).toEqual(['LogicStep_SerialContainer']);
+    expect(Object.keys(seq.extras.realvirtual).filter((k) => k !== 'NodeId')).toEqual(['LogicStep_SerialContainer']);
     const setStep = nodes.find((n) => n.name === 'RestartBall')!;
+    // plan-769: the signal node is created by the Fmu at runtime, so it is not in the file —
+    // the export keeps the path as `unresolvedPath` (never guessed); at runtime the signal
+    // binding falls back to that path exactly as it did for the path form.
     expect(setStep.extras.realvirtual.LogicStep_SetSignalBool).toMatchObject({
-      Signal: { type: 'ComponentReference', path: 'Ball/Signals/Restart', componentType: 'PLCInputBool' },
+      Signal: { type: 'ComponentReference', unresolvedPath: 'Ball/Signals/Restart', reason: 'missing', componentType: 'PLCInputBool' },
       SetToTrue: true,
     });
     // User request 2026-09-26: the ball really bounces — restart every 12 s, e = 0.95 stored.

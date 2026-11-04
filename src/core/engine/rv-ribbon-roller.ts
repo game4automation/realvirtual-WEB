@@ -71,6 +71,26 @@ import type { RVDrive } from './rv-drive';
 import type { NodeRegistry } from './rv-node-registry';
 import { resetMapOffsets } from './rv-texture-scroll';
 import { RV_RIBBON_SPIN_MESH } from './rv-traverse-utils';
+import { slotWrite } from './rv-slot-io';
+
+/** The ribbon manager's signal sink (`RibbonManager.setSignalWriter`). */
+export type RibbonSignalSink = (address: string, value: number | boolean) => void;
+
+/**
+ * Publish one feedback slot of a ribbon component: a wired address goes through
+ * the manager's sink as before, and a SlotIO-declared slot (unwired, bound
+ * directly in the viewer) receives the value as well.
+ */
+export function publishRibbonSlot(
+  instance: object,
+  field: string,
+  address: unknown,
+  value: number | boolean,
+  write: RibbonSignalSink,
+): void {
+  if (typeof address === 'string') write(address, value);
+  slotWrite(instance, field, null, value, null);
+}
 
 /** Local axis a roller turns about. */
 export type RibbonAxis = 'X' | 'Y' | 'Z';

@@ -15,6 +15,7 @@ export interface ToolInputSchema {
   type: 'object';
   properties: Record<string, { type: string; description: string }>;
   required: string[];
+  additionalProperties?: boolean;
 }
 
 /**
@@ -36,6 +37,11 @@ export interface ToolSchema {
   /** Per-call timeout hint in ms (long-running tools like screenshot bursts).
    *  Bridge-internal — stripped before the tool list is served to the MCP client. */
   timeoutMs?: number;
+  /** plan-641 Nachtrag 2026-10-21: `false` = command-bound alias, callable but not listed.
+   *  Bridge-internal — stripped (and the tool hidden) before the list reaches the client. */
+  listed?: boolean;
+  /** Retired tool redirect, hidden even when aliases are listed. */
+  tombstone?: boolean;
 }
 
 // ── browser → server ──

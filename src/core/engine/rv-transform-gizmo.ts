@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { bumpModelEditEpoch } from './rv-model-edit-epoch';
 /**
  * rv-transform-gizmo.ts — Reusable translate/rotate gizmo (IK-gizmo design).
  *
@@ -51,6 +52,8 @@ export interface TransformGizmoHost {
   readonly renderer: { domElement: HTMLCanvasElement };
   readonly scene: Scene;
   readonly controls: { enabled: boolean };
+  /** plan-2215 2.6: true while a screen pick is invalid (a render strategy draws other cameras). */
+  readonly pointerPickBlocked?: boolean;
   markRenderDirty(): void;
   markShadowsDirty(): void;
 }
@@ -275,6 +278,7 @@ export class TransformGizmo {
   private readonly _onPointerDown = (e: PointerEvent): void => {
     if (e.button !== 0 || !this.root?.visible || this.nodes.length === 0) return;
     if (!this.withinCanvas(e)) return;
+    if (this.host.pointerPickBlocked) return;
     const handle = this.pickHandle(e);
     if (!handle) return;
     e.stopPropagation();
@@ -348,6 +352,12 @@ export class TransformGizmo {
 
   private readonly _onPointerMove = (e: PointerEvent): void => {
     const host = this.host;
+    if (host.pointerPickBlocked) {
+      // A render strategy took over: the drag ends where it is (as on release), the hover goes.
+      if (this.drag) this._onPointerUp(e);
+      else this.setHovered(null);
+      return;
+    }
     if (!this.drag) {
       // Hover feedback: highlight handle + cursor hint.
       if (!this.root?.visible) return;
@@ -435,6 +445,7 @@ export class TransformGizmo {
     e.stopPropagation();
     try { this.host.renderer.domElement.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
     const moved = this._dragMoved;
+    if (moved) bumpModelEditEpoch('transform-commit');
     const nodes = this.drag.baselines.map((b) => b.node);
     this.endDrag();
     this.host.markShadowsDirty();

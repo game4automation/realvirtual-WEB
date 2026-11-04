@@ -24,6 +24,11 @@ interface SchedulerLike {
   yield?(): Promise<void>;
 }
 
+/** Let timer tasks run; priority continuations can otherwise starve them. */
+export function yieldToTimers(): Promise<void> {
+  return new Promise<void>(resolve => setTimeout(resolve, 0));
+}
+
 /** Yield one scheduling turn — `scheduler.yield()` with MessageChannel fallback. */
 export async function yieldToBrowser(): Promise<void> {
   const sched = (globalThis as { scheduler?: SchedulerLike }).scheduler;

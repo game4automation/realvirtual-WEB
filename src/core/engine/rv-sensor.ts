@@ -16,13 +16,15 @@ import {
 } from 'three';
 import { AABB } from './rv-aabb';
 import type { RVMovingUnit, InstancedMovingUnit, IMUAccessor } from './rv-mu';
+import { muDetectOverlaps } from './rv-mu';
+import { buildRaycastLayerMask, getLayerRevision, layerOfNode, layerPasses } from './rv-layers';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
 import { registerComponent, loadSchemaFromSpec } from './rv-component-registry';
 import { NodeRegistry } from './rv-node-registry';
 import { unityPositionToGltf } from './rv-coordinate-utils';
 import { debug } from './rv-debug';
 import { MM_TO_METERS } from './rv-constants';
-import { RV_SENSOR_BEAM_KEY, type PreBakedSensorBeam } from './rv-pre-bake-keys';
+import { RV_SENSOR_BEAM_KEY, RV_SENSOR_BOX_KEY, type PreBakedSensorBeam, type PreBakedSensorBox } from './rv-pre-bake-keys';
 import { RVTransportSurface } from './rv-transport-surface';
 import { createSignalWriter } from './rv-signal-store';
 import {
@@ -33,6 +35,8 @@ import {
 } from './rv-shared-viz-geometry';
 import { syncColliderGizmo } from './rv-collider-gizmo-sync';
 import { isSensorRuntimeVizName } from './rv-sensor-viz-names';
+import { refreshWorldMatrix } from './rv-world-matrix';
+import { rayColliderDistance, rayObbDistance, type RayCollider } from './rv-ray-colliders';
 
 // Shared materials (reused across all sensors to save GPU resources)
 const YELLOW = 0xffcc00;
@@ -71,6 +75,7 @@ function removePersistedSensorViz(node: Object3D): void {
 /** Reusable temporaries to avoid per-frame allocation */
 const _forward = new Vector3(0, 0, 1);
 const _quat = new Quaternion();
+const _scaleScratch = new Vector3();
 
 /**
  * Fast ray vs AABB intersection test (slab method).
@@ -175,6 +180,35 @@ export function findRayChild(node: Object3D): Object3D | null {
 }
 
 /**
+ * plan-655 B1 — the node-local collision box of a sensor: the union of its
+ * mesh subtree (runtime visualisation excluded) in the sensor node's OWN frame,
+ * so a SolidCraft sensor (a `Group` at the body origin whose `mesh_0` child
+ * carries millimetre vertices far from it) gets a box ON the beam. Null when
+ * the subtree has no geometry.
+ */
+export function computeSensorLocalBox(node: Object3D): PreBakedSensorBox | null {
+  node.updateWorldMatrix(true, true);
+  const inv = new Matrix4().copy(node.matrixWorld).invert();
+  const rel = new Matrix4();
+  const box = new Box3();
+  const part = new Box3();
+  node.traverse((o) => {
+    if (o !== node && isSensorRuntimeVizName(o.name)) return;
+    const mesh = o as Mesh;
+    if (!mesh.isMesh || !mesh.geometry) return;
+    if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+    if (!mesh.geometry.boundingBox) return;
+    rel.multiplyMatrices(inv, mesh.matrixWorld);
+    part.copy(mesh.geometry.boundingBox).applyMatrix4(rel);
+    box.union(part);
+  });
+  if (box.isEmpty()) return null;
+  const c = box.getCenter(new Vector3());
+  const h = box.getSize(new Vector3()).multiplyScalar(0.5);
+  return { c: [c.x, c.y, c.z], h: [h.x, h.y, h.z] };
+}
+
+/**
  * Derive a raycast beam spanning the LONGEST edge of the node's bounding box —
  * from the centre of one end face to the centre of the opposite face. Returns
  * null when the node has no geometry. Assumes ~unit world scale (placed library
@@ -215,6 +249,76 @@ export function computeBeamFromBounds(node: Object3D, boundsSource?: Object3D | 
  * - Collision: semi-transparent box (yellow = idle, red = occupied)
  * - Raycast: line from origin to ray end/hit (yellow = idle, red = occupied)
  */
+/** Which collider of the MU {@link rayDetectDist} hit: a `detectParts` index, -1 = the single detection box. */
+export interface RayDetectHit { part: number }
+
+const _detQuat = new Quaternion();
+const _partQuat = new Quaternion();
+const _detRot = new Matrix4();
+
+/** World rotation elements of detection part `i`: the frame rotation `q`, turned
+ *  by the part's own rotation relative to the frame (null = aligned). */
+function partRotation(q: Quaternion, rel: Quaternion | null): ArrayLike<number> {
+  return _detRot.makeRotationFromQuaternion(rel ? _partQuat.multiplyQuaternions(q, rel) : q).elements;
+}
+
+/**
+ * Ray distance to an MU's detection shape (plan-2016 S5 Codex fix): the union
+ * box as broadphase, then the nearest single collider box when the MU has
+ * several (the union fills the gaps between them). Negative = miss.
+ *
+ * The boxes are tested ORIENTED — each collider as its own exact box: centre,
+ * half extents and rotation relative to the MU (plan-2016 Codex review; a rotated
+ * child collider is not its axis-aligned enclosure).
+ *
+ * Raycast sensors hit colliders only; colliders must cover the part (Unity parity).
+ * An MU without any active collider still uses its mesh box (`detectAabb == null`).
+ * Missing an authored collider never retries the mesh box.
+ *
+ * A box that CONTAINS the ray origin is not reported ({@link rayObbDistance}, point (c2)).
+ *
+ * `layerMask` (plan-2016 S6c, Unity `Physics.Raycast(…, layermask)`): only
+ * colliders on a layer in the mask are hit — per part when the MU has several,
+ * else the layer of its one collider / root. null = every layer.
+ * `hit` (optional) receives which collider was hit.
+ */
+export function rayDetectDist(
+  mu: RVMovingUnit | InstancedMovingUnit, origin: Vector3, dir: Vector3, maxDist: number,
+  layerMask: number | null = null, hit?: RayDetectHit,
+): number {
+  const box = mu.detectAabb ?? mu.aabb;
+  return rayColliderBoxDist(mu, box, origin, dir, maxDist, layerMask, hit);
+}
+
+/** The detection-box test of {@link rayDetectDist}: the nearest collider box of the MU, -1 = miss. */
+function rayColliderBoxDist(
+  mu: RVMovingUnit | InstancedMovingUnit, box: AABB, origin: Vector3, dir: Vector3, maxDist: number,
+  layerMask: number | null, hit?: RayDetectHit,
+): number {
+  // Broadphase on the world enclosure of the collider boxes.
+  if (rayIntersectsAABB(origin.x, origin.y, origin.z, dir.x, dir.y, dir.z, maxDist, box.min, box.max) < 0) return -1;
+  const q = mu.detectQuaternion(_detQuat);
+  const parts = mu.detectParts;
+  if (!parts) {
+    if (!layerPasses(layerMask, mu.detectLayer)) return -1;
+    const h = mu.detectObbHalf(-1);
+    if (hit) hit.part = -1;
+    return rayObbDistance(origin, dir, maxDist, box.center, partRotation(q, mu.detectObbRotation(-1)), h.x, h.y, h.z);
+  }
+  const layers = layerMask === null ? null : mu.detectPartLayers;
+  let best = -1;
+  for (let i = 0; i < parts.length; i++) {
+    if (layers && !layerPasses(layerMask, layers[i])) continue;
+    const h = mu.detectObbHalf(i);
+    const di = rayObbDistance(origin, dir, maxDist, parts[i].center, partRotation(q, mu.detectObbRotation(i)), h.x, h.y, h.z);
+    if (di >= 0 && (best < 0 || di < best)) {
+      best = di;
+      if (hit) hit.part = i;
+    }
+  }
+  return best;
+}
+
 export class RVSensor implements RVComponent {
   // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
   static readonly schema: ComponentSchema = loadSchemaFromSpec('Sensor');
@@ -243,6 +347,53 @@ export class RVSensor implements RVComponent {
   }
   RayCastDirection: Vector3 | { x: number; y: number; z: number } = { x: -1, y: 0, z: 0 };
   RayCastLength = 1000;
+
+  /** Layer names a raycast hits (Unity `AdditionalRayCastLayers`, plan-2016 S6c).
+   *  Like Unity `Sensor.Start()` the sensor's own layer is added: the names that
+   *  resolve plus the own layer. A list without a single usable name — missing
+   *  field, EMPTY list, or the broken Unity export `[{}, {}]` — means NO filter
+   *  (plan-2016 point (e) hardening, Thomas 2026-10-29: an empty export array must
+   *  not blind the sensor). Collision mode ignores the field. */
+  private _rayLayers: unknown = [];
+  get AdditionalRayCastLayers(): unknown { return this._rayLayers; }
+  set AdditionalRayCastLayers(value: unknown) {
+    this._rayLayers = value;
+    this._layerMaskRev = -1;
+  }
+  /** Resolved bit mask of {@link AdditionalRayCastLayers}; null = no filter. */
+  private _layerMask: number | null = null;
+  /** Layer-table revision {@link _layerMask} was built against (-1 = stale). */
+  private _layerMaskRev = -1;
+  private _layerWarned = false;
+  private _brokenWarned = false;
+
+  /** The raycast layer mask (resolved lazily — the layer table comes with the file —
+   *  and rebuilt whenever the scene's layer table changes, `getLayerRevision`). */
+  get rayLayerMask(): number | null {
+    const rev = getLayerRevision();
+    if (this._layerMaskRev !== rev) {
+      const ownLayer = layerOfNode(this.node);
+      const { mask, unknown, broken } = buildRaycastLayerMask(this._rayLayers, ownLayer);
+      // A web-authored sensor has no layer of its own: an explicit list without a
+      // single known name would blind it to every layered MU — no filter instead
+      // (an unknown layer is never filtered, the same rule as for the hit side).
+      this._layerMask = mask === 0 && ownLayer < 0 ? null : mask;
+      this._layerMaskRev = rev;
+      if (unknown.length > 0 && !this._layerWarned) {
+        this._layerWarned = true;
+        console.warn(`[Sensor] "${this.node.name}": unknown raycast layer(s) ${unknown.map((n) => `"${n}"`).join(', ')}`
+          + (this._layerMask === null ? ' — no layer filter' : ' — ignored'));
+      }
+      // The parked Unity export bug: `List<string>` fields are written as empty
+      // objects. Visible, so it does not stay silent (plan-2016 point (e)).
+      if (broken && !this._brokenWarned) {
+        this._brokenWarned = true;
+        console.warn(`[Sensor] "${this.node.name}": AdditionalRayCastLayers has ${(this._rayLayers as unknown[]).length}`
+          + ' entries but no layer NAME (broken Unity export of List<string>) — no layer filter');
+      }
+    }
+    return this._layerMask;
+  }
   /** When true, the ray beam is auto-derived from the node bounding box (convention sensors). */
   AutoRay = false;
   /** Ray start in node-local space. (0,0,0) = node origin; set by AutoRay to a box-face centre. */
@@ -296,6 +447,21 @@ export class RVSensor implements RVComponent {
   /** Callback for state change (for UI/visualization updates) */
   onChanged?: (occupied: boolean, sensor: RVSensor) => void;
   private readonly feedbackListeners: (() => void)[] = [];
+  /** MU-enter listeners (plan-2016 S4, Unity `Sensor.EventEnter`): called once per MU
+   *  that ENTERS the sensor — it overlaps now and did not at the previous detection.
+   *  An MU that stays inside never fires again; `occupiedMU` is independent of it. */
+  private readonly muEnterListeners: ((mu: RVMovingUnit | InstancedMovingUnit, sensor: RVSensor) => void)[] = [];
+  /** MUs overlapping the sensor at the last detection — tracked only while an
+   *  MU-enter listener exists (no cost otherwise). Two sets swapped per detection,
+   *  so a tick allocates nothing. */
+  private _inside = new Set<RVMovingUnit | InstancedMovingUnit>();
+  private _insideNext = new Set<RVMovingUnit | InstancedMovingUnit>();
+  /** Scratch: MUs that entered at this detection (fired after the set swap). */
+  private readonly _entered: (RVMovingUnit | InstancedMovingUnit)[] = [];
+  /** Pre-bound Set.forEach callback (no closure per detection). */
+  private readonly _collectEntered = (mu: RVMovingUnit | InstancedMovingUnit): void => {
+    if (!this._inside.has(mu)) this._entered.push(mu);
+  };
 
   /** Visual mesh for sensor zone — Collision mode (child of sensor node) */
   private visMesh: Mesh | null = null;
@@ -317,8 +483,27 @@ export class RVSensor implements RVComponent {
 
   constructor(node: Object3D, aabb: AABB) {
     this.node = node;
-    this.aabb = aabb;
+    // plan-653: the loader's AABB (fromNode / fromBoxCollider) keeps its centre
+    // in NODE-LOCAL units — map it through the full world matrix so a sensor on
+    // a scaled node (SolidCraft body, scale 0.001) sits where its mesh is.
+    // Unit-scale nodes are unaffected (rigid matrix → historical path).
+    this.aabb = aabb.useNodeLocalFrame();
+    // plan-655 B1: the bake merged the sensor's own meshes away, so the
+    // loader's mesh box is empty (zero size at the node origin) and nothing
+    // could ever overlap it. Take the box the pre-bake hook measured instead,
+    // in the node's local frame; `updateAABB` keeps its world extents current.
+    const stamped = node.userData?.[RV_SENSOR_BOX_KEY] as PreBakedSensorBox | undefined;
+    if (stamped && Array.isArray(stamped.c) && Array.isArray(stamped.h)
+      && this.aabb.halfSize.lengthSq() === 0) {
+      this._localHalf = new Vector3(stamped.h[0], stamped.h[1], stamped.h[2]);
+      this.aabb.localCenter.set(stamped.c[0], stamped.c[1], stamped.c[2]);
+      this.aabb.setHalfSizeFromNodeExtents(this._localHalf);
+      this.aabb.update();
+    }
   }
+
+  /** Node-local half extents from the pre-bake box (plan-655 B1), else null. */
+  private _localHalf: Vector3 | null = null;
 
   addFeedbackListener(cb: () => void): void {
     if (!this.feedbackListeners.includes(cb)) this.feedbackListeners.push(cb);
@@ -327,6 +512,33 @@ export class RVSensor implements RVComponent {
   removeFeedbackListener(cb: () => void): void {
     const index = this.feedbackListeners.indexOf(cb);
     if (index >= 0) this.feedbackListeners.splice(index, 1);
+  }
+
+  /** Register an MU-enter listener (plan-2016 S4). Several listeners may coexist. */
+  addMuEnterListener(cb: (mu: RVMovingUnit | InstancedMovingUnit, sensor: RVSensor) => void): void {
+    if (!this.muEnterListeners.includes(cb)) this.muEnterListeners.push(cb);
+  }
+
+  removeMuEnterListener(cb: (mu: RVMovingUnit | InstancedMovingUnit, sensor: RVSensor) => void): void {
+    const index = this.muEnterListeners.indexOf(cb);
+    if (index >= 0) this.muEnterListeners.splice(index, 1);
+    if (this.muEnterListeners.length === 0) this.clearMuTracking();
+  }
+
+  /** Forget which MUs are inside (model unload / reset): the next detection
+   *  reports every MU present as entered. */
+  clearMuTracking(): void {
+    this._inside.clear();
+    this._insideNext.clear();
+    this._entered.length = 0;
+  }
+
+  /** `from` was replaced by `to` (instanced MU promoted to a clone, plan-2016 S4):
+   *  the clone inherits the tracking — it is inside already and does not enter again. */
+  replaceTrackedMU(from: RVMovingUnit | InstancedMovingUnit, to: RVMovingUnit | InstancedMovingUnit): void {
+    if (this.occupiedMU === from) this.occupiedMU = to;
+    if (this._inside.delete(from)) this._inside.add(to);
+    for (let i = 0; i < this._entered.length; i++) if (this._entered[i] === from) this._entered[i] = to;
   }
 
   readFeedbackSlot(slot: string): boolean | number {
@@ -369,7 +581,7 @@ export class RVSensor implements RVComponent {
     const sensorOccupiedAddr = typeof this.SensorOccupied === 'string' ? this.SensorOccupied : null;
     const sensorNotOccupiedAddr = typeof this.SensorNotOccupied === 'string' ? this.SensorNotOccupied : null;
 
-    this.onChanged = (occupied) => {
+    this._writeSignals = (occupied) => {
       // Live override (Planner Signal Linking): when a CONNECT source drives this
       // sensor's occupied signal, the relay owns the value — do NOT write the
       // AABB-derived value back over it (two-stage guard: AABB skip + this gate).
@@ -382,6 +594,8 @@ export class RVSensor implements RVComponent {
         writer.setByPath(sensorNotOccupiedAddr, !occupied);
       }
     };
+    this._signalsPrimed = false;
+    this.onChanged = (occupied) => this._writeSignals?.(occupied);
 
     // Convention sensors (bare Sensor/Sensor-* nodes, no authored BoxCollider):
     // derive a raycast beam along the longest bounding-box edge.
@@ -405,6 +619,21 @@ export class RVSensor implements RVComponent {
         z: Math.abs(bc.size.z) / 2,
       };
       this.createVisualization(gltfCenter, halfSize);
+    } else {
+      // plan-675 D2: a collision sensor WITHOUT a BoxCollider (SolidCraft /
+      // CAD sensor body) detects with its mesh box — the pre-bake box when the
+      // bake merged the meshes away, else the live mesh box. Show THAT volume.
+      // Node-local like the detection box: the scene graph carries the scale,
+      // no extra compensation (SOL R1 #7c).
+      const box = this._localHalf
+        ? { c: [this.aabb.localCenter.x, this.aabb.localCenter.y, this.aabb.localCenter.z], h: [this._localHalf.x, this._localHalf.y, this._localHalf.z] }
+        : computeSensorLocalBox(this.node);
+      if (box) {
+        this.createVisualization(
+          { x: box.c[0], y: box.c[1], z: box.c[2] },
+          { x: box.h[0], y: box.h[1], z: box.h[2] },
+        );
+      }
     }
 
     // Register in transport manager
@@ -442,6 +671,8 @@ export class RVSensor implements RVComponent {
       this._layoutUnsub = null;
     }
     this.feedbackListeners.length = 0;
+    this.muEnterListeners.length = 0;
+    this.clearMuTracking();
     this.releaseVisualization();
   }
 
@@ -517,10 +748,16 @@ export class RVSensor implements RVComponent {
 
     const maxDist = this.RayCastLength / MM_TO_METERS;
     const radius = 0.002; // 2mm radius — visible but not obtrusive
+    // plan-675 D1: `RayCastLength` and the 2 mm radius are WORLD measures (the
+    // detection casts a world ray of that length), but the tube is a child of
+    // the node — on a scaled node (SolidCraft body, 0.001) it was drawn 1000×
+    // too short and too thin to see. Divide by the node's world scale along /
+    // across the beam, so the drawn tube IS the detected segment.
+    const { along, across } = this._worldScaleAlongRay();
     // One geometry per (radius, length) shared by every sensor with the same
     // beam — pivot at the ray origin, pointing along the sensor's LOCAL +Z;
     // the scene graph carries the rest. Released in dispose().
-    const geo = acquireRayTubeGeometry(radius, maxDist, 6);
+    const geo = acquireRayTubeGeometry(radius / across, maxDist / along, 6);
 
     this.rayTube = new Mesh(geo, RVSensor.rayMatBlue);
     this.rayTube.visible = this.ShowGizmo;
@@ -544,6 +781,24 @@ export class RVSensor implements RVComponent {
     _quat.setFromUnitVectors(_forward, localDir);
     this.rayTube.quaternion.copy(_quat);
     this.node.add(this.rayTube);
+  }
+
+  /**
+   * plan-675 D1: the node's world scale along the ray direction and across it
+   * (mean of the perpendicular axes, weighted by how perpendicular they are).
+   * 1 / 1 for a unit-scale node.
+   */
+  private _worldScaleAlongRay(): { along: number; across: number } {
+    this.node.updateWorldMatrix(true, false);
+    const ws = this.node.getWorldScale(_scaleScratch);
+    const d = this.RayCastDirection;
+    const len = Math.hypot(d.x, d.y, d.z) || 1;
+    const dx = d.x / len, dy = d.y / len, dz = d.z / len;
+    const along = Math.hypot(dx * ws.x, dy * ws.y, dz * ws.z) || 1;
+    const wx = 1 - dx * dx, wy = 1 - dy * dy, wz = 1 - dz * dz;
+    const wsum = wx + wy + wz;
+    const across = wsum > 1e-9 ? (Math.abs(ws.x) * wx + Math.abs(ws.y) * wy + Math.abs(ws.z) * wz) / wsum : along;
+    return { along, across: across || 1 };
   }
 
   /**
@@ -588,7 +843,9 @@ export class RVSensor implements RVComponent {
     const d = this.RayCastDirection;
     this._rayMaxDist = this.RayCastLength / MM_TO_METERS;
 
-    this.node.updateWorldMatrix(true, false);
+    // Not `updateWorldMatrix(true, false)`: a sensor below a mover has a frozen
+    // LOCAL matrix and three would keep its last rendered world pose (rv-world-matrix.ts).
+    refreshWorldMatrix(this.node);
     // Ray start = local origin offset transformed to world (offset (0,0,0) → node origin).
     this._rayOrigin.copy(this.rayOriginOffset).applyMatrix4(this.node.matrixWorld);
     this._rayDir.set(d.x, d.y, d.z).transformDirection(this.node.matrixWorld).normalize();
@@ -616,7 +873,10 @@ export class RVSensor implements RVComponent {
     if (!beam) return;
     this.rayOriginOffset.copy(beam.originOffset);
     this.RayCastDirection = beam.direction;
-    this.RayCastLength = beam.lengthMm;
+    // plan-675 D1 (SOL R1 #7b): the beam is measured in the node's LOCAL
+    // extent, the detection casts `RayCastLength` in WORLD millimetres — on a
+    // scaled node (SolidCraft, 0.001) the beam was 1000× too long. Convert.
+    this.RayCastLength = beam.lengthMm * this._worldScaleAlongRay().along;
     this.UseRaycast = true;
     if (rayNode) rayNode.visible = false;   // helper marker — hide once used
   }
@@ -656,22 +916,32 @@ export class RVSensor implements RVComponent {
     } else {
       this.checkCollision(mus);
     }
+    this.primeSignals();
   }
 
-  /** Collision mode: AABB overlap check. */
+  /** Collision mode: AABB overlap check against each MU's detection box
+   *  (`detectAabb`: its authored BoxCollider when it has one, else its mesh box —
+   *  plan-2016 S5 fix, Unity sensors hit colliders). */
   private checkCollision(mus: (RVMovingUnit | InstancedMovingUnit)[]): void {
     let foundMU: (RVMovingUnit | InstancedMovingUnit) | null = null;
+    // MU-enter tracking (plan-2016 S4) needs EVERY overlapping MU, not just the first.
+    const inside = this.muEnterListeners.length > 0 ? this._insideNext : null;
+    inside?.clear();
 
     for (const mu of mus) {
       if (mu.markedForRemoval || !this.accepts(mu)) continue;
-      if (this.aabb.overlaps(mu.aabb)) {
-        foundMU = mu;
-        break; // First overlap is enough
+      if (muDetectOverlaps(mu, this.aabb)) {
+        if (foundMU === null) foundMU = mu;
+        if (inside === null) break; // First overlap is enough
+        inside.add(mu);
       }
     }
-    if (!foundMU && this.LimitSensorToTag) foundMU = this.findTaggedLoad(-1);
+    if (!foundMU && this.LimitSensorToTag) {
+      foundMU = this.findTaggedLoad(-1);
+      if (foundMU && inside) inside.add(foundMU);
+    }
 
-    this.applyResult(foundMU);
+    this.applyResult(foundMU, inside);
   }
 
   // ─── Passive loads (plan-516 F6) ──────────────────────────────────
@@ -714,13 +984,10 @@ export class RVSensor implements RVComponent {
       if (this.accepts(load)) {
         load.updateAABB();
         if (rayMax < 0) {
-          if (this.aabb.overlaps(load.aabb)) return load;
+          if (muDetectOverlaps(load, this.aabb)) return load;
         } else {
           const { origin, dir } = this.computeRay();
-          const d = rayIntersectsAABB(
-            origin.x, origin.y, origin.z, dir.x, dir.y, dir.z,
-            this._loadHitDist, load.aabb.min, load.aabb.max,
-          );
+          const d = rayDetectDist(load, origin, dir, this._loadHitDist, this.rayLayerMask);
           if (d >= 0 && d < this._loadHitDist) { this._loadHitDist = d; found = load; }
         }
       }
@@ -733,29 +1000,146 @@ export class RVSensor implements RVComponent {
     return found;
   }
 
-  /** Raycast mode: ray-AABB intersection against all MUs. */
-  private checkRaycast(mus: (RVMovingUnit | InstancedMovingUnit)[]): void {
-    const { origin, dir, maxDist } = this.computeRay();
+  // ─── Raycast (Unity `Sensor.Raycast` + `OnTriggerEnter`) ─────────
 
-    let foundMU: (RVMovingUnit | InstancedMovingUnit) | null = null;
-    let hitDist = maxDist;
+  /** Non-MU colliders of the scene (set by the transport manager, `rv-ray-colliders.ts`).
+   *  Point (c): withdrawn 2026-10-29, REINSTATED 2026-10-30 on Thomas' decision. */
+  rayColliders: readonly RayCollider[] | null = null;
+  /** {@link rayColliders} filtered by this sensor's layer mask — rebuilt when either changes. */
+  private _colliderCands: RayCollider[] = [];
+  private _colliderCandsOf: readonly RayCollider[] | null = null;
+  private _colliderCandsMask: number | null | undefined = undefined;
 
-    for (const mu of mus) {
-      if (mu.markedForRemoval || !this.accepts(mu)) continue;
-      const d = rayIntersectsAABB(
-        origin.x, origin.y, origin.z,
-        dir.x, dir.y, dir.z,
-        maxDist,
-        mu.aabb.min, mu.aabb.max,
-      );
-      if (d >= 0 && d < hitDist) {
-        hitDist = d;
-        foundMU = mu;
+  /** Nearest hit of the running {@link checkRaycast}. */
+  private _hitDist = 0;
+  private _hitMU: RVMovingUnit | InstancedMovingUnit | null = null;
+  private _hitCollider: RayCollider | null = null;
+  private readonly _hitPart: RayDetectHit = { part: -1 };
+  /** Identity of the collider the nearest hit sits on (see {@link _lastHitKey}). */
+  private _hitKey: unknown = null;
+  private _hitSub = -1;
+  /** The collider the beam hit at the previous detection (an MU part node, an MU,
+   *  the MU root for a mesh box; null = nothing). Unity's `FixedUpdate` compares
+   *  `hit.collider != lasthit.collider` and re-runs exit + enter when it changed,
+   *  also when both colliders belong to the SAME MU.
+   *
+   *  REINSTATED 2026-10-30 (Thomas' decision, plan-2016 point (f)). Measured on the
+   *  the blow-moulding line: the QC line ran 1/1/1 instead of 20/19/19 because the first hose
+   *  stayed `_inside` the loading gripper's sensor forever — one enter, one pick,
+   *  never again. Its MUs carry SEVERAL colliders (`FassMU` 3, `Source_Schlauch` 5),
+   *  so the beam walking from one collider of a part to the next has to be a new
+   *  entry or `DirectlyGrip` never fires again. The standard demo's turbine carries
+   *  exactly ONE collider, so the rule cannot change anything there. */
+  private _lastHitKey: unknown = null;
+  /** Collider index within {@link _lastHitKey} (a node can carry several colliders,
+   *  a pooled instance has a stable per-template id); -1 = the key alone names it. */
+  private _lastHitSub = -1;
+
+  private colliderCandidates(): readonly RayCollider[] {
+    const all = this.rayColliders;
+    if (!all) return this._colliderCands;
+    const mask = this.rayLayerMask;
+    if (all !== this._colliderCandsOf || mask !== this._colliderCandsMask) {
+      this._colliderCandsOf = all;
+      this._colliderCandsMask = mask;
+      this._colliderCands = all.filter((c) => layerPasses(mask, c.layer));
+    }
+    return this._colliderCands;
+  }
+
+  /** Offer one MU (and the passive loads riding on it) to the nearest-hit search.
+   *  An MU this sensor does not accept (`LimitSensorToTag`) is skipped — it does NOT
+   *  block the beam (plan-2016 point (b) withdrawn, Thomas 2026-10-29) — but the
+   *  passive loads riding on it are still tested. */
+  private rayTestMU(mu: RVMovingUnit | InstancedMovingUnit, origin: Vector3, dir: Vector3, layerMask: number | null): void {
+    if (this.accepts(mu)) {
+      const d = rayDetectDist(mu, origin, dir, this._hitDist, layerMask, this._hitPart);
+      if (d >= 0 && d < this._hitDist) {
+        this._hitDist = d;
+        this._hitMU = mu;
+        this._hitKey = mu.detectColliderKey(this._hitPart.part);
+        this._hitSub = mu.detectColliderSub(this._hitPart.part);
       }
     }
-    if (!foundMU && this.LimitSensorToTag) foundMU = this.findTaggedLoad(maxDist);
+    if (mu.isInstanced) return;
+    // A passive load (plan-516) is not ticked, but its colliders are in the scene:
+    // the ray of Unity hits it like any other collider.
+    const loads = (mu as RVMovingUnit).loadedMus;
+    for (let i = 0; i < loads.length; i++) {
+      const load = loads[i];
+      if (load.markedForRemoval) continue;
+      load.updateAABB();
+      this.rayTestMU(load, origin, dir, layerMask);
+    }
+  }
 
-    this.applyResult(foundMU);
+  /**
+   * Raycast mode — ONE ray, the NEAREST MU on it is detected (Unity
+   * `Sensor.Raycast` = one `Physics.Raycast`, plan-2016 S6c), filtered by
+   * `AdditionalRayCastLayers` and by `LimitSensorToTag`. Each MU is tested against
+   * its collider boxes only: colliders must cover the part. Only MUs without
+   * active colliders use their mesh box (`rayDetectDist`).
+   *
+   * Of the four points withdrawn on 2026-10-29, only (b) is still out: an MU the tag
+   * filter rejects does not block the beam (the pick-and-place cell relies on it, and all 18 sensors on the large CAD line
+   * beams carry an empty tag). (f) per-collider enter came back on 2026-10-30
+   * ({@link _lastHitKey}), (c2) origin-inside with it ({@link rayObbDistance} and the
+   * mesh-box rule in {@link rayDetectDist}), and (c) blocking non-MU colliders on
+   * Thomas' decision of 2026-10-30. The plan carries the measurements for each.
+   */
+  private checkRaycast(mus: (RVMovingUnit | InstancedMovingUnit)[]): void {
+    const { origin, dir, maxDist } = this.computeRay();
+    const layerMask = this.rayLayerMask;
+    this._hitDist = maxDist;
+    this._hitMU = null;
+    this._hitCollider = null;
+    this._hitKey = null;
+    this._hitSub = -1;
+
+    for (const mu of mus) {
+      if (mu.markedForRemoval) continue;
+      this.rayTestMU(mu, origin, dir, layerMask);
+    }
+    // Point (c), reinstated 2026-10-30: the nearest collider in the mask blocks
+    // everything behind it, MU or not (Unity `Sensor.Raycast` = ONE Physics.Raycast).
+    const cands = this.colliderCandidates();
+    if (cands.length > 0) {
+      const tick = RVTransportSurface.currentTickId;
+      for (let i = 0; i < cands.length; i++) {
+        const col = cands[i];
+        const d = rayColliderDistance(col, origin, dir, this._hitDist, tick);
+        if (d >= 0 && d < this._hitDist) {
+          this._hitDist = d;
+          this._hitMU = null;
+          this._hitCollider = col;
+          this._hitKey = col;
+          this._hitSub = -1;
+        }
+      }
+    }
+    let foundMU: RVMovingUnit | InstancedMovingUnit | null = this._hitMU;
+    this._hitMU = null;
+    // `Sensor.OnTriggerEnter`: a non-MU collider occupies without an MU-enter, unless
+    // it belongs to a Sensor or this sensor is tag-limited.
+    const col = this._hitCollider;
+    const nonMU = col !== null && !col.isSensor && !this.LimitSensorToTag;
+    this._hitCollider = null;
+    // A tag-limited sensor also sees a PASSIVE load that no tick carries (plan-516 F6).
+    if (!foundMU && !col && this.LimitSensorToTag) {
+      foundMU = this.findTaggedLoad(maxDist);
+      // That search reports no collider: the load itself is the identity, so a load
+      // that keeps being found does not re-enter every tick.
+      if (foundMU) { this._hitKey = foundMU; this._hitSub = -1; }
+    }
+    // Unity `FixedUpdate`: `hit.collider != lasthit.collider` → exit + enter, also
+    // when both colliders belong to the same MU (a second collider, a MUSwitcher variant).
+    const colliderChanged = this._hitKey !== this._lastHitKey || this._hitSub !== this._lastHitSub;
+    this._lastHitKey = this._hitKey;
+    this._lastHitSub = this._hitSub;
+    this._hitKey = null;
+    this._hitSub = -1;
+
+    this.applyResult(foundMU, null, colliderChanged, nonMU);
     this.updateRayTube();
   }
 
@@ -766,19 +1150,33 @@ export class RVSensor implements RVComponent {
    * reset then saw "free → free" and fired nothing (plan-569, engine gap 2).
    */
   resetDetection(): void {
+    this._lastHitKey = null;
+    this._lastHitSub = -1;
+    this._hitCollider = null;
+    // Unity writes SensorOccupied / SensorNotOccupied every FixedUpdate: after a
+    // reset the bound signals carry the detected state again, changed or not.
+    this._signalsPrimed = false;
     this.applyResult(null);
     this.occupiedMU = null;
+    this.clearMuTracking();
   }
 
-  /** Apply detection result and fire callback if state changed. */
-  private applyResult(foundMU: (RVMovingUnit | InstancedMovingUnit) | null): void {
+  /** Apply detection result and fire callback if state changed. `inside` = every MU
+   *  overlapping now (filled by the caller into `_insideNext`); null = only `foundMU`. */
+  private applyResult(
+    foundMU: (RVMovingUnit | InstancedMovingUnit) | null,
+    inside: Set<RVMovingUnit | InstancedMovingUnit> | null = null,
+    colliderChanged = false,
+    nonMU = false,
+  ): void {
     if (foundMU && !this.accepts(foundMU)) foundMU = null;
     // The nearest part can change while the occupied boolean stays true.
     this.occupiedMU = foundMU;
-    const rawOccupied = foundMU !== null;
+    const rawOccupied = foundMU !== null || nonMU;
     const newOccupied = this.invertSignal ? !rawOccupied : rawOccupied;
 
     if (newOccupied !== this.occupied) {
+      this._signalsPrimed = true;   // onChanged writes the bound signals
       this.occupied = newOccupied;
       this.occupiedMU = foundMU;
       debug('sensor', `Sensor "${this.node.name}" → ${newOccupied ? 'OCCUPIED' : 'CLEARED'}${foundMU ? ` by "${foundMU.getName()}"` : ''}`);
@@ -789,6 +1187,64 @@ export class RVSensor implements RVComponent {
       // Still update ray line even if state didn't change (MU might be moving)
       // updateRayTube is called from checkRaycast already
     }
+    if (this.muEnterListeners.length > 0) {
+      // Per-collider enter (raycast): the beam moved to ANOTHER collider of the MU it
+      // already saw — Unity exits that MU and enters it again. Reinstated 2026-10-30
+      // for the blow-moulding line, whose MUs carry 3 and 5 colliders; see {@link _lastHitKey}.
+      if (colliderChanged && foundMU !== null) this._inside.delete(foundMU);
+      this.fireMuEnter(foundMU, inside);
+    }
+  }
+
+  /** False until a detection wrote the bound signals (see {@link primeSignals}). */
+  private _signalsPrimed = false;
+  /** Writes SensorOccupied / SensorNotOccupied (set up by `init`). */
+  private _writeSignals: ((occupied: boolean) => void) | null = null;
+
+  /**
+   * Unity `Sensor.FixedUpdate` writes SensorOccupied / SensorNotOccupied EVERY step;
+   * the web writes on change. A sensor that never changes would leave its signals
+   * at their defaults — a free sensor's NotOccupied stayed false (the blow-moulding line:
+   * PunchingEmpty / LecktestStationEmpty, the check line never started). So the
+   * first detection after init or a reset writes the current state once — without
+   * an `onChanged` edge (monitors and recorders see edges only).
+   */
+  private primeSignals(): void {
+    if (this._signalsPrimed) return;
+    this._signalsPrimed = true;
+    this._writeSignals?.(this.occupied);
+  }
+
+  /**
+   * MU-enter event (plan-2016 S4, Unity `Sensor.EventEnter`): fires once for each MU
+   * that overlaps now and did not at the previous detection. A part that stays in
+   * the sensor (also one a grip just placed there) never fires again; it has to
+   * leave first. Listeners run after the set swap, so a listener may promote or
+   * remove an MU (`replaceTrackedMU`) without disturbing the bookkeeping.
+   */
+  private fireMuEnter(
+    foundMU: (RVMovingUnit | InstancedMovingUnit) | null,
+    inside: Set<RVMovingUnit | InstancedMovingUnit> | null,
+  ): void {
+    let next = inside;
+    if (next === null) {
+      next = this._insideNext;
+      next.clear();
+      if (foundMU !== null) next.add(foundMU);
+    }
+    this._entered.length = 0;
+    next.forEach(this._collectEntered);
+    this._insideNext = this._inside;
+    this._inside = next;
+    const entered = this._entered;
+    for (let i = 0; i < entered.length; i++) {
+      for (let l = 0; l < this.muEnterListeners.length; l++) {
+        const mu = entered[i];   // re-read: a listener may have promoted it
+        if (mu.markedForRemoval) break;
+        this.muEnterListeners[l](mu, this);
+      }
+    }
+    entered.length = 0;
   }
 
   // ─── Physics-managed detection (plan-276 Phase 5, F6) ───────────────
@@ -805,6 +1261,7 @@ export class RVSensor implements RVComponent {
     if (this.liveControlled) return;
     this.applyResult(foundMU);
     if (this.UseRaycast) this.updateRayTube();
+    this.primeSignals();
   }
 
   /**
@@ -826,6 +1283,10 @@ export class RVSensor implements RVComponent {
 
   /** Update AABB world position */
   updateAABB(): void {
+    // The current pose also without a render in between (a sensor on a moving gripper).
+    refreshWorldMatrix(this.node);
+    // A pre-baked box (plan-655 B1) follows the node's current rotation/scale.
+    if (this._localHalf) this.aabb.setHalfSizeFromNodeExtents(this._localHalf);
     this.aabb.update();
   }
 }

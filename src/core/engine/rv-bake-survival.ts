@@ -47,6 +47,8 @@ import {
 import { findByNameInSubtree } from './rv-traverse-utils';
 import { resolveReferencePath, scopeOf, type ReferenceScope } from './rv-reference-resolver';
 import { NodeRegistry } from './rv-node-registry';
+import { createFileReferenceLookup, type FileIdentity } from './rv-decode-identity';
+import { NAME_FIELDS, PATH_FIELDS, storedReferenceForm, storedReferenceLabel } from './rv-node-path-rewrite.mjs';
 
 // ─── Reference semantics table ───────────────────────────────────────
 
@@ -64,10 +66,37 @@ export interface ReferenceBakeTargetEntry {
 }
 
 /**
+ * The path-string entries of one component, DERIVED from the rewrite core's
+ * {@link PATH_FIELDS} (plan-610): the fields a rename/move rewrites are exactly
+ * the fields whose target the bake keeps. Core order is kept.
+ */
+const _consumedPathComponents = new Set<string>();
+function pathStringEntries(component: string, bakeTarget: ReferenceBakeTarget): ReferenceBakeTargetEntry[] {
+  const list = PATH_FIELDS.filter((e) => e.component === component);
+  if (list.length === 0) throw new Error(`rv-bake-survival: PATH_FIELDS has no entry for "${component}"`);
+  _consumedPathComponents.add(component);
+  return list.map((e) => ({ component, field: e.field, kind: 'pathString' as const, bakeTarget }));
+}
+
+/** The name-in-subtree entries of one component, derived from {@link NAME_FIELDS}. */
+const _consumedNameComponents = new Set<string>();
+function nameInSubtreeEntries(component: string, bakeTarget: ReferenceBakeTarget): ReferenceBakeTargetEntry[] {
+  const list = NAME_FIELDS.filter((e) => e.component === component);
+  if (list.length === 0) throw new Error(`rv-bake-survival: NAME_FIELDS has no entry for "${component}"`);
+  _consumedNameComponents.add(component);
+  return list.map((e) => ({ component, field: e.field, kind: 'nameInSubtree' as const, bakeTarget }));
+}
+
+/**
  * TS-side declaration of reference semantics the generated schema cannot carry
  * (plan-754 D15: no rv-odt.json / Unity change). ONE table: the chunk-tagged
  * fields and the path-string fields. Every `componentRef` / `componentRefArray`
  * field NOT listed here defaults to `bakeTargetOf(descriptor)` = `'merge'`.
+ *
+ * The path-string and name-in-subtree entries come from the rewrite core
+ * (`rv-node-path-rewrite.mjs`, plan-610) — this table only adds their bake
+ * target. `GroupNamePrefix` is a group-name prefix, not a node path: it is
+ * NOT a rewrite field and stays a bake-only `pathString` entry here.
  *
  * The table only tells the walker how to FIND the target — the components keep
  * their own resolvers (Kinematic Phase 8b, group build, `RVSource`, the
@@ -79,34 +108,69 @@ export const REFERENCE_BAKE_TARGETS: ReadonlyArray<ReferenceBakeTargetEntry> = O
   { component: 'KinematicJoint', field: 'BodyB', kind: 'ref', bakeTarget: 'chunk' },
   { component: 'WebVisibility', field: 'AdditionalTargets', kind: 'refArray', bakeTarget: 'chunk' },
   { component: 'Chain', field: 'ChainElement', kind: 'ref', bakeTarget: 'chunk' },
-  { component: 'Source', field: 'ThisObjectAsMU', kind: 'nameInSubtree', bakeTarget: 'chunk' },
+  ...nameInSubtreeEntries('Source', 'chunk'),
   { component: 'RibbonWinder', field: 'RollMesh', kind: 'ref', bakeTarget: 'chunk' },
   { component: 'RibbonRoller', field: 'MantleMesh', kind: 'ref', bakeTarget: 'chunk' },
   { component: 'RibbonWinder', field: 'MantleMesh', kind: 'ref', bakeTarget: 'chunk' },
   { component: 'RibbonDancer', field: 'MantleMesh', kind: 'ref', bakeTarget: 'chunk' },
   // An instruction step outlines its targets and (`Isolate`) hides everything
   // else — both need real geometry, and the targets are typically BARE CAD
-  // solids nothing else claims (Mauser: 14 of 28 were removed by the bake).
+  // solids nothing else claims (the large CAD line: 14 of 28 were removed by the bake).
   // The steps are read raw, so the schema never sees these as references.
-  { component: 'CustomRuntimeInstruction', field: 'steps.targetObjects', kind: 'pathString', bakeTarget: 'chunk' },
-  { component: 'CustomRuntimeInstruction', field: 'steps.targetObject', kind: 'pathString', bakeTarget: 'chunk' },
+  ...pathStringEntries('CustomRuntimeInstruction', 'chunk'),
+  // A LogicStep_Enable shows / hides its target (RVEnable sets `.visible`) — a node
+  // that must be hideable on its own is a boundary (D8). plan-769: a PATH_FIELDS entry.
+  ...pathStringEntries('LogicStep_Enable', 'chunk'),
   // merge — the target only has to exist as a node.
   { component: 'EnergyChain', field: 'Anchor', kind: 'ref', bakeTarget: 'merge' },
   { component: 'EnergyChain', field: 'Follower', kind: 'ref', bakeTarget: 'merge' },
   { component: 'KinematicTarget', field: 'TargetLink', kind: 'ref', bakeTarget: 'merge' },
-  { component: 'Kinematic', field: 'Parent', kind: 'pathString', bakeTarget: 'merge' },
+  ...pathStringEntries('Kinematic', 'merge'),
   { component: 'Kinematic', field: 'GroupNamePrefix', kind: 'pathString', bakeTarget: 'merge' },
   { component: 'Group', field: 'GroupNamePrefix', kind: 'pathString', bakeTarget: 'merge' },
   // A physics zone lists its static walls by RAW path (rawFields, not a schema
   // ref). Such a wall is typically an EMPTY node carrying only BoxCollider
   // extras — nothing else claims it, and without this entry the bake drops it,
   // so the zone warns "not found in the scene" and parts fall straight through
-  // (Festo hopper, 2026-09-24). `merge`: the node with its extras must exist.
-  { component: 'WebPhysicsZone', field: 'StaticColliders', kind: 'pathString', bakeTarget: 'merge' },
+  // (pick-and-place hopper, 2026-09-24). `merge`: the node with its extras must exist.
+  ...pathStringEntries('WebPhysicsZone', 'merge'),
+  // plan-661: a 2D zone's discharge surface, its guide rails (typically EMPTY
+  // nodes with only BoxCollider extras) and its switch drives must exist as nodes.
+  { component: 'WebPhysicsZone2D', field: 'Surface', kind: 'ref', bakeTarget: 'merge' },
+  { component: 'WebPhysicsZone2D', field: 'Guides', kind: 'refArray', bakeTarget: 'merge' },
+  { component: 'WebPhysicsZone2D', field: 'KinematicDrives', kind: 'refArray', bakeTarget: 'merge' },
+  // plan-673: the ORDER of a policy's axes is its actuator order, so every
+  // referenced drive node must exist after the bake — a target that vanished
+  // would shift every axis after it. `merge`: the node with its extras must
+  // exist, its mesh may merge into the enclosing chunk.
+  { component: 'LocomotionPolicy', field: 'Axes', kind: 'refArray', bakeTarget: 'merge' },
   // `RvConnection` edges live in the rv-ODT `Connections` block of one node.
-  { component: 'Connections', field: 'connections.source', kind: 'pathString', bakeTarget: 'merge' },
-  { component: 'Connections', field: 'connections.target', kind: 'pathString', bakeTarget: 'merge' },
+  ...pathStringEntries('Connections', 'merge'),
+  // A robot's TCP node: `merge`, not `chunk`. It has to EXIST so the joint chain
+  // can read its world matrix — it draws nothing (measured on DemoRobotIK.glb:
+  // no mesh, no children, extras only layer/tag/activeSelf), so a `chunk`
+  // boundary would buy a draw call for an empty node and `keep` would hold a
+  // separate object for no reason. Without the entry the bake removes it
+  // (`computeSurvival` → `survives=false, reason=none`, listed in
+  // `removalTops`) and the tool offset silently collapses onto the A6 flange.
+  ...pathStringEntries('RobotIK', 'merge'),
+  // plan-2016 S1: the node a Source parents its MUs to (`Source.Destination`, e.g. a
+  // drive axis the part rides on). `merge`: it only has to EXIST as a node so the MU
+  // can follow its world matrix — its own geometry may merge into the enclosing chunk.
+  ...pathStringEntries('Source', 'merge'),
+  // plan-2016 S4: the node a Grip aligns picked MUs to (`Grip.PickAlignWithObject`).
+  // `merge`: only its world pose is read.
+  ...pathStringEntries('Grip', 'merge'),
 ] as ReferenceBakeTargetEntry[]);
+
+// Every core path / name field must have a bake target: a field added to the
+// rewrite core without a decision here fails at module load, not silently.
+for (const e of PATH_FIELDS) {
+  if (!_consumedPathComponents.has(e.component)) throw new Error(`rv-bake-survival: no bake target for PATH_FIELDS component "${e.component}"`);
+}
+for (const e of NAME_FIELDS) {
+  if (!_consumedNameComponents.has(e.component)) throw new Error(`rv-bake-survival: no bake target for NAME_FIELDS component "${e.component}"`);
+}
 
 const _tableByComponent = new Map<string, ReferenceBakeTargetEntry[]>();
 for (const e of REFERENCE_BAKE_TARGETS) {
@@ -133,12 +197,15 @@ function tableEntriesOf(component: string): ReferenceBakeTargetEntry[] | undefin
 /**
  * The tag one reference field puts on its target: the table entry when the
  * field is declared, otherwise the schema descriptor's `bakeTarget`, otherwise
- * `'merge'`.
+ * `'merge'`. The descriptor follows the `_N` dedup convention like the table
+ * (plan-522): `LogicStep_AnimateTransform_1.Targets` reads the descriptor of
+ * `LogicStep_AnimateTransform` when the key has no schema of its own.
  */
 export function referenceBakeTargetOf(component: string, field: string): ReferenceBakeTarget {
   const entries = tableEntriesOf(component);
   if (entries) for (const e of entries) if (e.field === field) return e.bakeTarget;
-  return bakeTargetOf(getFieldDescriptor(component, field));
+  return bakeTargetOf(getFieldDescriptor(component, field)
+    ?? getFieldDescriptor(component.replace(/_\d+$/, ''), field));
 }
 
 // ─── Target finders ──────────────────────────────────────────────────
@@ -294,6 +361,14 @@ export interface ComputeSurvivalOptions {
    * root's historical names as well.
    */
   scope?: ReferenceScope;
+  /**
+   * plan-769 Phase 1b ("Survival == Runtime"): the decoded file's identity. A
+   * reference the FILE carries tags the node its migration names (by id, wherever
+   * a hook moved it) — exactly the node the registry resolves after the bake — and
+   * a file reference that names no node is unresolved here as well, never guessed.
+   * Values the file does not carry keep the scoped resolver above.
+   */
+  identity?: FileIdentity | null;
 }
 
 /** Unresolved references kept per model — enough to find them, not a second scene graph. */
@@ -335,7 +410,15 @@ export function computeSurvival(
   // THE resolver (plan-757 F7): what `prepare` resolves is what the runtime
   // registry resolves after the bake — same scope, same three steps.
   const scope = options?.scope ?? scopeOf(root, NodeRegistry.computeNodePath(root));
-  const scoped: SurvivalPathResolver = { getNode: (p) => resolveReferencePath(registry, p, scope).node };
+  const scopedPath: SurvivalPathResolver = { getNode: (p) => resolveReferencePath(registry, p, scope).node };
+  // plan-769 Phase 1b: a stored reference of the file first — by the file's verdict.
+  const fileRefs = createFileReferenceLookup(root, options?.identity);
+  const scoped: SurvivalPathResolver = {
+    getNode: (p) => {
+      const hit = fileRefs?.path(p);
+      return hit === undefined ? scopedPath.getNode(p) : hit;
+    },
+  };
   /** `miss` describes the field for the report; it is only built on a failure. */
   const tag = (
     target: Object3D | null,
@@ -364,8 +447,12 @@ export function computeSurvival(
       const record = cfg as Record<string, unknown>;
       // Schema-typed references (scalar + array) — the shared iterator.
       forEachComponentRef(record, (field, ref) => {
-        tag(scoped.getNode(ref.path), referenceBakeTargetOf(component, field),
-          () => ({ component, field, kind: 'ref', owner: pathOf(node), path: ref.path }));
+        // plan-769 Phase 3: an address names its node by id (`undefined` = an address
+        // into another occurrence — nothing of this file to claim).
+        const target = typeof ref.path === 'string' ? scoped.getNode(ref.path) : fileRefs.stored(ref);
+        if (target === undefined) return;
+        tag(target, referenceBakeTargetOf(component, field),
+          () => ({ component, field, kind: 'ref', owner: pathOf(node), path: storedReferenceLabel(ref) ?? '' }));
       });
       // Declared path-string / name-in-subtree fields.
       const entries = tableEntriesOf(component);
@@ -373,19 +460,34 @@ export function computeSurvival(
       for (const e of entries) {
         if (e.kind === 'pathString') {
           for (const v of valuesAt(record, e.field)) {
+            const form = storedReferenceForm(v);
+            if (form && form.form !== 'path') {
+              // plan-769 Phase 3: `{ address }` / `{ unresolvedPath }` of a path field.
+              const target = fileRefs.stored(v);
+              if (target === undefined) continue;
+              tag(target, e.bakeTarget,
+                () => ({ component, field: e.field, kind: e.kind, owner: pathOf(node), path: storedReferenceLabel(v) ?? '' }));
+              continue;
+            }
             const path = pathOfPathString(v);
             if (path === null) continue;
             tag(findPathStringTarget(v, scoped), e.bakeTarget,
               () => ({ component, field: e.field, kind: e.kind, owner: pathOf(node), path }));
           }
         } else if (e.kind === 'nameInSubtree') {
-          // Mirrors the component's OWN lookup (`RVSource`): by name in the
+          // Mirrors the component's OWN lookup (`RVSource`): the file's verdict for
+          // a name it carries (plan-769 1b, `migrateName`), else by name in the
           // subtree, then the plain registry — not a path, so not the resolver.
-          const target = findNameInSubtreeTarget(record[e.field], node, root, registry);
+          const raw = record[e.field];
+          // plan-769 Phase 3: a web save stores the target's `{ address }` here.
+          const fromFile = raw && typeof raw === 'object'
+            ? (fileRefs.stored(raw) ?? null)
+            : typeof raw === 'string' && raw.length > 0 ? fileRefs?.name(raw, node) : undefined;
+          const target = fromFile !== undefined ? fromFile : findNameInSubtreeTarget(raw, node, root, registry);
           // A self-reference claims nothing new — the owner survives as a component.
           if (target !== node) {
             tag(target, e.bakeTarget,
-              () => ({ component, field: e.field, kind: e.kind, owner: pathOf(node), path: String(record[e.field]) }));
+              () => ({ component, field: e.field, kind: e.kind, owner: pathOf(node), path: storedReferenceLabel(record[e.field]) ?? '' }));
           }
         }
       }
@@ -441,13 +543,13 @@ export function computeSurvival(
     if (!rv) return false;
     if (isBehavioural(rv)) return true;
     // A collider on a node that draws NOTHING is authored physics geometry —
-    // the hopper walls and the closure plate of the Festo cell are empty
+    // the hopper walls and the closure plate of the pick-and-place cell are empty
     // `BoxCollider` nodes the WEB physics authoring wrote, and the physics
     // plugin finds a moving collider only by traversing the drive's surviving
     // subtree. Dropping the node dropped the body: the logos fell through the
     // closed slide (2026-09-24). The Unity export markers `colliders` /
     // `rigidbody` sit on the CAD MESHES themselves and stay pure annotation
-    // (Mauser: thousands of them), so the mesh test is what keeps this cheap.
+    // (the large CAD line: thousands of them), so the mesh test is what keeps this cheap.
     if (!(node as Mesh).isMesh && carriesAuthoredCollider(rv)) return true;
     for (const key in rv) {
       const cfg = rv[key];

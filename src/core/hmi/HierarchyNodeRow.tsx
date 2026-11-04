@@ -20,7 +20,7 @@
 
 import { useCallback, useMemo, memo } from 'react';
 import { Box, IconButton, Tooltip, Typography } from '@mui/material';
-import { ExpandMore, ChevronRight, VisibilityOutlined, VisibilityOffOutlined, OpenInNewRounded, Inventory2Outlined, LockOutlined } from '@mui/icons-material';
+import { ExpandMore, ChevronRight, VisibilityOutlined, VisibilityOffOutlined, OpenInNewRounded, Inventory2Outlined, LockOutlined, LinkRounded } from '@mui/icons-material';
 import type { RVViewer } from '../rv-viewer';
 import type { SignalStore } from '../engine/rv-signal-store';
 import type { RVLogicEngine } from '../engine/rv-logic-engine';
@@ -28,6 +28,7 @@ import { isLogicStepType, isSignalType, signalOwnerLabel, type TreeNode, type Vi
 import type { SceneTreeNode } from './hierarchy-rows';
 import { NodeBadges, StateBadge, StepStateDot } from './hierarchy-badge-components';
 import { useLongPress } from '../../hooks/use-long-press';
+import { ICON_SIZE } from './shared-sx';
 import { useStepState } from '../../hooks/use-step-state';
 import { SignalUsageButton } from './rv-signal-usage-list';
 import { signalNameForPath } from './use-signal-usages';
@@ -266,6 +267,61 @@ function OpenInspectorButton({ node, onOpen }: { node: TreeNode; onOpen: (node: 
   );
 }
 
+export interface ReferenceRowProps {
+  /** Opens the asset a reference row places. Absent = glyph is a plain marker. */
+  onOpenReference?: (node: TreeNode) => void;
+}
+
+/** Tooltip of the link glyph when it opens the referenced asset. */
+export const OPEN_REFERENCE_TITLE = 'Open referenced asset';
+
+/** Leading link glyph of a row whose node is an `AssetReference`. Quiet like the
+ *  root marker; tilted so the chain reads as a link, not a minus sign. With
+ *  `onOpen` it is a button that opens the referenced asset. */
+function ReferenceGlyph({ node, selected, onOpen }: {
+  node: TreeNode;
+  selected: boolean;
+  onOpen?: (node: TreeNode) => void;
+}) {
+  const handleClick = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    onOpen?.(node);
+  }, [onOpen, node]);
+  const glyph = (
+    <LinkRounded
+      aria-hidden
+      sx={{ fontSize: ICON_SIZE.sm, transform: 'rotate(-45deg)' }}
+    />
+  );
+  const color = selected ? 'primary.main' : 'text.secondary';
+  if (!onOpen) {
+    return (
+      <Box
+        component="span"
+        aria-label="Asset reference"
+        data-testid="hierarchy-reference-glyph"
+        sx={{ display: 'inline-flex', mr: 0.5, flexShrink: 0, color }}
+      >
+        {glyph}
+      </Box>
+    );
+  }
+  return (
+    <Tooltip title={OPEN_REFERENCE_TITLE} placement="right" enterDelay={400} disableInteractive>
+      <IconButton
+        size="small"
+        aria-label={OPEN_REFERENCE_TITLE}
+        data-testid="hierarchy-reference-glyph"
+        onClick={handleClick}
+        onDoubleClick={(e) => e.stopPropagation()}
+        sx={{ p: 0, mr: 0.5, flexShrink: 0, color, '&:hover': { color: 'primary.main' } }}
+      >
+        {glyph}
+      </IconButton>
+    </Tooltip>
+  );
+}
+
 // ─── Shared row state badges ─────────────────────────────────────────────
 
 /** `runtime` / `chunk` markers for a scene-backed row (plan-754 D2). Rendered
@@ -286,7 +342,7 @@ function RowStateBadges({ node }: { node: TreeNode }) {
 
 // ─── TreeNodeRow ─────────────────────────────────────────────────────────
 
-export interface TreeNodeRowProps extends VisibilityRowProps, RowDndProps, LockRowProps {
+export interface TreeNodeRowProps extends VisibilityRowProps, RowDndProps, LockRowProps, ReferenceRowProps {
   row: VisibleTreeRow;
   /** Is this row part of the current selection? */
   selected?: boolean;
@@ -324,6 +380,7 @@ export const TreeNodeRow = memo(function TreeNodeRow({
   onToggleVisible,
   eyeDisabledReason,
   onUnlock,
+  onOpenReference,
   dndEnabled,
   dropZone,
   onRowDragStart,
@@ -344,6 +401,7 @@ export const TreeNodeRow = memo(function TreeNodeRow({
   // eye and the drop target stay — the lock guards position and structure of
   // the object itself, not what you may look at.
   const isLocked = node.locked === true;
+  const isReference = node.reference === true;
   const label = node.displayLabel ?? node.name;
   const isRuntime = (node as Partial<SceneTreeNode>).runtime === true;
   // plan-505: the fold row ("Geometry · N chunks") is display-only; a chunk row
@@ -554,9 +612,14 @@ export const TreeNodeRow = memo(function TreeNodeRow({
           />
         )}
 
+        {/* Reference marker: this node places another asset. */}
+        {isReference && <ReferenceGlyph node={node} selected={isSelected} onOpen={onOpenReference} />}
+
         <Tooltip
           title={isRootRow
             ? `${label}\nModel root — locked (node: ${node.name})`
+            : isReference
+              ? `${node.path ?? node.name}\nAsset reference`
             : isRevealed
               ? `${label}\n${BAKED_REVEALED_TITLE}`
               : isFold ? label : (node.path ?? node.name)}

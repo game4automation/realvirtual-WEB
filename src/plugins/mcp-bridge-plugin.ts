@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, readSessionStorage, writeLocalStorage, writeSessionStorage } from '../core/rv-safe-storage';
+
+
 /**
  * McpBridgePlugin — WebSocket bridge connecting the browser to the local MCP bridge server.
  *
@@ -43,9 +46,15 @@
  */
 
 import { lastBakeSurvivalCounts } from '../core/engine/rv-bake-survival';
+import { normalizeUserPathArgs } from './mcp-bridge/rv-mcp-user-paths';
+import { checkToolArgs } from './mcp-bridge/rv-mcp-arg-check';
+import { getProblems } from '../core/hmi/problems-store';
+import { handleConnectConfigPush, requestConnectConfigRefresh } from '../core/hmi/connect-store';
+import { onGatewayLicensed } from '../core/hmi/license-store';
 import { getCacheOutcomes, getCacheStorageEstimate, CACHE_OUTCOME_CAP } from '../core/engine/rv-asset-cache-outcomes';
 import { RVBehavior } from '../core/rv-behavior';
 import type { RVViewer } from '../core/rv-viewer';
+import type { DisplayWallPluginAPI, StereoPluginAPI, StereoStatus } from '../core/types/plugin-types';
 import {
   McpTool,
   McpParam,
@@ -54,6 +63,10 @@ import {
   type ToolCommandBinding,
 } from '../core/engine/rv-mcp-tools';
 import { createMcpDelegates } from './mcp-bridge/rv-mcp-instances';
+import { CALL_CONTEXT_TOOLS, aliasesListed, boundAliasToolNames, macroCapableToolNames, setAliasDescriptions, setGatewayCommandClassesState, withAliasListing, withMacroMetaParams } from './mcp-bridge/rv-mcp-command-tools';
+import { commandIdsOfCall } from './mcp-bridge/rv-mcp-tool-class';
+import { MOVED_TOOLS, movedToolAnswer, movedToolOf, movedToolSchemas } from './mcp-bridge/rv-mcp-moved-tools';
+import { splitMacroMeta } from './mcp-bridge/rv-mcp-macro';
 import {
   installMcpDialogPolicy,
   withDialogReport,
@@ -62,20 +75,43 @@ import {
 import {
   DELTA_PROBES, mergeDelta, parseResult, releaseCall, safeProbe,
 } from './mcp-bridge/rv-mcp-delta-probes';
-import { getLastLogs, queryLogs } from '../core/engine/rv-debug';
-import type { LogLevel } from '../core/engine/rv-debug';
+import { LOG_CATEGORIES, LOG_LEVELS, queryLogs } from '../core/engine/rv-debug';
+import { getDiagnosticsEntries } from '../core/diagnostics/rv-diagnostics-collector';
+import { ensureDiagnosticsExportCommandRegistered } from '../core/diagnostics/rv-diagnostics-command';
+import type { DebugCategory, LogLevel } from '../core/engine/rv-debug';
 import { Box3, MeshBasicMaterial, Vector3 } from 'three';
 import type { Object3D } from 'three';
 import { labelContractViolations } from '../core/engine/rv-label-sprite';
 import { clearBySource } from '../core/hmi/instruction-store';
 import { setAiActivity } from '../core/hmi/ai-activity-store';
 import { commandRegistry } from '../core/hmi/rv-command-registry';
-import { buildCallContext } from '../core/hmi/rv-command-context';
+import { buildCallContext, commandResultJson } from '../core/hmi/rv-command-context';
+import { setCommandStepHooks } from './mcp-bridge/rv-mcp-command-tools';
+import { choreographyToolOf } from './mcp-bridge/rv-mcp-command-choreography';
+import { dialogPolicyApplies } from './mcp-bridge/rv-mcp-command-dialog-policy';
+export { dialogPolicyApplies } from './mcp-bridge/rv-mcp-command-dialog-policy';
 import { ensureEditorCommandsRegistered } from '../core/hmi/editor-command-descriptors';
 import { ensurePlannerCommandsRegistered } from './layout-planner/planner-commands';
+import { ensureLibraryCommandsRegistered } from '../core/library/library-commands';
+import { ensureThumbnailCommandsRegistered } from '../core/thumbnails/rv-thumbnail-regenerate-commands';
 import { ensureSimCommandsRegistered } from './sim-controller/sim-commands';
+import { ensurePathNetworkCommandsRegistered } from './path-network/path-network-commands';
+import { ensureDiagnoseCommandsRegistered } from '../core/diagnostics/diagnose-command-descriptors';
 import { ensureViewCommandsRegistered } from '../core/hmi/view-commands';
+import { ensureSessionOverlayCommandsRegistered } from '../core/hmi/session-overlay-commands';
+import { ensureComponentCommandsRegistered } from '../core/hmi/component-commands';
+import { ensureQueryCommandsRegistered } from '../core/hmi/query-commands';
+import { ensureDocumentCommandsRegistered } from '../core/hmi/document-commands';
+import { ensureSignalAutomapCommandsRegistered } from '../core/hmi/signal-automap-commands';
+import { ensureDesPlcCommandsRegistered } from '../core/hmi/des-plc-commands';
+import { ensureCameraCommandsRegistered } from '../core/hmi/camera-commands';
+import { ensureSelectionCommandsRegistered } from '../core/hmi/selection-commands';
+import { ensureUiPanelCommandsRegistered } from '../core/hmi/ui-panel-commands';
+import { ensureDesRunCommandsRegistered } from '../core/hmi/des-run-commands';
+import { ensureDropDiagnosticsCommandsRegistered } from '../core/hmi/drop-diagnostics-commands';
 import { listPresets, matchPreset } from '../core/hmi/visual-presets';
+import { RENDER_MODE_IDS } from '../core/rv-render-modes';
+import { inactiveRaytracedStats } from '../core/engine/rv-raytraced-hook';
 import { touchAfterglow } from '../core/hmi/button-sim-state';
 import { ObjectAnalyzer } from './mcp-bridge/rv-object-analyzer';
 import { clampTileSize, parsePathsParam } from './mcp-bridge/rv-object-analyzer-math';
@@ -103,6 +139,16 @@ interface CallMessage {
   tool: string;
   arguments: Record<string, unknown>;
 }
+
+/**
+ * plan-621: the body of an INTERNAL bridge tool — a tool the bridge server may
+ * call (`call` → `result`) that is NOT announced in `discover`, so it never
+ * reaches the MCP catalog of an agent. CONNECT only forwards announced `web_*`
+ * tools from its MCP side, so an internal tool is reachable from CONNECT's own
+ * services alone (e.g. the SolidCraft sync relay). A string return is sent as
+ * is; anything else is sent as JSON. A throw becomes the call's `error`.
+ */
+export type InternalBridgeToolHandler = (args: Record<string, unknown>) => unknown | Promise<unknown>;
 
 /** Live health of the bridge SERVER process, pushed over the WebSocket. Lets the
  *  UI show the full chain (browser ⟷ bridge ⟷ AI client) instead of only the WS
@@ -167,7 +213,16 @@ export interface McpBridgeSnapshot {
   port: string;
   toolCount: number;
   toolNames: string[];
+  /** AI control is on (plan-668: this used to mean "the bridge socket is on").
+   *  Kept for existing readers; identical to {@link aiEnabled}. */
   enabled: boolean;
+  /** plan-668: AI agents / MCP clients may control this tab. Off = the tab
+   *  announces no tools and refuses every non-internal call with `AI_DISABLED:`. */
+  aiEnabled?: boolean;
+  /** plan-2220 E8: the AI panel may use the SolidCraft Live Link instance (default off). */
+  aiSolidCraft?: boolean;
+  /** plan-668: why the CONNECT channel is (or should be) open — independent of AI. */
+  channelReason?: McpChannelReason;
   reconnectAttempt: number;
   reconnectDelay: number;
   /** Bridge-server health (browser ⟷ bridge ⟷ AI client). Null if none received. */
@@ -186,6 +241,21 @@ export interface McpBridgeSnapshot {
 
 /** plan-564: ownership of this tab on a multi-tab CONNECT bridge. */
 export type McpBridgeRole = 'active' | 'standby';
+
+/**
+ * plan-668: why the `/webviewer` channel is open. `connect-origin` = CONNECT
+ * serves this page (always on, AI or not); `ai` = AI control is on (a page
+ * without CONNECT, today's behaviour); `acquired` = a user action asked for it
+ * ({@link McpBridgePlugin.acquireChannel}, e.g. SolidCraft connect); `none` =
+ * no channel.
+ */
+export type McpChannelReason = 'connect-origin' | 'ai' | 'acquired' | 'none';
+
+/** plan-668: fixed prefix of every refusal caused by the AI switch being off. */
+export const AI_DISABLED_PREFIX = 'AI_DISABLED:';
+/** plan-668: the refusal text a tab with AI control off answers a tool call with. */
+export const AI_DISABLED_MESSAGE =
+  `${AI_DISABLED_PREFIX} AI control is switched off in this viewer tab (Settings > AI).`;
 
 /** A log line streamed from the MCP bridge server (shown in the UI). */
 export interface McpServerLogLine {
@@ -206,10 +276,20 @@ interface StatusMessage {
   type: 'status';
   status: BridgeServerStatus;
   role?: McpBridgeRole;
+  capabilities?: { commandClasses?: string };
   claimed?: boolean;
+  /** plan-2220: this tab's own key; it identifies the tab to CONNECT's `/ai/prompt`. Secret. */
+  tabKey?: string;
 }
 
 /** server → browser: the claim session a redeemed launcher token became (plan-564 F13). */
+/** plan-2024: config invalidation pushed by CONNECT to every tab. */
+interface ConfigPushMessage {
+  type: 'config';
+  instance: string;
+  revision: number;
+}
+
 interface ClaimMessage {
   type: 'claim';
   claimId: string;
@@ -223,6 +303,14 @@ export interface ViewerStatusFrame {
   seq: number;
   claimToken?: string;
   claimSession?: { id: string; secret: string };
+  /** plan-668: AI control is on in this tab. CONNECT makes a tab an owner
+   *  candidate with its first `viewer_status` and publishes its catalog only
+   *  while this is true. Absent = an older browser (treated as AI on). */
+  ai?: boolean;
+  /** plan-2220 E8: "AI may control SolidCraft" is on in this tab. CONNECT adds the
+   *  SolidCraft server of the CONNECTED Live Link instance to the AI panel's CLI
+   *  only while this is true for the owner tab. Absent = off. */
+  aiSolidCraft?: boolean;
 }
 
 /** sessionStorage key of the claim session — per TAB, survives a reload, not a new tab. */
@@ -231,7 +319,7 @@ export const MCP_CLAIM_SESSION_KEY = 'rv-mcp-claim-session';
 /** Read the stored claim session of this tab, or null. Never throws. */
 export function readClaimSession(): { id: string; secret: string } | null {
   try {
-    const raw = sessionStorage.getItem(MCP_CLAIM_SESSION_KEY);
+    const raw = readSessionStorage(MCP_CLAIM_SESSION_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as { id?: unknown; secret?: unknown };
     return typeof parsed.id === 'string' && typeof parsed.secret === 'string'
@@ -243,7 +331,7 @@ export function readClaimSession(): { id: string; secret: string } | null {
 }
 
 function writeClaimSession(session: { id: string; secret: string }): void {
-  try { sessionStorage.setItem(MCP_CLAIM_SESSION_KEY, JSON.stringify(session)); }
+  try { writeSessionStorage(MCP_CLAIM_SESSION_KEY, JSON.stringify(session)); }
   catch { /* storage disabled: the claim then holds until the next reconnect */ }
 }
 
@@ -257,10 +345,14 @@ export function buildViewerStatusFrame(
   seq: number,
   claimToken: string | null,
   session: { id: string; secret: string } | null,
+  ai?: boolean,
+  aiSolidCraft?: boolean,
 ): ViewerStatusFrame {
   const frame: ViewerStatusFrame = { type: 'viewer_status', visible, seq };
   if (claimToken) frame.claimToken = claimToken;
   else if (session) frame.claimSession = session;
+  if (ai !== undefined) frame.ai = ai;
+  if (aiSolidCraft !== undefined) frame.aiSolidCraft = aiSolidCraft;
   return frame;
 }
 
@@ -286,26 +378,45 @@ export { DEFAULT_BRIDGE_PORT, NODE_FALLBACK_PORT } from './mcp-bridge/rv-mcp-bri
 import { DEFAULT_BRIDGE_PORT } from './mcp-bridge/rv-mcp-bridge-ports';
 import { placementsStatus } from './mcp-bridge/rv-mcp-scene-ready';
 import type { FollowDecision } from './mcp-bridge/rv-mcp-follow-policy';
+import { agentCallBegin, agentCallEnd, resultFailed } from './mcp-bridge/rv-mcp-agent-cursor';
+import { setBridgeTabKey } from './mcp-bridge/rv-mcp-tab-key';
 
 interface AiBridgeSettings {
   enabled: boolean;
   port: string;
+  /** plan-2220 E8: "AI may control SolidCraft" — default off. */
+  aiSolidCraft: boolean;
+}
+
+/** `web_status.stereo` (plan-2215) — present only when a stereo plugin is registered. */
+function stereoStatusField(viewer: RVViewer | null | undefined): { stereo?: StereoStatus } {
+  const plugin = viewer?.getPlugin?.<StereoPluginAPI>('stereo');
+  const status = plugin?.status;
+  return status ? { stereo: status } : {};
+}
+
+/** `web_status.wall` is present only when a display-wall plugin is registered. */
+function wallStatusField(viewer: RVViewer | null | undefined): { wall?: DisplayWallPluginAPI['status'] } {
+  const plugin = viewer?.getPlugin?.<DisplayWallPluginAPI>('display-wall');
+  const status = plugin?.status;
+  return status ? { wall: status } : {};
 }
 
 function loadSettings(): AiBridgeSettings {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { enabled: false, port: DEFAULT_BRIDGE_PORT };
+    const raw = readLocalStorage(STORAGE_KEY);
+    if (!raw) return { enabled: false, port: DEFAULT_BRIDGE_PORT, aiSolidCraft: false };
     const parsed = JSON.parse(raw) as Partial<AiBridgeSettings>;
     return {
       enabled: parsed.enabled === true,
       port: parsed.port || DEFAULT_BRIDGE_PORT,
+      aiSolidCraft: parsed.aiSolidCraft === true,
     };
-  } catch { return { enabled: false, port: DEFAULT_BRIDGE_PORT }; }
+  } catch { return { enabled: false, port: DEFAULT_BRIDGE_PORT, aiSolidCraft: false }; }
 }
 
 function saveSettings(settings: AiBridgeSettings): void {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(settings)); }
+  try { writeLocalStorage(STORAGE_KEY, JSON.stringify(settings)); }
   catch { /* quota exceeded */ }
 }
 
@@ -351,10 +462,11 @@ export interface McpBridgeTargetContext {
  *
  * Explicit / dev case — `ws://localhost:<bridgePort>/webviewer`. That is CONNECT
  * on the default port 5100, or the Node bridge when 18714 / 18715 is pinned.
- * Since plan-363 a dev session is normally served THROUGH CONNECT's proxy, so
- * this branch aims at a gateway on the default port rather than at the page
- * origin; a CONNECT listening elsewhere (worktree sessions) is reached by
- * pinning its port with `?mcpPort=`.
+ * Since plan-363 a dev session is normally served THROUGH CONNECT's proxy: such a
+ * dev page (its same-origin `/health` answers with CONNECT's signature) takes the
+ * embedded branch and talks to the CONNECT that serves it — a worktree CONNECT on
+ * another port included, without `?mcpPort=`. Only a bare Vite page (no CONNECT
+ * behind its origin) aims at the gateway on the default port.
  *
  * The auth token is **transport-independent** (plan-327 AP5): it must be able to
  * travel on BOTH branches, mirroring `websocket-realtime-interface.ts::buildUrl`.
@@ -387,7 +499,10 @@ export interface McpBridgeTargetContext {
  */
 export function resolveMcpBridgeTarget(ctx: McpBridgeTargetContext): string {
   const hosted = !ctx.isDevServer && !ctx.servedByConnect && !ctx.isLoopbackPage;
-  const embedded = !hosted && !ctx.explicitPort && !ctx.isDevServer;
+  // A dev page counts as embedded only when CONNECT is shown to serve it (its same-origin `/health`):
+  // a worktree CONNECT on 5200 must get the frames of the tab it serves, not the canonical one on 5100
+  // (SolidCraft autostart fix 2026-10-22). A bare Vite page keeps the localhost:<port> target.
+  const embedded = !hosted && !ctx.explicitPort && (!ctx.isDevServer || ctx.servedByConnect);
   const base = embedded
     ? `${ctx.protocol === 'https:' ? 'wss' : 'ws'}://${ctx.host}/webviewer`
     : `ws://localhost:${ctx.bridgePort}/webviewer`;
@@ -398,22 +513,6 @@ export function resolveMcpBridgeTarget(ctx: McpBridgeTargetContext): string {
 
 /** Release for a call that never installed a policy — nothing was answered. */
 const NO_DIALOG_POLICY: DialogPolicyRelease = () => [];
-
-/**
- * Should this tool call install the dialog auto-responder? (plan-486, SOL R2-3.)
- *
- * The policy exists for the EDITOR's modal dialogs, which an MCP call would
- * otherwise leave hanging with nobody to click them. It is installed around
- * every call, however short — so a dialog the USER raises while a call is in
- * flight is auto-answered too. For a millisecond-long call that is a tiny
- * window; for the prompt-queue tools, which an agent polls in a loop, it is a
- * window that is open most of the time. They touch no editor state and can
- * raise no dialog of their own, so they are exempt and a user dialog that
- * appears during one stays the user's to answer.
- */
-export function dialogPolicyApplies(tool: string): boolean {
-  return !tool.startsWith('web_prompt_');
-}
 
 /** The bridge URL with any `?apikey=` removed — what the panel may show. */
 export function redactBridgeTarget(target: string): string {
@@ -483,10 +582,19 @@ export class McpBridgePlugin extends RVBehavior {
   // into the URL for the rest of this session (plan-366 Phase 3).
   private _cookieAuthFailed = false;
   private _dispatcher: Map<string, { instance: object; methodKey: string; paramNames: string[]; command?: ToolCommandBinding }> | null = null;
+  private readonly _warnedMovedToolCollisions = new Set<string>();
   private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private _reconnectDelay = 1000;
   private _maxReconnectDelay = 30000;
+  /** LIFETIME only (plan-668): destroy, plugin deactivate, close 1008. It no
+   *  longer says anything about AI — that is {@link _aiEnabled}. */
   private _destroyed = false;
+  /** plan-668: AI control is on (persisted as `rv-ai-bridge.enabled`). */
+  private _aiEnabled = false;
+  /** plan-2220 E8: "AI may control SolidCraft" (persisted as `rv-ai-bridge.aiSolidCraft`, default off). */
+  private _aiSolidCraft = false;
+  /** plan-668: user actions holding the channel open on a page without CONNECT. */
+  private readonly _channelHolders = new Set<string>();
   private _currentPort = DEFAULT_BRIDGE_PORT;
   /** True once a bridge port is explicitly pinned (via `?mcpPort=` or the UI /
    *  a non-default saved port). Forces an explicit `localhost:<port>` target even
@@ -507,6 +615,8 @@ export class McpBridgePlugin extends RVBehavior {
   /** plan-541: the current socket delivered its first `status` frame — the bridge
    *  is READY. A transport `open` is not enough (pairing closes follow an open). */
   private _ready = false;
+  /** True once the channel was ready at least once (reconnect detection for the config reload). */
+  private _everReady = false;
   /** plan-541: why the bridge is not connected (shown in the AI Bridge panel). */
   private _failure: McpBridgeFailure = 'none';
   /** Start (ms) of the current uninterrupted run of `4401 pairing-pending` closes. */
@@ -534,13 +644,24 @@ export class McpBridgePlugin extends RVBehavior {
   /** plan-564: running number of `viewer_status` frames (CONNECT echoes it as `ack`). */
   private _statusSeq = 0;
   private _visibilityListener: (() => void) | null = null;
+  /** plan-2044: the one license-store subscription (unlicensed -> licensed edge); null when none. */
+  private _licenseUnsubscribe: (() => void) | null = null;
+  /** plan-621: internal tools — answer `call`, never in `discover`. */
+  private readonly _internalTools = new Map<string, InternalBridgeToolHandler>();
 
   // ── Public getters ──
 
   get mcpConnected(): boolean { return this._ready && this._ws?.readyState === WebSocket.OPEN; }
   get mcpPort(): string { return this._currentPort; }
   get mcpToolCount(): number { return this._dispatcher?.size ?? 0; }
-  get mcpEnabled(): boolean { return !this._destroyed; }
+  /** AI control is on (plan-668 — was "the bridge socket is on"). */
+  get mcpEnabled(): boolean { return this._aiEnabled; }
+  /** plan-668: AI agents / MCP clients may control this tab. */
+  get aiEnabled(): boolean { return this._aiEnabled; }
+  /** plan-2220 E8: the AI panel may use the SolidCraft Live Link instance. */
+  get aiSolidCraft(): boolean { return this._aiSolidCraft; }
+  /** plan-668: the CONNECT channel is ready (alias of {@link mcpConnected}). */
+  get channelConnected(): boolean { return this.mcpConnected; }
   /** Buffered log lines streamed from the bridge server. */
   get serverLog(): McpServerLogLine[] { return this._serverLog; }
   /** Last full-chain status pushed by the bridge server (null until received). */
@@ -556,7 +677,10 @@ export class McpBridgePlugin extends RVBehavior {
       port: this._currentPort,
       toolCount: this.mcpToolCount,
       toolNames: this.mcpToolNames,
-      enabled: this.mcpEnabled,
+      enabled: this._aiEnabled,
+      aiEnabled: this._aiEnabled,
+      aiSolidCraft: this._aiSolidCraft,
+      channelReason: this._channelReason(),
       reconnectAttempt: this._reconnectAttempt,
       reconnectDelay: this._reconnectDelay,
       serverStatus: this._serverStatus,
@@ -599,8 +723,11 @@ export class McpBridgePlugin extends RVBehavior {
     this._failure = 'none';
     this._resetDiagnosis();
     this._destroyed = false;
-    this._connect();
+    // plan-668: reconnect reopens the channel only where one is wanted (CONNECT
+    // origin, AI on, or a holder) — it never switches AI control on.
+    this._updateChannel();
     this._saveSettings();
+    this._emitChanged();
   }
 
   /** Set the target port without connecting (stored; applied on the next enable/reconnect). */
@@ -634,17 +761,134 @@ export class McpBridgePlugin extends RVBehavior {
   resumeServer(): void { this._sendControl('resume'); }
 
   private _sendControl(action: 'pause' | 'resume' | 'shutdown'): void {
-    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
-    this._ws.send(JSON.stringify({ type: 'control', action }));
+    this.sendControl(action);
   }
 
-  /** Enable or disable the MCP bridge. */
+  /**
+   * plan-621: sends one `control` frame `{type:'control', action, ...fields}` to
+   * the bridge server. Generic — the server routes on `action` (CONNECT:
+   * `WebViewerBridge.RegisterControlHandler`, keyed by the part before the first
+   * dot, e.g. `solidcraft.connect`). `fields` ride at the top level of the frame
+   * and cannot override `type` or `action`. Returns false, and sends nothing,
+   * while the socket is not open.
+   */
+  sendControl(action: string, fields?: Record<string, unknown>): boolean {
+    if (!action || !this._ws || this._ws.readyState !== WebSocket.OPEN) return false;
+    this._ws.send(JSON.stringify({ ...(fields ?? {}), type: 'control', action }));
+    return true;
+  }
+
+  /**
+   * plan-621: registers an internal tool (see {@link InternalBridgeToolHandler}).
+   * It answers `call` frames by name but is never part of `discover`, the tool
+   * count or {@link mcpToolNames}. `web_*` names are refused — that namespace is
+   * the MCP catalog. A second registration of the same name replaces the first;
+   * the returned function unregisters only its own handler.
+   */
+  registerInternalTool(name: string, handler: InternalBridgeToolHandler): () => void {
+    if (!name || name.startsWith('web_')) {
+      throw new Error(`[McpBridge] internal tool name '${name}' is invalid (web_* is the MCP catalog)`);
+    }
+    this._internalTools.set(name, handler);
+    return () => this.unregisterInternalTool(name, handler);
+  }
+
+  /** plan-621: removes an internal tool; with `handler`, only if it is still the registered one. */
+  unregisterInternalTool(name: string, handler?: InternalBridgeToolHandler): void {
+    if (handler && this._internalTools.get(name) !== handler) return;
+    this._internalTools.delete(name);
+  }
+
+  /** plan-621: names of the registered internal tools (diagnostics, tests). */
+  get internalToolNames(): string[] { return [...this._internalTools.keys()]; }
+
+  /**
+   * Switch AI control on or off (plan-668). This no longer opens or closes the
+   * CONNECT channel by itself: on a page CONNECT serves, the channel stays up
+   * either way and only the announced catalog (`discover`) and the call gate
+   * change — at once, without a reconnect. On a page without CONNECT the channel
+   * follows the switch as before (unless a holder keeps it open). A call already
+   * running when AI is switched off ends normally; every new one is refused.
+   *
+   * UI callers must show the one-time consent dialog BEFORE switching on
+   * (`hasAiBridgeConsent()`); no other product code switches AI on.
+   */
   setEnabled(enabled: boolean): void {
-    if (enabled && this._destroyed) {
-      this._destroyed = false;
-      this._connect();
-    } else if (!enabled && !this._destroyed) {
-      this._destroyed = true;
+    const changed = enabled !== this._aiEnabled;
+    this._aiEnabled = enabled;
+    this._saveSettings();
+    if (changed && this._ws && this._ws.readyState === WebSocket.OPEN) {
+      this._sendDiscover();
+      this._sendViewerStatus();
+    }
+    this._updateChannel();
+    this._emitChanged();
+  }
+
+  /**
+   * plan-2220 E8: "AI may control SolidCraft". CONNECT gives the AI panel's CLI the
+   * SolidCraft server of the connected Live Link instance only while this is on for
+   * the owner tab AND the Live Link is connected; it reads the value from the next
+   * `viewer_status`, so the next prompt already follows the switch.
+   */
+  setAiSolidCraft(enabled: boolean): void {
+    const changed = enabled !== this._aiSolidCraft;
+    this._aiSolidCraft = enabled;
+    this._saveSettings();
+    if (changed) this._sendViewerStatus();
+    this._emitChanged();
+  }
+
+  /**
+   * plan-668: a user action asks for the CONNECT channel (e.g. "Connect to
+   * SolidCraft"). On a page CONNECT serves the channel is up anyway; elsewhere
+   * this opens it without touching AI control. Idempotent per holder.
+   */
+  acquireChannel(holder: string): void {
+    if (!holder || this._channelHolders.has(holder)) return;
+    this._channelHolders.add(holder);
+    this._updateChannel();
+    this._emitChanged();
+  }
+
+  /** plan-668: drop a holder; the channel closes when nothing else wants it. Idempotent. */
+  releaseChannel(holder: string): void {
+    if (!this._channelHolders.delete(holder)) return;
+    this._updateChannel();
+    this._emitChanged();
+  }
+
+  /** plan-668: CONNECT is shown to serve this page on the channel's own origin. */
+  private _isConnectOrigin(): boolean {
+    if (this._explicitPort) return false;
+    return this._pageContext().markerCookie || this._sameOriginIsConnect === true;
+  }
+
+  private _wantsChannel(): boolean {
+    return this._isConnectOrigin() || this._aiEnabled || this._channelHolders.size > 0;
+  }
+
+  private _channelReason(): McpChannelReason {
+    if (this._isConnectOrigin()) return 'connect-origin';
+    if (this._aiEnabled) return 'ai';
+    if (this._channelHolders.size > 0) return 'acquired';
+    return 'none';
+  }
+
+  /**
+   * plan-668: bring the socket in line with {@link _wantsChannel}. Opens it when
+   * wanted and nothing is open or scheduled; closes it when nothing wants it.
+   * A page whose origin may still turn out to be CONNECT (dev page, remote HMI
+   * without the marker cookie) asks its OWN origin once — same-origin, so no
+   * Local Network Access prompt — and re-evaluates with the answer.
+   */
+  private _updateChannel(): void {
+    if (this._destroyed) return;
+    if (this._wantsChannel()) {
+      if (!this._ws && this._reconnectTimer === null) this._connect();
+      return;
+    }
+    if (this._ws || this._reconnectTimer !== null) {
       if (this._reconnectTimer !== null) {
         clearTimeout(this._reconnectTimer);
         this._reconnectTimer = null;
@@ -653,12 +897,17 @@ export class McpBridgePlugin extends RVBehavior {
       this._failure = 'none';
       this._resetDiagnosis();
     }
-    this._saveSettings();
-    this._emitChanged();
+    if (this._needsSameOriginProbe()) {
+      void this._probeSameOrigin().then((isConnect) => {
+        if (!isConnect || this._destroyed) return;
+        this._updateChannel();
+        this._emitChanged();
+      });
+    }
   }
 
   private _saveSettings(): void {
-    saveSettings({ enabled: !this._destroyed, port: this._currentPort });
+    saveSettings({ enabled: this._aiEnabled, port: this._currentPort, aiSolidCraft: this._aiSolidCraft });
   }
 
   // ── Lifecycle ──
@@ -667,9 +916,9 @@ export class McpBridgePlugin extends RVBehavior {
    *  onStart/onModelLoaded which never fire for an empty (model-less) scene
    *  (e.g. authoring in an empty Layout Planner). The bridge is viewer-lifetime
    *  infrastructure, so it captures the viewer and initialises its connection
-   *  here, independent of model loading. This also fixes the enable toggle: a
-   *  disabled bridge now correctly starts with `_destroyed = true`, so
-   *  `setEnabled(true)` actually calls `_connect()` instead of no-op'ing. */
+   *  here, independent of model loading. Since plan-668 the stored `enabled`
+   *  is AI control only; whether the channel opens is decided by
+   *  `_updateChannel()` (CONNECT origin, AI on, or a holder). */
   init(viewer: RVViewer): void {
     this.viewer = viewer;
     const saved = loadSettings();
@@ -686,10 +935,16 @@ export class McpBridgePlugin extends RVBehavior {
     // — the stored claim session carries the claim from then on.
     this._claimToken = new URLSearchParams(window.location.search).get('mcpClaim') || null;
     this._installVisibilityListener();
-    this._destroyed = !saved.enabled;
-    if (saved.enabled) {
-      this._connect();
-    }
+    // plan-2044: exactly one license subscription per plugin instance — a
+    // re-init replaces it instead of stacking a second one.
+    this._licenseUnsubscribe?.();
+    this._licenseUnsubscribe = onGatewayLicensed(() => this._onGatewayLicensed());
+    // plan-668: the stored `enabled` is AI control; the channel is decided
+    // separately — always on where CONNECT serves the page.
+    this._aiEnabled = saved.enabled;
+    this._aiSolidCraft = saved.aiSolidCraft;
+    this._destroyed = false;
+    this._updateChannel();
     this._emitChanged();
   }
 
@@ -723,11 +978,27 @@ export class McpBridgePlugin extends RVBehavior {
     if (!this._reconnectOnActivate || !this._destroyed) return;
     this._reconnectOnActivate = false;
     this._destroyed = false;
-    this._connect();
+    this._updateChannel();
     this._emitChanged();
   }
 
+  /**
+   * plan-2044: the gateway just became licensed. An unlicensed CONNECT refuses
+   * the `/webviewer` handshake (403 LICENSE_REQUIRED), and by the time the user
+   * has registered the backoff has grown to 30 s — the channel stayed "refused"
+   * until the next slot or a click on "Retry Now". Take the Retry Now path at
+   * once instead: reset backoff and diagnosis, connect now. A no-op while the
+   * plugin is deactivated or destroyed, while the channel is up, and where no
+   * channel is wanted — it never opens a channel by itself.
+   */
+  private _onGatewayLicensed(): void {
+    if (this._destroyed || this.mcpConnected || !this._wantsChannel()) return;
+    this.reconnect();
+  }
+
   protected onDestroy(): void {
+    this._licenseUnsubscribe?.();
+    this._licenseUnsubscribe = null;
     this._destroyed = true;
     // Clear reconnect timer to prevent leak (review fix #4)
     if (this._reconnectTimer !== null) {
@@ -742,6 +1013,8 @@ export class McpBridgePlugin extends RVBehavior {
     }
     this._objectAnalyzer?.dispose();
     this._objectAnalyzer = null;
+    this._internalTools.clear();
+    this._channelHolders.clear();
   }
 
   // ── WebSocket Connection ──
@@ -790,7 +1063,9 @@ export class McpBridgePlugin extends RVBehavior {
   private _sendViewerStatus(): void {
     if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
     const frame = buildViewerStatusFrame(
-      this._isPageVisible(), ++this._statusSeq, this._claimToken, readClaimSession());
+      this._isPageVisible(), ++this._statusSeq, this._claimToken, readClaimSession(), this._aiEnabled,
+      // plan-2220 E8: only an explicit true opts in; CONNECT reads an absent field as off.
+      this._aiSolidCraft ? true : undefined);
     this._ws.send(JSON.stringify(frame));
   }
 
@@ -828,7 +1103,11 @@ export class McpBridgePlugin extends RVBehavior {
   private _needsSameOriginProbe(): boolean {
     if (this._sameOriginIsConnect !== null || this._explicitPort) return false;
     const page = this._pageContext();
-    return !page.isDevServer && !page.markerCookie && !page.isLoopbackPage;
+    if (page.markerCookie) return false;
+    // A dev page: the CONNECT dev proxy sets no marker cookie, so the probe is the only way to learn
+    // that CONNECT (possibly a worktree CONNECT on another port) serves this page.
+    if (page.isDevServer) return true;
+    return !page.isLoopbackPage;
   }
 
   private _probeSameOrigin(): Promise<boolean> {
@@ -863,10 +1142,13 @@ export class McpBridgePlugin extends RVBehavior {
         // A newer connect, a disconnect or a disable superseded this one.
         if (token !== this._connectToken || this._destroyed) return;
         this._emitChanged(); // the target may have changed with the answer
+        // plan-668: the answer may show the channel is not wanted after all.
+        if (!this._wantsChannel()) return;
         this._openSocket();
       });
       return;
     }
+    if (!this._wantsChannel()) return;
     this._openSocket();
   }
 
@@ -912,6 +1194,7 @@ export class McpBridgePlugin extends RVBehavior {
       console.debug(`[McpBridge] Connection closed: code=${ev.code} reason="${ev.reason}"`);
       const wasReady = this._ready;
       this._ready = false;
+      setBridgeTabKey(null); // plan-2220: the key belonged to this socket
       const pairing = PAIRING_CLOSE_CODES[ev.code];
       // Closed without ever opening is the shape a refused handshake has — an
       // expired or absent session cookie among them. Put the query key back for
@@ -1001,7 +1284,9 @@ export class McpBridgePlugin extends RVBehavior {
     this._dispatcher = null;
     this._serverStatus = null;
     this._role = null;
+    setGatewayCommandClassesState('none');
     this._claimed = false;
+    setBridgeTabKey(null); // plan-2220: the key belongs to the closed socket
   }
 
   /** Schedule the next attempt — exponential backoff with jitter, or a fixed
@@ -1041,11 +1326,53 @@ export class McpBridgePlugin extends RVBehavior {
 
   private _sendDiscover(): void {
     if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
+    if (!this._aiEnabled) {
+      // plan-668 F2: AI control off — announce nothing an AI client could call.
+      // No dispatcher either: the tool count reads 0 and `_handleCall` refuses.
+      this._dispatcher = null;
+      this._ws.send(JSON.stringify({
+        type: 'discover', tools: [], instructions: '', schema_version: '1.0.0', ai: false,
+      }));
+      this._emitChanged();
+      return;
+    }
     const instances = this.mcpToolInstances;
     let schemas;
     try {
       schemas = generateToolSchemasMulti(instances);
       this._dispatcher = buildMultiDispatcher(instances);
+      this._installCommandStepHooks();
+      // plan-641 F2: the bound aliases of macro commands announce the optional
+      // `_reason/_source/_confidence` (split off centrally in `_handleCall`).
+      ensureEditorCommandsRegistered();
+      ensureSessionOverlayCommandsRegistered();
+      ensureComponentCommandsRegistered();
+      ensureQueryCommandsRegistered();
+      ensureDocumentCommandsRegistered();
+      ensureSignalAutomapCommandsRegistered();
+      ensureDesPlcCommandsRegistered();
+      ensureCameraCommandsRegistered();
+      ensureSelectionCommandsRegistered();
+      ensureUiPanelCommandsRegistered();
+      ensureDesRunCommandsRegistered();
+
+      ensureDropDiagnosticsCommandsRegistered();
+      ensureViewCommandsRegistered();
+      ensureSimCommandsRegistered();
+      schemas = withMacroMetaParams(schemas, macroCapableToolNames(this._dispatcher, commandRegistry));
+      // plan-641 Nachtrag 2026-10-21: bound aliases stay callable but leave tools/list.
+      setAliasDescriptions(this._dispatcher, schemas);
+      schemas = withAliasListing(schemas, boundAliasToolNames(this._dispatcher), aliasesListed());
+      for (const schema of movedToolSchemas()) {
+        if (this._dispatcher.has(schema.name)) {
+          if (!this._warnedMovedToolCollisions.has(schema.name)) {
+            this._warnedMovedToolCollisions.add(schema.name);
+            console.warn(`MCP moved tool ${schema.name} still has a decorator; the decorated tool wins`);
+          }
+        } else {
+          schemas.push(schema);
+        }
+      }
     } catch (e) {
       // R9 — both builders throw on a duplicate tool name, and this runs inside
       // `ws.onopen`. Unguarded, one collision took down the ENTIRE catalogue,
@@ -1062,6 +1389,7 @@ export class McpBridgePlugin extends RVBehavior {
       tools: schemas,
       instructions: MCP_INSTRUCTIONS,
       schema_version: '1.0.0',
+      ai: true,
     }));
     // No backoff reset here (plan-541): discover runs on transport open, which
     // a pairing close follows. The first `status` frame resets it.
@@ -1082,11 +1410,18 @@ export class McpBridgePlugin extends RVBehavior {
         const status = msg as StatusMessage;
         this._serverStatus = status.status;
         this._role = status.role === 'active' || status.role === 'standby' ? status.role : null;
+        setGatewayCommandClassesState('role' in status
+          ? typeof status.capabilities?.commandClasses === 'string' ? 'connect-with-classes' : 'connect-without-classes'
+          : 'none');
         this._claimed = status.claimed === true;
+        setBridgeTabKey(typeof status.tabKey === 'string' ? status.tabKey : null);
         if (!this._ready) this._markReady();
         this._emitChanged();
       } else if (msg.type === 'claim') {
         this._handleClaim(msg as ClaimMessage);
+      } else if (msg.type === 'config') {
+        // plan-2024: thin invalidation from CONNECT; connect-store reloads interfaces + bridges.
+        handleConnectConfigPush(msg as ConfigPushMessage);
       }
     } catch (e) {
       console.warn('[McpBridge] Failed to handle message:', e);
@@ -1107,6 +1442,10 @@ export class McpBridgePlugin extends RVBehavior {
    *  (backlog / relay) can arrive earlier and proves nothing. */
   private _markReady(): void {
     this._ready = true;
+    // plan-2024: pushes sent while this channel was down are gone for good; one reload on every
+    // reconnect closes that gap without a second push.
+    if (this._everReady) requestConnectConfigRefresh();
+    this._everReady = true;
     this._reconnectAttempt = 0;
     this._reconnectDelay = 1000;
     this._failure = 'none';
@@ -1133,10 +1472,70 @@ export class McpBridgePlugin extends RVBehavior {
     setAiActivity(label);
   }
 
-  /** Human-like PRE-execution choreography for web_editor_* calls: select the
-   *  target nodes, open the owning panel and simulate a real click on the
-   *  equivalent button (hover → press → release). AWAITED — the tool executes
-   *  at the release, like a real click. Loaded lazily; never throws. */
+  private _commandCallId: number | undefined;
+  private _commandHooksInstalled = false;
+
+  /** plan-2007 F11: `web_execute` / `web_query` of one command show that command's label in the pill. */
+  private _commandDoorLabel(tool: string, args: Record<string, unknown> | undefined): string | undefined {
+    if (tool !== 'web_execute' && tool !== 'web_query') return undefined;
+    const ids = commandIdsOfCall(tool, args ?? {});
+    if (!ids || ids.length !== 1 || !commandRegistry.get(ids[0])) return undefined;
+    let cmdArgs: unknown = {};
+    const raw = args?.['args'];
+    try { cmdArgs = typeof raw === 'string' && raw.trim() ? JSON.parse(raw) : (raw ?? {}); } catch { cmdArgs = {}; }
+    try { return commandRegistry.labelOf(ids[0], cmdArgs); } catch { return undefined; }
+  }
+
+  private _installCommandStepHooks(): void {
+    this._commandHooksInstalled = true;
+    type Token = {
+      key: string;
+      followDecision?: FollowDecision;
+      probe: (typeof DELTA_PROBES)[string] | undefined;
+      pctx: { viewer: RVViewer; tool: string; callId: number };
+      snap: unknown;
+    };
+    setCommandStepHooks({
+      before: async (id, args, captured) => {
+        const viewer = this.viewer;
+        const callId = this._commandCallId;
+        if (!viewer || !this._dispatcher || callId === undefined) return undefined;
+        // plan-2007 F11/Phase 6: a 1:1 key reuses the old tool's probe + feedback (identical args);
+        // a command behind a multiplexer tombstone (web_editor_pivot, _rotate90, …) still gets the
+        // editor choreography and afterglow, but no delta probe (its args are post-transform).
+        const exact = choreographyToolOf(id, this._dispatcher);
+        const key = exact ?? MOVED_TOOLS.find((m) => m.movedTo.length > 1 && m.movedTo.includes(id)
+          && m.tool.startsWith('web_editor_'))?.tool;
+        await commandRegistry.preload([id]);
+        if (commandRegistry.enabled(id, args, viewer, captured) !== true) return undefined;
+        const buttonKey = commandRegistry.get(id)?.buttonKey?.(args);
+        let followDecision: FollowDecision | undefined;
+        if (key) {
+          followDecision = await this._prepareEditorChoreography(key, args, buttonKey);
+        } else if (buttonKey) {
+          const { prepareCommandChoreography } = await import('./mcp-bridge/rv-mcp-editor-feedback');
+          await prepareCommandChoreography(buttonKey);
+        }
+        if (!key) return undefined;
+        const probe = exact ? DELTA_PROBES[exact] : undefined;
+        const pctx = { viewer, tool: key, callId };
+        const snap = probe ? safeProbe(() => probe.before(pctx, args)) : undefined;
+        return { key, followDecision, probe, pctx, snap } satisfies Token;
+      },
+      after: (opaque, _id, args, outcome) => {
+        const token = opaque as Token | undefined;
+        if (!token) return null;
+        const { key, followDecision, probe, pctx, snap } = token;
+        const result = commandResultJson(outcome.result);
+        const delta = probe ? safeProbe(() => probe.after(pctx, args, snap, parseResult(result))) : null;
+        if (outcome.result.ok) this._applyEditorFeedback(key, args, result, followDecision);
+        return delta ? { ...delta } : null;
+      },
+    });
+  }
+
+  /** Select targets, open the panel and press the corresponding button before execution.
+   *  The returned follow decision is reused by the feedback phase. Never throws. */
   private async _prepareEditorChoreography(
     tool: string, args: Record<string, unknown>, buttonKey?: string,
   ): Promise<FollowDecision | undefined> {
@@ -1145,7 +1544,7 @@ export class McpBridgePlugin extends RVBehavior {
     try {
       const m = await import('./mcp-bridge/rv-mcp-editor-feedback');
       // web_editor_* plus the scene tools listed in the feedback table
-      // (web_component_set: open the inspector and press the field row).
+      // (web_execute("component.setFields", …): open the inspector and press the field row).
       // plan-520: the pre-follow verdict is returned for the post phase.
       if (tool.startsWith('web_editor_') || m.EDITOR_FEEDBACK[tool]) {
         return await m.prepareEditorChoreography(v, tool, args ?? {}, buttonKey);
@@ -1177,18 +1576,53 @@ export class McpBridgePlugin extends RVBehavior {
   }
 
   private async _handleCall(msg: CallMessage): Promise<void> {
-    const { id, tool, arguments: args } = msg;
+    const { id, tool } = msg;
+    let args = msg.arguments;
+
+    // plan-621: an internal tool is answered directly — no command binding, no
+    // choreography, no AI-activity label: nobody "uses" it, a service feeds it.
+    const internal = this._internalTools.get(tool);
+    if (internal) {
+      await this._handleInternalCall(id, internal, args ?? {});
+      return;
+    }
+
+    // plan-668 F3: AI control off — every other call is refused, by name, alias
+    // or otherwise, before anything (dispatcher, choreography, label) runs.
+    if (!this._aiEnabled) {
+      this._sendResult(id, undefined, AI_DISABLED_MESSAGE);
+      return;
+    }
 
     if (!this._dispatcher) {
       this._sendResult(id, undefined, 'Dispatcher not ready');
       return;
     }
 
+    if (!this._commandHooksInstalled) this._installCommandStepHooks();
     const entry = this._dispatcher.get(tool);
     if (!entry) {
+      const moved = movedToolOf(tool);
+      if (moved) {
+        this._sendResult(id, undefined, movedToolAnswer(moved));
+        return;
+      }
       this._sendResult(id, undefined, `Unknown tool: ${tool}`);
       return;
     }
+
+    // plan-2005 F6: an undeclared argument is an error naming the allowed ones —
+    // never dropped silently. `_`-meta keys pass; declared aliases are renamed.
+    const checked = checkToolArgs(tool, entry.paramNames, args);
+    if (!checked.ok) {
+      this._sendResult(id, undefined, checked.error);
+      return;
+    }
+    args = checked.args;
+
+    // plan-769 F9 (Phase 3b): node paths a caller typed in the AUTHORED spelling (or
+    // the exact legacy one) reach every tool in the registry's spelling — never by a guess.
+    args = normalizeUserPathArgs(this.viewer?.registry, args) ?? args;
 
     // plan-499 F15/F21: resolve the binding ONCE, at call begin and before any
     // wait — command, command args, target button, document identity and
@@ -1196,13 +1630,39 @@ export class McpBridgePlugin extends RVBehavior {
     installAiTouchListener();
     ensureEditorCommandsRegistered();
     ensurePlannerCommandsRegistered();
+    ensureLibraryCommandsRegistered();
+    ensureThumbnailCommandsRegistered();
+    ensurePathNetworkCommandsRegistered();
+    ensureDiagnoseCommandsRegistered();
+    ensureDiagnosticsExportCommandRegistered();
     ensureSimCommandsRegistered();
     ensureViewCommandsRegistered();
+    ensureSessionOverlayCommandsRegistered();
+    ensureComponentCommandsRegistered();
+    ensureQueryCommandsRegistered();
+    ensureDocumentCommandsRegistered();
+    ensureSignalAutomapCommandsRegistered();
+    ensureDesPlcCommandsRegistered();
+    ensureCameraCommandsRegistered();
+    ensureSelectionCommandsRegistered();
+    ensureUiPanelCommandsRegistered();
+    ensureDesRunCommandsRegistered();
+
+    ensureDropDiagnosticsCommandsRegistered();
     const v = this.viewer ?? undefined;
     commandRegistry.attachViewer(v);
-    const callCtx = buildCallContext(entry.command, args ?? {}, v, id);
+    // plan-641 F2: a BOUND tool never sees the meta arguments — they are split
+    // off here, before the binding resolves, and travel in the call context to
+    // the macro recorder. An unbound tool (web_execute, web_batch) declares
+    // them as its own params and receives them unchanged.
+    const split = entry.command ? splitMacroMeta(args ?? {}) : null;
+    if (split) args = split.args;
+    const builtCtx = buildCallContext(entry.command, args ?? {}, v, id);
+    const callCtx = split?.meta ? { ...builtCtx, meta: split.meta } : builtCtx;
     const bound = callCtx.bound;
-    this._showActivity(tool, bound ? commandRegistry.labelOf(bound.id, bound.args) : undefined);
+    this._showActivity(tool, bound ? commandRegistry.labelOf(bound.id, bound.args) : this._commandDoorLabel(tool, args));
+    // plan-626 F8: the agent cursor marks what a WRITING call touches (args now, result later).
+    const cursorSeq = agentCallBegin(v, tool, entry, args, bound?.id);
 
     // Preflight (F21): a command that would refuse gets NO choreography — no
     // hover/press on a button a human could not press either, no afterglow.
@@ -1220,7 +1680,8 @@ export class McpBridgePlugin extends RVBehavior {
     // timeout and stay on screen poisoning the next call too. The policy
     // answers the safe ones and reports what it answered; see
     // rv-mcp-dialog-policy.ts for the per-dialog reasoning.
-    const releaseDialogs = dialogPolicyApplies(tool)
+    const commandDoor = tool === 'web_execute' || tool === 'web_batch';
+    const releaseDialogs = dialogPolicyApplies(tool, args, this._dispatcher)
       ? await installMcpDialogPolicy()
       : NO_DIALOG_POLICY;
     try {
@@ -1234,7 +1695,7 @@ export class McpBridgePlugin extends RVBehavior {
       const orderedArgs = entry.paramNames.map(name => args[name]);
       // plan-520: the pre-follow verdict keeps the post phase from framing twice.
       let followDecision: FollowDecision | undefined;
-      if (choreograph) {
+      if (choreograph && !commandDoor) {
         followDecision = await this._prepareEditorChoreography(tool, args ?? {}, bound?.buttonKey ?? undefined);
       }
 
@@ -1243,12 +1704,16 @@ export class McpBridgePlugin extends RVBehavior {
       // choreography already brackets. Every probe half runs inside safeProbe,
       // and mergeDelta returns the original string on any doubt, so nothing
       // here can turn a working tool call into a failing one (F9/R1).
-      const probe = DELTA_PROBES[tool] ?? null;
+      const probe = commandDoor ? null : DELTA_PROBES[tool] ?? null;
       const pctx = probe && this.viewer ? { viewer: this.viewer, tool, callId: id } : null;
       const snap = probe && pctx ? safeProbe(() => probe.before(pctx, args ?? {})) : undefined;
 
-      // Bound bodies take the call context as their trailing parameter.
-      const result = await method.apply(entry.instance, entry.command ? [...orderedArgs, callCtx] : orderedArgs);
+      // Bound bodies take the call context as their trailing parameter — and so
+      // does `web_execute` (plan-641 M4: its command's selection fallback must
+      // resolve against the selection at CALL BEGIN, not after the awaits above).
+      const wantsCtx = !!entry.command || CALL_CONTEXT_TOOLS.has(tool);
+      if (commandDoor) this._commandCallId = id;
+      const result = await method.apply(entry.instance, wantsCtx ? [...orderedArgs, callCtx] : orderedArgs);
       const reported = withDialogReport(result, releaseDialogs()) as string;
 
       // parseResult lives INSIDE the closure: a non-JSON result (an image)
@@ -1257,8 +1722,11 @@ export class McpBridgePlugin extends RVBehavior {
         ? safeProbe(() => probe.after(pctx, args ?? {}, snap, parseResult(reported))) ?? null
         : null;
       this._sendResult(id, mergeDelta(reported, delta));
-      this._applyEditorFeedback(tool, args, reported, followDecision);
+      if (!commandDoor) this._applyEditorFeedback(tool, args, reported, followDecision);
+      agentCallEnd(v, cursorSeq, tool, args, reported, !resultFailed(reported), bound?.id,
+        tool.startsWith('web_editor_') || followDecision !== undefined);
     } catch (e) {
+      agentCallEnd(v, cursorSeq, tool, args, undefined, false, bound?.id, true);
       const answered = releaseDialogs();
       const note = answered.length > 0
         ? ` (dialogs auto-answered: ${answered.map(a => `${a.kind}=${a.answer}`).join(', ')})`
@@ -1271,6 +1739,18 @@ export class McpBridgePlugin extends RVBehavior {
       // never runs when the tool body throws — and a call left in the registry
       // makes every later call on that scope report `ambiguous` forever.
       safeProbe(() => releaseCall(id));
+      if (commandDoor && this._commandCallId === id) this._commandCallId = undefined;
+    }
+  }
+
+  private async _handleInternalCall(
+    id: number, handler: InternalBridgeToolHandler, args: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      const result = await handler(args);
+      this._sendResult(id, typeof result === 'string' ? result : JSON.stringify(result ?? null));
+    } catch (e) {
+      this._sendResult(id, undefined, String(e));
     }
   }
 
@@ -1303,18 +1783,60 @@ export class McpBridgePlugin extends RVBehavior {
   // @McpTool Definitions
   // ═══════════════════════════════════════════════════════════════════
 
-  @McpTool('Get viewer status: connection state, FPS, loaded model, renderMode (simple|default|toon) and wireframe (editor view applied), visualPreset (quality preset, null = Custom) and antialiasActive, drive/signal/sensor/MU counts, render diagnostics (chunk meshes and source masking of the baked model), bake stats of the planner placements (baked assets, chunks, instances) plus the loaded model\'s pick-structure memory (pickBytes, nodeTableBytes/Rows, segments, clusters, geometryBytes, pickPercent) and `placements` (state, pending, total — NESTED placements count too: a reference inside a placed asset is a placement of its own, plan-757) — pending > 0: the scene is still filling — and `cache` (asset blob-cache outcomes, counts, storage). Call first to orient in any session.', { readOnly: true })
+  @McpTool('Get viewer status (call first): connection, FPS, renderer, mode, model, counts, sim (kernelMode, simTime), problems and placements (pending > 0: scene still filling). detail:"render" or "full" adds render diagnostics, bake stats of the planner placements, cache (cacheLast) and features.', { readOnly: true })
   async webStatus(
     @McpParam('cacheLast', 'Newest cache outcomes to list (default 20, max 128).', 'integer', false) cacheLast: number,
+    @McpParam('detail', 'basic (default) | render | full.', 'string', false) detail?: string,
   ): Promise<string> {
-    const planner = this.viewer?.getPlugin?.('layout-planner') as
-      { getBakeStats?: () => unknown } | undefined;
-    return JSON.stringify({
+    // plan-2005 F9: lean by default; the render-heavy blocks only on request.
+    const level = (detail ?? '').toString().trim().toLowerCase() || 'basic';
+    if (level !== 'basic' && level !== 'render' && level !== 'full') {
+      return JSON.stringify({ error: `invalid detail '${detail}'. Allowed: basic, render, full` });
+    }
+    const kernel = this.viewer?.simulationKernel ?? null;
+    const problems = { error: 0, warning: 0, info: 0 };
+    for (const p of getProblems()) {
+      if (p.severity in problems) problems[p.severity as keyof typeof problems]++;
+    }
+    const basic = {
       connected: true,
       fps: this.viewer?.currentFps ?? 0,
       renderer: (this.viewer?.renderer as { isWebGPURenderer?: boolean } | undefined)?.isWebGPURenderer
         ? 'webgpu' : 'webgl',
+      // plan-763: the exact kind — 'webgl' | 'webgpu' | 'webgpu-gl' (WebGPURenderer
+      // on its WebGL backend). `renderer` above stays as it was for existing readers.
+      rendererKind: this.viewer?.rendererKind ?? 'webgl',
       connectionState: this.viewer?.connectionState ?? 'unknown',
+      mode: this.viewer?.modes?.activeMode ?? null,
+      model: this.viewer?.currentModelUrl ?? null,
+      driveCount: this.drives.length,
+      sensorCount: this.sensors.length,
+      signalCount: this.signals?.size ?? 0,
+      muCount: this.transportManager?.mus.length ?? 0,
+      logicRoots: this.viewer?.logicEngine?.roots.length ?? 0,
+      // plan-2005 F9: `runState` joins once the DES run-state source exists (Phase 2).
+      sim: { kernelMode: kernel?.mode ?? null, simTime: this.viewer?.simTime ?? 0 },
+      problems,
+      blockage: this.viewer?.blockageWatch?.counters() ?? { deadlock: 0, stall: 0,
+        coverage: { expected: 0, registered: 0, armed: 0, missing: 0 } },
+      // Scene-ready contract: `pending > 0` = placed references of the open
+      // layout are still materializing — nodes / signals / layout list incomplete.
+      placements: placementsStatus(this.viewer),
+      // plan-2215: stereo state — only when the (commercial) stereo plugin is registered.
+      ...stereoStatusField(this.viewer),
+      ...wallStatusField(this.viewer),
+    };
+    if (level === 'basic') return JSON.stringify({ ...basic, detail: 'basic' });
+    const planner = this.viewer?.getPlugin?.('layout-planner') as
+      { getBakeStats?: () => unknown } | undefined;
+    return JSON.stringify({
+      ...basic,
+      detail: level,
+      // plan-762 F12/F15: true only on the real WebGPU backend — the first half
+      // of the raytraced render-mode gate (the second is a registered backend).
+      hasCompute: this.viewer?.hasCompute ?? false,
+      // plan-762 F12: the ray traced backend's diagnostics (active:false without one).
+      raytraced: this.viewer?.raytracedStats ?? { ...inactiveRaytracedStats(), phase: 'idle' },
       // plan-761: the persisted shading mode and the transient editor wireframe
       // view (the APPLIED state — true only in editor mode), the two fields the
       // render-mode pill folds into one axis.
@@ -1327,24 +1849,20 @@ export class McpBridgePlugin extends RVBehavior {
       // the preset can read "Default" while the picture is still aliased.
       visualPreset: this.viewer ? matchPreset(listPresets()) : null,
       antialiasActive: this.viewer?.antialiasActive ?? false,
-      model: this.viewer?.currentModelUrl ?? null,
       loadInfo: this.viewer?.lastLoadInfo ?? null,
-      driveCount: this.drives.length,
-      sensorCount: this.sensors.length,
-      signalCount: this.signals?.size ?? 0,
-      muCount: this.transportManager?.mus.length ?? 0,
-      logicRoots: this.viewer?.logicEngine?.roots.length ?? 0,
       render: this.renderDiagnostics(),
       // plan-753: planner placements AND the in-place loaded model are
       // baked-asset instances of the viewer's BakeRegistry (§2.4).
       // `bake.survival` (plan-754 Phase 0): counts of the read-only removal
       // report of the last model bake — what a destructive bake WOULD remove.
       bake: withBakeSurvival(withMainModelPick(planner?.getBakeStats?.() ?? null, this.viewer)),
-      // Scene-ready contract: `pending > 0` = placed references of the open
-      // layout are still materializing — nodes / signals / layout list incomplete.
-      placements: placementsStatus(this.viewer),
       // plan-508 F6: what the asset blob cache did — why a library GLB is (not) fresh.
       cache: await assetCacheStatus(cacheLast),
+      // plan-652: what the FeatureLoader activated, when and at what cost.
+      features: this.viewer?.features?.statuses?.().map((f) => ({
+        id: f.id, state: f.state, trigger: f.trigger ?? null, activation: f.activation,
+        ms: f.ms ?? null, bytes: f.bytes ?? null, ...(f.error ? { error: f.error } : {}),
+      })) ?? [],
     });
   }
 
@@ -1415,6 +1933,10 @@ export class McpBridgePlugin extends RVBehavior {
       frame,
       maskHistogram,
       drawTest: (() => {
+        // The probe renders straight to the canvas and reads it with raw GL
+        // calls; neither exists on a WebGPURenderer, where an extra canvas
+        // render after the pipeline would also blit over the finished frame.
+        if (viewer.isWebGPU) return 'n/a';
         try {
           const r = viewer.renderer as unknown as {
             render(s: unknown, c: unknown): void;
@@ -1698,7 +2220,7 @@ export class McpBridgePlugin extends RVBehavior {
     return canvasToRvImage(r.canvas, { crop: r.crop }, 'web_screenshot');
   }
 
-  @McpTool('Capture a burst of frames over a time window from the AGENT camera while the simulation runs, composited into one labelled montage. Use to diagnose MOTION (drive rotation, MU flow) that a single shot cannot show. count = frames (2..16), durationMs = total span, optional `path` crops each frame to a node. The frames come from the agent pose, so an operator navigating meanwhile cannot change what the burst shows. Requires the classic WebGL renderer.', { readOnly: true, timeoutMs: 60_000 })
+  @McpTool('Capture a burst of frames over a time window from the AGENT camera while the simulation runs, composited into one labelled montage. Use to diagnose MOTION (drive rotation, MU flow) that a single shot cannot show. count = frames (2..16), durationMs = total span, optional `path` crops each frame to a node. The frames come from the agent pose, so an operator navigating meanwhile cannot change what the burst shows.', { readOnly: true, timeoutMs: 60_000 })
   async webScreenshotBurst(
     @McpParam('count', 'Number of frames to capture (2..16).', 'number', false) count: number,
     @McpParam('durationMs', 'Total time window in ms the frames are evenly spread over (e.g. 2000).', 'number', false) durationMs: number,
@@ -1771,15 +2293,12 @@ export class McpBridgePlugin extends RVBehavior {
 
   @McpTool('Analyze objects visually: one labelled 4-view mosaic (scene context far/near with the target highlighted through occluders + two isolated 3/4 views) with bounding-box dimensions in meters. The two CONTEXT tiles look from the AGENT camera direction, so they show the part in the surroundings the agent is working from; the isolated 3/4 views keep their fixed angles. Use to understand SHAPE, ORIENTATION, SIZE and SURROUNDINGS of specific parts; for single shots use web_eye. Needs the WebGL renderer.', { readOnly: true })
   async webScreenshotAnalyze(
-    @McpParam('paths', 'One or more node paths, comma- or newline-separated.', 'string', true) paths: string,
+    @McpParam('paths', 'One or more node paths, comma-separated (or newline-separated), or a JSON array of strings for names containing commas.', 'string', true) paths: string,
     @McpParam('includeChildren', 'Include the full subtree (default true). false = only the node and its direct child meshes.', 'boolean', false) includeChildren: boolean,
     @McpParam('tileSize', 'Tile parameter in px (128..512, default 256). Tiles render at 2×tileSize; the mosaic is 4×tileSize wide.', 'number', false) tileSize: number,
   ): Promise<string> {
     const v = this.viewer;
     if (!v?.renderer || !v.scene) return JSON.stringify({ error: 'Renderer not ready' });
-    if (v.isWebGPU) {
-      return JSON.stringify({ error: 'web_screenshot_analyze requires the classic WebGL renderer — use web_screenshot instead.' });
-    }
 
     const requested = parsePathsParam(paths);
     if (requested.length === 0) return JSON.stringify({ error: 'No node paths given' });
@@ -1813,7 +2332,7 @@ export class McpBridgePlugin extends RVBehavior {
       : undefined;
 
     this._objectAnalyzer ??= new ObjectAnalyzer(v);
-    const result = this._objectAnalyzer.analyze(resolved.map(r => r.node), {
+    const result = await this._objectAnalyzer.analyze(resolved.map(r => r.node), {
       includeChildren: includeChildren !== false,
       tileSize: clampTileSize(tileSize),
       pathsLabel: resolved.map(r => r.path).join(', '),
@@ -1843,18 +2362,57 @@ export class McpBridgePlugin extends RVBehavior {
   }
 
 
-  @McpTool('Get recent browser console logs (errors, warnings, debug). Check after any unexpected tool failure or visual glitch.', { readOnly: true })
+  @McpTool('Get recent browser console logs: newest 100 at level info+ by default (debug only via level). category = comma list, filtered BEFORE the limit; since = seconds back. Check after any tool failure or visual glitch.', { readOnly: true })
   async webLogs(
     @McpParam('level', 'Minimum log level: trace|debug|info|warn|error', 'string', false) level: string,
     @McpParam('limit', 'Max number of entries to return', 'integer', false) limit: number,
+    @McpParam('category', 'Comma list, e.g. "signal,drive".', 'string', false) category?: string,
+    @McpParam('since', 'Seconds back.', 'number', false) since?: number,
   ): Promise<string> {
-    if (level || limit) {
-      return JSON.stringify(queryLogs({
-        level: (level as LogLevel) || undefined,
-        limit: limit || 100,
-      }));
+    // plan-2005 F7: validate instead of silently matching nothing (or everything).
+    const lvl = (level ?? '').toString().trim().toLowerCase() || 'info';
+    if (!(LOG_LEVELS as readonly string[]).includes(lvl)) {
+      return JSON.stringify({ error: `invalid level '${level}'. Allowed: ${LOG_LEVELS.join(', ')}` });
     }
-    return JSON.stringify(getLastLogs(100));
+    const diagnosticCategories = ['console', 'window', 'react', 'chunk'] as const;
+    const allowedCategories = [...LOG_CATEGORIES, ...diagnosticCategories];
+    let categories: string[] | undefined;
+    if (category !== undefined && category !== null && String(category).trim() !== '') {
+      const parts = String(category).split(',').map((c) => c.trim().toLowerCase()).filter(Boolean);
+      const bad = parts.filter((c) => !allowedCategories.includes(c as typeof allowedCategories[number]));
+      if (bad.length > 0) {
+        return JSON.stringify({ error: `unknown category '${bad.join("', '")}'. Allowed: ${allowedCategories.join(', ')}` });
+      }
+      categories = parts;
+    }
+    if (since !== undefined && since !== null && !(Number.isFinite(Number(since)) && Number(since) >= 0)) {
+      return JSON.stringify({ error: `invalid since '${since}' — seconds back, a number >= 0` });
+    }
+    const max = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Math.floor(Number(limit)) : 100;
+    const sinceTimestamp = since !== undefined && since !== null ? Date.now() - Number(since) * 1000 : undefined;
+    const debugCategories = categories?.filter(c => (LOG_CATEGORIES as readonly string[]).includes(c)) as (DebugCategory | 'system')[] | undefined;
+    const includeDebug = categories === undefined || debugCategories!.length > 0;
+    const debugEntries = includeDebug ? queryLogs({
+      level: lvl as LogLevel,
+      category: debugCategories,
+      since: sinceTimestamp,
+    }) : [];
+    const minLevel = LOG_LEVELS.indexOf(lvl as LogLevel);
+    const diagnosticEntries = getDiagnosticsEntries().filter(e =>
+      (diagnosticCategories as readonly string[]).includes(e.cat) &&
+      LOG_LEVELS.indexOf(e.lvl) >= minLevel &&
+      (categories === undefined || categories.includes(e.cat)) &&
+      (sinceTimestamp === undefined || Date.parse(e.t) >= sinceTimestamp)
+    ).map(e => ({
+      level: e.lvl,
+      category: e.cat,
+      message: e.msg,
+      timestamp: Date.parse(e.t),
+      elapsed: 0,
+      ...(e.stack ? { stack: e.stack } : {}),
+    }));
+    return JSON.stringify([...debugEntries, ...diagnosticEntries]
+      .sort((a, b) => a.timestamp - b.timestamp).slice(-max));
   }
 }
 

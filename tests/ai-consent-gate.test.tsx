@@ -14,6 +14,7 @@
 import { type ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { budgeted } from './helpers/wait-budget';
 import { ThemeProvider } from '@mui/material/styles';
 import { ActivityBar } from '../src/core/hmi/ActivityBar';
 import { AiBridgeGate } from '../src/core/hmi/AiBridgeGate';
@@ -124,9 +125,9 @@ function renderWithViewer(node: ReactNode, viewer: ReturnType<typeof createViewe
   );
 }
 
-// The accessible name carries the bridge state ("AI Bridge — off" /
-// "— connecting…" / "— connected (N tools)"), so match on the stem.
-const AI_BUTTON_NAME = /^AI Bridge/;
+// The accessible name carries the AI-control state ("AI control — off" /
+// "— connecting…" / "— on (N tools)", plan-668), so match on the stem.
+const AI_BUTTON_NAME = /^AI control/;
 const aiButton = () => screen.getByRole('button', { name: AI_BUTTON_NAME });
 
 beforeEach(() => {
@@ -180,15 +181,26 @@ describe('AI Bridge entry — activity bar', () => {
     stubGateway(true);
     renderWithViewer(<ActivityBar />, createViewer({ connected: true, enabled: true, toolCount: 42 }));
 
-    const btn = screen.getByRole('button', { name: 'AI Bridge — connected (42 tools)' });
+    const btn = screen.getByRole('button', { name: 'AI control — on (42 tools)' });
     expect(btn.className).toContain('colorPrimary');
+  });
+
+  // plan-668: a connected CONNECT channel with AI control off is no AI — no accent.
+  it('stays neutral while the channel is connected but AI control is off', () => {
+    stubGateway(true);
+    renderWithViewer(<ActivityBar />, createViewer({
+      connected: true, enabled: false, aiEnabled: false, channelReason: 'connect-origin',
+    }));
+
+    const btn = screen.getByRole('button', { name: 'AI control — off' });
+    expect(btn.className).not.toContain('colorPrimary');
   });
 
   it('stays neutral and says so while no bridge is connected', () => {
     stubGateway(true);
     renderWithViewer(<ActivityBar />, createViewer({ connected: false, enabled: true }));
 
-    const btn = screen.getByRole('button', { name: 'AI Bridge — connecting…' });
+    const btn = screen.getByRole('button', { name: 'AI control — connecting…' });
     expect(btn.className).not.toContain('colorPrimary');
   });
 
@@ -312,8 +324,11 @@ describe('AI Bridge entry — Settings tab (the only mobile route)', () => {
     fireEvent.click(tab);
 
     // Direct route into the tab — the gate must hold here, not in a button.
-    expect(await screen.findByTestId('ai-consent-dialog')).toBeInTheDocument();
+    // Budgeted findBy: the UI transition has no test-controlled completion signal.
+    expect(await screen.findByTestId('ai-consent-dialog', undefined, budgeted())).toBeInTheDocument();
     expect(screen.queryByTestId('mcp-tab')).not.toBeInTheDocument();
+    // plan-668: the CONNECT channel row is NOT behind the gate.
+    expect(await screen.findByTestId('connect-channel-row')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Got it' }));
     expect(await screen.findByTestId('mcp-tab')).toBeInTheDocument();

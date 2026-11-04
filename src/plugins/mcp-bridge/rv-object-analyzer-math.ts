@@ -10,6 +10,8 @@
  * small parsing/formatting helpers.
  */
 
+import { parsePathList, type PathListInput } from '../../core/hmi/rv-path-list';
+
 /** Minimal vector shape — matches THREE.Vector3 structurally. */
 export interface Vec3Like {
   x: number;
@@ -78,17 +80,15 @@ export const VIEW_DEFS: readonly ViewDef[] = [
   { name: 'back-bottom', label: 'isolated back-bottom', kind: 'isolated', framing: 'tight', dir: ISO_BACK, up: [0, 1, 0] },
 ];
 
-/** Split the `paths` tool parameter into clean individual node paths. */
-export function parsePathsParam(raw: string): string[] {
-  if (typeof raw !== 'string') return [];
-  // Newline-separated input treats commas as literal name characters — CAD
-  // part names like "ISO 15 ABB - 6020 - Full,SI,NC,Full" are real. The
-  // comma/semicolon convenience separators only apply to single-line input.
-  const splitter = /[\r\n]/.test(raw) ? /[;\r\n]+/ : /[,;\r\n]+/;
-  return raw
-    .split(splitter)
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0);
+/**
+ * Split the `paths` tool parameter into clean individual node paths — the one
+ * shared rule of `rv-path-list.ts`: a JSON array string keeps commas inside
+ * names (`["Asset/LINK,PLATE"]`; invalid JSON throws), else newline input
+ * treats commas as literal name characters and single-line input also splits
+ * on `,` / `;`.
+ */
+export function parsePathsParam(raw: PathListInput): string[] {
+  return parsePathList(raw);
 }
 
 /** Clamp/normalize the tileSize tool parameter (default 256, 128..512). */

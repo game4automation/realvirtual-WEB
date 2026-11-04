@@ -21,13 +21,13 @@ import {
   registerSelectionAssetResolver,
   resolveSelectionToAsset,
   _clearSelectionAssetResolvers,
-} from '@rv-private/plugins/asset-editor/selection-asset-resolver';
+} from '@rv-private/plugins/asset-editor/shared/selection-asset-resolver';
 import { libraryDocumentBase, projectDocumentBase } from '../src/core/editor/active-asset-store';
 import {
   peekPendingAssetOpen,
   setPendingAssetOpen,
   takePendingAssetOpen,
-} from '@rv-private/plugins/asset-editor/pending-open-store';
+} from '@rv-private/plugins/asset-editor/shared/pending-open-store';
 
 const BELT: AssetBase = projectDocumentBase('library/Custom/Belt.glb', 'Belt');
 

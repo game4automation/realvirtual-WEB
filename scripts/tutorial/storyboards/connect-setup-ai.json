@@ -1,0 +1,237 @@
+{
+  "$schema": "rv-tutorial/1",
+  "id": "connect-setup-ai",
+  "title": "realvirtual WEB - Set up CONNECT (part 3: switch AI control on and ask the AI about the demo scene)",
+  "url": "/?doc=doc_demorealvirtualweb_7l7hfw&mode=hmi",
+  "connect": "live",
+  "viewport": {
+    "width": 1920,
+    "height": 1080
+  },
+  "welcome": "dismiss",
+  "ready": "#rv-viewport",
+  "minStepSec": 2,
+  "setup": [
+    {
+      "type": "waitFor",
+      "scene": true,
+      "doc": "rvproject:DemoRealvirtualWeb.glb",
+      "timeoutMs": 120000
+    },
+    {
+      "type": "waitFor",
+      "selector": "button[aria-label=\"realvirtual CONNECT\"]",
+      "timeoutMs": 30000
+    },
+    {
+      "type": "click",
+      "target": {
+        "selector": "button[aria-label=\"realvirtual CONNECT\"]"
+      }
+    },
+    {
+      "type": "waitFor",
+      "selector": "button:has-text(\"Connect...\")",
+      "timeoutMs": 30000
+    },
+    {
+      "type": "click",
+      "target": {
+        "selector": "button:has-text(\"Connect...\")"
+      }
+    },
+    {
+      "type": "waitFor",
+      "selector": "button:text-is(\"Connect\")",
+      "timeoutMs": 30000
+    },
+    {
+      "type": "click",
+      "target": {
+        "selector": "button:text-is(\"Connect\")"
+      }
+    },
+    {
+      "type": "waitFor",
+      "selector": "[aria-label=\"License active\"]",
+      "timeoutMs": 30000
+    },
+    {
+      "type": "press",
+      "key": "Escape"
+    }
+  ],
+  "steps": [
+    {
+      "id": "overview",
+      "holdSec": 1,
+      "actions": [
+        {
+          "type": "camera",
+          "position": [
+            3.9,
+            3.6,
+            3.4
+          ],
+          "target": [
+            0.62,
+            1.1,
+            0.4
+          ],
+          "durationSec": 2
+        },
+        {
+          "type": "camera",
+          "position": [
+            7.13,
+            5.89,
+            6.64
+          ],
+          "target": [
+            0.62,
+            1.23,
+            0.13
+          ],
+          "durationSec": 2
+        }
+      ]
+    },
+    {
+      "id": "enable-ai-control",
+      "holdSec": 2,
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "selector": "button[aria-label^=\"AI control\"]"
+          }
+        },
+        {
+          "type": "waitFor",
+          "selector": "[data-rv-ai=\"panel\"]",
+          "timeoutMs": 10000
+        },
+        {
+          "type": "click",
+          "target": {
+            "selector": "[data-rv-ai=\"settings\"]"
+          }
+        },
+        {
+          "type": "waitFor",
+          "selector": "[data-testid=\"ai-consent-dialog\"]",
+          "timeoutMs": 10000
+        },
+        {
+          "type": "click",
+          "target": {
+            "selector": "[data-testid=\"ai-consent-dialog\"] button:has-text(\"Got it\")"
+          }
+        },
+        {
+          "type": "waitFor",
+          "selector": "[data-testid=\"ai-consent-dialog\"]",
+          "state": "hidden",
+          "timeoutMs": 10000
+        }
+      ]
+    },
+    {
+      "id": "switch-ai-control-on",
+      "holdSec": 2,
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "selector": "[data-testid=\"ai-control-switch\"]"
+          }
+        },
+        {
+          "type": "waitFor",
+          "selector": "[data-testid=\"ai-control-switch\"] input:checked",
+          "timeoutMs": 10000
+        }
+      ]
+    },
+    {
+      "id": "open-ai-prompt",
+      "holdSec": 2,
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "selector": "button[aria-label=\"Settings\"]"
+          }
+        },
+        {
+          "type": "waitFor",
+          "selector": "[data-rv-ai=\"panel\"]",
+          "timeoutMs": 10000
+        }
+      ]
+    },
+    {
+      "id": "ask-question",
+      "holdSec": 2,
+      "actions": [
+        {
+          "type": "type",
+          "target": {
+            "selector": "[data-rv-ai=\"input\"]"
+          },
+          "text": "What do you see in the demo scene?",
+          "delayMs": 60
+        }
+      ]
+    },
+    {
+      "id": "send-question",
+      "holdSec": 2,
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "selector": "[data-rv-ai=\"send\"]"
+          }
+        },
+        {
+          "type": "waitFor",
+          "selector": "[data-rv-ai-state=\"running\"]",
+          "timeoutMs": 10000
+        }
+      ]
+    },
+    {
+      "id": "show-answer",
+      "holdSec": 4,
+      "actions": [
+        {
+          "type": "waitFor",
+          "selector": "[data-rv-ai-state=\"idle\"]",
+          "timeoutMs": 600000
+        }
+      ]
+    },
+    {
+      "id": "closing-flight",
+      "holdSec": 2,
+      "tailSec": 0.4,
+      "actions": [
+        {
+          "type": "camera",
+          "position": [
+            5.5,
+            4.6,
+            5.2
+          ],
+          "target": [
+            0.62,
+            1.15,
+            0.3
+          ],
+          "durationSec": 3
+        }
+      ]
+    }
+  ]
+}

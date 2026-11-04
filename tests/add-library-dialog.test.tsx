@@ -34,7 +34,7 @@ vi.mock('../src/core/library/library-store-singleton', () => ({
   }),
 }));
 
-import { AddLibraryDialog } from '../src/core/library/AddLibraryDialog';
+import { AddLibraryDialog, type AddLibraryProjectsOptions } from '../src/core/library/AddLibraryDialog';
 
 beforeEach(() => {
   h.addCatalog.mockReset();
@@ -218,5 +218,152 @@ describe('Asset Manager', () => {
     expect(connect.disabled).toBe(true);
     fireEvent.change(screen.getByLabelText(/Project ID/), { target: { value: 'proj' } });
     expect(connect.disabled).toBe(true);
+  });
+});
+
+// ─── plan-778 9.8 — the Projects tab: another project as a library, by id ───
+
+describe('plan-778 — Projects tab', () => {
+  const CANDIDATES = [
+    { id: 'prj_realvirtual_library', name: 'realvirtual Library', location: 'bundled' as const },
+    { id: 'prj_a', name: 'Open Project', location: 'folder' as const, hint: 'A' },
+    { id: 'prj_shared', name: 'SharedConveyors', location: 'folder' as const, hint: 'SharedConveyors' },
+    { id: 'prj_cx', name: 'CustomerX Machines', location: 'browser' as const },
+  ];
+  function opts(over: Partial<AddLibraryProjectsOptions> = {}): AddLibraryProjectsOptions {
+    return {
+      openProjectId: 'prj_a',
+      attachedIds: ['prj_realvirtual_library'],
+      attach: vi.fn(async () => null),
+      listCandidates: async () => CANDIDATES,
+      directoryPicker: null,
+      ...over,
+    };
+  }
+
+  it('is absent without a project target, and the first (default) tab with one', () => {
+    const { unmount } = render(<AddLibraryDialog open onClose={() => {}} />);
+    expect(screen.queryByRole('tab', { name: /projects/i })).toBeNull();
+    unmount();
+    render(<AddLibraryDialog open onClose={() => {}} projects={opts()} />);
+    const tabs = screen.getAllByRole('tab');
+    expect(tabs[0].textContent).toMatch(/projects/i);
+    expect(tabs[0].getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('lists the known projects, excludes the open one, greys the attached ones', async () => {
+    render(<AddLibraryDialog open onClose={() => {}} projects={opts()} />);
+    await waitFor(() => expect(document.querySelector('[data-project-id="prj_shared"]')).toBeTruthy());
+    const ids = [...document.querySelectorAll('[data-project-id]')].map((n) => n.getAttribute('data-project-id'));
+    expect(ids).toEqual(['prj_realvirtual_library', 'prj_shared', 'prj_cx']);
+    const attached = document.querySelector('[data-project-id="prj_realvirtual_library"]')!;
+    expect(attached.getAttribute('aria-disabled')).toBe('true');
+    expect(attached.textContent).toContain('(attached)');
+    // Clicking an attached row selects nothing — Add stays disabled.
+    fireEvent.click(attached);
+    expect((screen.getByRole('button', { name: 'Add' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('Add attaches the picked project by id, with its name as label and its folder as hint', async () => {
+    const attach = vi.fn(async () => null);
+    const onAdded = vi.fn();
+    render(<AddLibraryDialog open onClose={() => {}} onAdded={onAdded} projects={opts({ attach })} />);
+    await waitFor(() => expect(document.querySelector('[data-project-id="prj_shared"]')).toBeTruthy());
+    fireEvent.click(document.querySelector('[data-project-id="prj_shared"]')!);
+    fireEvent.click(screen.getByRole('button', { name: 'Add' }));
+    await waitFor(() => expect(attach).toHaveBeenCalledWith({ projectId: 'prj_shared', label: 'SharedConveyors', hint: 'SharedConveyors' }));
+    await waitFor(() => expect(onAdded).toHaveBeenCalledWith('prj_shared'));
+    expect(h.addCatalog).not.toHaveBeenCalled();
+  });
+
+  it('From URL… reads the hosted project.json and attaches by its id with the URL as hint', async () => {
+    const attach = vi.fn(async () => null);
+    const readUrl = vi.fn(async (url: string) => ({ ok: true as const, id: 'prj_hosted', name: 'Hosted Lib', hint: url }));
+    render(<AddLibraryDialog open onClose={() => {}} projects={opts({ attach, readUrl })} />);
+    fireEvent.click(screen.getByRole('button', { name: /from url/i }));
+    fireEvent.change(screen.getByLabelText('Project URL'), { target: { value: ' https://cdn/libs/hosted/project.json ' } });
+    fireEvent.click(screen.getByRole('button', { name: /add from url/i }));
+    await waitFor(() => expect(readUrl).toHaveBeenCalledWith('https://cdn/libs/hosted/project.json'));
+    await waitFor(() => expect(attach).toHaveBeenCalledWith({
+      projectId: 'prj_hosted', label: 'Hosted Lib', hint: 'https://cdn/libs/hosted/project.json',
+    }));
+  });
+
+  it('From URL… of the open project itself is refused', async () => {
+    const attach = vi.fn(async () => null);
+    const readUrl = vi.fn(async (url: string) => ({ ok: true as const, id: 'prj_a', name: 'Open Project', hint: url }));
+    render(<AddLibraryDialog open onClose={() => {}} projects={opts({ attach, readUrl })} />);
+    fireEvent.click(screen.getByRole('button', { name: /from url/i }));
+    fireEvent.change(screen.getByLabelText('Project URL'), { target: { value: 'https://cdn/a/project.json' } });
+    fireEvent.click(screen.getByRole('button', { name: /add from url/i }));
+    await waitFor(() => expect(screen.getByText(/cannot be a library of itself/)).toBeTruthy());
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it('Link folder… is hidden without showDirectoryPicker, and opens the picker inside the click with it', async () => {
+    const { unmount } = render(<AddLibraryDialog open onClose={() => {}} projects={opts({ directoryPicker: null })} />);
+    expect(screen.queryByRole('button', { name: /link folder/i })).toBeNull();
+    unmount();
+
+    const attach = vi.fn(async () => null);
+    let picks = 0;
+    const dir = { name: 'SharedConveyors' } as unknown as FileSystemDirectoryHandle;
+    const linkFolder = vi.fn(async () => ({ ok: true as const, id: 'prj_shared', name: 'SharedConveyors', hint: 'SharedConveyors' }));
+    render(<AddLibraryDialog open onClose={() => {}} projects={opts({
+      attach, linkFolder, directoryPicker: () => { picks++; return Promise.resolve(dir); },
+    })} />);
+    fireEvent.click(screen.getByRole('button', { name: /link folder/i }));
+    expect(picks).toBe(1);   // synchronous — inside the click's user activation
+    await waitFor(() => expect(linkFolder).toHaveBeenCalledWith(dir));
+    await waitFor(() => expect(attach).toHaveBeenCalledWith({ projectId: 'prj_shared', label: 'SharedConveyors', hint: 'SharedConveyors' }));
+  });
+});
+
+describe('plan-778 review U3 / U7', () => {
+  it('U7: a fresh listCandidates function per render does not re-list (no render loop)', async () => {
+    let calls = 0;
+    const make = (): AddLibraryProjectsOptions => ({
+      openProjectId: 'prj_a',
+      attachedIds: [],
+      attach: async () => null,
+      listCandidates: async () => { calls++; return []; },
+      directoryPicker: null,
+    });
+    const { rerender } = render(<AddLibraryDialog open onClose={() => {}} projects={make()} />);
+    await waitFor(() => expect(calls).toBe(1));
+    for (let i = 0; i < 3; i++) rerender(<AddLibraryDialog open onClose={() => {}} projects={make()} />);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(calls).toBe(1);
+  });
+
+  it('U3: Link folder of the OPEN project is refused before anything is stored; another folder links through Locate\'s sequence (invalidate)', async () => {
+    const { linkLibraryFolder } = await import('../src/core/library/library-project-candidates');
+    const { setLibraryAvailabilityDepsForTests, resetLibraryAvailabilityForTests } = await import('../src/core/library/library-availability');
+    const { FakeDir, asDirHandle } = await import('./helpers/fake-fs-handles');
+    const folder = (id: string): FileSystemDirectoryHandle => {
+      const d = new FakeDir(id);
+      d.seedText('project.json', JSON.stringify({ schemaVersion: 2, id, name: id, canonicalName: id, documents: [] }));
+      return asDirHandle(d);
+    };
+    const stored: string[] = [];
+    const invalidated: string[] = [];
+    setLibraryAvailabilityDepsForTests({
+      putHandle: async (_dir, key) => { stored.push(key); },
+      recordLinkedProject: () => {},
+      loader: () => ({ getNode: () => null, invalidate: (id: string) => { invalidated.push(id); } }) as never,
+    });
+    try {
+      const self = await linkLibraryFolder(folder('prj_a'), 'prj_a');
+      expect(self.ok).toBe(false);
+      if (!self.ok) expect(self.reason).toMatch(/cannot be a library of itself/);
+      expect(stored).toEqual([]);
+
+      const other = await linkLibraryFolder(folder('prj_b'), 'prj_a');
+      expect(other.ok).toBe(true);
+      expect(stored).toEqual(['projectfolder:prj_b']);
+      expect(invalidated).toEqual(['prj_b']);
+    } finally {
+      resetLibraryAvailabilityForTests();
+    }
   });
 });

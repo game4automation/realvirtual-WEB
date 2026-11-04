@@ -8,6 +8,7 @@ import { registerComponentSchema, loadSchemaFromSpec } from './rv-component-regi
 import { NodeRegistry } from './rv-node-registry';
 import { createSignalWriter, type SignalWriter } from './rv-signal-store';
 import { debug } from './rv-debug';
+import { slotDeclare, slotUndeclare, slotWrite } from './rv-slot-io';
 
 /** One position range that contributes to the output (parity with C# PositionArea). */
 interface PositionArea {
@@ -35,6 +36,9 @@ interface PositionArea {
  * drives (JumpToLowerLimitOnUpperLimit). The web RVDrive does not model wrapping,
  * so no normalization is applied; wrapped AREAS (StartPosition > EndPosition) are
  * still supported via an OR range check.
+ *
+ * An unwired OutputSignal is bound directly through SlotIO (rv-slot-io.ts); the
+ * value is published after every drive update.
  */
 export class RVDrivePositionSwitch implements IDriveBehavior, RVComponent {
   // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
@@ -51,19 +55,9 @@ export class RVDrivePositionSwitch implements IDriveBehavior, RVComponent {
   private signalWriter: SignalWriter | null = null;
   private areas: PositionArea[] = [];
   private feedbackCb: ((drive: RVDrive) => void) | null = null;
-  private readonly feedbackListeners: (() => void)[] = [];
 
   constructor(node: Object3D) {
     this.node = node;
-  }
-
-  addFeedbackListener(cb: () => void): void {
-    if (!this.feedbackListeners.includes(cb)) this.feedbackListeners.push(cb);
-  }
-
-  removeFeedbackListener(cb: () => void): void {
-    const index = this.feedbackListeners.indexOf(cb);
-    if (index >= 0) this.feedbackListeners.splice(index, 1);
   }
 
   evaluateOutput(drivePosition: number): boolean {
@@ -79,11 +73,6 @@ export class RVDrivePositionSwitch implements IDriveBehavior, RVComponent {
       }
     }
     return this.InvertAreas ? !inAnyArea : inAnyArea;
-  }
-
-  readFeedbackSlot(slot: string): boolean | number {
-    if (slot !== 'OutputSignal') throw new Error(`[Drive_PositionSwitch] Unknown feedback slot "${slot}"`);
-    return this.evaluateOutput(this.drive?.currentPosition ?? 0);
   }
 
   init(context: ComponentContext): void {
@@ -117,9 +106,8 @@ export class RVDrivePositionSwitch implements IDriveBehavior, RVComponent {
 
     // Register self as a drive behavior so drive.update() calls our update().
     drive.driveBehaviors.push(this);
-    this.feedbackCb = () => {
-      for (let i = 0; i < this.feedbackListeners.length; i++) this.feedbackListeners[i]();
-    };
+    slotDeclare(this, 'OutputSignal', 'feedback', { initial: this.evaluateOutput(drive.currentPosition) });
+    this.feedbackCb = (d) => slotWrite(this, 'OutputSignal', null, this.evaluateOutput(d.currentPosition), null);
     drive.addAfterUpdate(this.feedbackCb);
 
     debug('loader',
@@ -138,6 +126,7 @@ export class RVDrivePositionSwitch implements IDriveBehavior, RVComponent {
   }
 
   dispose(): void {
+    slotUndeclare(this);
     if (this.drive) {
       const index = this.drive.driveBehaviors.indexOf(this);
       if (index >= 0) this.drive.driveBehaviors.splice(index, 1);
@@ -146,7 +135,6 @@ export class RVDrivePositionSwitch implements IDriveBehavior, RVComponent {
     this.feedbackCb = null;
     this.drive = null;
     this.signalWriter = null;
-    this.feedbackListeners.length = 0;
   }
 }
 

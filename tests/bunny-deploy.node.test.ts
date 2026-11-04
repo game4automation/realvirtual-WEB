@@ -18,7 +18,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   cpSync, mkdtempSync, writeFileSync, mkdirSync, existsSync, readFileSync, rmSync, readdirSync,
 } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import {
@@ -48,11 +48,11 @@ import {
 // @ts-expect-error — plain JS Node module, no type declarations by design.
 import { generateFragmentSecret, isEncryptedEnvelope, decryptGlb } from '../scripts/lib/rv-crypto.mjs';
 import { assertManifestResolves } from './helpers/assert-manifest-resolves';
-import { uploadDirectory, stageAndBuild } from '../scripts/bunny-deploy.mjs';
+import { uploadDirectory, stageAndBuild, generateDemoFeatures, createTimings, assertDevFastAllowed } from '../scripts/bunny-deploy.mjs';
 // @ts-expect-error — plan-487 helpers are not part of the declared module surface.
 import { deployPublic, fastBuildForPublicTarget, runWithConcurrency, publishLockName, reportThirdPartyNotices } from '../scripts/bunny-deploy.mjs';
 import { DEPLOY_PHASES, DEPLOY_PHASE_FILENAME, deployPhaseFilePath, reportDeployPhase } from '../scripts/bunny-deploy.mjs';
-import { stageFilteredSourceTree, runBuild } from '../scripts/_workspace-lib.mjs';
+import { stageFilteredSourceTree, runBuild, CORE_GENERATED_FILES } from '../scripts/_workspace-lib.mjs';
 // @ts-expect-error — plain JS Node module, no type declarations by design (plan-488).
 import { acquirePublishLock } from '../scripts/rv-publish-lock.mjs';
 import { randomBytes } from 'node:crypto';
@@ -258,7 +258,7 @@ describe('applyPublicModelAllowlist', () => {
     for (const f of ['Europallet.glb', 'EuropalletLoaded.glb', 'ChainConveyor-1m.glb']) {
       writeFileSync(join(dist, 'models', 'library', 'PalletHandling', f), 'GLB');
     }
-    writeFileSync(join(dist, 'models', 'library', 'catalog.json'), '{"entries":[]}');
+    writeFileSync(join(dist, 'models', 'library', 'project.json'), '{"id":"prj_realvirtual_library","documents":[]}');
     // hashed assets/ duplicates (Vite content hash; note a hash may contain '-')
     for (const f of [
       'DemoRealvirtualWeb-D17zvQbu.glb', 'DemoRobotIK-DVCOxFk2.glb',
@@ -287,7 +287,7 @@ describe('applyPublicModelAllowlist', () => {
     // planner library fully intact
     expect(existsSync(join(dist, 'models', 'library', 'PalletHandling', 'Europallet.glb'))).toBe(true);
     expect(existsSync(join(dist, 'models', 'library', 'PalletHandling', 'EuropalletLoaded.glb'))).toBe(true);
-    expect(existsSync(join(dist, 'models', 'library', 'catalog.json'))).toBe(true);
+    expect(existsSync(join(dist, 'models', 'library', 'project.json'))).toBe(true);
 
     // hashed duplicates of dropped models removed; demo + library + non-glb kept
     expect(existsSync(join(dist, 'assets', 'DemoRobotIK-DVCOxFk2.glb'))).toBe(false);
@@ -1098,7 +1098,7 @@ describe('public demo guards on the demo folder (plan-737)', () => {
       name: 'DemoRealvirtual',
       kind: 'demo',
       settings: { defaultModel: 'DemoRealvirtualWeb.glb' },
-      libraries: [{ url: 'library/catalog.json' }],
+      libraries: [{ projectId: 'prj_realvirtual_library', label: 'realvirtual Library', hint: 'library/project.json' }],
       documents: [
         { id: 'doc_a', name: 'Demo', path: 'DemoRealvirtualWeb.glb', settingsPath: 'DemoRealvirtualWeb.settings.json' },
         { id: 'doc_b', name: 'Planner', path: 'DemoPlanner.glb' },
@@ -1136,6 +1136,22 @@ describe('public demo guards on the demo folder (plan-737)', () => {
     const shipped = JSON.parse(readFileSync(join(dist, 'demo-realvirtual', 'project.json'), 'utf8'));
     expect(shipped.documents.map((d: { path: string }) => d.path))
       .toEqual(['DemoRealvirtualWeb.glb', 'DemoPlanner.glb']);
+  });
+
+  it('prunes the devOnly row\'s saved thumbnail and keeps the shipped ones (plan-776)', () => {
+    const dist = makeFolderDist();
+    const demo = join(dist, 'demo-realvirtual');
+    const manifest = JSON.parse(readFileSync(join(demo, 'project.json'), 'utf8'));
+    mkdirSync(join(demo, '.thumbnails'), { recursive: true });
+    for (const d of manifest.documents) {
+      d.thumbnail = `.thumbnails/${d.id}.0123abcd.webp`;
+      writeFileSync(join(demo, d.thumbnail), 'WEBP');
+    }
+    writeFileSync(join(demo, 'project.json'), JSON.stringify(manifest, null, 2));
+    applyPublicScenePruning(dist, { prefix: PUBLIC_TEST_SCENE_PREFIX });
+    expect(existsSync(join(demo, '.thumbnails', 'doc_c.0123abcd.webp'))).toBe(false);
+    expect(existsSync(join(demo, '.thumbnails', 'doc_a.0123abcd.webp'))).toBe(true);
+    expect(existsSync(join(demo, '.thumbnails', 'doc_b.0123abcd.webp'))).toBe(true);
   });
 
   it('resolves manifest misses against the demo folder, and exempts the library', () => {
@@ -1501,16 +1517,30 @@ describe('BunnyClient retry for delete and listing (plan-487 9.4, 9.5)', () => {
 
 describe('same-size change outside ALWAYS_UPLOAD_FILES is skipped — known gap R6 (plan-487 9.6)', () => {
   it('a same-size catalog.json ships since plan-508 (it carries the asset hashes), like project.json', () => {
+    // plan-778 Phase 4: an external catalog (the bundled library catalog.json is gone) and
+    // the library project manifest, which carries the same hashes as a project.json.
     const local = [
-      { rel: 'library/catalog.json', size: 120, abs: '' },
+      { rel: 'catalogs/partner/catalog.json', size: 120, abs: '' },
+      { rel: 'library/project.json', size: 90, abs: '' },
       { rel: 'project.json', size: 80, abs: '' },
       { rel: 'library/Belt.glb', size: 500, abs: '' },
     ];
-    const remote = new Map([['library/catalog.json', 120], ['project.json', 80], ['library/belt.glb', 500]]);
+    const remote = new Map([['catalogs/partner/catalog.json', 120], ['library/project.json', 90], ['project.json', 80], ['library/belt.glb', 500]]);
     const selected = selectFilesToUpload(local, remote, {});
     // The size-only diff (plan-487 R6) still skips a same-size binary that no catalog
     // hash flags — plan-508 closes that for catalogued files via `alwaysUploadRel`.
-    expect(selected.map((f) => f.rel)).toEqual(['library/catalog.json', 'project.json']);
+    expect(selected.map((f) => f.rel)).toEqual(['catalogs/partner/catalog.json', 'library/project.json', 'project.json']);
+  });
+
+  it('a same-size feature-chunks.json / features.json ships — chunk hashes change, the byte count does not (2026-10-23 /demo)', () => {
+    const local = [
+      { rel: 'feature-chunks.json', size: 4242, abs: '' },
+      { rel: 'features.json', size: 900, abs: '' },
+      { rel: 'assets/des.body-UPkK6sjH.js', size: 300, abs: '' },
+    ];
+    const remote = new Map([['feature-chunks.json', 4242], ['features.json', 900], ['assets/des.body-upkk6sjh.js', 300]]);
+    const selected = selectFilesToUpload(local, remote, {});
+    expect(selected.map((f) => f.rel)).toEqual(['feature-chunks.json', 'features.json']);
   });
 });
 
@@ -1724,6 +1754,20 @@ describe('stageAndBuild — hosted-link customer', () => {
     expect(options.profile).toMatchObject({ tier: 'commercial', restrictedFeatures: ['agents'] });
     expect(options.delivery).toMatchObject({ customer: 'kitchen', channel: 'hosted-link', projects: ['Kitchen'] });
     expect(options.workspaceFiles).toBe(false);
+  });
+
+  it('builds as the customer delivery tier so a private-only policy entry is not stale (notices)', () => {
+    const builds: Record<string, unknown>[] = [];
+    stageWithDeps({ mode: 'private', projectDir: join(work, 'private', 'projects', 'Kitchen'), dryRun: true }, {
+      resolveOwner: () => ({
+        customer: 'kitchen', kind: 'development',
+        delivery: { channel: 'hosted-link', tier: 'commercial', restrictedFeatures: [], projects: ['Kitchen'] },
+      }),
+      stage: () => ({ workspaceRoot: work, coreRoot: join(work, 'realvirtual-web'), manifest: { rules: [] } }),
+      build: (root: string, options: Record<string, unknown>) => { builds.push(options); return { coreRoot: root, distDir: join(root, 'dist'), dryRun: true }; },
+      assertProvenance: () => {},
+    });
+    expect(builds[0].noticesTier).toBe('commercial');
   });
 
   it('a git-workspace customer still resolves through its delivery config', () => {
@@ -2187,6 +2231,16 @@ describe('staged core scripts carry their relative imports (plan-508 hotfix)', (
       for (const specifier of relativeImports(file)) {
         followed++;
         const target = resolve(dirname(file), specifier);
+        // plan-778: a `scripts → src` edge lands in src/, which the staging copies
+        // WHOLESALE — but src/ is a stub in this fixture. Such a target must exist in the
+        // real src/ (the 'scripts → src edges' test pins it as self-contained).
+        const stagedSrc = join(staged.coreRoot, 'src');
+        if (target.startsWith(stagedSrc + sep)) {
+          if (!existsSync(join(REPO, 'src', target.slice(stagedSrc.length + 1)))) {
+            missing.push(`${file.slice(staged.coreRoot.length + 1)} -> ${specifier}`);
+          }
+          continue;
+        }
         if (!existsSync(target)) {
           missing.push(`${file.slice(staged.coreRoot.length + 1)} -> ${specifier}`);
         } else if (/\.m?js$/.test(target)) {
@@ -2204,17 +2258,120 @@ describe('staged core scripts carry their relative imports (plan-508 hotfix)', (
 });
 
 /**
+ * plan-637 Phase 6: the staged build packs the Isaac Sim extension download from
+ * `integrations/omniverse-kit` (scripts/_rv-livesync-extension.mjs). The staging must carry that
+ * folder — without its pytest suite and Python bytecode — or every staged deploy loses the download.
+ */
+describe('staged core carries the Isaac Sim extension (plan-637 Phase 6)', () => {
+  const REPO = resolve(__dirname, '..');
+  let work: string;
+  let stagedRoot: string | null = null;
+  beforeEach(() => { work = mkdtempSync(join(tmpdir(), 'rvstage-livesync-')); });
+  afterEach(() => {
+    rmSync(work, { recursive: true, force: true });
+    if (stagedRoot) rmSync(stagedRoot, { recursive: true, force: true });
+    stagedRoot = null;
+  });
+
+  it('stages integrations/omniverse-kit without tests/ and bytecode; the download resolves there', async () => {
+    const core = join(work, 'core');
+    const privateRoot = join(work, 'private');
+    mkdirSync(privateRoot, { recursive: true });
+    const write = (path: string, text: string) => {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, text);
+    };
+    write(join(core, 'src', 'main.ts'), 'export {};');
+    write(join(core, 'tsconfig.json'), JSON.stringify({ compilerOptions: { paths: {} } }));
+    write(join(core, 'recipes', 'kinematize-cad-import.md'), '# recipe fixture');
+    write(join(core, 'public', 'settings.json'), '{}');
+    cpSync(join(REPO, 'scripts'), join(core, 'scripts'), { recursive: true });
+    // The real integration, plus the debris a local pytest run leaves behind.
+    const kit = join(core, 'integrations', 'omniverse-kit');
+    cpSync(join(REPO, 'integrations', 'omniverse-kit'), kit, { recursive: true });
+    write(join(kit, 'exts', 'realvirtual.livesync', 'realvirtual', 'livesync', '__pycache__', 'server.cpython-310.pyc'), 'x');
+    write(join(kit, 'tests', '__pycache__', 'test_protocol.cpython-310.pyc'), 'x');
+
+    const staged = stageFilteredSourceTree({
+      coreRoot: core,
+      privateRoot,
+      profile: { tier: 'core', restrictedFeatures: [] },
+      includePublicDemoContent: true,
+    });
+    stagedRoot = staged.workspaceRoot;
+
+    const stagedKit = join(staged.coreRoot, 'integrations', 'omniverse-kit');
+    expect(existsSync(join(stagedKit, 'exts', 'realvirtual.livesync', 'config', 'extension.toml'))).toBe(true);
+    expect(existsSync(join(stagedKit, 'exts', 'realvirtual.livesync', 'realvirtual', 'livesync', 'server.py'))).toBe(true);
+    expect(existsSync(join(stagedKit, 'run_isaac_sim_with_realvirtual.bat'))).toBe(true);
+    expect(existsSync(join(stagedKit, 'run_isaac_sim_nvidia_only.bat'))).toBe(true);
+    expect(existsSync(join(stagedKit, 'README.md'))).toBe(true);
+    expect(existsSync(join(stagedKit, 'tests'))).toBe(false);
+    expect(existsSync(join(stagedKit, 'exts', 'realvirtual.livesync', 'realvirtual', 'livesync', '__pycache__'))).toBe(false);
+    // What the staged vite.config.ts will define: the same download as the source tree.
+    const { livesyncClientInfo, buildLivesyncZip } = await import('../scripts/_rv-livesync-extension.mjs');
+    expect(livesyncClientInfo(staged.coreRoot)).not.toBeNull();
+    expect(livesyncClientInfo(staged.coreRoot)).toEqual(livesyncClientInfo(REPO));
+    expect(buildLivesyncZip(stagedKit).entries).toEqual(buildLivesyncZip(join(REPO, 'integrations', 'omniverse-kit')).entries);
+  });
+});
+
+/**
  * plan-551 F17: `scripts/lib/rv-cinematic-frames.mjs` re-exports the shared cinematic manifest
  * module from `src/core/engine/rv-cinematic-manifest.mjs` — the first `scripts → src` edge.
  * The staging copies `src/` wholesale, so such an edge resolves in a staged workspace as long as
  * its target exists and stays self-contained (no imports of its own that would drag a script-only
  * or Node-only module into the browser bundle). The CLI that uses it (`rv-record-video.mjs`) is
  * not part of `CORE_SCRIPT_FILES`, i.e. not staged into customer workspaces at all.
+ *
+ * "Self-contained" is judged over the target's whole import CLOSURE (plan-769 Phase 1a, 2026-10-21):
+ * a target may import a sibling plain-JS core that is itself inside `src/` and self-contained by
+ * the same rule (`rv-reference-migration.mjs` -> `rv-node-path-rewrite.mjs`, so the reference
+ * baseline script and the viewer run ONE reference walker). Any bare specifier (`node:*`, a
+ * package), a `require(`, a non-`.mjs`/`.js` module or an edge leaving `src/` anywhere in the
+ * closure is still a problem — that is what would drag a Node- or script-only module along.
  */
 describe('scripts → src edges (plan-551 F17)', () => {
   const REPO = resolve(__dirname, '..');
   const SCRIPTS = join(REPO, 'scripts');
   const SPECIFIER = /\b(?:from|import)\s*\(?\s*['"](\.\.?\/[^'"]+)['"]/g;
+  const SRC = join(REPO, 'src');
+  /** Every specifier of a module (static, re-export, side-effect, dynamic) — relative or not. */
+  const ANY_SPECIFIER = /(?:\bfrom\s*|^\s*import\s*|\bimport\s*\(\s*)['"]([^'"]+)['"]/gm;
+  const stripComments = (code: string): string =>
+    code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+
+  /**
+   * Problems of one src module's import closure: every import must be a relative `.mjs`/`.js`
+   * module inside `src/` that is itself clean by this rule; nothing may `require(`.
+   */
+  function closureProblems(
+    file: string, read: (path: string) => string | null, seen = new Set<string>(),
+  ): string[] {
+    if (seen.has(file)) return [];
+    seen.add(file);
+    const rel = (p: string): string => p.slice(REPO.length + 1).replace(/\\/g, '/');
+    const raw = read(file);
+    if (raw === null) return [`${rel(file)}: missing`];
+    const code = stripComments(raw);
+    const problems: string[] = [];
+    if (/\brequire\(/.test(code)) problems.push(`${rel(file)}: uses require()`);
+    // Every `import` statement must be read by one of the patterns — a statement whose
+    // specifier escaped them is reported rather than silently passed.
+    const statements = (code.match(/^\s*import\b(?!\s*\()/gm) ?? []).length;
+    const readStatements = (code.match(/^\s*import\s*['"]|^\s*import\b[^;'"]*?\bfrom\s*['"]/gm) ?? []).length;
+    if (statements > readStatements) problems.push(`${rel(file)}: an import statement the check cannot read`);
+    for (const m of code.matchAll(ANY_SPECIFIER)) {
+      const spec = m[1];
+      if (!/^\.\.?\//.test(spec)) { problems.push(`${rel(file)}: imports the non-src module '${spec}'`); continue; }
+      const dep = resolve(dirname(file), spec);
+      if (!dep.startsWith(SRC)) { problems.push(`${rel(file)}: imports '${spec}' outside src/`); continue; }
+      if (!/\.m?js$/.test(dep)) { problems.push(`${rel(file)}: imports '${spec}', not a plain .mjs/.js core`); continue; }
+      problems.push(...closureProblems(dep, read, seen));
+    }
+    return problems;
+  }
+  const readSrc = (path: string): string | null => (existsSync(path) ? readFileSync(path, 'utf8') : null);
 
   function scriptFiles(dir: string, out: string[] = []): string[] {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -2241,12 +2398,38 @@ describe('scripts → src edges (plan-551 F17)', () => {
         const edge = `${file.slice(REPO.length + 1)} -> ${target.slice(REPO.length + 1)}`.replace(/\\/g, '/');
         edges.push(edge);
         if (!existsSync(target)) { problems.push(`${edge}: missing`); continue; }
-        const targetCode = readFileSync(target, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
-        if (/^\s*import\s|\brequire\(/m.test(targetCode)) problems.push(`${edge}: the target imports other modules`);
+        for (const p of closureProblems(target, readSrc)) problems.push(`${edge}: ${p}`);
       }
     }
     expect(problems).toEqual([]);
     expect(edges).toContain('scripts/lib/rv-cinematic-frames.mjs -> src/core/engine/rv-cinematic-manifest.mjs');
+    expect(edges).toContain('scripts/rv-reference-baseline.mjs -> src/core/engine/rv-reference-migration.mjs');
+  });
+
+  it('the closure check still rejects what would drag a Node- or script-only module along', () => {
+    const fake = (files: Record<string, string>) => (path: string): string | null =>
+      files[path.slice(SRC.length + 1).replace(/\\/g, '/')] ?? null;
+    const at = (p: string): string => join(SRC, p);
+    // A clean two-level closure passes, a multi-line import included.
+    expect(closureProblems(at('a.mjs'), fake({
+      'a.mjs': "import {\n  b,\n} from './b.mjs';\nexport const a = b;",
+      'b.mjs': 'export const b = 1;',
+    }))).toEqual([]);
+    // A Node built-in one level down is caught.
+    expect(closureProblems(at('a.mjs'), fake({
+      'a.mjs': "import { b } from './b.mjs';",
+      'b.mjs': "import { readFileSync } from 'node:fs';",
+    })).join('\n')).toMatch(/non-src module 'node:fs'/);
+    // A package, a require(), a TS module, an edge out of src/, side-effect / re-export / dynamic imports.
+    const caught = (code: string): string => closureProblems(at('a.mjs'), fake({ 'a.mjs': code, 't.ts': '' })).join('\n');
+    expect(caught("import * as THREE from 'three';")).toMatch(/non-src module 'three'/);
+    expect(caught("const fs = require('fs');")).toMatch(/require\(\)/);
+    expect(caught("import { t } from './t.ts';")).toMatch(/not a plain \.mjs\/\.js core/);
+    expect(caught("import { s } from '../scripts/x.mjs';")).toMatch(/outside src\//);
+    expect(caught("import 'node:process';")).toMatch(/non-src module 'node:process'/);
+    expect(caught("export * from 'node:path';")).toMatch(/non-src module 'node:path'/);
+    expect(caught("const m = await import('node:url');")).toMatch(/non-src module 'node:url'/);
+    expect(caught("import x from\n  `./b.mjs`;")).toMatch(/cannot read/);
   });
 
   it('the record CLI and its frames adapter are not staged into customer workspaces', () => {
@@ -2380,5 +2563,225 @@ describe('bunny-deploy — phase reporting for the watcher deadline (plan-587 F4
       stageAndBuild: () => ({ workspaceRoot: null, distDir: join(base, 'nope') }),
     } as never);
     expect(phases).toEqual(['build']);
+  });
+});
+
+/**
+ * plan-646 Phase 2 (F3b/F3c): `generated/features.json` is produced in the canonical tree from
+ * the ORIGINAL manifest before a --demo staging; the staging copies the finished file and never
+ * regenerates it, and the Vite emit ships it as `<prefix>/features.json`.
+ */
+describe('features.json reaches the demo build (plan-646 Phase 2)', () => {
+  let work: string;
+  let stagedRoot: string | null = null;
+  beforeEach(() => {
+    work = mkdtempSync(join(tmpdir(), 'rvstage-features-'));
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    rmSync(work, { recursive: true, force: true });
+    if (stagedRoot) rmSync(stagedRoot, { recursive: true, force: true });
+    stagedRoot = null;
+  });
+
+  function stageFixture(withFeatures: boolean, includeGeneratedFiles?: boolean) {
+    const core = join(work, 'core');
+    const privateRoot = join(work, 'private');
+    mkdirSync(privateRoot, { recursive: true });
+    const write = (path: string, text: string) => {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, text);
+    };
+    write(join(core, 'src', 'main.ts'), 'export {};');
+    write(join(core, 'tsconfig.json'), JSON.stringify({ compilerOptions: { paths: {} } }));
+    write(join(core, 'recipes', 'kinematize-cad-import.md'), '# recipe fixture\n');
+    write(join(core, 'public', 'settings.json'), '{}');
+    if (withFeatures) write(join(core, 'generated', 'features.json'), '{"version":1}\n');
+    const staged = stageFilteredSourceTree({
+      coreRoot: core,
+      privateRoot,
+      profile: { tier: 'core', restrictedFeatures: [] },
+      includePublicDemoContent: true,
+      ...(includeGeneratedFiles === undefined ? {} : { includeGeneratedFiles }),
+    });
+    stagedRoot = staged.workspaceRoot;
+    return staged;
+  }
+
+  it('the core staging list names generated/features.json', () => {
+    expect(CORE_GENERATED_FILES).toContain('generated/features.json');
+  });
+
+  it('demo staging (includeGeneratedFiles) copies generated/features.json unchanged', () => {
+    const staged = stageFixture(true, true);
+    expect(readFileSync(join(staged.coreRoot, 'generated', 'features.json'), 'utf8')).toBe('{"version":1}\n');
+  });
+
+  it('demo staging without the file stages without error', () => {
+    const staged = stageFixture(false, true);
+    expect(existsSync(join(staged.coreRoot, 'generated', 'features.json'))).toBe(false);
+  });
+
+  it.each([false, undefined])('non-demo staging (includeGeneratedFiles=%s) skips it even when it exists', (flag) => {
+    // includePublicDemoContent alone is also true for a plain public deploy, so it is not the gate.
+    const staged = stageFixture(true, flag);
+    expect(existsSync(join(staged.coreRoot, 'generated', 'features.json'))).toBe(false);
+  });
+
+  it.each([
+    ['demo', true],
+    ['public', false],
+  ] as const)('stageAndBuild(%s) asks the staging for generated files: %s', (mode, expected) => {
+    const seen: Array<Record<string, unknown>> = [];
+    const workspaceRoot = mkdtempSync(join(work, 'rv-customer-workspace-'));
+    (stageAndBuild as (o: unknown, d: unknown) => unknown)({ mode, dryRun: true }, {
+      stage: (options: Record<string, unknown>) => { seen.push(options); return { workspaceRoot, manifest: {} }; },
+      assertTierLeak: () => {},
+      build: () => ({ distDir: join(workspaceRoot, 'dist') }),
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0].includeGeneratedFiles === true).toBe(expected);
+  });
+
+  const cfg = { storageZone: 'z', region: 'storage.bunnycdn.com', storageKey: 'K', accountKey: 'A', pullZoneId: '42', remotePath: '', googleAnalyticsId: '', newsApiUrl: '' };
+  //! Staging stand-in that ends the deploy right after staging (dry-run, no dist).
+  function recordingStaging(order: string[]) {
+    return () => {
+      order.push('stageAndBuild');
+      return { workspaceRoot: mkdtempSync(join(work, 'rv-customer-workspace-')), distDir: join(work, 'none') };
+    };
+  }
+
+  it.each(['demo', 'dev'])('--demo --path %s generates features.json before stageAndBuild', async (path) => {
+    const order: string[] = [];
+    await deployPublic(cfg, { path, demo: true, dryRun: true }, {
+      generateFeatures: () => { order.push('generate'); },
+      stageAndBuild: recordingStaging(order),
+      reportPhase: () => null,
+    });
+    expect(order).toEqual(['generate', 'stageAndBuild']);
+  });
+
+  it('a public (non-demo) deploy does not run the generator', async () => {
+    const order: string[] = [];
+    await deployPublic(cfg, { path: 'dev', dryRun: true }, {
+      generateFeatures: () => { order.push('generate'); },
+      stageAndBuild: recordingStaging(order),
+      reportPhase: () => null,
+    });
+    expect(order).toEqual(['stageAndBuild']);
+  });
+
+  it('a generator failure aborts the deploy before staging', async () => {
+    const order: string[] = [];
+    await expect(deployPublic(cfg, { path: 'demo', demo: true, dryRun: true }, {
+      generateFeatures: () => generateDemoFeatures({ generate: () => { throw new Error('catalog mismatch'); } }),
+      stageAndBuild: recordingStaging(order),
+      reportPhase: () => null,
+    })).rejects.toThrow(/features\.json generation failed - deploy aborted\.\ncatalog mismatch/);
+    expect(order).toEqual([]);
+  });
+
+  it('generateDemoFeatures refuses a tree without the private manifest', () => {
+    expect(() => generateDemoFeatures({ generate: () => ({ available: false, manifestPath: 'X/tier-manifest.json' }) }))
+      .toThrow(/X\/tier-manifest\.json not found/);
+  });
+
+  it('generateDemoFeatures writes the generated json to its output', () => {
+    const out = join(work, 'generated', 'features.json');
+    expect(generateDemoFeatures({ generate: () => ({ available: true, json: '{"version":1}\n' }), out })).toBe(out);
+    expect(readFileSync(out, 'utf8')).toBe('{"version":1}\n');
+  });
+
+  it('the CLI entry generates before staging (source order guard)', () => {
+    const source = readFileSync(resolve(__dirname, '..', 'scripts', 'bunny-deploy.mjs'), 'utf8');
+    const body = source.slice(source.indexOf('export async function deployPublic('));
+    const generate = body.indexOf("if (mode === 'demo' && generate) timings.time('features', () => generate());");
+    const stage = body.indexOf('(deps.stageAndBuild ?? stageAndBuild)(');
+    expect(generate).toBeGreaterThan(0);
+    expect(generate).toBeLessThan(stage);
+  });
+});
+
+// ─── /dev build profile and step timing (2026-10-25) ─────────────────────
+
+describe('--dev-fast and [timing] lines', () => {
+  let work: string;
+  beforeEach(() => { work = mkdtempSync(join(tmpdir(), 'rv-dev-fast-')); });
+  afterEach(() => { vi.unstubAllEnvs(); rmSync(work, { recursive: true, force: true }); });
+
+  it('--dev-fast is allowed only for a public / --demo deploy to the prefix dev', () => {
+    expect(() => assertDevFastAllowed({ devFast: true, path: 'dev' })).not.toThrow();
+    expect(() => assertDevFastAllowed({ devFast: true, path: '/dev/' })).not.toThrow();
+    expect(() => assertDevFastAllowed({ devFast: false, path: 'demo' })).not.toThrow();
+    for (const opts of [{ path: 'demo' }, { path: 'demo-beta' }, { path: null }, { path: 'dev', root: true }, { path: 'dev', private: true }]) {
+      expect(() => assertDevFastAllowed({ devFast: true, ...opts })).toThrow(/--dev-fast is the \/dev build profile only/);
+    }
+  });
+
+  it('createTimings prints one [timing] line per step, for sync, async and throwing steps', async () => {
+    const lines: string[] = [];
+    let clock = 0;
+    const t = createTimings((line: string) => lines.push(line), () => clock);
+    t.mark('stage', 1234);
+    expect(t.time('features', () => { clock += 500; return 7; })).toBe(7);
+    await t.time('upload', async () => { clock += 2000; });
+    expect(() => t.time('broken', () => { clock += 100; throw new Error('x'); })).toThrow('x');
+    expect(lines).toEqual(['[timing] stage 1.2s', '[timing] features 0.5s', '[timing] upload 2.0s', '[timing] broken 0.1s']);
+  });
+
+  it('stageAndBuild hands devFast and the timing callback to the build only when asked', () => {
+    const builds: Array<Record<string, unknown>> = [];
+    const deps = {
+      stage: () => { const workspaceRoot = mkdtempSync(join(work, 'ws-')); return { workspaceRoot, manifest: {} }; },
+      assertTierLeak: () => {},
+      build: (_root: string, options: Record<string, unknown>) => { builds.push(options); return { distDir: join(work, 'dist') }; },
+      assertProvenance: () => {},
+    };
+    const marks: string[] = [];
+    const timings = { mark: (step: string) => marks.push(step), time: (_s: string, fn: () => unknown) => fn() };
+    (stageAndBuild as (o: unknown, d: unknown) => unknown)({ mode: 'demo', dryRun: true }, deps);
+    (stageAndBuild as (o: unknown, d: unknown) => unknown)({ mode: 'demo', dryRun: true, devFast: true, timings }, deps);
+    expect('devFast' in builds[0]).toBe(false);
+    expect('onTiming' in builds[0]).toBe(false);
+    expect(builds[1].devFast).toBe(true);
+    (builds[1].onTiming as (s: string, ms: number) => void)('vite-build', 10);
+    expect(marks).toEqual(['stage', 'vite-build']);
+  });
+
+  it('deployPublic passes devFast to the staging for --path dev and refuses it for /demo', async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const staging = (options: Record<string, unknown>) => { seen.push(options); return { workspaceRoot: null, distDir: join(work, 'none') }; };
+    const cfg = { storageZone: 'z', remotePath: '' };
+    await deployPublic(cfg, { path: 'dev', demo: true, dryRun: true, devFast: true }, { stageAndBuild: staging, generateFeatures: () => {}, reportPhase: () => {} });
+    expect(seen[0].devFast).toBe(true);
+    await deployPublic(cfg, { path: 'dev', demo: true, dryRun: true }, { stageAndBuild: staging, generateFeatures: () => {}, reportPhase: () => {} });
+    expect('devFast' in seen[1]).toBe(false);
+    await expect(deployPublic(cfg, { path: 'demo', demo: true, dryRun: true, devFast: true }, { stageAndBuild: staging, generateFeatures: () => {}, reportPhase: () => {} }))
+      .rejects.toThrow(/--dev-fast/);
+    expect(seen).toHaveLength(2);
+  });
+
+  it('runBuild sets RV_DEV_FAST_BUILD=1 only with devFast and never inherits it; it reports step timings', () => {
+    const workspaceRoot = join(work, 'workspace');
+    mkdirSync(workspaceRoot, { recursive: true });
+    writeFileSync(join(workspaceRoot, 'package.json'), '{"name":"staged-fixture","version":"1.0.0"}');
+    writeFileSync(join(workspaceRoot, 'package-lock.json'), '{"lockfileVersion":3,"packages":{}}');
+    const envs: Array<Record<string, string | undefined>> = [];
+    const npmRunner = (args: string[], options: { cwd: string; env?: Record<string, string | undefined> }) => {
+      if (args.join(' ') === 'run build') {
+        envs.push({ ...(options.env ?? {}) });
+        mkdirSync(join(options.cwd, 'dist'), { recursive: true });
+        writeFileSync(join(options.cwd, 'dist', 'app.js'), 'built');
+      }
+    };
+    vi.stubEnv('RV_DEV_FAST_BUILD', '1');
+    const steps: string[] = [];
+    runBuild(workspaceRoot, { npmRunner, mode: 'demo', sourceRoot: work, onTiming: (step: string) => steps.push(step) });
+    runBuild(workspaceRoot, { npmRunner, mode: 'demo', sourceRoot: work, devFast: true });
+    expect(envs[0].RV_DEV_FAST_BUILD).toBeUndefined();
+    expect(envs[1].RV_DEV_FAST_BUILD).toBe('1');
+    expect(steps).toEqual(['deps', 'vite-build', 'provenance']);
   });
 });

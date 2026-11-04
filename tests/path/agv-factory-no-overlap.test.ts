@@ -16,7 +16,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import type { MaterialFlowDefinition } from '../../src/core/material-flow/define-material-flow';
 import { getDefaultMovementAuthority, type MbStats } from '../../src/core/engine/rv-movement-authority';
 import { AgvFlow as AgvOrigFlow } from './_reference/agv-original-903';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
+import { DESRunner } from '@rv/plugins/des/des-runner';
 import {
   AGV_DEF, TICK, Object3D, makeHost, makeAgvRoot, bindDes, clearShared, runAnimated, centredBody,
   type RunMetrics,

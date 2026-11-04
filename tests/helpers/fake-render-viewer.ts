@@ -11,6 +11,8 @@
  *  - `wireframe` getter/setter (the latent toggle) → emits `wireframe-changed`
  *  - `wireframeActive` = toggle AND editor mode — the APPLIED state, exactly
  *    `_wireframeApplied` in the real viewer
+ *  - `hasCompute` (field, default false) + `renderModeContext`, read LIVE like
+ *    the real getter (plan-762 F18; `backendRegistered` from the hook)
  *  - `modes.activeMode` + `setMode()` → emits `mode-changed` (the real viewer
  *    re-syncs the applied wireframe inside that handler, rv-viewer.ts:3605)
  *
@@ -20,11 +22,17 @@
  */
 
 import type { RVViewer } from '../../src/core/rv-viewer';
+import {
+  getRaytracedBackend, inactiveRaytracedStats,
+  type RaytracedBackend, type RaytracedBackendFactory, type RaytracedSceneHost, type RaytracedStats,
+} from '../../src/core/engine/rv-raytraced-hook';
 
 export interface FakeRenderViewerInit {
   renderMode?: string;
   wireframe?: boolean;
   mode?: string;
+  /** Real-WebGPU flag of the fake (plan-762); default false = a WebGL viewer. */
+  hasCompute?: boolean;
 }
 
 export type FakeRenderViewer = RVViewer & {
@@ -53,6 +61,11 @@ export function fakeRenderViewer(init: FakeRenderViewerInit = {}): FakeRenderVie
     _wf: init.wireframe ?? false,
     _mode: init.mode ?? 'viewer',
     calls,
+    hasCompute: init.hasCompute ?? false,
+    // Read LIVE like the real getter (plan-762 F18).
+    get renderModeContext() {
+      return { hasCompute: v.hasCompute === true, backendRegistered: getRaytracedBackend() !== null };
+    },
     get renderMode() { return v._rm; },
     set renderMode(m: string) { calls.push(`renderMode=${m}`); v._rm = m; emit('render-mode-changed', { mode: m }); },
     get wireframe() { return v._wf; },
@@ -129,3 +142,53 @@ export function visualTabCapableFake(init: FakeRenderViewerInit = {}): FakeRende
     },
   }) as unknown as FakeRenderViewer;
 }
+
+// ─── Fake ray traced backend (plan-762 Phase 2) ──────────────────────────────
+
+/** A recording fake of the private backend: counts every lifecycle call. */
+export interface FakeRaytracedBackend extends RaytracedBackend {
+  readonly calls: { setup: number; frame: number; afterRender: number; order: string[]; resize: Array<[number, number]>; resetHistory: number; dispose: number };
+  /** The host the last `setup()` received. */
+  host: RaytracedSceneHost | null;
+  disposed: boolean;
+}
+
+/** Create a fake backend; `overrides` replace single methods (e.g. a gated `setup`). */
+export function createFakeRaytracedBackend(overrides: Partial<RaytracedBackend> = {}): FakeRaytracedBackend {
+  const calls = { setup: 0, frame: 0, afterRender: 0, order: [] as string[], resize: [] as Array<[number, number]>, resetHistory: 0, dispose: 0 };
+  const fake: FakeRaytracedBackend = {
+    calls,
+    host: null,
+    disposed: false,
+    async setup(host: RaytracedSceneHost): Promise<void> {
+      calls.setup++;
+      fake.host = host;
+      if (overrides.setup) await overrides.setup(host);
+    },
+    frame(): void {
+      calls.frame++;
+      calls.order.push('frame');
+      overrides.frame?.();
+    },
+    afterRender(): void {
+      calls.afterRender++;
+      calls.order.push('afterRender');
+      overrides.afterRender?.();
+    },
+    resize(width: number, height: number): void {
+      calls.resize.push([width, height]);
+    },
+    resetHistory(): void { calls.resetHistory++; },
+    stats(): RaytracedStats {
+      return { ...inactiveRaytracedStats(), active: !fake.disposed };
+    },
+    dispose(): void {
+      calls.dispose++;
+      fake.disposed = true;
+    },
+  };
+  return fake;
+}
+
+/** A factory that hands out a fresh {@link createFakeRaytracedBackend} per call. */
+export const fakeRaytracedBackendFactory: RaytracedBackendFactory = async () => createFakeRaytracedBackend();

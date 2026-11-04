@@ -146,7 +146,11 @@ describe('the demo project manifest', () => {
     // keeps the demo folder a self-contained, always-overwritable artefact.
     const owned = demo.documents.filter((d: { path: string }) => /^library\//i.test(d.path));
     expect(owned.map((d: { path: string }) => d.path)).toEqual([]);
-    expect((demo.libraries ?? []).map((l: { url: string }) => l.url)).toContain('library/catalog.json');
+    // plan-778: the subscription names the library PROJECT by id (hint = its app-level
+    // manifest), no longer the catalog URL.
+    expect(demo.libraries).toEqual([
+      { projectId: 'prj_realvirtual_library', label: 'realvirtual Library', hint: 'library/project.json' },
+    ]);
   });
 
   it('ships the knowledge sidecar the dashboard renders (plan-737 F8)', () => {
@@ -199,7 +203,16 @@ function walk(dir: string, out: string[] = []): string[] {
     return out; // A Connect~ sibling need not exist in every checkout.
   }
   for (const e of entries) {
-    if (e === 'node_modules' || e === 'dist' || e.startsWith('.')) continue;
+    // Skip observed CONNECT build dirs (bin/bin2/obj), not guessed names: they contain
+    // copies of shipped files, not definitions, and stale RAG builds would fail this guard.
+    if (
+      e === 'node_modules' ||
+      e === 'dist' ||
+      e === 'bin' ||
+      e === 'bin2' ||
+      e === 'obj' ||
+      e.startsWith('.')
+    ) continue;
     const p = join(dir, e);
     if (statSync(p).isDirectory()) walk(p, out);
     else if (SCAN_EXT.some(x => e.endsWith(x))) out.push(p);
@@ -264,6 +277,35 @@ describe('the demo model is defined once (plan-726 F10)', () => {
       // The robot-asset extraction script: its default `--source` is the demo
       // GLB it cuts the robot out of, named by path like every CLI default.
       'scripts/perf-extract-robot-asset.mjs',
+      // plan-522: the two one-shot authoring scripts that edit THIS model in
+      // place (cut out the coolant nozzle, author the maintenance procedure).
+      // Their `--in` default names the file they rewrite; the manifest's
+      // start document is the wrong source, because their edits are specific
+      // to this GLB and must not follow a future change of the start document.
+      'scripts/build-demo-maintenance-procedure.mjs',
+      'scripts/extract-demo-coolant-nozzle.mjs',
+      // plan-2039: the same kind of one-shot patch (restores the turbine body collider).
+      'scripts/patch-demo-turbine-collider.mjs',
+      // Demo MotionTrail on the robot gripper + its two record/clear signals.
+      'scripts/patch-demo-motion-trail.mjs',
+
+      // ── Tutorial recorder input (plan-2004) ──
+      // A storyboard is a SCRIPT about one scene, and `demo-basics` is the
+      // tutorial ABOUT the demo: naming the demo is its subject, not a default
+      // it could inherit from the manifest. It waits for that document by name
+      // (`rvproject:DemoRealvirtualWeb.glb`) because that wait is what makes
+      // the recording deterministic.
+      'scripts/tutorial/storyboards/demo-basics.json',
+      // The CONNECT setup tutorial records its four chapters against the same demo scene, for the
+      // same reason: the scene is the subject of the recording, waited for by name.
+      'scripts/tutorial/storyboards/connect-setup-activate.json',
+      'scripts/tutorial/storyboards/connect-setup-ai.json',
+      'scripts/tutorial/storyboards/connect-setup-download.json',
+      'scripts/tutorial/storyboards/connect-setup-register.json',
+      // The recorder's integration test drives the real BUILT viewer, so it
+      // needs one concrete model to point it at. The demo is the only GLB every
+      // checkout and every staged tree is guaranteed to have.
+      'scripts/tutorial/tutorial.viewer.test.mjs',
     ].sort());
   });
 
@@ -331,6 +373,24 @@ describe('the published-scene catalogue is gone (plan-731 F2)', () => {
     expect(start!.settingsPath).toBe('DemoRealvirtualWeb.settings.json');
     expect(() => readFileSync(join(ROOT, 'public', 'demo-realvirtual', start!.settingsPath as string)))
       .not.toThrow();
+  });
+
+  it('every shipped experiment archive is declared by its document row, and every declaration has bytes', () => {
+    // The deployed demo is read over HTTP: the viewer fetches exactly the archives
+    // a row declares (`experiments`) and probes nothing else. An undeclared archive
+    // would never load (PalletYard's experiment matrix), and a declaration without
+    // a file is the 404 the post-deploy smoke of 2026-11-02 failed on.
+    const expDir = join(ROOT, 'public', 'demo-realvirtual', 'experiments');
+    const shipped = existsSync(expDir)
+      ? readdirSync(expDir).filter(f => f.endsWith('.rvexp.ndjson')).map(f => `experiments/${f}`).sort()
+      : [];
+    const rows = demo.documents as Array<{ id: string; experiments?: string }>;
+    const declared = rows.filter(d => typeof d.experiments === 'string').map(d => d.experiments!).sort();
+    expect(declared).toEqual(shipped);
+    for (const row of rows) {
+      if (typeof row.experiments === 'string') expect(row.experiments).toBe(`experiments/${row.id}.rvexp.ndjson`);
+    }
+    expect(declared).toContain('experiments/doc_palletyard_hzmdb6.rvexp.ndjson');
   });
 });
 

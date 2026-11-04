@@ -53,6 +53,16 @@ export class RVDriveGear implements IDriveBehavior, RVComponent {
     this.node = node;
   }
 
+  /** The resolved master drive (null while inactive) — read by the pose adapter (plan-641 M6). */
+  get masterDrive(): RVDrive | null {
+    return this.master;
+  }
+
+  /** The slave drive this behavior moves (null while inactive). */
+  get slaveDrive(): RVDrive | null {
+    return this.drive;
+  }
+
   init(context: ComponentContext): void {
     const path = NodeRegistry.computeNodePath(this.node);
 
@@ -65,14 +75,16 @@ export class RVDriveGear implements IDriveBehavior, RVComponent {
     this.drive = drive;
 
     // MasterDrive is resolved to an RVDrive instance by resolveComponentRefs().
+    // Anything else — a raw string, or an UNRESOLVED reference object (an untagged
+    // `{ path, componentType }` the loader never resolves, plan-612 b0) — is no
+    // master: taking it would drive the slave from `undefined` (silent NaN).
+    let master = this.MasterDrive instanceof RVDrive ? this.MasterDrive : null;
     // Fallback: look it up by the raw ref path from the behavior extras — covers
     // the case where resolution returned null (e.g. a registry suffix-map miss).
-    let master = (this.MasterDrive && typeof this.MasterDrive !== 'string')
-      ? (this.MasterDrive as RVDrive)
-      : null;
     if (!master) {
       const raw = drive.BehaviorExtras['Drive_Gear']?.['MasterDrive'] as { path?: string } | undefined;
-      if (raw?.path) master = context.registry.getByPath<RVDrive>('Drive', raw.path) ?? null;
+      const hit = raw?.path ? context.registry.getByPath<RVDrive>('Drive', raw.path) : null;
+      master = hit instanceof RVDrive ? hit : null;
     }
     if (!master) {
       console.warn(`[Drive_Gear] "${drive.name}": MasterDrive could not be resolved — behavior inactive`);
@@ -100,6 +112,46 @@ export class RVDriveGear implements IDriveBehavior, RVComponent {
     drive.currentPosition = master.currentPosition * this.GearFactor + this.Offset;
     drive.currentSpeed = master.currentSpeed * this.GearFactor;
     drive.applyToNode();
+  }
+
+  /** The geared position this behavior asks for, in slave drive units. */
+  get gearedPosition(): number {
+    const master = this.master;
+    return master ? master.currentPosition * this.GearFactor + this.Offset : Number.NaN;
+  }
+
+  /**
+   * plan-673 Phase 5 — the gear coupling as a SETPOINT, for a slave axis whose
+   * position MuJoCo owns.
+   *
+   * The realvirtual idiom for a parallel gripper is a `Drive_Cylinder` on a
+   * `Drive{Direction:'Virtual'}` with one `Drive_Gear` per jaw. A `Virtual`
+   * drive is never a rigid body, so the MJCF writer makes the FIRST geared jaw
+   * the actuated lead and couples the second to it with an `<equality>` row
+   * (`virtualGearLeads()`, Phase 4b). That left exactly one gap: the lead jaw's
+   * actuator had nobody writing its setpoint, because {@link update} — the only
+   * thing that knows the gear ratio — is never reached once the jaw is
+   * physics-driven (`positionOverwrite` returns before the behavior loop).
+   *
+   * This is that route, and it is deliberately the SETPOINT and nothing else:
+   * the jaw closes because the actuator is told to, and `forcerange` decides how
+   * hard it actually holds — which is what makes the grip force a datasheet
+   * value instead of a function of the servo gain. Writing `currentPosition`
+   * here (what {@link update} does) would overwrite the measurement MuJoCo
+   * just produced and the whole `forcefit` mode would report the commanded
+   * position as if it were the real one.
+   *
+   * `RVDrive` only calls this on a dynamic axis; the guard repeats that
+   * invariant because the method is public. The kinematic gripper of every
+   * non-physics scene therefore keeps running through {@link update},
+   * untouched — the earlier attempt to route `update()` itself through the
+   * setpoint killed exactly that.
+   */
+  commandDynamicSetpoint(_dt: number): void {
+    const drive = this.drive;
+    const master = this.master;
+    if (!drive || !master || !drive.dynamicAxis) return;
+    drive.commandPosition(master.currentPosition * this.GearFactor + this.Offset);
   }
 }
 

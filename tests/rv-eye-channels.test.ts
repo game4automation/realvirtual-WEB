@@ -25,7 +25,7 @@ import {
   dedupeChannels, frameSize, paletteToIds,
   type EyeChannelHost, type EyeRenderResult,
 } from '../src/core/engine/rv-eye-channels';
-import { AGENT_EYE_LAYER, HIGHLIGHT_OVERLAY_LAYER } from '../src/core/engine/rv-group-registry';
+import { AGENT_EYE_LAYER, GroupRegistry, HIGHLIGHT_OVERLAY_LAYER } from '../src/core/engine/rv-group-registry';
 import type { AgentPose } from '../src/core/engine/rv-agent-eye';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { createTestViewer, type TestViewerHandle } from './helpers/create-test-viewer';
@@ -424,16 +424,16 @@ describe('EyeChannels.renderChannels (WebGL)', () => {
     }
   });
 
-  it('refuses under a WebGPU renderer with the documented message', async () => {
+  it('refuses a renderer that cannot read pixels back (plan-763: WebGPU itself captures)', async () => {
     const eye = new EyeChannels({
       scene: { } as never,
-      renderer: { isWebGPURenderer: true },
+      renderer: { isWebGPURenderer: true }, // no readRenderTargetPixels(Async) at all
       registry: undefined,
       currentModelRoot: null,
     });
     const out = await eye.renderChannels({ pose: POSE(), size: 512, channels: ['beauty'] });
-    expect(out).toEqual({ error: expect.stringMatching(/classic WebGL renderer/) });
-    expect(eye.guard('web_eye')).toMatch(/Settings → Visual → Renderer/);
+    expect(out).toEqual({ error: expect.stringMatching(/needs a renderer that can read pixels back/) });
+    expect(eye.guard('web_eye')).toMatch(/^web_eye needs a renderer/);
     eye.dispose();
   });
 
@@ -488,6 +488,107 @@ describe('EyeChannels.renderChannels (WebGL)', () => {
       // (something pathological, e.g. a per-pixel allocation), not the NFR.
       expect(ms).toBeLessThan(30_000);
     } finally {
+      eye.dispose();
+    }
+  });
+});
+
+// ─── The viewport isolate ──────────────────────────────────────────────
+
+describe('EyeChannels under the viewport isolate', () => {
+  /** Centre-of-list pixel of a legend group in a mask — always a member pixel. */
+  function memberPixel(r: EyeRenderResult, path: string): [number, number] {
+    const gi = r.legend.findIndex((l) => l.path === path);
+    expect(gi, `legend has ${path}`).toBeGreaterThanOrEqual(0);
+    const ids = r.channels.find((c) => c.idBuffer)!.idBuffer!;
+    const members: number[] = [];
+    for (let i = 0; i < ids.length; i++) if (ids[i] === gi) members.push(i);
+    expect(members.length, `${path} covers pixels`).toBeGreaterThan(0);
+    const i = members[members.length >> 1];
+    return [i % r.width, Math.floor(i / r.width)];
+  }
+  const maxDelta = (a: [number, number, number], b: [number, number, number]): number =>
+    Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]), Math.abs(a[2] - b[2]));
+
+  it('dims the non-isolated parts in beauty and drops them from the mask, then lets go on exit', async () => {
+    handle = await createTestViewer('webgl');
+    const { viewer } = handle;
+    const { root, registry } = buildModel(viewer);
+    // The test viewer loads no model, so the group registry a load would
+    // install is created by hand — isolateNodes() is a no-op without one.
+    if (!viewer.groups) viewer.groups = new GroupRegistry();
+    const eye = new EyeChannels({
+      ...hostFor(viewer, root, registry),
+      groups: viewer.groups,
+      autoFilters: viewer.autoFilters,
+    });
+    const render = async (): Promise<EyeRenderResult> => {
+      const out = await eye.renderChannels({
+        pose: POSE(), size: 256, channels: ['beauty', 'idmask'], root,
+      });
+      expect('error' in out).toBe(false);
+      return out as EyeRenderResult;
+    };
+    const beauty = (r: EyeRenderResult): HTMLCanvasElement =>
+      r.channels.find((c) => c.channel === 'beauty')!.canvas;
+    try {
+      const plain = await render();
+      expect(plain.isolate).toBeUndefined();
+      const front = memberPixel(plain, 'Cell/Front');
+      const back = memberPixel(plain, 'Cell/Back');
+
+      viewer.isolateNodes([registry.getNode('Cell/Front')!], false);
+      expect(viewer.groups!.isIsolateActive).toBe(true);
+      const iso = await render();
+      expect(iso.isolate).toBe(true);
+
+      // The mask knows only the focus set: Back and Wall have no identity.
+      expect(iso.legend.map((l) => l.path)).toEqual(['Cell/Front']);
+      const isoIds = iso.channels.find((c) => c.idBuffer)!.idBuffer!;
+      expect(isoIds[back[1] * iso.width + back[0]]).toBe(IDMASK_NO_GROUP);
+      expect(isoIds[front[1] * iso.width + front[0]]).toBe(0);
+
+      // Beauty: the isolated part is drawn as before, the other one is dimmed
+      // towards the background — the viewport's own composite, not a
+      // photograph of the whole machine.
+      const plainBeauty = beauty(plain), isoBeauty = beauty(iso);
+      expect(maxDelta(pixelAt(plainBeauty, ...front), pixelAt(isoBeauty, ...front))).toBeLessThan(32);
+      expect(maxDelta(pixelAt(plainBeauty, ...back), pixelAt(isoBeauty, ...back))).toBeGreaterThan(40);
+
+      // Exiting the isolate hands the eye the whole model back.
+      viewer.exitIsolate();
+      const again = await render();
+      expect(again.isolate).toBeUndefined();
+      expect(again.legend.map((l) => l.path)).toEqual(
+        expect.arrayContaining(['Cell/Front', 'Cell/Back', 'Cell/Wall']),
+      );
+      expect(maxDelta(pixelAt(plainBeauty, ...back), pixelAt(beauty(again), ...back))).toBeLessThan(32);
+    } finally {
+      eye.dispose();
+    }
+  });
+
+  it('leaves the eye camera mask and the live scene background exactly as it found them', async () => {
+    handle = await createTestViewer('webgl');
+    const { viewer } = handle;
+    const { root, registry } = buildModel(viewer);
+    if (!viewer.groups) viewer.groups = new GroupRegistry();
+    const eye = new EyeChannels({
+      ...hostFor(viewer, root, registry), groups: viewer.groups, autoFilters: viewer.autoFilters,
+    });
+    try {
+      const background = viewer.scene.background;
+      const viewportMask = viewer.camera.layers.mask;
+      viewer.isolateNodes([registry.getNode('Cell/Back')!], false);
+      const out = await eye.renderChannels({
+        pose: POSE(), size: 128, channels: ['beauty', 'idmask', 'xray'], root,
+      });
+      expect('error' in out).toBe(false);
+      expect(viewer.scene.background).toBe(background);
+      expect(viewer.camera.layers.mask).toBe(viewportMask);
+      expect((viewer.renderer as unknown as { getRenderTarget(): unknown }).getRenderTarget()).toBeNull();
+    } finally {
+      viewer.exitIsolate();
       eye.dispose();
     }
   });

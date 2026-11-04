@@ -30,6 +30,7 @@ import {
 } from './rv-command-registry';
 import { ERR_EDITOR_UNAVAILABLE } from '../editor/rv-editor-guard-core';
 import { inspectorFieldKey } from './inspector-field-touch';
+import { parsePathList as parseSharedPathList } from './rv-path-list';
 // The id lives in `problems-store` because a Problems entry's `action` must name it and that store
 // is deliberately dependency-free (importing THIS module there would drag the command registry
 // into the core bundle). One spelling, imported by both sides.
@@ -40,6 +41,9 @@ import {
   SIGNALS_CREATE_FROM_INTERFACE_COMMAND,
 } from './problems-store';
 import { isMissingWireValue, type BindingBranch, type BranchBinding } from '../engine/rv-mcp-tools';
+import { PARAMETRIC_USE_COMMAND, parametricUseImpl } from '../editor/rv-parametric-uses';
+// plan-2227: type-only — the implementations (and the component) load on demand.
+import type { SignalConnectorCreateBitsArgs, SignalConnectorSetModeArgs } from './signal-connector-commands';
 
 // ─── Reasons (formulated on the ARGS — plan-499 spike finding 4) ─────────
 
@@ -88,7 +92,7 @@ export const SIGNAL_TARGET_INVALID = 'target must be Bool | Int | Float';
  * (plan-590) plans it, previews it and carries every reference along.
  */
 export const SIGNAL_NAME_READONLY =
-  'The name is not a plain field — rename the signal with editor.signalRename (web_editor_signal_rename), '
+  'The name is not a plain field — rename the signal with editor.signalRename, '
   + 'which updates every reference';
 export { SIGNAL_RENAME_COMMAND, SIGNAL_RENAME_RECHECK_COMMAND, SIGNAL_RENAME_REPAIR_COMMAND };
 /** plan-590 — another rename (or its undo / redo) is running. */
@@ -121,19 +125,35 @@ export function nodeNotFound(path: string): string {
 export type PathsArg = string | readonly string[] | null | undefined;
 
 /**
- * Normalise a {@link PathsArg}. Same splitting rule as the bridge's
- * `parsePathsParam`: newline input keeps commas literal (CAD names contain
- * them), single-line input also splits on `,` and `;`.
+ * Normalise a {@link PathsArg} — THE shared rule of `rv-path-list.ts`: a list, a
+ * JSON array string (for names containing commas; invalid JSON throws), else the
+ * legacy split (newline input keeps commas literal, single-line input also splits
+ * on `,` and `;`).
  */
 export function parsePathList(arg: PathsArg): string[] {
-  if (arg === null || arg === undefined) return [];
-  if (Array.isArray(arg)) return (arg as readonly string[]).filter((p) => typeof p === 'string' && p.length > 0);
-  if (typeof arg !== 'string') return [];
-  const splitter = /[\r\n]/.test(arg) ? /[;\r\n]+/ : /[,;\r\n]+/;
-  return arg.split(splitter).map((p) => p.trim()).filter((p) => p.length > 0);
+  return parseSharedPathList(arg);
 }
 
 export interface PathArgs { readonly path: string | null | undefined }
+/** plan-661: add a `WebPhysicsZone2D` (with its BoxCollider) to a node. */
+export const PHYSICS_ZONE2D_ADD_COMMAND = 'physicszone2d.add';
+/** plan-661: set the node references (Surface / Guides / KinematicDrives) of a 2D zone. */
+export const PHYSICS_ZONE2D_SET_REFERENCES_COMMAND = 'physicszone2d.setReferences';
+export interface PhysicsZone2DAddArgs {
+  readonly path: string | null | undefined;
+  /** Jam | BufferTable | Diverter | Merge (default Jam). */
+  readonly kind?: string | null;
+  readonly propsJson?: string | null;
+}
+export interface PhysicsZone2DSetReferencesArgs {
+  readonly path: string | null | undefined;
+  /** Node path of the discharge surface; '' clears it, absent keeps it. */
+  readonly surface?: string | null;
+  /** Guide rail node paths; empty clears, absent keeps. */
+  readonly guides?: PathsArg;
+  /** Switch drive node paths; empty clears, absent keeps. */
+  readonly kinematicDrives?: PathsArg;
+}
 export interface PathsArgs { readonly paths: PathsArg }
 export interface Rotate90Args { readonly path: string | null | undefined; readonly axis: string; readonly sign?: number | null }
 export interface PivotToObjectArgs { readonly path: string | null | undefined; readonly targetPath: string | null | undefined }
@@ -143,10 +163,37 @@ export interface PivotToCircleArgs {
   readonly worldCenter: readonly number[] | null | undefined;
   readonly worldAxis: readonly number[] | null | undefined;
 }
+/**
+ * plan-641 — `editor.transform`: a node's LOCAL TRS, partial. Position in metres, rotation
+ * in degrees (XYZ Euler), scale; an omitted (null) component keeps its current value.
+ */
+export interface TransformArgs {
+  readonly path: string | null | undefined;
+  readonly px?: number | null; readonly py?: number | null; readonly pz?: number | null;
+  readonly rx?: number | null; readonly ry?: number | null; readonly rz?: number | null;
+  readonly sx?: number | null; readonly sy?: number | null; readonly sz?: number | null;
+}
 export interface RenameArgs { readonly path: string | null | undefined; readonly name: string }
 export interface SetVisibleArgs { readonly paths: PathsArg; readonly visible: boolean }
 export interface CreateEmptyArgs { readonly parentPath?: string | null; readonly name?: string | null }
 export interface ReparentArgs { readonly paths: PathsArg; readonly newParentPath?: string | null }
+/**
+ * plan-641 Phase 3 — `editor.clone`: deep copy of the subtree at `path`. `parentPath` omitted =
+ * next to the source (its parent), `''` = the asset root; `name` omitted = the source's name
+ * (deduped `_N`). The new path comes back in `created`.
+ */
+export interface CloneArgs { readonly path: string | null | undefined; readonly name?: string | null; readonly parentPath?: string | null }
+/** plan-641 Phase 3 — `editor.reorder`: put `path` at sibling slot `index` (0 = first) under its parent. */
+export interface ReorderArgs { readonly path: string | null | undefined; readonly index: number }
+/**
+ * plan-641 Phase 3 — `editor.materialDefine`: a NAMED free PBR material (hex colour, roughness,
+ * metalness, opacity 0..1) applied to every mesh under `paths` (omitted = the selection).
+ */
+export interface MaterialDefineArgs {
+  readonly name: string | null | undefined; readonly color: string | null | undefined;
+  readonly roughness?: number | null; readonly metalness?: number | null; readonly opacity?: number | null;
+  readonly paths?: PathsArg;
+}
 export interface AddComponentArgs { readonly path: string | null | undefined; readonly type: string; readonly propsJson?: string | null }
 export interface RemoveComponentArgs { readonly path: string | null | undefined; readonly componentType: string }
 export interface SetFieldArgs {
@@ -230,6 +277,11 @@ export interface SeedsArgs { readonly seeds: readonly string[] | null }
 export interface SelectedArgs { readonly selected: readonly string[] | null }
 /** `on` omitted / null = flip the current state (the key press); a boolean sets it. */
 export interface WireframeArgs { readonly on?: boolean | null }
+/** Same shape as {@link WireframeArgs}: omitted / null flips, a boolean sets (plan-766 F3). */
+export interface TransformToolArgs { readonly on?: boolean | null }
+
+/** plan-766 F3 — the transform-tool toggle's command id (T key, toolbar, web_editor_shortcut). */
+export const TOGGLE_TRANSFORM_TOOL_COMMAND = 'editor.toggleTransformTool';
 
 // ─── Module shape ───────────────────────────────────────────────────────
 
@@ -263,6 +315,9 @@ const opt = (name: string, type = 'string'): P => ({ name, type, required: false
 
 interface Spec {
   readonly id: string;
+  readonly timeoutMs?: number;
+  readonly lazyImpl?: () => Promise<CommandImpl<never, unknown>>;
+  readonly toolClass?: CommandDescriptor['toolClass'];
   readonly label: string | ((args: never) => string);
   readonly argsSchema: Readonly<Record<string, CommandArgType>>;
   readonly buttonKey?: (args: never) => string;
@@ -271,6 +326,11 @@ interface Spec {
   readonly mcp?: CommandMcpMirror;
   /** Open inline implementation (no private code needed). */
   readonly openImpl?: CommandImpl<never, unknown>;
+  /**
+   * plan-641 — the command changes the model: an MCP call of it becomes a macro line.
+   * The implementation must provide `resolveArgs` (M4) and resolve after the change (M8).
+   */
+  readonly macro?: boolean;
   /**
    * Document gate. Default `'editor'`. `'none'` for a command that also runs outside the asset
    * editor and resolves its document itself (the signal rename writes to the scene there).
@@ -281,82 +341,132 @@ interface Spec {
 const lower = (v: unknown): string => String(v ?? '').toLowerCase();
 
 const SPECS: readonly Spec[] = [
+  {
+    id: 'editor.kinematize', label: 'Kinematize', undoLabel: 'Kinematize', macro: true, timeoutMs: 60_000,
+    argsSchema: { paths: 'string', groupName: 'string', direction: 'string', speed: 'number', lowerLimit: 'number', upperLimit: 'number', startPosition: 'number', centerPivot: 'boolean' },
+    lazyImpl: async () => (await import('../../plugins/mcp-bridge/rv-mcp-editor-tools')).editorKinematizeImpl as CommandImpl<never, unknown>,
+  },
+  {
+    id: 'editor.importGlb', label: 'Import GLB', undoLabel: 'Import GLB', macro: true, timeoutMs: 120_000,
+    argsSchema: { relPath: 'string' },
+    lazyImpl: async () => (await import('../../plugins/mcp-bridge/rv-mcp-editor-tools')).editorImportGlbImpl as CommandImpl<never, unknown>,
+  },
+  {
+    id: 'editor.importCad', label: 'Import CAD', undoLabel: 'Import CAD', macro: true, timeoutMs: 600_000,
+    argsSchema: { relPath: 'string', quality: 'string' },
+    lazyImpl: async () => (await import('../../plugins/mcp-bridge/rv-mcp-editor-tools')).editorImportCadImpl as CommandImpl<never, unknown>,
+  },
   // ── Transform ──
   {
-    id: 'editor.zeroPosition', label: 'Zero Position', argsSchema: { paths: 'string' },
+    // plan-641: the field input of the Transform section as ONE command, so an agent's
+    // matrix edit is a macro line like every other model change.
+    id: 'editor.transform', macro: true, label: 'Set transform', undoLabel: 'Set transform',
+    argsSchema: {
+      path: 'string', px: 'number', py: 'number', pz: 'number',
+      rx: 'number', ry: 'number', rz: 'number', sx: 'number', sy: 'number', sz: 'number',
+    },
+    mcp: {
+      tool: 'web_editor_transform',
+      params: [
+        req('path'), opt('px', 'number'), opt('py', 'number'), opt('pz', 'number'),
+        opt('rx', 'number'), opt('ry', 'number'), opt('rz', 'number'),
+        opt('sx', 'number'), opt('sy', 'number'), opt('sz', 'number'),
+      ],
+    },
+  },
+  {
+    id: 'editor.zeroPosition', macro: true, label: 'Zero Position', argsSchema: { paths: 'string' },
     buttonKey: () => 'qe.zero-position',
     mcp: { tool: 'web_editor_zero_position', params: [req('paths')] },
   },
   {
-    id: 'editor.rotate90', label: (a: Rotate90Args) => `Rotate ${String(a?.axis ?? '').toUpperCase()}`,
+    id: 'editor.rotate90', macro: true, label: (a: Rotate90Args) => `Rotate ${String(a?.axis ?? '').toUpperCase()}`,
     argsSchema: { path: 'string', axis: 'string', sign: 'number' },
     buttonKey: (a: Rotate90Args) => `qe.rotate-${lower(a?.axis)}`,
     mcp: { tool: 'web_editor_rotate90', params: [req('path'), req('axis'), opt('sign', 'integer')] },
   },
   {
-    id: 'editor.toGround', label: 'To Ground', argsSchema: { path: 'string' },
+    id: 'editor.toGround', macro: true, label: 'To Ground', argsSchema: { path: 'string' },
     buttonKey: () => 'qe.to-ground',
     mcp: { tool: 'web_editor_to_ground', params: [req('path')] },
   },
-  { id: 'editor.pivotToBottom', label: 'Pivot to Bottom', argsSchema: { path: 'string' }, buttonKey: () => 'qe.pivot-bottom' },
+  { id: 'editor.pivotToBottom', macro: true, label: 'Pivot to Bottom', argsSchema: { path: 'string' }, buttonKey: () => 'qe.pivot-bottom' },
   {
-    id: 'editor.pivotToObjectCenter', label: 'Pivot to Object', argsSchema: { path: 'string', targetPath: 'string' },
+    id: 'editor.pivotToObjectCenter', macro: true, label: 'Pivot to Object', argsSchema: { path: 'string', targetPath: 'string' },
     buttonKey: () => 'qe.pivot-to-object',
   },
   {
     // UI-only (no tool, like `mechanism.addBodies`): the Quick Edit button
     // starts the circle pick, whose commit dispatches with the circle.
-    id: 'editor.pivotToCircle', label: 'Pivot to Circle', undoLabel: 'Pivot to circle',
+    id: 'editor.pivotToCircle', macro: true, label: 'Pivot to Circle', undoLabel: 'Pivot to circle',
     argsSchema: { path: 'string', worldCenter: 'number[]', worldAxis: 'number[]' },
     buttonKey: () => 'qe.pivot-to-circle',
   },
-  { id: 'editor.centerKinematicToGroup', label: 'Center to Group', argsSchema: { path: 'string' } },
-  { id: 'editor.alignYUp', label: 'Align Y Up', argsSchema: { path: 'string' }, buttonKey: () => 'qe.align-y-up' },
+  { id: 'editor.centerKinematicToGroup', macro: true, label: 'Center to Group', argsSchema: { path: 'string' } },
+  { id: 'editor.alignYUp', macro: true, label: 'Align Y Up', argsSchema: { path: 'string' }, buttonKey: () => 'qe.align-y-up' },
 
   // ── Structure ──
   {
-    id: 'editor.rename', label: 'Rename', argsSchema: { path: 'string', name: 'string' },
+    id: 'editor.rename', macro: true, label: 'Rename', argsSchema: { path: 'string', name: 'string' },
     mcp: { tool: 'web_editor_rename', params: [req('path'), req('name')] },
   },
   {
-    id: 'editor.delete', label: 'Delete', argsSchema: { paths: 'string' }, shortcut: 'Delete',
+    id: 'editor.delete', macro: true, label: 'Delete', argsSchema: { paths: 'string' }, shortcut: 'Delete',
     mcp: { tool: 'web_editor_delete', params: [req('paths')] },
   },
   {
-    id: 'editor.setVisible', label: (a: SetVisibleArgs) => (a?.visible === false ? 'Hide' : 'Show'),
+    id: 'editor.setVisible', macro: true, label: (a: SetVisibleArgs) => (a?.visible === false ? 'Hide' : 'Show'),
     argsSchema: { paths: 'string', visible: 'boolean' },
     mcp: { tool: 'web_editor_set_visible', params: [req('paths'), req('visible', 'boolean')] },
   },
-  { id: 'editor.hide', label: 'Hide', argsSchema: { paths: 'string[]' }, shortcut: 'H' },
-  { id: 'editor.show', label: 'Show', argsSchema: { paths: 'string[]' }, shortcut: 'Shift+H' },
+  { id: 'editor.hide', macro: true, label: 'Hide', argsSchema: { paths: 'string[]' }, shortcut: 'H' },
+  { id: 'editor.show', macro: true, label: 'Show', argsSchema: { paths: 'string[]' }, shortcut: 'Shift+H' },
   {
-    id: 'editor.createEmpty', label: (a: CreateEmptyArgs) => (a?.parentPath ? 'Empty Child' : 'Empty at Root'),
+    id: 'editor.createEmpty', macro: true, label: (a: CreateEmptyArgs) => (a?.parentPath ? 'Empty Child' : 'Empty at Root'),
     argsSchema: { parentPath: 'string', name: 'string' },
     buttonKey: (a: CreateEmptyArgs) => (a?.parentPath ? 'qe.empty-child' : 'qe.empty-root'),
     mcp: { tool: 'web_editor_create_empty', params: [opt('parentPath'), opt('name')] },
   },
   {
-    id: 'editor.groupIntoEmpty', label: 'Group into Empty', argsSchema: { paths: 'string[]' },
+    id: 'editor.groupIntoEmpty', macro: true, label: 'Group into Empty', argsSchema: { paths: 'string[]' },
     buttonKey: () => 'qe.group-into-empty',
   },
   {
-    id: 'editor.reparent', label: 'Reparent', argsSchema: { paths: 'string', newParentPath: 'string' },
+    id: 'editor.reparent', macro: true, label: 'Reparent', argsSchema: { paths: 'string', newParentPath: 'string' },
     mcp: { tool: 'web_editor_reparent', params: [req('paths'), opt('newParentPath')] },
+  },
+  // plan-641 Phase 3: registry-only (reached via web_execute / web_batch — no new MCP tool).
+  {
+    id: 'editor.clone', macro: true, label: 'Clone', argsSchema: { path: 'string', name: 'string', parentPath: 'string' },
+  },
+  {
+    id: 'editor.reorder', macro: true, label: 'Reorder', argsSchema: { path: 'string', index: 'number' },
   },
 
   // ── Components / kinematics ──
   {
-    id: 'editor.addComponent', label: (a: AddComponentArgs) => `Add ${a?.type ?? 'component'}`,
+    id: 'editor.addComponent', macro: true, label: (a: AddComponentArgs) => `Add ${a?.type ?? 'component'}`,
     argsSchema: { path: 'string', type: 'string', propsJson: 'string' },
     buttonKey: (a: AddComponentArgs) => `qe.add-${lower(a?.type)}`,
     mcp: { tool: 'web_editor_add_component', params: [req('path'), req('type'), opt('propsJson')] },
   },
   {
-    id: 'editor.removeComponent', label: 'Remove component', argsSchema: { path: 'string', componentType: 'string' },
+    id: PHYSICS_ZONE2D_ADD_COMMAND, macro: true,
+    label: (a: PhysicsZone2DAddArgs) => `Add 2D Physics Zone${a?.kind ? ` (${a.kind})` : ''}`,
+    undoLabel: 'Add 2D Physics Zone',
+    argsSchema: { path: 'string', kind: 'string', propsJson: 'string' },
+  },
+  {
+    id: PHYSICS_ZONE2D_SET_REFERENCES_COMMAND, macro: true, label: 'Set 2D Physics Zone references',
+    undoLabel: 'Set 2D Physics Zone references',
+    argsSchema: { path: 'string', surface: 'string', guides: 'string[]', kinematicDrives: 'string[]' },
+  },
+  {
+    id: 'editor.removeComponent', macro: true, label: 'Remove component', argsSchema: { path: 'string', componentType: 'string' },
     mcp: { tool: 'web_editor_remove_component', params: [req('path'), req('componentType')] },
   },
   {
-    id: 'editor.setField', label: 'Set field',
+    id: 'editor.setField', macro: true, label: 'Set field',
     argsSchema: { path: 'string', componentType: 'string', fieldName: 'string', valueJson: 'string' },
     // The Inspector row of the field IS the button (inspector-field-touch.ts):
     // the MCP choreography hovers/presses it and leaves the afterglow on it.
@@ -368,24 +478,24 @@ const SPECS: readonly Spec[] = [
   },
   // ── Signals / Logic Steps (Quick Edit; plan-499 Phase 4) ──
   {
-    id: 'editor.addSignal', label: (a: AddSignalArgs) => `Add ${a?.sigType ?? 'signal'}`,
+    id: 'editor.addSignal', macro: true, label: (a: AddSignalArgs) => `Add ${a?.sigType ?? 'signal'}`,
     argsSchema: { parentPath: 'string', sigType: 'string', name: 'string' },
     buttonKey: (a: AddSignalArgs) => `qe.signal-${String(a?.sigType ?? '')}`,
     mcp: { tool: 'web_editor_add_signal', params: [req('parentPath'), req('sigType'), opt('name')] },
   },
   {
-    id: 'editor.convertSignal', label: (a: ConvertSignalArgs) => `To ${a?.target ?? ''}`,
+    id: 'editor.convertSignal', macro: true, label: (a: ConvertSignalArgs) => `To ${a?.target ?? ''}`,
     argsSchema: { path: 'string', target: 'string' },
     buttonKey: (a: ConvertSignalArgs) => `qe.signal-to-${lower(a?.target)}`,
     mcp: { tool: 'web_editor_convert_signal', params: [req('path'), req('target')] },
   },
   {
-    id: 'editor.toggleSignalDirection', label: 'Flip signal direction', argsSchema: { path: 'string' },
+    id: 'editor.toggleSignalDirection', macro: true, label: 'Flip signal direction', argsSchema: { path: 'string' },
     buttonKey: () => 'qe.signal-flip',
     mcp: { tool: 'web_editor_toggle_signal_direction', params: [req('path')] },
   },
   {
-    id: 'editor.signalSetField',
+    id: 'editor.signalSetField', macro: true,
     label: (a: SignalSetFieldArgs) => `Set signal ${a?.field ?? 'field'}`,
     undoLabel: 'Edit signal',
     argsSchema: { path: 'string', field: 'string', value: 'string' },
@@ -397,8 +507,11 @@ const SPECS: readonly Spec[] = [
       params: [req('path'), req('field'), opt('value')],
     },
   },
+  // plan-641: deliberately NOT `macro: true` — the binding lives in CONNECT, not in the
+  // document's op log, so a recorded line would always classify `noop` and never replay.
   {
     id: 'editor.signalSetBinding',
+    toolClass: 'signal',
     label: (a: SignalSetBindingArgs) => (a?.remove ? 'Remove PLC binding' : 'Set PLC binding'),
     argsSchema: {
       name: 'string', interfaceId: 'string', topic: 'string',
@@ -414,6 +527,7 @@ const SPECS: readonly Spec[] = [
   },
   {
     id: SIGNALS_CREATE_FROM_INTERFACE_COMMAND,
+    macro: true,
     label: 'Create model signals',
     undoLabel: 'Create model signals',
     // `names` follows the `paths` convention: a list in the UI, a separated string on the wire.
@@ -429,6 +543,7 @@ const SPECS: readonly Spec[] = [
   // the implementation resolves the document through `signalRenameEnvironmentFor`.
   {
     id: SIGNAL_RENAME_COMMAND,
+    macro: true,
     label: (a: SignalRenameArgs) => (a?.dryRun ? 'Preview signal rename' : 'Rename signal'),
     undoLabel: 'Rename signal',
     scope: 'none',
@@ -450,46 +565,46 @@ const SPECS: readonly Spec[] = [
     mcp: { tool: 'web_editor_signal_rename_recheck', params: [req('journalId')] },
   },
   {
-    id: 'editor.addLogicStep', label: (a: AddLogicStepArgs) => `Add ${String(a?.stepType ?? 'LogicStep').replace('LogicStep_', '')}`,
+    id: 'editor.addLogicStep', macro: true, label: (a: AddLogicStepArgs) => `Add ${String(a?.stepType ?? 'LogicStep').replace('LogicStep_', '')}`,
     argsSchema: { path: 'string', stepType: 'string' },
     buttonKey: (a: AddLogicStepArgs) => `qe.logic-${String(a?.stepType ?? '')}`,
     mcp: { tool: 'web_editor_add_logic_step', params: [req('path'), req('stepType')] },
   },
   {
-    id: 'editor.createKinematic', label: 'Add Kinematic', argsSchema: { name: 'string' },
+    id: 'editor.createKinematic', macro: true, label: 'Add Kinematic', argsSchema: { name: 'string' },
     buttonKey: () => 'qe.add-kinematic',
     mcp: { tool: 'web_editor_create_kinematic', params: [opt('name')] },
   },
   {
-    id: 'editor.assignToKinematic', label: 'Assign to Kinematic', shortcut: 'K',
+    id: 'editor.assignToKinematic', macro: true, label: 'Assign to Kinematic', shortcut: 'K',
     argsSchema: { name: 'string', paths: 'string[]', requireExisting: 'boolean' },
   },
 
   // ── Groups (Quick Edit Groups section; plan-760 F13) ──
   {
-    id: GROUP_ASSIGN_COMMAND, label: 'Add to Group', argsSchema: { name: 'string', paths: 'string' },
+    id: GROUP_ASSIGN_COMMAND, macro: true, label: 'Add to Group', argsSchema: { name: 'string', paths: 'string' },
     buttonKey: () => 'qe.group-assign',
     mcp: { tool: 'web_editor_group_assign', params: [req('name'), opt('paths')] },
   },
   {
-    id: GROUP_REMOVE_COMMAND, label: 'Remove from Group', argsSchema: { name: 'string', paths: 'string' },
+    id: GROUP_REMOVE_COMMAND, macro: true, label: 'Remove from Group', argsSchema: { name: 'string', paths: 'string' },
     buttonKey: () => 'qe.group-remove',
     mcp: { tool: 'web_editor_group_remove', params: [req('name'), opt('paths')] },
   },
   {
-    id: GROUP_RENAME_COMMAND, label: 'Rename Group', argsSchema: { name: 'string', newName: 'string' },
+    id: GROUP_RENAME_COMMAND, macro: true, label: 'Rename Group', argsSchema: { name: 'string', newName: 'string' },
     buttonKey: () => 'qe.group-rename',
     mcp: { tool: 'web_editor_group_rename', params: [req('name'), req('newName')] },
   },
   {
-    id: GROUP_DISSOLVE_COMMAND, label: 'Dissolve Group', argsSchema: { name: 'string' },
+    id: GROUP_DISSOLVE_COMMAND, macro: true, label: 'Dissolve Group', argsSchema: { name: 'string' },
     buttonKey: () => 'qe.group-dissolve',
     mcp: { tool: 'web_editor_group_dissolve', params: [req('name')] },
   },
 
   // ── Materials ──
   {
-    id: 'editor.assignMaterial', label: 'Assign material',
+    id: 'editor.assignMaterial', macro: true, label: 'Assign material',
     argsSchema: {
       paths: 'string', presetId: 'string', color: 'string',
       metalness: 'number', roughness: 'number', opacity: 'number',
@@ -504,8 +619,15 @@ const SPECS: readonly Spec[] = [
     },
   },
   {
-    id: 'editor.materialize', label: 'Materialize', argsSchema: { assignmentsJson: 'string' },
+    id: 'editor.materialize', macro: true, label: 'Materialize', argsSchema: { assignmentsJson: 'string' },
     mcp: { tool: 'web_editor_materialize', params: [opt('assignmentsJson')] },
+  },
+  // plan-641 Phase 3: registry-only (reached via web_execute / web_batch — no new MCP tool).
+  {
+    id: 'editor.materialDefine', macro: true, label: (a: MaterialDefineArgs) => `Material ${a?.name ?? ''}`.trim(),
+    argsSchema: {
+      name: 'string', color: 'string', roughness: 'number', metalness: 'number', opacity: 'number', paths: 'string',
+    },
   },
 
   // ── History / selection ──
@@ -542,6 +664,42 @@ const SPECS: readonly Spec[] = [
       },
     } as CommandImpl<never, unknown>,
   },
+  {
+    // plan-766 F3: arms / disarms the transform gizmo. A tool state, not a
+    // document edit: no op, no undo. The store is private editor code, so the
+    // implementation lives in the private `editor-commands`.
+    id: TOGGLE_TRANSFORM_TOOL_COMMAND, label: 'Transform Tool', argsSchema: { on: 'boolean' }, shortcut: 'T',
+    buttonKey: () => 'editor.transform-tool',
+  },
+  {
+    // plan-650 Phase 5b: declared child families of a parametric family (Uses),
+    // one undo step incl. the regenerate. Registry-only (web_execute), open impl.
+    id: PARAMETRIC_USE_COMMAND, macro: true, label: (a: { remove?: boolean | null }) => (a?.remove ? 'Remove child family' : 'Use child family'),
+    undoLabel: 'Change child families',
+    argsSchema: { path: 'string', family: 'string', glbUrl: 'string', familyNodeId: 'string', docHash: 'string', assetPath: 'string', remove: 'boolean' },
+    openImpl: parametricUseImpl as CommandImpl<never, unknown>,
+  },
+  {
+    // plan-2227: Mode + unused slots cleared, one undo step (also behind editor.setField 'Mode').
+    id: 'signalConnector.setMode', macro: true,
+    label: (a: SignalConnectorSetModeArgs) => `Mode ${a?.mode ?? ''}`.trim(),
+    undoLabel: 'Set SignalConnector mode',
+    argsSchema: { path: 'string', mode: 'string', componentType: 'string' },
+    buttonKey: (a: SignalConnectorSetModeArgs) => inspectorFieldKey(String(a?.path ?? ''), String(a?.componentType ?? 'SignalConnector'), 'Mode'),
+    lazyImpl: async () => (await import('./signal-connector-commands')).signalConnectorSetModeImpl as CommandImpl<never, unknown>,
+  },
+  {
+    // plan-2227 R9: children Bit00… with one bit connector each, one undo step.
+    id: 'signalConnector.createBits', macro: true,
+    label: (a: SignalConnectorCreateBitsArgs) => `Create bit connectors${a?.mode ? ` (${a.mode})` : ''}`,
+    undoLabel: 'Create bit connectors',
+    argsSchema: {
+      path: 'string', mode: 'string', word: 'string', bits: 'string', signals: 'string[]',
+      width: 'string', signed: 'boolean', invert: 'boolean',
+    },
+    buttonKey: () => 'signal-connector.create-bits',
+    lazyImpl: async () => (await import('./signal-connector-commands')).signalConnectorCreateBitsImpl as CommandImpl<never, unknown>,
+  },
   { id: 'select.identical', label: 'Select identical', argsSchema: { seeds: 'string[]' }, shortcut: 'S>I' },
   { id: 'select.sameMaterial', label: 'Select same material', argsSchema: { seeds: 'string[]' }, shortcut: 'S>M' },
   { id: 'select.invert', label: 'Invert selection', argsSchema: { selected: 'string[]' }, shortcut: 'S>V' },
@@ -558,6 +716,8 @@ export function createEditorCommandDescriptors(opts: EditorDescriptorOptions): C
     id: s.id,
     label: s.label,
     readOnly: false,
+    ...(s.timeoutMs ? { timeoutMs: s.timeoutMs } : {}),
+    ...(s.toolClass ? { toolClass: s.toolClass } : {}),
     ...(s.shortcut ? { shortcut: s.shortcut } : {}),
     ...(s.undoLabel ? { undoLabel: s.undoLabel } : {}),
     scope: s.scope ?? 'editor',
@@ -565,10 +725,11 @@ export function createEditorCommandDescriptors(opts: EditorDescriptorOptions): C
     unavailableReason: ERR_EDITOR_UNAVAILABLE,
     ...(s.buttonKey ? { buttonKey: s.buttonKey } : {}),
     ...(s.mcp ? { mcp: s.mcp } : {}),
+    ...(s.macro ? { macro: true } : {}),
     argsSchema: s.argsSchema,
     impl: s.openImpl
       ? () => Promise.resolve(s.openImpl as CommandImpl<never, unknown>)
-      : implOf(s.id),
+      : s.lazyImpl ?? implOf(s.id),
   }));
 }
 
@@ -639,11 +800,13 @@ export const SHORTCUT_BRANCHES: readonly BindingBranch[] = [
   { when: { keys: 'CTRL+Y' }, id: 'editor.redo', args: () => ({ count: 1 }) },
   { when: { keys: 'ESCAPE' }, id: 'selection.clear', args: () => ({}) },
   // The key flips; an agent passes arg "on" / "off" to set it deterministically.
-  { when: { keys: 'SHIFT+Z' }, id: 'editor.wireframe', args: (w) => ({ on: wireframeArg(w['arg']) }), buttonKey: 'editor.wireframe' },
+  { when: { keys: 'SHIFT+Z' }, id: 'editor.wireframe', args: (w) => ({ on: onOffArg(w['arg']) }), buttonKey: 'editor.wireframe' },
+  // plan-766 F3 — the transform tool, same on/off/flip arg as Shift+Z.
+  { when: { keys: 'T' }, id: TOGGLE_TRANSFORM_TOOL_COMMAND, args: (w) => ({ on: onOffArg(w['arg']) }), buttonKey: 'editor.transform-tool' },
 ];
 
-/** `arg` of the SHIFT+Z shortcut: "on"/"off" (also true/false, 1/0); anything else = flip. */
-function wireframeArg(arg: unknown): boolean | null {
+/** `arg` of the SHIFT+Z / T shortcuts: "on"/"off" (also true/false, 1/0); anything else = flip. */
+function onOffArg(arg: unknown): boolean | null {
   const v = str(arg).trim().toLowerCase();
   if (v === 'on' || v === 'true' || v === '1') return true;
   if (v === 'off' || v === 'false' || v === '0') return false;

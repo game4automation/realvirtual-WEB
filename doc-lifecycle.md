@@ -113,7 +113,7 @@ loaded GLB. `viewer.loadScene(scene)` wraps it for the Scene/Op-Log workflow.
 | 5 | **Load gate** | `await this.loadGate` (set by e.g. login flow) | — |
 | 6 | **GLB parse + bake** | `loadGLB(url, scene, { overlay, … })` — the six-step pipeline below | — |
 | 7 | **Shader pre-compile** | `renderer.compileAsync()` against the render target the frame draws into (the composer's offscreen target when post-processing is on — a program variant is keyed on it). No frame renders until the programs are linked. | — |
-| 8 | **State assignment** | `currentModel`, `drives`, `transportManager`, `signalStore`, `playback`, `replayRecordings`, `logicEngine`, `registry`, `groups` are set | — |
+| 8 | **State assignment** | `currentModel`, `drives`, `transportManager`, `signalStore`, `playback`, `replayRecordings`, `registry`, `groups` are set; the model's LogicSteps join `logicEngine` here when the document places nothing — otherwise on this load's `placements-materialized` (see the note below) | — |
 | 9 | **Wire subsystems** | Source-markers binding, `ComponentEventDispatcher`, `AutoFilterRegistry`, `SelectionManager.init()`, `RaycastManager`, isolation gate, core context-menu items | — |
 | 9b | **Async BVH kickoff** | The three-mesh-bvh build for the remaining raycast geometry (collision, transport, instance pick — NOT baked chunks, which got their pick structure inside the bake) starts in the background (one reused worker across loads; time-sliced inline fallback when no `Worker` is available). The load does NOT wait for it | — |
 | 10 | **Plugin notification** | Every enabled plugin gets `onModelLoaded(result, viewer)` | `onModelLoaded` |
@@ -122,6 +122,37 @@ loaded GLB. `viewer.loadScene(scene)` wraps it for the Scene/Op-Log workflow.
 | 12b | **Shader pre-compile, second pass** | Same as step 7 for the variants plugins and listeners introduced (e.g. toon materials); already-linked programs are reused. Per-material clipping cannot be pre-compiled by three, so the Section tool binds its planes on first use, not at load. | — |
 | 13 | **Drain async** | `await whenLoadingIdle()` — env-map IBL, deferred prefetch, etc. | — |
 | 14 | **Resolve** | `loadModel` promise resolves with `LoadResult` | — |
+
+> **When the main model's LogicSteps are built (plan-769 Phase 6).** `loadGLB` builds
+> no logic and `LoadResult` carries no engine. A step resolves its targets once, when
+> it is built, and a step of the main document may address content of a placed asset
+> (`<p>#<id>`, `<p>/<b>#<id>`) that does not exist before the placements have
+> materialised. So the viewer builds the document's steps ONCE against the complete
+> scene, through the function a placement uses (`mergePlacedLogic`: engine created
+> lazily, started with the current connection state, then `addSubtree`):
+>
+> - a document without deferred references → in step 8, as always (before
+>   `onModelLoaded` and `'model-loaded'`, the engine is there when `loadModel` resolves);
+> - a document with placements → on this load's `placements-materialized`, which fires
+>   before any `whenSceneReady()` continuation. Until then the simulation is held anyway
+>   (`installPlacementsSimHold`), so only the moment of resolution moved.
+>
+> That moment has one name: `viewer.whenModelLogicBuilt()` — per load, resolved right where
+> the document's steps are merged (at once when already built, at the settle, or at
+> `activateGatedLogic()`), so its continuation runs before any `whenSceneReady()`
+> continuation of the same settle. A superseded load or `clearModel` releases it without
+> a build (callers guard with their own load generation). `'model-logic-activated'` only
+> means the component logic is bound — code that needs the document's steps (e.g. the PLC
+> plugin suppressing a replaced root) awaits `whenModelLogicBuilt()`.
+>
+> The trust gate is unchanged: a gated model builds its steps at `activateGatedLogic()`
+> (at once when its placements already settled, else at the settle). A load overtaken by
+> a newer load or `clearModel` builds nothing. Placement content is never part of this
+> merge — every placement brings its own steps (merged at its integration, or held by the
+> gate), and `RVLogicEngine.addSubtree` skips placement roots below the subtree root.
+> Removing or replacing a placement later does not rebuild the main model's steps: a step
+> that addressed it points nowhere until the next load (D21). The embed facade does the
+> same after its awaited materialisation.
 
 #### Step 6 in detail — `load → prepare → bake → drop → place → init` (plan-754)
 
@@ -204,6 +235,9 @@ Phase 2 — clear planner placements + sweep orphans
 Phase 3 — loadModel(url, { overlay })          ← emits 'model-loaded'
 Phase 4 — planner.applyPlacements(...)
 Phase 4b — keep planner authoring floor hidden
+Phase 4b-removals — authored nodes removed persistently (before added nodes)
+Phase 4c — op-created nodes (e.g. inserted IK waypoints), then IK paths re-resolved
+Phase 4d — persisted node transforms (dragged IK waypoints on base-GLB nodes)
 Phase 5 — whenLoadingIdle() again              ← in case step 4 queued work
         emit 'scene-loaded'
 ```
@@ -211,10 +245,14 @@ Phase 5 — whenLoadingIdle() again              ← in case step 4 queued work
 **Two events fire per scene load**, in this order:
 
 1. `'model-loaded'` — base GLB is parsed, components built, plugins notified
-2. `'scene-loaded'` — overlay edits + placements applied, scene fully ready
+2. `'scene-loaded'` — overlay edits applied and placement records handed over
 
-Subscribers that need the **final** placed-out world (e.g. per-scene camera
-presets, scene-aware HMI overlays) should listen to `'scene-loaded'`.
+`'scene-loaded'` does **not** mean every placement is drawn: since plan-757 the
+`PlacementInstancer` materialises placed references asynchronously, often after
+this event. Code that needs the **final** placed-out world awaits
+`viewer.whenSceneReady()` (no load in flight AND `placements.state === 'idle'`;
+event form `placements-materialized`). Per-scene settings that only need the
+scene record (e.g. camera presets) can keep listening to `'scene-loaded'`.
 Subscribers that only need the GLB and its `rv_extras` (e.g. raw signal
 wiring, drive lists) can use `'model-loaded'`.
 
@@ -308,6 +346,31 @@ Two further lifecycle notes:
 Nothing about this state is persisted; see [doc-persistence.md](doc-persistence.md)
 §7.3. Feature overview: [doc-webviewer.md](doc-webviewer.md) → *Pending
 placements (Planner)*.
+
+### 3.5 On-demand features in the load and mode paths (plan-652)
+
+The Editor and DES are declared at startup and activated on first use
+(full description: [doc-extending-webviewer.md](doc-extending-webviewer.md#on-demand-features--the-featureloader-plan-652)).
+Three places in the lifecycle know about it:
+
+- **Load.** Right after the naming scan, `loadGLB` collects the component types
+  of the document (extras, overlay nodes) and awaits every feature with a
+  matching `component:` trigger — before any component is constructed. The
+  placement instancer does the same for each library asset (template types
+  ∪ override types; a cache hit asks again, which is free once active). An
+  abort during the scan rejects with `LoadAbortedError` as usual; a failed
+  activation discards the load (root and composition disposed, the scene stays
+  as it was) and leaves a `feature-load-failed:<id>` Problems entry with Retry.
+- **Plugin registration during a load.** A feature activated mid-load
+  registers its plugins with `viewer.use()` while the load runs.
+  `clearModel()` has already dropped the previous load result, so there is no
+  retroactive `onModelLoaded` with the OLD model — the new plugin receives the
+  regular `onModelLoaded` of the model being loaded, exactly once.
+- **Mode switch.** A switch into a lazy mode passes the mode's enter guard,
+  which loads the feature first; the `mode-changing` / `mode-changed` events
+  and `onModeActivate` fire only after the feature is active, once, with the
+  correct `from` / `to`. A failed load emits no mode event — the old mode
+  stays. Exit guards run before enter guards; a vetoed exit loads nothing.
 
 ---
 
@@ -483,10 +546,22 @@ is a state machine `idle → preparing → running → restoring → idle` (plus
    caller must, or a drive-drag/jog preview pose bakes into the result.
 5. The exported blob is the test input **and** the restore snapshot.
 6. `loadModel(blob)` with default options → real drives, signals, LogicSteps.
-7. `runtime.beginEditorTest()`.
+7. `joinScenePlacements(viewer, …)` ([`rv-authoring-load.ts`](src/core/editor/rv-authoring-load.ts),
+   plan-769 Phase 7) — the export keeps the reference nodes EMPTY, so the placed
+   assets materialise after `loadModel` and their drives, signals and logic
+   arrive with them. The start waits for them with the same join (time budget,
+   `placements-still-loading` entry, supersede verdict) the restore uses. A
+   budget that runs out is reported and the run starts anyway; a document
+   switch during the join aborts the start (`idle`, lock released, nothing
+   attached). The blob URL is revoked after the join.
+8. `runtime.beginEditorTest()`, then `running`.
+
+MCP `web_editor_test_start` answers with the state reached, `ok` only for
+`running`, the drive count and the placement progress (`total` / `pending` /
+`missing`) — placements still loading or missing are reported, not a failure.
 
 `stop()` reverses it: `endEditorTest()`, overlay, `loadModel(blob, {
-preserveHierarchy: true })`, then `doc.restoreFromSnapshot(state)` — which sets
+preserveHierarchy: true })` with the same join (`loadAuthoringModel`), then `doc.restoreFromSnapshot(state)` — which sets
 op log, redo stack, baseline ids and the rename flag **without replaying
 anything**. Replay would re-apply ops that `markSaved` already baked into the
 base and turn a clean document dirty.
@@ -599,9 +674,11 @@ Steps in order:
 7. `raycastManager.dispose()`, drop the instance pick index and the highlight
    proxy provider
 8. Drop source-markers / vanishing-MU subscriptions
-9. `transportManager.reset()` then null it **before** scene traverse
-   (MUs share geometry with templates by reference); `statisticsManager.clear()`;
-   drop the simulation kernel
+9. `simulationKernel.dispose()` FIRST (plan-647 R3-1: cancels a running DES
+   FastForward synchronously — its drain loop would otherwise keep driving the
+   old model after its next yield), then `transportManager.reset()` and null it
+   **before** scene traverse (MUs share geometry with templates by reference);
+   `statisticsManager.clear()`; drop the simulation kernel
 10. `collisionManager.clear()`, `lampManager.clear()`, `energyChainManager.clear()`
     — these restore material clones / original meshes **before** the geometry teardown
 11. Sweep all `_rvModelRoot`-tagged children from the scene; dispose
@@ -613,6 +690,24 @@ Steps in order:
 13. Dispose `gizmoManager`; `resetSlotAuthority()` (unconditional — drops slot
     claims, slot↔channel indexes and the live-control gate); reset overlay producers
 14. Emit `'model-cleared'`
+15. `resetTrafficRegistries()` (plan-647, `core/engine/rv-traffic-registries.ts`) —
+    empties the AGV traffic world: path network, zones (with declarations and
+    claims), spacing controller, dock registry, both movement authorities (with
+    the continuous event clock) and the fleet HANDLES; fleet subscribers and
+    all other listeners stay.
+
+**Why the traffic reset is the LAST step.** The traffic registries are
+module-wide singletons, not owned by the model, and `clearModel()` has no
+general component dispose — without step 15 the next model routed over the
+paths of the previous one (LOP #214). The order matters: the `'model-cleared'`
+emit runs the behaviour teardowns synchronously (Agv: fleet unregister,
+authority unregister, zone `releaseAll`, spacing), and they release their own
+entries against still-filled registries. Only afterwards does the reset drop
+what no teardown owned (paths, zone declarations, plugin docks, waiters, the
+clock). `loadModel()` continues only after `clearModel()` returned, so the next
+model always starts on empty registries. The embed's
+`resetEmbedEngineRegistries()` and the test helper `clearShared()` call the same
+function; `resetSimulation()` does not (the model and its paths stay).
 
 The `SimulationLoop` keeps running. `onFixedUpdate` is still called but has
 no drives/transport to advance.
@@ -708,6 +803,99 @@ too. Non-DES scenes never produce run events.
 | `clearModel()` | gone | gone | gone | gone | kept | kept | kept |
 | `loadModel(newUrl)` | replaced | replaced | replaced | replaced | kept | kept | kept |
 | `dispose()` | gone | gone | gone | gone | gone | gone | gone |
+
+### 6.4 Kernel switch continuous ↔ DES (plan-648)
+
+`SimulationKernel.setMode(m)` is Reset-on-Switch, and it hands the vehicle ids
+over explicitly (doc-path-fleet-control.md §11):
+
+1. `old.clearMUs()` — the outgoing MUs go;
+2. `old.suspend()` — the outgoing executor releases every vehicle id its
+   instances own and drops its planner state (DES: FastForward stopped first,
+   the queue cleared last, after the releases);
+3. `setActiveTrafficKernel(m)`;
+4. `incoming.start()` — its vehicle instances restart from the start pose and
+   acquire their ids;
+5. `_active` / `_mode` committed, then `onModeChanged` →
+   `'simulation-mode-changed'`.
+
+**Failure:** when step 4 throws, the half-started incoming executor is
+suspended, the active traffic kernel is restored in a `finally` (a throwing
+suspend cannot skip it), and the old executor is started again. The old mode is
+then functional from its start state — it does not continue where it was (its
+MUs and, for DES, its queue were already cleared in step 1).
+
+While DES is the active kernel, `resetSimulation()` does not touch the
+continuous Agv bindings (they are muted), and the DES runner resets its own
+instances; the reverse holds in continuous mode. `clearModel()` resets the
+active traffic kernel to `null`; the next kernel built for the new model sets
+`'continuous'`.
+
+### 6.5 DES lifecycle service and callback scheduler (plan-645)
+
+A plugin that binds to a DES run listens to the **kernel**, not to a guess
+built from viewer events: `viewer.simulationKernel.onDesLifecycle(fn, { replay: true })`.
+Every event is `{ type, generation, runnerId }`; the generation is the runner's
+own counter (+1 per event — never an entity id, those keep growing per reset).
+
+| Outer path | Events, in order |
+|---|---|
+| first start (`start`, `setMode('des')`) | `bound` |
+| `reset()`, `rebindScene()` | `reset` → `bound` |
+| `clearMUs()` from bound | `reset` |
+| kernel switch out (`clearMUs` → `suspend` → `clearMUs`) | `reset` (once) |
+| `restoreFull`, full `restoreJson`, checkpoint restore | `restored` (no state change) |
+| restore that throws before any change (missing snapshot, AGV guard, legacy manager-only `restoreJson` — refused since plan-2058) | — |
+| `dispose()` | `reset` (if bound) → `disposed`; a second dispose is silent |
+
+Delivery rules (L1 / R2-1): **ending** events (`reset`, `disposed`) arrive
+synchronously **before** the runner tears its instances down, also inside
+`setMode` — tear your runtime down there and do not call `desControl()` (the
+event carries what you need). **Activating** events (`bound`) are held back
+during `setMode` until `_active` / `_mode` committed, so a `bound` listener sees
+the new mode and `desControl() !== null`; a failed switch drops them. `replay`
+delivers the current `bound` to a late subscriber (in DES mode only). Dispatch is
+synchronous over a copy of the listener list; a throwing listener is logged and
+does not stop the others. A runner without the service (older private build)
+never emits — `kernel.hasDesLifecycle()` tells, keep the fallback then (S9).
+
+`desControl().scheduleCallback(t, fn)` runs `fn` once at sim time `t` as a
+`DES.Callback` queue event (exact order with the model events, FastForward too);
+`cancelCallback(h)` drops it, a handle of an older generation is ignored.
+Callbacks are **not persistable**: snapshots never contain them (nor the legacy
+`PalletYard.Clock` events), and every lifecycle event drops the pending ones —
+after `restored`, plan again.
+
+#### When the runner re-binds (plan-645 L4/L5, plan-687)
+
+A DES run is bound to a **scene generation**: `viewer.sceneGeneration` counts
+every piece of material-flow layout content that was placed or removed, and
+`rebindScene()` drops the scene-discovered instances and discovers the scene
+anew. A rebind restarts the run at t = 0 (same semantics as the path verbs of
+plan-453) — it is never incremental. These are the triggers, and there are no
+others:
+
+| What changed | When the runner re-binds |
+|---|---|
+| the references of a load | at `placements-materialized` — ONCE per load, and only while the runner has not served the current generation (a repeated event rebinds once, an aborted load not at all) |
+| a planner drop / delete while the instancer is idle | after the synchronous burst, as ONE coalesced rebind (microtask — works while the sim is paused) |
+| a runtime placement after the load (`materializeDeferred` via MCP, a plugin, a `PlanningRegistry` structural reset), or the nested references of a dropped asset | at the instancer's transition back to `idle` — everything that landed before that idle shares ONE rebind |
+| content added in continuous mode | not at all; the generation moves on and the next `setMode('des')` binds instead of reusing the stale instance set |
+| a document change / abort mid-materialisation | not at all — the debt lapses (`total === 0` at the idle, plus `model-cleared`) |
+
+There is **no time debouncing**: two removals 20 ms apart are two rebinds. That
+is correct, only redundant; bundling changes over time is what plan-681's
+`structuralEdit` transaction is for. Internally all of this runs through ONE
+funnel (`_scheduleDesRebind` in `rv-viewer.ts`), and what is skipped while the
+instancer materialises — or while a transaction withholds rebinds — is recorded
+as a single owed rebind that the next idle (or the transaction's close) redeems.
+Every delivery re-checks the kernel identity, the mode, `isDesRestoring()` and
+`served >= target`, so no trigger can bind twice or bind a scene that is gone.
+
+Diagnostics: `trafficListenerStats().zoneListeners` (`rv-traffic-registries.ts`)
+counts the zone registry's availability subscribers, which survive
+`resetTrafficRegistries()` by design — a runtime that was never disposed shows up
+as a growing count between runs (plan-645 N3, the cause of plan-648 §9.3b).
 
 ---
 

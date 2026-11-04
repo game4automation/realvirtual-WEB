@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../../../core/rv-safe-storage';
+
 /**
  * AlarmHistoryDialog — Operator-note history for one alarm.
  *
@@ -24,7 +26,7 @@ export const OPERATOR_NAME_KEY = 'rv-operator-name';
 /** Read the remembered operator name. Never throws (private mode etc.). */
 export function loadOperatorName(): string {
   try {
-    return localStorage.getItem(OPERATOR_NAME_KEY) ?? '';
+    return readLocalStorage(OPERATOR_NAME_KEY) ?? '';
   } catch {
     return '';
   }
@@ -33,7 +35,7 @@ export function loadOperatorName(): string {
 /** Remember the operator name for the next note. Never throws. */
 export function saveOperatorName(name: string): void {
   try {
-    localStorage.setItem(OPERATOR_NAME_KEY, name);
+    writeLocalStorage(OPERATOR_NAME_KEY, name);
   } catch { /* storage unavailable — name simply not remembered */ }
 }
 

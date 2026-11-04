@@ -19,6 +19,15 @@
  *
  * The report shown here is the one the CONNECT plugin keeps in `reconcileReports` (debounced), so
  * the badge, the Problems panel and `web_signal_reconcile` can never disagree.
+ *
+ * ## Address sources (plan-2025 F11 / F12)
+ *
+ * A second line offers the two ways to put addresses into CONNECT in bulk, by CAPABILITY rather than
+ * by protocol: **Fill addresses from controller** wherever the gateway says the worker can browse
+ * (`supportsDiscovery`), and **Import address table** for every interface. The legacy seed sits on
+ * its own line below, labelled as such, and only where it means something (S7, PLCSIM) — it is a
+ * migration path, not an address source, and it is decided by `legacyAdoptProtocolOf`, not by the
+ * capability that decides Fill.
  */
 
 import { useState, useSyncExternalStore, useCallback } from 'react';
@@ -29,11 +38,16 @@ import {
   subscribeConnectStore,
   getConnectSnapshot,
   applyAutoMap,
-  autoMapProtocolOf,
+  legacyAdoptProtocolOf,
+  getConnectOpsSupport,
+  getSignalSchema,
   isModelManagedInterfaceType,
   reconcileInterfaces,
+  CONNECT_OPS_REQUIRED_MESSAGE,
   type ConnectInterface,
 } from './connect-store';
+import { supportsFillAddresses } from '../import/rv-fill-addresses';
+import { AddressTableImportDialog, FillAddressesDialog } from './ConnectAddressSourceDialogs';
 import { collectModelPlcSignals } from '../import/rv-plc-automap';
 import {
   creatablePlcOnly,
@@ -118,6 +132,8 @@ export function ConnectAutoMapSection({ iface }: { iface: ConnectInterface }) {
   const viewer = useViewer();
   const snap = useSyncExternalStore(subscribeConnectStore, getConnectSnapshot);
   const [error, setError] = useState<string | null>(null);
+  const [fillOpen, setFillOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
 
   const check = useCallback(() => {
     setError(null);
@@ -153,7 +169,10 @@ export function ConnectAutoMapSection({ iface }: { iface: ConnectInterface }) {
   }, [viewer, iface.id]);
 
   if (isModelManagedInterfaceType(iface.type)) return null;
-  const legacyProtocol = autoMapProtocolOf(iface.type);
+  const legacyProtocol = legacyAdoptProtocolOf(iface.type);
+  const canFill = supportsFillAddresses(getSignalSchema(iface.type), false);
+  // An older CONNECT (no write core): the address sources need FillEmpty and the end-state check.
+  const opsMissing = getConnectOpsSupport() === false;
   const busy = !!snap.autoMapBusy;
   const problems = report
     ? RECONCILE_CATEGORIES.filter((c) => WARN.has(c)).reduce((n, c) => n + report.counts[c], 0)
@@ -192,7 +211,35 @@ export function ConnectAutoMapSection({ iface }: { iface: ConnectInterface }) {
             </span>
           </Tooltip>
         )}
-        {legacyProtocol && (
+      </Box>
+      <Box data-testid="connect-address-sources" sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mt: 0.25 }}>
+        <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.6)', flex: 1 }}>Addresses</Typography>
+        {canFill && (
+          <Tooltip title={opsMissing ? CONNECT_OPS_REQUIRED_MESSAGE
+            : 'Browse the controller and fill in the address of every model signal whose name is exactly a controller symbol. Existing addresses are kept; you confirm a preview first.'}>
+            <span>
+              <Button size="small" variant="outlined" disabled={busy || opsMissing} onClick={() => setFillOpen(true)}
+                data-testid="connect-fill-addresses"
+                sx={{ fontSize: 10, textTransform: 'none', minWidth: 0, py: 0, px: 0.75 }}>
+                Fill addresses from controller
+              </Button>
+            </span>
+          </Tooltip>
+        )}
+        <Tooltip title={opsMissing ? CONNECT_OPS_REQUIRED_MESSAGE
+          : 'Import a CSV / TSV table name;address[;dataType[;topic]] — every row is checked, valid rows are written in one batch.'}>
+          <span>
+            <Button size="small" disabled={busy || opsMissing} onClick={() => setImportOpen(true)}
+              data-testid="connect-import-address-table"
+              sx={{ fontSize: 10, textTransform: 'none', minWidth: 0, py: 0, px: 0.75 }}>
+              Import address table
+            </Button>
+          </span>
+        </Tooltip>
+      </Box>
+      {legacyProtocol && (
+        <Box data-testid="connect-legacy-adopt" sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mt: 0.25 }}>
+          <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', flex: 1 }}>Legacy migration</Typography>
           <Tooltip title="Seed missing addresses from the legacy sources (comment prefix, Unity Metadata). Merge-only: an address this interface already has is never overwritten, and nothing is removed.">
             <span>
               <Button size="small" disabled={busy} onClick={() => void adoptLegacy()}
@@ -201,8 +248,10 @@ export function ConnectAutoMapSection({ iface }: { iface: ConnectInterface }) {
               </Button>
             </span>
           </Tooltip>
-        )}
-      </Box>
+        </Box>
+      )}
+      {fillOpen && <FillAddressesDialog open={fillOpen} onClose={() => setFillOpen(false)} iface={iface} />}
+      {importOpen && <AddressTableImportDialog open={importOpen} onClose={() => setImportOpen(false)} iface={iface} />}
       {error && (
         <Typography sx={{ fontSize: 10, color: ISA_RED, lineHeight: 1.4 }}>{error}</Typography>
       )}

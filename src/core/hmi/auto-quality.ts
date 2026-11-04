@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * auto-quality — Automatic visual-quality selection for weak devices.
  *
@@ -94,11 +96,11 @@ export function chooseInitialQualityPreset(): ReturnType<typeof pickInitialPrese
 // ─── Once-per-device flag ──────────────────────────────────────────────────
 
 export function hasAutoQualityApplied(): boolean {
-  try { return localStorage.getItem(AUTO_QUALITY_APPLIED_KEY) === '1'; } catch { return false; }
+  return readLocalStorage(AUTO_QUALITY_APPLIED_KEY) === '1';
 }
 
 export function markAutoQualityApplied(): void {
-  try { localStorage.setItem(AUTO_QUALITY_APPLIED_KEY, '1'); } catch { /* private mode */ }
+  writeLocalStorage(AUTO_QUALITY_APPLIED_KEY, '1');
 }
 
 // ─── User notice (consumed by AutoQualityDialog) ───────────────────────────

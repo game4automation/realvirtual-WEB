@@ -24,7 +24,8 @@ export function AiActivityOverlay() {
   const theme = useTheme();
 
   // Text only while connected AND interacting — the icon is the activity-bar button.
-  if (!mcp.connected || !activity) return null;
+  // plan-668: only while AI control is on — a connected CONNECT channel alone is no AI.
+  if (!mcp.connected || !(mcp.aiEnabled ?? mcp.enabled) || !activity) return null;
 
   // Accent-colored pill beside the AI icon (accent = bridge active / AI working).
   // Uses the theme accent so custom branding recolors it too — matching the
@@ -39,7 +40,7 @@ export function AiActivityOverlay() {
         pointerEvents: 'none',
         px: 1,
         py: 0.5,
-        borderRadius: 1.5,
+        borderRadius: 1,
         bgcolor: alpha(accent, 0.95),
         border: `1px solid ${accent}`,
         boxShadow: '0 2px 10px rgba(0,0,0,0.4)',

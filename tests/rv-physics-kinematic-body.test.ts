@@ -88,6 +88,8 @@ class FakeBody implements RapierRigidBody {
   // Snapshot, not reference: the provider hands out module-lifetime scratch.
   setNextKinematicTranslation(t: RapierVec3): void { this.nextTranslations.push({ ...t }); }
   setNextKinematicRotation(r: RapierQuat): void { this.nextRotations.push({ ...r }); }
+  setSoftCcdPrediction(_distance: number): void { /* not under test here */ }
+  setRotation(_r: RapierQuat, _wake: boolean): void { /* not under test here */ }
 }
 
 type BodyKind = 'dynamic' | 'fixed' | 'kinematicVelocity' | 'kinematicPosition';
@@ -102,6 +104,9 @@ class FakeDesc implements RapierRigidBodyDesc {
   setRotation(q: RapierQuat): FakeDesc { this.rot = { ...q }; return this; }
   setLinvel(x: number, y: number, z: number): FakeDesc { this.vel = { x, y, z }; return this; }
   setCcdEnabled(e: boolean): FakeDesc { this.ccd = e; return this; }
+  /** plan-2219: soft-CCD look-ahead of the dynamic MU (recorded, not simulated). */
+  softCcd = 0;
+  setSoftCcdPrediction(d: number): FakeDesc { this.softCcd = d; return this; }
 }
 
 class FakeColliderDesc implements RapierColliderDesc {

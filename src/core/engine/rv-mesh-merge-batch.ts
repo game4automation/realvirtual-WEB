@@ -183,6 +183,49 @@ export const UBER_ARENA_LAYOUT: readonly ArenaAttrSpec[] = [
   { name: 'rmPacked', itemSize: 2 },
 ];
 
+/** Editor arena layout for the uber bucket (plan-766 §2.4.1): position and
+ *  normal only. Colour and roughness/metalness are PER INSTANCE in the editor
+ *  (batching colour texture + rm texture of `RVUberArenaMaterial`), so the
+ *  `color` / `rmPacked` slots of {@link UBER_ARENA_LAYOUT} would be dead bytes.
+ *  {@link UBER_ARENA_LAYOUT} itself stays the bake's layout and is pinned. */
+export const EDITOR_UBER_LAYOUT: readonly ArenaAttrSpec[] = [
+  { name: 'position', itemSize: 3 },
+  { name: 'normal', itemSize: 3 },
+];
+
+/** UV channel names a textured editor arena keeps (three's uv, uv1..uv3). */
+const EDITOR_UV_NAMES = ['uv', 'uv1', 'uv2', 'uv3'] as const;
+
+/**
+ * Editor arena layout for a TEXTURED material bucket (plan-766 §2.4.1):
+ * `position` + `normal`, every UV channel the geometry carries, `color` only
+ * when the material reads vertex colours, `tangent` only when it has a normal
+ * map. Anything else the source carries is stripped — the material never
+ * reads it, and one arena needs one uniform attribute set. Geometries that
+ * produce the same layout share an arena (see {@link arenaLayoutSignature}).
+ */
+export function editorTexturedLayoutOf(
+  geom: BufferGeometry,
+  material?: { vertexColors?: boolean; normalMap?: unknown } | null,
+): ArenaAttrSpec[] {
+  const out: ArenaAttrSpec[] = [
+    { name: 'position', itemSize: 3 },
+    { name: 'normal', itemSize: 3 },
+  ];
+  for (const name of EDITOR_UV_NAMES) {
+    const attr = geom.getAttribute(name);
+    if (attr) out.push({ name, itemSize: attr.itemSize });
+  }
+  if (material?.vertexColors && geom.getAttribute('color')) out.push({ name: 'color', itemSize: 3 });
+  if (material?.normalMap && geom.getAttribute('tangent')) out.push({ name: 'tangent', itemSize: 4 });
+  return out;
+}
+
+/** Stable signature of an arena layout (names + item sizes, in layout order). */
+export function arenaLayoutSignature(layout: readonly ArenaAttrSpec[]): string {
+  return layout.map((s) => `${s.name}:${s.itemSize}`).join('|');
+}
+
 /** Attribute-layout signature used to group textured geometries into
  *  same-arena batches (names + item sizes; indexed-ness is normalized away
  *  by {@link canonicalizeForArena}, which always emits indexed output). */

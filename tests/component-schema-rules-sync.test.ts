@@ -26,6 +26,8 @@ import {
   parseSpecRules,
 } from '../src/core/engine/rv-component-schema-info';
 import { allSchemas } from './helpers/mcp-schemas';
+import { CommandRegistry } from '../src/core/hmi/rv-command-registry';
+import { ensureEditorCommandsRegistered } from '../src/core/hmi/editor-command-descriptors';
 
 interface OdtProp {
   $ref?: string;
@@ -42,11 +44,39 @@ const F5_TYPES = ['Drive', 'Drive_Cylinder', 'Drive_Simple', 'Drive_Gear', 'Kine
 /** Identifiers that are neither schema names nor tools, used deliberately:
  *  the reference implementation's hierarchy walk and the serialization flag
  *  Section 7 defines for group entries. */
-const CODE_IDENTIFIERS = new Set(['findInParent', '_enabled']);
+const CODE_IDENTIFIERS = new Set([
+  'findInParent', '_enabled',
+  // Keys INSIDE the `WebOperatorPanel.Config` JSON document and the two value
+  // forms its rules quote (`--` is the empty readout, `signal * scale` the
+  // displayed expression). They are content of a blob field, not schema fields,
+  // so no `$def` can carry them — the rules still have to be able to name them.
+  'sliders', 'readouts', 'signals', 'componentLabels', 'decimals',
+  'min', 'max', 'step', 'signal', 'signal * scale', '--',
+]);
 const GROUP_KEY = /^Group_?(\d+|N)$/;
+
+/** Names of FOREIGN APIs a rule may quote. A rule sometimes states that a
+ *  behaviour deliberately matches a named API of another system, and naming it
+ *  is clearer than paraphrasing it. Only real, public API names of a system
+ *  realvirtual mirrors belong here, and each needs a reason — never a schema
+ *  field or enum value, which has to resolve through the checks above. */
+const EXTERNAL_APIS = new Set([
+  // plan-2047: raycast sensors mirror Unity's raycast semantics (spec § 7, Sensor).
+  'Physics.Raycast',
+]);
+
+/** Words a value EXPRESSION may use beside in-scope field names: maths helpers
+ *  and the local-axis vocabulary Section 7 writes its conventions in. An
+ *  expression is resolved identifier by identifier (see `knownToken`), so a
+ *  misspelled FIELD inside one is still reported. */
+const EXPRESSION_WORDS = new Set(['sign', 'forward']);
 
 const rules = parseSpecRules(specText);
 const toolNames = new Set(allSchemas().map((s) => s.name));
+// plan-2007: a rule may name a registry command (`editor.setField`) — the agent's door since the tools moved.
+const commandRegistryForRules = new CommandRegistry();
+ensureEditorCommandsRegistered(commandRegistryForRules);
+const commandIds = new Set(commandRegistryForRules.list().map((d) => d.id));
 
 /**
  * A bare field / enum token must belong to a type in scope: the section's own
@@ -57,9 +87,18 @@ const toolNames = new Set(allSchemas().map((s) => s.name));
 function knownToken(token: string, scope: readonly string[]): boolean {
   if (DEFS[token]) return true;
   if (GROUP_KEY.test(token) || CODE_IDENTIFIERS.has(token)) return true;
+  if (EXTERNAL_APIS.has(token)) return true;
   if (token.startsWith('web_')) return toolNames.has(token);
+  if (commandIds.has(token)) return true;
   const qualified = /^(\w+)\.(\w+)$/.exec(token);
   if (qualified) return !!DEFS[qualified[1]]?.properties?.[qualified[2]];
+  // A value expression (`-forward * sign(Angle) * Radius`) is resolved name by
+  // name instead of being allowlisted whole: every identifier in it must itself
+  // be known, so the gate keeps catching a typo in a field name.
+  if (/[*+\-/()]/.test(token)) {
+    const ids = [...token.matchAll(/[A-Za-z_]\w*/g)].map((m) => m[0]);
+    if (ids.length > 0 && ids.every((id) => EXPRESSION_WORDS.has(id) || knownToken(id, scope))) return true;
+  }
   return scope.some((type) => {
     const props = DEFS[type]?.properties ?? {};
     return !!props[token] || Object.values(props).some((p) => p.enum?.includes(token));
@@ -73,7 +112,11 @@ describe('specification.md rule annotations ↔ rv-odt.json (plan-517 §9.2)', (
     for (const raw of specText.split(/\r?\n/)) {
       const line = raw.trim();
       if (line.startsWith('#')) {
-        type = /^#### 7[a-g]\.\d+ (\S+)$/.exec(line)?.[1] ?? null;
+        // Second copy of HEADING_RE from rv-component-schema-info.ts — the
+        // letter suffix (`7a.11b`) must be accepted on BOTH sides: a product-only
+        // fix leaves this gate red, a test-only fix hides the product hole
+        // behind the `rules.has(type)` assertion below (plan-2047).
+        type = /^#### 7[a-g]\.\d+[a-z]? (\S+)$/.exec(line)?.[1] ?? null;
         continue;
       }
       if (line !== RULES_MARKER && line !== NOTES_MARKER) continue;
@@ -103,6 +146,21 @@ describe('specification.md rule annotations ↔ rv-odt.json (plan-517 §9.2)', (
       }
     }
     expect(unknown).toEqual([]);
+  });
+
+  // plan-2047 §9.5 — the two vocabulary additions above widen what a rule may
+  // name. They must not widen what a TYPO may be: the value of this gate is
+  // that it rejects a field name that does not exist.
+  it('external API names and value expressions pass, invented field names do not', () => {
+    expect(knownToken('Physics.Raycast', ['Sensor'])).toBe(true);
+    expect(knownToken('-forward * sign(Angle) * Radius', ['TransportGuided'])).toBe(true);
+    // Same expression, one field misspelled — still reported.
+    expect(knownToken('-forward * sign(Angel) * Radius', ['TransportGuided'])).toBe(false);
+    // A foreign API name that is not on the list stays unknown.
+    expect(knownToken('Physics.Spherecast', ['Sensor'])).toBe(false);
+    // A plain invented field name is unaffected by either addition.
+    expect(knownToken('TransportDirektion', ['TransportSurface'])).toBe(false);
+    expect(knownToken('Angle', ['TransportGuided'])).toBe(true);
   });
 
   it('the F5 types have at least one authoring rule', () => {

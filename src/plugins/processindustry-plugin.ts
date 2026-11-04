@@ -678,8 +678,16 @@ export class ProcessIndustryPlugin implements RVViewerPlugin {
    *  Falls back to a unique leaf-name match when the NodeRegistry path lookup
    *  fails — typically caused by Three.js GLTFLoader sibling-name dedup that
    *  makes the exporter-recorded path stale (e.g. `/Tanks/X` → `/Tanks_6/X`). */
-  private resolveTank(viewer: RVViewer, path: string | null): RVTank | null {
+  private resolveTank(viewer: RVViewer, path: string | null, owner: Object3D | null = null): RVTank | null {
     if (!path) return null;
+    // plan-769 Phase 1b: the path is a stored reference of `owner`'s file — its
+    // verdict names the node (no leaf guess); only a path the file does not
+    // carry keeps the lookups below.
+    const stored = this.storedEndpoint(viewer, path, owner);
+    if (stored !== undefined) {
+      const inst = stored?.userData._rvComponentInstance;
+      return inst instanceof RVTank ? inst : null;
+    }
     const node = viewer.registry?.getNode(path);
     if (node) {
       const inst = node.userData._rvComponentInstance;
@@ -693,8 +701,13 @@ export class ProcessIndustryPlugin implements RVViewerPlugin {
   }
 
   /** Resolve a ComponentRef path to an RVPipe instance, with leaf fallback. */
-  private resolvePipe(viewer: RVViewer, path: string | null): RVPipe | null {
+  private resolvePipe(viewer: RVViewer, path: string | null, owner: Object3D | null = null): RVPipe | null {
     if (!path) return null;
+    const stored = this.storedEndpoint(viewer, path, owner);
+    if (stored !== undefined) {
+      const inst = stored?.userData._rvComponentInstance;
+      return inst instanceof RVPipe ? inst : null;
+    }
     const node = viewer.registry?.getNode(path);
     if (node) {
       const inst = node.userData._rvComponentInstance;
@@ -725,19 +738,33 @@ export class ProcessIndustryPlugin implements RVViewerPlugin {
     if (!endpointPath) return null;
 
     // Try direct tank first (covers the common case and uses leaf-fallback).
-    const directTank = this.resolveTank(viewer, endpointPath);
+    const directTank = this.resolveTank(viewer, endpointPath, originPipe.node);
     if (directTank) return directTank;
 
     // Otherwise try to resolve to a neighbour Pipe and walk one hop.
-    const neighbour = this.resolvePipe(viewer, endpointPath);
+    const neighbour = this.resolvePipe(viewer, endpointPath, originPipe.node);
     if (neighbour && neighbour !== originPipe) {
-      const neighbourSrc = this.resolveTank(viewer, neighbour.sourcePath);
+      const neighbourSrc = this.resolveTank(viewer, neighbour.sourcePath, neighbour.node);
       if (neighbourSrc) return neighbourSrc;
-      const neighbourDst = this.resolveTank(viewer, neighbour.destinationPath);
+      const neighbourDst = this.resolveTank(viewer, neighbour.destinationPath, neighbour.node);
       if (neighbourDst) return neighbourDst;
     }
 
     // ProcessingUnit, deeper chains, or genuinely unresolvable → give up.
+    return null;
+  }
+
+  /**
+   * plan-769 Phase 1b: the node a stored endpoint reference of `owner` names by its
+   * file's verdict; `null` = the file says "no node" (final); `undefined` = not a
+   * reference of the file (no owner / registry / identity, or written this session).
+   */
+  private storedEndpoint(viewer: RVViewer, path: string, owner: Object3D | null): Object3D | null | undefined {
+    const registry = viewer.registry;
+    if (!owner || !registry) return undefined;
+    const r = registry.readStoredRef(owner, path);
+    if (r.status === 'resolved') return r.node;
+    if (r.status === 'legacy') return undefined;
     return null;
   }
 
@@ -834,9 +861,9 @@ export class ProcessIndustryPlugin implements RVViewerPlugin {
     for (const pipe of this.pipes) {
       for (const path of [pipe.sourcePath, pipe.destinationPath]) {
         if (!path) continue;
-        const tank = this.resolveTank(viewer, path);
+        const tank = this.resolveTank(viewer, path, pipe.node);
         if (tank) { addEdge(pipe.node.uuid, tank.node.uuid); continue; }
-        const neighbour = this.resolvePipe(viewer, path);
+        const neighbour = this.resolvePipe(viewer, path, pipe.node);
         if (neighbour && neighbour !== pipe) {
           addEdge(pipe.node.uuid, neighbour.node.uuid);
           continue;
@@ -849,7 +876,7 @@ export class ProcessIndustryPlugin implements RVViewerPlugin {
     // belongs to the medium of the pipe it drives, so this is a hard edge.
     for (const pump of this.pumps) {
       if (!pump.pipePath) continue;
-      const pipe = this.resolvePipe(viewer, pump.pipePath);
+      const pipe = this.resolvePipe(viewer, pump.pipePath, pump.node);
       if (pipe) addEdge(pump.node.uuid, pipe.node.uuid);
     }
 

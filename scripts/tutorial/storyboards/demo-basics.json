@@ -1,0 +1,64 @@
+{
+  "$schema": "rv-tutorial/1",
+  "id": "demo-basics",
+  "title": "realvirtual WEB — demo basics: look around, zoom, pause, drives",
+  "url": "/?doc=doc_demorealvirtualweb_7l7hfw&mode=hmi",
+  "viewport": { "width": 1920, "height": 1080 },
+  "welcome": "dismiss",
+  "ready": "#rv-viewport",
+  "minStepSec": 2,
+  "setup": [
+    { "type": "waitFor", "scene": true, "doc": "rvproject:DemoRealvirtualWeb.glb", "timeoutMs": 60000 }
+  ],
+  "steps": [
+    {
+      "id": "overview",
+      "holdSec": 2,
+      "actions": [
+        { "type": "wait", "ms": 1000 }
+      ]
+    },
+    {
+      "id": "orbit",
+      "holdSec": 1,
+      "actions": [
+        { "type": "drag", "button": "right", "from": { "x": 1000, "y": 550 }, "to": { "x": 1250, "y": 620 }, "durationMs": 2000 }
+      ]
+    },
+    {
+      "id": "zoom-in",
+      "holdSec": 2.5,
+      "actions": [
+        { "type": "camera", "position": [3.9, 3.6, 3.4], "target": [0.62, 1.1, 0.4], "durationSec": 1.5 }
+      ]
+    },
+    {
+      "id": "pause",
+      "holdSec": 2,
+      "actions": [
+        { "type": "press", "key": "Space" }
+      ]
+    },
+    {
+      "id": "resume",
+      "holdSec": 2,
+      "actions": [
+        { "type": "press", "key": "Space" }
+      ]
+    },
+    {
+      "id": "drives-panel",
+      "holdSec": 3,
+      "actions": [
+        { "type": "click", "target": { "selector": "button[aria-label=\"Drives\"]" } }
+      ]
+    },
+    {
+      "id": "zoom-out",
+      "holdSec": 1.5,
+      "actions": [
+        { "type": "camera", "position": [7.13, 5.89, 6.64], "target": [0.62, 1.23, 0.13], "durationSec": 1.5 }
+      ]
+    }
+  ]
+}

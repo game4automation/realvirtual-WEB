@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * Multiuser settings persisted in localStorage.
  *
@@ -61,7 +63,7 @@ export function saveMultiuserSettings(settings: MultiuserSettings): void {
   // not enforce one, and multiuser settings are user-identity (display name,
   // role) rather than visual/runtime settings. Keep behavior unchanged.
   try {
-    localStorage.setItem(LS_KEY, JSON.stringify(settings));
+    writeLocalStorage(LS_KEY, JSON.stringify(settings));
   } catch {
     /* quota exceeded — silently ignore */
   }

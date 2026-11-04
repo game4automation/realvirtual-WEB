@@ -65,7 +65,14 @@ import {
 import { MM_TO_METERS, NO_AO_LAYER } from './rv-constants';
 import { RVRibbonBandMesh, RIBBON_BAND_SAMPLE_STRIDE } from './rv-ribbon-band-mesh';
 import { RVRibbonWinder } from './rv-ribbon-winder';
-import { RVRibbonRoller, axisVector, type RibbonRollerLike, type RibbonSideSign } from './rv-ribbon-roller';
+import {
+  RVRibbonRoller,
+  axisVector,
+  publishRibbonSlot,
+  type RibbonRollerLike,
+  type RibbonSideSign,
+} from './rv-ribbon-roller';
+import { slotDeclare, slotUndeclare } from './rv-slot-io';
 import {
   buildRibbonSegments,
   sampleArcLength,
@@ -602,6 +609,13 @@ export class RVRibbonPath implements RVComponent {
     this._errors = context.errorStore ?? null;
     this._sortKey = nodePathOf(this.node);
     this._alarmPath = NodeRegistry.computeNodePath(this.node);
+    // Unwired feedback slots stay bindable in the viewer (SlotIO).
+    slotDeclare(this, 'TensionN', 'feedback');
+    slotDeclare(this, 'SpecificTensionNPerM', 'feedback');
+    slotDeclare(this, 'StrainPercent', 'feedback');
+    slotDeclare(this, 'IsSlack', 'feedback', { initial: false });
+    slotDeclare(this, 'IsOverstretched', 'feedback', { initial: false });
+    slotDeclare(this, 'IsBroken', 'feedback', { initial: false });
     // Like `RVChain`: wait for `onSceneReady()` where the loader has one, because
     // the Kinematic re-parenting pass runs between init and onSceneReady and a
     // roller may still move.
@@ -1574,31 +1588,30 @@ export class RVRibbonPath implements RVComponent {
     // The hysteresis on the force is expressed in the SAME unit as the one on
     // the tension per unit width, so a wide and a narrow web are equally chatty.
     const forceEpsilon = SIGNAL_EPSILON_N_PER_M * (this.RibbonWidthMm / 1000);
-    if (typeof this.TensionN === 'string' && movedBy(tensionN, this._lastTensionN, forceEpsilon)) {
+    // The change memory runs for wired AND directly bound slots alike.
+    if (movedBy(tensionN, this._lastTensionN, forceEpsilon)) {
       this._lastTensionN = tensionN;
-      write(this.TensionN, tensionN);
+      publishRibbonSlot(this, 'TensionN', this.TensionN, tensionN, write);
     }
-    if (typeof this.SpecificTensionNPerM === 'string'
-      && movedBy(nPerM, this._lastNPerM, SIGNAL_EPSILON_N_PER_M)) {
+    if (movedBy(nPerM, this._lastNPerM, SIGNAL_EPSILON_N_PER_M)) {
       this._lastNPerM = nPerM;
-      write(this.SpecificTensionNPerM, nPerM);
+      publishRibbonSlot(this, 'SpecificTensionNPerM', this.SpecificTensionNPerM, nPerM, write);
     }
-    if (typeof this.StrainPercent === 'string'
-      && movedBy(strainPercent, this._lastStrainPercent, SIGNAL_EPSILON_STRAIN_PERCENT)) {
+    if (movedBy(strainPercent, this._lastStrainPercent, SIGNAL_EPSILON_STRAIN_PERCENT)) {
       this._lastStrainPercent = strainPercent;
-      write(this.StrainPercent, strainPercent);
+      publishRibbonSlot(this, 'StrainPercent', this.StrainPercent, strainPercent, write);
     }
-    if (typeof this.IsSlack === 'string' && slack !== this._lastSlack) {
+    if (slack !== this._lastSlack) {
       this._lastSlack = slack;
-      write(this.IsSlack, slack);
+      publishRibbonSlot(this, 'IsSlack', this.IsSlack, slack, write);
     }
-    if (typeof this.IsOverstretched === 'string' && over !== this._lastOver) {
+    if (over !== this._lastOver) {
       this._lastOver = over;
-      write(this.IsOverstretched, over);
+      publishRibbonSlot(this, 'IsOverstretched', this.IsOverstretched, over, write);
     }
-    if (typeof this.IsBroken === 'string' && broken !== this._lastBroken) {
+    if (broken !== this._lastBroken) {
       this._lastBroken = broken;
-      write(this.IsBroken, broken);
+      publishRibbonSlot(this, 'IsBroken', this.IsBroken, broken, write);
     }
   }
 
@@ -2277,6 +2290,7 @@ export class RVRibbonPath implements RVComponent {
   }
 
   dispose(): void {
+    slotUndeclare(this);
     this.setEditorBandPreview(false);
     this.setEditorPreview(false);
     this._overlay?.dispose();

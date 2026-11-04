@@ -30,7 +30,7 @@ import {
   ToggleButtonGroup,
   Typography,
 } from '@mui/material';
-import { SceneConfirmDialog } from '../hmi/scene/rv-scene-confirm-dialog';
+import { GUARD_Z_OFFSET, SceneConfirmDialog } from '../hmi/scene/rv-scene-confirm-dialog';
 import { getSceneStore } from '../hmi/scene/scene-store-singleton';
 import {
   getProjectStore,
@@ -76,7 +76,10 @@ export function ProjectConflictDialog({
   }, [items]);
 
   return (
-    <Dialog open={open} onClose={() => onResolve(choices)} maxWidth="sm" fullWidth>
+    <Dialog open={open} onClose={() => onResolve(choices)} maxWidth="sm" fullWidth
+      // Raised for the same reason as the switch guard below: it can open
+      // during a project open, under the dashboard's progress dialog.
+      sx={{ zIndex: theme => theme.zIndex.modal + GUARD_Z_OFFSET }}>
       <DialogTitle sx={{ fontSize: 14, fontWeight: 600 }}>
         {items.length === 1 ? 'This scene has changed in two places' : 'These scenes have changed in two places'}
       </DialogTitle>
@@ -242,6 +245,7 @@ export function ProjectDialogHost() {
         onSaveAs={() => { void onGuardSave(); }}
         onDiscard={() => { void onGuardDiscard(); }}
         onCancel={() => finishGuard('cancel')}
+        aboveModals
       />
     </>
   );

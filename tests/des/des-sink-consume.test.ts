@@ -19,15 +19,15 @@
  *  - `totalProcessed` counts throughput;
  *  - the event queue drains (no permanent block).
  *
- * Runs only in the private build (imports `@rv-private/plugins/des/*`).
+ * Imports `@rv/plugins/des/*` — DES is core code since plan-680.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Object3D, Mesh, BoxGeometry } from 'three';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
-import { _resetDesHookCache } from '@rv-private/plugins/des/des-hook-adapter';
-import { resetDESMUCounter } from '@rv-private/plugins/des/rv-des-mu';
-import type { MaterialFlowAdapter } from '@rv-private/plugins/des/material-flow-adapter';
+import { DESRunner } from '@rv/plugins/des/des-runner';
+import { _resetDesHookCache } from '@rv/plugins/des/des-hook-adapter';
+import { resetDESMUCounter } from '@rv/plugins/des/rv-des-mu';
+import type { MaterialFlowAdapter } from '@rv/plugins/des/material-flow-adapter';
 import { ConveyorFlow } from '../../src/behaviors/Conveyor';
 import Source from '../../src/behaviors/Source';
 import Sink from '../../src/behaviors/Sink';

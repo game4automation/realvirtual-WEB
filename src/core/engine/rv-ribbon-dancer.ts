@@ -39,7 +39,8 @@ import {
   setComponentInstance,
 } from './rv-component-registry';
 import { MM_TO_METERS } from './rv-constants';
-import { RVRibbonRoller, axisVector, type RibbonAxis } from './rv-ribbon-roller';
+import { RVRibbonRoller, axisVector, publishRibbonSlot, type RibbonAxis } from './rv-ribbon-roller';
+import { slotDeclare, slotUndeclare } from './rv-slot-io';
 import {
   accumulate,
   clampTravel,
@@ -235,6 +236,11 @@ export class RVRibbonDancer extends RVRibbonRoller {
     super.init(context);
     this._gizmos = context.gizmoManager ?? null;
     this._initDancer();
+    // Unwired feedback slots stay bindable in the viewer (SlotIO).
+    slotDeclare(this, 'PositionMm', 'feedback');
+    slotDeclare(this, 'AtMin', 'feedback', { initial: false });
+    slotDeclare(this, 'AtMax', 'feedback', { initial: false });
+    slotDeclare(this, 'TensionN', 'feedback');
   }
 
   // -- The travel track -----------------------------------------
@@ -545,24 +551,24 @@ export class RVRibbonDancer extends RVRibbonRoller {
     // `NaN` is the "never written" marker, and `Math.abs(x - NaN) > eps` is
     // FALSE — so the first write has to be its own case, or the PLC would never
     // see the initial position at all.
+    // The change memory runs for wired AND directly bound slots alike.
     const p = this.positionMm;
-    if (typeof this.PositionMm === 'string' && changedBy(p, this._lastPositionMm)) {
+    if (changedBy(p, this._lastPositionMm)) {
       this._lastPositionMm = p;
-      write(this.PositionMm, p);
+      publishRibbonSlot(this, 'PositionMm', this.PositionMm, p, write);
     }
-    if (typeof this.AtMin === 'string' && this._atMin !== this._lastAtMin) {
+    if (this._atMin !== this._lastAtMin) {
       this._lastAtMin = this._atMin;
-      write(this.AtMin, this._atMin);
+      publishRibbonSlot(this, 'AtMin', this.AtMin, this._atMin, write);
     }
-    if (typeof this.AtMax === 'string' && this._atMax !== this._lastAtMax) {
+    if (this._atMax !== this._lastAtMax) {
       this._lastAtMax = this._atMax;
-      write(this.AtMax, this._atMax);
+      publishRibbonSlot(this, 'AtMax', this.AtMax, this._atMax, write);
     }
     const t = this.tensionN;
-    if (typeof this.TensionN === 'string'
-      && (!Number.isFinite(this._lastTensionN) || Math.abs(t - this._lastTensionN) > SIGNAL_EPSILON_N)) {
+    if (!Number.isFinite(this._lastTensionN) || Math.abs(t - this._lastTensionN) > SIGNAL_EPSILON_N) {
       this._lastTensionN = t;
-      write(this.TensionN, t);
+      publishRibbonSlot(this, 'TensionN', this.TensionN, t, write);
     }
   }
 
@@ -601,6 +607,7 @@ export class RVRibbonDancer extends RVRibbonRoller {
   }
 
   override dispose(): void {
+    slotUndeclare(this);
     this.setEditorPreview(false);
     this._disposeTrack();
     this._disposeLabel();

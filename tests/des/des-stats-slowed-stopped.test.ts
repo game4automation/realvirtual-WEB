@@ -20,10 +20,10 @@ import { getDefaultPathNetwork } from '../../src/core/engine/rv-path-network';
 import { getDefaultAgvFleet } from '../../src/core/engine/rv-agv-fleet';
 import { getDefaultMovementAuthority } from '../../src/core/engine/rv-movement-authority';
 import { StateStatistics } from '../../src/core/material-flow/rv-state-statistics';
-import { DESComponent } from '@rv-private/plugins/des/rv-des-component';
-import { drawStateStackBar } from '@rv-private/plugins/des/hmi/des-stats-gizmos';
-import { DES_STATE_STACK } from '@rv-private/plugins/des/hmi/des-stat-colors';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
+import { DESComponent } from '@rv/plugins/des/rv-des-component';
+import { drawStateStackBar } from '@rv/plugins/des/hmi/des-stats-gizmos';
+import { DES_STATE_STACK } from '@rv/plugins/des/hmi/des-stat-colors';
+import { DESRunner } from '@rv/plugins/des/des-runner';
 import { TICK, makeHost, makeAgvRoot, bindDes, clearShared } from '../helpers/agv-harness';
 
 beforeEach(() => clearShared());
@@ -179,6 +179,6 @@ describe('AGV statistics Slowed / Stopped (plan-558 §9.9)', () => {
     expect(fills.every((w) => Number.isFinite(w))).toBe(true);
     expect(fills.reduce((a, b) => a + b, 0)).toBeCloseTo(100, 6);
     expect(DES_STATE_STACK.map((e) => e.label)).toEqual(
-      ['Working', 'Transport', 'Slowed', 'Setup', 'Blocked', 'Stopped', 'Empty', 'Failure']);
+      ['Working', 'Charging', 'Transport', 'Slowed', 'Setup', 'Blocked', 'Stopped', 'Empty', 'Failure']); // Charging: plan-612
   });
 });

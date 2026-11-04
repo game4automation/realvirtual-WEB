@@ -20,7 +20,9 @@
  * NodeRegistry, ContextMenuStore and transport manager.
  */
 
+import { executeDelegateValue } from './helpers/execute-value';
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
+import { queryValue } from './helpers/query-value';
 import { BoxGeometry, Mesh, MeshBasicMaterial, Object3D, PerspectiveCamera, Scene, Vector3 } from 'three';
 import { AABB } from '../src/core/engine/rv-aabb';
 import { RVMovingUnit } from '../src/core/engine/rv-mu';
@@ -342,15 +344,16 @@ describe('MCP web_mu_delete / web_mu_move (F7, SOL #12)', () => {
 
   it('web_transport_status lists the ids the two tools take', async () => {
     const { h, pallet, clone } = setup();
-    const status = JSON.parse(await tools(h).webTransportStatus()) as { mus: { id: number; name: string }[] };
+    const status = JSON.parse(await queryValue(h.viewer, 'transport.status')) as { mus: { id: number; name: string }[] };
     const ids = status.mus.map((m) => m.id);
     expect(ids).toEqual(expect.arrayContaining([pallet.id, clone.id]));
   });
 
   it('web_mu_delete removes by id; a load id addresses its carrier', async () => {
     const { h, pallet } = setup();
-    const res = JSON.parse(await tools(h).webMuDelete(pallet.loadedMus[0].id)) as Record<string, unknown>;
-    expect(res['ok']).toBe(true);
+    const res = JSON.parse(await executeDelegateValue(tools(h), 'mu.delete', { id: pallet.loadedMus[0].id })) as Record<string, unknown>;
+    // plan-2007: the old alias added ok:true; the command value carries the payload only.
+    expect(res['error']).toBeUndefined();
     expect(res['id']).toBe(pallet.id);
     expect(res['preplaced']).toBe(true);
     expect(h.tm.mus).not.toContain(pallet);
@@ -359,12 +362,12 @@ describe('MCP web_mu_delete / web_mu_move (F7, SOL #12)', () => {
   it('unknown id and wrong workspace are refused; nothing changes', async () => {
     const { h, pallet } = setup();
     const before = h.tm.mus.length;
-    const unknown = JSON.parse(await tools(h).webMuDelete(999999)) as Record<string, unknown>;
+    const unknown = JSON.parse(await executeDelegateValue(tools(h), 'mu.delete', { id: 999999 })) as Record<string, unknown>;
     expect(unknown['error']).toBe(muNotFound(999999));
     h.setMode('hmi');
-    const wrong = JSON.parse(await tools(h).webMuDelete(pallet.id)) as Record<string, unknown>;
+    const wrong = JSON.parse(await executeDelegateValue(tools(h), 'mu.delete', { id: pallet.id })) as Record<string, unknown>;
     expect(wrong['error']).toBe(REASON_MODE);
-    const wrongMove = JSON.parse(await tools(h).webMuMove(pallet.id, 6, 0, 0)) as Record<string, unknown>;
+    const wrongMove = JSON.parse(await executeDelegateValue(tools(h), 'mu.move', { id: pallet.id, x: 6, y: 0, z: 0 })) as Record<string, unknown>;
     expect(wrongMove['error']).toBe(REASON_MODE);
     expect(h.tm.mus.length).toBe(before);
     expect(pallet.node.position.x).toBeCloseTo(0, 6);
@@ -372,18 +375,18 @@ describe('MCP web_mu_delete / web_mu_move (F7, SOL #12)', () => {
 
   it('web_mu_move sets the carrier onto the named surface; an occupied spot is refused unchanged', async () => {
     const { h, clone, pallet } = setup();
-    const ok = JSON.parse(await tools(h).webMuMove(clone.id, 6, 0, 0, 'BeltB')) as Record<string, unknown>;
-    expect(ok['ok']).toBe(true);
+    const ok = JSON.parse(await executeDelegateValue(tools(h), 'mu.move', { id: clone.id, x: 6, y: 0, z: 0, surface: 'BeltB' })) as Record<string, unknown>;
+    expect(ok['error']).toBeUndefined();
     expect(ok['surface']).toBe('BeltB');
     clone.updateAABB();
     expect(clone.aabb.center.x).toBeCloseTo(6, 6);
 
     const before = pallet.node.position.clone();
-    const occupied = JSON.parse(await tools(h).webMuMove(pallet.id, 6, 0, 0)) as Record<string, unknown>;
+    const occupied = JSON.parse(await executeDelegateValue(tools(h), 'mu.move', { id: pallet.id, x: 6, y: 0, z: 0 })) as Record<string, unknown>;
     expect(String(occupied['error'])).toMatch(/occupied/);
     expect(pallet.node.position.equals(before)).toBe(true);
 
-    const noSurface = JSON.parse(await tools(h).webMuMove(clone.id, 6, 0, 0, 'Nope')) as Record<string, unknown>;
+    const noSurface = JSON.parse(await executeDelegateValue(tools(h), 'mu.move', { id: clone.id, x: 6, y: 0, z: 0, surface: 'Nope' })) as Record<string, unknown>;
     expect(noSurface['error']).toBe('Transport surface "Nope" not found');
   });
 });

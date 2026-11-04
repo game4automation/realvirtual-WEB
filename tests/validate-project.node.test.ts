@@ -20,7 +20,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { validateProject } from '../scripts/validate-project.mjs';
+import { KNOWN_WORKSPACE_MODES, validateProject } from '../scripts/validate-project.mjs';
 
 let root: string;
 
@@ -394,5 +394,91 @@ describe('known top-level folders', () => {
     const result = validateProject(dir);
     expect(result.warnings.some(w => /Unrecognised top-level folder "local"/.test(w))).toBe(false);
     expect(result.warnings.some(w => /Unrecognised top-level folder "whatever"/.test(w))).toBe(true);
+  });
+});
+
+/** plan-640 §9.4 — `settings.start`, the hosted start document. */
+describe('settings.start (plan-640)', () => {
+  const withStart = (start: unknown) =>
+    project({ ...BASE, kind: 'customer', documents: [doc()], settings: { start } }, ['models/a.glb']);
+  const startErrors = (r: { errors: string[] }) => r.errors.filter(e => e.includes('settings.start'));
+
+  it('accepts a start document named by id, by path or by its unique file name', () => {
+    for (const document of ['doc_a', 'models/a.glb', 'a.glb']) {
+      const result = validateProject(withStart({ document, mode: 'hmi' }));
+      expect(startErrors(result), document).toEqual([]);
+      expect(result.ok, document).toBe(true);
+    }
+  });
+
+  it('is silent without a start (the D14 default)', () => {
+    const result = validateProject(project({ ...BASE, kind: 'customer', documents: [doc()], settings: { defaultModel: 'a.glb' } },
+      ['models/a.glb']));
+    expect(startErrors(result)).toEqual([]);
+    expect(result.warnings.filter(w => w.includes('settings.start'))).toEqual([]);
+  });
+
+  it('fails a start document that names no document', () => {
+    const result = validateProject(withStart({ document: 'doc_missing', mode: 'hmi' }));
+    expect(result.ok).toBe(false);
+    expect(startErrors(result).some(e => e.includes('"doc_missing"'))).toBe(true);
+  });
+
+  it('fails a malformed start', () => {
+    expect(validateProject(withStart('doc_a')).ok).toBe(false);
+    expect(validateProject(withStart({ mode: 'hmi' })).ok).toBe(false);
+  });
+
+  it('only warns about a non-string mode', () => {
+    const result = validateProject(withStart({ document: 'doc_a', mode: 3 }));
+    expect(result.ok).toBe(true);
+    expect(result.warnings.some(w => w.includes('settings.start.mode'))).toBe(true);
+  });
+});
+
+describe('documents[].modes — per-document mode restriction', () => {
+  const withModes = (over: Record<string, unknown>) =>
+    project({ ...BASE, documents: [doc(over)] }, ['models/a.glb']);
+  const modeErrors = (r: { errors: string[] }) => r.errors.filter(e => e.includes('"mode'));
+
+  it('pins the known mode ids to what main.ts and the asset editor register', () => {
+    expect([...KNOWN_WORKSPACE_MODES].sort())
+      .toEqual(['commissioning', 'des', 'editor', 'hmi', 'planner', 'viewer']);
+  });
+
+  it('accepts known modes with a default among them', () => {
+    const r = validateProject(withModes({ modes: ['commissioning', 'viewer'], mode: 'commissioning' }));
+    expect(modeErrors(r)).toEqual([]);
+  });
+
+  it('accepts modes without a default', () => {
+    expect(modeErrors(validateProject(withModes({ modes: ['viewer'] })))).toEqual([]);
+  });
+
+  it('rejects an unknown mode name', () => {
+    const r = validateProject(withModes({ modes: ['commissioning', 'hmii'] }));
+    expect(r.ok).toBe(false);
+    expect(r.errors.some(e => e.includes('unknown mode "hmii"'))).toBe(true);
+  });
+
+  it('rejects listing the editor, which is always available', () => {
+    const r = validateProject(withModes({ modes: ['editor'] }));
+    expect(r.ok).toBe(false);
+    expect(r.errors.some(e => e.includes('must not list "editor"'))).toBe(true);
+  });
+
+  it('rejects an empty or non-array modes', () => {
+    expect(validateProject(withModes({ modes: [] })).ok).toBe(false);
+    expect(validateProject(withModes({ modes: 'viewer' })).ok).toBe(false);
+  });
+
+  it('rejects a default that is not one of the modes', () => {
+    const r = validateProject(withModes({ modes: ['commissioning', 'viewer'], mode: 'hmi' }));
+    expect(r.ok).toBe(false);
+    expect(r.errors.some(e => e.includes('"mode" "hmi" is not one of its "modes"'))).toBe(true);
+  });
+
+  it('leaves a row without modes alone (its own mode stays unchecked)', () => {
+    expect(modeErrors(validateProject(withModes({ mode: 'whatever' })))).toEqual([]);
   });
 });

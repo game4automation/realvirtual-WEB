@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { bumpModelEditEpoch, modelEditEpoch } from '../engine/rv-model-edit-epoch';
 /**
  * rv-command-registry — ONE definition per user action (plan-499).
  *
@@ -27,6 +28,7 @@
  */
 
 import type { RVViewer } from '../rv-viewer';
+import type { McpToolClassName } from '../engine/rv-mcp-tools';
 import type { AssetDocument } from '../editor/rv-asset-document';
 import { getActiveAssetContext } from '../editor/active-asset-store';
 import {
@@ -61,8 +63,10 @@ export type CommandScope = 'editor' | 'none';
 export type CommandArgType = 'string' | 'number' | 'boolean' | 'string[]' | 'number[]';
 
 export interface CommandContext {
+  /** Cooperative cancellation supplied by the caller. */
+  readonly signal?: AbortSignal;
   readonly viewer: RVViewer;
-  /** Active asset document, null for commands with scope 'none'. */
+  /** The document open in the editor, null for commands with scope 'none'. */
   readonly doc: AssetDocument | null;
   /** Selection snapshot — captured at the EARLIEST step of the call (bridge: call begin). */
   readonly selection: readonly string[];
@@ -84,6 +88,14 @@ export interface CommandImpl<A = unknown, R = unknown> {
   /** THE one availability rule — tooltip AND tool result. Formulated on the ARGS. */
   enabled(ctx: CommandContext, args: A): CommandEnabled;
   run(ctx: CommandContext, args: A): R | Promise<R>;
+  /**
+   * plan-641 M4 — turn the args into EXPLICIT values against a captured context:
+   * every "null = take it from the selection", every default, every trim the
+   * implementation would apply silently. A replay of the result must do the
+   * same thing whatever is selected then. Pure and synchronous, no side effects.
+   * MANDATORY for a command whose descriptor says `macro: true`.
+   */
+  resolveArgs?(ctx: CommandContext, args: A): A;
 }
 
 /** MCP mirror of a 1:1 tool — checked against the decorator by the parity gate. */
@@ -100,6 +112,12 @@ export interface CommandDescriptor<A = unknown, R = unknown> {
   /** Full chord for badge and MCP table: 'S>I', 'H', 'Shift+H', 'Ctrl+Z'. */
   readonly shortcut?: string;
   readonly readOnly: boolean;
+  /** Above the 120 s web_execute timeout, execution automatically runs as a job. */
+  readonly timeoutMs?: number;
+  /** The implementation honours ctx.signal for cooperative cancellation. */
+  readonly cancellable?: boolean;
+  /** CONNECT class override where the derived command class would be wrong. */
+  readonly toolClass?: McpToolClassName;
   readonly destructive?: boolean;
   /** Goes 1:1 into `doc.withTransaction(label)` by the implementation. */
   readonly undoLabel?: string | ((args: A) => string);
@@ -123,7 +141,19 @@ export interface CommandDescriptor<A = unknown, R = unknown> {
    * the direct call it replaces. `impl` must resolve the same object.
    */
   readonly eagerImpl?: CommandImpl<A, R>;
+  /**
+   * plan-641 — the command changes the DOCUMENT (model), so an MCP call of it is
+   * recorded as a macro line. Requires `readOnly: false` and an implementation
+   * with `resolveArgs`, and `run()` must resolve only after the change is
+   * applied (M8). Runtime / view / selection / history commands never carry it.
+   */
+  readonly macro?: boolean;
 }
+
+/** Result of {@link CommandRegistry.prepare}: the resolved args, or why the command cannot run. */
+export type PrepareResult<A = unknown> =
+  | { readonly ok: true; readonly args: A; readonly resolved: boolean }
+  | { readonly ok: false; readonly reason: string; readonly kind: ExecuteFailureKind };
 
 /** Early capture of the call's context (bridge: at call begin, before any wait). */
 export interface CapturedContext {
@@ -132,6 +162,8 @@ export interface CapturedContext {
 }
 
 export interface ExecuteOptions {
+  /** Cooperative cancellation forwarded to the command context. */
+  readonly signal?: AbortSignal;
   readonly origin: CommandOrigin;
   readonly buttonKey?: string;
   /** Viewer override; default is the attached viewer, then the active asset context's. */
@@ -140,7 +172,7 @@ export interface ExecuteOptions {
   readonly context?: CapturedContext;
 }
 
-export type ExecuteFailureKind = 'disabled' | 'unknown' | 'invisible' | 'unavailable' | 'stale' | 'threw';
+export type ExecuteFailureKind = 'disabled' | 'unknown' | 'invisible' | 'unavailable' | 'stale' | 'threw' | 'commercial-feature';
 
 export type ExecuteResult<R = unknown> =
   | { readonly ok: true; readonly value: R }
@@ -177,6 +209,24 @@ export class CommandError extends Error {
 type AnyDescriptor = CommandDescriptor<unknown, unknown>;
 type AnyImpl = CommandImpl<unknown, unknown>;
 type ContextOrRefusal = CommandContext | { readonly error: string; readonly kind: ExecuteFailureKind };
+
+const commercialPrefixes = new Map<string, string>();
+export function registerCommercialPrefix(prefix: string, reason: string): () => void {
+  commercialPrefixes.set(prefix, reason);
+  return () => { if (commercialPrefixes.get(prefix) === reason) commercialPrefixes.delete(prefix); };
+}
+const commercialReason = 'experiment manager is a commercial module (realvirtual Commercial)';
+registerCommercialPrefix('experiment.', commercialReason);
+// plan-2208b B4: checkpoint autosave of a live run (des.checkpoints.set, des.checkpoint.list/.load)
+// belongs to the experiment manager since plan-2211 F1. Only unknown ids reach this table, so the
+// core des.* commands are unaffected.
+registerCommercialPrefix('des.checkpoint', 'live checkpoints are part of the experiment manager, a commercial module (realvirtual Commercial)');
+function unknownFailure(id: string): Extract<ExecuteResult, { ok: false }> {
+  for (const [prefix, reason] of commercialPrefixes) {
+    if (id.startsWith(prefix)) return { ok: false, kind: 'commercial-feature', reason, details: { module: 'des-experiments' } };
+  }
+  return { ok: false, kind: 'unknown', reason: `Unknown command: ${id}` };
+}
 
 export class CommandRegistry {
   private readonly _descs = new Map<string, { desc: AnyDescriptor; gen: number }>();
@@ -275,13 +325,13 @@ export class CommandRegistry {
     };
 
     // 1. unknown
-    if (!desc) return done({ ok: false, kind: 'unknown', reason: `Unknown command: ${id}` });
+    if (!desc) return done(unknownFailure(id));
     // 2. eager capability — BEFORE the mode guard (F20)
     if (!desc.available) return done({ ok: false, kind: 'unavailable', reason: ERR_EDITOR_UNAVAILABLE });
     // 3. context + guard (reuses the guard-core texts, never copies them)
     const built = this._buildContext(desc, opts.viewer, opts.context);
     if ('error' in built) return done({ ok: false, kind: built.kind, reason: built.error });
-    const ctx: CommandContext = { ...built, origin: opts.origin };
+    const ctx: CommandContext = { ...built, origin: opts.origin, signal: opts.signal };
     // 4. lazy impl, then identity recheck (the loader may have taken a while).
     //    A cached impl is taken WITHOUT an await, so an already loaded command
     //    runs synchronously up to its own first await — a key press or a click
@@ -308,7 +358,9 @@ export class CommandRegistry {
     // 7. second identity recheck right before run
     if (!this._stillSame(ctx)) return done({ ok: false, kind: 'stale', reason: ERR_DOCUMENT_CHANGED });
     try {
+      const epochBefore = modelEditEpoch();
       const value = await impl.run(ctx, args);
+      if (desc.undoLabel && modelEditEpoch() === epochBefore) bumpModelEditEpoch('model-command');
       return done({ ok: true, value });
     } catch (e) {
       const details = e instanceof CommandError ? e.details : undefined;
@@ -316,6 +368,33 @@ export class CommandRegistry {
         ok: false, kind: 'threw', reason: e instanceof Error ? e.message : String(e),
         ...(details ? { details } : {}),
       });
+    }
+  }
+
+  /**
+   * plan-641 M4 — resolve a command's args against an EARLY captured context,
+   * without running it. Loads the implementation lazily (the result does not
+   * depend on how long that takes: the context is the captured one), rechecks
+   * the document identity and calls the implementation's `resolveArgs`. An
+   * implementation without `resolveArgs` hands the args back unchanged
+   * (`resolved: false`). Never throws.
+   */
+  async prepare<A = unknown>(
+    id: string, captured: CapturedContext, args: A, viewer?: RVViewer,
+  ): Promise<PrepareResult<A>> {
+    const desc = this.get(id);
+    if (!desc) return unknownFailure(id);
+    if (!desc.available) return { ok: false, kind: 'unavailable', reason: ERR_EDITOR_UNAVAILABLE };
+    const built = this._buildContext(desc, viewer, captured);
+    if ('error' in built) return { ok: false, kind: built.kind, reason: built.error };
+    const impl = this._impls.has(id) ? (this._impls.get(id) ?? null) : await this._loadImpl(id);
+    if (!impl) return { ok: false, kind: 'unavailable', reason: desc.unavailableReason };
+    if (!this._stillSame(built)) return { ok: false, kind: 'stale', reason: ERR_DOCUMENT_CHANGED };
+    if (!impl.resolveArgs) return { ok: true, args, resolved: false };
+    try {
+      return { ok: true, args: impl.resolveArgs(built, args as never) as A, resolved: true };
+    } catch (e) {
+      return { ok: false, kind: 'threw', reason: e instanceof Error ? e.message : String(e) };
     }
   }
 

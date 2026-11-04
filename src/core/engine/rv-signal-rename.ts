@@ -43,7 +43,7 @@ import { IFACE_PATH_PREFIX, type SignalStore } from './rv-signal-store';
 import {
   SIGNAL_TYPES, isGeneratedSignalData, isSignalNameTaken, resolveSignalName, trackedSignalOf,
 } from './rv-signal-construction';
-import { instanceScopeNode } from './rv-instance-scope';
+import { placementScopeNode } from './rv-instance-scope';
 import { isStringSignalField, type SignalUsage } from './rv-signal-usage-index';
 import type {
   ConnectSignalRenameOutcome, ConnectSignalRenameStatus, ConnectSignalRenameWireChange,
@@ -481,7 +481,7 @@ export async function planSignalRename(
     blockers.push('This signal is generated at load time (component behavior, material flow) and cannot be renamed.');
   }
   if (hasFmuMarker(node)) blockers.push('This signal belongs to an FMU and cannot be renamed.');
-  if (instanceScopeNode(node)) {
+  if (placementScopeNode(node)) {
     blockers.push('This signal lies inside a placement — rename it in the asset that defines it.');
   }
   if (owners.length > 1) {

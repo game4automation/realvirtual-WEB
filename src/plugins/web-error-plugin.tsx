@@ -73,7 +73,7 @@ export function WebErrorPanel({ viewer }: UISlotProps) {
   if (errors.length === 0) return null;
 
   // Frame the faulting part and pulse its outline in the severity color
-  // (same alarm effect as the Toray showcase, generalized in severity-pulse).
+  // (same alarm effect as the CAD-import showcase model, generalized in severity-pulse).
   const focusError = (path: string) => {
     pulseSeverityOutline(viewer, path, 'error');
   };

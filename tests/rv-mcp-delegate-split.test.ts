@@ -32,6 +32,9 @@ import { allSchemas, allInstances, delegateCensus } from './helpers/mcp-schemas'
 import { buildBaseline, toBaselineTools, type DiscoverBaseline } from './helpers/mcp-baseline';
 import BASELINE_RAW from './fixtures/mcp-discover-baseline.json?raw';
 
+/** The substring every path-list parameter description carries since 2026-11-01. */
+const PATH_LIST_JSON_HINT = 'or a JSON array of strings for names containing commas';
+
 /**
  * The Node-side writer, reached the same way `rv-mcp-docs-drift.test.ts` reaches
  * its own: `commands` is typed as an empty registry, and a module augmentation
@@ -70,9 +73,6 @@ const baseline = JSON.parse(BASELINE_RAW) as DiscoverBaseline;
 const ADDED_SINCE_BASELINE: string[] = [
   // 2026-09-24: the Display panel's Groups list became testable over MCP
   // (the Festo `Cover` that the persisted exclusion filter hid).
-  'web_group_list',
-  'web_group_set_visible',
-  'web_group_set_listed',
   // plan-740 Phase 2. The agent camera gains its own capture verb: up to five
   // aligned channels (beauty / idmask / edges / xray) from ONE pose in ONE
   // call, plus the Set-of-Mark sidecar.
@@ -85,13 +85,11 @@ const ADDED_SINCE_BASELINE: string[] = [
   // knowledgeRef — the manifest edit the dashboard's reference slots make, now
   // reachable from an agent. Deliberately NOT a fourth action of
   // `web_document_update`: that one is destructive and operates on files.
-  'web_document_bind',
   // plan-486. The prompt queue's two verbs: `list` looks, `claim` takes the
   // oldest open task and marks it claimed. Additive — nothing is retired, and
   // no existing tool changes shape. `claim` is the only new WRITE, and it is a
   // write on a browser-tab queue, not on the model.
   'web_prompt_claim',
-  'web_prompt_list',
   // plan-753 (Phase 3 residual). Per-phase timings of the last planner
   // placements (decode / bake / pick-mesh / BVH / clipping), so the ~30 s a
   // 140 MB GLB used to take per placement can be attributed instead of guessed.
@@ -100,23 +98,11 @@ const ADDED_SINCE_BASELINE: string[] = [
   // plan-729. Cartesian paths for rigid-body mechanisms (Delta pick & place):
   // five authoring writes beside the existing `web_editor_mechanism_*` family
   // plus one read of the path state. Nothing retired.
-  'web_editor_mechanism_add_target',
-  'web_editor_mechanism_path_create',
-  'web_editor_mechanism_path_add_waypoint',
-  'web_editor_mechanism_path_remove_waypoint',
-  'web_editor_mechanism_path_move_waypoint',
-  'web_editor_mechanism_path_inspect',
   // plan-501. Drive sizing from a sampled trajectory: import (write), run (write),
   // inspect and export (reads) beside the mechanism family. Nothing retired.
-  'web_editor_mechanism_trajectory_import',
-  'web_editor_mechanism_trajectory_run',
-  'web_editor_mechanism_trajectory_inspect',
-  'web_editor_mechanism_trajectory_export',
   // plan-506. Read and write a document's DESCRIPTION (summary + Markdown in the
   // GLB's scene extras, beside Classification) — document-scoped, any document
   // of the open project, through the same store path as the dashboard editor.
-  'web_document_info_get',
-  'web_document_info_set',
   // plan-517. Read-only component schema: the type list without argument, fields
   // (rv-odt.json) plus authoring rules (specification.md, lazy chunk) with `type`.
   // A new delegate of its own (McpComponentSchemaTool); nothing retired.
@@ -124,58 +110,101 @@ const ADDED_SINCE_BASELINE: string[] = [
   // plan-760 Phase 2. The Quick Edit Groups section's four verbs as views of
   // `editor.group*` (private impl, command-bound): assign / remove / rename /
   // dissolve of PLAIN groups beside the kinematic family. Nothing retired.
-  'web_editor_group_assign',
-  'web_editor_group_remove',
-  'web_editor_group_rename',
-  'web_editor_group_dissolve',
   // plan-539 F15. Simulation / PLC mode of the loaded model (get / set) —
   // the toggle next to the simulation controls as a tool. Nothing retired.
-  'web_sim_mode',
   // plan-537. Deterministic frame-by-frame MP4 recording of the 3D canvas.
   // Nothing retired.
   'web_record_video',
   // plan-545. PLC auto-map: model PLC signals -> S7 / PLCSIM interface signals
   // (check / apply). A new delegate (McpSignalAutoMapTools); nothing retired.
-  'web_signal_automap',
   // plan-761. The render-mode pill's shading switch (simple / default / toon)
   // as a tool, bound to `view.renderMode` in McpRuntimeTools beside
   // `web_view_source_markers`. Nothing retired.
-  'web_view_render_mode',
   // plan-566. The signal cross-reference list ("Used by") as a read-only tool —
   // a new delegate (McpSignalUsageTools); nothing retired.
-  'web_signal_usage',
   // plan-567. Remove / move a workpiece carrier in Commissioning — two writes in
   // McpRuntimeTools beside web_transport_status (which now also lists mus[].id).
-  'web_mu_delete',
-  'web_mu_move',
   // plan-589 Phase 2. The signal editor's two verbs as views of
   // `editor.signalSetField` / `editor.signalSetBinding` in McpEditorTools: edit a
   // PLC signal's own fields (never its NAME), and set / change / remove its PLC
   // binding in ONE CONNECT container. Nothing retired.
-  'web_editor_signal_set_field',
-  'web_editor_signal_set_binding',
   // plan-589 Phase 3. The reconcile report as a READ (a new verb of
   // McpSignalAutoMapTools), plus the one repair it offers as a view of
   // `editor.signalsCreateFromInterface` in McpEditorTools. Nothing retired.
-  'web_signal_reconcile',
-  'web_editor_signals_create_from_interface',
   // plan-590. The signal rename as a view of `editor.signalRename` (dry run =
   // preview), plus the two Problems actions of a failed / unknown rename as views
   // of `editor.signalRenameRepair` / `editor.signalRenameRecheck` — all three in
   // McpEditorTools. Nothing retired.
-  'web_editor_signal_rename',
-  'web_editor_signal_rename_repair',
-  'web_editor_signal_rename_recheck',
   // plan-591. The quality axis (resolution / antialias / shadow map / AO /
   // reflection) as a tool, bound to `view.visualPreset` in McpRuntimeTools
   // beside `web_view_render_mode`. Nothing retired.
-  'web_view_visual_preset',
   // 8a34c524 (2026-10-08), absorbed at the 6.4.0 release. Session-only collision
   // roles (McpCollisionTools): watch subtrees, read the latched pairs, reset.
   // Nothing retired.
-  'web_collision_watch',
-  'web_collision_status',
-  'web_collision_reset',
+  // plan-764. OpenUSD export of the open document with the realvirtual extras
+  // 1:1 (McpExportTools, a new delegate) — the card's "Export USD…" as a tool.
+  // Nothing retired.
+  'web_export_usd',
+  // plan-764 Phase 2. "Apply USD extras…" as two calls on the same delegate
+  // (McpExportTools): preview (read-only) and commit. Nothing retired.
+  // plan-629. The congestion trace along the path network (McpTraceTools, a new
+  // delegate): the top-N bottleneck buckets (read) and the band / time-range
+  // switch (write). Nothing retired.
+  // plan-621. The SolidCraft live sync (McpEditorTools): connect / resync /
+  // disconnect, views of the solidcraft.* commands. Nothing retired.
+  // plan-641 Phases 0-2. The reduced command interface (McpCommandTools, a new
+  // delegate): list / execute / batch over the command registry; and the macro
+  // recorder (McpMacroTools, a new delegate): record, list, get, annotate, save,
+  // replay as a job, status, cancel. Nothing retired — the bound web_editor_*
+  // tools stay as aliases.
+  'web_commands',
+  'web_execute',
+  'web_batch',
+  // plan-2007 Phase 0: the read door over read-only commands (McpCommandTools).
+  'web_query',
+  'web_macro_record_start',
+  'web_macro_record_stop',
+  'web_macro_list',
+  'web_macro_get',
+  'web_macro_annotate',
+  'web_macro_save',
+  'web_macro_replay',
+  'web_macro_status',
+  'web_macro_cancel',
+  // plan-641 Phases 4-5. Geometry checks + the part library (McpCheckTools, a new
+  // delegate) and the assertion line of a macro (McpMacroTools). Nothing retired.
+  'web_check_gap',
+  'web_check_contact',
+  'web_macro_assert',
+  // plan-641 Phase 2b. Import of a macro from the project folder or inline JSON
+  // (McpMacroTools). Nothing retired.
+  'web_macro_import',
+  // plan-650 Phase 4. Parametric component families in the asset editor: define a family
+  // (schema + rule code + parts root), set its values (one regeneration = one undo step),
+  // inspect the build plan / hashes / limits. Nothing retired.
+  'web_editor_parametric_define',
+  'web_editor_parametric_set',
+  'web_editor_parametric_inspect',
+  // plan-655: the part LIBRARIES of the open project (project.json.libraries[]) —
+  // list (read), attach / detach (views of library.attach / library.detach).
+  // plan-773 Phases 1-2 (McpRobotTools, a new delegate). Four read tools as the web
+  // pendant of Unity's `ik_get_chain` / `ik_get_state` / `ik_verify_fk`, plus the two
+  // rigging verbs: `_rig_diagnose` (read-only, works on an UNRIGGED node) and
+  // `_rig_from_library`, which writes a complete RobotIK in one call instead of seven
+  // fields by hand. Nothing retired — there was no robot tool before.
+  // plan-773 Phase 3: the path half of the same delegate — a path under the robot,
+  // its waypoints, their order, and the solve that drives the robot onto one. The
+  // listing is read-only; the six authoring verbs are `edit`. Nothing retired.
+  // plan-773 Phase 5: the export half — one read tool that turns a path into a
+  // vendor robot program (ABB RAPID, SEW MOVI-C) and hands the file(s) back
+  // inline. Read-only: it re-solves every waypoint but writes nothing.
+  // Nothing retired.
+  // plan-664 Phase 2 (McpSensorDataTools, a new delegate). One read tool for the
+  // ray sensors: the current scan frame out of the sensor data channel plus the
+  // sensor's configuration, or the list of registered ray sensors without a path.
+  // Unbound — there is no button it is a view of. Nothing retired.
+  // plan-675 Phase 1. UV generation for geometry without texture coordinates
+  // (McpEditorTools), a view of the macro command `editor.generateUVs`. Nothing retired.
 ].sort();
 
 /**
@@ -188,6 +217,171 @@ const ADDED_SINCE_BASELINE: string[] = [
  * way to delete a capability quietly.
  */
 const RETIRED_SINCE_BASELINE: Record<string, string> = {
+  web_signal_set_bool: 'web_execute',
+  web_signal_set_float: 'web_execute',
+  web_drive_jog: 'web_execute',
+  web_sim_play_pause: 'web_execute',
+  web_view_render_mode: 'web_execute',
+  web_view_visual_preset: 'web_execute',
+  web_sim_reset: 'web_execute',
+  web_drive_stop: 'web_execute',
+  web_drive_speed_override: 'web_execute',
+  web_mu_delete: 'web_execute',
+  web_mu_move: 'web_execute',
+  web_library_attach: 'web_execute',
+  web_library_detach: 'web_execute',
+  web_layout_place: 'web_execute',
+  web_layout_move: 'web_execute',
+  web_layout_remove: 'web_execute',
+  web_layout_snap_attach: 'web_execute',
+  web_robot_rig_from_library: 'web_execute',
+  web_robot_path_create: 'web_execute',
+  web_robot_target_add: 'web_execute',
+  web_robot_target_set: 'web_execute',
+  web_robot_target_remove: 'web_execute',
+  web_robot_target_reorder: 'web_execute',
+  web_robot_solve_target: 'web_execute',
+  web_robot_program_export: 'web_query',
+  web_signal_bind: 'web_execute',
+  web_signal_unbind: 'web_execute',
+  web_knowledge_set: 'web_execute',
+  web_document_info_set: 'web_execute',
+  web_editor_undo: 'web_execute',
+  web_editor_redo: 'web_execute',
+  web_editor_transform: 'web_execute',
+  web_editor_zero_position: 'web_execute',
+  web_editor_rotate90: 'web_execute',
+  web_editor_to_ground: 'web_execute',
+  web_editor_pivot: 'web_execute',
+  web_editor_rename: 'web_execute',
+  web_editor_delete: 'web_execute',
+  web_editor_set_visible: 'web_execute',
+  web_editor_separate: 'web_execute',
+  web_editor_generate_uvs: 'web_execute',
+  web_editor_create_empty: 'web_execute',
+  web_editor_reparent: 'web_execute',
+  web_editor_add_component: 'web_execute',
+  web_editor_remove_component: 'web_execute',
+  web_editor_set_field: 'web_execute',
+  web_editor_mechanism_create: 'web_execute',
+  web_editor_mechanism_add_joint: 'web_execute',
+  web_editor_mechanism_assign_drive: 'web_execute',
+  web_editor_mechanism_jog: 'web_execute',
+  web_editor_mechanism_set_anchor_snap: 'web_execute',
+  web_editor_mechanism_set_axis: 'web_execute',
+  web_editor_mechanism_add_body: 'web_execute',
+  web_editor_mechanism_set_mass: 'web_execute',
+  web_editor_mechanism_set_limits: 'web_execute',
+  web_editor_mechanism_statics: 'web_execute',
+  web_editor_mechanism_fix: 'web_execute',
+  web_editor_solidcraft_connect: 'web_execute',
+  web_editor_solidcraft_resync: 'web_execute',
+  web_editor_solidcraft_disconnect: 'web_execute',
+  web_editor_create_kinematic: 'web_execute',
+  web_editor_assign_to_kinematic: 'web_execute',
+  web_editor_group_assign: 'web_execute',
+  web_editor_group_remove: 'web_execute',
+  web_editor_group_rename: 'web_execute',
+  web_editor_group_dissolve: 'web_execute',
+  web_editor_add_signal: 'web_execute',
+  web_editor_convert_signal: 'web_execute',
+  web_editor_toggle_signal_direction: 'web_execute',
+  web_editor_signal_set_field: 'web_execute',
+  web_editor_signal_set_binding: 'web_execute',
+  web_editor_signals_create_from_interface: 'web_execute',
+  web_editor_signal_rename: 'web_execute',
+  web_editor_signal_rename_repair: 'web_execute',
+  web_editor_signal_rename_recheck: 'web_execute',
+  web_editor_add_logic_step: 'web_execute',
+  web_editor_shortcut: 'web_execute',
+  web_editor_assign_material: 'web_execute',
+  web_editor_materialize: 'web_execute',
+  // plan-2007 Phase 4C: runtime and remaining read-only queries.
+  web_drive_list: 'web_query',
+  web_sensor_list: 'web_query',
+  web_sensor_read: 'web_query',
+  web_transport_status: 'web_query',
+  web_logic_flow: 'web_query',
+  web_trace_top: 'web_query',
+  web_collision_status: 'web_query',
+  web_group_list: 'web_query',
+  web_knowledge_get: 'web_query',
+  web_knowledge_list: 'web_query',
+  web_document_info_get: 'web_query',
+  web_import_usd_extras: 'web_query',
+  web_link_compose: 'web_query',
+  web_part_lookup: 'web_query',
+  web_prompt_list: 'web_query',
+  // plan-2007 Phase 4B: sixteen queries; timings stays because clear mutates its buffers.
+  web_layout_list: 'web_query',
+  web_layout_export: 'web_query',
+  web_layout_snap_list: 'web_query',
+  web_layout_snap_suggest: 'web_query',
+  web_library_list: 'web_query',
+  web_catalog_list: 'web_query',
+  web_catalog_describe: 'web_query',
+  web_signal_bindings_list: 'web_query',
+  web_signal_sources_list: 'web_query',
+  web_signal_reconcile: 'web_query',
+  web_signal_usage: 'web_query',
+  web_des_components: 'web_query',
+  web_des_stats: 'web_query',
+  web_des_bottleneck: 'web_query',
+  web_plc_status: 'web_query',
+  web_des_status: 'web_query',
+  web_editor_mechanism_inspect: 'web_query',
+  web_editor_mechanism_forces: 'web_query',
+  web_editor_mechanism_path_inspect: 'web_query',
+  web_editor_mechanism_snap_list: 'web_query',
+  web_editor_mechanism_trajectory_export: 'web_query',
+  web_editor_mechanism_trajectory_inspect: 'web_query',
+  web_editor_mechanism_validate: 'web_query',
+  web_robot_list: 'web_query',
+  web_robot_get_chain: 'web_query',
+  web_robot_get_state: 'web_query',
+  web_robot_verify_fk: 'web_query',
+  web_robot_rig_diagnose: 'web_query',
+  web_robot_path_inspect: 'web_query',
+  web_editor_list_kinematics: 'web_query',
+  web_editor_material_presets: 'web_query',
+  web_editor_material_stats: 'web_query',
+  web_editor_project_files: 'web_query',
+  web_editor_project_info: 'web_query',
+  // plan-2007 Phase 3: mechanism authoring and sizing use registry commands.
+  web_editor_mechanism_set_anchor: 'web_execute',
+  web_editor_mechanism_add_target: 'web_execute',
+  web_editor_mechanism_path_create: 'web_execute',
+  web_editor_mechanism_path_add_waypoint: 'web_execute',
+  web_editor_mechanism_path_remove_waypoint: 'web_execute',
+  web_editor_mechanism_path_move_waypoint: 'web_execute',
+  web_editor_mechanism_trajectory_import: 'web_execute',
+  web_editor_mechanism_trajectory_run: 'web_execute',
+  // plan-2007 Phase 2B: document, USD and signal auto-map commands.
+  web_document_new: 'web_execute',
+  web_document_update: 'web_execute',
+  web_document_bind: 'web_execute',
+  web_import_usd_extras_commit: 'web_execute',
+  web_signal_automap: 'web_execute',
+  // plan-2007 Phase 2A: component fields, kinematize and imports.
+  web_component_set: 'web_execute',
+  web_editor_kinematize: 'web_execute',
+  web_editor_import_glb: 'web_execute',
+  web_editor_import_cad: 'web_execute',
+  // plan-2007 Phase 1: registry commands replace these tools (including later additions).
+  web_group_set_visible: 'web_execute',
+  web_group_set_listed: 'web_execute',
+  web_trace_set: 'web_execute',
+  web_collision_watch: 'web_execute',
+  web_collision_reset: 'web_execute',
+  web_mode_set: 'web_execute',
+  web_des_step: 'web_execute',
+  web_des_set_mode: 'web_execute',
+  web_plc_deploy: 'web_execute',
+  web_plc_run: 'web_execute',
+  web_plc_stop: 'web_execute',
+  web_view_isolate: 'web_execute',
+  web_view_source_markers: 'web_execute',
+  web_sim_mode: 'web_execute',
   // (empty.) The baseline was RE-FROZEN on 2026-08-19 with the terminology
   // rework: asset = document = model, one concept, hard rename with no aliases.
   // web_model_list/_open, web_scene_save/_new/_export, web_library_assets/
@@ -233,16 +427,20 @@ const RETIRED_SINCE_BASELINE: Record<string, string> = {
  * edit rewrite the description into anything at all.
  */
 const REDESCRIBED_SINCE_BASELINE: Record<string, string> = {
+  // plan-2007 Phase 5: agent descriptions point to the command doors and ids.
+  web_document_save: 'layout.export',
+  web_project_tree: 'editor.projectFiles',
+  web_project_folder: 'document.delete',
+  // plan-2005: the existing speed description includes simulation time as well as drives.
+  // Phase 4A: descriptions now point to the read-only command ids.
+  web_editor_test_start: 'mechanism.forces',
+  web_editor_test_stop: 'mechanism.forces',
   // plan-525: BoxCollider and WebPhysicsZone became authorable — the add tool
   // names both and the one rule an agent cannot guess (a box on a mesh lands on
   // a new child `Collider`, whose path is returned).
-  web_editor_add_component: 'on a mesh it goes onto a new child "Collider"',
   // 2026-09-17 field session (100-conveyor build): move/remove recorded no op,
   // so a save dropped them — both now say they are persisted; and a bare
   // play/pause call paused a running simulation, so the text says it TOGGLES.
-  web_layout_move: 'Persisted — booked as one undoable edit',
-  web_layout_remove: 'Persisted — booked as one undoable edit',
-  web_sim_play_pause: 'omitting it TOGGLES',
   // plan-743: the workspace root is gone — the dashboard lists LINKED project
   // folders, so both project verbs had to stop talking about 'the configured
   // workspace'. Declared here on 2026-09-11 by /tidy: the code landed on
@@ -257,7 +455,6 @@ const REDESCRIBED_SINCE_BASELINE: Record<string, string> = {
   // this repo before the removal — not in CONNECT's C#, not in
   // `unity_mcp_server.py`.
   web_document_list: 'the first path segment (`""` at the root) — a place, not a type',
-  web_editor_project_files: 'modified, folder, documentId',
   // plan-744 F7: `library/Custom` stopped being the save-as fallback, so the
   // tool that named it as the destination had to stop naming it. The prose is
   // exempt; the schema, annotations and timeout are still compared verbatim.
@@ -285,7 +482,6 @@ const REDESCRIBED_SINCE_BASELINE: Record<string, string> = {
   // SHARED with the human (D-U3), the camera move that used to come with them
   // belongs to the agent now.
   web_node_bounds: 'frames them with the AGENT camera',
-  web_view_isolate: 'only the AGENT camera frames',
   // plan-740 Phase 3 (D-U10): the last five perception tools stopped reading
   // the human's drawing buffer. Each had to say so, because the picture they
   // return is a DIFFERENT picture now — from the agent pose, at a size the
@@ -304,7 +500,6 @@ const REDESCRIBED_SINCE_BASELINE: Record<string, string> = {
   // still compared verbatim and only the prose is exempt. The pinned substring
   // is the part an agent acts on: a centre of gravity that arrives whether or
   // not anybody has a 3D marker switched on.
-  web_editor_mechanism_inspect: 'recomputed per call from the live pose, marker-independent',
   // 2026-09-15: `web_render`, `web_view_pick` and `web_view_gaze` were removed,
   // so the three descriptions that pointed at them had to stop. Each now names
   // the tool that actually answers the question.
@@ -312,14 +507,14 @@ const REDESCRIBED_SINCE_BASELINE: Record<string, string> = {
   // Same session: `web_screenshot` pointed at `web_screenshot_annotated` for
   // labelled markers, which no longer exists.
   web_screenshot: 'for labelled markers web_eye with channels=idmask',
-  web_editor_project_info: 'web_eye, web_view_sweep and web_view_ortho write them via savePath',
-  web_editor_mechanism_snap_list: 'Aim the camera first (web_camera_focus), then pass the ids',
   // plan-753 Phase 3: the status answer gained the render diagnostics of the
   // loaded model (arena stats) and the bake stats of the planner placements
   // (baked assets, chunks, instances) — pure ADDITIONS to the payload, no field
   // moved or left, so the schema, annotations and timeout are still compared
   // verbatim and only the prose is exempt. The pinned substring is the new
   // block an agent orients on before reaching for `web_layout_timings`.
+  // plan-2005 F9: lean by default — the render blocks moved behind detail:"render";
+  // the bake sentence above is kept verbatim in the render half of the text.
   web_status: 'bake stats of the planner placements',
   // plan-753 part 2 (scene-ready contract): the open verb waits for the placed
   // references within a budget and says so; `web_status` (above, still pinned
@@ -343,19 +538,47 @@ const REDESCRIBED_SINCE_BASELINE: Record<string, string> = {
   // plan-504: the Mechanism section's Anchor A/B pick dispatches the same
   // command as this tool, with the picked point as `pickJson` — so the tool
   // takes exactly ONE source now (candidateId OR pickJson) and says so.
-  web_editor_mechanism_set_anchor_snap: 'Pass exactly ONE source: candidateId, or pickJson',
   // 2026-10-04 (spike plc-st-welding): the virtual PLC runs several programs (one
   // per PLCProgram node). The tools address ONE program, so the text says which,
   // and status lists them all. Also shortened to stay under the payload ceiling.
-  web_plc_status: 'Also lists all programs in scan order',
-  web_plc_deploy: 'to a PLC program',
-  web_plc_run: 'scanning of a PLC program',
-  web_plc_stop: 'Stop scanning a PLC program',
   // 2026-10-02 (editor wireframe view): the shortcut table gained "Shift+Z", and
   // plan-543 gave web_help the `operator-panel` guide. Both landed without this
-  // declaration and left the gate red; declared on 2026-10-05.
-  web_editor_shortcut: '"Shift+Z" wireframe view',
+  // declaration and left the gate red; declared on 2026-10-05. plan-766 F3 adds
+  // "T" (transform gizmo) behind it — the pinned substring is unchanged.
   web_help: 'operator-panel (build an operator panel window as JSON',
+  // plan-641 Nachtrag 2026-10-21 (aa116719): descriptions name the COMMAND id instead of
+  // the alias tools that tools/list hides now; the pin is the command id sentence.
+  // plan-655: one parts list (catalog AND project parts) — the id hint stays.
+  // plan-2005 F7/F8: the filters are honoured and named (they used to be
+  // dropped silently by the dispatcher); web_signal_list answers an object
+  // with total/truncated now, and web_logs defaults to info and above.
+  web_logs: 'filtered BEFORE the limit',
+  web_signal_list: '{signals:[{name,value,type}], total, truncated}',
+  // `web_des_status` and `web_drive_speed_override` were declared here on
+  // 2026-10-27 and removed again the same day, by plan-2007 Phase 4A/4B rather
+  // than by a second thought: both tools now live BEHIND a door
+  // (`des.status` behind `web_query`, `sim.speedOverride` behind `web_execute`,
+  // `rv-mcp-moved-tools.ts`), so neither is announced in `allSchemas()` any more.
+  // A re-description exempts the prose of an ANNOUNCED tool from the frozen
+  // comparison; for a tool that has no announcement left it points at nothing, and
+  // the guard says so (`is declared re-described but is not announced`). Both are
+  // in `RETIRED_SINCE_BASELINE` with their door, which is the declaration that
+  // fits a moved tool — and it is the stronger one, because it pins WHERE an old
+  // caller has to go instead of merely excusing a text.
+  // plan-774 / plan-757 Phase 2: a placed reference is BAKED in its parent, so
+  // inside it only component nodes are addressable and only their field values
+  // can change (instance overrides) — geometry, structure, materials and
+  // mechanisms need a descend. An agent reading the old text would try to move a
+  // part inside a placement and be refused (`nested-transform-refused`), so the
+  // verb that goes in there had to say what it is for.
+  web_editor_descend: 'only its component nodes are addressable',
+  // Same phase, the status half: placements are materialised ASYNCHRONOUSLY by
+  // the instancer, so the editor status gained `placementsReady` /
+  // `placementsPending` — the one pair that tells an agent whether what it is
+  // about to read or save is complete. A pure ADDITION to the answer payload: no
+  // field moved or left, and the schema, annotations and timeout are still
+  // compared verbatim, only the prose is exempt.
+  web_editor_status: 'placementsReady / placementsPending',
 };
 
 /**
@@ -378,26 +601,27 @@ const EXTENDED_SINCE_BASELINE: Record<string, string[]> = {
   // (the guessed 0.62 m floated pallets above 0.50 m rollers); `flow` picks the
   // direction of the new part on a bidi turntable snap, so a feeder INTO a
   // turntable side no longer needs a second corner turntable.
-  web_layout_place: ['onto'],
-  web_layout_snap_attach: ['flow'],
+  // plan-675 D4: optional `ry` — the yaw; onto a curve it defaults to the tangent there.
+  // plan-655 F3: the one parts list gained optional filters; no field of the
+  // answer moved (it gained `source` and, per kind, `library` / `documentId` + `path`).
+  // plan-660 Phase 4 (integration 8): `limit`, and `source` may name a Library provider
+  // (SimReady via CONNECT) — without it the answer is catalog + project exactly as before.
   // plan-757 F12: fan-out to every placed instance of an asset — the path is
   // the address (D9). Optional; `name` and `value` and the result fields
   // `name` / `value` / `previous` are unchanged.
-  web_signal_set_bool: ['asset'],
-  web_signal_set_float: ['asset'],
   // plan-504: the panel's anchor pick travels as `pickJson` (optional) — the
   // alternative source to a listed snap candidate.
-  web_editor_mechanism_set_anchor_snap: ['pickJson'],
   // plan-508 F6: `cacheLast` (optional) sizes the new `cache` block — the asset
   // blob-cache outcomes. No field of the answer moved or left.
-  web_status: ['cacheLast'],
+  // plan-2005 F9: `detail` (optional) — basic (default, lean) | render | full.
+  web_status: ['cacheLast', 'detail'],
+  // plan-2005 F7: optional `category` (comma list) and `since` (seconds back).
+  web_logs: ['category', 'since'],
+  // plan-2005 F8: optional `filter` (name substring) and `limit`.
+  web_signal_list: ['filter', 'limit'],
   // 2026-10-04 (spike plc-st-welding): optional `program` (name or path) picks one
   // of several PLC programs; without it the tools address the program selected in
   // the editor — exactly the single program of before.
-  web_plc_status: ['program'],
-  web_plc_deploy: ['program'],
-  web_plc_run: ['program'],
-  web_plc_stop: ['program'],
 };
 
 /**
@@ -409,7 +633,6 @@ const EXTENDED_SINCE_BASELINE: Record<string, string[]> = {
  */
 const RELAXED_SINCE_BASELINE: Record<string, string[]> = {
   // `candidateId` OR the new `pickJson` — the command's run() demands exactly one.
-  web_editor_mechanism_set_anchor_snap: ['candidateId'],
 };
 
 /** The frozen `required` list minus the declared relaxations. */
@@ -432,6 +655,7 @@ function requiredNow(name: string, frozen: string[] | undefined): string[] | und
  * property this file is here to defend.
  */
 const REPARAMETERISED_SINCE_BASELINE: Record<string, Record<string, string>> = {
+  // plan-2007 Phase 5: argument hints name the replacement queries.
   web_camera_set: { durationMs: 'Ignored since the agent camera moves instantly' },
   web_camera_fly: { durationMs: 'Ignored since the agent camera moves instantly' },
   // plan-740 Phase 3, the same "kept rather than removed" reasoning as
@@ -439,22 +663,29 @@ const REPARAMETERISED_SINCE_BASELINE: Record<string, Record<string, string>> = {
   // no starting pose to return to and no fixed marker angle to choose. Dropping
   // the parameters would break a caller written against the frozen schema for
   // no benefit, so they stay and say that they do nothing.
-  web_view_sweep: { restore: 'Ignored since the sweep renders offscreen' },
+  web_view_sweep: { restore: 'Ignored since the sweep renders offscreen', paths: PATH_LIST_JSON_HINT },
   web_editor_verify_drive: { keepView: 'agent camera' },
   // 2026-09-17: `y` said "ignored on place" — it is honoured now (0 = ground),
   // so the old text would lie. Name, type and requiredness are unchanged.
-  web_layout_place: { y: 'height of the part origin' },
   // d86eedf2 (2026-09-23): `relPath` accepts a project-relative path, a
   // document id or a document name as well. Name, type and requiredness are
   // unchanged. Declared on 2026-09-24 (see REDESCRIBED_SINCE_BASELINE).
   web_editor_open: { relPath: 'document id or name from web_document_list' },
   // plan-504: ids are generation-bound (`snap<gen>-<i>`) and the param is
   // optional next to `pickJson`, so the old example "snap0" would lie.
-  web_editor_mechanism_set_anchor_snap: { candidateId: 'Omit when passing pickJson' },
   // 2026-10-02 / plan-543 (see REDESCRIBED_SINCE_BASELINE): the parameter texts name
   // the new values; name, type and requiredness are unchanged.
-  web_editor_shortcut: { arg: 'Shift+Z: "on" or "off"' },
   web_help: { topic: 'operator-panel' },
+  // plan-641 Nachtrag 2026-10-21 (aa116719): the id source names the command id.
+  // 2026-11-01: path lists also accept a JSON array of strings (rv-path-list), the
+  // only way to pass a CAD name that contains a comma. Name, type and requiredness
+  // are unchanged; a comma string still means what it meant.
+  web_measure: { paths: PATH_LIST_JSON_HINT },
+  web_node_shape: { paths: PATH_LIST_JSON_HINT },
+  web_node_bounds: { paths: PATH_LIST_JSON_HINT },
+  web_camera_focus: { paths: PATH_LIST_JSON_HINT },
+  web_select: { paths: PATH_LIST_JSON_HINT },
+  web_screenshot_analyze: { paths: PATH_LIST_JSON_HINT },
 };
 
 /**
@@ -500,7 +731,7 @@ describe('plan-713 T1 — delegate split is observationally neutral', () => {
       .toEqual(ADDED_SINCE_BASELINE);
     expect(baseNames.filter((n) => !liveNames.includes(n)).sort(),
       'tools LOST since the baseline — declare them in RETIRED_SINCE_BASELINE')
-      .toEqual(Object.keys(RETIRED_SINCE_BASELINE).sort());
+      .toEqual(Object.keys(RETIRED_SINCE_BASELINE).filter((n) => baseNames.includes(n)).sort());
   });
 
   it('every retired tool still has its replacement announced', () => {
@@ -562,7 +793,7 @@ describe('plan-713 T1 — delegate split is observationally neutral', () => {
 
   it('the tool count is the baseline plus additions minus retirements', () => {
     expect(live.toolCount).toBe(
-      baseline.toolCount + ADDED_SINCE_BASELINE.length - Object.keys(RETIRED_SINCE_BASELINE).length,
+      baseline.toolCount + ADDED_SINCE_BASELINE.length - baseline.tools.filter((t) => t.name in RETIRED_SINCE_BASELINE).length,
     );
   });
 
@@ -738,7 +969,100 @@ describe('plan-713 T1 — delegate split is observationally neutral', () => {
     // purpose. MEASURED 123 759 B over 185 tools (collision tools and every tool
     // added since plan-567 included); the raise is that figure plus 241 B of slack.
     // From here on each plan raises it by its own measured delta again.
-    const PAYLOAD_CEILING_BYTES = 124_000;
+    // plan-764: raised 124 000 -> 124 250 for `web_export_usd` (two optional string
+    // parameters, a three-sentence description). MEASURED 124 236 B over 186 tools,
+    // i.e. +477 B against the 123 759 B above; the raise is the overshoot plus 14 B.
+    // plan-764 Phase 2: raised 124 250 -> 125 650 for `web_import_usd_extras` (one
+    // required string) and `web_import_usd_extras_commit` (one required string, two
+    // optional booleans). ESTIMATED, not yet measured (no test run allowed in the
+    // executor window): +1 384 B for the two baseline entries over 188 tools, i.e.
+    // ~125 620 B; the orchestrator replaces this with the measured figure.
+    // (plan-629 measured it: 125 620 B over 188 tools, exactly the estimate.)
+    // plan-629: raised 125 650 -> 126 800 for `web_trace_top` (three optional
+    // parameters) and `web_trace_set` (four optional parameters). MEASURED
+    // 126 761 B over 190 tools against 125 620 B with the delegate switched off,
+    // i.e. +1 141 B; the raise is that delta plus 9 B of rounding.
+    // plan-621: raised 126 800 -> 127 950 for `web_editor_solidcraft_connect` (two optional
+    // parameters) and the parameterless `_resync` / `_disconnect`, descriptions cut to one or two
+    // sentences BEFORE the raise. MEASURED 127 915 B over 193 tools against 126 761 B above,
+    // i.e. +1 154 B; the raise is that delta plus 35 B of rounding.
+    // plan-641 Phases 0-2: raised 127 950 -> 132 800 for the twelve new tools
+    // `web_commands` / `web_execute` / `web_batch` and the nine `web_macro_*` (24
+    // parameters together), descriptions cut to one or two sentences and parameter
+    // texts to a few words BEFORE the raise (first measurement 135 261 B). MEASURED
+    // 132 786 B over 205 tools against 127 915 B above, i.e. +4 871 B; the raise is
+    // that delta plus 14 B of rounding.
+    // plan-641 Phases 4-5: raised 132 800 -> 134 830 for `web_check_gap` / `web_check_contact`
+    // (two required + two optional parameters each), `web_part_lookup` (one) and
+    // `web_macro_assert` (four required + the three optional meta parameters), descriptions cut
+    // to one sentence BEFORE the raise (first measurement 135 314 B). MEASURED 134 816 B over
+    // 209 tools against 132 786 B above, i.e. +2 030 B; the raise is that delta plus 14 B.
+    // +147 B aus origin/main (plan-642/644) nach Merge in plan-641: raised 134 830 -> 134 991.
+    // The growth is plan-642's longer `web_editor_solidcraft_connect` description and `design`
+    // parameter text (plan-644 touches no MCP tool); origin/main kept its own pin at 127 950,
+    // so no main-side pin was overwritten. MEASURED 134 977 B over 209 tools (+161 B against
+    // 134 816 B above, +147 B over the old pin); the raise is the measured figure plus 14 B.
+    // plan-641 Phase 2b: raised 134 991 -> 135 500 for `web_macro_import` (three optional
+    // parameters) and the optional `files` parameter of `web_macro_list`, descriptions cut to one
+    // sentence BEFORE the raise (first measurement 135 583 B). MEASURED 135 486 B over 210 tools
+    // against 134 977 B over 209 (same HEAD, the tools file at HEAD), i.e. +509 B; the raise is
+    // that figure plus 14 B.
+    // plan-650 Phase 4: raised 135 500 -> 137 362 for `web_editor_parametric_define` (five
+    // parameters), `_set` (two) and `_inspect` (three), descriptions cut to one sentence BEFORE the
+    // raise (first measurement 138 641 B). MEASURED 137 348 B over 213 tools against 135 486 B over
+    // 210, i.e. +1 862 B; the raise is that figure plus 14 B.
+    // plan-655: raised 137 362 -> 138 567 for `web_library_list` / `_attach` / `_detach` and the
+    // two optional filters of `web_catalog_list`, descriptions cut to one sentence BEFORE the raise
+    // (first measurement 139 507 B). MEASURED 138 553 B over 216 tools against 137 348 B over 213,
+    // i.e. +1 205 B; the raise is that figure plus 14 B.
+    // Integration 8 (2026-10-23): origin/main b8ee991c already measured 139 113 B (red against
+    // 138 567 — growth after plan-655 that nobody pinned); plan-660 Phase 4 adds `limit` on
+    // `web_catalog_list` and the provider-id wording of its `source` / description (+133 B).
+    // MEASURED 139 246 B over 216 tools; the raise is that figure plus 14 B.
+    // plan-773 Phases 1-2: raised 139 260 -> 143 905 for the six `web_robot_*` tools
+    // (McpRobotTools — four reads taking one or three optional parameters, `_rig_diagnose`,
+    // and `_rig_from_library` with three). Descriptions cut BEFORE the raise, twice: the
+    // first measurement was 144 555 B with `_rig_from_library` over the 110-word budget, so
+    // all six were shortened. MEASURED 143 891 B over 222 tools against 139 246 B over 216,
+    // i.e. +4 645 B — ~774 B per tool, close to the catalogue average and not a new outlier.
+    // The raise is that figure plus 14 B.
+    // plan-773 Phase 3: raised 143 905 -> 150 348 for the seven path tools
+    // (`web_robot_path_create` / `_path_inspect` / `_target_add` / `_target_set` / `_target_remove` /
+    // `_target_reorder` / `_solve_target`). Parameter descriptions cut BEFORE the raise (first
+    // measurement 150 445 B). MEASURED 150 334 B over 229 tools against 143 891 B over 222,
+    // i.e. +6 443 B — ~920 B per tool, above the ~774 B of plan-773 Phases 1-2 because `_target_add`
+    // and `_target_set` carry five and four optional parameters each (a pose in two halves, a field
+    // bag and the unreachable opt-out), and because each description has to state the F10 promise
+    // that a pose and its joint angles are written together or not at all. The raise is that
+    // figure plus 14 B.
+    // plan-773 Phase 5: raised 150 348 -> 151 557 for `web_robot_program_export` — ONE tool with five
+    // parameters (vendor plus four optional). Description cut BEFORE the raise (first measurement
+    // 151 627 B). MEASURED 151 543 B over 230 tools against 150 334 B over 229, i.e. +1 209 B for one
+    // tool — above the ~920 B of Phase 3 and the reason is in the description rather than in the
+    // parameters: the refusals are the feature. A tool that silently emitted a degraded program would
+    // be shorter and would be the defect plan-773 R1 exists for, so the words that name the four
+    // refusal conditions earn their bytes. The raise is that figure plus 14 B.
+    // plan-664 Phase 2: raised 151 557 -> 152 083 for `web_sensor_read` — ONE read tool with ONE
+    // optional parameter. Description cut BEFORE the raise (first measurement 152 107 B).
+    // MEASURED 152 069 B over 231 tools against 151 543 B over 230, i.e. +526 B for one tool —
+    // well BELOW the ~774 B catalogue average, which is what a one-parameter reader should cost.
+    // The bytes that stayed are the three facts an agent cannot guess: the unit is mm, no hit is
+    // -1 (not 0 and not the max range), and the reported time is the MEASUREMENT time rather than
+    // the delivery time — the last one is the contract the AGV coupling of Phase 3 reads. The
+    // raise is that figure plus 14 B.
+    // plan-675 Phase 1: raised 139 260 -> 139 825 for `web_editor_generate_uvs` (three optional
+    // parameters), description cut to one sentence BEFORE the raise (first measurement 140 378 B).
+    // MEASURED 139 811 B over 217 tools against 139 246 B over 216, i.e. +565 B; the raise is that
+    // figure plus 14 B.
+    // plan-675 Phase 4 (D4): raised 139 825 -> 139 912 for the optional `ry` of `web_layout_place`
+    // (one-line description). MEASURED 139 898 B over 217 tools, i.e. +87 B; the raise is that
+    // figure plus 14 B.
+    // Merge of plan-675 onto plan-773/plan-664 (2026-10-24): both raises above were taken against
+    // 139 246 B; re-measured on the merged tree. MEASURED 152 811 B over 232 tools against
+    // 152 069 B over 231, i.e. +742 B for `web_editor_generate_uvs` plus the `ry` of
+    // `web_layout_place`. The ceiling is that figure plus 14 B.
+    // plan-2007 Phase 0: + `web_query` and the `background` param of web_execute → 153 474 B.
+    const PAYLOAD_CEILING_BYTES = 153_500;
 
     it('reports the payload against the Phase-0 baseline', () => {
       const bytes = JSON.stringify(toBaselineTools(schemas)).length;
@@ -763,7 +1087,7 @@ describe('plan-713 T1 — delegate split is observationally neutral', () => {
       ).toBeLessThanOrEqual(PAYLOAD_CEILING_BYTES);
     });
 
-    it('the editor domain is still where the payload lives — the finding, pinned', () => {
+    it('retiring editor aliases reduces the editor share of the payload', () => {
       // Recorded as an assertion so the Phase-0 conclusion stays checkable rather
       // than becoming a paragraph nobody re-measures. If this ever stops being
       // true, the consolidation question is worth reopening.
@@ -771,7 +1095,8 @@ describe('plan-713 T1 — delegate split is observationally neutral', () => {
       const editor = JSON.stringify(
         toBaselineTools(schemas).filter((t) => t.name.startsWith('web_editor_')),
       ).length;
-      expect(editor / total).toBeGreaterThan(0.3);
+      const baselineEditor = JSON.stringify(baseline.tools.filter((t) => t.name.startsWith('web_editor_'))).length;
+      expect(editor / total).toBeLessThan(baselineEditor / JSON.stringify(baseline.tools).length);
     });
   });
 

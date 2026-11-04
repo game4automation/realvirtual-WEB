@@ -43,7 +43,8 @@ import {
   registerComponent,
   setComponentInstance,
 } from './rv-component-registry';
-import { RVRibbonRoller, axisVector, measureRollerRadiusMm } from './rv-ribbon-roller';
+import { RVRibbonRoller, axisVector, measureRollerRadiusMm, publishRibbonSlot } from './rv-ribbon-roller';
+import { slotDeclare, slotUndeclare } from './rv-slot-io';
 import { RV_RIBBON_ROLL_SCALE } from './rv-traverse-utils';
 import { MM_TO_METERS } from './rv-constants';
 import { lengthFromRadiusMm, radiusFromLengthMm } from './ribbon/ribbon-winder-math';
@@ -198,6 +199,11 @@ export class RVRibbonWinder extends RVRibbonRoller {
     // runs `initRoller()`; skipping it left a driven winder without a drive.
     super.init(context);
     this.initRibbonWinder(context);
+    // Unwired feedback slots stay bindable in the viewer (SlotIO).
+    slotDeclare(this, 'DiameterMm', 'feedback');
+    slotDeclare(this, 'WoundLengthMm', 'feedback');
+    slotDeclare(this, 'Empty', 'feedback', { initial: false });
+    slotDeclare(this, 'Full', 'feedback', { initial: false });
   }
 
   override setEditorPreview(
@@ -490,25 +496,26 @@ export class RVRibbonWinder extends RVRibbonRoller {
     // `NaN` is the "never written" marker, and `Math.abs(x - NaN) > eps` is
      // FALSE — so the first write has to be its own case, or the PLC would never
      // see the initial diameter at all.
+    // The change memory runs for wired AND directly bound slots alike.
     const d = this.diameterMm;
-    if (typeof this.DiameterMm === 'string' && changedBy(d, this._lastDiameterMm)) {
+    if (changedBy(d, this._lastDiameterMm)) {
       this._lastDiameterMm = d;
-      write(this.DiameterMm, d);
+      publishRibbonSlot(this, 'DiameterMm', this.DiameterMm, d, write);
     }
     const l = this.woundLengthMm;
-    if (typeof this.WoundLengthMm === 'string' && changedBy(l, this._lastLengthMm)) {
+    if (changedBy(l, this._lastLengthMm)) {
       this._lastLengthMm = l;
-      write(this.WoundLengthMm, l);
+      publishRibbonSlot(this, 'WoundLengthMm', this.WoundLengthMm, l, write);
     }
     const empty = this.isEmpty;
-    if (typeof this.Empty === 'string' && empty !== this._lastEmpty) {
+    if (empty !== this._lastEmpty) {
       this._lastEmpty = empty;
-      write(this.Empty, empty);
+      publishRibbonSlot(this, 'Empty', this.Empty, empty, write);
     }
     const full = this.isFull;
-    if (typeof this.Full === 'string' && full !== this._lastFull) {
+    if (full !== this._lastFull) {
       this._lastFull = full;
-      write(this.Full, full);
+      publishRibbonSlot(this, 'Full', this.Full, full, write);
     }
   }
 
@@ -544,6 +551,7 @@ export class RVRibbonWinder extends RVRibbonRoller {
   }
 
   override dispose(): void {
+    slotUndeclare(this);
     if (this._rollNode) {
       this._rollNode.scale.copy(this._authoredRollScale);
       // Hidden by `applyVisual` while the reel was empty — a disposed component

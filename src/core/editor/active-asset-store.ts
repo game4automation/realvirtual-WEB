@@ -266,6 +266,11 @@ export function sameDocumentBase(a: AssetBase | null, b: AssetBase | null): bool
         && a.providerId === other.providerId
         && a.sourceId === other.sourceId;
     }
+    case 'libraryDocument': {
+      // plan-778: a document id is unique only within its project.
+      const other = b as typeof a;
+      return a.libraryProjectId === other.libraryProjectId && a.documentId === other.documentId;
+    }
     // Not exhaustiveness ceremony: without this the switch RETURNS UNDEFINED
     // for a kind it does not know, and `undefined` is falsy in an `if` but not
     // equal to `false` — so a caller comparing the result, or a test asserting

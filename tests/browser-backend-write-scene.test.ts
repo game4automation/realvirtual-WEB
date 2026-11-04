@@ -37,7 +37,6 @@ import {
   sceneGlbRelPathFor,
   type RvDocumentEntry,
   type RvProject,
-  type RvProjectSceneEntry,
 } from '../src/core/project/rv-project-types';
 import type { SceneWrite } from '../src/core/project/rv-scene-record';
 import { clearAllScenes } from '../src/core/hmi/scene/rv-scene-storage';
@@ -188,7 +187,7 @@ describe('BrowserBackend — a scene row without an id is refused', () => {
     const backend = await openBrowser();
     const idless = {
       glb: new TextEncoder().encode('glTF-stand-in'),
-      meta: { id: '', name: 'Nameless' } as unknown as RvProjectSceneEntry,
+      meta: { id: '', name: 'Nameless' } as unknown as RvDocumentEntry,
     } satisfies SceneWrite;
 
     // Same words as the folder backend — one contract, one message.

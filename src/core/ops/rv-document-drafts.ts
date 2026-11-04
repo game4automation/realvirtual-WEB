@@ -219,6 +219,15 @@ export type RvDraftBase =
       path?: string;
       label: string;
     }
+  /** Twin of `AssetDraftBase.libraryDocument` (plan-778); keyed by the library's project id. */
+  | {
+      kind: 'libraryDocument';
+      libraryProjectId: string;
+      documentId: string;
+      path: string;
+      name: string;
+      libraryLabel?: string;
+    }
   /**
    * Scene lineage: baked bytes under this slot in the scene-GLB store.
    *
@@ -401,7 +410,7 @@ function sceneIdsAliasedTo(documentId: string): string[] {
 }
 
 /**
- * The shared draft of a scene document, trying the new frame then the legacy one.
+ * The shared draft of the planner's document, trying the new frame then the legacy one.
  *
  * The read half of the permanent alias path. Deliberately a function rather than
  * a flag on {@link loadDocumentDraft}: only the SHARED frame has two spellings,
@@ -467,6 +476,20 @@ export async function loadDocumentDraft(frame: RvDraftFrameKey): Promise<RvDocum
 
 /** Drop one frame's draft (after save / explicit discard). Best-effort. */
 export async function clearDocumentDraft(frame: RvDraftFrameKey): Promise<void> {
+  // Forgotten at CALL time (before the first await), not when the delete lands:
+  // from this moment the frame has no record this session owns.
+  forgetSessionDraft(frame);
+  await deleteFrameRecord(frame);
+}
+
+/**
+ * The storage half of {@link clearDocumentDraft}, without the session claim.
+ *
+ * The autosave queues its deletes behind earlier writes and settles the claim
+ * itself, synchronously, at flush time; forgetting again when the queued delete
+ * finally runs would erase the claim of a write that was queued AFTER it.
+ */
+async function deleteFrameRecord(frame: RvDraftFrameKey): Promise<void> {
   let db: IDBDatabase | null = null;
   try {
     db = await openDraftDb();
@@ -642,6 +665,104 @@ export async function shelveDocumentDraft(input: RvDocumentDraftInput): Promise<
   } finally {
     db.close();
   }
+  // Only once the move has COMMITTED: a failed shelving leaves the frame record
+  // where it was, and with it this session's claim on it (plan-616 §2.3).
+  forgetSessionDraft(input.frame);
+}
+
+// ─── Session drafts of a bound editor (plan-616 §2.3) ───────────────────
+//
+// The editor's crash recovery must not offer back a draft that a BOUND editor
+// wrote in this very page: its work is not lost, it lives in the scene's living
+// `RvDocument`, and offering it forks that document into a second one built
+// from the record (LOP #196). A bound `builtinModel` scene has no shared frame
+// (`sharedDocumentFrame` is null), so its records are instance-keyed — one new
+// `asset_<id>` per binding — and only a memory of "this page wrote them, bound
+// to THAT document" can tell them apart from a crash draft.
+//
+// Keyed on the living document OBJECT, not on the scene identity: the identity
+// can change on the first save (`builtinModel` -> `document`), the object does
+// not. A WeakMap, so the claim dies with the document; in memory only, so after
+// a reload every record is a crash draft again. Only BOUND writers register — a
+// fork editor built from a draft carries its work nowhere else, and its draft
+// must never be hidden. Hidden is never deleted: nothing here touches storage.
+
+interface SessionDraftEntry { rootDocumentId: string; projectId: string | null; }
+
+/** Living document -> stack prefix (`rootPrefix`) -> the frame's root identity. */
+const sessionDrafts = new WeakMap<object, Map<string, SessionDraftEntry>>();
+/**
+ * The same inner maps, iterable, so {@link forgetSessionDraft} can reach them
+ * without knowing the document. Holds the small maps only, never a document.
+ */
+const sessionDraftMaps = new Set<Map<string, SessionDraftEntry>>();
+
+/**
+ * Record that a writer BOUND to `boundDoc` is writing `frame`'s draft.
+ *
+ * The claim covers the whole stack of that root (`projectId` + `rootDocumentId`),
+ * so a descended child's record is never left behind without its root.
+ */
+export function noteSessionDraftWrite(boundDoc: object, frame: RvDraftFrameKey): void {
+  let entries = sessionDrafts.get(boundDoc);
+  if (!entries) {
+    entries = new Map();
+    sessionDrafts.set(boundDoc, entries);
+  }
+  sessionDraftMaps.add(entries);
+  entries.set(rootPrefix(frame.projectId, frame.rootDocumentId), {
+    rootDocumentId: frame.rootDocumentId,
+    projectId: frame.projectId,
+  });
+}
+
+/**
+ * Drop this session's claim on a frame whose record is gone.
+ *
+ * Only the ROOT frame releases the claim: the claim covers the whole stack, and
+ * a cleared child says nothing about whether the root's record still exists.
+ */
+export function forgetSessionDraft(frame: RvDraftFrameKey): void {
+  if (frame.occurrence !== ROOT_OCCURRENCE || sessionDraftMaps.size === 0) return;
+  const key = rootPrefix(frame.projectId, frame.rootDocumentId);
+  for (const entries of sessionDraftMaps) {
+    entries.delete(key);
+    if (entries.size === 0) sessionDraftMaps.delete(entries);
+  }
+}
+
+/**
+ * Forget every claim on `livingDoc` — its history was REPLACED by an open.
+ *
+ * plan-616 deviation, recorded in the report: `SceneStore` keeps ONE readonly
+ * `RvDocument` for its whole life and installs every newly opened scene into it
+ * (`_installOps` -> `restoreHistory`). "The scene was rebuilt" is therefore not
+ * a new object, and a claim keyed on the object alone would outlive the work it
+ * describes — the draft would stay hidden although the document on screen no
+ * longer holds it (F4, test 9.8). Called from `_installOps`; only ever makes
+ * MORE drafts visible, never fewer.
+ */
+export function forgetSessionDraftsOf(livingDoc: object): void {
+  const entries = sessionDrafts.get(livingDoc);
+  if (!entries) return;
+  sessionDrafts.delete(livingDoc);
+  sessionDraftMaps.delete(entries);
+}
+
+/**
+ * Did a writer bound to EXACTLY `livingDoc` write this record in this session?
+ *
+ * Pure: reads the in-memory claims, never storage, never the editor's stores.
+ * False for a null document — no living document, nothing can be live.
+ */
+export function isLiveSessionDraft(
+  record: { frame: RvDraftFrameKey },
+  livingDoc: object | null,
+): boolean {
+  if (!livingDoc) return false;
+  const entries = sessionDrafts.get(livingDoc);
+  if (!entries || entries.size === 0) return false;
+  return entries.has(rootPrefix(record.frame.projectId, record.frame.rootDocumentId));
 }
 
 /** Every shelved draft, newest first. Best-effort — never throws. */
@@ -713,6 +834,14 @@ export interface RvDraftAutosaveOptions {
    * while the document is not bound and the stamp moves with it.
    */
   bytesCache?: () => RvDraftBytesCache | null;
+  /**
+   * The living document this writer is BOUND to, or null (plan-616 §2.3).
+   *
+   * Set only by a facade that borrowed the scene's document; a writer without
+   * it never claims its records for the session, so its drafts are always
+   * offered back. Read at flush time — a disposed facade answers null.
+   */
+  boundDoc?: () => object | null;
   delayMs?: number;
 }
 
@@ -740,7 +869,7 @@ export interface RvDraftAutosaveOptions {
  *
  * ── The one exception, and why it is not a second writer (plan-711 §2.4) ────
  *
- * A scene document the EDITOR has bound is written from here too, because for
+ * A planner's document the EDITOR has bound is written from here too, because for
  * the duration of the binding the editor facade is what holds it. That is not
  * the scene lineage acquiring an op draft behind its own back: the frame key
  * comes from the document's IDENTITY ({@link sharedDocumentFrame}), the record
@@ -752,6 +881,7 @@ export interface RvDraftAutosaveOptions {
 export class RvDraftAutosave {
   private readonly _shell: () => RvDocumentDraft['shell'];
   private readonly _bytesCache: (() => RvDraftBytesCache | null) | null;
+  private readonly _boundDoc: (() => object | null) | null;
   private readonly _delayMs: number;
   private _frame: RvDraftFrameKey;
   private _timer: ReturnType<typeof setTimeout> | null = null;
@@ -763,6 +893,7 @@ export class RvDraftAutosave {
     this._frame = opts.frame;
     this._shell = opts.shell;
     this._bytesCache = opts.bytesCache ?? null;
+    this._boundDoc = opts.boundDoc ?? null;
     this._delayMs = opts.delayMs ?? DRAFT_AUTOSAVE_DELAY_MS;
   }
 
@@ -815,15 +946,28 @@ export class RvDraftAutosave {
     if (!doc || this._disposed) return this._inFlight;
     const frame = this._frame;
     const bytes = this._bytesCache?.() ?? null;
+    // plan-616 §2.3 — the session claim is settled HERE, synchronously and in
+    // flush order, before the write is queued: the editor's next entry reads the
+    // claims while this write may still be in flight, and a record that lands
+    // unclaimed is exactly the one that forks the document. Not tied to the
+    // write's success (`saveDocumentDraft` swallows errors) — a claim without a
+    // record is harmless, the open chain then simply finds no draft.
+    const bound = this._boundDoc?.() ?? null;
+    if (doc.dirty) {
+      if (bound) noteSessionDraftWrite(bound, frame);
+    } else {
+      forgetSessionDraft(frame);
+    }
     this._inFlight = this._inFlight.then(() =>
       doc.dirty
         ? saveDocumentDraft({
             frame,
             shell: this._shell(),
-            ops: [...doc.ops],
+            // plan-774 review fix E3: the history PLUS a pending replay tail.
+            ops: doc.draftOps,
             ...(bytes ? { bytesCache: bytes } : {}),
           })
-        : clearDocumentDraft(frame),
+        : deleteFrameRecord(frame),
     );
     return this._inFlight;
   }

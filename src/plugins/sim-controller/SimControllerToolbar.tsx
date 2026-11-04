@@ -13,13 +13,20 @@
 
 import { useSyncExternalStore, useMemo, useRef, useState, useEffect } from 'react';
 import { PlayArrow, Pause, Replay, Speed, Schedule } from '@mui/icons-material';
-import { Menu, MenuItem, Box } from '@mui/material';
+import { Menu, MenuItem, Box, Snackbar, Alert, Button, Portal } from '@mui/material';
 import type { UISlotProps } from '../../core/rv-ui-plugin';
 import { ActionSegment, ActionDivider } from '../../core/hmi/action-group';
 import { SIM_CONTROLLER_PAUSE_REASON } from './index';
 import { getDriveSpeedOverride, subscribeDriveSpeedOverride } from '../../core/engine/rv-speed-override';
 import { commandRegistry } from '../../core/hmi/rv-command-registry';
 import { formatSimClock } from './format-sim-time';
+import { useKernelSnapshot } from '../../hooks/use-kernel-snapshot';
+import { shouldWarnDesSpeed, dismissDesSpeedWarningForSession, switchToDesMode } from './sim-speed-des-warning';
+
+/** Text of the DES speed warning (plan decision 2026-10-25, Thomas: variant B). */
+export const DES_SPEED_WARNING_TEXT =
+  'Running DES blocks faster in continuous mode — above ~10× parts can be missed by sensors. '
+  + 'For long runs use DES mode (event jumps, fast forward). Switching resets moving parts.';
 
 /** Snapshot shape returned by `getPauseSnapshot`. Compared by reference so
  *  `useSyncExternalStore` re-renders only when the underlying state changes. */
@@ -42,18 +49,22 @@ export function PlayPauseSegment({ viewer }: UISlotProps) {
   const snap = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 
   const userPaused = snap.reasons.includes(SIM_CONTROLLER_PAUSE_REASON);
+  // DES "Run finished" (end time reached) is not a pause, yet Play continues the run:
+  // show Play and send paused:false so one click continues instead of pausing first.
+  const rs = useKernelSnapshot(viewer).runState;
+  const canContinue = !snap.paused && rs.runState === 'finished' && rs.reason === 'duration-reached';
 
   // Icon reflects the ACTUAL sim state (paused by ANY reason — user, planner
   // 'layout-edit', AR, …) so the toolbar shows "paused" whenever the sim is
   // held, e.g. on entering the Layout-Planner. (Size is normalized by ActionSegment.)
-  const playPauseIcon = snap.paused ? <PlayArrow /> : <Pause />;
+  const playPauseIcon = snap.paused || canContinue ? <PlayArrow /> : <Pause />;
   // Detailed tooltip surfaces *all* active pause reasons — replaces the inline
   // chip that used to render in the toolbar. Keeps the info discoverable on
   // hover without cluttering the main menu.
   const reasonsList = snap.paused && snap.reasons.length > 0
     ? ` — paused by: ${snap.reasons.join(', ')}`
     : '';
-  const playPauseTitle = (snap.paused ? 'Play (Space)' : 'Pause (Space)') + reasonsList;
+  const playPauseTitle = (snap.paused ? 'Play (Space)' : canContinue ? 'Play - continue run (Space)' : 'Pause (Space)') + reasonsList;
 
   // Subtle visual hint when paused by *something else* (not the user button):
   // the play/pause button picks up the warning colour so the user notices the
@@ -67,7 +78,7 @@ export function PlayPauseSegment({ viewer }: UISlotProps) {
       title={playPauseTitle}
       // plan-499: a view of `sim.playPause` (Space and web_sim_play_pause are the
       // others); the explicit value keeps the toggle semantics of the old onClick.
-      command={{ id: 'sim.playPause', args: () => ({ paused: !userPaused }), viewer }}
+      command={{ id: 'sim.playPause', args: () => ({ paused: canContinue ? false : !userPaused }), viewer }}
       color={playPauseColor}
       icon={playPauseIcon}
       buttonProps={{ 'data-testid': 'sim-controller-playpause' }}
@@ -137,9 +148,11 @@ export function SimControllerToolbar({ viewer }: UISlotProps) {
   );
 }
 
-// ── Drive-speed selector ────────────────────────────────────────────────────
-// A central master speed override for continuous simulation: one factor that
-// scales the effective speed of ALL drives (1 = normal). Sits next to Reset.
+// ── Simulation-speed selector ───────────────────────────────────────────────
+// One master factor for the continuous simulation (1 = normal): drives move
+// faster AND the time-based logic (sim clock, Source intervals, LogicStep Delay,
+// DES Animated clock, PLC timers) advances by `factor × dt` — see
+// rv-speed-override.ts. Sits next to Reset.
 
 // Engine cap is 100× (see setDriveSpeedOverride). Above ~10–20× fast/small parts
 // can tunnel past sensors in the fixed 60 Hz step — fine for large parts / big zones.
@@ -150,10 +163,12 @@ export function SpeedSelector({ viewer }: { viewer?: UISlotProps['viewer'] } = {
   const factor = useSyncExternalStore(subscribeDriveSpeedOverride, getDriveSpeedOverride, getDriveSpeedOverride);
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   const segRef = useRef<HTMLElement | null>(null);
+  const [desWarnOpen, setDesWarnOpen] = useState(false);
+  const closeDesWarn = () => setDesWarnOpen(false);
   return (
     <>
       <ActionSegment
-        title="Drive speed override — scales all drive speeds (1× = normal)"
+        title="Simulation speed — runs the simulation faster or slower (1× = real time)"
         icon={<Speed />}
         label={`${factor}×`}
         // plan-499: the segment is the (interactive) view of `sim.speedOverride`:
@@ -175,8 +190,12 @@ export function SpeedSelector({ viewer }: { viewer?: UISlotProps['viewer'] } = {
             key={o}
             selected={o === factor}
             onClick={() => {
+              // Non-blocking: the speed is applied either way; the warning only
+              // points DES scenes to DES mode. UI-only — MCP calls never get here.
+              const warn = shouldWarnDesSpeed(viewer, o, factor);
               void commandRegistry.execute('sim.speedOverride', { factor: o }, { origin: 'ui', ...(viewer ? { viewer } : {}) });
               setAnchor(null);
+              if (warn) setDesWarnOpen(true);
             }}
             sx={{ fontSize: 13, minHeight: 0, py: 0.5, justifyContent: 'center' }}
           >
@@ -184,6 +203,48 @@ export function SpeedSelector({ viewer }: { viewer?: UISlotProps['viewer'] } = {
           </MenuItem>
         ))}
       </Menu>
+      {/* Portal: the toolbar pill clips (overflow hidden) and is a containing
+          block for fixed children — the Snackbar must live on <body>. */}
+      <Portal>
+      <Snackbar
+        open={desWarnOpen}
+        onClose={(_e, reason) => { if (reason !== 'clickaway') closeDesWarn(); }}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+      >
+        <Alert
+          severity="warning"
+          variant="filled"
+          onClose={closeDesWarn}
+          data-testid="sim-speed-des-warning"
+          sx={{ fontSize: 12, alignItems: 'center', maxWidth: 760, '& .MuiAlert-action': { pt: 0 } }}
+          action={(
+            <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'nowrap', whiteSpace: 'nowrap' }}>
+              <Button
+                color="inherit"
+                size="small"
+                data-testid="sim-speed-des-warning-switch"
+                onClick={() => { closeDesWarn(); switchToDesMode(viewer); }}
+              >
+                Switch to DES mode
+              </Button>
+              <Button color="inherit" size="small" data-testid="sim-speed-des-warning-stay" onClick={closeDesWarn}>
+                Stay
+              </Button>
+              <Button
+                color="inherit"
+                size="small"
+                data-testid="sim-speed-des-warning-dismiss"
+                onClick={() => { dismissDesSpeedWarningForSession(); closeDesWarn(); }}
+              >
+                Don&apos;t ask again
+              </Button>
+            </Box>
+          )}
+        >
+          {DES_SPEED_WARNING_TEXT}
+        </Alert>
+      </Snackbar>
+      </Portal>
     </>
   );
 }

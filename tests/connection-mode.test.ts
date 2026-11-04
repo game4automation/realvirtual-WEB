@@ -13,11 +13,11 @@
  *   survives the virtual PLC's deactivation; disconnect (or no model output in
  *   its discovered signals any more) returns to the saved StartMode — all
  *   through the real `BaseIndustrialInterface` flush path;
- * - MCP `web_sim_mode` get / set (incl. interfaceConnected / takeover);
+ * - MCP `sim.connectionMode` / `sim.setConnectionMode` (incl. interfaceConnected / takeover);
  * - the toggle label.
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { Object3D, Scene } from 'three';
 import {
   ConnectionModeController,
@@ -32,7 +32,9 @@ import { SignalStore } from '../src/core/engine/rv-signal-store';
 import { StepState } from '../src/core/engine/rv-logic-step';
 import { BaseIndustrialInterface, type SignalDescriptor } from '../src/interfaces/base-industrial-interface';
 import type { InterfaceSettings } from '../src/interfaces/interface-settings-store';
-import { McpSimModeTool } from '../src/plugins/mcp-bridge/rv-mcp-sim-mode-tool';
+import { commandRegistry } from '../src/core/hmi/rv-command-registry';
+import { McpCommandTools } from '../src/plugins/mcp-bridge/rv-mcp-command-tools';
+import { ensureSimCommandsRegistered } from '../src/plugins/sim-controller/sim-commands';
 import { connectionModeLabel } from '../src/core/hmi/ConnectionModeToggle';
 import { registerSignal } from '../src/core/engine/rv-signal-construction';
 import type { RVViewer } from '../src/core/rv-viewer';
@@ -303,21 +305,23 @@ describe('plan-539 F15b — an interface takes over only when it writes model ou
   });
 });
 
-describe('plan-539 F15/F15b — MCP web_sim_mode and the toggle label', () => {
+describe('plan-539 F15/F15b — MCP sim connection commands and the toggle label', () => {
+  afterEach(() => commandRegistry.attachViewer(undefined));
   it('reads and sets the mode (incl. interfaceConnected / takeover); refuses while an interface has taken over', async () => {
     const r = rig('Simulation');
     r.load();
-    const tool = new McpSimModeTool(() => ({ connectionMode: r.controller } as unknown as RVViewer));
-    expect(JSON.parse(await tool.webSimMode())).toMatchObject({ mode: 'Simulation', source: 'model', label: 'Simulation' });
-    expect(JSON.parse(await tool.webSimMode('plc'))).toMatchObject({ mode: 'PLC', source: 'toggle', persisted: true });
-    expect(JSON.parse(await tool.webSimMode('bogus')).error).toMatch(/Unknown mode/);
+    ensureSimCommandsRegistered();
+    const tool = new McpCommandTools(() => ({ connectionMode: r.controller } as unknown as RVViewer));
+    expect(JSON.parse(await tool.webQuery('sim.connectionMode')).value).toMatchObject({ mode: 'Simulation', source: 'model', label: 'Simulation' });
+    expect(JSON.parse(await tool.webExecute('sim.setConnectionMode', JSON.stringify({ mode: 'plc' }))).value).toMatchObject({ mode: 'PLC', source: 'toggle', persisted: true });
+    expect(JSON.parse(await tool.webExecute('sim.setConnectionMode', JSON.stringify({ mode: 'bogus' }))).value.error).toMatch(/Unknown mode/);
     r.controller.interfaceConnected('plc');
-    expect(JSON.parse(await tool.webSimMode())).toMatchObject({ interfaceConnected: true, takeover: false, label: 'PLC · interface connected' });
+    expect(JSON.parse(await tool.webQuery('sim.connectionMode')).value).toMatchObject({ interfaceConnected: true, takeover: false, label: 'PLC · interface connected' });
     r.controller.interfaceWrites('plc', ['Out_Q']);
-    const refused = JSON.parse(await tool.webSimMode('Simulation'));
+    const refused = JSON.parse(await tool.webExecute('sim.setConnectionMode', JSON.stringify({ mode: 'Simulation' }))).value;
     expect(refused.error).toMatch(/interface/);
     expect(refused.source).toBe('interface');
-    expect(JSON.parse(await tool.webSimMode())).toMatchObject({ label: 'PLC (interface)', takeover: true, interfaceConnected: true });
+    expect(JSON.parse(await tool.webQuery('sim.connectionMode')).value).toMatchObject({ label: 'PLC (interface)', takeover: true, interfaceConnected: true });
   });
 
   it('labels: Simulation / PLC / PLC (interface)', () => {

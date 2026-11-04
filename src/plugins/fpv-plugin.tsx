@@ -234,6 +234,7 @@ export class FpvPlugin extends BaseViewerPlugin {
     // XR conflict guard
     const xrPlugin = this._viewer.getPlugin<WebXRPlugin>('webxr');
     if (xrPlugin?.isPresenting) return;
+    if (this._viewer.getPlugin<{ id: string; status: { active: boolean } }>('display-wall')?.status.active) return;
 
     // Show info overlay — user clicks to start
     this._showOverlay();
@@ -288,6 +289,11 @@ export class FpvPlugin extends BaseViewerPlugin {
   private _activateFpv(): void {
     const viewer = this._viewer;
     if (!viewer) return;
+    // The overlay may have opened before a wall took ownership.
+    if (viewer.getPlugin<{ id: string; status: { active: boolean } }>('display-wall')?.status.active) {
+      this._removeOverlay();
+      return;
+    }
 
     this._isTransitioning = true;
 

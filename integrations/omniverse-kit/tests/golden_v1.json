@@ -1,0 +1,173 @@
+{
+  "version": 1,
+  "comment": "Golden bytes of livesync protocol v1 (plan-637). Shared by tests/usd-live-link-protocol.test.ts and tests/test_protocol.py - change both encoders together.",
+  "readyAck": {
+    "comment": "Text ack after a valid hello (extension >= 0.2.0). Python: protocol.ready_ack(\"0.2.0\"); TS: parseAck + checkExtension.",
+    "text": "{\"type\": \"ready\", \"extVersion\": \"0.2.0\", \"protocol\": 1}"
+  },
+  "cases": [
+    {
+      "name": "mountBegin",
+      "input": {
+        "session": 3,
+        "compressedBytes": 1000,
+        "rawBytes": 4096,
+        "chunkCount": 2,
+        "meta": {
+          "encoding": "gzip",
+          "nodes": [
+            "/Root/Scenes/Scene/Cell",
+            "/Root/Scenes/Scene/Cell/Axis1"
+          ],
+          "templates": [
+            "/Root/Scenes/Scene/Cell/Box"
+          ],
+          "preplaced": [
+            {
+              "muId": 7,
+              "nodeIndex": 1
+            }
+          ]
+        }
+      },
+      "hex": "0103000000e803000000100000020000007b22656e636f64696e67223a22677a6970222c226e6f646573223a5b222f526f6f742f5363656e65732f5363656e652f43656c6c222c222f526f6f742f5363656e65732f5363656e652f43656c6c2f4178697331225d2c2274656d706c61746573223a5b222f526f6f742f5363656e65732f5363656e652f43656c6c2f426f78225d2c22707265706c61636564223a5b7b226d754964223a372c226e6f6465496e646578223a317d5d7d"
+    },
+    {
+      "name": "mountChunk",
+      "input": {
+        "session": 3,
+        "index": 1,
+        "payloadHex": "deadbeef"
+      },
+      "hex": "020300000001000000deadbeef"
+    },
+    {
+      "name": "frame",
+      "input": {
+        "session": 3,
+        "seq": 42,
+        "nodes": [
+          {
+            "index": 1,
+            "m": [
+              1,
+              0,
+              0,
+              0,
+              0,
+              1,
+              0,
+              0,
+              0,
+              0,
+              1,
+              0,
+              0.5,
+              -2.25,
+              3,
+              1
+            ]
+          }
+        ],
+        "mus": [
+          {
+            "muId": 9,
+            "m": [
+              0,
+              1,
+              0,
+              0,
+              -1,
+              0,
+              0,
+              0,
+              0,
+              0,
+              1,
+              0,
+              10,
+              20,
+              -0.125,
+              1
+            ]
+          }
+        ]
+      },
+      "hex": "03030000002a00000001000000010000000000803f000000000000000000000000000000000000803f000000000000000000000000000000000000803f000000000000003f000010c0000040400000803f0100000009000000000000000000803f0000000000000000000080bf00000000000000000000000000000000000000000000803f00000000000020410000a041000000be0000803f"
+    },
+    {
+      "name": "frameEmptyMus",
+      "input": {
+        "session": 4,
+        "seq": 0,
+        "nodes": [
+          {
+            "index": 0,
+            "m": [
+              0,
+              1,
+              0,
+              0,
+              -1,
+              0,
+              0,
+              0,
+              0,
+              0,
+              1,
+              0,
+              10,
+              20,
+              -0.125,
+              1
+            ]
+          }
+        ],
+        "mus": []
+      },
+      "hex": "0304000000000000000100000000000000000000000000803f0000000000000000000080bf00000000000000000000000000000000000000000000803f00000000000020410000a041000000be0000803f00000000"
+    },
+    {
+      "name": "muSpawn",
+      "input": {
+        "session": 3,
+        "muId": 9,
+        "templateIndex": 0,
+        "m": [
+          0,
+          1,
+          0,
+          0,
+          -1,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          10,
+          20,
+          -0.125,
+          1
+        ]
+      },
+      "hex": "04030000000900000000000000000000000000803f0000000000000000000080bf00000000000000000000000000000000000000000000803f00000000000020410000a041000000be0000803f"
+    },
+    {
+      "name": "muDelete",
+      "input": {
+        "session": 3,
+        "muId": 9
+      },
+      "hex": "050300000009000000"
+    },
+    {
+      "name": "reset",
+      "input": {
+        "session": 3
+      },
+      "hex": "0603000000"
+    }
+  ]
+}

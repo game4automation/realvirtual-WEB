@@ -300,7 +300,9 @@ describe('(b) Bake-Regel im Misch-Fall', () => {
 
   it('MESSUNG b2: eleven kinds are affected — the whole asset lineage, not an edge case', () => {
     const assetKinds = RV_OP_KINDS.filter((k: RvOpKind) => RV_OP_ORIGIN[k] === 'asset');
-    expect(assetKinds).toHaveLength(11);
+    // 12 since plan-621 added `replaceNodeGeometry` (asset lineage, structural as well),
+    // 13 since plan-641 added `cloneNode`.
+    expect(assetKinds).toHaveLength(13);
     // Structural, all of them: there is no `MaterialisedEdits` category that
     // could express "this node was deleted / renamed / reparented" — which is
     // why "erweitertes Overlay" is a new vocabulary, and "projizierter Baum"

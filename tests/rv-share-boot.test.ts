@@ -286,8 +286,11 @@ describe('share boot — main.ts routing', () => {
     // the planner fallback — `urlDocNew || (plannerMode && …)` — so the guard
     // list is now nested one level deeper. What is pinned is unchanged: the
     // planner fallback must still exclude BOTH `?glb=` and `?doc=`.
+    // plan-640 appended `&& !hostedStartApplies` (a hosted start document
+    // replaces the IMPLICIT empty route only) — pinned verbatim, so the two
+    // exclusions above can still not be dropped silently.
     expect(mainSource).toMatch(
-      /const urlScene = params\.get\('scene'\)\s*\?\?\s*\(\(urlDocNew \|\| \(plannerMode && !params\.get\('model'\) && !urlGlb && !urlDoc\)\) \? 'empty' : null\)/,
+      /const urlScene = params\.get\('scene'\)\s*\?\?\s*\(\(urlDocNew \|\| \(plannerMode && !params\.get\('model'\) && !urlGlb && !urlDoc && !hostedStartApplies\)\) \? 'empty' : null\)/,
     );
     // …and `?doc=new` is a reserved value that never becomes a document id,
     // otherwise the new-document branch would swallow real `?doc=` links.
@@ -301,8 +304,11 @@ describe('share boot — main.ts routing', () => {
     const result = await bootSharedGlb(viewer, SHARE_URL, { fetch: { fetchImpl: okFetch() } });
     expect(result.ok).toBe(true);
 
-    // … and the resume block is gated on exactly that flag.
-    const resumeGuard = mainSource.indexOf('if (!sceneRouted) {');
+    // … and the resume block is gated on exactly that flag (plan-640 added a
+    // second condition — a hosted start document skips the resume too — but
+    // `!sceneRouted` stays the first operand of the guard).
+    const resumeGuard = mainSource.indexOf('if (!sceneRouted && !hostedStartApplies) {');
+    expect(resumeGuard).toBeGreaterThan(-1);
     const glbBranch = mainSource.indexOf('if (!sceneRouted && urlGlb)');
     expect(resumeGuard).toBeGreaterThan(glbBranch);
     expect(mainSource.slice(resumeGuard, resumeGuard + 400)).toContain('readActiveId()');
@@ -387,8 +393,13 @@ describe('share boot — load trust (F17)', () => {
   it('the viewer routes both load entry points through that one rule', () => {
     // Two call sites, one implementation — the guard that keeps a future edit
     // from reintroducing a hand-rolled try/finally that forgets the restore.
+    // `loadModel` awaits inside a try/catch of its own since plan-774 review
+    // fix E7 (a FAILED load must not keep the previous document's bakes), and
+    // `_loadModelInner` gained a ticket argument with it. Neither touches the
+    // trust restore, which still lives only inside `withLoadTrust` — so the
+    // guard pins the routing, not the argument list that follows it.
     expect(viewerSource).toContain(
-      'return withLoadTrust(this._trustSlot, options?.trust, () => this._loadModelInner(url, options));',
+      'withLoadTrust(this._trustSlot, options?.trust, () => this._loadModelInner(url, options',
     );
     expect(viewerSource).toContain(
       'return withLoadTrust(this._trustSlot, trust, () => this._loadSceneInner(scene, trust, opts));',
@@ -423,11 +434,12 @@ describe('share boot — load trust (F17)', () => {
 // ─── The card (F5/F14) ──────────────────────────────────────────────────
 
 describe('share boot — info card', () => {
-  it('share_CardShowsOriginAndExpiry: origin always, expiry only when one was set', () => {
+  it('share_CardShowsNameAndExpiry: no origin row, expiry only when one was set', () => {
     const info = buildSharedGlbInfo({ url: SHARE_URL, userData: { rv_share: RV_SHARE } });
     render(createElement(SharedGlbInfoCard, { info }));
 
-    expect(screen.getByTestId('shared-glb-origin').textContent).toContain('files.example.org');
+    // The "loaded from <host>" row was dropped from the card (display only).
+    expect(screen.queryByTestId('shared-glb-origin')).toBeNull();
     expect(screen.getByTestId('shared-glb-expiry').textContent).toMatch(/expires on/i);
     expect(screen.getByText(/Pick & Place Cell/)).toBeTruthy();
     expect(screen.getByText(/assembly · Thomas Strigl · CC-BY-4\.0/)).toBeTruthy();
@@ -441,7 +453,7 @@ describe('share boot — info card', () => {
       userData: { rv_share: { v: 1, name: 'Portal Axis' } },
     });
     render(createElement(SharedGlbInfoCard, { info: noExpiry }));
-    expect(screen.getByTestId('shared-glb-origin')).toBeTruthy();
+    expect(screen.getByText(/Portal Axis/)).toBeTruthy();
     expect(screen.queryByTestId('shared-glb-expiry')).toBeNull();
   });
 

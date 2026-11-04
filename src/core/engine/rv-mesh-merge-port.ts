@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage } from '../rv-safe-storage';
+
 /**
  * MeshMergePort — asynchronous mesh-merge compute behind an injectable port
  * (plan-274 Phase 1).
@@ -58,7 +60,7 @@ export const SMALL_MODEL_VERTEX_THRESHOLD = 200_000;
  *  (WASM) path. Inline merging is unaffected by the switch. */
 export function isMeshMergeWasmEnabled(): boolean {
   try {
-    const v = typeof localStorage !== 'undefined' ? localStorage.getItem(MESH_MERGE_WASM_FLAG_KEY) : null;
+    const v = readLocalStorage(MESH_MERGE_WASM_FLAG_KEY);
     if (v === 'off' || v === 'false' || v === '0') return false;
   } catch {
     /* storage unavailable (privacy mode) — default ON */

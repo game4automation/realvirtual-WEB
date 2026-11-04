@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { DESEventQueue } from '@rv-private/plugins/des/rv-des-event-queue';
+import { DESEventQueue } from '@rv/plugins/des/rv-des-event-queue';
 
 describe('DESEventQueue', () => {
   it('returns events in time order', () => {

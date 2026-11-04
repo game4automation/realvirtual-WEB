@@ -73,6 +73,13 @@ for (const arg of args) {
 }
 const reportPath = reportPaths[0];
 
+// Files that import the probe but are NOT dev-asset dependent (their asset is public, or
+// cannot be measured on the machine). Read from the checked-in file and carried over on
+// regeneration; the node test applies the same exclusion to its coverage check.
+const PROBE_ONLY = (() => {
+  try { return JSON.parse(readFileSync(OUT, 'utf8')).probeOnly ?? { files: [] }; } catch { return { files: [] }; }
+})();
+
 if (!reportPath || [...reportPaths, ...withoutReports].some(p => !existsSync(p))) {
   console.error('usage:');
   console.error('  node scripts/gen-dev-asset-dependent-tests.mjs <with.json...> --without <no.json...>');
@@ -104,6 +111,7 @@ function usesDevAssets(file) {
   // Listing it here would make the "exactly this set skips" gate demand that the
   // guard switch itself off, which is the one thing it must never do.
   if (file.replace(/\\/g, '/').endsWith('tests/dev-asset-probe.test.ts')) return false;
+  if (PROBE_ONLY.files.some(f => file.split('\\').join('/').endsWith(f))) return false;
   try {
     return readFileSync(file, 'utf8').includes('dev-asset-available');
   } catch {
@@ -216,6 +224,7 @@ const payload = {
   ],
   generatedAt: new Date().toISOString().slice(0, 10),
   devAssetDependent: ids,
+  probeOnly: PROBE_ONLY,
   knownFailing: {
     $comment: [
       'Pre-existing failures, EXCLUDED from the guard but not ignored: if this set grows,',

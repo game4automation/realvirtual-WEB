@@ -4,11 +4,57 @@
 import { Vector3, Object3D, Box3, Quaternion, Matrix4 } from 'three';
 import { unityPositionToGltf } from './rv-coordinate-utils';
 
+// ── Unit contract of `halfSize` / `localCenter` (plan-653 spike, 2026-10-21) ──
+//
+// `halfSize` is ALWAYS world units and world-axis-aligned once `update()` ran.
+// `localCenter` differs per factory — which is why `update()` alone cannot
+// decide whether the node's world SCALE applies to it:
+//
+//   path                                   halfSize (stored)              localCenter (stored)
+//   fromNode (loader; MU fallback)         world (Box3 of world mesh)     node-local, scale INCLUDED (worldToLocal)
+//   fromBoxCollider (loader, physics zone) collider size/2, local units   Unity collider centre, node-local units
+//   fromHalfSize (MU, synthetic line)      world (caller)                 MU rotation frame in WORLD units
+//                                                                         (rv-mu-collider-bounds) or template-local
+//   fromPositionFn (instanced MU)          world (caller)                 same frame as the position callback
+//   TransportSurface.init()                local extents kept aside       node-local incl. scale (_computeLocalAABB)
+//   Sensor (via loader)                    as fromNode / fromBoxCollider  as fromNode / fromBoxCollider
+//
+// `update()` / `updateFrom()` keep the historical rule: offset rotated by the
+// world QUATERNION only. That is exact for the MU paths (world-unit rotation
+// frame) and for every unit-scale node. Node-local consumers (TransportSurface,
+// Sensor) opt in with `useNodeLocalFrame()`: their centre then goes through the
+// full `matrixWorld` (rotation × scale, mirrors included) and, for the surface,
+// `setHalfSizeFromNodeExtents()` derives the world extents from |M_ij| of the
+// linear 3×3. On a rigid (unit-scale, det > 0) node both opt-ins take the
+// historical code path, so their result is bit-identical to before. MU paths
+// never opt in — scaling a world-unit offset again would double-scale it.
+// Known, out of scope: a meshless fromBoxCollider AABB keeps an unscaled
+// halfSize on a scaled node (Sink, collider-only surfaces).
+
 // Module-level scratch — pre-allocated to keep `AABB.update()` GC-free in the
 // transport hot path. Each `update()` call is single-threaded so reuse is safe.
 const _scratchQuat = new Quaternion();
 const _scratchOffset = new Vector3();
 const _scratchRotMat = new Matrix4();
+const _scratchPos = new Vector3();
+const _scratchScale = new Vector3();
+
+/** Tolerance on the squared column lengths for "rigid" (unit scale). */
+const RIGID_EPS = 1e-9;
+
+/** True when the linear 3×3 of `e` (column-major) is a proper rotation: unit
+ *  column lengths and a positive determinant (no scale, no mirror). */
+function isRigid(e: ArrayLike<number>): boolean {
+  const cx = e[0] * e[0] + e[1] * e[1] + e[2] * e[2];
+  const cy = e[4] * e[4] + e[5] * e[5] + e[6] * e[6];
+  const cz = e[8] * e[8] + e[9] * e[9] + e[10] * e[10];
+  if (Math.abs(cx - 1) > RIGID_EPS || Math.abs(cy - 1) > RIGID_EPS || Math.abs(cz - 1) > RIGID_EPS) return false;
+  const det =
+    e[0] * (e[5] * e[10] - e[9] * e[6]) -
+    e[4] * (e[1] * e[10] - e[9] * e[2]) +
+    e[8] * (e[1] * e[6] - e[5] * e[2]);
+  return det > 0;
+}
 
 /**
  * Pre-allocated Axis-Aligned Bounding Box for fast overlap tests.
@@ -30,6 +76,9 @@ export class AABB {
   private node: Object3D | null = null;
   /** Callback that provides world position — decouples AABB from Object3D */
   private getPositionFn: ((out: Vector3) => Vector3) | null = null;
+  /** plan-653: `localCenter` is in the node's LOCAL frame (scale included) —
+   *  `update()` maps it through the full `matrixWorld`. Set via `useNodeLocalFrame()`. */
+  private nodeLocalFrame = false;
 
   /**
    * Create AABB from BoxCollider center/size in GLB extras.
@@ -76,7 +125,13 @@ export class AABB {
     box.getCenter(boxCenter);
     node.worldToLocal(boxCenter); // boxCenter is now in node-local space
     aabb.localCenter.copy(boxCenter);
+    // plan-653: the construction-time centre goes through the full world matrix
+    // (scale included) — identical to before on a unit-scale node, no longer
+    // ~1000× off on a mm-scaled SolidCraft body. The opt-in is NOT kept: MU
+    // callers own their tick semantics (see the contract at the top).
+    aabb.nodeLocalFrame = true;
     aabb.update();
+    aabb.nodeLocalFrame = false;
     return aabb;
   }
 
@@ -123,6 +178,7 @@ export class AABB {
    *  rotated by a Drive or the planner) rotates. The AABB itself remains
    *  axis-aligned; only its centre moves on a circle around the parent pivot. */
   update(): void {
+    if (this.nodeLocalFrame && this.node && this._updateInNodeFrame(this.node)) return;
     if (this.getPositionFn) {
       this.getPositionFn(this.center);
       if (this.node) {
@@ -182,6 +238,68 @@ export class AABB {
       Math.abs(e[1]) * localHalf.x + Math.abs(e[5]) * localHalf.y + Math.abs(e[9]) * localHalf.z,
       Math.abs(e[2]) * localHalf.x + Math.abs(e[6]) * localHalf.y + Math.abs(e[10]) * localHalf.z,
     );
+  }
+
+  /**
+   * plan-653 — declare `localCenter` as NODE-LOCAL (the node's world scale
+   * applies to it). From then on `update()` maps the centre through the node's
+   * full `matrixWorld` whenever that matrix is not rigid (scale ≠ 1 or mirror);
+   * on a rigid node the historical rotation-only path runs unchanged.
+   * Only for node-backed AABBs with the default node position callback
+   * (TransportSurface, Sensor). Returns `this` for chaining.
+   */
+  useNodeLocalFrame(): this {
+    this.nodeLocalFrame = true;
+    return this;
+  }
+
+  /** Whether `useNodeLocalFrame()` is active. */
+  get usesNodeLocalFrame(): boolean {
+    return this.nodeLocalFrame;
+  }
+
+  /**
+   * plan-653 — set the world axis-aligned `halfSize` from half-extents in the
+   * node's LOCAL frame (scale included): `worldHalf_i = Σ_j |M_ij|·localHalf_j`
+   * with M the linear 3×3 of the node's `matrixWorld` (rotation × scale). On a
+   * rigid node this is exactly `setHalfSizeFromRotatedExtents(localHalf,
+   * worldQuaternion)` — bit-identical to the historical surface footprint.
+   * No-op without a backing node. Allocation-free. Call BEFORE `update()`.
+   */
+  setHalfSizeFromNodeExtents(localHalf: Vector3): void {
+    const node = this.node;
+    if (!node) return;
+    node.updateWorldMatrix(true, false);
+    const m = node.matrixWorld;
+    const e = m.elements;
+    if (isRigid(e)) {
+      // The same decompose `getWorldQuaternion()` performs — same bits as before.
+      m.decompose(_scratchPos, _scratchQuat, _scratchScale);
+      this.setHalfSizeFromRotatedExtents(localHalf, _scratchQuat);
+      return;
+    }
+    this.halfSize.set(
+      Math.abs(e[0]) * localHalf.x + Math.abs(e[4]) * localHalf.y + Math.abs(e[8]) * localHalf.z,
+      Math.abs(e[1]) * localHalf.x + Math.abs(e[5]) * localHalf.y + Math.abs(e[9]) * localHalf.z,
+      Math.abs(e[2]) * localHalf.x + Math.abs(e[6]) * localHalf.y + Math.abs(e[10]) * localHalf.z,
+    );
+  }
+
+  /** Node-local centre through the full world matrix. Returns false (the caller
+   *  then runs the historical path) when the matrix is rigid. */
+  private _updateInNodeFrame(node: Object3D): boolean {
+    node.updateWorldMatrix(true, false);
+    const e = node.matrixWorld.elements;
+    if (isRigid(e)) return false;
+    const lc = this.localCenter;
+    this.center.set(
+      e[0] * lc.x + e[4] * lc.y + e[8] * lc.z + e[12],
+      e[1] * lc.x + e[5] * lc.y + e[9] * lc.z + e[13],
+      e[2] * lc.x + e[6] * lc.y + e[10] * lc.z + e[14],
+    );
+    this.min.copy(this.center).sub(this.halfSize);
+    this.max.copy(this.center).add(this.halfSize);
+    return true;
   }
 
   /** Replace the position callback (used when InstancedMesh slot changes) */

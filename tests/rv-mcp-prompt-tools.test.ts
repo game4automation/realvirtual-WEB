@@ -13,6 +13,8 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import type { RVViewer } from '../src/core/rv-viewer';
+import { createQueryCommandDescriptors } from '../src/core/hmi/query-commands';
 import { McpBridgePlugin, dialogPolicyApplies } from '../src/plugins/mcp-bridge-plugin';
 import { buildMultiDispatcher, generateToolSchemasMulti } from '../src/core/engine/rv-mcp-tools';
 import { allSchemas, allInstances } from './helpers/mcp-schemas';
@@ -46,6 +48,9 @@ let store: PromptTaskStore;
 
 function setupBridge() {
   const plugin = new McpBridgePlugin();
+  (plugin as unknown as { viewer: RVViewer }).viewer = { modes: { activeMode: 'hmi' } } as unknown as RVViewer;
+  // plan-668: the test transport stands for a tab with AI control on.
+  (plugin as unknown as { _aiEnabled: boolean })._aiEnabled = true;
   (plugin as unknown as { _dispatcher: ReturnType<typeof buildMultiDispatcher> })._dispatcher =
     buildMultiDispatcher(plugin.mcpToolInstances);
   const sent: string[] = [];
@@ -71,7 +76,8 @@ async function call(tool: string, args: Record<string, unknown> = {}): Promise<R
   expect(frame.error, `transport error: ${frame.error}`).toBeUndefined();
   // THE assertion this file exists for: the bridge carries a STRING.
   expect(typeof frame.result).toBe('string');
-  return JSON.parse(frame.result as string) as Record<string, unknown>;
+  const parsed = JSON.parse(frame.result as string);
+  return tool === 'web_query' ? parsed.value : parsed;
 }
 
 let seq = 0;
@@ -105,18 +111,18 @@ afterEach(() => {
 describe('plan-486 §9.3 — the tools are declared the way the gates expect', () => {
   it('list is read-only, claim is a write, and neither carries a timeout', () => {
     const schemas = allSchemas();
-    const list = schemas.find((s) => s.name === 'web_prompt_list');
+    const list = createQueryCommandDescriptors().find((d) => d.id === 'prompt.list');
+    expect(schemas.some((s) => s.name === 'web_prompt_list')).toBe(false);
     const claim = schemas.find((s) => s.name === 'web_prompt_claim');
-    expect(list, 'web_prompt_list must be announced').toBeTruthy();
+    expect(list, 'prompt.list must be registered').toBeTruthy();
     expect(claim, 'web_prompt_claim must be announced').toBeTruthy();
-    expect(list!.annotations?.readOnlyHint).toBe(true);
+    expect(list!.readOnly).toBe(true);
     expect(claim!.annotations?.readOnlyHint).toBe(false);
     // No timeoutMs: a tool that returns at once has no use for one, and a
     // timeout on the wire would suggest a wait mode that does not exist.
     expect(list!.timeoutMs).toBeUndefined();
     expect(claim!.timeoutMs).toBeUndefined();
-    expect(Object.keys(list!.inputSchema.properties)).toEqual(['includeClaimed']);
-    expect(list!.inputSchema.required).toEqual([]);
+    expect(Object.keys(list!.argsSchema ?? {})).toEqual(['includeClaimed']);
     expect(Object.keys(claim!.inputSchema.properties)).toEqual([]);
   });
 
@@ -190,7 +196,7 @@ describe('plan-486 §9.3 — the wire format, read off the sent frame', () => {
 
   it('list is read-only — same wire shape, and it consumes nothing', async () => {
     store.enqueue(makeTask());
-    const before = await call('web_prompt_list') as { tasks: Array<{ userInstruction: string; status: string }>; open: number; claimed: number; truncated: boolean };
+    const before = await call('web_query', { command: 'prompt.list' }) as { tasks: Array<{ userInstruction: string; status: string }>; open: number; claimed: number; truncated: boolean };
     expect(before.tasks).toHaveLength(1);
     expect(before.open).toBe(1);
     expect(before.claimed).toBe(0);
@@ -198,15 +204,15 @@ describe('plan-486 §9.3 — the wire format, read off the sent frame', () => {
     expect(before.tasks[0].userInstruction).toContain('<<<RV-USER-DATA-');
     expect(before.tasks[0].status).toBe('open');
     // Called twice, it still shows the same open task.
-    expect((await call('web_prompt_list') as { open: number }).open).toBe(1);
+    expect((await call('web_query', { command: 'prompt.list' }) as { open: number }).open).toBe(1);
     expect(store.list()).toHaveLength(1);
   });
 
   it('includeClaimed brings a handed-out task back into view', async () => {
     store.enqueue(makeTask());
     await call('web_prompt_claim');
-    expect((await call('web_prompt_list') as { tasks: unknown[] }).tasks).toHaveLength(0);
-    const all = await call('web_prompt_list', { includeClaimed: true }) as {
+    expect((await call('web_query', { command: 'prompt.list' }) as { tasks: unknown[] }).tasks).toHaveLength(0);
+    const all = await call('web_query', { command: 'prompt.list', args: JSON.stringify({ includeClaimed: true }) }) as {
       tasks: Array<{ status: string }>; claimed: number;
     };
     expect(all.tasks).toHaveLength(1);
@@ -240,11 +246,11 @@ describe('plan-486 §9.3 — the wire format, read off the sent frame', () => {
     }
     const { handleMessage, sent } = setupBridge();
     await handleMessage(JSON.stringify({
-      type: 'call', id: 487, tool: 'web_prompt_list', arguments: { includeClaimed: true },
+      type: 'call', id: 487, tool: 'web_query', arguments: { command: 'prompt.list', args: JSON.stringify({ includeClaimed: true }) },
     }));
     const frame = JSON.parse(sent[0]) as { result: string };
     expect(utf8Bytes(frame.result)).toBeLessThanOrEqual(MAX_LIST_RESPONSE_BYTES + 4096);
-    const parsed = JSON.parse(frame.result) as { tasks: unknown[]; truncated: boolean; open: number };
+    const parsed = JSON.parse(frame.result).value as { tasks: unknown[]; truncated: boolean; open: number };
     expect(parsed.truncated).toBe(true);
     expect(parsed.open).toBe(MAX_QUEUE_TASKS);
     // Escaping survived: the whole frame is still valid JSON containing the text.

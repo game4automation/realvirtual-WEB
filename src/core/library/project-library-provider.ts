@@ -25,108 +25,32 @@
 
 import { getProjectStore } from '../project/project-store';
 import type { ProjectBackend } from '../project/backends/project-backend';
-import type { RvDocumentEntry } from '../project/rv-project-types';
+import type { RvProject } from '../project/rv-project-types';
+import { documentsOf } from '../project/rv-project-documents';
 import type { LibraryCatalogEntry } from './library-types';
 import {
   registerLibrarySourceProvider,
   type LibrarySource,
   type LibrarySourceProvider,
-  type ResolvePurpose,
-  type ResolvedAsset,
 } from './library-source-registry';
-import { isSha256, resolvedAssetKey, setAssetHash } from './rv-asset-hash-registry';
+import {
+  createEntryResolver,
+  indexProjectEntries,
+  listProjectDocuments,
+  registerEntryHashes,
+  type ProjectEntryIndex,
+} from './project-library-entries';
+import { isProjectBackedProvider, OPEN_PROJECT_PROVIDER_ID } from './library-origin';
 
 /** Stable provider id — a project switch REPLACES this provider, never adds one. */
-export const PROJECT_LIBRARY_PROVIDER_ID = 'project';
+export const PROJECT_LIBRARY_PROVIDER_ID = OPEN_PROJECT_PROVIDER_ID;
+export { isProjectBackedProvider };
 
 /** The minimum of `ProjectStore` this module needs. Keeps tests tiny. */
 export interface ProjectStoreLike {
   subscribe(listener: () => void): () => void;
   getBackend(): ProjectBackend | null;
   getProject(): { id: string; name: string } | null;
-}
-
-/**
- * Derive a catalog entry from a project DOCUMENT (plan-716 §2.7 / F7).
- *
- * It used to take a manifest `library[]` record, and that was the whole limit:
- * a document in `models/` or `scenes/` could not be placed because the catalog
- * never listed it. Since plan-716 there is one kind of owned artefact and
- * `library/` is an ordinary folder, so the feed is `listDocuments()` — every
- * section — and placeability is decided by the cycle guard at insert time
- * (`compose()` → `ReferenceCycleError`), not by which folder a file sits in.
- */
-function toCatalogEntry(doc: RvDocumentEntry): LibraryCatalogEntry {
-  const path = String(doc.path ?? '');
-  const filename = path.split('/').pop() ?? path;
-  const stem = filename.replace(/\.(scene\.)?(glb|gltf|splat|ksplat|ply)$/i, '');
-  // Collections are the UNION of two different things, and keeping them
-  // distinct in the head is what makes the union correct rather than muddled
-  // (plan-717 §2.6):
-  //
-  //  - **Folder chips** — every parent directory, cumulative. A *place*. They
-  //    mirror the local-folder derivation, so a project's documents and a
-  //    local folder library facet identically, and `scenes` / `models` /
-  //    `library` are among them because the folder is the only thing that ever
-  //    separated those.
-  //  - **Row collections** — what the user filed the document under. A
-  //    *filing*, typed in the Collections editor, and until plan-717 written
-  //    into a sidecar nothing read back.
-  //
-  // The row's come first: they are the answer to "why did I put this here",
-  // and the panel renders chips in order.
-  const dirSegments = path.split('/').slice(0, -1).filter(Boolean);
-  const collections: string[] = [];
-  for (const name of Array.isArray(doc.collections) ? doc.collections : []) {
-    if (typeof name === 'string' && name.trim() !== '') collections.push(name);
-  }
-  for (let i = 0; i < dirSegments.length; i++) {
-    const chip = dirSegments.slice(0, i + 1).join('/');
-    if (!collections.includes(chip)) collections.push(chip);
-  }
-  const label = typeof doc.label === 'string' && doc.label.trim() !== '' ? doc.label.trim() : '';
-  // A document minted from a bare folder scan carries the raw stem as its
-  // `name`; anything else was authored and is used verbatim. Prettifying the
-  // former (and only the former) is what keeps `RollConveyor-1m.glb` reading as
-  // "RollConveyor 1m" the way the manifest-less library listing always did.
-  const authored = typeof doc.name === 'string' && doc.name !== '' && doc.name !== stem
-    ? doc.name
-    : '';
-  return {
-    id: `project:${path}`,
-    name: label || authored || stem.replace(/[_-]/g, ' '),
-    category: 'custom',
-    glbUrl: '',
-    thumbnailUrl: typeof doc.thumbnail === 'string' ? doc.thumbnail : '',
-    pivotToFloor: true,
-    localPath: path,
-    collections: collections.length > 0 ? collections : undefined,
-    // The manifest id, when the entry has one — every migrated manifest does,
-    // because the documents migration mints one for each entry that arrives
-    // without. It is the second key this source answers to; see
-    // `LibraryCatalogEntry.documentId`.
-    documentId: typeof doc.id === 'string' && doc.id.trim() !== '' ? doc.id : undefined,
-    // plan-508 F4: the manifest's own content hash, passed through. It keys the
-    // decoded/baked caches of this entry (via the registry, see `_refresh`) and
-    // never resolves anything.
-    ...(isSha256(doc.sha256) ? { sha256: doc.sha256 } : {}),
-    ...(isSha256(doc.sha256) && typeof doc.sizeBytes === 'number' ? { sizeBytes: doc.sizeBytes } : {}),
-  };
-}
-
-/**
- * Every document of a project backend — the catalog feed (F7).
- *
- * `listDocuments()` is the one list and the only call this makes. The
- * `listLibrary()` fallback that used to stand here is gone with the method
- * (plan-744 F1); what it was really covering — a test double that implements
- * less than the interface — is covered where it belongs, by the double
- * answering `listDocuments()`, and by this guard, which keeps a partial stub
- * from throwing rather than quietly halving the catalog.
- */
-async function listProjectDocuments(backend: ProjectBackend): Promise<RvDocumentEntry[]> {
-  if (typeof backend.listDocuments !== 'function') return [];
-  return backend.listDocuments();
 }
 
 /**
@@ -166,6 +90,14 @@ class ProjectLibraryProvider implements LibrarySourceProvider {
 
   private _emit(): void { for (const l of this._listeners) l(); }
 
+  /** The CURRENT manifest path of an entry's document id, or null (plan-655 F5). */
+  private _currentPathOf(entry: LibraryCatalogEntry): string | null {
+    if (!entry.documentId) return null;
+    const project = this._store.getProject() as RvProject | null;
+    const row = documentsOf(project).find((d) => d.id === entry.documentId);
+    return typeof row?.path === 'string' && row.path ? row.path : null;
+  }
+
   private async _refresh(): Promise<void> {
     const generation = ++this._generation;
     const backend = this._store.getBackend();
@@ -181,32 +113,24 @@ class ProjectLibraryProvider implements LibrarySourceProvider {
     // Publish the source immediately (unloaded) so the UI can render a
     // placeholder, then fill it in when the listing lands.
     const sourceId = project.id;
-    let entries: LibraryCatalogEntry[] = [];
+    // The content version per entry id (the manifest hash, else the row's
+    // revision — also a SHA-256 of the body, plan-397): a document re-saved in
+    // the asset editor changes its revision, which is what retires the cached
+    // bake of the old bytes in this session (plan-660 G4). `indexProjectEntries`
+    // computes it; the open project keys entries by `project:<path>` + id.
+    let index: ProjectEntryIndex = { entries: [], byId: new Map(), byAlias: new Map(), versions: new Map() };
     let error: string | null = null;
     try {
-      entries = (await listProjectDocuments(backend)).map(toCatalogEntry);
+      index = indexProjectEntries(await listProjectDocuments(backend), backend, { keyBy: 'path' });
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     }
     if (generation !== this._generation) return;   // a newer refresh won
 
-    // Two keys per entry: the path-derived catalog id the panel selects with,
-    // and the manifest document id a reference survives a move by (§2.7). The
-    // catalog id is registered last so it wins any freak overlap — it is the
-    // one the UI hands back.
-    const byId = new Map<string, LibraryCatalogEntry>();
-    for (const e of entries) if (e.documentId) byId.set(e.documentId, e);
-    for (const e of entries) byId.set(e.id, e);
-    // plan-508 F4: a project document has no stable url (its bytes come as a
-    // fresh `blob:` per resolve), so its hash is registered under the ModelCache
-    // key the placement instancer derives for it — for both ids it answers to.
-    for (const [assetId, e] of byId) {
-      if (!e.sha256) continue;
-      setAssetHash(resolvedAssetKey(PROJECT_LIBRARY_PROVIDER_ID, sourceId, assetId), {
-        sha256: e.sha256,
-        ...(typeof e.sizeBytes === 'number' ? { sizeBytes: e.sizeBytes } : {}),
-      });
-    }
+    // plan-508 F4: the hash of every key an entry answers to, under the
+    // ModelCache key the placement instancer derives for it.
+    registerEntryHashes(PROJECT_LIBRARY_PROVIDER_ID, sourceId, index);
+    const { entries, byId } = index;
     const source: LibrarySource = {
       id: sourceId,
       label: project.name,
@@ -218,19 +142,13 @@ class ProjectLibraryProvider implements LibrarySourceProvider {
       error,
       listEntries: () => entries,
       getEntry: (assetId: string) => byId.get(assetId) ?? null,
-      resolveAsset: async (assetId: string, _purpose: ResolvePurpose): Promise<ResolvedAsset> => {
-        const entry = byId.get(assetId);
-        if (!entry?.localPath) {
-          throw new Error(`Asset "${assetId}" is not in project "${project.name}".`);
-        }
-        const blob = await backend.readDocumentUrl(entry.localPath);
-        if (!blob) throw new Error(`Asset "${entry.localPath}" could not be read.`);
-        // `sha256` rides along for the ModelCache (plan-508 F4): the expected
-        // content of this resolve, compared before the decode.
-        const resolved: ResolvedAsset & { sha256?: string } = { url: blob.url, revokeUrl: () => blob.release() };
-        if (entry.sha256) resolved.sha256 = entry.sha256;
-        return resolved;
-      },
+      // plan-655 F5: the listing is a snapshot. A rename / move between that
+      // listing and a resolve leaves `localPath` pointing at a file that no
+      // longer exists; the manifest row of the document id is current the
+      // moment the move is written, so the path is read from there first.
+      resolveAsset: createEntryResolver(backend, index, project.name, {
+        currentPathOf: (entry) => this._currentPathOf(entry),
+      }),
       refresh: () => this._refresh(),
     };
 
@@ -253,6 +171,16 @@ export function installProjectLibraryProvider(
   const unregister = registerLibrarySourceProvider(provider);
   installed = { provider, unregister };
   return uninstallProjectLibraryProvider;
+}
+
+/**
+ * Re-list the active project's documents NOW and resolve when the provider's
+ * entries are current (plan-655 F5). A rename / move / delete via MCP awaits
+ * this, so a place by id right after the tool answered sees the new path —
+ * the store's publish only kicks the same refresh off asynchronously.
+ */
+export async function refreshProjectLibrary(): Promise<void> {
+  await installed?.provider.refresh();
 }
 
 export function uninstallProjectLibraryProvider(): void {

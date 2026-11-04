@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage, readLocalStorage, removeLocalStorage } from '../rv-safe-storage';
+
 /**
  * rv-local-filesystem.ts — Local Working Folder for realvirtual WEB.
  *
@@ -194,37 +196,22 @@ export async function listHandleKeys(): Promise<string[]> {
 
 function getMeta(): WorkFolderMeta | null {
   try {
-    const raw = localStorage.getItem(LS_KEY);
+    const raw = readLocalStorage(LS_KEY);
     return raw ? JSON.parse(raw) : null;
   } catch { return null; }
 }
 
 function setMeta(meta: WorkFolderMeta): void {
-  localStorage.setItem(LS_KEY, JSON.stringify(meta));
+  const storage = getLocalStorage();
+  if (!storage) throw new Error('Storage is unavailable');
+  storage.setItem(LS_KEY, JSON.stringify(meta));
 }
 
 function clearMeta(): void {
-  localStorage.removeItem(LS_KEY);
+  removeLocalStorage(LS_KEY);
 }
 
 // ─── Public API ─────────────────────────────────────────────────────────
-
-/**
- * Show the native directory picker dialog and set it as the working folder.
- * Returns the directory handle on success, null if user cancels.
- */
-export async function selectWorkFolder(): Promise<FileSystemDirectoryHandle | null> {
-  if (!isSupported()) return null;
-  try {
-    const handle = await window.showDirectoryPicker!({ id: 'rv-workfolder', mode: 'read' });
-    await putHandle(handle);
-    setMeta({ displayName: handle.name, lastAccessed: new Date().toISOString() });
-    return handle;
-  } catch (e: unknown) {
-    if (e instanceof DOMException && e.name === 'AbortError') return null;
-    throw e;
-  }
-}
 
 /**
  * Retrieve the previously configured working folder and verify permission.
@@ -524,21 +511,5 @@ export async function tryGetSubfolder(
   } catch {
     return null;
   }
-}
-
-/**
- * Convenience: get files from a specific subfolder of the working folder.
- * Returns empty array if working folder not set or subfolder doesn't exist.
- */
-export async function listSubfolderFiles(
-  subfolder: SubfolderName,
-  extensions: string[],
-  promptPermission = false,
-): Promise<LocalFileEntry[]> {
-  const root = await getWorkFolder(promptPermission);
-  if (!root) return [];
-  const sub = await getSubfolder(root, subfolder);
-  if (!sub) return [];
-  return listFiles(sub, extensions);
 }
 

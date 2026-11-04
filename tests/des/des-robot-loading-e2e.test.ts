@@ -6,8 +6,8 @@ import type { BindContextHost } from '../../src/core/behavior-runtime';
 import { EventEmitter } from '../../src/core/rv-events';
 import { ContextMenuStore } from '../../src/core/hmi/context-menu-store';
 import { getDefaultPathNetwork } from '../../src/core/engine/rv-path-network';
-import { _resetDesHookCache } from '@rv-private/plugins/des/des-hook-adapter';
-import { resetDESMUCounter } from '@rv-private/plugins/des/rv-des-mu';
+import { _resetDesHookCache } from '@rv/plugins/des/des-hook-adapter';
+import { resetDESMUCounter } from '@rv/plugins/des/rv-des-mu';
 import {
   ROBOT_LOADING_REFERENCE_DURATION_SECONDS,
   ROBOT_LOADING_REFERENCE_SEED,
@@ -15,7 +15,7 @@ import {
   robotLoadingDemoResult,
   type RobotLoadingDemoOptions,
   type RobotLoadingDemoResult,
-} from '@rv-private/plugins/des/material-flow/demo-robot-loading';
+} from '@rv/plugins/des/material-flow/demo-robot-loading';
 
 function host(): BindContextHost {
   const values = new Map<string, boolean | number>();

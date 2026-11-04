@@ -46,6 +46,7 @@ import {
 } from 'three';
 import type { ChunkPickData, ChunkRange, NodeTable } from './rv-pick-structure';
 import type { SignatureState } from '../persistence/rv-sig-verify';
+import type { FileIdentity } from './rv-decode-identity';
 
 /**
  * - `merge` — default. The node's meshes become part of the enclosing chunk
@@ -196,6 +197,13 @@ export interface BakedChunk {
 export interface BakedAlias {
   path: string;
   template: Object3D;
+  /**
+   * The authored path of a RE-PARENTED subtree (plan-610 Phase 5c): registered
+   * as a prefix alias too (`NodeRegistry.registerPrefixAlias`), so a path INTO
+   * the moved subtree resolves under the node's new place as well. Absent for a
+   * dedup spelling — those already cover the renamed node's whole subtree.
+   */
+  subtree?: true;
 }
 
 export interface BakedAsset {
@@ -272,6 +280,13 @@ export interface BakedAsset {
   retired: boolean;
   /** True once the chunk geometries were freed. */
   disposed: boolean;
+  /**
+   * plan-774 F6: set by `ModelCache.releaseDocument({ keepBaked: true })` — the
+   * document that held this asset is gone, but the NEXT load may claim it
+   * without a re-bake. Steers only `ModelCache.retireKept()`, which retires the
+   * flagged assets nobody claimed; every other retire path keeps precedence.
+   */
+  keptForNextLoad?: boolean;
   /** `instances++`. */
   acquire(): void;
   /** `instances--`; disposes when it reaches 0 on a retired asset. */
@@ -281,6 +296,13 @@ export interface BakedAsset {
   /** Total staged vertices / triangles (bake statistics). */
   vertices: number;
   triangles: number;
+  /**
+   * plan-769 F2/F3: the identity record of the file this asset was decoded from
+   * (seeded ids, authored index, migrated references) — shared by every instance;
+   * the registry registers it per occurrence. Absent for a bake without a parser
+   * (test fakes, a tree baked directly).
+   */
+  identity?: FileIdentity | null;
 }
 
 /**
@@ -290,6 +312,17 @@ export interface BakedAsset {
  * header).
  */
 export const chunkMetaOf = new WeakMap<BufferGeometry, { chunk: BakedChunk; asset: BakedAsset }>();
+
+/**
+ * The geometries of a `BakedAsset`'s KEEP templates (`asset.keep[].mesh.geometry`)
+ * — plan-774 review round 2 (R8). Every placement's keep mesh is a `clone(false)`
+ * of its template and SHARES that geometry; the asset owns it and frees it in
+ * its own `dispose()` (at refcount 0). The dispose guard
+ * (`disposeModelSubtree`) skips these, exactly like chunk geometries — or the
+ * teardown of one placement would free the geometry of a kept asset that the
+ * next load re-instantiates.
+ */
+export const bakedKeepGeometries = new WeakSet<BufferGeometry>();
 
 // ─── Range proxy geometry ────────────────────────────────────────────
 

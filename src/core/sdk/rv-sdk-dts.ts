@@ -295,6 +295,7 @@ interface Self {
   readonly state: string; setState(next: string): void;
   readonly prop: { [k: string]: PropValue };
   readonly now: number; random(): number;
+  persist<T>(initial: T): T;
 
   drive(p: string): DriveHandle | null; sensor(p: string): SensorHandle | null;
   belt(p: string): BeltHandle | null; transport(p: string): TransportHandle | null;
@@ -360,6 +361,10 @@ interface Self {
   /** Canonical utilization category (Working|Blocked|Empty|Setup|Failure) —
    *  separate from setState so the FSM phase never pollutes the stats. */
   statState(name: string): void;
+  /** Show a row in the Statistics window, section "Scripts".
+   *  Group defaults to the script node path; the last value for each key wins.
+   *  Rows disappear with the script instance. Units are display-only. */
+  statValue(key: string, value: number | string | null, unit?: string, group?: string): void;
   statOutput(n?: number): void; statCycleStart(): void; statCycleEnd(): void;
 }
 

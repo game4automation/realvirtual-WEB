@@ -16,7 +16,7 @@
  *   completed  — summary screen with pass/fail per step
  */
 
-import { useCallback } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   Box,
   Typography,
@@ -26,6 +26,7 @@ import {
   Checkbox,
   FormControlLabel,
   LinearProgress,
+  Tooltip,
 } from '@mui/material';
 import {
   ArrowBack,
@@ -38,12 +39,27 @@ import {
   PlayArrow,
   ListAlt,
   Close,
+  SettingsInputComponent,
+  MenuBook,
+  PanTool,
+  OilBarrel,
+  Visibility,
+  Straighten,
+  CleaningServices,
+  Lock,
 } from '@mui/icons-material';
 import { useViewer } from '../../hooks/use-viewer';
 import { useMaintenanceMode } from '../../hooks/use-maintenance-mode';
 import type { MaintenancePluginAPI } from '../types/plugin-types';
-import type { MaintenanceStep } from '../maintenance-parser';
+import type { MaintenanceDocumentLink, MaintenanceStep } from '../maintenance-parser';
+import {
+  documentButtonLabel,
+  resolveMaintenanceDocument,
+  type ResolvedMaintenanceDocument,
+} from './maintenance-document-link';
+import { openPdfViewer } from './pdf-viewer-store';
 import { ISA_GREEN, ISA_AMBER, ISA_RED } from './isa-colors';
+import { FS, INK_MID, LIVE } from './shared-sx';
 
 // ─── ISA-101 Colors ──────────────────────────────────────────────────────
 
@@ -51,6 +67,33 @@ const COLOR_DONE    = ISA_GREEN;
 const COLOR_ACTIVE  = ISA_AMBER;
 const COLOR_PENDING = 'rgba(255,255,255,0.3)';
 const COLOR_WARNING = ISA_RED;
+
+// ─── UI texts (plan-522) ────────────────────────────────────────────────
+
+/** Why Next is disabled on an unconfirmed safety step. */
+export const MAINTENANCE_BARRIER_HINT = 'Confirm the safety step first';
+/** Shown while a live interface is connected — the guide does not move the machine. */
+export const MAINTENANCE_LIVE_HINT = 'Live connection — machine is not moved by the guide';
+
+// ─── Step symbols (plan-522 Phase 6) ────────────────────────────────────
+
+/** Material icon of a step symbol key (same keys as the 3D markers). */
+const STEP_SYMBOL_ICON: Record<string, typeof Build> = {
+  MoveByHand: PanTool,
+  Lubricate: OilBarrel,
+  TurnScrew: Build,
+  Inspect: Visibility,
+  Measure: Straighten,
+  Clean: CleaningServices,
+  Safety: Lock,
+  Done: CheckCircle,
+};
+
+function StepSymbol({ symbol, color }: { symbol?: string; color: string }) {
+  const Icon = symbol ? STEP_SYMBOL_ICON[symbol] : undefined;
+  if (!Icon) return null;
+  return <Icon data-testid="maintenance-step-symbol" sx={{ fontSize: 14, color, flexShrink: 0, mt: '1px' }} />;
+}
 
 // ─── Helper: Get plugin instance ────────────────────────────────────────
 
@@ -289,7 +332,7 @@ function CompletionSummary({ plugin }: { plugin: MaintenancePluginAPI }) {
         )}
         <Box sx={{ textAlign: 'center' }}>
           <Typography variant="h5" sx={{ color: COLOR_PENDING, fontWeight: 700 }}>{totalSteps - passCount - failCount}</Typography>
-          <Typography variant="caption" sx={{ color: 'text.secondary' }}>Skipped</Typography>
+          <Typography variant="caption" sx={{ color: 'text.secondary' }}>Open</Typography>
         </Box>
       </Box>
 
@@ -310,6 +353,11 @@ function CompletionSummary({ plugin }: { plugin: MaintenancePluginAPI }) {
               <Typography variant="caption" sx={{ color, fontSize: 11 }}>
                 {step.title}
               </Typography>
+              {result === null && (
+                <Typography variant="caption" sx={{ color: COLOR_PENDING, fontSize: FS.micro, ml: 'auto' }}>
+                  Open
+                </Typography>
+              )}
             </Box>
           );
         })}
@@ -339,7 +387,9 @@ function StepperView({ plugin, isFlythrough }: { plugin: MaintenancePluginAPI; i
   const proc = state.procedure;
   if (!proc) return null;
 
-  const { currentStep, stepResults, isCameraAnimating } = state;
+  const { currentStep, stepResults, isCameraAnimating, isLive } = state;
+  // plan-522: the safety barrier — Next stays disabled on an unconfirmed ConfirmWarning step.
+  const blockedByBarrier = !isFlythrough && plugin.clampToBarrier(currentStep + 1) <= currentStep;
   const progressPct = proc.steps.length > 0
     ? (stepResults.filter(r => r !== null).length / proc.steps.length) * 100
     : 0;
@@ -391,6 +441,18 @@ function StepperView({ plugin, isFlythrough }: { plugin: MaintenancePluginAPI; i
             Flythrough in progress...
           </Typography>
         )}
+
+        {isLive && (
+          <Box
+            data-testid="maintenance-live-hint"
+            sx={{ display: 'flex', alignItems: 'center', gap: 0.75, mt: 0.75 }}
+          >
+            <SettingsInputComponent sx={{ fontSize: FS.body, color: LIVE }} />
+            <Typography variant="caption" sx={{ color: INK_MID, fontSize: FS.micro, lineHeight: 1.4 }}>
+              {MAINTENANCE_LIVE_HINT}
+            </Typography>
+          </Box>
+        )}
       </Box>
 
       {/* Step list */}
@@ -405,6 +467,7 @@ function StepperView({ plugin, isFlythrough }: { plugin: MaintenancePluginAPI; i
             isActive={i === currentStep}
             plugin={plugin}
             isFlythrough={isFlythrough}
+            reachable={plugin.clampToBarrier(i) === i}
           />
         ))}
       </Box>
@@ -432,23 +495,37 @@ function StepperView({ plugin, isFlythrough }: { plugin: MaintenancePluginAPI; i
           >
             Prev
           </Button>
-          <Button
-            size="small"
-            endIcon={<NavigateNext />}
-            disabled={isCameraAnimating}
-            onClick={() => plugin.nextStep()}
-            sx={{
-              flex: 1,
-              textTransform: 'none',
-              fontSize: 11,
-              color: COLOR_ACTIVE,
-              '&:hover': { bgcolor: 'rgba(255,167,38,0.08)' },
-              '&.Mui-disabled': { color: 'rgba(255,255,255,0.15)' },
-            }}
-          >
-            Next
-          </Button>
+          <Tooltip title={blockedByBarrier ? MAINTENANCE_BARRIER_HINT : ''}>
+            <Box component="span" sx={{ flex: 1, display: 'flex' }}>
+              <Button
+                size="small"
+                endIcon={<NavigateNext />}
+                disabled={isCameraAnimating || blockedByBarrier}
+                onClick={() => plugin.nextStep()}
+                data-testid="maintenance-next"
+                sx={{
+                  flex: 1,
+                  textTransform: 'none',
+                  fontSize: 11,
+                  color: COLOR_ACTIVE,
+                  '&:hover': { bgcolor: 'rgba(255,167,38,0.08)' },
+                  '&.Mui-disabled': { color: 'rgba(255,255,255,0.15)' },
+                }}
+              >
+                Next
+              </Button>
+            </Box>
+          </Tooltip>
         </Box>
+      )}
+      {blockedByBarrier && (
+        <Typography
+          variant="caption"
+          data-testid="maintenance-barrier-hint"
+          sx={{ px: 1.5, pb: 1, color: COLOR_WARNING, fontSize: FS.micro, display: 'block' }}
+        >
+          {MAINTENANCE_BARRIER_HINT}
+        </Typography>
       )}
     </Box>
   );
@@ -456,7 +533,7 @@ function StepperView({ plugin, isFlythrough }: { plugin: MaintenancePluginAPI; i
 
 // ─── Individual Step Item ───────────────────────────────────────────────
 
-function StepItem({ step, stepIndex, currentStep, stepResults, isActive, plugin, isFlythrough }: {
+function StepItem({ step, stepIndex, currentStep, stepResults, isActive, plugin, isFlythrough, reachable }: {
   step: MaintenanceStep;
   stepIndex: number;
   currentStep: number;
@@ -464,24 +541,30 @@ function StepItem({ step, stepIndex, currentStep, stepResults, isActive, plugin,
   isActive: boolean;
   plugin: MaintenancePluginAPI;
   isFlythrough: boolean;
+  /** plan-522: false for entries behind an unconfirmed safety step — not clickable. */
+  reachable: boolean;
 }) {
+  const clickable = !isFlythrough && reachable;
   const handleStepClick = useCallback(() => {
-    if (!isFlythrough) {
+    if (clickable) {
       plugin.goToStep(stepIndex);
     }
-  }, [plugin, stepIndex, isFlythrough]);
+  }, [plugin, stepIndex, clickable]);
 
   return (
     <Box
       onClick={handleStepClick}
+      data-testid={`maintenance-step-${stepIndex}`}
+      aria-disabled={clickable ? undefined : true}
       sx={{
         display: 'flex',
         gap: 1,
         px: 1.5,
         py: 0.75,
-        cursor: isFlythrough ? 'default' : 'pointer',
+        cursor: clickable ? 'pointer' : 'default',
+        opacity: !isFlythrough && !reachable ? 0.5 : 1,
         bgcolor: isActive ? 'rgba(255,167,38,0.06)' : 'transparent',
-        '&:hover': isFlythrough ? {} : { bgcolor: 'rgba(255,255,255,0.03)' },
+        '&:hover': clickable ? { bgcolor: 'rgba(255,255,255,0.03)' } : {},
         transition: 'background-color 0.15s',
       }}
     >
@@ -507,17 +590,23 @@ function StepItem({ step, stepIndex, currentStep, stepResults, isActive, plugin,
 
       {/* Step content */}
       <Box sx={{ flex: 1, minWidth: 0, pb: isActive ? 1 : 0 }}>
-        <Typography
-          variant="body2"
-          sx={{
-            fontWeight: isActive ? 600 : 400,
-            fontSize: 12,
-            color: isActive ? COLOR_ACTIVE : stepResults[stepIndex] === 'pass' ? COLOR_DONE : 'text.primary',
-            lineHeight: 1.4,
-          }}
-        >
-          {step.title}
-        </Typography>
+        <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 0.5 }}>
+          <StepSymbol
+            symbol={step.symbol}
+            color={isActive ? COLOR_ACTIVE : stepResults[stepIndex] === 'pass' ? COLOR_DONE : 'rgba(255,255,255,0.6)'}
+          />
+          <Typography
+            variant="body2"
+            sx={{
+              fontWeight: isActive ? 600 : 400,
+              fontSize: 12,
+              color: isActive ? COLOR_ACTIVE : stepResults[stepIndex] === 'pass' ? COLOR_DONE : 'text.primary',
+              lineHeight: 1.4,
+            }}
+          >
+            {step.title}
+          </Typography>
+        </Box>
 
         {/* Expanded content for active step */}
         {isActive && (
@@ -548,6 +637,9 @@ function StepItem({ step, stepIndex, currentStep, stepResults, isActive, plugin,
               </Typography>
             )}
 
+            {/* Document link (plan-522 Phase 6) */}
+            {step.document && <StepDocumentButton link={step.document} />}
+
             {/* Estimated time */}
             {step.estimatedMinutes > 0 && (
               <Typography variant="caption" sx={{ color: 'text.secondary', fontSize: 10 }}>
@@ -563,6 +655,55 @@ function StepItem({ step, stepIndex, currentStep, stepResults, isActive, plugin,
         )}
       </Box>
     </Box>
+  );
+}
+
+// ─── Document link (plan-522 Phase 6) ──────────────────────────────────
+
+/**
+ * "Betriebsanleitung, S. 18": resolved when the step is shown, so the click
+ * opens synchronously (a new tab after an await would be blocked).
+ */
+function StepDocumentButton({ link }: { link: MaintenanceDocumentLink }) {
+  const viewer = useViewer();
+  const [resolved, setResolved] = useState<ResolvedMaintenanceDocument | null | undefined>(undefined);
+  useEffect(() => {
+    let alive = true;
+    setResolved(undefined);
+    resolveMaintenanceDocument(link, viewer)
+      .then((r) => { if (alive) setResolved(r); })
+      .catch((e) => {
+        console.warn('[MaintenancePanel] document link not resolved:', e);
+        if (alive) setResolved(null);
+      });
+    return () => { alive = false; };
+  }, [link, viewer]);
+
+  const label = documentButtonLabel(link);
+  const open = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!resolved) return;
+    // External: the project's mirrored copy inline at the page (docs/aas/mirror.json), else a new tab.
+    if (resolved.kind === 'external') openPdfViewer(link.title, { type: 'external', url: resolved.href });
+    else openPdfViewer(link.title, { type: 'blob', aasId: resolved.aasId, zipPath: resolved.zipPath }, { initialPage: resolved.page || undefined });
+  }, [resolved, link.title]);
+
+  return (
+    <Tooltip title={resolved === null ? 'Document not available' : ''}>
+      <span>
+        <Button
+          size="small"
+          variant="outlined"
+          startIcon={<MenuBook sx={{ fontSize: 14 }} />}
+          onClick={open}
+          disabled={!resolved}
+          data-testid="maintenance-step-document"
+          sx={{ mt: 0.5, mb: 0.5, fontSize: 11, textTransform: 'none', py: 0.25 }}
+        >
+          {label}
+        </Button>
+      </span>
+    </Tooltip>
   );
 }
 

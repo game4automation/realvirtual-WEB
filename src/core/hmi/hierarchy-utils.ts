@@ -80,6 +80,12 @@ export interface TreeNode {
    */
   locked?: boolean;
   /**
+   * This row's node carries an `AssetReference` — it places another asset
+   * (a planner placement or a hand-authored reference). Drives the leading
+   * link glyph; presentation only.
+   */
+  reference?: boolean;
+  /**
    * Label to render INSTEAD of {@link name} (the document name for the root
    * row). The path space keeps using `name`; this is presentation only, exactly
    * like the snap and chunk labels.

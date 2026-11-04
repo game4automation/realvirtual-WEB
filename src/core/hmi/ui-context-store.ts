@@ -117,6 +117,22 @@ export function registerUIElement(id: string, rule: UIVisibilityRule): void {
   _notify(); // trigger re-evaluation in subscribed components
 }
 
+/**
+ * Register `rule` as the code-declared default for `id` unless a rule already
+ * exists (a deployment override or an earlier default wins) — the non-React
+ * twin of what {@link useUIVisible} does on its first call. No notification:
+ * the effective visibility of an id nobody had registered does not change for
+ * any subscriber that already evaluated it through `useUIVisible`.
+ */
+export function ensureUIElementRule(id: string, rule: UIVisibilityRule): void {
+  if (!_registeredRules.has(id)) _registeredRules.set(id, rule);
+}
+
+/** The rule currently registered for `id` (config override or code default), if any. */
+export function getUIElementRule(id: string): UIVisibilityRule | undefined {
+  return _registeredRules.get(id);
+}
+
 // ─── Visibility Evaluation (Pure Function) ──────────────────────────────
 
 /**

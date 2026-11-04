@@ -12,6 +12,7 @@ import {
   type SignalWriter,
 } from './rv-signal-store';
 import { debug } from './rv-debug';
+import { slotDeclare, slotRead, slotUndeclare, slotWrite } from './rv-slot-io';
 
 /**
  * RVDriveSEWMovilink — TypeScript port of Drive_SEWMovilink.cs (plan-457).
@@ -111,6 +112,11 @@ export class RVDriveSEWMovilink implements IDriveBehavior, RVComponent {
 
     // Register self as a drive behavior so drive.update() calls our update().
     drive.driveBehaviors.push(this);
+    // Unwired slots stay bindable in the viewer (SlotIO, rv-slot-io.ts).
+    slotDeclare(this, 'ControlWord1', 'poll');
+    slotDeclare(this, 'SpeedSetpoint', 'poll');
+    slotDeclare(this, 'StatusWord1', 'feedback');
+    slotDeclare(this, 'SpeedActual', 'feedback');
 
     debug('loader',
       `  Drive_SEWMovilink "${drive.name}": ` +
@@ -137,7 +143,7 @@ export class RVDriveSEWMovilink implements IDriveBehavior, RVComponent {
     if (!drive || !store) return;
 
     // ── Decode control word 1 (PLC → drive) ──
-    const cw = this.ControlWord1 ? Math.round(store.getFloatByPath(this.ControlWord1)) : 0;
+    const cw = Math.round(slotRead(store, this, 'ControlWord1', this.ControlWord1, 0));
     const controllerInhibit = bit(cw, 0);
     const noRapidStop = bit(cw, 1);
     const noStop = bit(cw, 2);
@@ -168,7 +174,7 @@ export class RVDriveSEWMovilink implements IDriveBehavior, RVComponent {
     } else {
       // Enable (control word low byte = 0x06): run toward the speed setpoint.
       this.State = 'Enabled';
-      const raw = this.SpeedSetpoint ? Math.round(store.getFloatByPath(this.SpeedSetpoint)) : 0;
+      const raw = Math.round(slotRead(store, this, 'SpeedSetpoint', this.SpeedSetpoint, 0));
       const target = this.speedToFraction(raw) * this.MaxSpeed;
       if (commands) {
         drive.targetSpeed = Math.abs(target);
@@ -198,14 +204,13 @@ export class RVDriveSEWMovilink implements IDriveBehavior, RVComponent {
     this.StatusWord1Value = sw;
 
     // ── Feedback (drive → PLC) — ALWAYS, also under liveControlled ──
-    if (this.StatusWord1) this.signalWriter!.setByPath(this.StatusWord1, sw);
-    if (this.SpeedActual) {
-      const fraction = this.MaxSpeed !== 0 ? drive.currentSpeed / this.MaxSpeed : 0;
-      this.signalWriter!.setByPath(this.SpeedActual, this.fractionToSpeed(fraction));
-    }
+    slotWrite(this, 'StatusWord1', this.StatusWord1, sw, this.signalWriter);
+    const fraction = this.MaxSpeed !== 0 ? drive.currentSpeed / this.MaxSpeed : 0;
+    slotWrite(this, 'SpeedActual', this.SpeedActual, this.fractionToSpeed(fraction), this.signalWriter);
   }
 
   dispose(): void {
+    slotUndeclare(this);
     if (this.drive) {
       const index = this.drive.driveBehaviors.indexOf(this);
       if (index >= 0) this.drive.driveBehaviors.splice(index, 1);

@@ -14,6 +14,7 @@
  */
 
 import { debugWarn } from './rv-debug';
+import { isUnsafeObjectKey, ownValue } from './rv-safe-keys';
 import type { Scene } from 'three';
 
 // ─── Types ─────────────────────────────────────────────────────────────
@@ -111,7 +112,9 @@ function deepMergePluginConfig(
 ): Record<string, Record<string, unknown>> {
   const result = { ...base };
   for (const [key, val] of Object.entries(override)) {
-    result[key] = { ...(result[key] ?? {}), ...val };
+    // Content-safe (rv-safe-keys.ts): a GLB/model config cannot reach a prototype slot.
+    if (isUnsafeObjectKey(key)) continue;
+    result[key] = { ...((ownValue(result, key) as Record<string, unknown> | undefined) ?? {}), ...val };
   }
   return result;
 }

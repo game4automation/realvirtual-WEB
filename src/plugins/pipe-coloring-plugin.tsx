@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../core/rv-safe-storage';
+
 /**
  * PipeColoringPlugin — Toolbar toggle for fluid-based coloring of pipes AND
  * tanks.
@@ -33,7 +35,7 @@ const LS_KEY = 'rv-pipe-coloring-enabled';
 
 export function loadPipeColoringEnabled(): boolean {
   try {
-    return localStorage.getItem(LS_KEY) === 'true';
+    return readLocalStorage(LS_KEY) === 'true';
   } catch {
     return false;
   }
@@ -41,7 +43,7 @@ export function loadPipeColoringEnabled(): boolean {
 
 export function savePipeColoringEnabled(enabled: boolean): void {
   try {
-    localStorage.setItem(LS_KEY, enabled ? 'true' : 'false');
+    writeLocalStorage(LS_KEY, enabled ? 'true' : 'false');
   } catch {
     /* ignore quota errors */
   }

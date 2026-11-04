@@ -65,9 +65,10 @@ export type LinkedOpenResult =
  * user "access was not granted" for a project whose handle was evicted sends
  * them to a permission dialog that will never appear.
  *
- * `prompt: true` is the FIRST await after the click by construction — no
- * manifest read comes before it — so the browser still counts the user's
- * gesture and the re-grant dialog is allowed to open.
+ * Only the handle lookup (one IndexedDB read) comes before `prompt: true` — no
+ * manifest read does. Chrome's user activation is time-based (a few seconds),
+ * so it still counts the user's gesture and the re-grant dialog may open; do
+ * not add slow awaits in front of the prompt.
  */
 export async function resolveLinkedOpen(id: string): Promise<LinkedOpenResult> {
   const stored = await getHandle(projectHandleKey(id));
@@ -177,18 +178,23 @@ export async function linkChildProjects(
   dirs?: readonly (FileSystemDirectoryHandle | undefined)[],
 ): Promise<ParentAddSummary> {
   const summary: ParentAddSummary = { linked: 0, duplicates: [], broken: [] };
+  // Ids linked by THIS run: two copied siblings with the same id must not both
+  // count as linked, the second silently overwriting the first's handle.
+  const linkedNow = new Set<string>();
   for (let i = 0; i < childNames.length; i++) {
     const name = childNames[i]!;
     try {
       const child = dirs?.[i] ?? await parent.getDirectoryHandle(name);
       const manifest = (await readManifest(child))?.project;
       if (!manifest?.id) { summary.broken.push(name); continue; }
-      if (known.some(l => l.id === manifest.id)
-        && !(await isSameLinkedFolder(manifest.id, child))) {
+      if (linkedNow.has(manifest.id)
+        || (known.some(l => l.id === manifest.id)
+          && !(await isSameLinkedFolder(manifest.id, child)))) {
         summary.duplicates.push(name);
         continue;
       }
       await putHandle(child, projectHandleKey(manifest.id));
+      linkedNow.add(manifest.id);
       // `opened: false` — these were linked in bulk and never opened, so they
       // must not outrank a project the user actually worked in.
       recordLinkedProject({

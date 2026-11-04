@@ -38,6 +38,9 @@ import { EmergencyStop } from './EmergencyStop';
 import { IlluminatedPushButton } from './IlluminatedPushButton';
 import { SelectorSwitch } from './SelectorSwitch';
 import { StackLight } from './StackLight';
+import { SetpointSlider } from './SetpointSlider';
+import { DigitalReadout } from './DigitalReadout';
+import { KeyLegend } from './KeyLegend';
 import {
   evaluateCondition, OFFLINE_SNAPSHOT, OperatorPanelController, resolveStatus,
   type OperatorPanelConfig, type OperatorPanelSnapshot, type OperatorPanelSource, type PanelLampConfig,
@@ -83,6 +86,9 @@ export class OperatorPanelPlugin extends RVBehavior implements OperatorPanelSour
   /** Writes an operator input. Ignored while the panel is not ready. */
   write(signal: string, value: boolean): void { this.controller.write(signal, value); }
 
+  /** Writes an analog operator input (a slider) — plan-659. */
+  writeNumber(signal: string, value: number): void { this.controller.writeNumber(signal, value); }
+
   protected onStart(): void {
     if (this.viewer) this.controller.start(this.viewer);
   }
@@ -115,7 +121,7 @@ const ICONS: Record<StatusIcon, typeof ErrorOutline> = {
  * the restart sequence the operator is (the steps as numbers, the current one
  * bright; the words in its tooltip and accessible name).
  */
-function StatusStrip({ rule, restart }: { rule: PanelStatusRule; restart?: OperatorPanelConfig['restart'] }) {
+function StatusStrip({ rule, restart, compact }: { rule: PanelStatusRule; restart?: OperatorPanelConfig['restart']; compact?: boolean }) {
   const tone = TONE[rule.tone];
   const Icon = ICONS[rule.icon ?? tone.icon];
   const steps = rule.step && restart ? restart.steps : null;
@@ -125,14 +131,15 @@ function StatusStrip({ rule, restart }: { rule: PanelStatusRule; restart?: Opera
       aria-label="Station state"
       data-state={rule.kind}
       sx={{
-        display: 'flex', alignItems: 'center', gap: 0.75, px: 1, minHeight: 26, boxSizing: 'border-box',
+        display: 'flex', alignItems: 'center', gap: compact ? 0.5 : 0.75, px: compact ? 0.75 : 1,
+        minHeight: compact ? 20 : 26, boxSizing: 'border-box',
         borderRadius: '4px',
         bgcolor: tone.tint ? `${tone.color}24` : 'transparent',
         border: `1px solid ${tone.tint ? `${tone.color}66` : 'rgba(255,255,255,0.08)'}`,
       }}
     >
-      <Icon sx={{ fontSize: ICON_SIZE.md, color: tone.color }} />
-      <Box component="span" data-part="state-text" sx={{ fontSize: FS.label, lineHeight: 1.3, fontWeight: 700, letterSpacing: '0.03em', color: INK_HIGH }}>
+      <Icon sx={{ fontSize: compact ? ICON_SIZE.sm : ICON_SIZE.md, color: tone.color }} />
+      <Box component="span" data-part="state-text" sx={{ fontSize: compact ? FS.micro : FS.label, lineHeight: 1.3, fontWeight: 700, letterSpacing: '0.03em', color: INK_HIGH }}>
         {rule.text}
       </Box>
       {steps && restart && (
@@ -239,6 +246,9 @@ export function OperatorPanel({ viewer, panelId, source, title: titleProp, defau
   });
   const plc = snap.modeLabel !== '' && !snap.modeLabel.startsWith('Simulation');
   const rule = off ? null : resolveStatus(config, v);
+  // plan-659: a plate that sits next to the machine it operates is packed
+  // tighter. Opt-in — without `density` every panel keeps its old metrics.
+  const compact = config.density === 'compact';
 
   const estop = (e: OperatorPanelConfig['estops'][number], size: 'full' | 'mini') => (
     <EmergencyStop
@@ -271,12 +281,16 @@ export function OperatorPanel({ viewer, panelId, source, title: titleProp, defau
   );
 
   // The device grid: every device on its cell; devices sharing a cell stack.
-  const cells = new Map<string, { row: number; col: number; separated: boolean; items: ReactNode[] }>();
-  const place = (row: number, col: number, node: ReactNode, separated = false) => {
+  const cells = new Map<string, { row: number; col: number; span: number; separated: boolean; items: ReactNode[] }>();
+  // `span` (plan-659): an analog device needs more than a third of a 3-column
+  // plate to be readable or draggable. Default 1 — every boolean device, and
+  // every panel built before this, places exactly as before.
+  const place = (row: number, col: number, node: ReactNode, separated = false, span?: number) => {
     const key = `${row}:${col}`;
-    const cell = cells.get(key) ?? { row, col, separated: false, items: [] };
+    const cell = cells.get(key) ?? { row, col, span: 1, separated: false, items: [] };
     cell.items.push(node);
     cell.separated ||= separated;
+    if (typeof span === 'number' && span > cell.span) cell.span = span;
     cells.set(key, cell);
   };
   config.buttons.forEach((b) => place(b.row, b.col, (
@@ -308,6 +322,45 @@ export function OperatorPanel({ viewer, panelId, source, title: titleProp, defau
     />
   )));
   config.estops.forEach((e) => place(e.row, e.col, estop(e, 'full')));
+  // plan-659, the analog devices. `n` reads the numeric snapshot — a signal the
+  // model lacks never gets here (the config would not validate), so a missing
+  // entry means "not read yet" and NaN is the honest reading for it.
+  const n = (name: string): number => {
+    const v = snap.numbers[name];
+    return typeof v === 'number' ? v : NaN;
+  };
+  (config.sliders ?? []).forEach((s) => place(s.row, s.col, (
+    <SetpointSlider
+      key={s.signal}
+      label={s.label}
+      caption={s.caption}
+      value={n(s.signal)}
+      min={s.min}
+      max={s.max}
+      step={s.step}
+      unit={s.unit}
+      decimals={s.decimals}
+      disabled={off}
+      compact={compact}
+      onChange={(v) => plugin?.writeNumber?.(s.signal, v)}
+    />
+  ), false, s.span));
+  (config.readouts ?? []).forEach((r) => place(r.row, r.col, (
+    <DigitalReadout
+      key={r.signal ?? (r.signals ?? []).join(',')}
+      label={r.label}
+      values={r.signals ? r.signals.map(n) : [n(r.signal!)]}
+      componentLabels={r.componentLabels}
+      unit={r.unit}
+      decimals={r.decimals}
+      scale={r.scale}
+      disabled={off}
+      compact={compact}
+    />
+  ), false, r.span));
+
+  // Rows holding a stacked cell (two devices sharing one) — aligned on their centre.
+  const stackedRows = new Set([...cells.values()].filter((c) => c.items.length > 1).map((c) => c.row));
 
   return (
     <ControlWindow
@@ -317,27 +370,42 @@ export function OperatorPanel({ viewer, panelId, source, title: titleProp, defau
       defaultWidth={config.width ?? 300}
       defaultPosition={defaultPosition ?? config.position ?? { x: 80, y: 100 }}
       defaultCollapsed={defaultCollapsed}
+      resizable={config.resizable === true}
+      defaultHeight={config.height}
     >
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, mb: 0.75 }}>{headerExtras}</Box>
-      {snap.errors.length > 0 ? <Errors errors={snap.errors} /> : rule && <StatusStrip rule={rule} restart={config.restart} />}
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, mb: compact ? 0.5 : 0.75 }}>{headerExtras}</Box>
+      {snap.errors.length > 0 ? <Errors errors={snap.errors} /> : rule && <StatusStrip rule={rule} restart={config.restart} compact={compact} />}
       <Box
         data-part="device-grid"
         // Row gap 2 px: a legend box is two lines high, so rows are already apart.
-        sx={{ display: 'grid', gridTemplateColumns: `repeat(${config.columns ?? 3}, minmax(0, 1fr))`, columnGap: 1, rowGap: 0.25 }}
+        sx={{
+          display: 'grid',
+          gridTemplateColumns: `repeat(${config.columns ?? 3}, minmax(0, 1fr))`,
+          columnGap: compact ? 0.75 : 1,
+          rowGap: compact ? 0 : 0.25,
+          mt: compact ? 0.5 : 0,
+        }}
       >
         {[...cells.values()].map((c) => (
           <Box
             key={`${c.row}:${c.col}`}
             data-cell={`${c.row}:${c.col}`}
+            data-align={stackedRows.has(c.row) ? 'center' : 'bottom'}
             sx={{
               gridRow: c.row,
-              gridColumn: c.col,
+              gridColumn: c.span > 1 ? `${c.col} / span ${c.span}` : c.col,
               position: 'relative',
               display: 'flex',
               flexDirection: 'column',
               alignItems: 'center',
-              justifyContent: 'center',
-              gap: 0.5,
+              // The row's devices stand on one line: every device ends in a
+              // two-line legend box, so bottom alignment puts all legends on
+              // one baseline and all equal faces on one centre line — and a
+              // selector's mark band rises ABOVE its face instead of pushing it
+              // down. A row with a stacked cell (two devices in one) centres
+              // instead, so a single device sits beside the pair, not below it.
+              justifyContent: stackedRows.has(c.row) ? 'center' : 'flex-end',
+              gap: compact ? 0.25 : 0.5,
               minWidth: 0,
               // A separated cell (an immediate stop) gets a hairline on its left
               // edge, drawn inside the column gap so the columns stay equal.
@@ -363,6 +431,16 @@ export function OperatorPanel({ viewer, panelId, source, title: titleProp, defau
           </Box>
         ))}
       </Box>
+      {/* The legend card, last: the devices are what is operated, the keys are
+          how — and it is read once, not watched (plan-659). */}
+      {config.keyLegend && (
+        <KeyLegend
+          title={config.keyLegend.title}
+          rows={config.keyLegend.keys}
+          note={config.keyLegend.note}
+          compact={compact}
+        />
+      )}
     </ControlWindow>
   );
 }

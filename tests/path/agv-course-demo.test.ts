@@ -52,8 +52,8 @@ import { AgvFlow } from '../../src/behaviors/Agv';
 import {
   registerModelPlugins,
   unregisterModelPlugins,
-} from '@rv-projects/DiscreteEventSimulation/plugins/index';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
+} from '../../src/plugins/models/AGVDemo/index';
+import { DESRunner } from '@rv/plugins/des/des-runner';
 import { makeHost, makeAgvRoot as makeAgv, bindContinuous, bindDes, clearShared, sig,
   type AgvTestHost as Host,
 } from '../helpers/agv-harness';
@@ -405,15 +405,38 @@ describe('plan-451 §9.4 — the east-curve dock releases deterministically', ()
 
 // ─── 9.4 (second half) — the project dock must not outlive its registration ──
 
-describe('plan-451 §9.4 — the DES project dock cancels its timer on unregister', () => {
-  /** The plugin only ever calls `viewer.on(...)` and keeps the disposer. */
-  const stubViewer = (): RVViewer =>
-    ({ on: () => () => { /* no-op disposer */ } }) as unknown as RVViewer;
+describe('plan-451 §9.4 — the DES project dock ends its stay on simulation time and not after unregister', () => {
+  /**
+   * The plugin reads `simTime` and `simulationKernel`, registers one tick plugin
+   * (`use` / `removePlugin`) and keeps the `on(...)` disposers (plan-2006 LOW #30,
+   * plan-559 Phase 5: the handling time is simulation time, never a wall-clock timer).
+   */
+  interface StubViewer {
+    simTime: number;
+    simulationKernel: { desControl(): unknown } | null;
+    plugins: Map<string, { onFixedUpdatePost?(dt: number): void }>;
+    on(): () => void;
+    use(p: { id: string; onFixedUpdatePost?(dt: number): void }): void;
+    removePlugin(id: string): void;
+  }
+  const stubViewer = (desControl: unknown = null): StubViewer => ({
+    simTime: 0,
+    simulationKernel: { desControl: () => desControl },
+    plugins: new Map(),
+    on: () => () => { /* no-op disposer */ },
+    use(p) { this.plugins.set(p.id, p); },
+    removePlugin(id) { this.plugins.delete(id); },
+  });
+  /** One fixed tick at simulation time `t`. */
+  const tick = (v: StubViewer, t: number): void => {
+    v.simTime = t;
+    for (const p of v.plugins.values()) p.onFixedUpdatePost?.(TICK);
+  };
 
-  it('a release() scheduled before unregister never fires afterwards', () => {
-    vi.useFakeTimers();
+  it('a release() pending before unregister never fires afterwards', () => {
+    const v = stubViewer();
     try {
-      registerModelPlugins(stubViewer());
+      registerModelPlugins(v as unknown as RVViewer);
       const dock = getDefaultPathDockRegistry().dockAt('PathEast');
       expect(dock, 'the plugin registers a dock on PathEast').toBeTruthy();
 
@@ -421,37 +444,59 @@ describe('plan-451 §9.4 — the DES project dock cancels its timer on unregiste
       dock!.onVehicleArrive('Agv1', () => { released++; });
 
       // Mid-service: the handling time has not elapsed yet.
-      vi.advanceTimersByTime(1000);
+      tick(v, 1.0);
       expect(released).toBe(0);
 
-      // A model clear in the middle of the service. Before plan-451 the handle
-      // was never kept, so this timer survived and fired release() into a fleet
-      // generation that no longer existed.
+      // A model clear in the middle of the service: nothing may reach a fleet
+      // generation that no longer exists.
       unregisterModelPlugins();
-      vi.advanceTimersByTime(10_000);
+      tick(v, 10);
       expect(released).toBe(0);
     } finally {
       unregisterModelPlugins();
     }
   });
 
-  it('positive control: an undisturbed service still releases after the handling time', () => {
-    vi.useFakeTimers();
+  it('positive control: an undisturbed service releases once 1.5 s of SIMULATION time passed', () => {
+    const v = stubViewer();
     try {
-      registerModelPlugins(stubViewer());
+      registerModelPlugins(v as unknown as RVViewer);
       const dock = getDefaultPathDockRegistry().dockAt('PathEast')!;
       let released = 0;
+      v.simTime = 2;
       dock.onVehicleArrive('Agv1', () => { released++; });
 
-      vi.advanceTimersByTime(1499);
+      tick(v, 3.499);
       expect(released).toBe(0);
-      vi.advanceTimersByTime(1);
+      tick(v, 3.5);
       expect(released).toBe(1);
 
-      // ...and the fired timer left nothing behind for the unregister to cancel.
       unregisterModelPlugins();
-      vi.advanceTimersByTime(10_000);
+      tick(v, 20);
       expect(released).toBe(1);
+    } finally {
+      unregisterModelPlugins();
+    }
+  });
+
+  it('DES: the stay is one persistable runner event at arrival + 1.5 s (exact event order, FastForward too)', () => {
+    // Phase 6 (plan-2059): the stay is a DES queue event with a registered action, not a closure callback.
+    const planned: Array<{ t: number; action: string; data: unknown }> = [];
+    const v = stubViewer({
+      registerSnapshotProvider: () => () => {},
+      scheduleCallback: () => ({ generation: 1, key: 1 }),
+      getManager: () => ({ currentTime: 7,
+        scheduleEvent: (t: number, action: string, _e: number, _m: number, _p: number, data: unknown) => { planned.push({ t, action, data }); return 1; } }),
+    });
+    try {
+      registerModelPlugins(v as unknown as RVViewer);
+      let released = 0;
+      v.simTime = 7;
+      getDefaultPathDockRegistry().dockAt('PathEast')!.onVehicleArrive('Agv1', () => { released++; });
+      expect(planned.map(p => p.t)).toEqual([8.5]);
+      expect(planned[0].data).toEqual({ agvId: 'Agv1', epoch: -1 });
+      tick(v, 100);
+      expect(released, 'not by the continuous tick').toBe(0);
     } finally {
       unregisterModelPlugins();
     }

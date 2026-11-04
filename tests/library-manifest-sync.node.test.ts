@@ -2,8 +2,9 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * library-manifest-sync — the bundled library folder and `library/catalog.json`
- * must agree, and the demo must not own either of them.
+ * library-manifest-sync — the bundled library folder and its project manifest
+ * (`library/project.json`, plan-778; the catalog.json it replaced is gone) must
+ * agree, and the demo must not own either of them.
  *
  * ## What this guarded before, and why it changed (plan-737)
  *
@@ -30,13 +31,12 @@ import { join } from 'node:path';
 import {
   ROOT,
   LIBRARY_DIR,
-  OUTPUT,
+  PROJECT_OUTPUT,
   collectGlbs,
   gitIgnored,
   libraryAssetId,
 } from '../scripts/build-local-library-catalog.mjs';
 
-interface CatalogEntry { id?: string; glbUrl?: string }
 interface ManifestDoc { id?: string; path?: string }
 
 const DEMO_MANIFEST = join(ROOT, 'public', 'demo-realvirtual', 'project.json');
@@ -45,40 +45,50 @@ async function exists(p: string): Promise<boolean> {
   try { await stat(p); return true; } catch { return false; }
 }
 
-describe('library catalog sync', () => {
-  it('public/library/catalog.json mirrors public/library exactly', async () => {
-    if (!await exists(LIBRARY_DIR) || !await exists(OUTPUT)) return; // fork without the bundled library
+describe('library project sync', () => {
+  // plan-778 Phase 4: the library project manifest is the ONE bundled-library artefact
+  // (the catalog.json it was compared against here is gone). The same three contracts
+  // hold, now on project.json: every file has a row, every row a file, and every id is
+  // the stable derivation a baked `AssetReference.assetId` resolves by.
+  it('public/library/project.json mirrors public/library exactly', async () => {
+    if (!await exists(LIBRARY_DIR) || !await exists(PROJECT_OUTPUT)) return; // fork without the bundled library
 
     const scanned = (await collectGlbs(LIBRARY_DIR)).sort();
     const ignored = gitIgnored(scanned);
     const wanted = scanned.filter(rel => !ignored.has(rel));
-    const wantedUrls = wanted.map(rel => rel.split(/[\\/]/).join('/')).sort();
+    const wantedPaths = wanted.map(rel => rel.split(/[\\/]/).join('/')).sort();
 
-    const catalog = JSON.parse(await readFile(OUTPUT, 'utf8')) as { entries?: CatalogEntry[] };
-    const entries = catalog.entries ?? [];
-    const haveUrls = entries.map(e => e.glbUrl ?? '').sort();
+    const project = JSON.parse(await readFile(PROJECT_OUTPUT, 'utf8')) as { id?: string; documents?: ManifestDoc[] };
+    expect(project.id).toBe('prj_realvirtual_library');
+    const rows = project.documents ?? [];
+    const havePaths = rows.map(d => d.path ?? '').sort();
 
     expect(
-      wantedUrls.filter(u => !haveUrls.includes(u)),
-      'library files without a catalog entry — run: node scripts/build-local-library-catalog.mjs',
+      wantedPaths.filter(u => !havePaths.includes(u)),
+      'library files without a project row — run: node scripts/build-local-library-catalog.mjs',
     ).toEqual([]);
     expect(
-      haveUrls.filter(u => !wantedUrls.includes(u)),
-      'catalog entries without a library file — run: node scripts/build-local-library-catalog.mjs',
+      havePaths.filter(u => !wantedPaths.includes(u)),
+      'project rows without a library file — run: node scripts/build-local-library-catalog.mjs',
     ).toEqual([]);
 
-    // One entry per file, and every entry addressable: ids must be unique.
-    const ids = entries.map(e => e.id ?? '');
-    expect(new Set(ids).size, 'duplicate catalog entry ids').toBe(ids.length);
+    // One row per file, and every row addressable: ids must be unique.
+    const ids = rows.map(d => d.id ?? '');
+    expect(new Set(ids).size, 'duplicate document ids').toBe(ids.length);
 
-    // The identity contract: an entry's id is the stable derivation, so every
-    // `AssetReference.assetId` a planner scene baked against this catalog keeps
+    // The identity contract: a row's id is the stable derivation, so every
+    // `AssetReference.assetId` a planner scene baked against the library keeps
     // resolving by identity rather than only through its path fallback.
     const wantedById = new Map(wanted.map(rel => [rel.split(/[\\/]/).join('/'), libraryAssetId(rel)] as const));
-    for (const e of entries) {
-      expect(e.id, `catalog id for ${e.glbUrl} drifted — run: node scripts/build-local-library-catalog.mjs`)
-        .toBe(wantedById.get(e.glbUrl ?? ''));
+    for (const d of rows) {
+      expect(d.id, `document id for ${d.path} drifted — run: node scripts/build-local-library-catalog.mjs`)
+        .toBe(wantedById.get(d.path ?? ''));
     }
+  });
+
+  it('no bundled catalog.json is emitted any more (plan-778 Phase 4)', async () => {
+    if (!await exists(LIBRARY_DIR)) return;
+    expect(await exists(join(LIBRARY_DIR, 'catalog.json')), 'a catalog.json is back in public/library — the builder must write project.json only').toBe(false);
   });
 
   it('the demo project subscribes to the library and owns no part of it', async () => {
@@ -86,7 +96,7 @@ describe('library catalog sync', () => {
 
     const manifest = JSON.parse(await readFile(DEMO_MANIFEST, 'utf8')) as {
       documents?: ManifestDoc[];
-      libraries?: { url?: string }[];
+      libraries?: { url?: string; projectId?: string; hint?: string }[];
     };
 
     // Ownership, negatively: not one `library/` document row (plan-737 F7).
@@ -95,11 +105,13 @@ describe('library catalog sync', () => {
       .filter(p => p.toLowerCase().startsWith('library/'));
     expect(owned, 'the demo manifest must not declare library documents — the library is app-level').toEqual([]);
 
-    // Subscription, positively: the app-level catalog, DEPLOY-ROOT-relative.
-    // Not `demo-realvirtual/library/…` — the catalog sits beside the demo
-    // folder, not inside it, and the URL is resolved against the page base
-    // rather than through the demo backend's base path.
-    const urls = (manifest.libraries ?? []).map(l => l.url ?? '');
-    expect(urls).toContain('library/catalog.json');
+    // Subscription, positively (plan-778): the realvirtual library PROJECT, by id. Its
+    // location hint is DEPLOY-ROOT-relative — not `demo-realvirtual/library/…`: the
+    // library sits beside the demo folder, not inside it, and is app-level.
+    const refs = manifest.libraries ?? [];
+    expect(refs.map(l => l.projectId)).toContain('prj_realvirtual_library');
+    expect(refs.find(l => l.projectId === 'prj_realvirtual_library')?.hint).toBe('library/project.json');
+    // …and no URL subscription to the old bundled catalog, in any spelling.
+    expect(refs.some(l => /(^|\/)library\/catalog\.json$/i.test(l.url ?? '')), 'the demo must not subscribe to the catalog URL any more').toBe(false);
   });
 });

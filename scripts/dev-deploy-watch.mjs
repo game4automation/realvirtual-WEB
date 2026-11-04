@@ -22,6 +22,17 @@
  * SMOKE FAILED (no backoff — the pair IS deployed), keeps `lastSmoke` in state.json, shows a
  * Windows notification on the transition to FAILED and keeps the smoke runtime (npm ci +
  * Playwright Chromium) of the web clone current. `--retry-smoke` re-runs only the smoke.
+ * `--no-smoke` in `deployArgs` switches all of that off: no runtime refresh, no smoke booking.
+ *
+ * Load guards (2026-10-25): a tick that WOULD deploy is deferred — no attempt used, no backoff,
+ * just a `DEFER …` line and the next tick tries again — while a foreign process holds the
+ * machine-wide test lock (`scripts/test-lock.mjs`, port 47177) or while free physical memory is
+ * below `minFreeMemoryMb` (default 3072), or the CPU is busier than `maxCpuPercent` (85) over a
+ * 15 s sample; after `maxDeferMinutes` (60) only low memory still defers. The watcher lowers its own priority to below normal
+ * before the deploy (`lowPriority`, default on), and every child — git, npm, Vite — inherits it.
+ * `--dev-fast` in `deployArgs` selects the lighter /dev build profile of bunny-deploy.mjs.
+ * Each deploy ends with one `TIMING …` line: the watcher's own steps plus the `[timing]` lines
+ * the deploy child printed.
  *
  * Usage (see doc-deploy.md § "Automatic /dev deploys"):
  *   node scripts/dev-deploy-watch.mjs --install [--root <dir>] [--credentials <file>]… [--dry-run]
@@ -40,6 +51,8 @@ import {
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, parse as parsePath } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { get as httpGet } from 'node:http';
+import { constants as osConstants, cpus, freemem, setPriority as osSetPriority } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomBytes } from 'node:crypto';
 import { acquirePublishLock, LOCK_BUSY_CODE } from './rv-publish-lock.mjs';
@@ -87,8 +100,22 @@ export const DEPLOY_TIMEOUT_MS = 45 * 60_000;
 export const REQUIRED_CREDENTIALS = Object.freeze(['BUNNY_STORAGE_KEY', 'BUNNY_STORAGE_ZONE']);
 //! Credential keys whose presence is logged but not required (purge is skipped without them).
 export const OPTIONAL_CREDENTIALS = Object.freeze(['BUNNY_ACCOUNT_KEY', 'BUNNY_PULL_ZONE_ID']);
-//! What the deploy child is started with.
-export const DEFAULT_DEPLOY_ARGS = Object.freeze(['--demo', '--path', 'dev']);
+//! What the deploy child is started with. `--dev-fast` = the lighter /dev build profile; remove it
+//! from `deployArgs` in config.json to build /dev exactly like /demo again.
+export const DEFAULT_DEPLOY_ARGS = Object.freeze(['--demo', '--path', 'dev', '--dev-fast']);
+//! Free physical memory below which a deploy is deferred to the next tick (`minFreeMemoryMb`, 0 = off).
+export const DEFAULT_MIN_FREE_MEMORY_MB = 3072;
+//! Machine-wide CPU busy share above which a deploy is deferred (`maxCpuPercent`, 0 = off), and
+//! the window it is measured over (`cpuSampleMs`) — a short spike must not defer a deploy.
+export const DEFAULT_MAX_CPU_PERCENT = 85;
+export const DEFAULT_CPU_SAMPLE_MS = 15_000;
+//! After this long deferring the same pair, the test lock and the CPU stop deferring it
+//! (`maxDeferMinutes`); low memory always defers.
+export const DEFAULT_MAX_DEFER_MINUTES = 60;
+//! Port of the machine-wide test lock (`scripts/test-lock.mjs`; `RV_TEST_LOCK_PORT` overrides).
+export const DEFAULT_TEST_LOCK_PORT = 47177;
+//! Watcher options `--install` carries over from an existing config.json (operator decisions).
+export const PRESERVED_CONFIG_KEYS = Object.freeze(['deployArgs', 'lowPriority', 'minFreeMemoryMb', 'deferWhileTestLockHeld', 'testLockPort', 'maxCpuPercent', 'cpuSampleMs', 'maxDeferMinutes', 'prepublishTimeoutSeconds', 'deployTimeoutMs']);
 //! Folder names of the two clones — the deploy resolves the private repo as the web clone's sibling.
 export const CLONE_DIRS = Object.freeze({ web: 'realvirtual-WebViewer~', private: 'realvirtual-WebViewer-Private~' });
 
@@ -292,6 +319,11 @@ export const smokeOutDirOf = (config) => config.smokeOutDir ?? join(config.root,
 export const browsersPathOf = (config) => config.browsersPath ?? join(config.root, BROWSERS_DIRNAME);
 export const runtimeLogPathOf = (config) => join(config.root, 'last-runtime.log');
 export const retrySmokeLogPathOf = (config) => join(config.root, 'last-retry-smoke.log');
+//! Whether the demo smoke is switched off for this watcher: `deployArgs` carry `--no-smoke`, the
+//! flag the deploy child itself honours. ONE switch, read where it acts — no second config key that
+//! could disagree with the child. Then the tick neither refreshes the smoke runtime (npm ci +
+//! Playwright Chromium) nor books a smoke outcome, and `--retry-smoke` refuses with a message.
+export const smokeDisabled = (config) => Array.isArray(config?.deployArgs) && config.deployArgs.includes('--no-smoke');
 
 // ─── Demo smoke outcome (plan-503 §2.6) ───────────────────────────────────
 
@@ -636,6 +668,123 @@ export function deployEnv(config, credentials, baseEnv = process.env, pair = nul
   };
 }
 
+// ─── Load guards, priority and timing (2026-10-25) ───────────────────────
+
+//! Asks the test-lock port who holds it (the same `GET /` as `scripts/test-lock.mjs`, inlined —
+//! the installed copy stays self-contained). Resolves the holder `{ pid, argv, … }` or null
+//! (free, foreign program, no answer within `timeoutMs`). Never rejects.
+export function probeTestLock({ port = DEFAULT_TEST_LOCK_PORT, timeoutMs = 1000 } = {}) {
+  return new Promise((resolvePromise) => {
+    let settled = false;
+    const done = (value) => { if (!settled) { settled = true; resolvePromise(value); } };
+    let req;
+    try {
+      req = httpGet({ host: '127.0.0.1', port, path: '/', agent: false, timeout: timeoutMs }, (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => { body += chunk; if (body.length > 65536) req.destroy(); });
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(body);
+            done(parsed && parsed.rvTestLock === 1 && Number.isInteger(parsed.pid) ? parsed : null);
+          } catch { done(null); }
+        });
+        res.on('error', () => done(null));
+      });
+    } catch { done(null); return; }
+    req.on('timeout', () => { req.destroy(); done(null); });
+    req.on('error', () => done(null));
+  });
+}
+
+//! Decides whether a tick that would deploy is deferred. Pure. `holder` = probeTestLock's answer,
+//! `freeBytes` = free physical memory, `ownLockPid` = `RV_TEST_LOCK_HELD` of this process (a
+//! watcher started INSIDE a lock-holding run — the tests — must not wait for its own lock).
+//! Returns `{ reason, detail }` or null.
+//! `cpuPercent` = machine-wide CPU busy share over the sample window (sampleCpuBusy). `overdue`
+//! = the pair has waited longer than `maxDeferMinutes`: then the test lock and the CPU no longer
+//! defer it (a machine that is always busy must not stop /dev for good) — low memory still does.
+export function deferReason(config, { holder = null, freeBytes = null, ownLockPid = null, cpuPercent = null, overdue = false } = {}) {
+  const minMb = Number(config?.minFreeMemoryMb ?? DEFAULT_MIN_FREE_MEMORY_MB);
+  if (minMb > 0 && Number.isFinite(freeBytes) && freeBytes < minMb * 1024 * 1024) {
+    return { reason: 'low-memory', detail: `free memory ${(freeBytes / 1024 ** 3).toFixed(1)} GB < ${(minMb / 1024).toFixed(1)} GB` };
+  }
+  if (overdue) return null;
+  if (config?.deferWhileTestLockHeld !== false && holder && Number(holder.pid) !== Number(ownLockPid)) {
+    const argv = Array.isArray(holder.argv) ? holder.argv.join(' ') : '';
+    return { reason: 'test-lock', detail: `test lock held by PID ${holder.pid}${argv ? ` (${argv.slice(0, 160)})` : ''}` };
+  }
+  const maxCpu = Number(config?.maxCpuPercent ?? DEFAULT_MAX_CPU_PERCENT);
+  if (maxCpu > 0 && Number.isFinite(cpuPercent) && cpuPercent > maxCpu) {
+    return { reason: 'cpu-busy', detail: `CPU ${Math.round(cpuPercent)} % > ${maxCpu} % over ${Math.round(Number(config?.cpuSampleMs ?? DEFAULT_CPU_SAMPLE_MS) / 1000)} s` };
+  }
+  return null;
+}
+
+//! Machine-wide CPU busy share in percent over `ms` (two `os.cpus()` snapshots). Resolves null
+//! when it cannot be measured. Never rejects.
+export async function sampleCpuBusy(ms = DEFAULT_CPU_SAMPLE_MS, readCpus = cpus) {
+  const total = () => readCpus().reduce((acc, cpu) => {
+    const t = cpu.times;
+    acc.idle += t.idle; acc.all += t.user + t.nice + t.sys + t.idle + t.irq;
+    return acc;
+  }, { idle: 0, all: 0 });
+  try {
+    const a = total();
+    await new Promise((r) => setTimeout(r, ms));
+    const b = total();
+    const all = b.all - a.all;
+    return all > 0 ? (100 * (all - (b.idle - a.idle))) / all : null;
+  } catch {
+    return null;
+  }
+}
+
+//! Lowers the priority of THIS process to below normal (`lowPriority`, default on). Children
+//! started afterwards inherit it: on Windows a child of a BELOW_NORMAL process gets
+//! BELOW_NORMAL unless it asks otherwise, and neither git, npm nor Vite asks. Returns true when
+//! applied; never throws.
+export function lowerOwnPriority(config, setPriority = osSetPriority) {
+  if (config?.lowPriority === false) return false;
+  try {
+    setPriority(0, osConstants.priority.PRIORITY_BELOW_NORMAL);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+//! Folder under `<root>` that keeps the deploy log of every failed attempt, and how many it keeps.
+export const FAILED_LOGS_DIRNAME = 'failed-deploys';
+export const FAILED_LOGS_KEEP = 20;
+
+//! Copies `last-deploy.log` of a failed attempt to `<root>\failed-deploys\deploy-<time>-<web>-<private>.log`
+//! before the next attempt overwrites it, and prunes the folder to the newest FAILED_LOGS_KEEP.
+//! Returns the copy's path or null; never throws.
+export function preserveFailedDeployLog(config, pair, at = Date.now()) {
+  try {
+    const dir = join(config.root, FAILED_LOGS_DIRNAME);
+    mkdirSync(dir, { recursive: true });
+    const stamp = new Date(at).toISOString().replace(/[:.]/g, '-');
+    const target = join(dir, `deploy-${stamp}-${shortSha(pair?.web)}-${shortSha(pair?.private)}.log`);
+    copyFileSync(deployLogPathOf(config), target);
+    const files = readdirSync(dir).filter((name) => /^deploy-.*\.log$/.test(name)).sort();
+    for (const name of files.slice(0, Math.max(0, files.length - FAILED_LOGS_KEEP))) {
+      try { unlinkSync(join(dir, name)); } catch { /* best effort */ }
+    }
+    return target;
+  } catch {
+    return null;
+  }
+}
+
+//! The `[timing] <step> <seconds>s` lines bunny-deploy.mjs printed, as `step=<s>s` pairs in order.
+export function parseDeployTimings(text) {
+  const pairs = [];
+  for (const match of String(text ?? '').matchAll(/^\[timing\] ([\w.-]+) ([\d.]+)s\s*$/gm)) pairs.push(`${match[1]}=${match[2]}s`);
+  return pairs;
+}
+
 // ─── Smoke runtime in the web clone (plan-503 F12) ────────────────────────
 
 //! SHA-256 of `<clone>/package-lock.json`, or null when there is none.
@@ -711,8 +860,10 @@ export function ensureRuntime(config, state, deps = {}) {
 
 //! Runs one watcher tick. Resolves `{ outcome, … }`; the outcome names the step that ended it:
 //! `watcher-busy`, `disabled`, `credentials-missing`, `credentials-unreadable`, `git-locked`,
-//! `fetch-failed`, `state-unreadable`, `idle`, `gave-up`, `state-unwritable`, `deployed`, `deploy-failed`.
-//! `deps` are test seams: `now`, `acquire`, `afterCapture(pair)`, `stateFs`, `startDeploy`, `notify`.
+//! `fetch-failed`, `state-unreadable`, `idle`, `deferred`, `gave-up`, `state-unwritable`, `deployed`,
+//! `deploy-failed`.
+//! `deps` are test seams: `now`, `acquire`, `afterCapture(pair)`, `stateFs`, `startDeploy`, `notify`,
+//! `probeTestLock`, `freeMemory`, `cpuBusy(ms)`, `setPriority`.
 export async function runTick(config, deps = {}) {
   const now = deps.now ?? Date.now;
   const acquire = deps.acquire ?? acquirePublishLock;
@@ -763,8 +914,10 @@ export async function runTick(config, deps = {}) {
 
     // 3. + 4. Fetch both clones, capture the pair. One failure ends the tick with nothing changed
     //     but the fetch-failure streak (plan-547).
+    const fetchStarted = now();
     const web = await fetchClone(config.clones.web, config, log);
     const priv = web.ok ? await fetchClone(config.clones.private, config, log) : null;
+    const fetchEnded = now();
     if (!web.ok || !priv?.ok) {
       const error = !web.ok ? `web: ${web.error}` : `private: ${priv.error}`;
       log(`FETCH FAILED ${error} (no deploy, no attempt used)`);
@@ -799,6 +952,35 @@ export async function runTick(config, deps = {}) {
     const current = priorFetchFailures > 0 ? { ...read.state, fetchFailures: 0 } : read.state;
     if (priorFetchFailures > 0) log(`FETCH RECOVERED after ${priorFetchFailures} failed tick${priorFetchFailures === 1 ? '' : 's'}`);
     const decision = decideTick(current, pair, now());
+    // 5a. Load guards: a deploy is deferred while free memory is low, while a foreign test run
+    //     holds the machine-wide test lock, or while the CPU is busy over a sample window. Nothing
+    //     is reserved and no backoff starts — the next tick simply decides again. `deferred` in
+    //     state.json remembers since when a deploy has been pending (any pair); past maxDeferMinutes only low memory
+    //     still defers it.
+    if (decision.action === 'deploy') {
+      const lockPort = Number(config.testLockPort ?? process.env.RV_TEST_LOCK_PORT ?? DEFAULT_TEST_LOCK_PORT) || DEFAULT_TEST_LOCK_PORT;
+      // Since the FIRST deferral of the pending deploy, whatever pair it was: pushes arrive every few
+      // minutes, and a clock that restarted per pair would never reach the limit.
+      const since = Number.isFinite(Number(current.deferred?.since)) && current.deferred?.since != null ? Number(current.deferred.since) : null;
+      const overdue = since != null && now() - since > Number(config.maxDeferMinutes ?? DEFAULT_MAX_DEFER_MINUTES) * 60_000;
+      const freeBytes = (deps.freeMemory ?? freemem)();
+      const holder = overdue || config.deferWhileTestLockHeld === false ? null : await (deps.probeTestLock ?? probeTestLock)({ port: lockPort });
+      const maxCpu = Number(config.maxCpuPercent ?? DEFAULT_MAX_CPU_PERCENT);
+      const cpuPercent = overdue || !(maxCpu > 0) ? null
+        : await (deps.cpuBusy ?? sampleCpuBusy)(Number(config.cpuSampleMs ?? DEFAULT_CPU_SAMPLE_MS));
+      const deferred = deferReason(config, { holder, freeBytes, ownLockPid: process.env.RV_TEST_LOCK_HELD ?? null, cpuPercent, overdue });
+      if (deferred) {
+        const waiting = { ...current, deferred: { pair, since: since ?? now() } };
+        try { writeStateAtomic(statePathOf(config), waiting, { fs: stateFs }); } catch (error) {
+          log(`STATE NOT WRITABLE defer ${error?.code ?? error?.message}`);
+        }
+        const waited = since != null ? ` waiting ${Math.round((now() - since) / 60_000)} min` : '';
+        log(`DEFER ${deferred.reason}: ${deferred.detail} ${pairText(pair)}${waited} (no attempt used, next tick retries)`);
+        return { outcome: 'deferred', reason: deferred.reason, pair };
+      }
+      if (overdue) log(`DEFER LIMIT ${pairText(pair)} waited over ${config.maxDeferMinutes ?? DEFAULT_MAX_DEFER_MINUTES} min — deploying despite test lock / CPU load`);
+      if (current.deferred) decision.state = { ...decision.state, deferred: null };
+    }
     if (decision.action === 'none') {
       if (priorFetchFailures > 0) {
         try { writeStateAtomic(statePathOf(config), current, { fs: stateFs }); } catch (error) {
@@ -842,14 +1024,22 @@ export async function runTick(config, deps = {}) {
     let result;
     let runtime = decision.state.runtime ?? null;
     let smoke = null;
+    let childStartedAt = null;
+    const timing = [`fetch=${((fetchEnded - fetchStarted) / 1000).toFixed(1)}s`];
+    if (lowerOwnPriority(config, deps.setPriority)) log('priority: below normal (deploy child, npm and vite inherit it)');
     try {
       // 7. Exactly the captured SHAs — never origin/main again. `git clean` keeps node_modules.
+      const resetStarted = now();
       await resetClone(config.clones.web, pair.web, config, log);
       await resetClone(config.clones.private, pair.private, config, log);
+      timing.push(`reset=${((now() - resetStarted) / 1000).toFixed(1)}s`);
       // 7a. The smoke runtime (plan-503 F12): reinstalled when missing or when the lockfile moved.
       //     A failed install does not stop the deploy — the smoke then ends runtime-missing.
+      //     With `--no-smoke` in deployArgs nothing of this runs and no smoke is booked.
+      const noSmoke = smokeDisabled(config);
+      if (noSmoke) log('runtime: skipped (smoke disabled)');
       const runtimeStarted = now();
-      const rt = (deps.ensureRuntime ?? ensureRuntime)(config, decision.state, {
+      const rt = noSmoke ? { runtime, action: 'skipped' } : (deps.ensureRuntime ?? ensureRuntime)(config, decision.state, {
         now, ...(deps.runtimeRunner ? { runner: deps.runtimeRunner } : {}), ...(deps.runtimePresent ? { present: deps.runtimePresent } : {}),
       });
       runtime = rt.runtime ?? runtime;
@@ -860,13 +1050,19 @@ export async function runTick(config, deps = {}) {
         sendNotification({ title: 'realvirtual WEB /dev/ — SMOKE RUNTIME FAILED', body: `${rt.error ?? rt.reason}\n${runtimeLogPathOf(config)}` });
       }
       // A smoke-result.json of an earlier run must never be read as this run's.
-      try { rmSync(join(smokeOutDirOf(config), 'smoke-result.json'), { force: true }); } catch { /* best effort */ }
+      if (!noSmoke) {
+        try { rmSync(join(smokeOutDirOf(config), 'smoke-result.json'), { force: true }); } catch { /* best effort */ }
+      }
       // 8. The deploy child, non-detached. Exit 3 = deployed, smoke red (plan-503).
+      const childStarted = now();
+      childStartedAt = childStarted;
       const child = (deps.startDeploy ?? startDeployChild)(config, deployEnv(config, credentials, process.env, pair));
       const exit = await child.exit;
+      timing.push(`deploy-child=${((now() - childStarted) / 1000).toFixed(1)}s`);
+      try { timing.push(...parseDeployTimings(readFileSync(deployLogPathOf(config), 'utf8'))); } catch { /* no log */ }
       const deployed = exit.code === 0 || exit.code === SMOKE_FAILED_EXIT;
       result = { ok: deployed, exitCode: exit.code, ...(exit.error ? { error: exit.error } : {}) };
-      if (deployed) smoke = readSmokeOutcome(config, { exitCode: exit.code, pair, at: now() });
+      if (deployed && !noSmoke) smoke = readSmokeOutcome(config, { exitCode: exit.code, pair, at: now() });
     } catch (error) {
       result = { ok: false, exitCode: null, error: String(error?.message ?? error) };
     }
@@ -881,6 +1077,7 @@ export async function runTick(config, deps = {}) {
     }
     // 10. Log.
     const seconds = ((finishedAt - started) / 1000).toFixed(1);
+    log(`TIMING ${timing.join(' ')} ${pairText(pair)}`);
     if (result.ok) {
       log(`DEPLOY OK ${pairText(pair)} duration=${seconds}s${result.exitCode === SMOKE_FAILED_EXIT ? ' (exit 3: live, smoke red)' : ''}`);
       if (smoke) {
@@ -890,7 +1087,9 @@ export async function runTick(config, deps = {}) {
       }
       return { outcome: 'deployed', pair, smoke: smoke?.status ?? null };
     }
-    log(`DEPLOY FAILED ${pairText(pair)} duration=${seconds}s exit=${result.exitCode}${result.error ? ` error=${result.error}` : ''} (see last-deploy.log)`);
+    // The child wrote last-deploy.log only when it was started; keep a copy before the next attempt overwrites it.
+    const kept = childStartedAt !== null ? preserveFailedDeployLog(config, pair, finishedAt) : null;
+    log(`DEPLOY FAILED ${pairText(pair)} duration=${seconds}s exit=${result.exitCode}${result.error ? ` error=${result.error}` : ''} (see ${kept ?? 'last-deploy.log'})`);
     if (booked.attempt.status === 'failed') {
       log(`GIVING UP ${pairText(pair)} after ${booked.attempt.attempts} attempts (--retry to try again)`);
       sendNotification(blockedNotification(pair, `exit=${result.exitCode}${result.error ? ` ${result.error}` : ` (see ${deployLogPathOf(config)})`}`));
@@ -991,6 +1190,10 @@ export async function retrySmoke(config, deps = {}) {
   const notify = deps.notify ?? defaultNotify;
   const log = (message) => appendLog(config, message, { now });
   const sendNotification = notificationSender(notify, log);
+  if (smokeDisabled(config)) {
+    out('smoke is disabled (deployArgs contain --no-smoke) — nothing to retry. Remove --no-smoke from config.json to turn it back on.');
+    return { smoke: null, exit: null, disabled: true };
+  }
   const expectedFile = join(smokeOutDirOf(config), 'expected.json');
   if (!existsSync(expectedFile)) {
     throw new Error(`No ${expectedFile} — nothing to retry. A deploy writes it right after the purge.`);
@@ -1282,6 +1485,19 @@ export function install(options = {}, deps = {}) {
   }
   let configPath = join(config.root, 'config.json');
   const firstInstall = !existsSync(configPath);
+  // A reinstall keeps the deployArgs of the existing config.json (e.g. an added --no-smoke) and
+  // the watcher options of PRESERVED_CONFIG_KEYS: they are operator decisions, not something the
+  // installer derives.
+  if (!firstInstall) {
+    try {
+      const previous = JSON.parse(readFileSync(configPath, 'utf8'));
+      if (Array.isArray(previous.deployArgs) && previous.deployArgs.every((arg) => typeof arg === 'string')) config.deployArgs = previous.deployArgs;
+      for (const key of PRESERVED_CONFIG_KEYS) {
+        if (key === 'deployArgs' || previous[key] === undefined) continue;
+        config[key] = previous[key];
+      }
+    } catch { /* unreadable: the defaults are written */ }
+  }
   const prefix = dryRun ? '[dry-run] would ' : '';
   const step = (text) => out(`${prefix}${text}`);
 
@@ -1291,6 +1507,7 @@ export function install(options = {}, deps = {}) {
   out(`  node        : ${config.nodePath}`);
   out(`  workspace   : ${config.workspaceRoot}`);
   out(`  credentials : ${config.credentialsFiles.join(', ') || '(none)'}`);
+  out(`  deploy args : ${config.deployArgs.join(' ')}`);
   out(`  task        : ${config.taskName} as ${account.name} (${account.sid})`);
 
   step(`create ${join(config.root, 'bin')} and ${join(config.root, 'clones')}`);
@@ -1354,7 +1571,9 @@ export function install(options = {}, deps = {}) {
     mkdirSync(config.smokeOutDir, { recursive: true });
     mkdirSync(config.browsersPath, { recursive: true });
   }
-  if (dryRun) {
+  if (smokeDisabled(config)) {
+    out('  runtime     : skipped (smoke disabled)');
+  } else if (dryRun) {
     for (const command of runtimeInstallCommands(config)) step(`run in ${config.clones.web}: ${commandText(command)} (PLAYWRIGHT_BROWSERS_PATH=${config.browsersPath})`);
   } else if (!lockHashOf(config.clones.web)) {
     out(`  runtime     : no package-lock.json in ${config.clones.web} — nothing to install`);
@@ -1500,7 +1719,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
   if (flags.has('retry-smoke')) {
     const { smoke } = await retrySmoke(config);
-    return smoke.status === 'failed' ? SMOKE_FAILED_EXIT : 0;
+    return smoke?.status === 'failed' ? SMOKE_FAILED_EXIT : 0;
   }
   if (flags.has('enable') || flags.has('disable')) {
     if (flags.has('enable')) writeFileSync(enabledPathOf(config), 'delete this file to pause automatic /dev deploys\n');

@@ -3,6 +3,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { waitForBudgeted } from './helpers/wait-budget';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { SignalStore } from '../src/core/engine/rv-signal-store';
 import {
@@ -57,9 +58,16 @@ function assignmentChip(): HTMLElement {
   return chip as HTMLElement;
 }
 
-async function openAssignmentTooltip(): Promise<void> {
-  fireEvent.mouseOver(assignmentChip());
-  await screen.findByText(/Output · Bool/);
+async function openAssignmentTooltip(): Promise<HTMLElement> {
+  const chip = assignmentChip();
+  fireEvent.mouseOver(chip);
+  return waitForBudgeted(() => {
+    const tooltipId = chip.getAttribute('aria-labelledby');
+    const tooltip = tooltipId ? document.getElementById(tooltipId) : null;
+    if (!tooltip) throw new Error('assignment tooltip not rendered');
+    expect(tooltip.textContent).toMatch(/Output · Bool/);
+    return tooltip;
+  });
 }
 
 describe('SignalSlotRow linked-signal cell (User decision 30.07.)', () => {
@@ -168,11 +176,11 @@ describe('SignalSlotRow linked-signal cell (User decision 30.07.)', () => {
         onUnbind={vi.fn()}
       />,
     );
-    await openAssignmentTooltip();
-    expect(screen.getByText('%Q0.1')).toBeTruthy();
-    expect(screen.getByText('Interface · plc')).toBeTruthy();
-    expect(screen.getByText('Topic · Data_I_1')).toBeTruthy();
-    expect(screen.getByText('Mapped branch comment')).toBeTruthy();
+    const mappedTooltip = await openAssignmentTooltip();
+    expect(within(mappedTooltip).getByText('%Q0.1')).toBeTruthy();
+    expect(within(mappedTooltip).getByText('Interface · plc')).toBeTruthy();
+    expect(within(mappedTooltip).getByText('Topic · Data_I_1')).toBeTruthy();
+    expect(within(mappedTooltip).getByText('Mapped branch comment')).toBeTruthy();
 
     cleanup();
 
@@ -205,9 +213,9 @@ describe('SignalSlotRow linked-signal cell (User decision 30.07.)', () => {
         onUnbind={vi.fn()}
       />,
     );
-    await openAssignmentTooltip();
-    expect(screen.getByText('Signals/Cell/InternalRun')).toBeTruthy();
-    expect(screen.getByText('Internal branch comment')).toBeTruthy();
+    const internalTooltip = await openAssignmentTooltip();
+    expect(within(internalTooltip).getByText('Signals/Cell/InternalRun')).toBeTruthy();
+    expect(within(internalTooltip).getByText('Internal branch comment')).toBeTruthy();
     expect(screen.getByTestId('slot-linked-Forward').textContent).toContain('PLC.DB1.InternalRun');
   });
 });

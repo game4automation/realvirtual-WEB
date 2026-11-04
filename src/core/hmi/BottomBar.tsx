@@ -39,6 +39,7 @@ import { collectSearchAiContext, docHintsForNodes, withExtraDocHints } from './s
 import { SearchAiDialog } from './SearchAiDialog';
 import { groupSearchResults, flattenGroupedResults } from './search-result-grouping';
 import { isUnclaimedSearchShortcut } from './search-shortcut';
+import { useRegisteredSearchActions } from './search-action-registry';
 
 const DEBOUNCE_MS = 250;
 const ASK_AI_TOOLTIP = 'Ask the machine documentation (AI)';
@@ -161,7 +162,7 @@ export function BottomBar() {
   // not the whole window, so it tracks the viewport as panels open/resize.
   const insets = useViewportInsets();
   const [mobileSearchOpen, setMobileSearchOpen] = useState(false);
-  const [selectedIdx, setSelectedIdx] = useState(-1);
+  const [selectedResultId, setSelectedResultId] = useState<string | null>(null);
   const [dropdownVisible, setDropdownVisible] = useState(true);
   const listRef = useRef<HTMLUListElement>(null);
   const programmaticScroll = useRef(false);
@@ -184,6 +185,10 @@ export function BottomBar() {
   // probe) — the search bar knows nothing about CONNECT.
   useSyncExternalStore(subscribeSearchDiagnoseProvider, getSearchDiagnoseProviderSnapshot);
   const aiAvailable = getSearchDiagnoseProvider() !== null;
+  const registeredSearchActions = useRegisteredSearchActions();
+  const availableSearchActions = registeredSearchActions.filter((action) => action.available());
+  const searchActions = inputValue.trim() ? availableSearchActions : [];
+  const wideSearch = aiAvailable || registeredSearchActions.length > 0;
   const aiHistory = useSyncExternalStore(
     subscribeSearchAiHistory,
     getSearchAiHistorySnapshot,
@@ -221,6 +226,17 @@ export function BottomBar() {
     setSearchExpanded(true);
     if (focusInput) setTimeout(() => inputRef.current?.focus(), 60);
   }, []);
+
+  const handleSearchFocus = useCallback(() => {
+    expandSearch(false);
+    for (const action of registeredSearchActions) {
+      try {
+        action.onSearchFocus?.();
+      } catch {
+        // A contributed refresh hook must not break the global search field.
+      }
+    }
+  }, [expandSearch, registeredSearchActions]);
 
   const scheduleCollapse = useCallback(() => {
     if (collapseTimer.current) clearTimeout(collapseTimer.current);
@@ -262,7 +278,7 @@ export function BottomBar() {
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const val = e.target.value;
       setInputValue(val);
-      setSelectedIdx(-1);
+      setSelectedResultId(null);
       setDropdownVisible(true);
       applyFilter(val);
     },
@@ -340,12 +356,17 @@ export function BottomBar() {
       if (editorPlugin) editorPlugin.selectAndReveal(result.path);
       // Hide dropdown (keep search text)
       setDropdownVisible(false);
-      setSelectedIdx(-1);
+      setSelectedResultId(null);
     },
     [viewer],
   );
 
-  const visibleCount = flatResults.length;
+  const visibleResultIds = useMemo(() => [
+    ...searchActions.map((action) => `action:${action.id}`),
+    ...flatResults.map((result) => `node:${result.path}`),
+  ], [searchActions, flatResults]);
+  const visibleCount = visibleResultIds.length;
+  const selectedIdx = selectedResultId === null ? -1 : visibleResultIds.indexOf(selectedResultId);
 
   // Group headers sit between rows, so index-based child lookup no longer
   // works — rows carry data-result-idx for the keyboard-scroll instead.
@@ -360,36 +381,46 @@ export function BottomBar() {
     (e: React.KeyboardEvent) => {
       if (e.key === 'Escape') {
         handleClear();
-        setSelectedIdx(-1);
+        setSelectedResultId(null);
         (e.target as HTMLElement).blur();
       } else if (e.key === 'ArrowDown') {
         e.preventDefault();
-        setSelectedIdx(prev => {
-          const next = Math.min(prev + 1, visibleCount - 1);
+        setSelectedResultId((previousId) => {
+          if (visibleCount === 0) return null;
+          const previous = previousId === null ? -1 : visibleResultIds.indexOf(previousId);
+          const next = Math.min(previous + 1, visibleCount - 1);
           scrollResultIntoView(next);
-          return next;
+          return visibleResultIds[next] ?? null;
         });
       } else if (e.key === 'ArrowUp') {
         e.preventDefault();
-        setSelectedIdx(prev => {
-          const next = Math.max(prev - 1, 0);
+        setSelectedResultId((previousId) => {
+          if (visibleCount === 0) return null;
+          const previous = previousId === null ? -1 : visibleResultIds.indexOf(previousId);
+          const next = Math.max(previous - 1, 0);
           scrollResultIntoView(next);
-          return next;
+          return visibleResultIds[next] ?? null;
         });
       } else if (e.key === 'Enter' && !e.shiftKey) {
         // Multiline field: plain Enter keeps its action semantics (no newline),
         // Shift+Enter falls through to insert a line break.
         e.preventDefault();
-        if (selectedIdx >= 0 && selectedIdx < flatResults.length) {
-          handleResultClick(flatResults[selectedIdx]);
+        const selectedAction = searchActions.find((action) => `action:${action.id}` === selectedResultId);
+        const selectedNode = flatResults.find((result) => `node:${result.path}` === selectedResultId);
+        if (selectedAction) {
+          selectedAction.run(inputValueRef.current.trim());
+          setDropdownVisible(false);
+          setSelectedResultId(null);
+        } else if (selectedNode) {
+          handleResultClick(selectedNode);
         } else {
           handleFocus();
           setDropdownVisible(false);
-          setSelectedIdx(-1);
+          setSelectedResultId(null);
         }
       }
     },
-    [handleClear, handleFocus, handleResultClick, flatResults, selectedIdx, visibleCount, scrollResultIntoView],
+    [handleClear, handleFocus, handleResultClick, flatResults, searchActions, selectedResultId, visibleCount, visibleResultIds, scrollResultIntoView],
   );
 
   // Cleanup debounce on unmount
@@ -458,7 +489,9 @@ export function BottomBar() {
     // (types self-register during async model load) or the popover re-opens.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [subscribers.length, settingsOpen]);
-  const showResults = filter && filteredNodes.length > 0 && dropdownVisible;
+  const showResults = !!inputValue.trim()
+    && dropdownVisible
+    && (filteredNodes.length > 0 || searchActions.length > 0);
   const resultCount = filteredNodes.length;
 
   // Count badge text
@@ -476,7 +509,8 @@ export function BottomBar() {
           right: 12,
           zIndex: 1201,
           bgcolor: 'background.paper',
-          boxShadow: 4,
+          boxShadow: 'none',
+          border: '1px solid rgba(255,255,255,0.08)',
           width: 40,
           height: 40,
           pointerEvents: 'auto',
@@ -504,17 +538,38 @@ export function BottomBar() {
         {/* Result dropdown (above search bar) */}
         {showResults && (
           <Paper
-            elevation={4}
+            elevation={0}
             className={RV_SCROLL_CLASS}
-            onScroll={() => { if (programmaticScroll.current) programmaticScroll.current = false; else if (selectedIdx >= 0) setSelectedIdx(-1); }}
+            onScroll={() => { if (programmaticScroll.current) programmaticScroll.current = false; else if (selectedIdx >= 0) setSelectedResultId(null); }}
             sx={{
-              width: { xs: 'calc(100vw - 24px)', sm: aiAvailable ? 'min(560px, calc(100vw - 24px))' : 388 },
+              width: { xs: 'calc(100vw - 24px)', sm: wideSearch ? 'min(560px, calc(100vw - 24px))' : 388 },
               mb: 0.5,
-              borderRadius: 2,
+              borderRadius: 1,
               pointerEvents: 'auto',
             }}
           >
             <List dense disablePadding ref={listRef}>
+              {searchActions.map((action, index) => (
+                <ListItemButton
+                  key={action.id}
+                  data-result-idx={index}
+                  selected={selectedResultId === `action:${action.id}`}
+                  onClick={() => {
+                    action.run(inputValueRef.current.trim());
+                    setDropdownVisible(false);
+                    setSelectedResultId(null);
+                  }}
+                  onMouseEnter={() => setSelectedResultId(`action:${action.id}`)}
+                  onMouseMove={() => { if (selectedResultId !== `action:${action.id}`) setSelectedResultId(`action:${action.id}`); }}
+                  sx={{ py: 0.5, px: 1.5, minHeight: 0 }}
+                >
+                  <AutoAwesome sx={{ mr: 1, fontSize: 15, color: 'primary.main' }} />
+                  <Typography variant="body2" noWrap sx={{ flex: 1 }}>
+                    {action.label(inputValue.trim())}
+                  </Typography>
+                </ListItemButton>
+              ))}
+              {searchActions.length > 0 && resultGroups.length > 0 && <Divider />}
               {resultGroups.map((group) => (
                 <Fragment key={group.label}>
                   {/* Category header — ink-low, passive (never selectable) */}
@@ -528,20 +583,22 @@ export function BottomBar() {
                     {group.label} ({group.items.length})
                   </Typography>
                   {group.items.map((r, gi) => {
-                    const i = group.startIndex + gi;   // index in flatResults
+                    const resultIndex = group.startIndex + gi;
+                    const i = searchActions.length + resultIndex;
+                    const resultId = `node:${r.path}`;
                     const nodeName = r.path.split('/').pop() ?? r.path;
                     const label = r.displayText ?? nodeName;
                     // Show where the match was found: matchedBy component, or primary type for name matches
                     const badgeType = r.matchedBy ?? (r.types.length > 0 ? r.types[0] : 'Node');
-                    const isSelected = i === selectedIdx;
+                    const isSelected = resultId === selectedResultId;
                     return (
                       <Tooltip key={r.path} title={r.path} placement="right" enterDelay={800} slotProps={{ tooltip: { sx: { fontSize: 10 } } }}>
                       <ListItemButton
                         data-result-idx={i}
                         selected={isSelected}
                         onClick={() => { handleResultHover(null); handleResultClick(r); }}
-                        onMouseEnter={() => { setSelectedIdx(i); handleResultHover(r); }}
-                        onMouseMove={() => { if (selectedIdx !== i) { setSelectedIdx(i); handleResultHover(r); } }}
+                        onMouseEnter={() => { setSelectedResultId(resultId); handleResultHover(r); }}
+                        onMouseMove={() => { if (selectedResultId !== resultId) { setSelectedResultId(resultId); handleResultHover(r); } }}
                         onMouseLeave={() => handleResultHover(null)}
                         sx={{ py: 0.25, px: 1.5, minHeight: 0 }}
                       >
@@ -571,7 +628,7 @@ export function BottomBar() {
 
         {/* Search bar — collapses to a magnifier on desktop, expands on click/hover */}
         <Paper
-          elevation={4}
+          elevation={0}
           data-ui-panel
           onMouseEnter={isMobile ? undefined : () => expandSearch(false)}
           onMouseLeave={isMobile ? undefined : scheduleCollapse}
@@ -579,12 +636,12 @@ export function BottomBar() {
             py: 0,
             pl: 0,
             pr: barExpanded ? 1.5 : 0,
-            borderRadius: 2,
+            borderRadius: 1,
             pointerEvents: 'auto',
             // With the AI provider registered the expanded bar takes typed
             // questions, not just node names — give it room (plan-283).
             width: barExpanded
-              ? { xs: 'calc(100vw - 24px)', sm: aiAvailable ? 'min(560px, calc(100vw - 24px))' : 380 }
+              ? { xs: 'calc(100vw - 24px)', sm: wideSearch ? 'min(560px, calc(100vw - 24px))' : 380 }
               : 40,
             // minHeight instead of a fixed height: long AI questions wrap and the
             // bar grows upward (the container is bottom-anchored).
@@ -635,7 +692,7 @@ export function BottomBar() {
               inputRef={inputRef}
               onChange={handleChange}
               onKeyDown={handleKeyDown}
-              onFocus={() => expandSearch(false)}
+              onFocus={handleSearchFocus}
               onBlur={isMobile ? undefined : scheduleCollapse}
               slotProps={{
                 input: {

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage, readLocalStorage } from '../core/rv-safe-storage';
+
 /**
  * annotation-plugin.ts — Annotation system for the realvirtual WebViewer.
  *
@@ -409,6 +411,8 @@ export class AnnotationPlugin implements RVViewerPlugin, AnnotationPluginAPI {
   private _handlePointerDown(e: PointerEvent): void {
     if (!this._viewer) return;
     if (e.button !== 0) return; // Left click only
+    // plan-2215: no screen pick while a render strategy draws other cameras.
+    if (this._viewer.pointerPickBlocked) return;
 
     // Drawing mode: accumulate points on pointerdown
     if (this._drawingMode && this._annotationMode) {
@@ -569,7 +573,7 @@ export class AnnotationPlugin implements RVViewerPlugin, AnnotationPluginAPI {
     try {
       const key = LS_PREFIX + this._modelHash;
       const data = JSON.stringify(this._annotations);
-      localStorage.setItem(key, data);
+      getLocalStorage()?.setItem(key, data);
     } catch (e) {
       // QuotaExceededError — gracefully ignore
       if (e instanceof DOMException && e.name === 'QuotaExceededError') {
@@ -581,7 +585,7 @@ export class AnnotationPlugin implements RVViewerPlugin, AnnotationPluginAPI {
   private _load(): void {
     try {
       const key = LS_PREFIX + this._modelHash;
-      const data = localStorage.getItem(key);
+      const data = readLocalStorage(key);
       if (!data) return;
 
       const parsed = JSON.parse(data) as Annotation[];

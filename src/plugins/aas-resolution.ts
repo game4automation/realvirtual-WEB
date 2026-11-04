@@ -56,7 +56,7 @@ import {
 
 // The marking lives in its own module so the scene loader can mark nodes
 // without pulling the active-source machinery (project store) into its graph.
-import { AAS_RESOLUTION_KEY, markAasPending, type AasResolution } from './aas-resolution-mark';
+import { AAS_RESOLUTION_KEY, markAasPending, isAasNodeVisible as isAasNodeVisibleLocal, type AasResolution } from './aas-resolution-mark';
 export {
   AAS_RESOLUTION_KEY,
   getAasResolution,
@@ -77,6 +77,23 @@ interface AasResolutionViewer {
   projectAssetsPath?: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   on?: (event: any, handler: any) => unknown;
+}
+
+// ─── Shown AAS nodes (the one count) ────────────────────────────────────
+
+/**
+ * Every AASLink node under `root` that can actually be shown
+ * (`isAasNodeVisible`). The ONE source for "does this document have AAS" —
+ * AAS button counter, AAS mode and the Order Cart button all read it
+ * (plan-682 F2). `out` is cleared and reused when given (no garbage on rebuild).
+ */
+export function collectAasNodes(root: Object3D | null | undefined, out: Object3D[] = []): Object3D[] {
+  out.length = 0;
+  if (!root) return out;
+  root.traverse((node) => {
+    if (node.userData?._rvAasLink && isAasNodeVisibleLocal(node)) out.push(node);
+  });
+  return out;
 }
 
 // ─── Load generation (stale-completion guard) ───────────────────────────

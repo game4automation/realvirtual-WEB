@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, removeLocalStorage } from '../rv-safe-storage';
+
 /** State and authenticated CONNECT REST access for historian trend data. */
 
 import { createStore } from './create-store';
@@ -107,7 +109,7 @@ function persistView(): void {
 }
 
 function hasStoredHistorianUrl(): boolean {
-  try { return localStorage.getItem(HISTORIAN_STORAGE_KEY) !== null; } catch { return false; }
+  return readLocalStorage(HISTORIAN_STORAGE_KEY) !== null;
 }
 
 function initialSnapshot(): HistorianSnapshot {
@@ -399,6 +401,6 @@ export async function saveInfluxSettings(next: {
 
 /** Reset state and persistence for isolated tests. */
 export function __resetHistorianStore(): void {
-  try { localStorage.removeItem(HISTORIAN_STORAGE_KEY); } catch { /* ignore */ }
+  removeLocalStorage(HISTORIAN_STORAGE_KEY);
   _store.set(initialSnapshot());
 }

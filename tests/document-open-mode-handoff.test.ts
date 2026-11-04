@@ -18,7 +18,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 const calls: string[] = [];
 
-vi.mock('@rv-private/plugins/asset-editor/pending-open-store', () => ({
+vi.mock('@rv-private/plugins/asset-editor/shared/pending-open-store', () => ({
   setPendingAssetOpen: (base: { documentId: string }) => {
     calls.push(`pending:${base.documentId}`);
   },
@@ -169,16 +169,16 @@ describe('the host routes every deliberate open through the chain (plan-513 F8)'
   };
 
   it('a card opens through openProjectDocument with the stored last mode, the dirty guard only once', () => {
-    const openScene = block('const openScene = useCallback((id: string) => {');
-    const chain = openScene.indexOf('openProjectDocument(');
-    const fallback = openScene.indexOf('trySwitch(');
-    expect(openScene).toContain('readDocumentMode(backend, projectId, id)');
+    const openRow = block('const openDocumentRow = useCallback((id: string) => {');
+    const chain = openRow.indexOf('openProjectDocument(');
+    const fallback = openRow.indexOf('trySwitch(');
+    expect(openRow).toContain('readDocumentMode(backend, projectId, id)');
     expect(chain).toBeGreaterThan(0);
     // `trySwitch` survives only as the no-project fallback, AFTER the chain's return.
     expect(fallback).toBeGreaterThan(chain);
-    expect(openScene.slice(chain, fallback)).toContain('return;');
+    expect(openRow.slice(chain, fallback)).toContain('return;');
     // The already-open short-circuit still comes first.
-    expect(openScene.indexOf('closeProjectsDashboard();')).toBeLessThan(chain);
+    expect(openRow.indexOf('closeProjectsDashboard();')).toBeLessThan(chain);
   });
 
   it('a search hit hands the stored mode as lastMode and the index mode as display only', () => {

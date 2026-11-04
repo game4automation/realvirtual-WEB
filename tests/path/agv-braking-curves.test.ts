@@ -16,7 +16,7 @@ import { parsePathExtras } from '../../src/core/engine/rv-path';
 import { getDefaultPathNetwork } from '../../src/core/engine/rv-path-network';
 import { getDefaultAgvFleet } from '../../src/core/engine/rv-agv-fleet';
 import { getDefaultMovementAuthority } from '../../src/core/engine/rv-movement-authority';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
+import { DESRunner } from '@rv/plugins/des/des-runner';
 import { TICK, makeHost, makeAgvRoot, bindDes, clearShared } from '../helpers/agv-harness';
 
 beforeEach(() => clearShared());

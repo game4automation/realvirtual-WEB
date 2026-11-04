@@ -16,9 +16,9 @@ Document linking consists of two phases:
 The tooltip system automatically renders PDF links for any node that has `_rvPdfLinks` in its userData.
 
 > **Not a document link: a GLB `AssetReference`.** A node that references another GLB asset is a
-> *placement* of that asset, not a link to a document — at runtime the viewer materialises it
-> through the placement instancer, recursively (plan-757 Phase 2: nothing is grafted at runtime;
-> the asset editor is the one authoring load that still composes). Document links attached to nodes
+> *placement* of that asset, not a link to a document — the viewer materialises it through the
+> placement instancer, recursively (plan-757 Phase 2: nothing is grafted at runtime; since plan-774
+> the asset editor shows references as the same baked placements). Document links attached to nodes
 > INSIDE a placed asset resolve on `layout-content-added` like any other placed content; a nested
 > placement (a reference inside a placed asset) is content of its record's placement, and an edit
 > under it is refused by name ("Open the referenced asset"). See `doc-node-paths.md` §9.
@@ -137,6 +137,36 @@ Two ways to set the flag, checked in this order (`resolveDemoNote()` in `aas-lin
    ```
 
 The qualifier wins when both are present. When neither is set, no banner renders.
+
+#### Documents in the AAS tooltip — grouped by kind (plan-682)
+
+A component's handover documentation easily lists 20–30 documents, every one
+twice (IDTA 02004 keeps DE and EN as separate documents). The pinned AAS
+tooltip and the AAS detail panel therefore show them through
+`groupDocuments()` (`src/plugins/aas-tooltip-groups.ts`, pure):
+
+- **Group = document kind**: the version's `KeyWords`, else the VDI 2770
+  `ClassName` (`AasDocument.kind`), matched through a DE/EN synonym table
+  (case- and umlaut-insensitive). Order: operating instructions, full
+  documentation, declaration of conformity, datasheet, catalogue, application
+  description, application note, software, other kinds alphabetically,
+  "Other documents" last. Each group is collapsed by default and shows its row
+  count.
+- **One row per document, not per language**: translations are recognised by
+  their address (same URL except the language segment, `…/de/652885` ↔
+  `…/en/652885`), else by position (k-th DE ↔ k-th EN of the kind). The row
+  shows the document in the UI language; the other languages are chips that
+  open their version.
+- **Title** (`displayTitle`): `Title – Subtitle` of the version in the
+  preferred language, a trailing `-DE` language suffix removed; fallback the
+  container idShort (without `DocumentNN_`), then the file name. `Version` is a
+  separate tag. The parser keeps these parts as `baseTitle`, `subtitle`,
+  `version`, `documentIdShort` next to the composed legacy `title`; `Language`
+  may be a Property or a MultiLanguageProperty, a container may be named plain
+  `Document`.
+- The **hover** tooltip shows one summary line only
+  (`summarizeDocuments`). AAS-generated `_rvPdfLinks` (`aasGenerated`) are left
+  out of the generic PDF tooltip section, so the list never appears twice.
 
 ### 2. Standalone PDF Links (Model Config)
 

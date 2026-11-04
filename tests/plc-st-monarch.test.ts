@@ -47,9 +47,9 @@ describe('ST Monarch grammar — keywords', () => {
   });
 
   it('classifies the ST structure keywords', () => {
-    for (const kw of ['PROGRAM', 'END_PROGRAM', 'VAR_EXTERNAL', 'VAR', 'END_VAR',
+    for (const kw of ['PROGRAM', 'END_PROGRAM', 'VAR_EXTERNAL', 'VAR', 'CONSTANT', 'END_VAR',
       'IF', 'THEN', 'ELSIF', 'ELSE', 'END_IF', 'CASE', 'FOR', 'WHILE', 'REPEAT', 'UNTIL',
-      'AND', 'OR', 'XOR', 'NOT', 'MOD', 'TRUE', 'FALSE']) {
+      'AND', 'OR', 'XOR', 'NOT', 'MOD', 'TRUE', 'FALSE', 'EXIT', 'RETURN']) {
       expect(ST_KEYWORDS).toContain(kw);
     }
     // Monarch keyword matching goes through the identifier rule's cases:
@@ -130,5 +130,26 @@ describe('ST Monarch grammar — comments + configuration', () => {
     expect(ST_LANGUAGE_CONFIGURATION.comments.lineComment).toBe('//');
     expect(ST_LANGUAGE_CONFIGURATION.comments.blockComment).toEqual(['(*', '*)']);
     expect(ST_LANGUAGE_CONFIGURATION.brackets).toEqual([['(', ')']]);
+  });
+});
+
+
+describe('Phase 2 editor scope', () => {
+  it('highlights built-ins only when followed by an opening parenthesis', () => {
+    const rule = ruleWithToken('predefined');
+    expect(rule).toBeDefined();
+    for (const word of ['SHL', 'SHR', 'ROL', 'ROR']) {
+      expect(ST_MONARCH.keywords).not.toContain(word);
+      const re = new RegExp(rule![0].source, 'i');
+      expect(re.exec(`${word.toLowerCase()} (1, 2)`)?.[0]).toBe(word.toLowerCase());
+      expect(re.test(`${word} := 1;`)).toBe(false);
+      expect(re.test(`${word}Value(1, 2)`)).toBe(false);
+    }
+  });
+  it('matches => as one operator, with the multi-character alternative first', () => {
+    const re = ruleWithToken('operator')![0];
+    for (const op of ['=>', ':=', '<>', '>=', '<=', '=', '>']) expect(matchesWhole(re, op)).toBe(true);
+    expect(re.source.indexOf('=>')).toBeLessThan(re.source.indexOf('<>'));
+    expect(re.source.indexOf('=>')).toBeLessThan(re.source.indexOf('>='));
   });
 });

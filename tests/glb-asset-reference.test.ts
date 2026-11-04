@@ -124,10 +124,10 @@ describe('AssetReference', () => {
 describe('AssetOverrides', () => {
   it('round-trips and drops an empty override set', () => {
     const node = new Object3D();
-    setAssetOverrides(node, { byNodeId: { motor: { Drive: { TargetSpeed: 250 } } } });
-    expect(getAssetOverrides(node)).toEqual({ byNodeId: { motor: { Drive: { TargetSpeed: 250 } } } });
+    setAssetOverrides(node, { byAddress: { '#motor': { Drive: { TargetSpeed: 250 } } } });
+    expect(getAssetOverrides(node)).toEqual({ byAddress: { '#motor': { Drive: { TargetSpeed: 250 } } } });
 
-    setAssetOverrides(node, { byNodeId: {} });
+    setAssetOverrides(node, { byAddress: {} });
     expect(getAssetOverrides(node)).toBeNull();
     expect(rv(node).AssetOverrides).toBeUndefined();
   });
@@ -135,7 +135,7 @@ describe('AssetOverrides', () => {
   it('applies by NodeId and leaves the rest of the subtree alone', () => {
     const subtree = buildReferencedSubtree();
     const result = applyAssetOverrides(
-      { byNodeId: { motor: { Drive: { TargetSpeed: 999 } } } },
+      { byAddress: { '#motor': { Drive: { TargetSpeed: 999 } } } },
       makeSubtreeResolvers(subtree),
       { occurrence: 'ref-1', assetId: 'press-500t' },
     );
@@ -149,7 +149,7 @@ describe('AssetOverrides', () => {
   it('deletes a field with null (RFC 7396)', () => {
     const subtree = buildReferencedSubtree();
     applyAssetOverrides(
-      { byNodeId: { motor: { Drive: { Acceleration: null } } } },
+      { byAddress: { '#motor': { Drive: { Acceleration: null } } } },
       makeSubtreeResolvers(subtree),
       { occurrence: '', assetId: 'press-500t' },
     );
@@ -159,7 +159,7 @@ describe('AssetOverrides', () => {
   it('falls back to byPath, relative to the reference node', () => {
     const subtree = buildReferencedSubtree();
     const result = applyAssetOverrides(
-      { byNodeId: {}, byPath: { 'Gripper/Motor': { Drive: { TargetSpeed: 42 } } } },
+      { byAddress: {}, legacyByPath: { 'Gripper/Motor': { Drive: { TargetSpeed: 42 } } } },
       makeSubtreeResolvers(subtree),
       { occurrence: '', assetId: 'press-500t' },
     );
@@ -170,15 +170,15 @@ describe('AssetOverrides', () => {
   it('reports an override whose target is gone instead of dropping it', () => {
     const subtree = buildReferencedSubtree();
     const result = applyAssetOverrides(
-      { byNodeId: { 'removed-node': { Drive: { TargetSpeed: 7 } } } },
+      { byAddress: { '#removed-node': { Drive: { TargetSpeed: 7 } } } },
       makeSubtreeResolvers(subtree),
       { occurrence: 'ref-1', assetId: 'press-500t' },
     );
 
     expect(result.applied).toBe(0);
     expect(result.orphaned).toEqual([{
-      addressing: 'nodeId',
-      key: 'removed-node',
+      addressing: 'address',
+      key: '#removed-node',
       occurrence: 'ref-1',
       assetId: 'press-500t',
       componentTypes: ['Drive'],
@@ -192,7 +192,7 @@ describe('AssetOverrides', () => {
     // node itself carries the override, so nothing here can reach the source.
     const referenceNode = new Object3D();
     setAssetReference(referenceNode, { assetId: 'press-500t' });
-    setAssetOverrides(referenceNode, { byNodeId: { motor: { Drive: { TargetSpeed: 1 } } } });
+    setAssetOverrides(referenceNode, { byAddress: { '#motor': { Drive: { TargetSpeed: 1 } } } });
 
     const overrides = getAssetOverrides(referenceNode)!;
     const a = buildReferencedSubtree();
@@ -258,11 +258,11 @@ describe('Overlay store shares the merge implementation', () => {
     const resolvers = makeSubtreeResolvers(subtree);
     const result = applyOverlayByNodeId(
       { motor: { Drive: { TargetSpeed: 5 } }, ghost: { Drive: { TargetSpeed: 6 } } },
-      resolvers.byNodeId,
+      (id) => resolvers.byAddress(`#${id}`),
       { occurrence: 'ref-1', assetId: 'press-500t' },
     );
     expect(result.applied).toBe(1);
-    expect(result.orphaned.map((o) => o.key)).toEqual(['ghost']);
+    expect(result.orphaned.map((o) => o.key)).toEqual(['#ghost']);
   });
 
   it('applyComponentPatch ignores a non-object component entry', () => {

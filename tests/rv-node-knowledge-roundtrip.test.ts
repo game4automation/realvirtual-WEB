@@ -88,7 +88,8 @@ describe('NodeKnowledge GLB roundtrip', () => {
     const reloaded = await roundtrip(root, 'Axis');
 
     const rv = reloaded.userData.realvirtual as Record<string, Record<string, unknown>>;
-    expect(Object.keys(rv).sort()).toEqual(['Drive', NODE_KNOWLEDGE_TYPE].sort());
+    // plan-769 Phase 3a: the export also writes the node's id.
+    expect(Object.keys(rv).sort()).toEqual(['Drive', 'NodeId', NODE_KNOWLEDGE_TYPE].sort());
     expect(rv.Drive.Direction).toBe('LinearX');
     expect(rv.Drive.TargetSpeed).toBe(250);
     expect(readNodeKnowledge(reloaded)?.Note).toBe(NOTE);

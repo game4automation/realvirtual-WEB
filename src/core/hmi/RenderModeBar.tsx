@@ -6,8 +6,10 @@
  * (plan-761, compacted by plan-578), modelled on Unity's Draw Modes bar.
  *
  * ONE segment, not four: it shows the icon of the ACTIVE mode and opens a menu
- * upwards (`ActionDropdownSegment`) listing the three exclusive shading modes —
- * Unlit / Shaded / Toon, labels and order straight from `RENDER_MODES` — plus
+ * upwards (`ActionDropdownSegment`) listing the exclusive shading modes —
+ * Unlit / Shaded / Toon, plus Ray traced only where the registry's backend gate
+ * offers it (`availableRenderModes`, plan-762); labels and order straight from
+ * `RENDER_MODES` — plus
  * Wireframe, which only exists in the editor workspace. Every row is a VIEW of
  * a command (plan-499): the shading rows of `view.renderMode {mode}`, the
  * wireframe row of `editor.wireframe {on:true}` (same command as Shift+Z and
@@ -42,14 +44,14 @@
  */
 
 import { useMemo, useSyncExternalStore, type ReactElement } from 'react';
-import { AutoAwesome, Brush, Grid4x4, Lens, PanoramaFishEye, Speed } from '@mui/icons-material';
+import { AutoAwesome, Brush, Grid4x4, Lens, PanoramaFishEye, Speed, WbSunny } from '@mui/icons-material';
 import { useViewer } from '../../hooks/use-viewer';
 import { isTabLocked } from '../rv-app-config';
-import { RENDER_MODES, type RenderMode } from '../rv-render-modes';
+import { NO_RENDER_MODE_CONTEXT, RENDER_MODES, availableRenderModes, type RenderMode } from '../rv-render-modes';
 import { ActionDropdownSegment, ActionGroupPill, type ActionDropdownItem } from './action-group';
 import { ensureEditorCommandsRegistered } from './editor-command-descriptors';
 import { commandRegistry } from './rv-command-registry';
-import { subscribeRenderModeValue, type RenderModeValue } from './render-mode-controller';
+import { renderModeLockReason, subscribeRenderModeValue, type RenderModeValue } from './render-mode-controller';
 import {
   ensureViewCommandsRegistered, VIEW_RENDER_MODE_COMMAND, VIEW_VISUAL_PRESET_COMMAND,
 } from './view-commands';
@@ -94,6 +96,7 @@ const ICONS: Readonly<Record<RenderModeValue, ReactElement>> = {
   simple: <PanoramaFishEye />,
   default: <Lens />,
   toon: <Brush />,
+  raytraced: <WbSunny />,
   wireframe: <Grid4x4 />,
 };
 
@@ -129,13 +132,18 @@ export function useRenderModeSegment(): ReactElement | null {
   const value = useSyncExternalStore(
     subscribe,
     () => `${viewer.renderMode}|${viewer.wireframeActive}|${viewer.modes.activeMode}`
-      + `|${matchPreset(listShippedPresets()) ?? ''}`,
+      + `|${matchPreset(listShippedPresets()) ?? ''}`
+      // plan-522: a maintenance guide locks the mode — the rows' enabled state
+      // must re-render when it starts/ends (last field: never destructured).
+      + `|${renderModeLockReason() ?? ''}`,
   );
   // After the hooks: a locked deployment renders nothing at all.
   if (isTabLocked('visual')) return null;
   const [renderMode, wireActive, activeMode, activePreset] = value.split('|');
   const current: RenderModeValue = wireActive === 'true' ? 'wireframe' : (renderMode as RenderMode);
-  const items: ActionDropdownItem[] = RENDER_MODES.map((m) => ({
+  // plan-762 F2: only the modes the registry's gate offers on THIS viewer — a
+  // WebGL / webgpu-gl viewer or a build without a backend keeps three rows.
+  const items: ActionDropdownItem[] = availableRenderModes(viewer.renderModeContext ?? NO_RENDER_MODE_CONTEXT).map((m) => ({
     key: m.id,
     icon: ICONS[m.id],
     label: m.label,
@@ -184,10 +192,11 @@ export function useRenderModeSegment(): ReactElement | null {
       testId: row.key,
     });
   }
-  // Fixed-length proxy list: the three shading keys, the wireframe key and the
-  // two quality keys, in EVERY workspace. The wireframe key simply never
-  // receives a touch outside the editor, and the trigger's hook order stays
-  // stable (§2.5). Six keys is exactly `PROXY_KEY_SLOTS` — a seventh would be
+  // Fixed-length proxy list: ALL four shading keys (the gated ray traced key
+  // included, plan-762), the wireframe key and the two quality keys, in EVERY
+  // workspace. The wireframe / ray traced keys simply never receive a touch
+  // where their row is absent, and the trigger's hook order stays stable
+  // (§2.5). Seven keys is exactly `PROXY_KEY_SLOTS` — an eighth would be
   // ignored, so that constant has to grow with the list.
   const proxyKeys = [
     ...RENDER_MODES.map((m) => commandRegistry.buttonKeyOf(VIEW_RENDER_MODE_COMMAND, { mode: m.id })),

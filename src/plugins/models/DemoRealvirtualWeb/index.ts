@@ -26,15 +26,12 @@ import { KpiDemoPlugin } from '../../demo/kpi-demo-plugin';
 import { DemoHMIPlugin } from '../../demo/demo-hmi-plugin';
 import { TestAxesPlugin } from '../../demo/test-axes-plugin';
 import { MachineControlPlugin } from '../../demo/machine-control-plugin';
-import { MaintenancePlugin } from '../../demo/maintenance-plugin';
 
 // Optional feature plugins
 import { WebXRPlugin } from '../../webxr-plugin';
 import { MultiuserPlugin } from '../../multiuser-plugin';
 import { FpvPlugin } from '../../fpv-plugin';
 import { AnnotationPlugin } from '../../annotation-plugin';
-import { AasLinkPlugin } from '../../aas-link-plugin';
-import { OrderManagerPlugin } from '../../order-manager-plugin';
 
 // Kiosk Mode — disabled for now, re-enable when tour content is ready
 // import type { KioskPlugin } from '../../kiosk-plugin';
@@ -110,8 +107,10 @@ export function registerModelPlugins(viewer: RVViewer): void {
   // Must be paired with resetInstructionTypeColors() in unregisterModelPlugins.
   //   setInstructionTypeColors({ maintenance: 0x673ab7, info: 0x00bcd4 });
   const instances = [
-    // Model options (AAS supplier swap) — MUST be first so the remap runs
-    // before AasLinkPlugin pre-parses the AASX for the swapped ids.
+    // Model options (AAS supplier swap). AasLinkPlugin and OrderManagerPlugin
+    // are core plugins (main.ts, plan-682) — never register them here. The
+    // remap runs in onModelLoaded, i.e. before the AAS resolution and the AAS
+    // plugin's model work, which both wait for 'model-loaded'.
     new ModelOptionPlugin(applyModelOption),
     // Hide engineering sim controls (Play/Pause/Reset + Realtime/DES) in HMI mode.
     new OperatorHmiControlsPlugin(),
@@ -121,14 +120,12 @@ export function registerModelPlugins(viewer: RVViewer): void {
     new DemoHMIPlugin(),
     new TestAxesPlugin(),
     new MachineControlPlugin(),
-    new MaintenancePlugin(),
+    // MaintenancePlugin is a core plugin since plan-522 Phase 6 (main.ts).
     // Optional features
     new WebXRPlugin(),
     new MultiuserPlugin(),
     new FpvPlugin(),
     new AnnotationPlugin(),
-    new AasLinkPlugin(),
-    new OrderManagerPlugin(),
   ];
   for (const p of instances) {
     viewer.use(p);

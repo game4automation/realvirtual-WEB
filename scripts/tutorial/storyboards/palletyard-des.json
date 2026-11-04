@@ -1,0 +1,88 @@
+{
+  "$schema": "rv-tutorial/1",
+  "id": "palletyard-des",
+  "title": "realvirtual WEB - PalletYard DES: scale to 9 AGVs, statistics, ride along",
+  "url": "/?projectUrl=/demo-realvirtual/&doc=doc_palletyard_hzmdb6&mode=des",
+  "viewport": { "width": 1920, "height": 1080 },
+  "welcome": "dismiss",
+  "start": "paused",
+  "ready": "#rv-viewport",
+  "minStepSec": 0.5,
+  "motionRegion": { "x": 560, "y": 300, "w": 800, "h": 500 },
+  "setup": [
+    { "type": "waitFor", "scene": true, "timeoutMs": 120000 },
+    { "type": "command", "id": "planning.param.set", "via": "direct", "args": { "values": "{\"palletYard.size\":6}" } },
+    { "type": "command", "id": "planning.param.apply", "via": "direct", "waitSec": 3 },
+    { "type": "command", "id": "ui.panel", "via": "direct", "args": { "panelId": "planning-parameters", "collapsed": true } },
+    { "type": "click", "target": { "selector": "[aria-label=\"Close panel\"]" } },
+    { "type": "command", "id": "des.setEnd", "via": "direct", "args": { "end": "100:00:00:00" } },
+    { "type": "command", "id": "des.badges", "via": "direct", "args": { "on": true } },
+    { "type": "command", "id": "des.setMode", "via": "direct", "args": { "subMode": "hybrid", "multiplier": 5 } },
+    { "type": "command", "id": "ui.panel", "via": "direct", "args": { "panelId": "des-stats-chart", "rect": [72, 400, 1120, 640] } },
+    { "type": "command", "id": "sim.playPause", "via": "direct", "waitSec": 1 },
+    { "type": "command", "id": "des.fastForward", "via": "direct", "args": { "untilSimTime": "00:02:00:00" }, "maxWaitSec": 120 },
+    { "type": "camera", "position": [4, 3.2, -7.5], "target": [12.5, 1.2, 0.5], "durationSec": 0.1 }
+  ],
+  "steps": [
+    {
+      "id": "start-and-dolly",
+      "holdSec": 0.5,
+      "actions": [
+        { "type": "command", "id": "sim.playPause" },
+        { "type": "camera", "position": [5.4, 3.1, -6.0], "target": [13.8, 1.2, 1.8], "durationSec": 7 }
+      ]
+    },
+    {
+      "id": "open-statistics",
+      "holdSec": 1.5,
+      "actions": [
+        { "type": "command", "id": "des.stats.window" },
+        { "type": "waitFor", "selector": ".MuiChip-root:has-text(\"Source\")", "state": "visible", "timeoutMs": 8000 }
+      ]
+    },
+    {
+      "id": "chips-off",
+      "holdSec": 0.4,
+      "actions": [
+        { "type": "click", "target": { "selector": ".MuiChip-root:has-text(\"Source\")" } },
+        { "type": "click", "target": { "selector": ".MuiChip-root:has-text(\"Sink\")" } }
+      ]
+    },
+    {
+      "id": "pick-vehicle",
+      "holdSec": 0.5,
+      "actions": [
+        { "type": "pick", "rule": "moving-vehicle", "among": "PalletYard/PalletYardRoot/Stapler_*", "as": "agv" }
+      ]
+    },
+    {
+      "id": "bar-tooltip",
+      "holdSec": 3.5,
+      "actions": [
+        { "type": "hover", "target": { "recordingTarget": "des-stats-bar", "key": "$agv" } }
+      ]
+    },
+    {
+      "id": "close-statistics",
+      "holdSec": 0.5,
+      "actions": [
+        { "type": "command", "id": "des.stats.window", "via": "direct", "args": { "open": false } }
+      ]
+    },
+    {
+      "id": "fly-to-vehicle",
+      "holdSec": 0.5,
+      "actions": [
+        { "type": "command", "id": "selection.select", "via": "direct", "args": { "path": "$agv" } },
+        { "type": "command", "id": "camera.flyTo", "via": "direct", "args": { "node": "$agv", "offset": [-1.2, 1.8, -3.2], "durationSec": 1.2 } }
+      ]
+    },
+    {
+      "id": "follow",
+      "holdSec": 8,
+      "actions": [
+        { "type": "command", "id": "camera.follow", "buttonKey": "follow" }
+      ]
+    }
+  ]
+}

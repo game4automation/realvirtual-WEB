@@ -212,6 +212,33 @@ describe('PLC lifecycle — reset', () => {
     runner.tick(DT);
     expect(store.getInt('CountOut')).toBe(1); // mem was cleared, default 0 + 1
   });
+
+  it('reset() after a scan died while running brings the program back to running (2026-10-14)', async () => {
+    // A wall-clock deadline overrun on a loaded machine killed one station; the simulation
+    // reset rebuilt it but left it 'stopped' — the station stood still for good.
+    const runner = makeRunner();
+    await runner.deploy(INFINITE_LOOP_PROGRAM);
+    await runner.run();
+    runner.tick(DT); // aborted by the interrupt deadline
+    expect(runner.state).toBe('error');
+
+    await runner.reset();
+    expect(runner.state).toBe('running');
+    expect(runner.lastError).toBeNull();
+  });
+
+  it('reset() of an errored program the user stopped keeps it stopped', async () => {
+    const runner = makeRunner();
+    await runner.deploy(DIVISION_PROGRAM);
+    await runner.run();
+    runner.tick(DT);
+    expect(runner.state).toBe('error');
+    runner.stop(); // the user's stop wins over the earlier run
+
+    await runner.reset();
+    expect(runner.state).toBe('stopped');
+    expect(runner.lastError).toBeNull();
+  });
 });
 
 // ─── Public PlcControl registry ─────────────────────────────────────────────
@@ -235,4 +262,157 @@ describe('PlcControl registry', () => {
     registerPlcControl(null);
     expect(getPlcControl()).toBeNull();
   });
+});
+
+
+const FIRST_SCAN_PROGRAM = `PROGRAM Main
+VAR_EXTERNAL RV_FirstScan : BOOL; D : INT; SensorInFeed : BOOL; END_VAR
+VAR n : INT; value : INT := 7; observed : INT; quotient : INT;
+    tDelay : TON := (PT := T#2s); END_VAR
+IF RV_FirstScan THEN n := n + 1; END_IF;
+observed := value;
+IF SensorInFeed THEN
+  value := 99;
+  tDelay(IN := TRUE, PT := T#5s);
+ELSE
+  tDelay(IN := TRUE);
+END_IF;
+quotient := 10 / D;
+END_PROGRAM`;
+
+describe('COLD/WARM and RV_FirstScan (plan-2218 section 9.3)', () => {
+  async function deployFirstScan(): Promise<RVPlcRunner> {
+    store.set('D', 2);
+    const runner = makeRunner();
+    runner.setOnlineView(true);
+    const diagnostics = await runner.deploy(FIRST_SCAN_PROGRAM);
+    expect(diagnostics.filter((d) => d.severity === 'error')).toEqual([]);
+    expect(diagnostics.filter((d) => d.severity === 'warning')).toEqual([]);
+    // node-identity Golden Rule 10: the system variable has no store entry/address.
+    expect(store.get('RV_FirstScan')).toBeUndefined();
+    expect(runner.bindsSystemInput('RV_FirstScan')).toBe(true);
+    expect(runner.watch().get('tDelay.PT')).toBe(2000);
+    return runner;
+  }
+
+  function expectFirstScan(runner: RVPlcRunner): void {
+    expect(runner.watch().get('n')).toBe(1);
+    expect(runner.watch().get('observed')).toBe(7);
+    expect(runner.watch().get('RV_FirstScan')).toBe(true);
+    expect(runner.watch().get('tDelay.PT')).toBe(2000);
+    expect(store.get('RV_FirstScan')).toBeUndefined();
+  }
+
+  it('deploy and healthy reset are COLD; Stop -> Run preserves modified memory and inputs', async () => {
+    const runner = await deployFirstScan();
+    await runner.run();
+    runner.tick(DT);
+    expectFirstScan(runner);
+    store.set('SensorInFeed', true);
+    runner.tick(DT);
+    expect(runner.watch().get('value')).toBe(99);
+    expect(runner.watch().get('tDelay.PT')).toBe(5000);
+    runner.stop();
+    store.set('SensorInFeed', false);
+    await runner.run();
+    runner.tick(DT);
+    expect(runner.watch().get('n')).toBe(1);
+    expect(runner.watch().get('observed')).toBe(99);
+    expect(runner.watch().get('RV_FirstScan')).toBe(false);
+    expect(runner.watch().get('tDelay.PT')).toBe(5000);
+    await runner.reset();
+    expect(runner.state).toBe('running');
+    expect(runner.watch().get('tDelay.PT')).toBe(2000);
+    runner.tick(DT);
+    expectFirstScan(runner);
+    runner.tick(DT);
+    expect(runner.watch().get('n')).toBe(1);
+    expect(runner.watch().get('RV_FirstScan')).toBe(false);
+  });
+
+  it.each(['run', 'reset'] as const)('%s after division by zero restores start values and first scan once', async (recover) => {
+    const runner = await deployFirstScan();
+    await runner.run();
+    store.set('SensorInFeed', true);
+    runner.tick(DT);
+    runner.tick(DT);
+    store.set('D', 0);
+    runner.tick(DT);
+    expect(runner.state).toBe('error');
+    expect(runner.lastError).toMatch(/Division by zero/);
+    store.set('D', 2);
+    store.set('SensorInFeed', false);
+    await runner[recover]();
+    expect(runner.state).toBe('running');
+    expect(runner.watch().get('tDelay.PT')).toBe(2000);
+    runner.tick(DT);
+    expectFirstScan(runner);
+    runner.tick(DT);
+    expect(runner.watch().get('n')).toBe(1);
+    expect(runner.watch().get('RV_FirstScan')).toBe(false);
+  });
+
+  it('step consumes first scan, including after a stopped healthy reset', async () => {
+    const runner = await deployFirstScan();
+    runner.step();
+    expectFirstScan(runner);
+    expect(runner.state).toBe('stopped');
+    runner.step();
+    expect(runner.watch().get('RV_FirstScan')).toBe(false);
+    await runner.run();
+    runner.tick(DT);
+    expect(runner.watch().get('n')).toBe(1);
+    expect(runner.watch().get('RV_FirstScan')).toBe(false);
+    runner.stop();
+    await runner.reset();
+    runner.step();
+    expectFirstScan(runner);
+    runner.step();
+    expect(runner.watch().get('RV_FirstScan')).toBe(false);
+  });
+
+  it('rejects writes to RV_FirstScan without registering it as an output', async () => {
+    const runner = makeRunner();
+    const diagnostics = await runner.deploy(`PROGRAM Main
+VAR_EXTERNAL RV_FirstScan : BOOL; END_VAR
+RV_FirstScan := TRUE;
+END_PROGRAM`);
+    expect(diagnostics.some((d) => d.severity === 'error' && /read-only system variable/.test(d.message))).toBe(true);
+    expect(runner.state).toBe('error');
+    expect(store.get('RV_FirstScan')).toBeUndefined();
+    expect(runner.outputStartValues.has('RV_FirstScan')).toBe(false);
+  });
+});
+
+
+it('poisoned reset restores FB start values and first scan', async () => {
+  const runner = makeRunner();
+  runner.setOnlineView(true);
+  const diagnostics = await runner.deploy(`PROGRAM Main
+VAR_EXTERNAL RV_FirstScan : BOOL; SensorInFeed : BOOL; END_VAR
+VAR n : INT; x : INT := 7; tDelay : TON := (PT := T#2s); END_VAR
+IF RV_FirstScan THEN n := n + 1; END_IF;
+IF SensorInFeed THEN
+  tDelay(IN := TRUE, PT := T#5s);
+  WHILE TRUE DO x := x + 1; END_WHILE;
+END_IF;
+END_PROGRAM`);
+  expect(diagnostics.filter((d) => d.severity === 'error')).toEqual([]);
+  await runner.run();
+  runner.tick(DT);
+  store.set('SensorInFeed', true);
+  runner.tick(DT);
+  expect(runner.state).toBe('error');
+  store.set('SensorInFeed', false);
+  await runner.reset();
+  expect(runner.state).toBe('running');
+  expect(runner.watch().get('tDelay.PT')).toBe(2000);
+  runner.tick(DT);
+  expect(runner.watch().get('n')).toBe(1);
+  expect(runner.watch().get('x')).toBe(7);
+  expect(runner.watch().get('RV_FirstScan')).toBe(true);
+  runner.tick(DT);
+  expect(runner.watch().get('n')).toBe(1);
+  expect(runner.watch().get('RV_FirstScan')).toBe(false);
+  expect(store.get('RV_FirstScan')).toBeUndefined();
 });

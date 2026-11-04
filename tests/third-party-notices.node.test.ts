@@ -301,8 +301,8 @@ describe('mode resolution and banners (F11)', () => {
     expect(resolveNoticesMode({ env: { RV_NOTICES_MODE: 'off' } }).mode).toBe('warn');
   });
 
-  it('until plan-544 Phase 6 the release default is warn', () => {
-    expect(RELEASE_DEFAULT_MODE).toBe('warn');
+  it('since plan-544 Phase 6 the release default is enforce', () => {
+    expect(RELEASE_DEFAULT_MODE).toBe('enforce');
   });
 
   it('the banner fires for warn and for missing notices, not for enforce', () => {

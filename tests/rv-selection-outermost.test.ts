@@ -8,7 +8,7 @@
  * drill level) over an `Object3D` parent chain, so the whole of decision 22 can
  * be checked against three nested references built by hand — no GLB, no
  * `WebGLRenderer`, no picking. That is deliberate rather than convenient: the
- * rule must NOT live in the picking path (`doc-render-picking.md` §2.4 rule 1),
+ * rule must NOT live in the picking path (`contract-bake-picking.md` §2.4 rule 1),
  * and a test that needed a raycast to reach it would be evidence that it does.
  */
 import { describe, it, expect } from 'vitest';

@@ -29,6 +29,7 @@ import type { RVViewer } from '../../core/rv-viewer';
 import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
 import { computeSubtreeAABB } from '../../core/engine/rv-traverse-utils';
 import { isChunkMesh, isRuntimeNode } from '../../core/engine/rv-node-classification';
+import { forEachOwnedNode } from '../../core/engine/rv-reference-scope';
 import { parsePathsParam } from './rv-object-analyzer-math';
 import {
   canvasToRvImage, canvasesToRvImages, saveCanvasToProject, compositeMontage,
@@ -39,7 +40,7 @@ import { computeFlyPose } from './rv-camera-fly-math';
 // with the viewport's CameraManager so there is exactly one copy of the maths.
 import type { AgentEye } from '../../core/engine/rv-agent-eye';
 import { fitDistanceBothAxesFor } from '../../core/rv-camera-manager';
-import { fitPoseToPoints, type Vec3 as FitVec3 } from './rv-frame-fit-math';
+import { fitBox, frameEyeToBox } from '../../core/hmi/agent-eye-frame';
 import {
   sweepPoses, summarizeVisibleGroups,
   DEFAULT_SWEEP_COUNT, DEFAULT_SWEEP_PITCH_DEG, DEFAULT_TOP_N, type SweepViewNote,
@@ -58,7 +59,7 @@ import {
   computeSameMaterialPaths,
   computeInvertPaths,
   expandToUniverseMeshes,
-} from '@rv-private/plugins/asset-editor/select-actions';
+} from '@rv-private/plugins/asset-editor/shared/select-actions';
 
 const r3 = (n: number): number => +n.toFixed(3);
 const vec3 = (v: Vector3): [number, number, number] => [r3(v.x), r3(v.y), r3(v.z)];
@@ -130,8 +131,6 @@ const SWEEP_CELL_PX = 640;
 // view too small to read is not a cheaper answer, it is no answer. The CEILING
 // sits above the floor on purpose — with min === max the size parameter would
 // silently do nothing again, which is the exact defect this tool just had.
-/** Meshes sampled for a framing fit — see `_fitPoints`. */
-const FIT_MESH_SAMPLE_CAP = 2000;
 
 const ORTHO_CELL_DEFAULT_PX = 1024;
 const ORTHO_CELL_MIN_PX = 1024;
@@ -221,7 +220,10 @@ export function buildMeshUniverse(viewer: RVViewer): Map<string, Object3D> {
   const root = viewer.currentModelRoot;
   const registry = viewer.registry;
   if (!root || !registry) return map;
-  root.traverse((obj) => {
+  // plan-774 F9: owned content only — a placed reference's baked chunks are
+  // not parts this document can select-similar into (the editor descends
+  // into the referenced asset to work on them).
+  forEachOwnedNode(root, (obj) => {
     if (!(obj as Mesh).isMesh) return;
     // Effectively visible: every ancestor up to the root visible, and no
     // authored rv.Hidden flag on the chain (matches raycast BVH exclusion).
@@ -258,7 +260,7 @@ export class McpViewTools {
   // construction, so nothing is actually unmeasurable.
   @McpTool('Measure nodes: world AABB (center/size/min/max, meters), node-local box + world quaternion (oriented bounds), mesh count. Also SELECTS the nodes (shared viewport highlight, like a user click) and frames them with the AGENT camera, unless focus=false. THE numeric grounding for pivot placement, axis positions and part sizes. Paths from web_node_find / web_node_tree — including the chunk/runtime nodes those report, which come back flagged and are measured but never selected.', { readOnly: false })
   async webNodeBounds(
-    @McpParam('paths', 'Node paths, comma- or newline-separated.') paths: string,
+    @McpParam('paths', 'Node paths, comma-separated (or newline-separated), or a JSON array of strings for names containing commas.') paths: string,
     @McpParam('focus', 'Also select and frame the measured nodes (default true); pass false for measurement only.', 'boolean', false) focus?: boolean,
   ): Promise<string> {
     const v = this.viewer;
@@ -350,48 +352,6 @@ export class McpViewTools {
     });
   }
 
-  @McpTool('Isolate nodes visually: only the given subtrees stay bright and interactive, everything else is dimmed. The dimming is SHARED with the user (it is document state), but only the AGENT camera frames the isolated set — the user viewport stays where it is. Call with empty paths to EXIT isolation. Use before captures of buried parts.', { readOnly: false })
-  async webViewIsolate(
-    @McpParam('paths', 'Node paths to isolate (comma/newline-separated). Empty = exit isolation.', 'string', false) paths: string,
-  ): Promise<string> {
-    const v = this.viewer;
-    if (!v) return JSON.stringify({ error: 'No viewer' });
-    const requested = parsePathsParam(paths ?? '');
-    if (requested.length === 0) {
-      v.exitIsolate();
-      return JSON.stringify({ isolated: 0, active: false });
-    }
-    const nodes: Object3D[] = [];
-    const unresolved: string[] = [];
-    for (const p of requested) {
-      const n = v.registry?.getNode(p);
-      if (n) nodes.push(n); else unresolved.push(p);
-    }
-    if (nodes.length === 0) {
-      return JSON.stringify({ error: `Node(s) not found: ${unresolved.join(', ')}` });
-    }
-    // Dimming yes, viewport flight no (plan-740 D-U3): the isolation itself is
-    // shared scene state, the framing belongs to whoever asked for it.
-    v.isolateNodes(nodes, false);
-    let framed = false;
-    const eye = this._eye(v);
-    if (eye) {
-      const box = new Box3().makeEmpty();
-      for (const n of nodes) { n.updateMatrixWorld(true); box.union(computeSubtreeAABB(n, new Box3()).box); }
-      if (!box.isEmpty()) {
-        const pose = eye.pose;
-        const dir = new Vector3(pose.px - pose.tx, pose.py - pose.ty, pose.pz - pose.tz);
-        if (dir.lengthSq() < 1e-12) dir.set(0, 0, 1);
-        dir.normalize();
-        this._frameEyeToBox(eye, box, dir, nodes);
-        framed = true;
-      }
-    }
-    return JSON.stringify({
-      isolated: nodes.length, active: true, framed,
-      ...(unresolved.length ? { unresolved } : {}),
-    });
-  }
 
   // ═══ Camera ═══════════════════════════════════════════════════════════
 
@@ -447,77 +407,14 @@ export class McpViewTools {
   private _fitBox(
     eye: AgentEye, box: Box3, dir: Vector3, nodes?: readonly Object3D[],
   ): { eye: Vector3; target: Vector3 } {
-    const p = eye.pose;
-    const fit = fitPoseToPoints(
-      this._fitPoints(box, nodes),
-      [dir.x, dir.y, dir.z],
-      p.fov, p.aspect,
-    );
-    return {
-      eye: new Vector3(fit.eye[0], fit.eye[1], fit.eye[2]),
-      target: new Vector3(fit.target[0], fit.target[1], fit.target[2]),
-    };
-  }
-
-  /**
-   * Points the fit should frame: the corners of each MESH's own box, falling
-   * back to the subtree's single world AABB when there are no meshes.
-   *
-   * One world-axis AABB around a rotated assembly has large empty corners, so
-   * centring its projection centres the empty box rather than the part — the
-   * valve terminal still came out 122 px right of centre that way. Per-mesh
-   * boxes follow each part's own placement and hug the geometry far more
-   * tightly. Capped because this is per-corner arithmetic and a big assembly
-   * can carry tens of thousands of meshes; the subsample keeps the extremes,
-   * which is all an extent needs.
-   */
-  private _fitPoints(box: Box3, nodes?: readonly Object3D[]): FitVec3[] {
-    const out: FitVec3[] = [];
-    if (nodes && nodes.length > 0) {
-      const meshes: Mesh[] = [];
-      for (const n of nodes) {
-        n.updateMatrixWorld(true);
-        n.traverse((c) => { if ((c as Mesh).isMesh && (c as Mesh).geometry) meshes.push(c as Mesh); });
-      }
-      const step = Math.max(1, Math.ceil(meshes.length / FIT_MESH_SAMPLE_CAP));
-      const corner = new Vector3();
-      for (let i = 0; i < meshes.length; i += step) {
-        const m = meshes[i];
-        const g = m.geometry;
-        if (!g.boundingBox) g.computeBoundingBox();
-        const bb = g.boundingBox;
-        if (!bb || bb.isEmpty()) continue;
-        for (let k = 0; k < 8; k++) {
-          corner.set(
-            k & 1 ? bb.max.x : bb.min.x,
-            k & 2 ? bb.max.y : bb.min.y,
-            k & 4 ? bb.max.z : bb.min.z,
-          ).applyMatrix4(m.matrixWorld);
-          out.push([corner.x, corner.y, corner.z]);
-        }
-      }
-    }
-    if (out.length === 0 && !box.isEmpty()) {
-      for (let k = 0; k < 8; k++) {
-        out.push([
-          k & 1 ? box.max.x : box.min.x,
-          k & 2 ? box.max.y : box.min.y,
-          k & 4 ? box.max.z : box.min.z,
-        ]);
-      }
-    }
-    return out;
+    return fitBox(eye, box, dir, nodes);
   }
 
   /** Frame `box` with the agent camera, keeping its current view direction. */
   private _frameEyeToBox(
     eye: AgentEye, box: Box3, dir: Vector3, nodes?: readonly Object3D[],
   ): void {
-    const fit = this._fitBox(eye, box, dir, nodes);
-    eye.setPose({
-      px: fit.eye.x, py: fit.eye.y, pz: fit.eye.z,
-      tx: fit.target.x, ty: fit.target.y, tz: fit.target.z,
-    });
+    frameEyeToBox(eye, box, dir, nodes);
   }
 
   /** Aim the agent at `center` from `distance` along `dir` (normalised). */
@@ -587,7 +484,7 @@ export class McpViewTools {
 
   @McpTool('Frame one or more nodes with the AGENT camera: it moves so they fill its view, keeping its current view direction. THE standard way to look at a part before a capture. Instant, and the user viewport stays where it is.', { readOnly: false })
   async webCameraFocus(
-    @McpParam('paths', 'Node paths, comma- or newline-separated.') paths: string,
+    @McpParam('paths', 'Node paths, comma-separated (or newline-separated), or a JSON array of strings for names containing commas.') paths: string,
   ): Promise<string> {
     const v = this.viewer;
     if (!v) return JSON.stringify({ error: 'No viewer' });
@@ -820,9 +717,9 @@ export class McpViewTools {
     });
   }
 
-  @McpTool('Contact sheet of a part: renders 4-8 views evenly around it OFFSCREEN through the AGENT camera and returns ONE labelled montage plus a note per view (visible top nodes with coverage and ownerPath, background share, camera position). Understands an unknown assembly in a SINGLE call instead of an orbit+screenshot loop. Coverage is measured on the ID MASK of a depth-tested frame, so it is occlusion-correct rather than ray-sampled. Instant: nothing is animated, neither the user viewport nor the agent body moves. Each note carries its cameraPosition, so pulling one view up is one web_camera_set away. Requires the classic WebGL renderer.', { readOnly: true, timeoutMs: 120_000 })
+  @McpTool('Contact sheet of a part: renders 4-8 views evenly around it OFFSCREEN through the AGENT camera and returns ONE labelled montage plus a note per view (visible top nodes with coverage and ownerPath, background share, camera position). Understands an unknown assembly in a SINGLE call instead of an orbit+screenshot loop. Coverage is measured on the ID MASK of a depth-tested frame, so it is occlusion-correct rather than ray-sampled. Instant: nothing is animated, neither the user viewport nor the agent body moves. Each note carries its cameraPosition, so pulling one view up is one web_camera_set away.', { readOnly: true, timeoutMs: 120_000 })
   async webViewSweep(
-    @McpParam('paths', 'Node paths to sweep around, comma/newline-separated. Empty = whole model.', 'string', false) paths?: string,
+    @McpParam('paths', 'Node paths to sweep around, comma-separated (or newline-separated), or a JSON array of strings for names containing commas. Empty = whole model.', 'string', false) paths?: string,
     @McpParam('count', 'Number of views, clamped to 4..8 (default 6).', 'number', false) count?: number,
     @McpParam('pitchDeg', 'Elevation of every view in degrees (default 20).', 'number', false) pitchDeg?: number,
     @McpParam('yawStartDeg', 'Yaw of the first view (default: current camera azimuth).', 'number', false) yawStartDeg?: number,
@@ -950,9 +847,9 @@ export class McpViewTools {
 
   // ═══ web_view_ortho ═══════════════════════════════════════════════════
 
-  @McpTool('Render the six ORTHOGRAPHIC views (front, back, left, right, top, bottom) OFFSCREEN through the AGENT camera into ONE labelled 3×2 mosaic per requested channel (beauty, idmask = flat ID colors + white crease edges, xray = look inside, translucent on black). labels=true marks the idmask mosaic only, capped at topN so every marker has a topNodes entry; beauty stays unannotated and pixel-aligned. The sidecar lists per view the marks, top visible nodes and the camera pose. clip=true (default) puts each camera on the bounding-box face, so a part inside a cabinet still shows. Instant: neither the user viewport nor the agent body moves. Requires the classic WebGL renderer.', { readOnly: true, timeoutMs: 120_000 })
+  @McpTool('Render the six ORTHOGRAPHIC views (front, back, left, right, top, bottom) OFFSCREEN through the AGENT camera into ONE labelled 3×2 mosaic per requested channel (beauty, idmask = flat ID colors + white crease edges, xray = look inside, translucent on black). labels=true marks the idmask mosaic only, capped at topN so every marker has a topNodes entry; beauty stays unannotated and pixel-aligned. The sidecar lists per view the marks, top visible nodes and the camera pose. clip=true (default) puts each camera on the bounding-box face, so a part inside a cabinet still shows. Instant: neither the user viewport nor the agent body moves.', { readOnly: true, timeoutMs: 120_000 })
   async webViewOrtho(
-    @McpParam('paths', 'Node paths, comma/newline-separated. Empty = whole model.', 'string', false) paths?: string,
+    @McpParam('paths', 'Node paths, comma-separated (or newline-separated), or a JSON array of strings for names containing commas. Empty = whole model.', 'string', false) paths?: string,
     @McpParam('channels', 'Comma-separated: beauty, idmask, xray (default "beauty"). One mosaic per channel.', 'string', false) channels?: string,
     @McpParam('size', 'Edge of each view in px, 1024..2048 (default 1024); smaller values are raised to 1024. The mosaic is 3 cells wide, so 1024 gives a 3072px sheet — the returned image is downscaled to the transport cap, savePath keeps full size.', 'number', false) size?: number,
     @McpParam('labels', 'Burn numbered Set-of-Mark markers on the idmask mosaic (default true). beauty is never annotated.', 'boolean', false) labels?: boolean,
@@ -1139,7 +1036,7 @@ export class McpViewTools {
 
   @McpTool('Change the selection (reflected in the viewport highlight and all panels, exactly like user clicks). mode: replace (default) | add | toggle | clear. paths = comma/newline-separated node paths (ignored for clear).', { readOnly: false })
   async webSelect(
-    @McpParam('paths', 'Node paths, comma- or newline-separated.', 'string', false) paths: string,
+    @McpParam('paths', 'Node paths, comma-separated (or newline-separated), or a JSON array of strings for names containing commas.', 'string', false) paths: string,
     @McpParam('mode', 'replace | add | toggle | clear (default replace).', 'string', false) mode: string,
   ): Promise<string> {
     const v = this.viewer;

@@ -3,7 +3,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Object3D } from 'three';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
+import { DESRunner } from '@rv/plugins/des/des-runner';
 import { RVDrive, DriveDirection } from '../../src/core/engine/rv-drive';
 import { RVIKPath } from '../../src/core/engine/rv-ik-path';
 import { RVIKTarget } from '../../src/core/engine/rv-ik-target';

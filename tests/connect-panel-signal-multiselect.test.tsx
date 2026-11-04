@@ -6,7 +6,8 @@
  *
  * signal-selection.test.ts covers the pure selection algebra. This file covers what that cannot
  * see: that a click on a row actually reaches the selection state, that Shift and Ctrl arrive as
- * the intended intent, and that the row menu deletes through ONE updateInterface write. The first
+ * the intended intent, and that the row menu deletes through ONE write — since plan-2025 F10 one
+ * `removeSignals` call (one atomic batch of `signal.remove` on CONNECT's write core). The first
  * cut of this feature had green logic tests and a dead click path, so the wiring is asserted here.
  */
 
@@ -18,6 +19,7 @@ import type { ConnectInterface, ConnectInterfaceSignal } from '../src/core/hmi/c
 import { findSignalRowLabel, getSignalRowLabel, querySignalRowLabel } from './helpers/signal-row-label';
 
 const updateInterfaceMock = vi.fn(async () => {});
+const removeSignalsMock = vi.fn(async () => {});
 
 // The row's edit affordances (and with them selection) are gated on the gateway-advertised
 // schema. The store has no gateway in a test, so the schema is supplied here.
@@ -27,6 +29,7 @@ vi.mock('../src/core/hmi/connect-store', async (importOriginal) => {
     ...actual,
     getSignalSchema: () => ({ supportsManualAdd: true, dataTypes: ['Bool', 'Float'] }),
     updateInterface: (...args: unknown[]) => updateInterfaceMock(...(args as [])),
+    removeSignals: (...args: unknown[]) => removeSignalsMock(...(args as [])),
   };
 });
 
@@ -93,6 +96,7 @@ beforeEach(() => {
   localStorage.clear();
   _resetConnectStore();
   updateInterfaceMock.mockClear();
+  removeSignalsMock.mockClear();
 });
 
 describe('CONNECT signal list — multi-selection wiring', () => {
@@ -183,17 +187,14 @@ describe('CONNECT signal list — multi-selection wiring', () => {
     fireEvent.click(screen.getByText('Delete 2 signals…'));
     fireEvent.click(await screen.findByRole('button', { name: /Delete 2 signals/ }));
 
-    expect(updateInterfaceMock).toHaveBeenCalledTimes(1);
-    const [, patch] = updateInterfaceMock.mock.calls[0] as unknown as [string, {
-      signals?: ConnectInterfaceSignal[];
-      topics?: { topic: string; signals: ConnectInterfaceSignal[] }[];
-    }];
-    // Flat signals untouched — nothing flat was selected.
-    expect(patch.signals).toBeUndefined();
-    expect(patch.topics?.[0].signals.map(s => s.name)).toEqual(['Lamp']);
+    expect(removeSignalsMock).toHaveBeenCalledTimes(1);
+    expect(updateInterfaceMock).not.toHaveBeenCalled();
+    const [, entries] = removeSignalsMock.mock.calls[0] as unknown as [string, Array<{ name: string; topic?: string }>];
+    // Only the two topic signals, addressed in their topic container; nothing flat.
+    expect(entries.map(e => [e.name, e.topic]).sort()).toEqual([['Motor', 'Data_Q_1'], ['Valve', 'Data_Q_1']]);
   });
 
-  it('deletes every selected signal in ONE updateInterface write', async () => {
+  it('deletes every selected signal in ONE write', async () => {
     renderList(fixture());
     fireEvent.click(rowOf('Alpha'));
     fireEvent.click(rowOf('Charlie'), { shiftKey: true });   // Alpha, Bravo, Charlie
@@ -203,9 +204,9 @@ describe('CONNECT signal list — multi-selection wiring', () => {
     // Confirm through the shared dialog rather than a window.confirm.
     fireEvent.click(await screen.findByRole('button', { name: /Delete 3 signals/ }));
 
-    expect(updateInterfaceMock).toHaveBeenCalledTimes(1);
-    const [id, patch] = updateInterfaceMock.mock.calls[0] as unknown as [string, { signals: ConnectInterfaceSignal[] }];
+    expect(removeSignalsMock).toHaveBeenCalledTimes(1);
+    const [id, entries] = removeSignalsMock.mock.calls[0] as unknown as [string, Array<{ name: string; topic?: string }>];
     expect(id).toBe('mqtt-sel');
-    expect(patch.signals.map(s => s.name)).toEqual(['Delta']);
+    expect(entries).toEqual([{ name: 'Alpha' }, { name: 'Bravo' }, { name: 'Charlie' }]);
   });
 });

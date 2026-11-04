@@ -31,7 +31,7 @@ import { useCustomBranding } from './branding-store';
 import { HMIShell, SlotRenderer } from './HMIShell';
 import { TopBar } from './TopBar';
 import { TitleBar } from './TitleBar';
-import { KpiBar } from './KpiBar';
+import { KpiBar, KPI_BAR_DEFAULT_RULE } from './KpiBar';
 import { ActivityBar } from './ActivityBar';
 import { ViewportFrame } from './ViewportFrame';
 import { ButtonPanel } from './ButtonPanel';
@@ -75,20 +75,31 @@ import './tooltip/GenericTooltipController';
 import { tooltipStore } from './tooltip/tooltip-store';
 // Import custom field renderers to trigger self-registration
 import './rv-metadata-field-renderer';
+import './rv-blockage-budget-field-renderer';
 import './rv-ik-path-field-renderer';
 import './rv-ribbon-path-rollers-field-renderer';
+// plan-673: the generic struct-list editor (CollisionShapeSet.Shapes) and the
+// two LocomotionPolicy editors (ordered Axes list, derived policy rate).
+import './rv-struct-list-field-renderer';
+import './rv-locomotion-policy-field-renderers';
 import './rv-custom-runtime-instruction-field-renderer';
 import './rv-node-knowledge-field-renderer';
 import './rv-web-label-text-field-renderer';
+// plan-2019: Sound.Variant (filtered type + Preview) and Sound.Volume (slider)
+import './rv-sound-field-renderer';
 // plan-543: WebOperatorPanel.Config JSON editor (+ the operator-window overlay module)
 import './operator-devices/WebOperatorPanelHost';
 // plan-525: BoxCollider center/size in mm + thin-wall warning
 import './rv-box-collider-field-renderer';
+// plan-2016 S6c/S7: Sensor.AdditionalRayCastLayers and WebPhysicsZone.LimitToLayers as layer lists
+import './rv-sensor-layers-field-renderer';
 // plan-498: Fmu inspector renderer, editor attach/detach actions, context menu, tooltip
 import './FmuAttachAction';
 import './rv-fmu-parameters-field-renderer';
 // plan-596: AASLink.AASId picker + "Import AASX…" (project aasx/ folder)
 import './rv-aaslink-aasid-field-renderer';
+// plan-650: parameter mask of a parametric family (regeneration loads on demand)
+import './rv-parametric-values-field';
 
 // Context menu (plugin-extensible right-click / long-press menu)
 import { ContextMenuLayer } from './ContextMenuLayer';
@@ -128,10 +139,12 @@ import { OrderPanel } from '../../plugins/order-manager-plugin';
 import { SensorHistoryPanel } from './SensorHistoryPanel';
 
 // Connect panel (realvirtual CONNECT gateway)
-import { ConnectPanel } from './ConnectPanel';
+import { ConnectPanelHost } from './ConnectPanelHost';
 // Models panel host — shared by the full HMI (via TopBar) and the embed shell.
-// Dev-server-only badge naming the served checkout (eliminated from builds).
-import { ServeSessionBadge } from './ServeSessionBadge';
+// Dev toolbar (plan-615): tab-title prefix + the fallback handle for a page without ActivityBar.
+// Dev server only — `RV_SERVE_INFO` is the literal null in builds.
+import { DevSessionHost } from './DevToolbarButton';
+import { RV_SERVE_INFO } from '../rv-serve-info';
 import {
   ConnectEmbedDemoControls,
   ConnectEmbedGate,
@@ -210,7 +223,7 @@ export function App() {
   // the message stack, the views slot and the AI activity overlay. Everything an
   // integrator needs (Inspector, Hierarchy, CONNECT, AI bridge, ButtonPanel)
   // stays, which is why those lines carry no commissioning string at all.
-  const showKpiBar = useUIVisible('kpi-bar', { hiddenIn: ['fpv', 'planner', 'xr', 'mode:editor', 'mode:viewer', 'mode:commissioning'] });
+  const showKpiBar = useUIVisible('kpi-bar', KPI_BAR_DEFAULT_RULE);
   // top-bar and activity-bar stay MOUNTED in the viewer: they carry Settings,
   // the camera cluster and the Groups button. Their children are gated one by
   // one inside TopBar/ActivityBar instead.
@@ -231,10 +244,13 @@ export function App() {
           Inter on body, transparent background, touch font-size). Without this
           mount, non-MUI elements render in the browser's default serif. */}
       <CssBaseline />
-      {/* Outside both shells on purpose: it must show in the CONNECT embed
-          shell too, and staying out of HMIShell keeps it clear of the shell's
-          CSS zoom, so the badge holds one size at any UI scale. */}
-      {!recording && <ServeSessionBadge />}
+      {/* Outside both shells on purpose: the tab-title prefix must hold in the
+          CONNECT embed shell too, and the fallback dev handle (only while no
+          ActivityBar is mounted) stays clear of the shell's CSS zoom. The
+          button itself is the ActivityBar's last entry. Dev server only (dropped from every build). The
+          constant MUST lead the `&&` chain: Rollup folds `null !== null && X`
+          away, but not `!recording && null !== null && X` (tests/dev-toolbar-bundle-absence). */}
+      {RV_SERVE_INFO !== null && !recording && <DevSessionHost />}
       {/* Outside both shells so F1 reaches the docs in the CONNECT embed too. */}
       <HelpShortcut />
       {recording ? (
@@ -262,7 +278,7 @@ function ConnectEmbedMinimalShell() {
   return (
     <HMIShell>
       <ActivityBar entryAllowlist={CONNECT_EMBED_ACTIVITY_BAR_ALLOWLIST} />
-      <ConnectPanel />
+      <ConnectPanelHost />
       {/* Same host as the full shell — one slot condition, so the Models panel
           and the CONNECT panel can never occupy the LEFT slot at once. */}
       <ConnectEmbedGate />
@@ -412,7 +428,7 @@ function FullHmiShell({
         {hmiVisible && <MeasurementPanel />}
         {hmiVisible && <ClippingPanel />}
         {hmiVisible && showOrderPanel && <OrderPanel />}
-        {hmiVisible && showConnectPanel && <ConnectPanel />}
+        {hmiVisible && showConnectPanel && <ConnectPanelHost />}
         <ConnectEmbedDemoControls />
         {showAnnotationEditModal && <AnnotationEditModal />}
         {/* When the HMI is hidden, the eye toggle in the top bar's right
@@ -437,7 +453,9 @@ function FullHmiShell({
  */
 export const RECORDING_SHELL_INVENTORY: Readonly<Record<string, 'kept' | 'hidden'>> = {
   // App root
-  ServeSessionBadge: 'hidden', HelpShortcut: 'kept',
+  // DevSessionHost = the dev toolbar's App-root part (title prefix, fallback handle without a bar, plan-615);
+  // the dev button itself sits in the ActivityBar, which a recording does not mount either.
+  DevSessionHost: 'hidden', HelpShortcut: 'kept',
   // FullHmiShell
   HMIShell: 'hidden', ViewportFrame: 'kept', TooltipLayer: 'hidden', AnchoredPopover: 'hidden',
   SignalDragGhost: 'hidden', SensorHistoryPanel: 'hidden', ContextMenuLayer: 'hidden', KeyBadgeLayer: 'hidden',
@@ -450,6 +468,7 @@ export const RECORDING_SHELL_INVENTORY: Readonly<Record<string, 'kept' | 'hidden
   OmniverseStatusOverlay: 'hidden', AgentActivityRow: 'hidden', AgentEyeMonitorBadge: 'hidden',
   AiActivityOverlay: 'hidden', AgentEyeMonitorPanel: 'hidden', AnnotationPanel: 'hidden', MeasurementPanel: 'hidden',
   ClippingPanel: 'hidden', OrderPanel: 'hidden', ConnectPanel: 'kept', ConnectEmbedDemoControls: 'hidden',
+  ConnectPanelHost: 'kept',
   AnnotationEditModal: 'hidden', HmiRestoreButton: 'hidden',
   // The overlay slot (TopBar renders it normally): only operator panels + the allow-list.
   'SlotRenderer[overlay]': 'kept',
@@ -503,7 +522,7 @@ export function RecordingHmiShell() {
       <div id="rv-floating-panel-root" style={{ pointerEvents: 'none' }} />
       <ViewportFrame />
       <RecordingOverlaySlot />
-      <ConnectPanel />
+      <ConnectPanelHost />
       <RecordingFrameProbe />
     </Box>
   );

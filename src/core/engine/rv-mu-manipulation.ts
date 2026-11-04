@@ -42,6 +42,7 @@ import { holdMU, detachMU, sceneRootOf } from './rv-mu-hold';
 import { LOAD_OVERLAP_EPS } from './rv-mu-load';
 import { getConnectionHolds, type HoldMode } from './rv-connection-hold';
 import { forgetMuInFlowLedgers } from '../sdk/rv-sdk-flow';
+import { isPhysicsOwned } from './rv-mu-owner';
 
 type AnyMU = RVMovingUnit | InstancedMovingUnit;
 
@@ -59,6 +60,7 @@ const HOLDER_TEXT: Readonly<Record<MuHolder, string>> = {
   zone: 'This carrier is held by a zone',
   connection: 'This carrier is held at a station (StopOnExit)',
   user: 'This carrier is being moved by hand',
+  pusher: 'This carrier is being pushed',
 };
 
 /** The refusal text for an MU held by `holder`. */
@@ -81,7 +83,7 @@ export function carrierOf(mu: RVMovingUnit): RVMovingUnit {
 
 /** True when `mu` (a carrier) is simulated by `tm` right now. */
 export function isLiveCarrier(tm: RVTransportManager, mu: AnyMU): boolean {
-  return !mu.markedForRemoval && tm.mus.includes(mu);
+  return !mu.markedForRemoval && tm.hasMU(mu);
 }
 
 /**
@@ -114,7 +116,7 @@ function findInTree(root: RVMovingUnit, id: number): RVMovingUnit | null {
 function checkManipulable(tm: RVTransportManager, mu: AnyMU): string | null {
   if (mu.isInstanced) return REASON_POOLED;
   if (!isLiveCarrier(tm, mu)) return REASON_GONE;
-  if (mu.physicsOwned) return REASON_PHYSICS;
+  if (isPhysicsOwned(mu)) return REASON_PHYSICS;
   return null;
 }
 
@@ -178,7 +180,7 @@ function releaseLoadTree(tm: RVTransportManager, root: RVMovingUnit): void {
   const loads = root.loadedMus;
   for (let i = 0; i < loads.length; i++) {
     const load = loads[i];
-    tm.physicsMUHook?.onMUDisposed(load);
+    tm.notifyPhysicsMUDisposed(load);
     tm.muLifecycleHook?.onMURemoved(load);
     for (const grip of tm.grips) grip.onMUDisposed(load);
     for (const zone of tm.zones) zone.onMUDisposed(load);

@@ -189,16 +189,17 @@ describe('the compact card fits its panel header', () => {
   });
 
   /**
-   * One row, two things. The header was a six-control row (dot, trail, the
-   * word UNSAVED, undo, redo, Save, kebab) in the narrowest panel of the app;
-   * the trail lost to controls that all had a better home elsewhere.
+   * One row: the name, Save and the document menu. The header was a
+   * seven-control row (dot, trail, the word UNSAVED, undo, redo, Save, kebab)
+   * in the narrowest panel of the app; undo, redo and the word stay out. The
+   * kebab came back on 2026-10-25 so "Discard changes" is reachable here.
    */
-  it('holds the name and Save, and nothing else', () => {
+  it('holds the name, Save and the menu, and nothing else', () => {
     mountInPanel(320);
     const card = screen.getByTestId('document-card');
     expect(screen.queryByTestId('document-card-undo')).toBeNull();
     expect(screen.queryByTestId('document-card-redo')).toBeNull();
-    expect(screen.queryByLabelText('More actions')).toBeNull();
+    expect(screen.getByLabelText('More actions')).toBeTruthy();
     expect(card.textContent).not.toContain('Unsaved');
     expect(card.querySelectorAll('[data-testid="dirty-dot"]').length).toBe(1);
     expect(screen.getByTestId('document-card-save')).toBeTruthy();

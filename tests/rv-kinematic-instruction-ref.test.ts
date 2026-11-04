@@ -23,7 +23,7 @@ import type { RVCustomRuntimeInstruction } from '../src/core/engine/rv-custom-ru
 /** Build a GLB mirroring the Unity export: a Kinematic that integrates group
  *  "G", a group member under a different authoring parent, and an instruction
  *  whose target references the member by its authoring path. */
-async function buildGLB(): Promise<ArrayBuffer> {
+async function buildGLB(withTip = false): Promise<ArrayBuffer> {
   const src = new Scene();
 
   const kin = new Object3D();
@@ -36,6 +36,13 @@ async function buildGLB(): Promise<ArrayBuffer> {
   part.name = 'Part';
   part.userData = { realvirtual: { Group: { GroupName: 'G' } } };
   oldParent.add(part);
+  if (withTip) {
+    // A node INSIDE the moved subtree (plan-610 Phase 5c).
+    const tip = new Mesh(new BoxGeometry(0.2, 0.2, 0.2), new MeshBasicMaterial());
+    tip.name = 'Tip';
+    tip.position.set(0, 1, 0);
+    part.add(tip);
+  }
 
   const instrNode = new Object3D();
   instrNode.name = 'Instruction';
@@ -94,6 +101,42 @@ describe('GLB round-trip: instruction target on a kinematic-group member', () =>
     const targets = instrs[0].instance.stepTargetPaths(0);
     expect(targets).toEqual(['OldParent/Part']);
     expect(registry.getNode(targets[0])).toBe(part);
+  });
+});
+
+/**
+ * plan-610 Phase 5c: a path INTO the moved subtree (`OldParent/Part/Tip`) resolves
+ * through the re-parent PREFIX alias of the asset alias table — exactly, as stage
+ * `alias`, not through the name fallback.
+ */
+describe('GLB round-trip: path into a re-parented subtree (plan-610 Phase 5c)', () => {
+  it('resolves the authored child path through the prefix alias', async () => {
+    const data = await buildGLB(true);
+    const scene = new Scene();
+    const result = await loadGLB('kinematic-instruction-ref.glb', scene, {
+      data,
+      bakeRegistry: new BakeRegistry(),
+      bakePickPort: createPickBuildPort({ createWorker: () => null }),
+      bakeClaims: [{ path: 'OldParent/Part', role: 'chunk' }, { path: 'OldParent/Part/Tip', role: 'chunk' }],
+    });
+    const registry = result.registry;
+    const alias = result.bakedAsset!.aliases.find((a) => a.path.replace(/^\//, '') === 'OldParent/Part');
+    expect(alias?.subtree).toBe(true);
+
+    let tip: Object3D | null = null;
+    result.root.traverse((n) => { if (n.name === 'Tip') tip = n; });
+    expect(tip).not.toBeNull();
+    const tipPath = registry.getPathForNode(tip as unknown as Object3D)!;
+    expect(tipPath.endsWith('Kine/Part/Tip')).toBe(true);
+    // The asset alias table is registered under the instance root's path.
+    const rootPrefix = tipPath.slice(0, tipPath.length - 'Kine/Part/Tip'.length);
+    expect(registry.prefixAliasCount()).toBeGreaterThan(0);
+    expect(registry.getNode(`${rootPrefix}OldParent/Part/Tip`)).toBe(tip);
+    const staged = registry.resolveWithStage(
+      { path: `${rootPrefix}OldParent/Part/Tip`, componentType: 'UnityEngine.Transform' }, 'UnityEngine.Transform', null,
+    );
+    expect(staged?.node).toBe(tip);
+    expect(staged?.stage).toBe('alias');
   });
 });
 

@@ -85,8 +85,10 @@ import {
   clearSceneSyncNotices,
   onSceneSyncEvent,
   STALE_DRAFT_NOTICE_ID,
+  DRAFT_RESTORED_NOTICE_ID,
   type SceneSyncNotice,
 } from '../src/core/hmi/scene/rv-scene-live-sync';
+import { plannerDocumentView } from '../src/core/hmi/scene/scene-document-view';
 import type { RvScenePrimitiveOp } from '../src/core/ops/rv-unified-ops';
 import type { RvDocumentEntry } from '../src/core/project/rv-project-types';
 import {
@@ -659,5 +661,105 @@ describe('plan-546 — discard() drops draft/<documentId> (AC 6)', () => {
     expect(readSceneGlbPointer(DRAFT)).toBeNull();
     expect(lastLoadWas()).toBe('file');
     expect(viewer.loaded[viewer.loaded.length - 1].base).toMatchObject({ url: projectAssetUrl(BELT_PATH) });
+  });
+});
+
+// ─── A resumed draft is unsaved work (field finding 2026-10-25) ─────────
+
+describe('a document resumed from its draft slot is draft-backed', () => {
+  /** "Discard changes" as the active-document card offers it. */
+  function discardVerb() {
+    const view = plannerDocumentView(store, store.getSnapshot(), getProjectStore().getBackend());
+    return view?.actions.menu?.find((v) => v.id === 'discard');
+  }
+
+  function setReadOnly(): void {
+    (project.backend as unknown as { writable: boolean }).writable = false;
+  }
+
+  it('matching baseSha: resumes the draft, dirty + discard enabled, discard drops the slot and reloads the file', async () => {
+    const fileRev = (await revisionOfFile(project, BELT_PATH)) ?? undefined;
+    await seedDraft(DRAFT, 'mine', { baseSha: fileRev });
+
+    await store.openDocument(BELT_ID);
+
+    expect(lastLoadWas()).toBe('draft');
+    const snap = store.getSnapshot();
+    expect(snap.draftBacked).toBe(true);
+    // The op log is empty — the edits are baked into the resumed body.
+    expect(store.document.dirty).toBe(false);
+    expect(snap.dirty).toBe(true);
+    expect(discardVerb()?.disabled).toBe(false);
+
+    await discardVerb()!.run();
+
+    expect(readSceneGlbPointer(DRAFT)).toBeNull();
+    expect(lastLoadWas()).toBe('file');
+    expect(store.getSnapshot().draftBacked).toBe(false);
+    expect(store.getSnapshot().dirty).toBe(false);
+    expect(discardVerb()?.disabled).toBe(true);
+  });
+
+  it('a plain open without a draft is not draft-backed', async () => {
+    await store.openDocument(BELT_ID);
+    expect(lastLoadWas()).toBe('file');
+    expect(store.getSnapshot().draftBacked).toBe(false);
+    expect(store.getSnapshot().dirty).toBe(false);
+  });
+
+  it('a stale draft is still set aside, the file loads clean (behaviour unchanged)', async () => {
+    await seedDraft(DRAFT, 'old', { baseSha: 'feedface' });
+    await store.openDocument(BELT_ID);
+    expect(lastLoadWas()).toBe('file');
+    expect(setAside()).toHaveLength(1);
+    expect(store.getSnapshot().draftBacked).toBe(false);
+    expect(notices.get(DRAFT_RESTORED_NOTICE_ID)).toBeUndefined();
+  });
+
+  it('read-only backend: the notice is shown, and its Discard drops the draft and clears it', async () => {
+    const fileRev = (await revisionOfFile(project, BELT_PATH)) ?? undefined;
+    await seedDraft(DRAFT, 'mine', { baseSha: fileRev });
+    setReadOnly();
+
+    await store.openDocument(BELT_ID);
+
+    const notice = notices.get(DRAFT_RESTORED_NOTICE_ID);
+    expect(notice).toMatchObject({ kind: 'draft-restored', documentId: BELT_ID });
+    expect(notice?.message).toContain('local changes that are not in the file');
+
+    await store.discardRestoredDraft(BELT_ID);
+
+    expect(readSceneGlbPointer(DRAFT)).toBeNull();
+    expect(lastLoadWas()).toBe('file');
+    expect(notices.get(DRAFT_RESTORED_NOTICE_ID)).toBeUndefined();
+    expect(store.getSnapshot().dirty).toBe(false);
+  });
+
+  it('writable backend: no notice — the card says "Unsaved" — and a save clears the flag', async () => {
+    const fileRev = (await revisionOfFile(project, BELT_PATH)) ?? undefined;
+    await seedDraft(DRAFT, 'mine', { baseSha: fileRev });
+
+    await store.openDocument(BELT_ID);
+    expect(notices.get(DRAFT_RESTORED_NOTICE_ID)).toBeUndefined();
+    expect(store.getSnapshot().dirty).toBe(true);
+
+    expect(await store.save()).toBe('saved');
+    expect(store.getSnapshot().draftBacked).toBe(false);
+    expect(store.getSnapshot().dirty).toBe(false);
+  });
+
+  it('opening another document clears the flag and the notice', async () => {
+    const fileRev = (await revisionOfFile(project, BELT_PATH)) ?? undefined;
+    await seedDraft(DRAFT, 'mine', { baseSha: fileRev });
+    setReadOnly();
+    await store.openDocument(BELT_ID);
+    expect(notices.get(DRAFT_RESTORED_NOTICE_ID)).toBeDefined();
+
+    await store.openDocument(GEAR_ID);
+
+    expect(store.getSnapshot().draftBacked).toBe(false);
+    expect(notices.get(DRAFT_RESTORED_NOTICE_ID)).toBeUndefined();
+    // The draft itself is untouched — only Discard drops it.
+    expect(readSceneGlbPointer(DRAFT)).not.toBeNull();
   });
 });

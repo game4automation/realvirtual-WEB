@@ -85,7 +85,8 @@ function buildCatalog(tree) {
       name: stem.replace(/[_-]+/g, ' ').trim(),
       category: 'custom',
       glbUrl: rawUrl,
-      thumbnailUrl: '',
+      // No picture field (plan-776 F11): a GitHub catalog ships no saved
+      // previews, and an empty `thumbnailUrl` said nothing the absence does not.
       _path: n.path,
       ...(parent ? { collections: [parent] } : {}),
     };

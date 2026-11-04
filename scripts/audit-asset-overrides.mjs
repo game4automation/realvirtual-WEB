@@ -32,6 +32,12 @@
  * Default roots: the four private project folders (wmyb, mauser3dhmi, Toray,
  * Development) and `public/`. A missing private root is reported, not fatal.
  *
+ * plan-769 (F13/F14): the viewer writes `byAddress` (`#<id>` → patch) only. It still
+ * READS `byNodeId` (as `#<id>`) and `byPath` (migrated to its address when it
+ * resolves); `trsByNodeId` is no longer applied — a load reports it
+ * (`override-transforms-dropped`) and the next save drops it. So the old columns
+ * below are what is left to migrate, and `byAddress` is what is already migrated.
+ *
  * Exit codes: 0 = audit printed · 2 = no GLB found at all.
  */
 
@@ -116,6 +122,7 @@ function auditGlb(file) {
     trsByNodeId: 0,
     trsByNodeIdNoComponent: 0,
     byPath: 0,
+    byAddress: 0,
     componentTypes: new Map(),
   };
   for (const node of nodes) {
@@ -127,14 +134,17 @@ function auditGlb(file) {
     const byNodeId = isObj(ov.byNodeId) ? ov.byNodeId : {};
     const trsByNodeId = isObj(ov.trsByNodeId) ? ov.trsByNodeId : {};
     const byPath = isObj(ov.byPath) ? ov.byPath : {};
+    const byAddress = isObj(ov.byAddress) ? ov.byAddress : {};
     const nId = Object.keys(byNodeId).length;
     const nTrs = Object.keys(trsByNodeId).length;
     const nPath = Object.keys(byPath).length;
-    if (nId + nTrs + nPath > 0) row.placementsWithOverrides++;
+    const nAddr = Object.keys(byAddress).length;
+    if (nId + nTrs + nPath + nAddr > 0) row.placementsWithOverrides++;
     row.byNodeId += nId;
     row.trsByNodeId += nTrs;
     row.byPath += nPath;
-    for (const patch of Object.values(byNodeId)) {
+    row.byAddress += nAddr;
+    for (const patch of [...Object.values(byNodeId), ...Object.values(byAddress)]) {
       const types = isObj(patch) ? Object.keys(patch) : [];
       const componentTypes = types.filter((t) => COMPONENT_TYPES.has(t));
       if (componentTypes.length === 0) row.byNodeIdNoComponent++;
@@ -181,7 +191,8 @@ const total = rows.reduce((acc, r) => ({
   trsByNodeId: acc.trsByNodeId + r.trsByNodeId,
   trsByNodeIdNoComponent: acc.trsByNodeIdNoComponent + r.trsByNodeIdNoComponent,
   byPath: acc.byPath + r.byPath,
-}), { placements: 0, placementsWithOverrides: 0, byNodeId: 0, byNodeIdNoComponent: 0, byNodeIdFields: 0, trsByNodeId: 0, trsByNodeIdNoComponent: 0, byPath: 0 });
+  byAddress: acc.byAddress + r.byAddress,
+}), { placements: 0, placementsWithOverrides: 0, byNodeId: 0, byNodeIdNoComponent: 0, byNodeIdFields: 0, trsByNodeId: 0, trsByNodeIdNoComponent: 0, byPath: 0, byAddress: 0 });
 
 const typeTotals = new Map();
 for (const r of rows) for (const [t, n] of r.componentTypes) typeTotals.set(t, (typeTotals.get(t) ?? 0) + n);
@@ -204,15 +215,15 @@ out.push('');
 out.push(`GLBs scanned: ${glbCount} · scenes (with AssetReference): ${rows.length} · assets/other: ${nonSceneCount} · unreadable: ${errors.length}`);
 if (missingRoots.length > 0) out.push(`Missing roots: ${missingRoots.map(rel).join(', ')}`);
 out.push('');
-out.push(row(['scene', 'placements', 'with overrides', 'byNodeId', 'byNodeId no-component', 'byNodeId fields', 'trsByNodeId', 'trsByNodeId no byNodeId', 'byPath']));
-out.push(row(Array(9).fill('---')));
+out.push(row(['scene', 'placements', 'with overrides', 'byNodeId', 'byNodeId no-component', 'byNodeId fields', 'trsByNodeId', 'trsByNodeId no byNodeId', 'byPath', 'byAddress']));
+out.push(row(Array(10).fill('---')));
 for (const r of rows) {
-  out.push(row([rel(r.file), r.placements, r.placementsWithOverrides, r.byNodeId, r.byNodeIdNoComponent, r.byNodeIdFields, r.trsByNodeId, r.trsByNodeIdNoComponent, r.byPath]));
+  out.push(row([rel(r.file), r.placements, r.placementsWithOverrides, r.byNodeId, r.byNodeIdNoComponent, r.byNodeIdFields, r.trsByNodeId, r.trsByNodeIdNoComponent, r.byPath, r.byAddress]));
 }
-out.push(row(['**total**', total.placements, total.placementsWithOverrides, total.byNodeId, total.byNodeIdNoComponent, total.byNodeIdFields, total.trsByNodeId, total.trsByNodeIdNoComponent, total.byPath]));
+out.push(row(['**total**', total.placements, total.placementsWithOverrides, total.byNodeId, total.byNodeIdNoComponent, total.byNodeIdFields, total.trsByNodeId, total.trsByNodeIdNoComponent, total.byPath, total.byAddress]));
 out.push('');
 if (typeTotals.size > 0) {
-  out.push('Component types patched via byNodeId: ' + [...typeTotals].sort((a, b) => b[1] - a[1]).map(([t, n]) => `${t}×${n}${COMPONENT_TYPES.has(t) ? '' : ' (not a component)'}`).join(', '));
+  out.push('Component types patched via byNodeId / byAddress: ' + [...typeTotals].sort((a, b) => b[1] - a[1]).map(([t, n]) => `${t}×${n}${COMPONENT_TYPES.has(t) ? '' : ' (not a component)'}`).join(', '));
   out.push('');
 }
 for (const e of errors) out.push(`- unreadable: ${rel(e.file)} — ${e.error}`);

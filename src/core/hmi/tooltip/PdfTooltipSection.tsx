@@ -31,14 +31,22 @@ export interface PdfTooltipData extends TooltipData {
   nodePath: string;
 }
 
+/**
+ * The links this section shows: everything except the AAS-generated ones —
+ * the AAS tooltip lists those itself, grouped by document kind (plan-682).
+ */
+export function ownPdfLinks(links: readonly PdfLink[] | undefined): PdfLink[] {
+  return (links ?? []).filter(l => !(l as PdfLink & { aasGenerated?: string }).aasGenerated);
+}
+
 // ─── Content Provider ──────────────────────────────────────────────────
 
 export function PdfTooltipSection({ data, isPinned }: TooltipContentProps<PdfTooltipData>) {
   const viewer = useViewer();
   const node = viewer.registry?.getNode(data.nodePath);
-  const pdfLinks = node?.userData?._rvPdfLinks as PdfLink[] | undefined;
+  const pdfLinks = ownPdfLinks(node?.userData?._rvPdfLinks as PdfLink[] | undefined);
 
-  if (!pdfLinks || pdfLinks.length === 0) return null;
+  if (pdfLinks.length === 0) return null;
 
   // Hover mode: compact one-line summary
   if (!isPinned) {
@@ -100,8 +108,7 @@ tooltipRegistry.register({
 
 // Data resolver: check for _rvPdfLinks on the node
 tooltipRegistry.registerDataResolver('pdf', (node, viewer) => {
-  const pdfLinks = node.userData?._rvPdfLinks as PdfLink[] | undefined;
-  if (!pdfLinks || pdfLinks.length === 0) return null;
+  if (ownPdfLinks(node.userData?._rvPdfLinks as PdfLink[] | undefined).length === 0) return null;
   const path = viewer.registry?.getPathForNode(node) ?? '';
   return { type: 'pdf', nodePath: path };
 });

@@ -27,6 +27,8 @@ import type { RVViewerPlugin } from '../rv-plugin';
 import type { RVViewer } from '../rv-viewer';
 import type { UISlotEntry } from '../rv-ui-plugin';
 import { SharedGlbInfoCard } from './SharedGlbInfoCard';
+import { useViewportInsets } from '../../hooks/use-viewport-insets';
+import { useMobileLayout } from '../../hooks/use-mobile-layout';
 import {
   subscribeSharedGlb,
   getSharedGlbSnapshot,
@@ -70,8 +72,22 @@ export function setSharedBookmarkHost(host: BookmarkCatalogHost | null): () => v
   return () => { bookmarkHost = previous; };
 }
 
+/**
+ * Slot entry: reads the HMI layout (viewport insets, compact layout) and hands
+ * it to the host, so the card clears the activity bar, docked windows and the
+ * mobile dock. Kept apart from the host because those hooks need a viewer
+ * context, and the host is rendered without one in tests.
+ */
+export function SharedGlbInfoCardSlot() {
+  const insets = useViewportInsets();
+  const compact = useMobileLayout();
+  return <SharedGlbInfoCardHost viewportLeft={insets.left} compact={compact} />;
+}
+
 /** Slot host: reads the store and renders nothing at all when there is no share. */
-export function SharedGlbInfoCardHost() {
+export function SharedGlbInfoCardHost(
+  { viewportLeft, compact }: { viewportLeft?: number; compact?: boolean } = {},
+) {
   const snap = useSyncExternalStore(subscribeSharedGlb, getSharedGlbSnapshot, getSharedGlbSnapshot);
   const bookmarks = useSyncExternalStore(subscribeSharedBookmarks, bookmarkVersion, bookmarkVersion);
   const [escalating, setEscalating] = useState(false);
@@ -127,6 +143,8 @@ export function SharedGlbInfoCardHost() {
       // list changes; the value itself is a revision counter.
       bookmarked={snap.info && followUps ? hasSharedAssetBookmark(snap.info.url) && bookmarks >= 0 : false}
       onDismiss={clearSharedGlb}
+      viewportLeft={viewportLeft}
+      compact={compact}
     />
   );
 }
@@ -154,7 +172,7 @@ export class SharePlugin implements RVViewerPlugin {
     // No `modes` and no visibility rule: a visitor must be able to see where a
     // foreign model came from in every mode he can reach, including after an
     // escalation into the full app.
-    { slot: 'overlay', component: SharedGlbInfoCardHost, order: 95 },
+    { slot: 'overlay', component: SharedGlbInfoCardSlot, order: 95 },
   ];
 }
 

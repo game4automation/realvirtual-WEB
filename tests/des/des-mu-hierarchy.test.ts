@@ -1,21 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { testAddressRegistry } from '../helpers/test-address-registry';
+
+import { muRecords, reservations } from './snapshot-test-utils';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Object3D } from 'three';
 import { RVMovingUnit } from '../../src/core/engine/rv-mu';
-import { DESManager } from '@rv-private/plugins/des/rv-des-manager';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
+import { DESManager } from '@rv/plugins/des/rv-des-manager';
+import { DESRunner } from '@rv/plugins/des/des-runner';
 import {
   freeCarrierSlots,
   loadMUOnCarrier,
   topmostPickable,
-} from '@rv-private/plugins/des/rv-des-component';
-import { createDESMU, resetDESMUCounter, type DESMU } from '@rv-private/plugins/des/rv-des-mu';
-import { migrateSnapshotToV3, type DESSnapshot } from '@rv-private/plugins/des/rv-des-snapshot';
-import { MaterialFlowAdapter } from '@rv-private/plugins/des/material-flow-adapter';
-import { PalletSource } from '@rv-private/plugins/des/material-flow/PalletSource';
-import { _resetDesHookCache } from '@rv-private/plugins/des/des-hook-adapter';
+} from '@rv/plugins/des/rv-des-component';
+import { createDESMU, resetDESMUCounter, type DESMU } from '@rv/plugins/des/rv-des-mu';
+
+import { MaterialFlowAdapter } from '@rv/plugins/des/material-flow-adapter';
+import { PalletSource } from '@rv/plugins/des/material-flow/PalletSource';
+import { _resetDesHookCache } from '@rv/plugins/des/des-hook-adapter';
 import {
   createSelf,
   type MaterialFlowSelf,
@@ -36,7 +39,7 @@ import { EventEmitter } from '../../src/core/rv-events';
 import { ContextMenuStore } from '../../src/core/hmi/context-menu-store';
 
 function makeMU(manager: DESManager, carrierType: string, capacity?: number): DESMU {
-  const mu = createDESMU(manager.currentTime);
+  const mu = createDESMU(manager.currentTime, null, manager);
   manager.registerMU(mu);
   mu.carrierType = carrierType;
   mu.carrierCapacity = capacity;
@@ -62,7 +65,7 @@ function bindContext(root: Object3D): RVBindContext {
     on: (event, callback) => events.on(event, callback as never),
     contextMenu: new ContextMenuStore(),
     drives: [] as never,
-    registry: null,
+    registry: null, desAddresses: testAddressRegistry(),
     getPlugin: () => undefined,
   };
   const accum: KinematicsSpec = {};
@@ -93,7 +96,7 @@ function bindStation(runner: DESRunner, type: string): Bound {
     reserveDownstream: (n, port, carrier) => adapter.reserveDownstream(n, port, carrier),
     reservation: (id) => adapter.reservation(id),
   });
-  adapter = runner.addInstance(def, self, node);
+  adapter = runner.addInstance(def, self, node, undefined, { desId: node.name + '@' + def.type });
   return { def, self, adapter };
 }
 
@@ -110,24 +113,6 @@ function reservationLine(): { runner: DESRunner; a: Bound; b: Bound; target: Bou
   b.adapter.reconfigureCapacity(10);
   target.adapter.reconfigureCapacity(10);
   return { runner, a, b, target };
-}
-
-function bareFixture(version: 1 | 2): DESSnapshot {
-  const runner = new DESRunner();
-  const mu = runner.createMU();
-  const snapshot = runner.fullSnapshot();
-  snapshot.version = version;
-  const legacy = snapshot.mus[0] as unknown as Record<string, unknown>;
-  delete legacy.generation;
-  delete legacy.childMUs;
-  delete legacy.parentMU;
-  delete legacy.visualTemplateId;
-  delete snapshot.muGenerationCounters;
-  if (version === 1) delete snapshot.scriptStates;
-  delete snapshot.reservations;
-  delete snapshot.nextReservationId;
-  expect(mu.id).toBe(0);
-  return snapshot;
 }
 
 beforeEach(() => {
@@ -183,6 +168,7 @@ describe('DESMU hierarchy', () => {
 
   it('MuRef(id,gen): reuse never resurrects stale refs (same-run AND after snapshot restore)', () => {
     const runner = new DESRunner();
+    runner.start([], { root: new Object3D() });
     const manager = runner.getManager();
     const parent = runner.createMU(); parent.carrierType = 'pallet';
     const first = runner.createMU();
@@ -194,6 +180,8 @@ describe('DESMU hierarchy', () => {
     expect(replacement.generation).toBe(stale.gen + 1);
     parent.childMUs.push(stale);
     expect(topmostPickable(parent, manager)).not.toBe(replacement);
+    expect(() => runner.fullSnapshot()).toThrow('des-snapshot-contract');
+    parent.childMUs = []; // Invalid stale references cannot enter a v4 envelope.
 
     const snapshot = runner.fullSnapshot();
     runner.restoreFull(snapshot);
@@ -231,6 +219,7 @@ describe('DESMU hierarchy', () => {
 
   it('generation counters are persisted: no repeated generations after restore', () => {
     const runner = new DESRunner();
+    runner.start([], { root: new Object3D() });
     const manager = runner.getManager();
     const first = runner.createMU();
     manager.retireMU(first);
@@ -256,9 +245,10 @@ describe('DESMU hierarchy', () => {
     warn.mockRestore();
   });
 
-  it('snapshot v3 round-trip: hierarchy + per-template visuals (two real templates, nested headless child materializes when uncovered)', () => {
+  it('snapshot v4 round-trip: hierarchy + per-template visuals (two real templates, nested headless child materializes when uncovered)', () => {
     const disposed = { pallet: 0, part: 0 };
     const runner = new DESRunner({ subMode: 'fastforward' });
+    runner.start([], { root: new Object3D() });
     runner.registerMuVisualFactory('pallet-template', () => visual('pallet-template'), () => { disposed.pallet++; });
     runner.registerMuVisualFactory('part-template', () => visual('part-template'), () => { disposed.part++; });
     const pallet = runner.createMU('pallet-template'); pallet.carrierCapacity = 2;
@@ -267,7 +257,7 @@ describe('DESMU hierarchy', () => {
     loadMUOnCarrier(pallet, buried, runner.getManager());
     loadMUOnCarrier(pallet, top, runner.getManager());
     const snapshot = runner.fullSnapshot();
-    expect(snapshot.version).toBe(3);
+    expect(snapshot.version).toBe(4);
     runner.restoreFull(snapshot);
     runner.setSubMode('animated');
     const restoredPallet = runner.getManager().getMU(pallet.id) as DESMU;
@@ -299,16 +289,12 @@ describe('DESMU hierarchy', () => {
     warn.mockRestore();
   });
 
-  it('migrates v1 and v2 fixtures to v3', () => {
-    for (const version of [1, 2] as const) {
-      const migrated = migrateSnapshotToV3(bareFixture(version));
-      expect(migrated.version).toBe(3);
-      expect(migrated.mus[0]).toMatchObject({ generation: 0, childMUs: [], parentMU: null });
-      expect(migrated.muGenerationCounters?.[0]).toBe(0);
-      expect(migrated.reservations).toEqual([]);
-      const runner = new DESRunner();
-      expect(() => runner.restoreFull(migrated)).not.toThrow();
-    }
+  it.each([1, 2, 3])('refuses legacy v%s without changing MU state', version => {
+    const { runner } = reservationLine();
+    runner.createMU();
+    const before = runner.snapshotJson();
+    expect(() => runner.restoreFull({ version })).toThrow('des-snapshot-legacy');
+    expect(runner.snapshotJson()).toBe(before);
   });
 
   it('PalletSource generates configured grid from templateRefs; reset and restore reproduce it', () => {
@@ -334,10 +320,10 @@ describe('DESMU hierarchy', () => {
       BlisterCount: 2, PartsPerBlister: 3, CarrierCapacity: 3,
       GridRows: 2, GridColumns: 2, GridPitch: 100,
     });
-    adapter = runner.addInstance(palletDef, self, node);
+    adapter = runner.addInstance(palletDef, self, node, undefined, { desId: node.name + '@' + palletDef.type });
     runner.start([palletDef], { root: node });
     const snapshot = runner.fullSnapshot();
-    expect(snapshot.mus).toHaveLength(9);
+    expect(muRecords(snapshot)).toHaveLength(9);
     const pallet = runner.getManager().getMU(0) as DESMU;
     expect(pallet.childMUs).toHaveLength(2);
     const firstBlister = runner.getManager().getMUByRef(pallet.childMUs[0]) as DESMU;
@@ -347,8 +333,8 @@ describe('DESMU hierarchy', () => {
     expect(secondBlister.prop.gridPosition).toEqual([0.1, 0, 0]);
 
     runner.reset();
-    expect(runner.fullSnapshot().mus).toHaveLength(9);
+    expect(muRecords(runner.fullSnapshot())).toHaveLength(9);
     runner.restoreFull(snapshot);
-    expect(runner.fullSnapshot().mus).toEqual(snapshot.mus);
+    expect(muRecords(runner.fullSnapshot())).toEqual(muRecords(snapshot));
   });
 });

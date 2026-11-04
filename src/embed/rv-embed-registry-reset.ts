@@ -2,21 +2,19 @@
 // Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 
 import { ikSolverRegistry } from '../core/engine/rv-ik-solver';
-import { defaultPathNetwork } from '../core/engine/rv-path-network';
 import { physicsRegistry } from '../core/engine/rv-physics-registry';
-import { defaultSpacingController } from '../core/engine/rv-spacing-controller';
 import { resetSlotAuthority } from '../core/engine/rv-slot-authority';
-import { defaultZoneRegistry } from '../core/engine/rv-zone-registry';
+import { resetTrafficRegistries } from '../core/engine/rv-traffic-registries';
 
 /**
  * Reset model-scoped state held by engine singletons between sequential embed
- * instances. Provider-independent registries are emptied; the IK provider is
- * retained while its per-model live-solve claims are released.
+ * instances. The AGV traffic registries go through the SAME reset point as the
+ * main viewer's `clearModel()` (plan-647 D1); physics and the slot authority
+ * are emptied; the IK provider is retained while its per-model live-solve
+ * claims are released.
  */
 export function resetEmbedEngineRegistries(): void {
-  defaultPathNetwork.clear();
-  defaultZoneRegistry.clear();
-  defaultSpacingController.clear();
+  resetTrafficRegistries();
   physicsRegistry.clear();
   ikSolverRegistry.resetLiveSolveClaims();
   resetSlotAuthority();

@@ -33,6 +33,10 @@ import {
   SR,
 } from '@rv-private/plc/rv-plc-fbs';
 
+import { compileSt } from '@rv-private/plc/st-compiler';
+import { RVPlcRunner } from '@rv-private/plc/rv-plc-runner';
+import { SignalStore } from '../src/core/engine/rv-signal-store';
+
 const DT = 1 / 60;
 
 // ─── TON (on-delay) ─────────────────────────────────────────────────────────
@@ -405,4 +409,131 @@ describe('createFbInstance factory', () => {
   it('throws on unknown FB types (load-time error)', () => {
     expect(() => createFbInstance('FOO', new PlcClock())).toThrow(/unknown function block/i);
   });
+});
+
+
+describe('FB declaration start values (plan-2218 section 9.2)', () => {
+  it('seeds inputs without evaluating and resets to start values', () => {
+    const clock = new PlcClock();
+    const ton = new TON(clock);
+    ton.setInitialInputs({ IN: true, PT: 2000 });
+    clock.setScanTime(10);
+    expect(ton.outputs()).toEqual({ Q: false, ET: 0 });
+    ton.call({}); // timing starts here, not at initialization
+    expect(ton.Q).toBe(false);
+    clock.setScanTime(11.999);
+    ton.call({});
+    expect(ton.Q).toBe(false);
+    clock.setScanTime(12);
+    ton.call({});
+    expect(ton.Q).toBe(true);
+    ton.call({ PT: 5000 });
+    const snapshot = ton.inputs();
+    snapshot.PT = 99;
+    expect(ton.inputs().PT).toBe(5000);
+    ton.reset();
+    expect(ton.inputs()).toEqual({ IN: true, PT: 2000 });
+    expect(ton.outputs()).toEqual({ Q: false, ET: 0 });
+    ton.call({});
+    expect(ton.Q).toBe(false);
+  });
+
+  it('uses CTU PV start values for three edges and restores them on reset', () => {
+    const cnt = new CTU();
+    cnt.setInitialInputs({ PV: 3 });
+    for (let edge = 1; edge <= 3; edge++) {
+      cnt.call({ CU: true });
+      expect(cnt.Q).toBe(edge === 3);
+      cnt.call({ CU: false });
+    }
+    cnt.call({ PV: 9 });
+    cnt.reset();
+    expect(cnt.inputs().PV).toBe(3);
+    expect(cnt.CV).toBe(0);
+    expect(cnt.Q).toBe(false);
+  });
+
+  it.each(['Unknown := 1', 'Q := TRUE', 'PT := TRUE'])(
+    'rejects invalid TON initializer %s with a source location', (init) => {
+      const result = compileSt(`PROGRAM Main
+VAR tDelay : TON := (${init}); END_VAR
+END_PROGRAM`);
+      expect(result.program).toBeFalsy();
+      expect(result.diagnostics.some((d) => d.severity === 'error' && d.line > 0)).toBe(true);
+    },
+  );
+
+  it('keeps Watch and guest members current before calls, after calls, and after reset', async () => {
+    const store = new SignalStore();
+    store.register('Change', 'PLC/Change', false);
+    const runner = new RVPlcRunner(store);
+    try {
+      const diagnostics = await runner.deploy(`PROGRAM Main
+VAR_EXTERNAL Change : BOOL; Before : TIME; After : TIME; END_VAR
+VAR tDelay : TON := (PT := T#2s); END_VAR
+Before := tDelay.PT;
+IF Change THEN tDelay(IN := TRUE, PT := T#5s);
+ELSE tDelay(IN := TRUE); END_IF;
+After := tDelay.PT;
+END_PROGRAM`);
+      expect(diagnostics.filter((d) => d.severity === 'error')).toEqual([]);
+      expect(runner.watch().get('tDelay.PT')).toBe(2000);
+      expect(runner.watch().get('tDelay.Q')).toBe(false);
+      runner.step();
+      expect(store.getFloat('Before')).toBe(2000);
+      expect(store.getFloat('After')).toBe(2000);
+      store.set('Change', true);
+      runner.step();
+      expect(store.getFloat('Before')).toBe(2000);
+      expect(store.getFloat('After')).toBe(5000);
+      expect(runner.watch().get('tDelay.PT')).toBe(5000);
+      expect(runner.watch().get('tDelay.IN')).toBe(true);
+      store.set('Change', false);
+      runner.step();
+      expect(store.getFloat('Before')).toBe(5000);
+      expect(store.getFloat('After')).toBe(5000);
+      expect(runner.watch().get('tDelay.PT')).toBe(5000);
+      await runner.reset();
+      expect(runner.watch().get('tDelay.PT')).toBe(2000);
+      runner.step();
+      expect(store.getFloat('Before')).toBe(2000);
+      expect(store.getFloat('After')).toBe(2000);
+      await runner.run();
+      runner.tick(1.999);
+      expect(runner.watch().get('tDelay.Q')).toBe(false);
+      runner.tick(0.002);
+      expect(runner.watch().get('tDelay.Q')).toBe(true);
+    } finally {
+      runner.dispose();
+    }
+  });
+});
+
+
+it('runs a declared CTU PV initializer without passing PV at calls', async () => {
+  const store = new SignalStore();
+  store.register('Pulse', 'PLC/Pulse', false);
+  const runner = new RVPlcRunner(store);
+  try {
+    const diagnostics = await runner.deploy(`PROGRAM Main
+VAR_EXTERNAL Pulse : BOOL; Done : BOOL; END_VAR
+VAR cnt : CTU := (PV := 3); END_VAR
+cnt(CU := Pulse);
+Done := cnt.Q;
+END_PROGRAM`);
+    expect(diagnostics.filter((d) => d.severity === 'error')).toEqual([]);
+    for (let edge = 1; edge <= 3; edge++) {
+      store.set('Pulse', true);
+      runner.step();
+      expect(store.getBool('Done')).toBe(edge === 3);
+      store.set('Pulse', false);
+      runner.step();
+    }
+    await runner.reset();
+    expect(runner.watch().get('cnt.PV')).toBe(3);
+    expect(runner.watch().get('cnt.CV')).toBe(0);
+    expect(runner.watch().get('cnt.Q')).toBe(false);
+  } finally {
+    runner.dispose();
+  }
 });

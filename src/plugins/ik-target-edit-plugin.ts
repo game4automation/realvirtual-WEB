@@ -46,8 +46,10 @@ import type { Object3D, Material } from 'three';
 import type { RVViewerPlugin } from '../core/rv-plugin';
 import type { RVViewer } from '../core/rv-viewer';
 import type { SelectionSnapshot } from '../core/engine/rv-selection-manager';
-import { ikSolverRegistry, targetPoseInBase, type OpwParams, type CobotSolveOpts, type IKSolution } from '../core/engine/rv-ik-solver';
-import { reachableSolutions, closestSolutionIndex } from '../core/engine/rv-ik-solution-utils';
+import { ikSolverRegistry, solveFrameFor, targetPoseInBase, type OpwParams, type CobotSolveOpts, type IKSolution } from '../core/engine/rv-ik-solver';
+import { reachableSolutions, closestSolutionIndex, solutionsWithinLimits } from '../core/engine/rv-ik-solution-utils';
+import { limitRespectingAxisPosition } from '../core/engine/rv-axis-angle-utils';
+import { writeLiveAxisPos, reportTargetReplayAngles } from '../core/engine/rv-ik-authoring';
 import { HIGHLIGHT_OVERLAY_LAYER } from '../core/engine/rv-group-registry';
 import { ensureMovableTransform, applyLocalPose } from '../core/engine/rv-node-transform';
 import { claimAxes, releaseAxes, AxisOwnershipError } from '../core/engine/rv-axis-ownership';
@@ -56,8 +58,10 @@ import type { RVRobotIK } from '../core/engine/rv-robot-ik';
 import type { RVDrive } from '../core/engine/rv-drive';
 import type { RVIKTarget } from '../core/engine/rv-ik-target';
 import { isRef, type RVIKPath } from '../core/engine/rv-ik-path';
+import { storedReferenceValue } from '../core/engine/rv-node-path-rewrite.mjs';
 import type { ComponentRef } from '../core/engine/rv-node-registry';
 import { assetRelativePath } from '../core/engine/rv-reference-resolver';
+import { authoredAssetRelativePath } from '../core/hmi/rv-reference-field';
 import { ikEditStore, type IKEditController, type IKEditValues, type IKEditActive, type PoseField } from '../core/hmi/ik-edit-store';
 import { popoverStore } from '../core/hmi/popover-store';
 import { persistFieldOp } from '../core/hmi/scene/scene-field-ops';
@@ -281,6 +285,7 @@ export class IKTargetEditPlugin implements RVViewerPlugin {
   private readonly _onPointerDown = (e: PointerEvent): void => {
     const viewer = this.viewer;
     if (!viewer || e.button !== 0 || !this.withinCanvas(e)) return;
+    if (viewer.pointerPickBlocked) return; // plan-2215: no screen pick under a render strategy
     // Clicks on the floating popover must not reach the plugin. The popover's own
     // stopPropagation can't help: this listener is capture-phase (runs first).
     if ((e.target as HTMLElement | null)?.closest?.('[data-rv-popover]')) return;
@@ -358,6 +363,8 @@ export class IKTargetEditPlugin implements RVViewerPlugin {
   private readonly _onPointerMove = (e: PointerEvent): void => {
     const viewer = this.viewer;
     if (!viewer) return;
+    // plan-2215: under a render strategy the pose freezes (no ray from the mono camera).
+    if (viewer.pointerPickBlocked) return;
     if (!this.drag) {
       // Sticky model: never show/hide on hover (arrows reach beyond the point).
       // Hint via cursor + handle highlight: 'move' over translate handles, the
@@ -475,15 +482,40 @@ export class IKTargetEditPlugin implements RVViewerPlugin {
     prevPos: [number, number, number],
     prevQuat: [number, number, number, number],
   ): void {
+    this.commitMovedPose(c, prevPos, prevQuat);
+  }
+
+  /**
+   * The pose and the joint angles move TOGETHER or not at all (plan-773 Phase 4).
+   *
+   * A drag into an UNREACHABLE pose used to persist the transform and keep the
+   * AxisPos of the pose before it: the waypoint then looked fine and drove
+   * somewhere else — a drift nobody can see. It is now emptied instead, so the
+   * waypoint is visibly replay-less (red ring, and the Problems panel's
+   * `IK_PROBLEM_CODES.targetNoAngles` entry says "the waypoint is skipped").
+   * Visibly wrong beats invisibly wrong, and it is the same rule the MCP route
+   * keeps (`web_robot_target_set` with `allowUnreachable`).
+   */
+  private commitMovedPose(
+    c: Candidate,
+    prevPos: [number, number, number],
+    prevQuat: [number, number, number, number],
+  ): void {
     const reach = this.resolve(c);
     const angles = reach ? c.drives.slice(0, 6).map((d) => d.currentPosition) : null;
-    if (angles) c.target.AxisPos = [...angles];
+    // ALWAYS — `null` writes an EMPTY AxisPos, never a stale one. The shared
+    // helper exists because AxisPos is a raw extras field that no setField
+    // executor writes back onto the live instance (see its doc comment).
+    writeLiveAxisPos(c.target, angles);
     this.persistPose(c, prevPos, prevQuat, angles);
+    const nodePath = this.viewer?.registry?.getPathForNode(c.node);
+    if (nodePath) reportTargetReplayAngles(c.target, c.ikPath, nodePath);
     this.pushEditState(c, reach);
   }
 
-  /** Persist the target's CURRENT local transform (+ AxisPos when solvable) as
-   *  one undoable transaction. No-op without a SceneStore / registry path. */
+  /** Persist the target's CURRENT local transform AND its AxisPos as one
+   *  undoable transaction — both halves always, the AxisPos empty when the pose
+   *  has no solution. No-op without a SceneStore / registry path. */
   private persistPose(
     c: Candidate,
     prevPos: [number, number, number],
@@ -507,19 +539,19 @@ export class IKTargetEditPlugin implements RVViewerPlugin {
       },
       prev: { position: [...prevPos], quaternion: [...prevQuat] },
     };
-    if (angles) {
-      const raw = (n.userData?.realvirtual as Record<string, Record<string, unknown>> | undefined)?.['IKTarget'];
-      const prevAxis = raw?.['AxisPos'];
-      void store.withTransaction('Move path point', async () => {
-        await store.applyOp(tOp);
-        await store.applyOp({
-          id: freshOpId(), ts: Date.now(), schemaV: 1, kind: 'setField',
-          nodePath, componentType: 'IKTarget', fieldName: 'AxisPos', value: [...angles], prev: prevAxis,
-        });
+    const raw = (n.userData?.realvirtual as Record<string, Record<string, unknown>> | undefined)?.['IKTarget'];
+    const prevAxis = raw?.['AxisPos'];
+    // The AxisPos op is written unconditionally — an unreachable pose stores an
+    // EMPTY array, which is what makes the undo step whole: redoing the move
+    // and undoing it both restore the matching angle set.
+    void store.withTransaction('Move path point', async () => {
+      await store.applyOp(tOp);
+      await store.applyOp({
+        id: freshOpId(), ts: Date.now(), schemaV: 1, kind: 'setField',
+        nodePath, componentType: 'IKTarget', fieldName: 'AxisPos',
+        value: angles ? [...angles] : [], prev: prevAxis,
       });
-    } else {
-      void store.applyOp(tOp);
-    }
+    });
   }
 
   private endDrag(): void {
@@ -676,6 +708,7 @@ export class IKTargetEditPlugin implements RVViewerPlugin {
     this.active = null;
     this._activeSolutions = [];
     this._activeSolutionIdx = -1;
+    this._lastLimitRejected = -1;
     this.clearPreview();
     this.setHovered(null);
     this._suppressClose = true;
@@ -775,11 +808,9 @@ export class IKTargetEditPlugin implements RVViewerPlugin {
       this.gizmo.position.copy(this.worldPos(node, this._pos));
       this.gizmo.quaternion.copy(this.worldQuat(node, this._q));
     }
-    const reach = this.resolve(c);
-    const angles = reach ? c.drives.slice(0, 6).map((d) => d.currentPosition) : null;
-    if (angles) c.target.AxisPos = [...angles];
-    this.persistPose(c, prevPos, prevQuat, angles);
-    this.pushEditState(c, reach);
+    // Same commit rule as a gizmo drag — a numeric pose edit or an align
+    // shortcut into the unreachable empties AxisPos too.
+    this.commitMovedPose(c, prevPos, prevQuat);
   }
 
   /** Step through the reachable configurations of the active point and write the
@@ -854,11 +885,12 @@ export class IKTargetEditPlugin implements RVViewerPlugin {
    *  replay drives to what the user sees) AND as a persisted setField op (node
    *  transforms persist too via transformNode, so no reload inconsistency). */
   private commitAxisPos(c: Candidate, angles: readonly number[]): void {
-    c.target.AxisPos = [...angles];
+    writeLiveAxisPos(c.target, angles);
     const nodePath = this.viewer?.registry?.getPathForNode(c.node);
     if (!nodePath) return;
     const raw = (c.node.userData?.realvirtual as Record<string, Record<string, unknown>> | undefined)?.['IKTarget'];
     persistFieldOp(nodePath, 'IKTarget', 'AxisPos', [...angles], raw?.['AxisPos']);
+    reportTargetReplayAngles(c.target, c.ikPath, nodePath);
   }
 
   private buildActive(c: Candidate, reachable: boolean): IKEditActive {
@@ -918,7 +950,11 @@ export class IKTargetEditPlugin implements RVViewerPlugin {
     if (store && reg && ikNodePath && targetPath && Array.isArray(rawPath)) {
       // Rewrite IKPath.Path without the deleted target (matched by node → robust
       // against dedup-renames / runtime reorders).
-      const next = (rawPath as unknown[]).filter((r) => !(isRef(r) && reg.getNode((r as ComponentRef).path) === c.node));
+      // plan-769 Phase 3: a ref of any stored form, read as IKPath's node reads it.
+      const next = (rawPath as unknown[]).filter((r) => !(isRef(r)
+        && (typeof (r as ComponentRef).path === 'string'
+          ? reg.getNode((r as ComponentRef).path!)
+          : reg.storedNode(c.ikPath.node, storedReferenceValue(r))) === c.node));
       const isAdded = !!(c.node.userData as Record<string, unknown>)['__rvAdded'];
       const pathOp = { id: freshOpId(), ts: Date.now(), schemaV: 1 as const, kind: 'setField' as const, nodePath: ikNodePath, componentType: 'IKPath', fieldName: 'Path', value: next, prev: rawPath };
       if (isAdded) {
@@ -969,10 +1005,13 @@ export class IKTargetEditPlugin implements RVViewerPlugin {
     // claimLiveSolve already returns false when tier === 'none' (== !available),
     // so the extra `available &&` guard is redundant.
     if (ikSolverRegistry.claimLiveSolve(c.robot.node.uuid)) {
-      targetPoseInBase(c.robot.node.matrixWorld, newWorld, this._p3, this._q4);
+      targetPoseInBase(c.robot.node.matrixWorld, newWorld, this._p3, this._q4,
+        solveFrameFor(c.robot.WristType, c.robot.getJointChain()));
       for (let i = 0; i < 6; i++) this._seed[i] = c.drives[i]?.currentPosition ?? 0;
       const sols = this.solveFor(c, this._seed); // wrist-type routing (Cobot vs Pieper)
-      const best = sols ? ikSolverRegistry.selectClosest(sols, this._seed) : null;
+      // Joint limits gate the selection (plan-772 Phase 5): an interpolated
+      // waypoint must not be born carrying a configuration the rig cannot hold.
+      const best = sols ? ikSolverRegistry.selectClosest(sols, this._seed, c.drives) : null;
       if (best) axisPos = [...best];
     }
 
@@ -1007,7 +1046,15 @@ export class IKTargetEditPlugin implements RVViewerPlugin {
     // plan-757 D12: written ASSET-RELATIVE to the IKPath's own asset (the
     // enclosing reference scope), read tolerantly — the same file then works
     // as a document and as a placement.
-    const relativeTarget = assetRelativePath(nodePath, reg.enclosingScope(c.ikPath.node));
+    // plan-765 F3: node-first through the ONE writer, in AUTHORED names. The new
+    // target node does not exist yet (addNode runs after the setField), so its
+    // existing PARENT is spelled and the new leaf appended; a parent outside the
+    // scope keeps the string rule.
+    const scope = reg.enclosingScope(c.ikPath.node);
+    const parentAuthored = parent === scope.root ? '' : authoredAssetRelativePath(parent, scope.root);
+    const relativeTarget = parentAuthored === null
+      ? assetRelativePath(nodePath, scope)
+      : (parentAuthored === '' ? name : `${parentAuthored}/${name}`);
     nextPath.splice(insertAt, 0, { type: 'ComponentReference', path: relativeTarget });
 
     // Order matters: setField(Path) first so addNode's rebuildIKPaths sees the ref.
@@ -1194,12 +1241,20 @@ export class IKTargetEditPlugin implements RVViewerPlugin {
     // live re-solving; further robots fall back to AxisPos replay. Claim is keyed
     // by the robot node uuid (stable per scene) and reset on model clear.
     if (!ikSolverRegistry.claimLiveSolve(c.robot.node.uuid)) return false;
-    targetPoseInBase(c.robot.node.matrixWorld, c.node.matrixWorld, this._p3, this._q4);
+    // Same condition `solveFor` below routes on, so pose frame and solver
+    // cannot disagree (plan-772 F5).
+    targetPoseInBase(c.robot.node.matrixWorld, c.node.matrixWorld, this._p3, this._q4,
+      solveFrameFor(c.robot.WristType, c.robot.getJointChain()));
     // _seed doubles as Cobot warm start AND closest-selection reference.
     for (let i = 0; i < 6; i++) this._seed[i] = (seed ? seed[i] : c.drives[i].currentPosition) ?? 0;
     const solutions = this.solveFor(c, this._seed);
     this.refreshSolutionList(c, solutions);
-    const best = solutions ? ikSolverRegistry.selectClosest(solutions, this._seed) : null;
+    // The rig's joint limits are a hard gate on the selection (plan-772 Phase 5).
+    // The solvers never see the limits, so "reachable" only means the geometry
+    // closes; without this a branch that violates a limit could be applied while
+    // an admissible one sat next to it. All of them violating one reads as
+    // unreachable here — see `solutionsWithinLimits` for what that does NOT fix.
+    const best = solutions ? ikSolverRegistry.selectClosest(solutions, this._seed, c.drives) : null;
     if (c === this.active) this._activeSolutionIdx = best ? closestSolutionIndex(this._activeSolutions, best) : -1;
     if (!best) return false;
     this.applyAngles(c, best);
@@ -1211,21 +1266,63 @@ export class IKTargetEditPlugin implements RVViewerPlugin {
    *  EARLY-EXITS once the warm start converges (one reachable slot) — the
    *  branch variety only comes from a COLD solve. That extra solve is skipped
    *  in the drag hot path (the list from activation stays; it refreshes on
-   *  drag end / pose edits via the post-drag resolve). */
+   *  drag end / pose edits via the post-drag resolve).
+   *
+   *  The list is limit-filtered too, so the stepper cannot offer a configuration
+   *  the rig refuses — and the popover's "Solution n/m" count visibly shrinks
+   *  when the limits take branches away. */
   private refreshSolutionList(c: Candidate, warmSolutions: IKSolution[] | null): void {
     if (c !== this.active) return;
     if (c.robot.WristType === 'NonSpherical' && ikSolverRegistry.canSolveCobot) {
       if (this.drag) return; // keep the last cold list while dragging
       const cold = this.solveFor(c, null);
-      this._activeSolutions = cold ? reachableSolutions(cold) : [];
+      this._activeSolutions = this.admissible(c, cold ? reachableSolutions(cold) : []);
       return;
     }
-    this._activeSolutions = warmSolutions ? reachableSolutions(warmSolutions) : [];
+    this._activeSolutions = this.admissible(c, warmSolutions ? reachableSolutions(warmSolutions) : []);
   }
 
-  /** Drive all six axes to the given joint angles (preview pose). */
+  /** Last reported joint-limit rejection count — so the note below is logged on
+   *  CHANGE only and never once per pointermove. */
+  private _lastLimitRejected = -1;
+
+  /** Drop the configurations the candidate's drive limits refuse, and say so.
+   *
+   *  The quick-edit's "Solution n/m" count already shrinks visibly, and all of
+   *  them being refused reads as unreachable (red ring + the Problems entry).
+   *  The console line is the third surface, for the case where a user wonders
+   *  why a branch they expect is not offered — see doc-web-debugging.md. */
+  private admissible(c: Candidate, solutions: number[][]): number[][] {
+    const filtered = solutionsWithinLimits(solutions, c.drives, this._seed);
+    if (filtered.rejected !== this._lastLimitRejected) {
+      this._lastLimitRejected = filtered.rejected;
+      if (filtered.rejected > 0) {
+        console.info(
+          `[ik-edit] ${filtered.rejected} of ${solutions.length} IK configuration(s) discarded at `
+          + `"${c.node.name}": joint limits of `
+          + `${filtered.rejectedAxes.map((i) => `A${i + 1}`).join(', ')} refuse them in every 360° `
+          + 'representation. The solver is not given the limits, so this is a rejection, not a search.',
+        );
+      }
+    }
+    return filtered.kept;
+  }
+
+  /** Drive all six axes to the given joint angles (preview pose).
+   *
+   *  `positionOverwrite` bypasses the drive's own `UseLimits` clamp (see the
+   *  overwrite branch in rv-drive.ts), so the limit-respecting representation is
+   *  written rather than the raw solver output. A value the limits already
+   *  accept is written UNCHANGED, so the solver's branch identity survives the
+   *  drag; only a value they refuse is shifted to a representation they allow. */
   private applyAngles(c: Candidate, angles: readonly number[]): void {
-    for (let i = 0; i < 6; i++) { const d = c.drives[i]; d.positionOverwrite = true; d.currentPosition = angles[i] ?? 0; d.applyToNode(); }
+    for (let i = 0; i < 6; i++) {
+      const d = c.drives[i];
+      const raw = angles[i] ?? 0;
+      d.positionOverwrite = true;
+      d.currentPosition = limitRespectingAxisPosition(raw, d) ?? raw;
+      d.applyToNode();
+    }
   }
 }
 

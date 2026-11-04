@@ -20,6 +20,7 @@
 
 import { MeshBasicMaterial } from 'three';
 import type { Material, Mesh, Object3D, Plane } from 'three';
+import type { ArenaVisibilitySink } from './engine/rv-arena-sink';
 
 /** The one line colour: a neutral ink, deliberately not the accent blue the
  *  selection / hover highlight uses. */
@@ -44,6 +45,8 @@ export class RVWireframeView {
   private readonly _meshes: Mesh[] = [];
   private readonly _originals: (Material | Material[])[] = [];
   private _isFixture: (node: Object3D) => boolean = () => false;
+  /** Arena sink held in capture mode between swapIn and swapOut (plan-766). */
+  private _capture: ArenaVisibilitySink | null = null;
 
   /** Number of meshes currently holding the line material (0 between frames). */
   get swappedCount(): number { return this._meshes.length; }
@@ -53,9 +56,20 @@ export class RVWireframeView {
    * `isFixture` prunes viewer-owned subtrees (floor, reflector, lights).
    * Must be paired with {@link swapOut}; a second call without it is a no-op.
    */
-  swapIn(root: Object3D | null, isFixture: (node: Object3D) => boolean): void {
-    if (!root || this._meshes.length > 0) return;
+  swapIn(
+    root: Object3D | null,
+    isFixture: (node: Object3D) => boolean,
+    capture?: ArenaVisibilitySink | null,
+  ): void {
+    if (!root || this._meshes.length > 0 || this._capture) return;
     this._isFixture = isFixture;
+    // plan-766 F10: with editor arenas the sources sit on layer mask 0 and the
+    // arenas draw them — the wireframe needs the SOURCES, so the arenas go into
+    // capture mode (sources back on their layers) until swapOut.
+    if (capture) {
+      capture.enterCapture();
+      this._capture = capture;
+    }
     this._walk(root);
   }
 
@@ -66,6 +80,9 @@ export class RVWireframeView {
     for (let i = 0; i < meshes.length; i++) meshes[i].material = originals[i];
     meshes.length = 0;
     originals.length = 0;
+    const capture = this._capture;
+    this._capture = null;
+    capture?.leaveCapture();
   }
 
   /** Section planes — the beauty pass clips per material, so the line material

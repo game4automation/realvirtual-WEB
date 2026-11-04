@@ -39,7 +39,9 @@ import type { Object3D } from 'three';
 import { MathUtils, Vector3, Quaternion } from 'three';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
 import { registerComponent, loadSchemaFromSpec } from './rv-component-registry';
-import type { ComponentRef, NodeRegistry } from './rv-node-registry';
+import { NodeRegistry, type ComponentRef } from './rv-node-registry';
+import { reportIkTargetNoAngles, reportRobotIkAxesUnresolved } from '../hmi/problems-store';
+import { isComponentReference, storedReferenceValue, type StoredReferenceValue } from './rv-node-path-rewrite.mjs';
 import {
   createSignalWriter,
   type SignalStore,
@@ -49,7 +51,7 @@ import type { RVDrive } from './rv-drive';
 import { RVIKTarget } from './rv-ik-target';
 import { wireBoolSignal } from './rv-signal-wiring';
 import { debug } from './rv-debug';
-import { ikSolverRegistry, targetPoseInBase, type CobotSolveOpts, type IKSolution } from './rv-ik-solver';
+import { ikSolverRegistry, solveFrameFor, targetPoseInBase, type CobotSolveOpts, type IKSolution } from './rv-ik-solver';
 import { getDriveSpeedOverride } from './rv-speed-override';
 import { MM_TO_METERS } from './rv-constants';
 import { axisTargetPosition } from './rv-axis-angle-utils';
@@ -58,6 +60,7 @@ import {
   registerAxisOwnershipParticipant,
   type AxisOwner,
 } from './rv-axis-ownership';
+import { commandAxisPosition, isDynamicAxis } from './rv-axis-contract';
 // Type-only — rv-robot-ik imports runtime helpers from this file; a value import
 // here would create a cycle. The instance is resolved via the registry at init.
 import type { RVRobotIK } from './rv-robot-ik';
@@ -72,9 +75,101 @@ interface PendingSignalReset { addr: string; at: number; }
  * hands the ENTIRE remaining segment to joint-space PTP replay — the LIN live
  * solve must never make the motion worse than the plain AxisPos replay.
  */
-const LIN_MAX_STEP_JUMP_DEG = 30;
+export const LIN_MAX_STEP_JUMP_DEG = 30;
+
+/** Wrapped distance treats full-turn representations as the same pose. */
+export function linMaxJump(angles: readonly number[], current: readonly number[]): number {
+  let max = 0;
+  for (let i = 0; i < 6; i++) {
+    let d = Math.abs(angles[i] - current[i]) % 360;
+    if (d > 180) d = 360 - d;
+    if (d > max) max = d;
+  }
+  return max;
+}
+
+/** Ordered guards preserve replay's first refusal, including the PTP arrival transition. */
+export function linStartCheck(available: boolean, start: readonly number[] | null,
+  current: readonly number[], endReachable = true): string | null {
+  if (!available) return 'unavailable';
+  if (!start) return 'start-unreachable';
+  if (linMaxJump(start, current) > LIN_MAX_STEP_JUMP_DEG) return 'start-jump';
+  return endReachable ? null : 'end-unreachable';
+}
+
+/** Same routing prerequisites as replay; budget inspection itself never claims. */
+export function linAvailable(robot: RVRobotIK | null, axisCount: number): robot is RVRobotIK {
+  return !!robot && axisCount === 6 && !!robot.getOpwParams()
+    && (robot.WristType === 'NonSpherical' ? ikSolverRegistry.canSolveCobot && !!robot.getJointChain() : ikSolverRegistry.available)
+    && ikSolverRegistry.wouldGrantLiveSolve(robot.node.uuid);
+}
+
+/** Shared numerical step, with caller-owned buffers for the runtime hot path. */
+export function linSolveStep(robot: RVRobotIK, pos: [number, number, number], quat: [number, number, number, number],
+  seed: number[], warm: Float64Array, opts: CobotSolveOpts): number[] | null {
+  const params = robot.getOpwParams();
+  if (!params) return null;
+  for (let i = 0; i < 6; i++) warm[i] = seed[i];
+  let sols: IKSolution[] | null = null;
+  if (robot.WristType === 'NonSpherical') {
+    const chain = robot.getJointChain();
+    if (chain && ikSolverRegistry.canSolveCobot) {
+      opts.opw = params; opts.warmStart = warm;
+      sols = ikSolverRegistry.solveCobot(chain, pos, quat, opts);
+    }
+  } else sols = ikSolverRegistry.solvePieper(params, pos, quat);
+  return sols ? ikSolverRegistry.selectClosest(sols, seed, robot.getAxisDrives()) : null;
+}
+
+export interface LinProfileState { distance: number; position: number; speed: number; decel: boolean; }
+
+/** Reusable output keeps the runtime allocation-free; the deceleration latch
+ * and zero-speed snap retain the original discrete Unity profile. */
+export function linProfileStep(state: LinProfileState, speedMm: number, accelMm: number,
+  dt: number, speedOverride: number, globalOverride: number, out: LinProfileState): number {
+  const override = globalOverride * MathUtils.clamp(speedOverride, 0.0001, 10);
+  const vMax = (Math.max(speedMm, 0.0001) / MM_TO_METERS) * override;
+  const accel = Math.max(accelMm, 0.0001) / MM_TO_METERS;
+  let speed = state.speed;
+  const decel = state.decel || speed * speed / (2 * accel) >= Math.max(state.distance - state.position, 0);
+  if (decel) speed -= accel * dt;
+  else if (speed < vMax) speed = Math.min(vMax, speed + accel * dt);
+  else speed = vMax;
+  const position = state.position + Math.max(speed, 0) * dt;
+  out.distance = state.distance; out.position = position; out.speed = speed; out.decel = decel;
+  const frac = state.distance > 1e-9 ? position / state.distance : 1;
+  return frac >= 1 || (decel && speed <= 0) ? 1 : frac;
+}
+
+export interface IKPathRunEvent {
+  readonly type: 'started' | 'target-reached' | 'target-skipped' | 'lin-fallback' | 'finished' | 'cancelled';
+  readonly runSeq: number;
+  readonly index?: number;
+  readonly reason?: string;
+}
 
 export class RVIKPath implements RVComponent {
+  private _runSeq = 0;
+  private readonly _runListeners = new Set<(event: IKPathRunEvent) => void>();
+  private _observedTarget: 'moved' | 'skipped-no-angles' | null = null;
+
+  /** Identity survives reset so a restarted LogicStep cannot impersonate an old run. */
+  get runSeq(): number { return this._runSeq; }
+
+  addRunListener(fn: (event: IKPathRunEvent) => void): () => void {
+    this._runListeners.add(fn);
+    return () => { this._runListeners.delete(fn); };
+  }
+
+  private emitRun(type: IKPathRunEvent['type'], index?: number, reason?: string): void {
+    if (!this._runListeners.size) return;
+    const event: IKPathRunEvent = { type, runSeq: this._runSeq, index, reason };
+    for (const fn of this._runListeners) {
+      // Observers must never interrupt motion, signal writes or path chaining.
+      try { fn(event); } catch (e) { console.warn('[RVIKPath] Run listener failed', e); }
+    }
+  }
+
   // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
   // Path is listed so it shows in the inspector (rendered by a custom
   // reorderable-list field renderer). The runtime target list is resolved from
@@ -128,11 +223,15 @@ export class RVIKPath implements RVComponent {
   private _waitSignalAddr: string | null = null;
   private _pendingReset: PendingSignalReset | null = null;
   private _warnedNoDrives = false;
+  /** Kept for the per-target diagnosis (target node paths). */
+  private _registry: NodeRegistry | null = null;
+  /** Resolved once in `init()` — the Problems entries key and display on it. */
+  private _nodePath = '';
   private _ownershipPaused = false;
   private _ownershipUnregister: (() => void) | null = null;
 
-  // ── LIN (cartesian) segment state — poses in the robot-local, scale-free
-  //    meter frame (the solver frame; see targetPoseInBase). ──
+  // ── LIN (cartesian) segment state — poses in the robot-local solve frame
+  //    (`'chain'` or `'unity'`; see targetPoseInBase / solveFrameFor). ──
   private _robot: RVRobotIK | null = null;
   private _linActive = false;
   private _linTarget: RVIKTarget | null = null;
@@ -140,12 +239,29 @@ export class RVIKPath implements RVComponent {
   private readonly _linStartQuat = new Quaternion();
   private readonly _linEndPos = new Vector3();
   private readonly _linEndQuat = new Quaternion();
+  private readonly _linProfile: LinProfileState = { distance: 0, position: 0, speed: 0, decel: false };
   private _linDist = 0;   // segment length [m]
   private _linPos = 0;    // distance travelled [m]
   private _linSpeed = 0;  // current speed [m/s]
   private _linDecel = false; // latched deceleration flag (IKPath.cs lineardeceleration)
   // Reusable unwrapped PTP destinations (per-target, not per-frame).
   private readonly _ptpDest: number[] = [];
+  /**
+   * plan-673 Phase 4 — per-axis setpoint speed (drive units/s) of a PTP segment
+   * on a DYNAMIC axis. Empty while every axis of this path is kinematic.
+   *
+   * A dynamic axis cannot use the drive's own motion profile: with
+   * `positionOverwrite` set, `updateMotion()` returns at the overwrite branch
+   * before the profile runs, so `startMove()` would arm a profile that never
+   * executes and the axis would simply never move. The planner therefore
+   * generates the setpoint RAMP itself — one velocity-limited setpoint per
+   * tick, which is also what a real controller sends. Commanding the
+   * destination in one step instead would be a 180-degree step input into a
+   * force-limited servo.
+   */
+  private readonly _ptpRampSpeed: number[] = [];
+  /** True while a PTP setpoint ramp is running on at least one dynamic axis. */
+  private _ptpRampActive = false;
   // Reusable solver inputs — no allocation in the per-step hot path.
   private readonly _p3: [number, number, number] = [0, 0, 0];
   private readonly _q4: [number, number, number, number] = [0, 0, 0, 1];
@@ -161,6 +277,8 @@ export class RVIKPath implements RVComponent {
 
   init(context: ComponentContext): void {
     const registry = context.registry;
+    this._registry = registry;
+    this._nodePath = registry.getPathForNode(this.node) ?? NodeRegistry.computeNodePath(this.node);
     this._store = context.signalStore;
     this._writer = createSignalWriter(
       context.signalStore,
@@ -182,7 +300,7 @@ export class RVIKPath implements RVComponent {
     // Resolve the chained path.
     const nextRef = raw['StartNextPath'];
     if (isRef(nextRef)) {
-      this._startNextPath = resolveComp<RVIKPath>(registry, 'IKPath', (nextRef as ComponentRef).path);
+      this._startNextPath = resolveComp<RVIKPath>(registry, 'IKPath', storedReferenceValue(nextRef), this.node);
     }
 
     // Resolve the ordered axis drives from the parent RobotIK's serialized Axis[].
@@ -240,10 +358,23 @@ export class RVIKPath implements RVComponent {
     return [];
   }
 
+  /** How many axes the parent RobotIK DECLARES — so the diagnosis can tell
+   *  "nothing was assigned" apart from "what was assigned did not resolve". */
+  private declaredAxisCount(): number {
+    let n: Object3D | null = this.node;
+    while (n) {
+      const robot = (n.userData?.realvirtual as Record<string, Record<string, unknown>> | undefined)?.['RobotIK'];
+      if (robot) return Array.isArray(robot['Axis']) ? (robot['Axis'] as unknown[]).length : 0;
+      n = n.parent;
+    }
+    return 0;
+  }
+
   // ── Lifecycle ──────────────────────────────────────────────────
 
   startPath(): void {
     if (this.PathIsActive) return;
+    this._runSeq++;
     this.PathIsActive = true;
     this.PathIsFinished = false;
     this.NumTarget = 0;
@@ -254,6 +385,7 @@ export class RVIKPath implements RVComponent {
     this.setSignal(this._signalIsStartedAddr, true);
     this.setSignal(this._signalEndedAddr, false);
     debug('logic', `IKPath "${this.node.name}": startPath (${this._path.length} targets)`);
+    this.emitRun('started');
     this.checkNextTarget();
   }
 
@@ -267,6 +399,7 @@ export class RVIKPath implements RVComponent {
       this.setSignal(this._signalEndedAddr, true);
       this.setSignal(this._signalIsStartedAddr, false);
       debug('logic', `IKPath "${this.node.name}": finished`);
+      this.emitRun('finished');
       if (this._startNextPath) {
         this._startNextPath.startPath();
       } else if (this.LoopPath) {
@@ -277,11 +410,19 @@ export class RVIKPath implements RVComponent {
 
   private driveToTarget(target: RVIKTarget): void {
     this.CurrentTarget = target;
+    this._observedTarget = null;
 
     const axisCount = this._axisDrives.length;
     if (axisCount === 0) {
       if (!this._warnedNoDrives) {
         console.warn(`[RVIKPath] "${this.node.name}": no axis drives resolved — cannot replay path.`);
+        // A console warning nobody reads is how this stayed invisible: a path
+        // that moves nothing looks identical to one that is simply idle.
+        reportRobotIkAxesUnresolved({
+          nodePath: this._nodePath || this.node.name,
+          label: this.node.name || this._nodePath,
+          declared: this.declaredAxisCount(),
+        });
         this._warnedNoDrives = true;
       }
       // No drives ⇒ allAxesAtTarget() is vacuously true ⇒ the fixedUpdate poll
@@ -294,6 +435,7 @@ export class RVIKPath implements RVComponent {
     // (IKPath.cs parity). First target is always PTP (Unity forceFirstPTP).
     // tryStartLinear returning false ⇒ joint-space PTP replay fallback.
     if (target.InterpolationToTarget === 'Linear' && this.NumTarget > 0 && this.tryStartLinear(target)) {
+      this._observedTarget = 'moved';
       this._activeMoving = true;
       return;
     }
@@ -312,10 +454,22 @@ export class RVIKPath implements RVComponent {
     const axisCount = this._axisDrives.length;
     if (!target.hasReplayAngles(axisCount)) {
       console.warn(`[RVIKPath] "${this.node.name}": target "${target.node.name}" has no replay angles (AxisPos) — skipping motion.`);
+      // Skipping a waypoint changes the pose sequence the robot visits, so it
+      // belongs in the panel and not only in the console (same id per target ⇒
+      // a LoopPath re-report replaces, never appends).
+      reportIkTargetNoAngles({
+        nodePath: this._registry?.getPathForNode(target.node) ?? NodeRegistry.computeNodePath(target.node),
+        label: target.node.name || '(unnamed target)',
+        pathLabel: this.node.name || this._nodePath,
+        axisCount,
+      });
+      this._observedTarget = 'skipped-no-angles';
+      this.emitRun('target-skipped', this.NumTarget, 'no-angles');
       this._activeMoving = true; // drives left in place ⇒ poll advances next tick
       return;
     }
 
+    this._observedTarget = 'moved';
     const speedFactor = MathUtils.clamp(this.SpeedOverride * target.SpeedToTarget, 0.0001, 10);
     const synced = target.InterpolationToTarget !== 'PointToPointUnsynced';
 
@@ -338,16 +492,43 @@ export class RVIKPath implements RVComponent {
       }
     }
 
+    if (this._ptpRampSpeed.length !== axisCount) this._ptpRampSpeed.length = axisCount;
+    this._ptpRampActive = false;
     for (let i = 0; i < axisCount; i++) {
       const drive = this._axisDrives[i];
       const dest = this._ptpDest[i];
-      drive.positionOverwrite = false;
       const delta = Math.abs(dest - drive.currentPosition);
-      if (synced && maxTime > 0) {
-        drive.targetSpeed = Math.max(delta / maxTime, 0.0001);
-      } else {
-        drive.targetSpeed = Math.max(drive.TargetSpeed * speedFactor, 0.0001);
+      const speed = (synced && maxTime > 0)
+        ? Math.max(delta / maxTime, 0.0001)
+        : Math.max(drive.TargetSpeed * speedFactor, 0.0001);
+
+      // plan-673 Phase 4, the cascade of rule 2: on a dynamic axis the planner
+      // writes the SETPOINT and the physics decides whether the axis gets
+      // there. `positionOverwrite` is NOT cleared — the physics authority owns
+      // it, and handing the axis back to its own integration mid-move is
+      // exactly the "last writer in the tick wins" race the contract exists to
+      // prevent.
+      if (isDynamicAxis(drive)) {
+        drive.targetSpeed = speed;
+        // The FINAL goal, so `isAtTarget` (with the axis's widened arrival
+        // tolerance) answers the arrival poll below.
+        drive.targetPosition = dest;
+        // The planner is the ONE setpoint source for this segment: a stale
+        // `isRunning` would also arm the drive's own setpoint ramp
+        // (`stepDynamicSetpoint`) toward the same destination, and two ramps on
+        // one command is an ambiguity nobody should have to debug.
+        drive.isRunning = false;
+        // Nothing has commanded the axis yet ⇒ start the ramp where the axis
+        // actually is, so the first tick is not a step input.
+        if (!Number.isFinite(drive.commandedPosition)) drive.commandPosition(drive.currentPosition);
+        this._ptpRampSpeed[i] = speed;
+        this._ptpRampActive = true;
+        continue;
       }
+
+      drive.positionOverwrite = false;
+      this._ptpRampSpeed[i] = 0;
+      drive.targetSpeed = speed;
       drive.startMove(dest);
     }
 
@@ -379,27 +560,23 @@ export class RVIKPath implements RVComponent {
    */
   private tryStartLinear(target: RVIKTarget): boolean {
     const robot = this._robot;
-    if (!robot || this._axisDrives.length !== 6) return false;
+    if (!linAvailable(robot, this._axisDrives.length)) return this.linFallback('unavailable');
     const prev = this._path[this.NumTarget - 1];
-    if (!prev) return false; // LIN needs a previous target as segment start
-    // Wrist-type routing (same as the edit plugin) — but replay must stay
-    // exact: a NonSpherical robot without the Cobot solver would land subtly
-    // off with Pieper, so it keeps joint-space replay instead.
-    if (robot.WristType === 'NonSpherical') {
-      if (!ikSolverRegistry.canSolveCobot || !robot.getJointChain()) return false;
-    } else if (!ikSolverRegistry.available) {
-      return false;
-    }
-    if (!robot.getOpwParams()) return false;
-    if (!ikSolverRegistry.claimLiveSolve(robot.node.uuid)) return false;
+    if (!prev) return this.linFallback('unavailable');
+    if (!ikSolverRegistry.claimLiveSolve(robot.node.uuid)) return this.linFallback('unavailable');
 
-    // Segment endpoints in the robot-local, scale-free meter frame — BOTH from
-    // target nodes (identical frame convention; matrixWorld read directly, no
-    // updateWorldMatrix: frozen nodes have it baked).
-    targetPoseInBase(robot.node.matrixWorld, prev.node.matrixWorld, this._p3, this._q4);
+    // Segment endpoints in the robot-local solve frame — BOTH from target nodes
+    // (identical frame convention; matrixWorld read directly, no
+    // updateWorldMatrix: frozen nodes have it baked). The frame follows the
+    // solver this path routes to (plan-772 F5); interpolating in it is safe
+    // either way, because the glTF ⇄ Unity mirror is linear on positions and a
+    // quaternion conjugation on rotations, so a straight line stays straight
+    // and a slerp stays the same motion.
+    const frame = solveFrameFor(robot.WristType, robot.getJointChain());
+    targetPoseInBase(robot.node.matrixWorld, prev.node.matrixWorld, this._p3, this._q4, frame);
     this._linStartPos.set(this._p3[0], this._p3[1], this._p3[2]);
     this._linStartQuat.set(this._q4[0], this._q4[1], this._q4[2], this._q4[3]);
-    targetPoseInBase(robot.node.matrixWorld, target.node.matrixWorld, this._p3, this._q4);
+    targetPoseInBase(robot.node.matrixWorld, target.node.matrixWorld, this._p3, this._q4, frame);
     this._linEndPos.set(this._p3[0], this._p3[1], this._p3[2]);
     this._linEndQuat.set(this._q4[0], this._q4[1], this._q4[2], this._q4[3]);
 
@@ -409,10 +586,12 @@ export class RVIKPath implements RVComponent {
     // (stale export, different configuration branch) — joint-space replay of
     // the baked angles is then the trustworthy motion.
     const startAngles = this.solveStep(this._linStartPos, this._linStartQuat);
-    if (!startAngles || this.maxJumpFromCurrent(startAngles) > LIN_MAX_STEP_JUMP_DEG) return false;
+    for (let i = 0; i < 6; i++) this._seed[i] = this._axisDrives[i].currentPosition;
+    const startReason = linStartCheck(true, startAngles, this._seed);
+    if (startReason) return this.linFallback(startReason);
 
     // End pose must be solvable — Unity errors here; replay falls back to PTP.
-    if (!this.solveStep(this._linEndPos, this._linEndQuat)) return false;
+    if (!this.solveStep(this._linEndPos, this._linEndQuat)) return this.linFallback('end-unreachable');
 
     this._linDist = this._linStartPos.distanceTo(this._linEndPos);
     this._linPos = 0;
@@ -423,6 +602,11 @@ export class RVIKPath implements RVComponent {
     return true;
   }
 
+  private linFallback(reason: string): false {
+    this.emitRun('lin-fallback', this.NumTarget, reason);
+    return false;
+  }
+
   /**
    * Advance the LIN trapezoid profile by one fixed step, interpolate the TCP
    * pose on the straight line (lerp/slerp) and re-solve the joints for it —
@@ -431,33 +615,13 @@ export class RVIKPath implements RVComponent {
    */
   private stepLinear(dt: number): void {
     const target = this._linTarget!;
-    // Speed profile in meters (LinearSpeedToTarget mm/s, LinearAcceleration
-    // mm/s²), scaled by the path override × the global sim speed override —
-    // Unity's combinedSpeedOverride (SpeedToTarget is PTP-only, as in Unity).
-    const override = getDriveSpeedOverride() * MathUtils.clamp(this.SpeedOverride, 0.0001, 10);
-    const vMax = (Math.max(target.LinearSpeedToTarget, 0.0001) / MM_TO_METERS) * override;
-    const accel = Math.max(target.LinearAcceleration, 0.0001) / MM_TO_METERS;
-    // Deceleration latch (IKPath.cs lineardeceleration): stopping distance
-    // v²/(2a) ≥ remaining distance ⇔ Unity's needslowdowntime ≥ availslowdowntime.
-    if (!this._linDecel) {
-      const distToEnd = Math.max(this._linDist - this._linPos, 0);
-      if ((this._linSpeed * this._linSpeed) / (2 * accel) >= distToEnd) this._linDecel = true;
-    }
-    if (this._linDecel) {
-      this._linSpeed -= accel * dt; // decelerate toward the segment end
-    } else if (this._linSpeed < vMax) {
-      this._linSpeed = Math.min(vMax, this._linSpeed + accel * dt);
-    } else {
-      this._linSpeed = vMax; // override was lowered mid-move — clamp down
-    }
-    this._linPos += Math.max(this._linSpeed, 0) * dt;
-
-    let frac = this._linDist > 1e-9 ? this._linPos / this._linDist : 1;
-    // At destination when the line is covered — or when the discretized
-    // deceleration hits zero speed first (Unity: lineardeceleration && speed<0
-    // ⇒ pathpercent=1 snap).
-    const end = frac >= 1 || (this._linDecel && this._linSpeed <= 0);
-    if (end) frac = 1;
+    const profile = this._linProfile;
+    profile.distance = this._linDist; profile.position = this._linPos;
+    profile.speed = this._linSpeed; profile.decel = this._linDecel;
+    const frac = linProfileStep(profile, target.LinearSpeedToTarget, target.LinearAcceleration,
+      dt, this.SpeedOverride, getDriveSpeedOverride(), profile);
+    this._linPos = profile.position; this._linSpeed = profile.speed; this._linDecel = profile.decel;
+    const end = frac >= 1;
     this._stepPos.lerpVectors(this._linStartPos, this._linEndPos, frac);
     this._stepQuat.slerpQuaternions(this._linStartQuat, this._linEndQuat, frac);
 
@@ -470,6 +634,7 @@ export class RVIKPath implements RVComponent {
       // no per-step ping-pong — worst case equals the plain replay).
       this._linActive = false;
       this._linTarget = null;
+      this.linFallback(angles ? 'step-jump' : 'step-unreachable');
       this.drivePtpToTarget(target);
       return;
     }
@@ -481,14 +646,22 @@ export class RVIKPath implements RVComponent {
       // (chart speeds stay sane and the following PTP starts from a continuous
       // state). Same physical pose either way.
       const a = axisTargetPosition(angles[i], d);
+      // plan-673 Phase 4: on a DYNAMIC axis `commandAxisPosition` writes the
+      // setpoint and leaves the position to the physics; `positionOverwrite`
+      // stays with the physics authority in both branches. On a kinematic axis
+      // this is byte-for-byte the old behaviour. A LIN segment is already a
+      // per-tick stream of poses, so it needs no ramp of its own — the
+      // interpolation IS the ramp.
+      if (isDynamicAxis(d)) {
+        d.targetPosition = a;
+        commandAxisPosition(d, a);
+        continue;
+      }
       if (end) {
         // Final pose: snap, mark at-target so the arrival poll advances the
         // path on the next tick (same ≥1-tick guarantee as PTP).
         d.positionOverwrite = false;
-        d.currentPosition = a;
-        d.targetPosition = a;
-        d.currentSpeed = 0;
-        d.applyToNode();
+        commandAxisPosition(d, a, true);
       } else {
         // Mid-path: overwrite mode — the drive loop (after this tick) applies
         // the transform and derives currentSpeed for charts.
@@ -502,17 +675,41 @@ export class RVIKPath implements RVComponent {
     }
   }
 
+  /**
+   * plan-673 Phase 4 — one step of the PTP setpoint ramp on the dynamic axes.
+   *
+   * The setpoint moves toward the destination at the segment speed and stops
+   * there; what the axis does with it is the physics' answer, which is the
+   * whole point. The ramp is deliberately velocity-limited only and carries no
+   * acceleration profile: the drive's own acceleration shaping belongs to its
+   * motion integration, which a dynamic axis does not run, and a force-limited
+   * actuator already rounds off the start of a move by saturating. Adding a
+   * second S-curve here would shape a command whose execution is governed by
+   * `forcerange` anyway.
+   */
+  private stepDynamicPtp(dt: number): void {
+    let running = false;
+    for (let i = 0; i < this._axisDrives.length; i++) {
+      const speed = this._ptpRampSpeed[i] ?? 0;
+      if (speed <= 0) continue;
+      const drive = this._axisDrives[i];
+      const dest = this._ptpDest[i];
+      const from = Number.isFinite(drive.commandedPosition) ? drive.commandedPosition : drive.currentPosition;
+      if (from === dest) continue;
+      const step = speed * dt * Math.max(getDriveSpeedOverride(), 0);
+      const next = from < dest ? Math.min(dest, from + step) : Math.max(dest, from - step);
+      commandAxisPosition(drive, next);
+      if (next !== dest) running = true;
+    }
+    this._ptpRampActive = running;
+  }
+
   /** Largest per-axis angular distance (deg, 360°-unwrapped) between a solve
    *  result and the drives' CURRENT positions — the configuration-jump metric
    *  for the LIN guard rail. */
   private maxJumpFromCurrent(angles: number[]): number {
-    let max = 0;
-    for (let i = 0; i < 6; i++) {
-      let d = Math.abs(angles[i] - this._axisDrives[i].currentPosition) % 360;
-      if (d > 180) d = 360 - d;
-      if (d > max) max = d;
-    }
-    return max;
+    for (let i = 0; i < 6; i++) this._seed[i] = this._axisDrives[i].currentPosition;
+    return linMaxJump(angles, this._seed);
   }
 
   /** Solve the joints for a robot-local TCP pose, routed by wrist type; warm
@@ -523,33 +720,16 @@ export class RVIKPath implements RVComponent {
   private solveStep(pos: Vector3, quat: Quaternion): number[] | null {
     const robot = this._robot;
     if (!robot) return null;
-    const params = robot.getOpwParams();
-    if (!params) return null;
     this._p3[0] = pos.x; this._p3[1] = pos.y; this._p3[2] = pos.z;
     this._q4[0] = quat.x; this._q4[1] = quat.y; this._q4[2] = quat.z; this._q4[3] = quat.w;
-    for (let i = 0; i < 6; i++) {
-      const cur = this._axisDrives[i].currentPosition;
-      this._warm[i] = cur;
-      this._seed[i] = cur;
-    }
-    let sols: IKSolution[] | null = null;
-    if (robot.WristType === 'NonSpherical') {
-      // Cobot-only (gated in tryStartLinear) — no Pieper fallback for replay.
-      const chain = robot.getJointChain();
-      if (chain && ikSolverRegistry.canSolveCobot) {
-        this._cobotOpts.opw = params;
-        this._cobotOpts.warmStart = this._warm;
-        sols = ikSolverRegistry.solveCobot(chain, this._p3, this._q4, this._cobotOpts);
-      }
-    } else {
-      sols = ikSolverRegistry.solvePieper(params, this._p3, this._q4);
-    }
-    return sols ? ikSolverRegistry.selectClosest(sols, this._seed) : null;
+    for (let i = 0; i < 6; i++) this._seed[i] = this._axisDrives[i].currentPosition;
+    return linSolveStep(robot, this._p3, this._q4, this._seed, this._warm, this._cobotOpts);
   }
 
   private atTarget(): void {
     const target = this.CurrentTarget;
     if (target) {
+      if (this._observedTarget === 'moved') this.emitRun('target-reached', this.NumTarget);
       target.onAtTarget();
       // Schedule SetSignal reset (mirrors IKTarget.OnLeaveTarget timer).
       if (target.setSignalAddr && target.SetSignalDuration > 0) {
@@ -580,6 +760,10 @@ export class RVIKPath implements RVComponent {
   }
 
   private allAxesAtTarget(): boolean {
+    // plan-673 Phase 4: a running setpoint ramp means the COMMAND has not
+    // arrived yet. Without this a dynamic axis that happens to pass close to
+    // its destination early would advance the path mid-move.
+    if (this._ptpRampActive) return false;
     for (const drive of this._axisDrives) {
       if (!drive.isAtTarget) return false;
     }
@@ -635,6 +819,11 @@ export class RVIKPath implements RVComponent {
       return;
     }
 
+    // plan-673 Phase 4 — advance the setpoint ramp of the dynamic axes of a
+    // PTP segment. Runs BEFORE the arrival poll so the last ramp step and the
+    // arrival are not one tick apart.
+    if (this._ptpRampActive) this.stepDynamicPtp(dt);
+
     // PTP motion in progress — poll axis drives.
     if (this._activeMoving && this.allAxesAtTarget()) {
       this._activeMoving = false;
@@ -644,6 +833,7 @@ export class RVIKPath implements RVComponent {
 
   /** Reset to idle (used by RVIKPathStep.reset and engine reset). */
   reset(): void {
+    const wasActive = this.PathIsActive;
     this.PathIsActive = false;
     this.PathIsFinished = false;
     this.NumTarget = 0;
@@ -661,6 +851,8 @@ export class RVIKPath implements RVComponent {
     this._linPos = 0;
     this._linSpeed = 0;
     this._linDecel = false;
+    this._ptpRampActive = false;
+    if (wasActive) this.emitRun('cancelled');
   }
 
   /**
@@ -675,6 +867,18 @@ export class RVIKPath implements RVComponent {
     this.reset();
     if (wasActive) {
       for (const drive of this._axisDrives) {
+        // plan-673 Phase 4: a dynamic axis keeps its physics authority and its
+        // last SETPOINT — the actuator then holds the axis where it was
+        // commanded, working against gravity. Clearing `positionOverwrite`
+        // would hand it back to an integration that was never running, and
+        // snapping the setpoint to the measured position would be a step input
+        // the size of the following error.
+        if (isDynamicAxis(drive)) {
+          drive.targetPosition = Number.isFinite(drive.commandedPosition)
+            ? drive.commandedPosition
+            : drive.currentPosition;
+          continue;
+        }
         drive.positionOverwrite = false;
         drive.stop();
         drive.targetPosition = drive.currentPosition;
@@ -684,7 +888,23 @@ export class RVIKPath implements RVComponent {
   }
 
   /** Resolved, ordered target list (read-only) — used by the path visualizer. */
+  get axesAvailable(): number { return this._axisDrives.length; }
+
+  /** Signal being awaited, captured before cancel clears the state machine. */
+  get waitingFor(): string | null { return this.WaitForSignal ? this._waitSignalAddr : null; }
+
+  /** Resolved, ordered target list (read-only) — used by the path visualizer. */
   get targets(): readonly RVIKTarget[] { return this._path; }
+
+  /** The parent robot this path belongs to, or null — the web pendant of
+   *  Unity's `IKPath.RobotIK ?? GetComponentInParent<RobotIK>()`. Resolved once
+   *  in `init()`; read by the LIN replay and by the program export (plan-773). */
+  get robot(): RVRobotIK | null { return this._robot; }
+
+  /** The chained `StartNextPath`, or null. Read-only: the chain is authored in
+   *  the file, and the program export (plan-773 F16) walks it with its own
+   *  cycle guard exactly like `IKPathToProgram.cs:67`. */
+  get nextPath(): RVIKPath | null { return this._startNextPath; }
 
   /** Re-resolve the ordered target list from the (possibly overridden) raw
    *  `IKPath.Path` extras. Called from init() and again after op-created target
@@ -694,7 +914,7 @@ export class RVIKPath implements RVComponent {
     const pathArr = Array.isArray(raw['Path']) ? (raw['Path'] as unknown[]) : [];
     this._path = pathArr
       .filter(isRef)
-      .map((ref) => resolveComp<RVIKTarget>(registry, 'IKTarget', (ref as ComponentRef).path))
+      .map((ref) => resolveComp<RVIKTarget>(registry, 'IKTarget', storedReferenceValue(ref), this.node))
       .filter((t): t is RVIKTarget => t != null);
   }
 
@@ -730,6 +950,7 @@ export class RVIKPath implements RVComponent {
   }
 
   dispose(): void {
+    this._runListeners.clear();
     this._ownershipUnregister?.();
     this._ownershipUnregister = null;
     this._unsubStart?.();
@@ -755,15 +976,32 @@ export class RVIKPath implements RVComponent {
 }
 
 export function isRef(v: unknown): v is ComponentRef {
-  return !!v && typeof v === 'object'
-    && (v as Record<string, unknown>).type === 'ComponentReference'
-    && typeof (v as Record<string, unknown>).path === 'string';
+  // plan-769 Phase 3: THE guard — every stored form (path, address, kept path).
+  return isComponentReference(v);
 }
 
 /** Resolve a component by path, robust against undefined paths and Three.js node
- *  renames (duplicate-name dedup): falls back to node lookup → current path. */
-export function resolveComp<T>(registry: NodeRegistry, type: string, path: string | undefined): T | null {
-  if (typeof path !== 'string' || path.length === 0) return null;
+ *  renames (duplicate-name dedup): falls back to node lookup → current path.
+ *
+ *  plan-769 Phase 1b: with `referrer` (the node whose extras hold the reference)
+ *  the path is a STORED reference — read by its file's verdict (address /
+ *  migration; a typed miss on the named node is a miss), and the lookups below
+ *  run only for a path the file does not carry. */
+export function resolveComp<T>(
+  registry: NodeRegistry,
+  type: string,
+  path: StoredReferenceValue | string | null | undefined,
+  referrer?: Object3D | null,
+): T | null {
+  if (path === null || path === undefined || path === '') return null;
+  if (referrer) {
+    return registry.storedComponent<T>(referrer, path, type, {
+      legacy: (p) => resolveComp<T>(registry, type, p),
+    });
+  }
+  // An address names its target relative to a referrer's document — without one it
+  // names nothing (plan-769 Phase 3).
+  if (typeof path !== 'string') return null;
   const direct = registry.getByPath<T>(type, path);
   if (direct) return direct;
   const node = registry.getNode(path);
@@ -783,7 +1021,7 @@ export function resolveAxisDrivesFromNode(registry: NodeRegistry, node: Object3D
   if (!Array.isArray(axis)) return [];
   return axis
     .filter(isRef)
-    .map((ref) => resolveComp<RVDrive>(registry, 'Drive', (ref as ComponentRef).path))
+    .map((ref) => resolveComp<RVDrive>(registry, 'Drive', storedReferenceValue(ref), node))
     .filter((d): d is RVDrive => d != null);
 }
 

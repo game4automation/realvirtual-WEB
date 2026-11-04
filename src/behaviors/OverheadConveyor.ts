@@ -273,6 +273,10 @@ const def = {
     if (!self.isWired) self.sig.Run.set(true);
   },
 
+  // resolveNodeMaterialFlows includes this definition even without DES hooks.
+  // bindSceneToRunner binds every discovery result, so declare the carrier nodes.
+  des: { movedNodes: (self: OverheadSelf) => self.findAll('carrier') },
+
   continuous: {
     fixedUpdate(self: OverheadSelf, dt: number): void {
       const l = self.local;

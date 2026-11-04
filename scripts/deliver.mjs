@@ -32,9 +32,10 @@ import {
   readPlasticChangeset,
   resolveRequestedProjects,
 } from './_workspace-lib.mjs';
-import { customerRegistryPath } from './_rv-customers.mjs';
+import { customerRegistryPath, deliversDiagnosis } from './_rv-customers.mjs';
 import { assertValidProject } from './validate-project.mjs';
 import { ragSeedIndex, tmpDir } from './lib/rv-machine-paths.mjs';
+import { librarySourceArgv, parseLibrarySourceArgs } from './lib/rv-library-trim.mjs';
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const coreRoot = resolve(scriptDir, '..');
@@ -164,7 +165,25 @@ export function resolveDelivery({ token, customerFlag }) {
     remote: typeof config.remote === 'string' && config.remote.trim() ? config.remote.trim() : '<remote>',
     requestyApiKey: config.requestyApiKey,
     requestyBaseUrl: config.requestyBaseUrl,
+    // plan-679 Phase 2: the register's `support` decides the diagnosis package. A legacy
+    // delivery/<key>.json has no `support` and keeps its old default (with the package).
+    support: config.support,
   };
+}
+
+/**
+ * Whether this delivery ships WITHOUT the CONNECT diagnosis package, and why (plan-679 Phase 2).
+ *
+ * The register decides it — `support: "managed"` means diagnosis, anything else means none —
+ * so nobody has to remember to type `--no-rag` for a basic customer. There is deliberately no
+ * flag that forces diagnosis onto a basic customer: who needs it sets the customer to managed.
+ */
+export function ragDecision({ argv = [], projectless = false, support, projects = [] }) {
+  if (argv.includes('--no-rag')) return { noRag: true, reason: '--no-rag' };
+  if (projectless) return { noRag: true, reason: 'projectless' };
+  if (support === undefined) return { noRag: false, reason: 'legacy delivery config (no register support field)' };
+  if (!deliversDiagnosis({ support, projects })) return { noRag: true, reason: `register: support=${support}` };
+  return { noRag: false, reason: 'register: support=managed' };
 }
 
 //! Picks the win-x64 artifact from a v1 (flat) or v2 (platforms map) CONNECT channel manifest.
@@ -279,6 +298,32 @@ Flags:
                  rule says otherwise, and this is the one place that says so out loud.
   --no-rag       deliver without the CONNECT diagnosis package (no rag.zip, no connect/ folder).
                  Neither the RAG seed index nor a <projectKey>.diagnosis.json preset is needed.
+                 Implied by the register for every customer that is not support "managed"
+                 (and for projectless customers): you only type it to drop the package
+                 from a managed delivery.
+  --release-check <out.json> --release-version X.Y.Z
+                 plan-679: run every check of this delivery WITHOUT pushing, before the release
+                 tag exists: staging, guards (all findings, not the first), build incl. third-party
+                 notices, and the tier diff against the customer's last delivery (read with a bare,
+                 blob-filtered clone - nothing is written to the remote, no dependency archive is
+                 uploaded). The diagnosis package is built into the content-keyed cache. Writes the
+                 result to <out.json>; exit 2 when a check failed. New private files are approval
+                 findings, not failures.
+  --accept-private-files <file.json>
+                 the APPROVED new private files, { "<target>": [paths] } (the release approval).
+                 Every new file must be on it; any other aborts the delivery and names it.
+  --connect-lock <file>  use this CONNECT pin instead of resolving the channel (release push).
+  --rag-expect <key>,<zipSha256>,<configSha256>
+                 release push: reuse exactly the cached diagnosis package of the dry-run.
+  --receipt <file>
+                 release push: the dry-run receipt (the commit body then carries the approved
+                 release notes; without a matching CHANGELOG section the delivery fails).
+  --library <projectId>=<folder>   (repeatable)
+  --projects-dir <dir>
+                 plan-778: where the library projects of the delivered projects are found
+                 (project.json libraries[]). They ship trimmed under projects/<key>/libraries/<id>/.
+                 Default: by id in the private tree's projects/. An id no source knows fails the
+                 delivery before anything is built.
   --no-deps-archive
                  skip packing and publishing the node_modules archive; the customer restores
                  dependencies with npm ci instead. The archive is named after the DELIVERING
@@ -328,6 +373,30 @@ async function main() {
   // the documented `deliver.mjs <projectKey>` form fail with "Missing <projectKey>". Only skip the
   // value slot when there actually is a --customer to consume it.
   if (customerIndex >= 0) consumed.add(customerIndex + 1);
+  // plan-679: value flags of the release path. Their values must never read as the slug.
+  const valueFlag = (name) => {
+    const index = argv.indexOf(name);
+    if (index < 0) return null;
+    const value = argv[index + 1];
+    if (!value || value.startsWith('--')) fail(`${name} needs a value.`);
+    consumed.add(index + 1);
+    return value;
+  };
+  const releaseCheckOut = valueFlag('--release-check');
+  const releaseVersion = valueFlag('--release-version');
+  const approvedFiles = valueFlag('--accept-private-files');
+  const ragExpect = valueFlag('--rag-expect');
+  const connectLockOverride = valueFlag('--connect-lock');
+  const receiptFile = valueFlag('--receipt');
+  // plan-778 F15: library sources, handed on to the generator unchanged. Their values are
+  // consumed so that a folder never reads as the slug.
+  argv.forEach((token, index) => {
+    if ((token === '--library' || token === '--projects-dir') && argv[index + 1] && !argv[index + 1].startsWith('--')) {
+      consumed.add(index + 1);
+    }
+  });
+  let librarySources;
+  try { librarySources = parseLibrarySourceArgs(argv); } catch (error) { fail(error.message); }
   const projectsIndex = argv.indexOf('--projects');
   const requestedProjects = [];
   if (projectsIndex >= 0) {
@@ -349,28 +418,41 @@ async function main() {
   const force = argv.includes('--force');
   const acceptNewPrivateFiles = argv.includes('--accept-new-private-files');
   const dryRun = !push; // never push unless explicitly asked
+  // plan-679 Phase 4: the release check — every check of a delivery, no push, before the tag.
+  const releaseCheck = releaseCheckOut !== null;
+  if (releaseCheck && push) fail('--release-check never pushes; it cannot be combined with --push.');
+  if (releaseCheck && !releaseVersion) fail('--release-check needs --release-version X.Y.Z (the version about to be released).');
+  if (releaseVersion && !/^\d+\.\d+\.\d+(?:[-+].+)?$/.test(releaseVersion)) fail(`--release-version must be X.Y.Z (got "${releaseVersion}").`);
+  if (approvedFiles && acceptNewPrivateFiles) fail('--accept-private-files and --accept-new-private-files exclude each other.');
+  if (acceptNewPrivateFiles) {
+    console.warn('[deliver] WARNING: --accept-new-private-files accepts EVERY new private file unseen. '
+      + 'It is kept for a manual single delivery; a release passes the approved list (--accept-private-files).');
+  }
 
   const version = JSON.parse(readFileSync(join(coreRoot, 'package.json'), 'utf8')).version;
 
   // ── Resolve the request to ONE customer repository. ────────────────────────────────────
-  const { channel, remote, projects, primary, kind, customer: customerSlug, requestyApiKey, requestyBaseUrl } =
+  const { channel, remote, projects, primary, kind, customer: customerSlug, requestyApiKey, requestyBaseUrl, support } =
     resolveDelivery({ token: requestedKey, customerFlag: customer });
   const projectKey = primary;
   // A `standard` customer receives the product with an empty `projects/` folder.
   // There is no corpus to embed and no diagnosis preset to read, so --no-rag is
   // not a choice here, it is the only shape this delivery has (plan-434 Phase 4).
   const projectless = projects.length === 0;
-  const noRag = argv.includes('--no-rag') || projectless;
+  const { noRag, reason: noRagReason } = ragDecision({ argv, projectless, support, projects });
   const noDepsArchive = argv.includes('--no-deps-archive');
   console.log(`[deliver] ${projectless ? `customer=${customerSlug} (projectless)` : `project=${projectKey}`}`
-    + ` mode=${push ? 'PUSH' : 'dry-run'}${fast ? ' fast' : ''}${noRag ? ' no-rag' : ''} viewer=${version}`);
+    + ` mode=${push ? 'PUSH' : 'dry-run'}${fast ? ' fast' : ''}${noRag ? ` no-rag (${noRagReason})` : ''} viewer=${version}`);
   if (projectless) console.log(`[deliver] ${kind} customer: projectless delivery, no RAG`);
   if (projects.length > 1) console.log(`[deliver] repository carries ${projects.length} projects: ${projects.join(', ')}`);
 
   // ── Preflight: fail early, before any path resolution, network, or build. ──────────────
   assertCleanTree('realvirtual-WebViewer~ (core)', coreRoot);
   assertCleanTree('realvirtual-WebViewer-Private~ (private)', privateRoot);
-  assertReleaseTag(coreRoot, version);
+  // The release check runs BEFORE the tag (plan-679 Gate R1 finding 1): clean trees are its
+  // whole precondition, the planned version lives only in --release-version.
+  if (releaseCheck) console.log(`[deliver] release check for ${releaseVersion} (current package.json ${version}); no release tag required.`);
+  else assertReleaseTag(coreRoot, version);
   // The project validator is a GATE, not a suggestion (F10 / B12). It used to
   // exist and be wired into nothing, so an invalid manifest, a secret committed
   // into a project, or a vendor glob pointing at the customer's own scenes all
@@ -381,19 +463,27 @@ async function main() {
   // A projectless delivery gates nothing here — there is no project to validate,
   // which is exactly what the count below says.
   for (const key of projects) assertValidProject(join(privateRoot, 'projects', key), `projects/${key}`);
-  console.log(`[deliver] preflight ok: both trees clean, release tag present, ${projects.length} project(s) valid.`);
+  console.log(`[deliver] preflight ok: both trees clean, ${releaseCheck ? 'release check (no tag yet)' : 'release tag present'}, ${projects.length} project(s) valid.`);
 
   // --no-rag ships a workspace without the CONNECT diagnosis package. Both inputs below exist
   // only to build that package, so neither is resolved — and neither is required — in that mode.
   let diagnosisConfig = null;
   let seedIndex = null;
   let seedIndexOrigin = null;
+  // In a release check a missing diagnosis input is a FINDING, not the end of the run: the target
+  // is still staged, built and tier-checked without the package and reported `ok: false`
+  // (plan-679 Gate R2 finding 5). On every other path it stops the delivery, as before.
+  let diagnosisUnavailable = null;
+  const diagnosisFail = (message) => {
+    if (!releaseCheck) fail(message);
+    if (!diagnosisUnavailable) diagnosisUnavailable = message.split('\n').map((line) => line.trim()).filter(Boolean).join(' ');
+  };
   if (noRag) {
     console.log('[deliver] no-rag:            no diagnosis package (seed index and diagnosis preset not required)');
   } else {
     diagnosisConfig = join(presetsDir, `${projectKey}.diagnosis.json`);
     if (!existsSync(diagnosisConfig)) {
-      fail(`Diagnosis preset not found:\n  ${diagnosisConfig}\n  Expected ../realvirtual-Connect~/tools/presets/${projectKey}.diagnosis.json\n  Or deliver without the diagnosis package: --no-rag`);
+      diagnosisFail(`Diagnosis preset not found:\n  ${diagnosisConfig}\n  Expected ../realvirtual-Connect~/tools/presets/${projectKey}.diagnosis.json\n  Or deliver without the diagnosis package: --no-rag`);
     }
 
     // The seed index is the embedded form of THIS customer's document corpus - not shared
@@ -416,7 +506,7 @@ async function main() {
       seedIndexSource = 'machine-global (legacy)';
     }
     if (!existsSync(seedIndex)) {
-      fail(`RAG seed index not found:\n  ${seedIndex}\n  Commit the project index to ${projectSeedIndex},\n  set RV_RAG_SEED_INDEX, or start CONNECT and trigger /diagnose once to build the vector index.\n  Or deliver without the diagnosis package: --no-rag`);
+      diagnosisFail(`RAG seed index not found:\n  ${seedIndex}\n  Commit the project index to ${projectSeedIndex},\n  set RV_RAG_SEED_INDEX, or start CONNECT and trigger /diagnose once to build the vector index.\n  Or deliver without the diagnosis package: --no-rag`);
     }
     seedIndexOrigin = seedIndexSource;
   }
@@ -428,7 +518,21 @@ async function main() {
   mkdirSync(tmpBase, { recursive: true });
   console.log(`[deliver] temp:             ${tmpBase} (${tmpOverride ? 'RV_DELIVER_TMP' : 'forced default, override with RV_DELIVER_TMP'})`);
 
-  const { lockPath, source, channel: effectiveChannel } = await resolveConnectLock(channel, tmpBase);
+  // plan-679 Gate R2 finding 4: a release push uses the CONNECT pin the dry-run resolved (handed
+  // in as --connect-lock by deliver-release), never a fresh resolution of the channel.
+  let connectLock;
+  if (connectLockOverride) {
+    const lockPath = resolve(connectLockOverride);
+    if (!existsSync(lockPath)) fail(`--connect-lock points to a missing file: ${lockPath}`);
+    if (process.env.RV_CONNECT_LOCK && resolve(process.env.RV_CONNECT_LOCK) !== lockPath) {
+      const differs = readFileSync(resolve(process.env.RV_CONNECT_LOCK), 'utf8') !== readFileSync(lockPath, 'utf8');
+      if (differs) fail('RV_CONNECT_LOCK differs from the CONNECT pin of the release receipt (--connect-lock). Unset it or run a new dry-run.');
+    }
+    connectLock = { lockPath, source: '--connect-lock', channel: JSON.parse(readFileSync(lockPath, 'utf8')).channel ?? channel };
+  } else {
+    connectLock = await resolveConnectLock(channel, tmpBase);
+  }
+  const { lockPath, source, channel: effectiveChannel } = connectLock;
 
   if (!noRag) {
     console.log(`[deliver] diagnosis-config: ${diagnosisConfig}`);
@@ -446,8 +550,16 @@ async function main() {
   if (requestedProjects.length) args.push('--projects', ...requestedProjects);
   if (force) args.push('--force');
   if (acceptNewPrivateFiles) args.push('--accept-new-private-files');
+  if (approvedFiles) args.push('--accept-private-files', resolve(approvedFiles));
   if (noRag) args.push('--no-rag');
+  else if (diagnosisUnavailable) args.push('--diagnosis-unavailable', diagnosisUnavailable);
   else args.push('--seed-index', seedIndex, '--diagnosis-config', diagnosisConfig);
+  // plan-679 A4: the diagnosis package goes through the content-keyed cache on the release path —
+  // built once in the release check, reused by the push that names its key (--rag-expect).
+  if (!noRag && !diagnosisUnavailable && (releaseCheck || ragExpect)) args.push('--rag-cache', join(tmpBase, 'rag-cache'));
+  if (ragExpect) args.push('--rag-expect', ragExpect);
+  if (releaseCheck) args.push('--release-check', resolve(releaseCheckOut), '--release-version', releaseVersion);
+  if (receiptFile) args.push('--receipt', resolve(receiptFile));
   // Forwarded explicitly, like every other flag: this list is the generator's whole command
   // line, so a flag missing here is silently ignored rather than rejected - which is how a
   // release once paid for a 90 MB archive it had asked not to build.
@@ -455,6 +567,7 @@ async function main() {
   if (push) args.push('--push');
   if (dryRun) args.push('--dry-run');
   if (fast) args.push('--fast');
+  args.push(...librarySourceArgv(librarySources));
 
   const childEnv = { ...process.env };
   // The diagnosis credentials, resolved like the three paths above: the environment wins (a one-off

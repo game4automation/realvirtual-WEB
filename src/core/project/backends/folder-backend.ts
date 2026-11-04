@@ -57,7 +57,6 @@ import {
 import { isPrivateSegment, isStagingPath } from '../rv-asset-identity';
 import {
   type RvDocumentEntry,
-  type RvProjectSceneEntry,
   type RvProject,
 } from '../rv-project-types';
 import {
@@ -682,7 +681,7 @@ export class FolderBackend implements ProjectBackend {
    * invented from a filename here, because a wrong id is worse than a missing
    * one — it would make the record claim to be a scene it is not.
    */
-  private async _entryForPath(relPath: string): Promise<Partial<RvProjectSceneEntry>> {
+  private async _entryForPath(relPath: string): Promise<Partial<RvDocumentEntry>> {
     const fromHost = (readDocuments(this._manifest()) ?? []).find(e => e.path === relPath);
     if (fromHost) return fromHost;
     let onDisk: RvDocumentEntry | undefined;

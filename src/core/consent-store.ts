@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, readSessionStorage, removeLocalStorage, removeSessionStorage, writeLocalStorage, writeSessionStorage } from './rv-safe-storage';
+
 /**
  * Analytics consent (GDPR / §25 TDDDG).
  *
@@ -39,7 +41,7 @@ let sessionDeclined = false;
 
 function readInitial(): boolean {
   try {
-    return localStorage.getItem(STORAGE_KEY) === 'granted';
+    return readLocalStorage(STORAGE_KEY) === 'granted';
   } catch {
     return false; // private mode / storage disabled
   }
@@ -63,7 +65,7 @@ export function hasAnalyticsConsent(): boolean {
 export function grantAnalyticsConsent(): void {
   if (granted) return;
   granted = true;
-  try { localStorage.setItem(STORAGE_KEY, 'granted'); } catch { /* private mode */ }
+  writeLocalStorage(STORAGE_KEY, 'granted');
   emit();
 }
 
@@ -71,7 +73,7 @@ export function grantAnalyticsConsent(): void {
 export function resetAnalyticsConsent(): void {
   if (!granted) return;
   granted = false;
-  try { localStorage.removeItem(STORAGE_KEY); } catch { /* private mode */ }
+  removeLocalStorage(STORAGE_KEY);
   emit();
 }
 
@@ -89,7 +91,7 @@ export function readConsentUrlDirective(search: string): 'decline' | null {
 
 /** Record a decline for this browser session (never persisted beyond it). */
 export function declineAnalyticsForSession(): void {
-  try { sessionStorage.setItem(SESSION_DECLINE_KEY, '1'); } catch { /* storage disabled */ }
+  writeSessionStorage(SESSION_DECLINE_KEY, '1');
   sessionDeclined = true;
   emit();
 }
@@ -97,14 +99,14 @@ export function declineAnalyticsForSession(): void {
 /** Forget the session decline — the dialog is asked again on the next boot. */
 export function resetAnalyticsSessionDecline(): void {
   sessionDeclined = false;
-  try { sessionStorage.removeItem(SESSION_DECLINE_KEY); } catch { /* storage disabled */ }
+  removeSessionStorage(SESSION_DECLINE_KEY);
   emit();
 }
 
 /** True when this session declined analytics — a state distinct from consent. */
 export function hasAnalyticsSessionDecline(): boolean {
   if (sessionDeclined) return true;
-  try { return sessionStorage.getItem(SESSION_DECLINE_KEY) === '1'; } catch { return false; }
+  try { return readSessionStorage(SESSION_DECLINE_KEY) === '1'; } catch { return false; }
 }
 
 function subscribe(cb: () => void): () => void {

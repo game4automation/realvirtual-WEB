@@ -2,13 +2,18 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * Tests for attachAasLink (runtime drive-datasheet attach) and the documentation-
- * mode gating of the registered 'aas' tooltip data resolver.
+ * AAS links come only from authored data — no name rule attaches one (the SEW
+ * demo shell auto-attach was removed) — plus the documentation-mode gating of
+ * the registered 'aas' tooltip data resolver.
  */
 
 import { describe, it, expect } from 'vitest';
-import { Object3D, Mesh, BoxGeometry, MeshBasicMaterial, Vector3 } from 'three';
-import { attachAasLink, SEW_DRIVE_AAS, isDriveDatasheetNode } from '../src/behaviors/_shared/aas-link';
+import { Object3D, Mesh, BoxGeometry, MeshBasicMaterial, Vector3, Scene, Group } from 'three';
+import { processExtras } from '../src/core/engine/rv-scene-loader';
+import { buildInitContext } from '../src/core/engine/rv-init-context';
+import { NodeRegistry } from '../src/core/engine/rv-node-registry';
+import { SignalStore } from '../src/core/engine/rv-signal-store';
+import { RVTransportManager } from '../src/core/engine/rv-transport-manager';
 // Side-effect import registers the real 'aas' data resolver; also pull the
 // documentation-mode motor-bbox hover resolver for direct testing.
 import { findGatedAasAtPoint } from '../src/plugins/aas-link-plugin';
@@ -20,57 +25,6 @@ function withResolution(node: Object3D, resolution: AasResolution = 'resolved'):
   node.userData[AAS_RESOLUTION_KEY] = resolution;
   return node;
 }
-
-describe('attachAasLink', () => {
-  it('writes the standard AAS representation + gated flag', () => {
-    const node = new Object3D();
-    attachAasLink(node, SEW_DRIVE_AAS.aasId, SEW_DRIVE_AAS.description);
-
-    const rv = node.userData.realvirtual as Record<string, unknown>;
-    expect(rv.AASLink).toEqual({ AASId: SEW_DRIVE_AAS.aasId, Description: SEW_DRIVE_AAS.description });
-    expect(node.userData._rvAasLink).toEqual({
-      aasId: SEW_DRIVE_AAS.aasId,
-      description: SEW_DRIVE_AAS.description,
-      serverUrl: '',
-      gated: true,
-    });
-  });
-
-  it('marks the node pending so no AAS surface shows before the index answered', () => {
-    const node = new Object3D();
-    attachAasLink(node, SEW_DRIVE_AAS.aasId, SEW_DRIVE_AAS.description);
-    expect(node.userData[AAS_RESOLUTION_KEY]).toBe('pending');
-  });
-
-  it('is a no-op for a null node', () => {
-    expect(() => attachAasLink(null, 'x', 'y')).not.toThrow();
-  });
-
-  it('does not overwrite an existing / authored AAS link', () => {
-    const node = new Object3D();
-    node.userData._rvAasLink = { aasId: 'authored', description: 'Authored' };
-    attachAasLink(node, SEW_DRIVE_AAS.aasId, SEW_DRIVE_AAS.description);
-    expect((node.userData._rvAasLink as { aasId: string }).aasId).toBe('authored');
-  });
-
-  it('does not overwrite an existing realvirtual.AASLink marker', () => {
-    const node = new Object3D();
-    node.userData.realvirtual = { AASLink: { AASId: 'authored', Description: 'A' } };
-    attachAasLink(node, SEW_DRIVE_AAS.aasId, SEW_DRIVE_AAS.description);
-    expect((node.userData.realvirtual.AASLink as { AASId: string }).AASId).toBe('authored');
-    expect(node.userData._rvAasLink).toBeUndefined();
-  });
-
-  it('preserves existing realvirtual keys and _rvType', () => {
-    const node = new Object3D();
-    node.userData.realvirtual = { LayoutObject: { id: 1 } };
-    node.userData._rvType = 'Drive';
-    attachAasLink(node, SEW_DRIVE_AAS.aasId, SEW_DRIVE_AAS.description);
-    expect(node.userData.realvirtual.LayoutObject).toEqual({ id: 1 });
-    expect(node.userData.realvirtual.AASLink).toBeDefined();
-    expect(node.userData._rvType).toBe('Drive'); // not clobbered to 'AASLink'
-  });
-});
 
 describe('aas resolver documentation-mode gating', () => {
   const resolver = tooltipRegistry.getDataResolver('aas');
@@ -109,17 +63,38 @@ describe('aas resolver documentation-mode gating', () => {
   });
 });
 
-describe('isDriveDatasheetNode (GLB-First name contract)', () => {
-  it('matches motor/antrieb and library drive meshes', () => {
-    for (const n of ['Motor', 'Motor_2', 'Antrieb', 'DriveMesh', 'DriveRotate', 'DriveRolls']) {
-      expect(isDriveDatasheetNode(n), n).toBe(true);
+describe('no name-based AAS attach (authored data only)', () => {
+  function load(node: Object3D): void {
+    const scene = new Scene();
+    const root = new Group();
+    root.add(node);
+    scene.add(root);
+    const transportManager = new RVTransportManager();
+    transportManager.scene = scene;
+    processExtras(root, buildInitContext({
+      registry: new NodeRegistry(), signalStore: new SignalStore(), transportManager, scene,
+    }));
+  }
+
+  it('a node named "Motor_X" gets NO AAS link without authored data', () => {
+    for (const name of ['Motor_X', 'Antrieb', 'DriveMesh', 'DriveRolls']) {
+      const node = new Object3D();
+      node.name = name;
+      node.add(new Mesh(new BoxGeometry(1, 1, 1), new MeshBasicMaterial()));
+      load(node);
+      expect(node.userData._rvAasLink, name).toBeUndefined();
+      expect((node.userData.realvirtual as Record<string, unknown> | undefined)?.AASLink, name).toBeUndefined();
+      expect(node.userData[AAS_RESOLUTION_KEY], name).toBeUndefined();
     }
   });
 
-  it('does NOT match the Drive-Lin/Rot logic nodes (they contain the belt) or plain parts', () => {
-    for (const n of ['Drive-Rot-Y', 'Drive-Lin-Y', 'Drive-Rot-X', 'Transport-Z', 'Belt', 'BeltSurfaceTop', 'ConveyorEntry1', 'Base', 'Sensor', 'Roll']) {
-      expect(isDriveDatasheetNode(n), n).toBe(false);
-    }
+  it('an authored AASLink on "Motor_X" is kept as authored (not gated)', () => {
+    const node = new Object3D();
+    node.name = 'Motor_X';
+    node.userData.realvirtual = { AASLink: { AASId: 'urn:festo:motor', Description: 'Festo' } };
+    load(node);
+    expect(node.userData._rvAasLink).toMatchObject({ aasId: 'urn:festo:motor', description: 'Festo' });
+    expect((node.userData._rvAasLink as { gated?: boolean }).gated).toBeUndefined();
   });
 });
 

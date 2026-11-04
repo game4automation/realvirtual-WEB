@@ -122,6 +122,11 @@ describe('MU accumulation — core clamp', () => {
     expect(follower.aabb.overlaps(leader.aabb)).toBe(false);
     expect(follower.blocked).toBe(true);
     expect(leader.blocked).toBe(false);
+    expect(follower.blockedBy).toBe(leader.id);
+    expect(leader.blockedBy).toBeNull();
+    setSpeed(A, 0);
+    run(manager, 1);
+    expect(follower.blockedBy).toBeNull();
   });
 
   it('jam releases when leader moves again', () => {
@@ -383,6 +388,36 @@ describe('MU accumulation — edge cases', () => {
     expect(gapX(follower, leader)).toBeGreaterThanOrEqual(-1e-6);
   });
 
+  it('a held leader still blocks until it is lifted clear (grip at the head of a queue)', () => {
+    // Festo cell, 2026-10-15: the gripper closed on the box at the stop and the
+    // next box drove 10-47 mm into it while it was still being lifted, because
+    // held MUs were skipped as leaders.
+    const manager = createManager();
+    const A = createSurface(0, 0, 0, new Vector3(1, 0.1, 0.5), new Vector3(1, 0, 0), 500);
+    const B = createSurface(2, 0, 0, new Vector3(1, 0.1, 0.5), new Vector3(1, 0, 0), 0);
+    A.MinGap = 10;
+    manager.surfaces.push(A, B);
+
+    const leader = createMU('leader', 1.08, 0, 0);   // parked on stopped B
+    const follower = createMU('follower', 0, 0, 0);
+    manager.mus.push(leader, follower);
+    run(manager, 300);
+    expect(follower.blocked).toBe(true);
+
+    // Gripper closes, the box has not moved yet: the follower must stay put.
+    leader.heldBy = 'grip';
+    const queued = follower.getPosition().x;
+    run(manager, 60);
+    expect(follower.getPosition().x).toBeCloseTo(queued, 5);
+    expect(follower.aabb.overlaps(leader.aabb)).toBe(false);
+
+    // Lifted clear of the follower (box 0.1 m tall): the follower moves on until
+    // it reaches the stopped belt B (~80 mm here) - it is no longer held back.
+    leader.node.position.y += 0.2;
+    run(manager, 60);
+    expect(follower.getPosition().x).toBeGreaterThan(queued + 0.05);
+  });
+
   it('instanced MUs accumulate identically to clone MUs', () => {
     // Same seam scenario with both IMUAccessor backends — final positions must
     // match (the clamp reads candidate AABBs, never the shared pool temp).
@@ -397,6 +432,7 @@ describe('MU accumulation — edge cases', () => {
       run(manager, 300);
       expect(follower.aabb.overlaps(leader.aabb)).toBe(false);
       expect(follower.blocked).toBe(true);
+      expect(follower.blockedBy).toBe(leader.id);
       return { leaderX: leader.aabb.center.x, followerX: follower.aabb.center.x };
     };
 

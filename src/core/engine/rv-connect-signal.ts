@@ -9,6 +9,8 @@ import { debug } from './rv-debug';
 import { createSignalWriter, type SignalStore, type SignalWriter } from './rv-signal-store';
 import { isSignalLiveControlled, subscribeLiveControl } from './rv-slot-authority';
 import { wireValueSignal } from './rv-signal-wiring';
+import { connectSignalConvert, kindOfPlcType, type ValueKind } from './rv-signal-convert-core';
+import { addConnectSignalRelay, removeConnectSignalRelay, type LegacyRelayEdge } from './rv-signal-connector-link';
 
 /**
  * RVConnectSignal — TypeScript port of ConnectSignal.cs
@@ -31,6 +33,14 @@ import { wireValueSignal } from './rv-signal-wiring';
  * during the suppression — until the source happened to move again. It
  * therefore subscribes to the live-control TRANSITION of its target and
  * re-copies the current source value once on `true → false`.
+ *
+ * **Unity parity (plan-2227 F2).** The copy follows `ConnectSignal.cs`: an INT
+ * source onto a BOOL target is `> 0` (a negative INT is false), a BOOL source
+ * onto an INT target is 1/0, every other pair is copied raw — through the shared
+ * kernel `connectSignalConvert`, on change, on re-apply AND on the resync. The
+ * kinds come from the PLC types of the two signals; an untyped signal is copied
+ * raw as before. The relay also joins the SignalConnector network, so a
+ * SignalConnector writing the same target is reported as fan-in.
  */
 export class RVConnectSignal implements RVComponent {
   // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
@@ -51,6 +61,9 @@ export class RVConnectSignal implements RVComponent {
   /** Store NAME of this node's own signal — the key the live-control gate uses. */
   private _targetName: string | null = null;
   private _liveControlUnsub: (() => void) | null = null;
+  private _sourceKind: ValueKind | undefined = undefined;
+  private _targetKind: ValueKind | undefined = undefined;
+  private _relayEdge: LegacyRelayEdge | null = null;
 
   constructor(node: Object3D) {
     this.node = node;
@@ -68,6 +81,10 @@ export class RVConnectSignal implements RVComponent {
     // here rather than per write. A node without a registered signal simply has
     // no gate to respect (and nothing external could bind it either).
     this._targetName = context.signalStore.nameForPath(thisPath) ?? null;
+    const store = context.signalStore;
+    // Narrow store doubles in tests may lack the type lookup: untyped = raw copy.
+    this._sourceKind = kindOfPlcType(store.getType?.(store.nameForPath(sourceAddr) ?? sourceAddr));
+    this._targetKind = kindOfPlcType(this._targetName ? store.getType?.(this._targetName) : undefined);
     this._writer = createSignalWriter(
       context.signalStore,
       `component:ConnectSignal:${thisPath}`,
@@ -77,13 +94,12 @@ export class RVConnectSignal implements RVComponent {
 
     // Copy the source onto this node's signal — on the initial read, on every
     // change, and (plan-427) on every re-apply after reset/reconnect. The RAW
-    // helper: a ConnectSignal forwards bools AND numbers verbatim, so neither
-    // the bool nor the number coercion may touch the value. Skipping an
-    // unresolved source is the helper's contract and matches the hand-written
-    // `if (initial !== undefined)` guard this replaces.
+    // helper: the only coercion is the Unity ConnectSignal rule (F2), applied
+    // by `_convert`. Skipping an unresolved source is the helper's contract and
+    // matches the hand-written `if (initial !== undefined)` guard this replaces.
     this._unsubscribe = wireValueSignal(context.signalStore, sourceAddr, (value) => {
       if (this._isSuppressed()) return;
-      this._writer?.setByPath(thisPath, value);
+      this._writer?.setByPath(thisPath, this._convert(value));
     }, undefined, context.reapply).unsubscribe;
 
     // Resynchronise the moment an external binding lets go: read the CURRENT
@@ -93,11 +109,20 @@ export class RVConnectSignal implements RVComponent {
       this._liveControlUnsub = subscribeLiveControl(this._targetName, (controlled) => {
         if (controlled) return;
         const current = this._store?.getByPath(this._sourceAddr ?? '');
-        if (current !== undefined) this._writer?.setByPath(this._thisPath, current);
+        if (current !== undefined) this._writer?.setByPath(this._thisPath, this._convert(current));
       });
     }
 
+    this._relayEdge = { sourcePath: sourceAddr, targetPath: thisPath };
+    addConnectSignalRelay(context.signalStore, this._relayEdge);
+
     debug('loader', `  ConnectSignal: ${this.node.name} copies "${sourceAddr}" → "${thisPath}"`);
+  }
+
+  /** The Unity ConnectSignal rule; the kind of an untyped source follows its value. */
+  private _convert(value: boolean | number): boolean | number {
+    const sourceKind = this._sourceKind ?? (typeof value === 'boolean' ? 'bool' : undefined);
+    return connectSignalConvert(value, sourceKind, this._targetKind);
   }
 
   /** True while an external binding owns this node's signal. */
@@ -106,6 +131,9 @@ export class RVConnectSignal implements RVComponent {
   }
 
   dispose(): void {
+    // Unsubscribe FIRST: leaving the network re-checks it and can release a
+    // connector this relay blocked (a cycle A → B, B → A). Were the relay still
+    // subscribed, the released connector and the relay would feed each other.
     if (this._unsubscribe) {
       this._unsubscribe();
       this._unsubscribe = null;
@@ -114,6 +142,10 @@ export class RVConnectSignal implements RVComponent {
       this._liveControlUnsub();
       this._liveControlUnsub = null;
     }
+    if (this._relayEdge && this._store) {
+      removeConnectSignalRelay(this._store, this._relayEdge);
+    }
+    this._relayEdge = null;
     this._writer = null;
     this._store = null;
     this._sourceAddr = null;

@@ -22,7 +22,7 @@
  *
  * Hard rules:
  * - The merged pick geometries of the batched render pipeline are never touched
- *   (see doc-render-picking.md) — only per-mesh `boundsTree`s.
+ *   (see contract-bake-picking.md) — only per-mesh `boundsTree`s.
  * - The simulation is never stopped or paused. A hit outlines the involved
  *   nodes (OutlinePass status channel — the error-message silhouette) and adds
  *   a card in the right-side messages panel. Both LATCH: they stay after the

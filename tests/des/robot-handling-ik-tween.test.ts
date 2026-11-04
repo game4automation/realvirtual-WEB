@@ -3,15 +3,15 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Object3D, Vector3 } from 'three';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
-import { MaterialFlowAdapter } from '@rv-private/plugins/des/material-flow-adapter';
+import { DESRunner } from '@rv/plugins/des/des-runner';
+import { MaterialFlowAdapter } from '@rv/plugins/des/material-flow-adapter';
 import {
   RobotHandling,
   cycleDuration,
-} from '@rv-private/plugins/des/material-flow/RobotHandling';
-import { _resetDesHookCache } from '@rv-private/plugins/des/des-hook-adapter';
-import type { DESMU } from '@rv-private/plugins/des/rv-des-mu';
-import { resetDESMUCounter } from '@rv-private/plugins/des/rv-des-mu';
+} from '@rv/plugins/des/material-flow/RobotHandling';
+import { _resetDesHookCache } from '@rv/plugins/des/des-hook-adapter';
+import type { DESMU } from '@rv/plugins/des/rv-des-mu';
+import { resetDESMUCounter } from '@rv/plugins/des/rv-des-mu';
 import {
   createSelf,
   type MaterialFlowSelf,
@@ -30,6 +30,7 @@ import {
 } from '../../src/core/behavior-runtime';
 import { EventEmitter } from '../../src/core/rv-events';
 import { ContextMenuStore } from '../../src/core/hmi/context-menu-store';
+import { testAddressRegistry } from '../helpers/test-address-registry';
 import { NodeRegistry, type ComponentRef } from '../../src/core/engine/rv-node-registry';
 import { SignalStore } from '../../src/core/engine/rv-signal-store';
 import type { ComponentContext } from '../../src/core/engine/rv-component-registry';
@@ -89,6 +90,8 @@ function makeHost(registry: NodeRegistry, store: SignalStore, drives: RVDrive[])
     contextMenu: new ContextMenuStore(),
     drives,
     registry,
+    // plan-2059 D7: the snapshot needs DES ids; this fixture's NodeRegistry carries no NodeIds.
+    desAddresses: testAddressRegistry(),
     getPlugin: () => undefined,
   } as unknown as BindContextHost;
 }
@@ -211,7 +214,7 @@ function bind(
     })(),
   });
   Object.assign(self.prop, config);
-  adapter = runner.addInstance(def, self, node);
+  adapter = runner.addInstance(def, self, node, undefined, { desId: node.name + '@' + def.type });
   return { def, self, adapter, node };
 }
 
@@ -376,6 +379,8 @@ describe('RobotHandling IK binding', () => {
         moveTimeToHome: 1,
       },
     };
+    // plan-2059 D7: the snapshot needs DES ids; this fixture's NodeRegistry carries no NodeIds.
+    fixture.host.desAddresses = testAddressRegistry();
     const runner = new DESRunner();
     runner.start([RobotDefinition], { root: fixture.root, host: fixture.host });
     const instance = runner.liveInstances.find((entry) => entry.def.type === 'RobotHandling')!;
@@ -391,6 +396,8 @@ describe('RobotHandling IK binding', () => {
     expect(instance.self.prop.waypointPick).toBe(fixture.targetPaths.pick);
 
     const snapshot = JSON.parse(runner.snapshotJson());
+    // The corrupted ref still resolves to the robot, so its axis drives stay collected (plan-2059 P8: drives are addressed, not dropped).
+    fixture.registry.register('RobotIK', 'corrupted', fixture.robot);
     instance.self.prop.robotRef = 'corrupted';
     runner.restoreFull(snapshot);
     expect(instance.self.prop.robotRef).toBe('Robot');
@@ -447,6 +454,7 @@ describe('RobotHandling IK binding', () => {
     expect(h.fixture.path?.getLiveState().OwnershipPaused).toBe(true);
     h.runner.tick(1);
     h.runner.lateTick(0);
+    const tweensAtSnapshot = h.runner.getTweenRegistry().activeCount;
     const snapshot = JSON.parse(h.runner.snapshotJson());
     h.runner.tick(5);
     h.runner.lateTick(0);
@@ -459,7 +467,8 @@ describe('RobotHandling IK binding', () => {
     expect(h.fixture.drives.map((drive) => drive.currentPosition)).toEqual([10, 20]);
     expect(h.fixture.path?.getLiveState().OwnershipPaused).toBe(true);
     expect(claimedAxisCount()).toBe(h.fixture.drives.length);
-    expect(h.runner.getTweenRegistry().activeCount).toBe(0);
+    // plan-2059 P8: drive tween windows are part of the snapshot and relinked on restore.
+    expect(h.runner.getTweenRegistry().activeCount).toBe(tweensAtSnapshot);
     h.runner.tick(5);
     h.runner.lateTick(0);
     const restoredKpis = h.runner.kpiSnapshot();
@@ -556,11 +565,12 @@ describe('RobotHandling IK lifecycle and pool bounds', () => {
     } });
     acceptBatch(restored, 1);
     restored.runner.tick(1);
+    const tweensAtSnapshot = restored.runner.getTweenRegistry().activeCount;
     const snapshot = JSON.parse(restored.runner.snapshotJson());
     restored.runner.restoreFull(snapshot);
     expect(claimedAxisCount()).toBe(2);
     expect(restored.fixture.drives.every((drive) => axisOwner(drive) !== null)).toBe(true);
-    expect(restored.runner.getTweenRegistry().activeCount).toBe(0);
+    expect(restored.runner.getTweenRegistry().activeCount).toBe(tweensAtSnapshot); // plan-2059 P8: relinked on restore
     restored.runner.tick(3);
     expect(claimedAxisCount()).toBe(0);
     restored.runner.clearMUs();

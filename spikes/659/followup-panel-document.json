@@ -1,0 +1,78 @@
+{
+  "url": "http://localhost:5659/?projectUrl=/spike-659-duck/&doc=doc_rv_walker_659",
+  "startedAt": "2026-10-23T01:27:59.064Z",
+  "host": {
+    "entries": [
+      {
+        "nodePath": "rv_duck_scene/rv_duck/OperatorPanel",
+        "panelId": "robot-locomotion-panel",
+        "title": "Robot",
+        "dock": "top-left",
+        "errors": [],
+        "signals": 13,
+        "ready": true
+      }
+    ],
+    "pluginHasOwnWindow": false,
+    "pluginPanelErrors": []
+  },
+  "window": {
+    "found": true,
+    "rect": {
+      "x": 80,
+      "y": 100,
+      "w": 290,
+      "h": 288
+    },
+    "svgLegends": [],
+    "htmlText": [
+      "Robot",
+      "SIM",
+      "WALKING — WASD · SPACE · R",
+      "RESET",
+      "PUSH",
+      "OFF",
+      "RUN",
+      "DRIVE",
+      "OFF",
+      "ON",
+      "FOLLOW",
+      "0.25 m/s",
+      "WALK SPEED",
+      "1.00 m/s",
+      "PUSH 0.5 CATCH / 1.0 FALL",
+      "0.10",
+      "m",
+      "DIST",
+      "121",
+      "mm",
+      "HEIGHT",
+      "0",
+      "FALLS",
+      "0",
+      "GET-UPS"
+    ],
+    "radios": 4,
+    "buttons": 4,
+    "sliders": 2
+  },
+  "operate": {
+    "before": {
+      "status": "running",
+      "enable": true
+    },
+    "stopped": {
+      "status": "paused",
+      "enable": false
+    },
+    "running": {
+      "status": "running",
+      "enable": true
+    }
+  },
+  "ok": true,
+  "consoleErrors": [
+    "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+    "Failed to load resource: net::ERR_CONNECTION_REFUSED"
+  ]
+}

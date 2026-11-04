@@ -243,6 +243,52 @@ describe('reimportCad (swap flow)', () => {
 
     doc.dispose();
   });
+
+  it('plan-769 Phase 2: the new revision takes over the ids of the matched old nodes; undo gives the old nodes back theirs', async () => {
+    const { viewer, model, cadRoot, registry, cadRootPath } = makeWorld();
+    // Identities as a decode would have seeded them; the model is document ''.
+    const stamp = (n: Object3D, id: string): void => { (n.userData as Record<string, unknown>)._rvNodeId = id; };
+    stamp(model, 'id-asset');
+    stamp(cadRoot, 'id-gearbox');
+    const housing = cadRoot.children[0]!;
+    stamp(housing, 'id-housing');
+    stamp(housing.children[0]!, 'id-shaft');
+    stamp(cadRoot.children[1]!, 'id-legacy');
+    registry.registerDocument(model, '');
+    const doc = scratchAssetDocument(viewer);
+
+    const glb = await objectToGlb(named('IGNORED', named('Housing', named('Shaft')), named('NewPart')));
+    registerCadProvider('step', {
+      importFile: async () => ({
+        glb,
+        cadlink: { File: 'gearbox_v2.step', Sha256: 'newhash-769', Quality: 'standard', ImportScaleFactor: 0.001, ZIsUpVector: true },
+      }),
+    });
+    await reimportCad(viewer, doc, cadRootPath, new File(['dummy'], 'gearbox_v2.step'), 'standard');
+    await doc.whenIdle();
+
+    const idOf = (n: Object3D | undefined): string | undefined =>
+      (n?.userData as Record<string, unknown> | undefined)?._rvNodeId as string | undefined;
+    const newRoot = model.children.find((c) => c.name === 'Gearbox')!;
+    expect(newRoot).not.toBe(cadRoot);
+    const newHousing = newRoot.children.find((c) => c.name === 'Housing')!;
+    expect(idOf(newRoot)).toBe('id-gearbox');
+    expect(idOf(newHousing)).toBe('id-housing');
+    expect(idOf(newHousing.children.find((c) => c.name === 'Shaft'))).toBe('id-shaft');
+    // A part the old revision did not have: a fresh id, not a seed of the CAD file.
+    expect(idOf(newRoot.children.find((c) => c.name === 'NewPart'))).toMatch(/^[0-9a-f-]{36}$/);
+    expect(['id-gearbox', 'id-housing', 'id-shaft', 'id-legacy']).not.toContain(idOf(newRoot.children.find((c) => c.name === 'NewPart')));
+    // A reference by address to the housing still reaches the housing — the new one.
+    expect(registry.getNodeByAddress('id-housing')).toBe(newHousing);
+    expect(registry.auditIdIndex()).toEqual({ unindexed: [], stale: [], wrong: [] });
+
+    await doc.undo();
+    expect(registry.getNode(cadRootPath)).toBe(cadRoot);
+    expect(registry.getNodeByAddress('id-housing')).toBe(housing);
+    expect(registry.getNodeByAddress('id-legacy')).toBe(cadRoot.children[1]);
+    expect(registry.auditIdIndex()).toEqual({ unindexed: [], stale: [], wrong: [] });
+    doc.dispose();
+  });
 });
 
 /**

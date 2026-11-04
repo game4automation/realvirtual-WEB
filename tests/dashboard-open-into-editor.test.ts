@@ -26,7 +26,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 const calls: string[] = [];
 
-vi.mock('@rv-private/plugins/asset-editor/pending-open-store', () => ({
+vi.mock('@rv-private/plugins/asset-editor/shared/pending-open-store', () => ({
   setPendingAssetOpen: (base: unknown) => {
     calls.push(`pending:${JSON.stringify(base)}`);
   },

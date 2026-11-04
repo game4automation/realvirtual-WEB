@@ -61,6 +61,10 @@ function createMockPlc(overrides: Partial<{
 
 function setupPlugin() {
   const plugin = new McpBridgePlugin();
+  // plan-668: the test transport stands for a tab with AI control on.
+  (plugin as unknown as { _aiEnabled: boolean })._aiEnabled = true;
+  // plan-2007: plc.* are registry commands, which need a viewer for their context (any object).
+  (plugin as unknown as { viewer: unknown }).viewer = {};
   // Decorator metadata lives per-prototype, so the tools are spread over a
   // dozen decorated instances; dispatching over the plugin alone would silently
   // lose every delegated tool — the `web_plc_*` family among them since
@@ -95,7 +99,21 @@ function setupPlugin() {
     return JSON.parse(result.result);
   };
 
-  return { plugin, call };
+  /** plan-2007 Phase 1: deploy/run/stop are registry commands — run one through web_execute. */
+  const exec = async (command: string, args: Record<string, unknown> = {}) => {
+    const r = await call('web_execute', { command, args: JSON.stringify(args) });
+    return r.value ?? { error: r.error };
+  };
+
+  /** The old tool name answers with the move (a tool error carrying the replacement). */
+  const callRaw = async (tool: string) => {
+    sent.length = 0;
+    await handleMessage(JSON.stringify({ type: 'call', id: 2, tool, arguments: {} }));
+    return JSON.parse(sent[0]);
+  };
+
+  const query = async (command: string) => (await call('web_query', { command, args: '{}' })).value;
+  return { plugin, call, exec, query, callRaw };
 }
 
 afterEach(() => {
@@ -105,22 +123,36 @@ afterEach(() => {
 // ── Tests ──
 
 describe('web_plc_* tools — PLC not available (no registered control)', () => {
-  it.each(['web_plc_status', 'web_plc_run', 'web_plc_stop'])(
-    '%s answers with a clear not-available error',
-    async (tool) => {
-      registerPlcControl(null);
-      const { call } = setupPlugin();
-      const payload = await call(tool);
-      expect(payload.error).toBe('PLC not available in this build');
-    },
-  );
-
-  it('web_plc_deploy answers not-available without calling anything', async () => {
+  it('web_plc_status answers with a clear not-available error', async () => {
     registerPlcControl(null);
-    const { call } = setupPlugin();
-    const payload = await call('web_plc_deploy', { code: 'PROGRAM P END_PROGRAM' });
+    const { query } = setupPlugin();
+    const payload = await query('plc.status');
     expect(payload.error).toBe('PLC not available in this build');
   });
+
+  it.each(['plc.run', 'plc.stop'])('%s answers with a clear not-available error', async (command) => {
+    registerPlcControl(null);
+    const { exec } = setupPlugin();
+    const payload = await exec(command);
+    expect(payload.error).toBe('PLC not available in this build');
+  });
+
+  it('plc.deploy answers not-available without calling anything', async () => {
+    registerPlcControl(null);
+    const { exec } = setupPlugin();
+    const payload = await exec('plc.deploy', { code: 'PROGRAM P END_PROGRAM' });
+    expect(payload.error).toBe('PLC not available in this build');
+  });
+
+  it.each([['web_plc_deploy', 'plc.deploy'], ['web_plc_run', 'plc.run'], ['web_plc_stop', 'plc.stop']])(
+    '%s is a tombstone pointing at %s (plan-2007)',
+    async (tool, command) => {
+      const { callRaw } = setupPlugin();
+      const frame = await callRaw(tool);
+      const moved = JSON.parse(frame.error);
+      expect(moved).toMatchObject({ error: 'MOVED', movedTo: [command], use: 'web_execute' });
+    },
+  );
 });
 
 describe('web_plc_* tools — with a registered PlcControl', () => {
@@ -135,9 +167,9 @@ describe('web_plc_* tools — with a registered PlcControl', () => {
       ]),
     });
     registerPlcControl(plc);
-    const { call } = setupPlugin();
+    const { query } = setupPlugin();
 
-    const payload = await call('web_plc_status');
+    const payload = await query('plc.status');
     expect(payload.state).toBe('running');
     expect(payload.scanTimeMs).toBeCloseTo(0.422, 3);
     expect(payload.lastError).toBeNull();
@@ -146,9 +178,9 @@ describe('web_plc_* tools — with a registered PlcControl', () => {
 
   it('web_plc_status surfaces the error state with lastError', async () => {
     registerPlcControl(createMockPlc({ state: 'error', lastError: 'RangeError: interrupted' }));
-    const { call } = setupPlugin();
+    const { query } = setupPlugin();
 
-    const payload = await call('web_plc_status');
+    const payload = await query('plc.status');
     expect(payload.state).toBe('error');
     expect(payload.lastError).toBe('RangeError: interrupted');
   });
@@ -160,10 +192,10 @@ describe('web_plc_* tools — with a registered PlcControl', () => {
     ];
     const plc = createMockPlc({ state: 'error', diagnostics });
     registerPlcControl(plc);
-    const { call } = setupPlugin();
+    const { exec } = setupPlugin();
 
     const code = 'PROGRAM P x := ; END_PROGRAM';
-    const payload = await call('web_plc_deploy', { code });
+    const payload = await exec('plc.deploy', { code });
 
     expect(plc.deploy).toHaveBeenCalledWith(code);
     expect(payload.errorCount).toBe(1);
@@ -175,9 +207,9 @@ describe('web_plc_* tools — with a registered PlcControl', () => {
   it('web_plc_run delegates to run() and reports the resulting state', async () => {
     const plc = createMockPlc({ state: 'stopped' });
     registerPlcControl(plc);
-    const { call } = setupPlugin();
+    const { exec } = setupPlugin();
 
-    const payload = await call('web_plc_run');
+    const payload = await exec('plc.run');
     expect(plc.run).toHaveBeenCalledTimes(1);
     expect(payload.state).toBe('running');
     expect(payload.lastError).toBeNull();
@@ -186,9 +218,9 @@ describe('web_plc_* tools — with a registered PlcControl', () => {
   it('web_plc_stop delegates to stop() and reports the resulting state', async () => {
     const plc = createMockPlc({ state: 'running' });
     registerPlcControl(plc);
-    const { call } = setupPlugin();
+    const { exec } = setupPlugin();
 
-    const payload = await call('web_plc_stop');
+    const payload = await exec('plc.stop');
     expect(plc.stop).toHaveBeenCalledTimes(1);
     expect(payload.state).toBe('stopped');
   });

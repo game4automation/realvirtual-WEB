@@ -403,7 +403,7 @@ describe('pivot-to-circle interaction', () => {
 
     expect(getPivotCirclePickSnapshot().stage).toBe('hovering');
     expect(h.isolated()).toEqual([h.bore]);
-    // One part's silhouette — the thing the whole x-ray is for.
+    // One part's see-through fill — the thing the whole x-ray is for.
     expect(h.xrayRoots()).toHaveLength(1);
   });
 
@@ -421,9 +421,17 @@ describe('pivot-to-circle interaction', () => {
     // re-enables hover unconditionally, so `setEnabled` alone let the highlight
     // back in as soon as the user moved the camera.
     expect(h.hoverAllowed(h.bore)).toBe(false);
-    // The part stays rendered; only its silhouette is added, without depth test,
-    // so the circles inside it can be aimed at.
+    // The part stays rendered; only a see-through FILL is added, without depth
+    // test, so the circles inside it can be aimed at (plan-766 F6: a fill
+    // mesh sharing the target's geometry, never an EdgesGeometry/LineSegments).
     expect(h.xrayRoots()).toHaveLength(1);
+    const xray = h.xrayRoots()[0] as Mesh;
+    expect(xray.isMesh).toBe(true);
+    expect((xray as unknown as { isLineSegments?: boolean }).isLineSegments).toBeUndefined();
+    expect(xray.geometry).toBe(h.bore.geometry);
+    const xrayMat = xray.material as { depthTest: boolean; transparent: boolean };
+    expect(xrayMat.depthTest).toBe(false);
+    expect(xrayMat.transparent).toBe(true);
 
     escape();   // back to stage one — every exit edge restores
     expect(h.hoverEnabled()).toBe(true);
@@ -524,7 +532,7 @@ describe('pivot-to-circle interaction', () => {
     armedOnMesh(h, { queryVertexCircle: query });
 
     for (let i = 0; i < 6; i++) pointer('pointermove', CENTRE_X + i, CENTRE_Y);
-    // The throttle IS the CPU budget of hovering (doc-render-picking §2.4).
+    // The throttle IS the CPU budget of hovering (doc-bake-picking-internals §2.4).
     expect(spy).toHaveBeenCalledTimes(1);
 
     await pastThrottle();

@@ -8,10 +8,11 @@
  * create your own RVViewerPlugin with a `slots` array.
  */
 
-import { useState, useSyncExternalStore } from 'react';
+import { useEffect, useState, useSyncExternalStore } from 'react';
 import { Speed, Sensors, Warning, Build, PrecisionManufacturing } from '@mui/icons-material';
 import type { RVViewerPlugin } from '../../core/rv-plugin';
 import type { UISlotEntry, UISlotProps } from '../../core/rv-ui-plugin';
+import type { MaintenancePluginAPI } from '../../core/types/plugin-types';
 
 // Core reusable components
 import { KpiCard } from '../../core/hmi/KpiCard';
@@ -187,15 +188,34 @@ function DriveOverloadMessage(_props: UISlotProps) {
   );
 }
 
+/**
+ * The demo's hand-made entry into the nozzle-cleaning guide (the standard demo
+ * procedure has no trigger). plan-522 Phase 7: as soon as the loaded model has
+ * a procedure with real tiles — triggers or `Message: Always` — this
+ * placeholder is gone for good, also while that procedure is "ok" and after it
+ * was completed; the generic maintenance tiles speak for the model then.
+ */
 function MaintenanceDueMessage({ viewer }: UISlotProps) {
+  const read = (): boolean => (viewer.getPlugin<MaintenancePluginAPI>('maintenance')?.getProcedures?.() ?? [])
+    .some((p) => p.message === 'Always' || (p.triggers?.length ?? 0) > 0);
+  const [hasRealTile, setHasRealTile] = useState(read);
+  useEffect(() => {
+    const update = (): void => setHasRealTile(read());
+    update();
+    const offDue = viewer.on('maintenance-due-changed' as string, update);
+    const offLoaded = viewer.on('model-loaded' as string, update);
+    return () => { offDue(); offLoaded(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewer]);
+  if (hasRealTile) return null;
   return (
     <TileCard
       title="Maintenance Due"
-      subtitle="Belt Conveyor 2 — 4800h / 5000h"
+      subtitle="Coolant pressure low at nozzle 3 — cleaning due"
       severity="warning"
       icon="build"
       timestamp="Today"
-      componentPath="ConveyorEntry2"
+      componentPath="DemoCell/CNC/MovingParts/X_Axis/YAxis/ZAxis/NozzleTip_3"
       onAction={() => viewer.emit('enter-maintenance' as string, undefined)}
     />
   );

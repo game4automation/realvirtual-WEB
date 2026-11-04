@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage, writeLocalStorage } from './rv-safe-storage';
+
 /** Fail-silent WEB and CONNECT news queues with strict contract validation. */
 
 import { getAppConfig, setAppConfig } from './rv-app-config';
@@ -121,7 +123,7 @@ export function markNewsSeen(id: string): void {
   const seen = readSeenIds();
   if (!seen.includes(id)) seen.push(id);
   try {
-    localStorage.setItem(NEWS_SEEN_STORAGE_KEY, JSON.stringify(seen));
+    writeLocalStorage(NEWS_SEEN_STORAGE_KEY, JSON.stringify(seen));
   } catch {
     // Disabled/private storage is intentionally a no-op.
   }
@@ -181,20 +183,16 @@ function resolveConfiguredNewsUrl(): URL | null {
 
 function readSeenIds(): string[] {
   try {
-    const raw = localStorage.getItem(NEWS_SEEN_STORAGE_KEY);
+    const raw = getLocalStorage()!.getItem(NEWS_SEEN_STORAGE_KEY);
     if (raw == null) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed) || !parsed.every((value) => typeof value === 'string')) {
-      localStorage.setItem(NEWS_SEEN_STORAGE_KEY, '[]');
+      writeLocalStorage(NEWS_SEEN_STORAGE_KEY, '[]');
       return [];
     }
     return [...new Set(parsed)];
   } catch {
-    try {
-      localStorage.setItem(NEWS_SEEN_STORAGE_KEY, '[]');
-    } catch {
-      // Storage may be entirely unavailable (for example Safari private mode).
-    }
+    writeLocalStorage(NEWS_SEEN_STORAGE_KEY, '[]');
     return [];
   }
 }

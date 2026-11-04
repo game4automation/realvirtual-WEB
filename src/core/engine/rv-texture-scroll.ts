@@ -79,3 +79,40 @@ export function disposeScrollableMaps(maps: Texture[]): void {
   for (const tex of maps) tex.dispose();
   maps.length = 0;
 }
+
+/** Map slots a scrolled material moves together (plan-675, SOL R1 #10). */
+const SCROLL_SLOTS = ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'aoMap'] as const;
+
+/**
+ * plan-675 (spike S1): clone a SHARED material for one owner together with its
+ * maps, so the owner can scroll them without touching anybody else — the
+ * template material and its maps stay exactly as they were. Every map slot is
+ * cloned (one clone per distinct texture: an ORM texture in both the roughness
+ * and the metalness slot stays ONE clone), `RepeatWrapping`, image shared (one
+ * GPU upload). The caller owns material and maps and disposes them.
+ *
+ * Unlike {@link cloneScrollableMaps} this never writes into the source
+ * material — that is what makes per-placement isolation possible on chunk
+ * materials the bake shares between every instance of an asset.
+ */
+export function cloneMaterialWithScrollableMaps(source: Material): { material: Material; maps: Texture[] } {
+  const material = source.clone();
+  const slots = material as unknown as Record<string, Texture | null | undefined>;
+  const cloneOf = new Map<Texture, Texture>();
+  const maps: Texture[] = [];
+  for (const slot of SCROLL_SLOTS) {
+    const src = slots[slot];
+    if (!src) continue;
+    let tex = cloneOf.get(src);
+    if (!tex) {
+      tex = src.clone();
+      tex.wrapS = RepeatWrapping;
+      tex.wrapT = RepeatWrapping;
+      if (src.image) tex.needsUpdate = true;
+      cloneOf.set(src, tex);
+      maps.push(tex);
+    }
+    slots[slot] = tex;
+  }
+  return { material, maps };
+}

@@ -91,9 +91,9 @@ function makeViewer(opts?: { mirrorScale?: boolean }) {
 // ══════════════════════════════════════════════════════════════════════
 
 describe('unified vocabulary shape', () => {
-  it('has 25 primitives + composite (14 + 14 - 2 identical - 1 merged)', () => {
-    expect(RV_OP_KINDS).toHaveLength(26);
-    expect(RV_OP_KINDS.filter((k) => k !== 'composite')).toHaveLength(25);
+  it('has 27 primitives + composite (14 + 14 - 2 identical - 1 merged, + replaceNodeGeometry of plan-621, + cloneNode of plan-641)', () => {
+    expect(RV_OP_KINDS).toHaveLength(28);
+    expect(RV_OP_KINDS.filter((k) => k !== 'composite')).toHaveLength(27);
   });
 
   it('marks every kind with its origin, and only the truly shared ones as "both"', () => {
@@ -102,7 +102,7 @@ describe('unified vocabulary shape', () => {
     // transformNode is the ONE merge (Phase-0 row P1).
     expect(both).toEqual(['composite', 'setField', 'transformNode', 'unsetField']);
     expect(RV_OP_KINDS.filter((k) => RV_OP_ORIGIN[k] === 'scene')).toHaveLength(11);
-    expect(RV_OP_KINDS.filter((k) => RV_OP_ORIGIN[k] === 'asset')).toHaveLength(11);
+    expect(RV_OP_KINDS.filter((k) => RV_OP_ORIGIN[k] === 'asset')).toHaveLength(13);
   });
 
   it('never invents a kind that existed in neither vocabulary', () => {

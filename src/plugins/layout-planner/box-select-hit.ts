@@ -125,6 +125,75 @@ export function combineSelection(
   return [...marquee];
 }
 
+// ─── Hit providers (plan-628 8.11a) ─────────────────────────────────────
+
+/**
+ * The marquee as a query for geometry that is not a placement root (path
+ * blocks are lines, not Object3D roots in the planner's map). Same rectangle,
+ * same camera, same any-overlap rule: an item is hit when any part of it lies
+ * in the rectangle.
+ */
+export interface BoxSelectQuery {
+  /**
+   * True when any of the world-space segments touches the marquee. `pairs`
+   * holds `[x0, y0, z0, x1, y1, z1, …]` — every 6 numbers are one segment
+   * (the `LineSegments` layout). A segment with an end behind the camera is
+   * skipped.
+   */
+  intersectsWorldSegments(pairs: ArrayLike<number>): boolean;
+}
+
+/**
+ * A second selection holder the marquee feeds (plan-628 8.11a, E57): called on
+ * every SELECTION commit of the marquee, after the placements went to the
+ * selection manager, with the modifiers of the release (same replace / union /
+ * toggle semantics as {@link combineSelection}).
+ */
+export interface BoxSelectHitProvider {
+  commit(query: BoxSelectQuery, mods: ModifierState): void;
+}
+
+/** Build the query of one marquee release (canvas-client rectangle). */
+export function createBoxSelectQuery(
+  camera: PerspectiveCamera | OrthographicCamera,
+  canvas: HTMLCanvasElement,
+  rectClient: ClientRect,
+): BoxSelectQuery {
+  const ndc = clientRectToNdc(rectClient, canvas);
+  const a = new Vector3();
+  const b = new Vector3();
+  const pa = new Vector3();
+  const pb = new Vector3();
+  return {
+    intersectsWorldSegments(pairs: ArrayLike<number>): boolean {
+      for (let i = 0; i + 5 < pairs.length; i += 6) {
+        a.set(pairs[i], pairs[i + 1], pairs[i + 2]);
+        b.set(pairs[i + 3], pairs[i + 4], pairs[i + 5]);
+        if (!isInFrontOfCamera(a, camera) || !isInFrontOfCamera(b, camera)) continue;
+        pa.copy(a).project(camera);
+        pb.copy(b).project(camera);
+        if (segmentIntersectsNdcRect(pa.x, pa.y, pb.x, pb.y, ndc)) return true;
+      }
+      return false;
+    },
+  };
+}
+
+/** Liang–Barsky: does the 2D segment (x0,y0)→(x1,y1) touch the rectangle? */
+function segmentIntersectsNdcRect(x0: number, y0: number, x1: number, y1: number, r: NdcRect): boolean {
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  let t0 = 0;
+  let t1 = 1;
+  const clip = (p: number, q: number): boolean => {
+    if (p === 0) return q >= 0;
+    const t = q / p;
+    if (p < 0) { if (t > t1) return false; if (t > t0) t0 = t; } else { if (t < t0) return false; if (t < t1) t1 = t; }
+    return true;
+  };
+  return clip(-dx, x0 - r.xMin) && clip(dx, r.xMax - x0) && clip(-dy, y0 - r.yMin) && clip(dy, r.yMax - y0) && t0 <= t1;
+}
+
 // ─── Internals ──────────────────────────────────────────────────────────
 
 interface NdcRect {

@@ -8,6 +8,7 @@ import {
   parseTransportName,
   isStructuralTag,
   isSensorName,
+  isCarrierName,
   scanLibraryComponent,
   hasLibraryMarker,
 } from '../src/core/library-component-loader';
@@ -57,10 +58,65 @@ describe('isSensorName', () => {
     expect(isSensorName('Sensor-Infeed_(2)')).toBe(true); // dashed id + dup suffix
   });
   it('rejects non-sensor names', () => {
-    expect(isSensorName('Sensor_1')).toBe(false);       // underscore + digit, no parens
     expect(isSensorName('Sensor_Housing')).toBe(false); // underscore word, not a dup suffix
     expect(isSensorName('SensorMount')).toBe(false);    // no separator
     expect(isSensorName('MySensor-1')).toBe(false);     // prefix only
+  });
+});
+
+describe('three.js dedup suffix `_<digits>` (plan-622)', () => {
+  // GLTFLoader.createUniqueName makes node names unique per FILE: the second
+  // instance of a library in one GLB carries `Transport-Z_1`, `Sensor_1`, ...
+  it('parseTransportName: suffixed name yields the same axis', () => {
+    expect(parseTransportName('Transport-Z_1')).toBe(parseTransportName('Transport-Z'));
+    expect(parseTransportName('Transport-Z_12')).toBe('+Z');
+    expect(parseTransportName('Transport-X_3')).toBe('+X');
+  });
+  it('parseDriveName: suffixed name yields the same direction', () => {
+    expect(parseDriveName('Drive-Lin-Y_2')).toBe('LinearY');
+    expect(parseDriveName('Drive-Rot-Z_10')).toBe('RotationZ');
+  });
+  it('isSensorName / isCarrierName: bare suffixed names match', () => {
+    expect(isSensorName('Sensor_1')).toBe(true);
+    expect(isSensorName('Sensor-Infeed_1')).toBe(true);
+    expect(isCarrierName('Carrier_3')).toBe(true);
+    expect(isCarrierName('Carrier-Front_2')).toBe(true);
+  });
+  it('existing forms keep matching', () => {
+    expect(isSensorName('Sensor_(1)')).toBe(true);
+    expect(isSensorName('Sensor (1)')).toBe(true);
+    expect(isSensorName('Sensor-Infeed')).toBe(true);
+    expect(isCarrierName('Carrier')).toBe(true);
+    expect(isCarrierName('Carrier_(2)')).toBe(true);
+    expect(isCarrierName('Carrier (2)')).toBe(true);
+    expect(parseTransportName('Transport-Z')).toBe('+Z');
+    expect(parseDriveName('Drive-Lin-Y')).toBe('LinearY');
+  });
+  it('no wildcard: malformed suffixes stay unrecognised', () => {
+    expect(parseTransportName('Transport-Z_')).toBeNull();
+    expect(parseTransportName('Transport-Z_a')).toBeNull();
+    expect(parseTransportName('Transport-Zfoo')).toBeNull();
+    expect(parseTransportName('Transport-Z1')).toBeNull();
+    expect(parseDriveName('Drive-Lin-Y1')).toBeNull();
+    expect(parseDriveName('Drive-Lin-Y_')).toBeNull();
+    expect(isSensorName('Sensorx')).toBe(false);
+    expect(isSensorName('Sensor_')).toBe(false);
+    expect(isSensorName('Sensor_Housing')).toBe(false);
+    expect(isCarrierName('Carrierx')).toBe(false);
+    expect(isCarrierName('Carrier_')).toBe(false);
+  });
+  it('scanLibraryComponent wires a suffixed Transport + Sensor like the plain ones', () => {
+    const root = new Object3D(); root.name = 'RollConveyor_1';
+    const t = new Object3D(); t.name = 'Transport-Z_1';
+    const s = new Object3D(); s.name = 'Sensor_1';
+    root.add(t, s);
+    const spec = scanLibraryComponent(root);
+    expect(spec.transports).toHaveLength(1);
+    expect(spec.transports![0]).toMatchObject({ target: t, direction: '+Z' });
+    expect(spec.drives).toHaveLength(1);
+    expect(spec.drives![0]).toMatchObject({ target: t, direction: 'LinearZ' });
+    expect(spec.sensors).toHaveLength(1);
+    expect(spec.sensors![0].target).toBe(s);
   });
 });
 

@@ -23,7 +23,7 @@ import {
   BundledBackend,
   DEMO_BASE_PATH,
   DEMO_PROJECT_FOLDER,
-  REALVIRTUAL_LIBRARY_PATH,
+  REALVIRTUAL_LIBRARY_PROJECT_PATH,
 } from '../src/core/project/backends/bundled-backend';
 import { ProjectStore, resetProjectStore } from '../src/core/project/project-store';
 
@@ -95,12 +95,13 @@ describe('BundledBackend base path', () => {
     }
   });
 
-  it('keeps the library catalog root-relative — it is app-level, not the demo\'s', () => {
+  it('keeps the library root-relative — it is app-level, not the demo\'s', () => {
     // The library sits BESIDE `demo-realvirtual/`, is shared by every project,
     // and is reached through the manifest's `libraries[]` (resolved against the
-    // page base by library-store), never through this backend's `_url()`.
-    expect(REALVIRTUAL_LIBRARY_PATH).toBe('library/catalog.json');
-    expect(REALVIRTUAL_LIBRARY_PATH.startsWith(DEMO_PROJECT_FOLDER)).toBe(false);
+    // page base by the library project loader), never through this backend's `_url()`.
+    // plan-778 Phase 4: the library is a project; its catalog.json constant is gone.
+    expect(REALVIRTUAL_LIBRARY_PROJECT_PATH).toBe('library/project.json');
+    expect(REALVIRTUAL_LIBRARY_PROJECT_PATH.startsWith(DEMO_PROJECT_FOLDER)).toBe(false);
   });
 
   it('gives the root and the demo instance different ids on one deploy', () => {

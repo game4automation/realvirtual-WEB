@@ -18,13 +18,16 @@ import type { ContextMenuTarget } from './context-menu-store';
 import { loadOverlay, saveOverlay, saveOriginals, loadOriginals, removeOriginals, type RVExtrasOverlay } from '../engine/rv-extras-overlay-store';
 import { materialise as materialiseEdits } from './scene/rv-scene-edits';
 import { getSceneStore } from './scene/scene-store-singleton';
-import { getActiveEditTarget } from './rv-edit-target';
+import { getActiveEditTarget, getActivePersistenceTarget, type EditTarget } from './rv-edit-target';
+import { referenceOverriddenFields } from './rv-field-override';
+import { overrideTargetOf } from '../ops/rv-reference-guard';
 import { baseComponentType } from './rv-inspector-helpers';
 import { isEphemeralField } from './rv-value-resolver';
 import { getFieldDescriptor, isFieldDisplayReadonly } from '../engine/rv-component-registry';
 import { openSetPositionDialog } from './SetPositionDialog';
 import { INSPECTOR_PANEL_WIDTH, INSPECTOR_MIN_WIDTH, INSPECTOR_MAX_WIDTH } from './layout-constants';
 import { isCompactWidth } from '../../hooks/use-mobile-layout';
+import { readLocalStorage, writeLocalStorage } from './rv-storage-keys';
 
 // ─── Layout Object Helpers (for context menu) ──────────────────────────
 
@@ -137,6 +140,11 @@ export interface ExtrasEditorState {
   settingsOpen: boolean;
 }
 
+export type FieldEditState =
+  | { kind: 'confirm'; value: unknown; previous: unknown; revision: number }
+  | { kind: 'applying'; revision: number }
+  | { kind: 'error'; reason: string; code?: 'shared-field'; revision: number };
+
 // ─── Plugin ──────────────────────────────────────────────────────────────
 
 export class RvExtrasEditorPlugin implements RVViewerPlugin {
@@ -159,6 +167,9 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
   private _revealObject: import('three').Object3D | null = null;
   private _showInspector = false;
   private _settingsOpen = false;
+  private _fieldEditStates = new Map<string, FieldEditState>();
+  private _fieldEditTargets = new Map<string, object>();
+  private _fieldEditRevision = 0;
   private _viewer: RVViewer | null = null;
   private _glbName: string | null = null;
 
@@ -167,11 +178,11 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
   private _originals = new Map<string, unknown>();
 
   constructor() {
-    const storedWidth = localStorage.getItem(LS_KEY_PANEL_WIDTH);
+    const storedWidth = readLocalStorage(LS_KEY_PANEL_WIDTH);
     this._panelWidth = storedWidth ? Math.max(HIERARCHY_MIN_WIDTH, Math.min(HIERARCHY_MAX_WIDTH, Number(storedWidth))) : HIERARCHY_DEFAULT_WIDTH;
-    const storedInspectorWidth = localStorage.getItem(LS_KEY_INSPECTOR_WIDTH);
+    const storedInspectorWidth = readLocalStorage(LS_KEY_INSPECTOR_WIDTH);
     this._inspectorWidth = storedInspectorWidth ? Math.max(INSPECTOR_MIN_WIDTH, Math.min(INSPECTOR_MAX_WIDTH, Number(storedInspectorWidth))) : INSPECTOR_PANEL_WIDTH;
-    this._panelOpen = localStorage.getItem(LS_KEY_PANEL_OPEN) === 'true';
+    this._panelOpen = readLocalStorage(LS_KEY_PANEL_OPEN) === 'true';
     // Selection is deliberately NOT restored (plan-754 D10): the old
     // `rv-extras-editor-selected` key was global across documents, so it handed
     // whatever loaded next a selected path from a completely different model.
@@ -244,7 +255,7 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
 
   togglePanel(): void {
     this._panelOpen = !this._panelOpen;
-    localStorage.setItem(LS_KEY_PANEL_OPEN, String(this._panelOpen));
+    writeLocalStorage(LS_KEY_PANEL_OPEN, String(this._panelOpen));
     // Coordinate with LeftPanelManager for mutual exclusion
     if (this._viewer) {
       if (this._panelOpen) {
@@ -263,13 +274,13 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
 
   setPanelWidth(width: number): void {
     this._panelWidth = Math.max(HIERARCHY_MIN_WIDTH, Math.min(HIERARCHY_MAX_WIDTH, width));
-    localStorage.setItem(LS_KEY_PANEL_WIDTH, String(this._panelWidth));
+    writeLocalStorage(LS_KEY_PANEL_WIDTH, String(this._panelWidth));
     this.notify();
   }
 
   setInspectorWidth(width: number): void {
     this._inspectorWidth = Math.max(INSPECTOR_MIN_WIDTH, Math.min(INSPECTOR_MAX_WIDTH, width));
-    localStorage.setItem(LS_KEY_INSPECTOR_WIDTH, String(this._inspectorWidth));
+    writeLocalStorage(LS_KEY_INSPECTOR_WIDTH, String(this._inspectorWidth));
     this.notify();
   }
 
@@ -384,7 +395,7 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
    *
    * Cheap and OUTSIDE the picking path: this runs on the already-resolved hit,
    * at the same place the LayoutObject resolution has always run
-   * (`doc-render-picking.md` §2.4 rule 1).
+   * (`contract-bake-picking.md` §2.4 rule 1).
    */
   findOutermostReferenceAncestor(path: string): string | null {
     const cached = this._referenceCache.get(path);
@@ -464,7 +475,7 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
   selectAndReveal(path: string, showInspector = true): void {
     if (!this._panelOpen) {
       this._panelOpen = true;
-      localStorage.setItem(LS_KEY_PANEL_OPEN, 'true');
+      writeLocalStorage(LS_KEY_PANEL_OPEN, 'true');
       // Coordinate with LeftPanelManager for mutual exclusion
       if (this._viewer) {
         this._viewer.leftPanelManager.open('hierarchy', this._panelWidth);
@@ -581,6 +592,15 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
    * localStorage write is kept ONLY for the boot path (no SceneStore yet);
    * SceneStore-driven sessions persist via the per-base draft autosave.
    */
+  /** Why the last field edit was refused by the active edit target (plan-2013 §2.6); null = not refused. */
+  get lastRefusal(): string | null { return this._lastRefusal; }
+  private _lastRefusal: string | null = null;
+
+  getFieldEditState(nodePath: string, componentType: string, fieldName: string): FieldEditState | undefined {
+    const key = this.origKey(nodePath, componentType, fieldName);
+    return this._fieldEditTargets.get(key) === getActiveEditTarget() ? this._fieldEditStates.get(key) : undefined;
+  }
+
   updateOverlayField(nodePath: string, componentType: string, fieldName: string, value: unknown): boolean {
     // Never write a field its schema marks read-only for display (readonly:true
     // OR scope:'des') — defense in depth in case the inspector UI (which already
@@ -617,10 +637,37 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
     const prev = this.readSceneField(nodePath, componentType, fieldName);
     if (Object.is(prev, value)) return true;
 
-    // Snapshot original before first override (for the legacy reset path).
-    this.snapshotOriginal(nodePath, componentType, fieldName);
-
     const target = getActiveEditTarget();
+    // plan-2013 §2.6 (Gate R1 #5): a target that can refuse answers first — a refusal
+    // writes nothing (no overlay entry, no userData) and reaches the caller as `false`.
+    if (target.available && target.trySetField) {
+      const verdict = target.trySetField(nodePath, componentType, fieldName, value);
+      if (!verdict.ok) {
+        this._lastRefusal = verdict.reason;
+        this._fieldEditStates.set(this.origKey(nodePath, componentType, fieldName), {
+          kind: 'error', reason: verdict.reason, code: verdict.code, revision: ++this._fieldEditRevision,
+        });
+        this._fieldEditTargets.set(this.origKey(nodePath, componentType, fieldName), target);
+        console.warn(`[rvExtrasEditor] ${componentType}.${fieldName} refused: ${verdict.reason}`);
+        this.notify();
+        return false;
+      }
+    }
+    // The variant in the scene writes only inside its apply transaction: no optimistic
+    // overlay entry, no synchronous userData write — the transaction is the one writer.
+    if (target.available && target.persistsTo === 'variant') {
+      const key = this.origKey(nodePath, componentType, fieldName);
+      if ((this._viewer?.simTime ?? 0) > 0) {
+        this._fieldEditStates.set(key, { kind: 'confirm', value, previous: prev, revision: ++this._fieldEditRevision });
+        this._fieldEditTargets.set(key, target);
+        this.notify();
+        return true;
+      }
+      return this.applyVariantField(target, key, nodePath, componentType, fieldName, value, prev);
+    }
+
+    // Snapshot original before first base/asset override (for the legacy reset path).
+    this.snapshotOriginal(nodePath, componentType, fieldName);
     if (target.available) {
       // Optimistically reflect the override in the cached overlay and notify
       // NOW, so the inspector marks the field as overridden the moment it
@@ -645,7 +692,21 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
       // Op-based path — the target pushes a `setField` op into its document
       // (SceneStore outside the editor, AssetDocument inside); the executor
       // writes userData + reapplies schema.
-      target.setField(nodePath, componentType, fieldName, value, prev);
+      const settled = target.setField(nodePath, componentType, fieldName, value, prev);
+      // plan-774 F1: on placed content in the asset editor the op writes the
+      // instance override on the reference node, which the badge reads from then
+      // on. Nothing re-materialises this cache for an AssetDocument, so the
+      // optimistic entry is dropped once the op settled (applied or refused) —
+      // left standing it kept the badge lit after an undo removed the override.
+      if (settled && this.isPlacedAssetEdit(nodePath)) {
+        const drop = (): void => {
+          // A newer edit of the same field owns the entry; its own settle drops it.
+          if (!Object.is(this._overlay?.nodes[nodePath]?.[componentType]?.[fieldName], value)) return;
+          this.pruneOverlayEntry(nodePath, componentType, fieldName);
+          this.notify();
+        };
+        void settled.then(drop, drop);
+      }
       this.emitLockChange(nodePath, componentType, fieldName, value);
       return true;
     }
@@ -660,6 +721,75 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
     this.notify();
     this.emitLockChange(nodePath, componentType, fieldName, value);
     return true;
+  }
+
+  confirmFieldEdit(nodePath: string, componentType: string, fieldName: string): boolean {
+    const key = this.origKey(nodePath, componentType, fieldName);
+    const state = this._fieldEditStates.get(key);
+    const target = getActiveEditTarget();
+    if (state?.kind !== 'confirm' || this._fieldEditTargets.get(key) !== target) return false;
+    return this.applyVariantField(target, key, nodePath, componentType, fieldName, state.value, state.previous);
+  }
+
+  cancelFieldEdit(nodePath: string, componentType: string, fieldName: string): void {
+    const key = this.origKey(nodePath, componentType, fieldName);
+    if (this._fieldEditStates.get(key)?.kind !== 'confirm') return;
+    this._fieldEditStates.delete(key);
+    this._fieldEditTargets.delete(key);
+    this.notify();
+  }
+
+  private applyVariantField(
+    target: EditTarget,
+    key: string,
+    nodePath: string,
+    componentType: string,
+    fieldName: string,
+    value: unknown,
+    prev: unknown,
+  ): boolean {
+    this._lastRefusal = null;
+    const revision = ++this._fieldEditRevision;
+    this._fieldEditStates.set(key, { kind: 'applying', revision });
+    this._fieldEditTargets.set(key, target);
+    this.notify();
+    const settled = target.setField(nodePath, componentType, fieldName, value, prev);
+    if (settled) void settled.then(() => {
+      if (this._fieldEditStates.get(key)?.revision === revision) {
+        this._fieldEditStates.delete(key);
+        this._fieldEditTargets.delete(key);
+      }
+      this.notify();
+    }, (err: unknown) => {
+      const reason = err instanceof Error ? err.message : String(err);
+      this._lastRefusal = reason;
+      this._fieldEditStates.set(key, { kind: 'error', reason, revision });
+      this.notify();
+    });
+    else {
+      this._fieldEditStates.delete(key);
+      this._fieldEditTargets.delete(key);
+      this.notify();
+    }
+    return true;
+  }
+
+  /**
+   * plan-774 F1: is an edit of `nodePath` an instance override in the asset
+   * editor — placed content (inside a reference of the open file) with the
+   * editor's document as the persistence target? There the executor writes the
+   * override on the reference node, and that record is the badge source.
+   */
+  private isPlacedAssetEdit(nodePath: string): boolean {
+    if (getActivePersistenceTarget() !== 'asset' || !this._viewer) return false;
+    const node = this._viewer.registry?.getNode(nodePath);
+    return !!node && overrideTargetOf(node, this._viewer.currentModelRoot ?? null) !== null;
+  }
+
+  /** The fields of `componentType` an enclosing reference overrides on `nodePath` — asset editor only. */
+  private instanceOverriddenFields(nodePath: string, componentType: string): readonly string[] {
+    if (getActivePersistenceTarget() !== 'asset' || !this._viewer) return [];
+    return referenceOverriddenFields(this._viewer, nodePath, componentType);
   }
 
   /** `LayoutObject.Locked` has no live component behind it, so the planner
@@ -739,8 +869,15 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
    */
   resetComponent(nodePath: string, componentType: string): void {
     const target = getActiveEditTarget();
-    if (target.available && this._overlay?.nodes[nodePath]?.[componentType]) {
-      const fields = Object.keys(this._overlay.nodes[nodePath][componentType]);
+    // plan-774 F1: in the asset editor an instance override read from the file
+    // (no optimistic overlay entry after a reopen) is reset by the same ops —
+    // the executor clears it on the reference node and restores the live value.
+    const instanceFields = target.available ? this.instanceOverriddenFields(nodePath, componentType) : [];
+    if (target.available && (this._overlay?.nodes[nodePath]?.[componentType] || instanceFields.length > 0)) {
+      const fields = [...new Set([
+        ...Object.keys(this._overlay?.nodes[nodePath]?.[componentType] ?? {}),
+        ...instanceFields,
+      ])];
       void target.withTransaction(`Reset ${componentType}`, async () => {
         for (const fieldName of fields) {
           const prev = this.readSceneField(nodePath, componentType, fieldName);
@@ -780,11 +917,27 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
    */
   resetNode(nodePath: string): void {
     const target = getActiveEditTarget();
-    if (target.available && this._overlay?.nodes[nodePath]) {
-      const nodeOv = this._overlay.nodes[nodePath];
-      const work: Array<{ componentType: string; fieldName: string; prev: unknown }> = [];
+    // plan-774 F1: per component the same union as `resetComponent` — the
+    // optimistic overlay AND the instance overrides read from the file.
+    const nodeOv = this._overlay?.nodes[nodePath] ?? {};
+    const byComponent = new Map<string, Set<string>>();
+    if (target.available) {
       for (const [componentType, fields] of Object.entries(nodeOv)) {
-        for (const fieldName of Object.keys(fields)) {
+        byComponent.set(componentType, new Set(Object.keys(fields)));
+      }
+      const live = this._viewer?.registry?.getNode(nodePath)?.userData?.realvirtual as Record<string, unknown> | undefined;
+      for (const componentType of Object.keys(live ?? {})) {
+        const fields = this.instanceOverriddenFields(nodePath, componentType);
+        if (fields.length === 0) continue;
+        const set = byComponent.get(componentType) ?? new Set<string>();
+        for (const f of fields) set.add(f);
+        byComponent.set(componentType, set);
+      }
+    }
+    if (target.available && (this._overlay?.nodes[nodePath] || byComponent.size > 0)) {
+      const work: Array<{ componentType: string; fieldName: string; prev: unknown }> = [];
+      for (const [componentType, fields] of byComponent) {
+        for (const fieldName of fields) {
           work.push({ componentType, fieldName, prev: this.readSceneField(nodePath, componentType, fieldName) });
         }
       }
@@ -1061,7 +1214,7 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
         const snap = viewer.leftPanelManager.getSnapshot();
         if (snap.activePanel !== null && snap.activePanel !== 'hierarchy' && this._panelOpen) {
           this._panelOpen = false;
-          localStorage.setItem(LS_KEY_PANEL_OPEN, 'false');
+          writeLocalStorage(LS_KEY_PANEL_OPEN, 'false');
           this.notify();
         }
       }),

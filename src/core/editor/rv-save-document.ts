@@ -68,7 +68,7 @@
  *
  * ## Two lineages, one routing (plan-710 F5)
  *
- * `saveDocument()` takes either behaviour layer — the asset document or the
+ * `saveDocument()` takes either behaviour layer — the editor's document or the
  * scene store — and one {@link decideSaveVerb} answers for both. What is NOT
  * merged is the protection: each lineage keeps the writer that already carries
  * its plan-709 guarantees (binding, `runExclusive`, floor-before-bake, CAS,
@@ -77,15 +77,26 @@
  * was doubled, never the safety.
  */
 
+import type { Object3D } from 'three';
 import type { RVViewer } from '../rv-viewer';
 import type { AssetDocument, AssetBase } from './rv-asset-document';
 import { exportAssetGlb } from './rv-asset-glb-export';
+// Namespace import on purpose: ten save-routing suites `vi.mock` this module with
+// a factory that exports `exportAssetGlb` only, and a NAMED import of a missing
+// export fails the ESM link in browser mode. The predicate is read only inside
+// the export's clone callback, which a stubbed export never calls (plan-765 F5).
+import * as assetGlbExport from './rv-asset-glb-export';
+import { countWrittenReferences } from '../engine/rv-reference-audit';
+import { clearSaveReferenceLoss, reportSaveReferenceLoss } from '../hmi/problems-store';
 import { stableDocumentIdOfPath } from './rv-asset-draft-storage';
 import { sanitizeAssetFileName, CUSTOM_LIBRARY_FOLDER } from './rv-asset-library-save';
 import { getProjectStore } from '../project/project-store';
 import { revisionOfBytes, SceneRevisionConflictError } from '../project/rv-scene-record';
 import type { ProjectBackend, WriteExpectation } from '../project/backends/project-backend';
 import { assertNoDocumentIdCollisions } from '../project/rv-asset-identity';
+import { macrosForEmbed } from './rv-macro-store';
+import { finishDocumentSave } from './rv-finish-document-save';
+import { libraryLabelOf, librarySaveBackend } from '../library/library-save-target';
 
 // ─── The verb, before the click (§2.2.1-6) ──────────────────────────────
 
@@ -133,9 +144,24 @@ export type SaveOutcome =
   | { kind: 'target-changed' }
   | { kind: 'error'; message: string };
 
+/**
+ * What a save's serialization did to the stored references (plan-765 F5):
+ * unresolved references over the live tree in authored spelling (`before`) and
+ * over the written tree (`after`), both taken inside the same save with the same
+ * prune set. `byField` = the per-`Component.field` INCREASE (positive deltas only).
+ */
+export interface SaveReferenceCounts {
+  before: number;
+  after: number;
+  byField: Record<string, number>;
+}
+
 export type SaveDocumentResult =
-  /** Written. `base` is the identity the document now has — it may have moved. */
-  | { kind: 'saved'; base: AssetBase; relPath: string; copied: boolean }
+  /**
+   * Written. `base` is the identity the document now has — it may have moved.
+   * `references` is absent when the guard could not measure (never a reason not to save).
+   */
+  | { kind: 'saved'; base: AssetBase; relPath: string; copied: boolean; references?: SaveReferenceCounts }
   | SaveOutcome;
 
 /**
@@ -146,7 +172,7 @@ export type SaveDocumentResult =
  * bytes live in slots the store owns. Inventing an `AssetBase` for it just to
  * share one result shape would be the second identity model plan-709 removed.
  */
-export type SaveSceneResult =
+export type SavePlannerResult =
   /** Written. `sceneId` is the catalogue id it now has (a first save mints one). */
   | { kind: 'saved'; sceneId: string | null }
   | SaveOutcome;
@@ -182,6 +208,14 @@ export function forgetSavedRevisions(backendId?: string): void {
   for (const key of [...seenRevisions.keys()]) {
     if (key.startsWith(`${backendId} `)) seenRevisions.delete(key);
   }
+}
+
+/** Retain the session's conflict precondition when the same bytes move. */
+export function adoptRenamedRevision(backend: ProjectBackend, from: string, to: string): void {
+  const revision = seenRevisions.get(ledgerKey(backend, from));
+  seenRevisions.delete(ledgerKey(backend, to));
+  if (revision) seenRevisions.set(ledgerKey(backend, to), revision);
+  seenRevisions.delete(ledgerKey(backend, from));
 }
 
 /**
@@ -252,8 +286,8 @@ async function expectedRevisionFor(
  * were two.
  */
 export type SaveSubject =
-  | { lineage: 'asset'; base: AssetBase | null; name: string }
-  | { lineage: 'scene'; open: boolean; transient: boolean };
+  | { lineage: 'editor'; base: AssetBase | null; name: string }
+  | { lineage: 'planner'; open: boolean; transient: boolean };
 
 /**
  * Where this document's bytes belong, and whether writing them there is
@@ -271,8 +305,12 @@ export function decideSaveVerb(
   subject: SaveSubject,
   backend: ProjectBackend | null = getProjectStore().getBackend(),
 ): SaveVerbDecision {
-  const open = subject.lineage === 'asset' ? subject.base !== null : subject.open;
+  const open = subject.lineage === 'editor' ? subject.base !== null : subject.open;
   if (!open) return { verb: 'blocked', reason: 'Nothing is open.' };
+  // plan-778: a library document is decided on library B's backend, not the caller's.
+  if (subject.lineage === 'editor' && subject.base?.kind === 'libraryDocument') {
+    return decideLibrarySaveVerb(subject.base, saveTargetBackendOf(subject.base));
+  }
   // The three refusals both lineages share, in one place and one wording.
   if (!backend) {
     return { verb: 'blocked', reason: 'No project is open — open or create one to save.' };
@@ -286,7 +324,7 @@ export function decideSaveVerb(
     };
   }
 
-  if (subject.lineage === 'scene') {
+  if (subject.lineage === 'planner') {
     // A transient workspace holds somebody else's content and persists nothing
     // (plan-386 §2.5). Saying so beats a Save that appears to work.
     if (subject.transient) {
@@ -353,6 +391,28 @@ export function decideSaveVerb(
     default:
       return { verb: 'blocked', reason: 'This document has no place to be saved to.' };
   }
+}
+
+/** The backend a document is written through: library B's for a `libraryDocument` (plan-778), else the open project's. */
+export function saveTargetBackendOf(base: AssetBase | null): ProjectBackend | null {
+  if (base?.kind === 'libraryDocument') return librarySaveBackend(base.libraryProjectId);
+  return getProjectStore().getBackend();
+}
+
+/** Save into library B in place, or why not. */
+function decideLibrarySaveVerb(
+  base: Extract<AssetBase, { kind: 'libraryDocument' }>,
+  backend: ProjectBackend | null,
+): SaveVerbDecision {
+  const label = base.libraryLabel || libraryLabelOf(base.libraryProjectId);
+  if (backend?.writable) return { verb: 'save', relPath: base.path };
+  return {
+    verb: 'blocked',
+    reason: backend
+      ? `This document belongs to library '${label}' and is read-only here: Edit in library saves into a library `
+        + 'folder on this computer, Copy into project changes it for this project only.'
+      : `Library '${label}' is not available — grant access or locate its folder first.`,
+  };
 }
 
 function assetFileName(name: string): string {
@@ -442,8 +502,8 @@ function noteSaveActivity(): void {
  * What routing needs is four members, and `lineage` is the discriminant that
  * keeps the choice a compile-time one rather than a duck-type guess.
  */
-export interface SceneSaveFacade {
-  readonly lineage: 'scene';
+export interface PlannerSaveFacade {
+  readonly lineage: 'planner';
   getSnapshot(): {
     draft: { name: string } | null;
     saved: { id: string } | null;
@@ -465,10 +525,10 @@ export interface SceneSaveFacade {
 }
 
 /** Either behaviour layer over the one document class (plan-710 F5). */
-export type SaveableDocument = AssetDocument | SceneSaveFacade;
+export type SaveableDocument = AssetDocument | PlannerSaveFacade;
 
-function isSceneFacade(doc: SaveableDocument): doc is SceneSaveFacade {
-  return (doc as SceneSaveFacade).lineage === 'scene';
+function isPlannerSaveFacade(doc: SaveableDocument): doc is PlannerSaveFacade {
+  return (doc as PlannerSaveFacade).lineage === 'planner';
 }
 
 /**
@@ -491,16 +551,16 @@ export async function saveDocument(
 ): Promise<SaveDocumentResult>;
 export async function saveDocument(
   viewer: RVViewer | null,
-  doc: SceneSaveFacade,
+  doc: PlannerSaveFacade,
   opts?: SaveDocumentOptions,
-): Promise<SaveSceneResult>;
+): Promise<SavePlannerResult>;
 export async function saveDocument(
   viewer: RVViewer | null,
   doc: SaveableDocument,
   opts: SaveDocumentOptions = {},
-): Promise<SaveDocumentResult | SaveSceneResult> {
-  if (isSceneFacade(doc)) return saveSceneDocument(doc, opts);
-  return saveAssetDocument(viewer as RVViewer, doc, opts);
+): Promise<SaveDocumentResult | SavePlannerResult> {
+  if (isPlannerSaveFacade(doc)) return savePlannerDocument(doc, opts);
+  return saveEditorDocument(viewer as RVViewer, doc, opts);
 }
 
 /**
@@ -513,14 +573,14 @@ export async function saveDocument(
  * `_installOps`. Adding a WeakSet here would change scene concurrency behaviour,
  * which is not what "one routing" means.
  */
-async function saveSceneDocument(
-  store: SceneSaveFacade,
+async function savePlannerDocument(
+  store: PlannerSaveFacade,
   opts: SaveDocumentOptions,
-): Promise<SaveSceneResult> {
+): Promise<SavePlannerResult> {
   const snap = store.getSnapshot();
   const backend = getProjectStore().getBackend();
   const decision = decideSaveVerb(
-    { lineage: 'scene', open: !!snap?.draft, transient: snap?.transient === true },
+    { lineage: 'planner', open: !!snap?.draft, transient: snap?.transient === true },
     backend,
   );
   if (decision.verb === 'blocked' || !snap) {
@@ -570,23 +630,23 @@ async function saveSceneDocument(
  * Dynamically imported on purpose. `SceneStore` lives downstream of this module
  * (it imports the project store this module imports, and `active-asset-store`
  * beside it), which is why the scene lineage reaches this file as the
- * structural {@link SceneSaveFacade} rather than as a named class. The routing
+ * structural {@link PlannerSaveFacade} rather than as a named class. The routing
  * of a BOUND document is the one case that has to go the other way — it starts
  * from an `AssetBase` and needs the instance — so it takes the import at call
  * time and keeps the module graph acyclic.
  *
  * The id check is not ceremony: the editor may have been left open across a
- * scene switch, and saving "the scene document" into whatever scene is open now
+ * scene switch, and saving "the planner's document" into whatever document is open now
  * is precisely the mis-binding the identity work exists to prevent.
  */
-async function sceneSaveTargetFor(sceneId: string): Promise<SceneSaveFacade | null> {
+async function plannerSaveTargetFor(sceneId: string): Promise<PlannerSaveFacade | null> {
   try {
     const { getSceneStore } = await import('../hmi/scene/scene-store-singleton');
     const store = getSceneStore();
     if (!store) return null;
     // The same identity surface the BIND compared (`documentIdentity()`), not
     // `saved.id`: a document workspace opens with `_saved = null` and only a
-    // scene save in THIS session fills it, so a bound editor document was
+    // planner save in THIS session fills it, so a bound editor document was
     // refused as "not the scene that is open" until the planner had saved once
     // — the very document the transition had just handed over. `saved.id`
     // stays as the fallback for the legacy scene-glb workspace, whose identity
@@ -599,7 +659,7 @@ async function sceneSaveTargetFor(sceneId: string): Promise<SceneSaveFacade | nu
   }
 }
 
-async function saveAssetDocument(
+async function saveEditorDocument(
   viewer: RVViewer,
   doc: AssetDocument,
   opts: SaveDocumentOptions = {},
@@ -628,13 +688,13 @@ async function saveAssetDocument(
     };
   }
   try {
-    return await saveAssetDocumentLocked(viewer, doc, opts);
+    return await saveEditorDocumentLocked(viewer, doc, opts);
   } finally {
     doc.unlock(lock);
   }
 }
 
-async function saveAssetDocumentLocked(
+async function saveEditorDocumentLocked(
   viewer: RVViewer,
   doc: AssetDocument,
   opts: SaveDocumentOptions = {},
@@ -662,27 +722,20 @@ async function saveAssetDocumentLocked(
   // Before the `saving` WeakSet on purpose: the scene branch has its own
   // concurrency discipline (`SceneStore.save()` holds the document's exclusive
   // queue and re-verifies its target after the bake), and adding a second guard
-  // here would change scene behaviour — the same reasoning `saveSceneDocument`
+  // here would change scene behaviour — the same reasoning `savePlannerDocument`
   // already documents.
   if (doc.base.kind === 'document' && (!doc.base.path || doc.isBound)) {
-    const store = await sceneSaveTargetFor(doc.base.documentId);
+    const store = await plannerSaveTargetFor(doc.base.documentId);
     if (!store) {
       return {
         kind: 'blocked',
         reason: `"${doc.base.name || 'This scene'}" is not the scene that is open — switch back to it to save.`,
       };
     }
-    const result = await saveSceneDocument(store, opts);
-    // F8 for the slot-addressed half too: this branch is a document save like
-    // any other, it just writes through the scene's writer. `relPath` is the
-    // row's path when it has one and `''` when the bytes live in a body slot —
-    // subscribers key on `documentId`, which is always meaningful.
-    if (result.kind === 'saved') {
-      viewer?.emit('document-saved', {
-        documentId: doc.base.documentId,
-        relPath: doc.base.path,
-      });
-    }
+    const result = await savePlannerDocument(store, opts);
+    // No post-save step of its own (plan-777 P8): this branch writes through
+    // the planner's writer, and the planner's save runs `finishDocumentSave`
+    // itself — exactly one announce and one rescan per save.
     // Translated, not re-shaped: the caller asked through the asset overload and
     // reads an `AssetBase` back. `relPath` is the identity's own — the row's
     // path when it carries one, empty for a genuinely slot-addressed document —
@@ -705,17 +758,22 @@ async function saveAssetDocumentLocked(
 
   // §2.2.1-1: bind the destination BEFORE anything long-running starts.
   const store = getProjectStore();
-  const backend = store.getBackend();
-  const projectIdAtStart = store.getProject()?.id ?? null;
   const baseAtStart = doc.base;
+  // plan-778: the TARGET backend, bound before anything long-running.
+  const backend = saveTargetBackendOf(baseAtStart);
+  const projectIdAtStart = store.getProject()?.id ?? null;
+  const library = baseAtStart.kind === 'libraryDocument' ? baseAtStart : null;
 
   let name = doc.name;
   // Routed BEFORE the prompt, because the verb is what decides whether there is
   // a question to ask at all. A document saves to itself in silence; only a
   // source that cannot be written back has to be placed somewhere first.
-  const routed = decideSaveVerb({ lineage: 'asset', base: baseAtStart, name }, backend);
+  const routed = decideSaveVerb({ lineage: 'editor', base: baseAtStart, name }, backend);
   if (routed.verb === 'blocked' || !backend) {
     return { kind: 'blocked', reason: routed.reason ?? 'This document cannot be saved.' };
+  }
+  if (library && opts.forceNamePrompt) {
+    return { kind: 'blocked', reason: '"Save as…" is not available for a library document — use Copy into project.' };
   }
 
   /**
@@ -775,7 +833,7 @@ async function saveAssetDocumentLocked(
   // Re-routed with the CONFIRMED name, because the destination file name is
   // derived from it — routing once with the old name would place the copy
   // under the source's name and ignore what the user just typed.
-  const named = decideSaveVerb({ lineage: 'asset', base: baseAtStart, name }, backend);
+  const named = decideSaveVerb({ lineage: 'editor', base: baseAtStart, name }, backend);
   // "Save as…" is the user naming a NEW document BESIDE the one that is open —
   // `models/Cell.glb` saves as `models/<name>.glb`, a library asset stays in its
   // own library folder. It used to send every save-as to
@@ -831,7 +889,23 @@ async function saveAssetDocumentLocked(
       // plan-703 Lauf-11 fix. Routing the save through a different exporter is
       // exactly how composed references would get melted back into the parent,
       // so this path deliberately reuses the one that already prunes.
-      const glb = await exportAssetGlb(assetRoot, name);
+      //
+      // plan-765 F5, the save guard: both counts are taken when the export
+      // hands out its clone — after the authored-name restore and both prunes,
+      // before the sanitizer — so they measure exactly what the serialization
+      // loses, not what the user edited (a broken edit is the live audit's
+      // `reference-unresolved`). The live tree is untouched at that moment (the
+      // export only reads it, and `runExclusive` holds every op). Measured in
+      // the callback rather than before the call, so an export stub that never
+      // clones (the save-routing tests mock the module) measures nothing.
+      let references: SaveReferenceCounts | undefined;
+      const glb = await exportAssetGlb(assetRoot, name, undefined, undefined, {
+        onClone: (clone) => { references = measureSavedReferences(assetRoot, clone); },
+        // plan-641 M5: the document's macros ride in the scene extras.
+        macros: macrosForEmbed(doc.document),
+        // plan-769 Phase 3: every stored reference is read the way the scene reads it.
+        registry: viewer.registry ?? null,
+      });
       const bytes = new Uint8Array(glb);
 
       // A copy goes to a path nothing may occupy; an in-place save replaces
@@ -853,7 +927,7 @@ async function saveAssetDocumentLocked(
       // the ADOPTION is abandoned, so nothing is entered into a project the
       // user has meanwhile moved to.
       if (
-        store.getBackend() !== backend
+        saveTargetBackendOf(doc.base) !== backend
         || (store.getProject()?.id ?? null) !== projectIdAtStart
         || doc.base !== baseAtStart
       ) {
@@ -867,15 +941,13 @@ async function saveAssetDocumentLocked(
       // keyspace and the next save all follow the new path — that is what
       // `markSaved(nextBase)` does, and why it takes the base rather than
       // assuming the old one.
-      const nextBase = nextIdentity(baseAtStart, relPath, name);
-      // AFTER the identity is known, because the preview is keyed by it since
-      // plan-744 F5 — not by the path it used to mirror.
-      await writeDocumentThumbnail(viewer, assetRoot, backend, nextBase.documentId);
+      // plan-778: a library document keeps its identity in library B.
+      const nextBase = library ? { ...library, name } : nextIdentity(baseAtStart, relPath, name);
       // plan-703's collision machinery, not a second one: a copy that lands
       // beside an identically named document must be caught here rather than
       // by whoever reads the manifest next.
       try {
-        assertNoDocumentIdCollisions(store.getProject());
+        if (!library) assertNoDocumentIdCollisions(store.getProject());
       } catch (e) {
         console.warn('[save-document] identity collision after save:', e);
       }
@@ -883,17 +955,43 @@ async function saveAssetDocumentLocked(
       // The floor captured before the bake — NOT the log as it stands now.
       doc.document.markSaved({ floor: floorAtBakeStart });
 
-      // F8 — announced AFTER the identity has moved, so a subscriber reading
-      // the document back sees the state the bytes describe. Emitted for every
-      // path, which is what makes the planner's cache invalidation correct for
-      // `models/**` as well as `library/**` (Defect b).
-      viewer.emit('document-saved', { documentId: nextBase.documentId, relPath });
+      // The one post-save step (plan-777 F5/P8): thumbnail → `document-saved`
+      // → background rescan, AFTER the identity has moved — the preview is keyed
+      // by the id since plan-744 F5, and a subscriber reading the document back
+      // sees the state the bytes describe. Announced for every path, which is
+      // what makes the planner's cache invalidation correct for `models/**` as
+      // well as `library/**` (Defect b). Never able to fail the save.
+      // plan-778: into library B — B's row gets the new hash and B is re-read;
+      // nothing of A (thumbnail, announce, rescan) describes it.
+      if (library) {
+        await (await import('../library/library-document-edit')).finishLibraryDocumentSave(
+          library.libraryProjectId, backend, relPath, bytes);
+      } else {
+        await finishDocumentSave({
+          viewer, store, backend, documentId: nextBase.documentId, relPath,
+        });
+      }
+
+      // plan-765 F5: reported once the file is really written and adopted — a
+      // conflict or a moved target wrote nothing this document owns. Keyed by
+      // the identity the document has NOW; a copy also retires the entry of
+      // the identity it was saved from (the session continues on the copy).
+      if (references) {
+        if (references.after > references.before) {
+          reportSaveReferenceLoss(nextBase.documentId, references.before, references.after, references.byField);
+        } else {
+          clearSaveReferenceLoss(nextBase.documentId);
+        }
+        const startId = 'documentId' in baseAtStart ? baseAtStart.documentId : null;
+        if (startId && startId !== nextBase.documentId) clearSaveReferenceLoss(startId);
+      }
 
       return {
         kind: 'saved',
         base: nextBase,
         relPath,
         copied: decision.copies === true,
+        ...(references ? { references } : {}),
       } as const;
     });
   } catch (e) {
@@ -902,6 +1000,34 @@ async function saveAssetDocumentLocked(
   } finally {
     saving.delete(doc);
     noteSaveActivity();
+  }
+}
+
+/** The authored name of a node: the loader's dedup stamp when it carries one (plan-734), else its name. */
+function authoredNameOf(node: Object3D): string {
+  const orig: unknown = node.userData?._rvOrigName;
+  return typeof orig === 'string' && orig.length > 0 ? orig : node.name;
+}
+
+/**
+ * The save guard's two counts (plan-765 F5): the LIVE tree spelled in authored
+ * names with the export's own prune predicate, and the export CLONE spelled in
+ * the names the file will hold. Never throws — a guard that cannot measure
+ * reports nothing and the save goes on (decision Q5: the guard never blocks).
+ */
+function measureSavedReferences(liveRoot: Object3D, clone: Object3D): SaveReferenceCounts | undefined {
+  try {
+    const before = countWrittenReferences(liveRoot, authoredNameOf, assetGlbExport.exportPrunePredicate);
+    const after = countWrittenReferences(clone, (n) => n.name);
+    const byField: Record<string, number> = {};
+    for (const [key, n] of Object.entries(after.byField)) {
+      const grown = n - (before.byField[key] ?? 0);
+      if (grown > 0) byField[key] = grown;
+    }
+    return { before: before.unresolved, after: after.unresolved, byField };
+  } catch (e) {
+    console.warn('[save-document] reference guard could not measure this save:', e);
+    return undefined;
   }
 }
 
@@ -983,54 +1109,5 @@ async function uniqueProjectPath(backend: ProjectBackend, relPath: string): Prom
   for (let i = 1; ; i++) {
     const next = candidate(`${stem}_${i}.glb`);
     if (!taken.has(next.toLowerCase())) return next;
-  }
-}
-
-/**
- * Best-effort preview beside a saved document — **any** document
- * (plan-744 F5).
- *
- * Two things changed at once and they are the same change. The file is keyed
- * by the document's ID (`<project>/.thumbnails/<encodeThumbnailId(id)>.png`)
- * rather than by a mirror of its path, and it is written for every document
- * rather than for `library/**` alone.
- *
- * The old rule read as an optimisation — "a model gets its preview from the
- * thumbnail cache instead" — and was a hole: the browser cache is per-browser
- * and per-machine, so a model, a scene, or anything a customer received on a
- * fresh machine had no persisted preview to show. And the path mirror lost the
- * picture on every move or rename, because the key WAS the location.
- *
- * Read back by `resolveDocumentThumbnail()`.
- */
-async function writeDocumentThumbnail(
-  viewer: RVViewer,
-  assetRoot: unknown,
-  backend: ProjectBackend,
-  documentId: string,
-): Promise<void> {
-  const id = typeof documentId === 'string' ? documentId.trim() : '';
-  if (id === '') return;
-  try {
-    const [{ ThumbnailRenderer }, { thumbnailSidecarPath }] = await Promise.all([
-      import('../thumbnails/thumbnail-renderer'),
-      import('../library/library-types'),
-    ]);
-    const thumbs = new ThumbnailRenderer(
-      viewer.renderer as never, viewer.scene as never);
-    const dataUrl = thumbs.render(assetRoot as never, 256);
-    thumbs.dispose();
-    // null = WebGPU renderer; thumbnails need the classic one (plan-271).
-    if (!dataUrl) return;
-    const blob = await (await fetch(dataUrl)).blob();
-    // Overwrite-by-design: a thumbnail is derived from the document that was
-    // just saved, so the current one is by definition the one to replace.
-    await backend.writeDocument(
-      thumbnailSidecarPath(id),
-      new Uint8Array(await blob.arrayBuffer()),
-      { expectedRevision: 'any' },
-    );
-  } catch (e) {
-    console.warn('[save-document] thumbnail write failed (the document saved fine):', e);
   }
 }

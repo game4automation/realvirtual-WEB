@@ -146,7 +146,7 @@ export function ReloadHintHost() {
         px: 2,
         py: 1,
         maxWidth: 'calc(100vw - 32px)',
-        borderRadius: 2,
+        borderRadius: 1,
         border: `1px solid ${WARN_LIGHT}`,
         bgcolor: 'background.paper',
         backdropFilter: 'blur(calc(8px * var(--rv-ui-blur-scale, 1)))',

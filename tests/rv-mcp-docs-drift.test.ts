@@ -44,6 +44,7 @@ import HELP_LAYOUT from '../src/plugins/mcp-bridge/help/layout.md?raw';
 import HELP_SIMULATION from '../src/plugins/mcp-bridge/help/simulation.md?raw';
 import HELP_PLC from '../src/plugins/mcp-bridge/help/plc.md?raw';
 import HELP_DES from '../src/plugins/mcp-bridge/help/des.md?raw';
+import HELP_PARAMETRIC from '../src/plugins/mcp-bridge/help/parametric.md?raw';
 
 const SOURCES: Record<string, string> = {
   'webviewer.mcp.md': INSTRUCTIONS,
@@ -52,6 +53,7 @@ const SOURCES: Record<string, string> = {
   'src/plugins/mcp-bridge/help/simulation.md': HELP_SIMULATION,
   'src/plugins/mcp-bridge/help/plc.md': HELP_PLC,
   'src/plugins/mcp-bridge/help/des.md': HELP_DES,
+  'src/plugins/mcp-bridge/help/parametric.md': HELP_PARAMETRIC,
 };
 
 const schemas = allSchemas();
@@ -123,13 +125,16 @@ describe('MCP documentation drift gate', () => {
 
   it('every tool appears in the generated roster — nothing falls off the end', () => {
     const roster = blocks.find((b) => b.marker === 'tool-domains')!.body;
-    const missing = schemas.map((s) => s.name).filter((n) => !roster.includes(`\`${n}\``));
+    // plan-641 Nachtrag 2026-10-21: aliases (`listed: false`) are counted, not listed.
+    const missing = schemas.filter((s) => s.listed !== false).map((s) => s.name).filter((n) => !roster.includes(`\`${n}\``));
     expect(missing, `not documented anywhere: ${missing.join(', ')}`).toEqual([]);
   });
 
   it('the roster counts what the schema list holds', () => {
     const roster = blocks.find((b) => b.marker === 'tool-domains')!.body;
-    expect(roster).toContain(`${schemas.length} tools across`);
+    const listed = schemas.filter((s) => s.listed !== false).length;
+    expect(roster).toContain(`${listed} tools across`);
+    if (listed < schemas.length) expect(roster).toContain(`Plus ${schemas.length - listed} command-bound aliases`);
   });
 
   /**

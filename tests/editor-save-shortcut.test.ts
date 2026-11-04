@@ -59,12 +59,10 @@ vi.mock('../src/core/editor/rv-asset-glb-export', async (original) => {
 
 // Thumbnails need a WebGL renderer and are best-effort in the code. `null` is
 // the documented WebGPU path — no thumbnail write, no noise here.
-vi.mock('../src/core/thumbnails/thumbnail-renderer', () => ({
-  ThumbnailRenderer: class {
-    render(): string | null { return null; }
-    dispose(): void {}
-  },
-}));
+// plan-776: the save reaches the renderer only through the thumbnail writer —
+// one shared stand-in for it (tests/helpers/mock-thumbnail-write.ts).
+vi.mock('../src/core/thumbnails/rv-thumbnail-write', async () =>
+  (await import('./helpers/mock-thumbnail-write')).mockThumbnailWriteModule());
 
 const writes: string[] = [];
 
@@ -277,7 +275,10 @@ describe('Ctrl+S while a save is already running', () => {
 
     expect(writes).toEqual(['library/Custom/Belt.glb']);
     expect(doc.markSavedCalls).toHaveLength(1);
-    expect(isSaving(doc)).toBe(false);
+    // `markSaved` is no longer the save's last step: the post-save step
+    // (thumbnail → document-saved → rescan, plan-777 P8) runs after it, inside
+    // the same save, so the guard clears a few ticks later.
+    await vi.waitFor(() => { expect(isSaving(doc)).toBe(false); });
   });
 
   it('but a later press saves again once the first one finished', async () => {

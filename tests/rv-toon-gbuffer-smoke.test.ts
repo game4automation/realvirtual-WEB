@@ -18,7 +18,7 @@
  *     P2.0 spike: the whole batched render pipeline draws through arenas, and
  *     an override shader that forgets `<batching_pars_vertex>` /
  *     `<batching_vertex>` renders every instance at the identity transform
- *     (doc-render-picking §1.6 point 5). `MeshDepthMaterial` with
+ *     (doc-bake-picking-internals §1.6 point 5). `MeshDepthMaterial` with
  *     `RGBADepthPacking` is checked in the same pass, because the depth channel
  *     rides on three's own batching-aware shader rather than on ours.
  *

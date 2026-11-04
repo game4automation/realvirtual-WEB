@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * signal-activity-indicator-store.ts — feature flag for the signal-list activity
  * indicator (plan-234 Phase 4, §10-H).
@@ -22,7 +24,7 @@ const listeners = new Set<() => void>();
 
 function loadInitial(): boolean {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = readLocalStorage(STORAGE_KEY);
     // Default ON: only an explicit '0' turns it off.
     return raw === null ? true : raw === '1';
   } catch {
@@ -38,7 +40,7 @@ function notify() {
 export function setSignalActivityIndicator(value: boolean): void {
   if (enabled === value) return;
   enabled = value;
-  try { localStorage.setItem(STORAGE_KEY, enabled ? '1' : '0'); } catch { /* ignore */ }
+  writeLocalStorage(STORAGE_KEY, enabled ? '1' : '0');
   notify();
 }
 

@@ -360,7 +360,7 @@ export function SensorHistoryPanel() {
         zIndex: Z_INDEX,
         display: 'flex',
         flexDirection: 'column',
-        borderRadius: 2,
+        borderRadius: 1,
         border: '1px solid rgba(255,255,255,0.08)',
         overflow: 'hidden',
         pointerEvents: 'auto',

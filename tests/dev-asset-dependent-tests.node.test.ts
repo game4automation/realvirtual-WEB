@@ -41,6 +41,7 @@ const IN_GIT_REPO = existsSync(resolve(REPO, '.git'));
 
 interface Expectations {
   devAssetDependent: string[];
+  probeOnly?: { files: string[] };
   knownFailing: { files: string[]; measured: string };
 }
 
@@ -92,6 +93,9 @@ describe('devAssetDependent expectation set (plan-395 §2.11)', () => {
       // The probe's own test carries the helper but must run in both worlds, so
       // it is deliberately not in the set (same exclusion as the generator).
       .filter(f => !f.endsWith('dev-asset-probe.test.ts'))
+      // Files that import the probe but are measured as not dependent (public asset / not
+      // measurable here) are recorded under `probeOnly` in the set, with the reason.
+      .filter(f => !(load().probeOnly?.files ?? []).includes(f))
       .filter(f => readFileSync(resolve(REPO, f), 'utf8').includes('dev-asset-available'));
 
     const listed = new Set(load().devAssetDependent.map(fileOf));

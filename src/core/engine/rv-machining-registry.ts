@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage } from '../rv-safe-storage';
+
 /**
  * rv-machining-registry.ts — Public interface + registry for the optional CSG
  * material-removal (machining) provider (plan-405).
@@ -342,9 +344,7 @@ export const machiningSettings = { enabled: true };
 /** False when the `rv.machining.wasm` kill-switch disables the WASM path. */
 export function isMachiningWasmFlagEnabled(): boolean {
   try {
-    const v = typeof localStorage !== 'undefined'
-      ? localStorage.getItem(MACHINING_WASM_FLAG_KEY)
-      : null;
+    const v = readLocalStorage(MACHINING_WASM_FLAG_KEY);
     if (v === 'off' || v === 'false' || v === '0') return false;
   } catch {
     /* storage unavailable (privacy mode) — default ON */

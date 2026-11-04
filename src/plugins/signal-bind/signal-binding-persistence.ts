@@ -8,6 +8,7 @@ import { persistFieldOp } from '../../core/hmi/scene/scene-field-ops';
 import { getActiveEditTarget } from '../../core/hmi/rv-edit-target';
 import { noteSignalMappingsWritten } from './first-link-notice';
 import { isDuplicateSignalName } from '../../core/engine/rv-signal-construction';
+import { fromStoredMapping, placementRootOf, toStoredMapping } from '../../core/engine/rv-signal-mapping-address';
 
 export interface SignalBindingPersistenceAdapter {
   read(): SignalMapping[];
@@ -75,8 +76,15 @@ export function createSignalBindingPersistence(
 ): SignalBindingPersistenceAdapter {
   if (target.kind === 'placed') {
     const planner = viewer.getPlugin<PlannerLike>('layout-planner');
-    const readPlaced = () => planner?.store.getSnapshot().placed
-      .find((p) => p.id === target.placedId)?.signalMappings?.map((m) => ({ ...m })) ?? [];
+    // plan-769 F15: a record loaded from a file names its component by ADDRESS — the
+    // in-memory copy gets its `componentPath` back (the slot rows speak paths).
+    const readPlaced = () => {
+      const list = planner?.store.getSnapshot().placed.find((p) => p.id === target.placedId)?.signalMappings ?? [];
+      if (!list.some((m) => m.componentPath === undefined || m.sourceAddress)) return list.map((m) => ({ ...m }));
+      const registry = viewer.registry ?? null;
+      const root = registry ? placementRootOf(registry, target.placedId) : null;
+      return list.map((m) => fromStoredMapping(m, root, registry, viewer.signalStore ?? null));
+    };
     return {
       read: readPlaced,
       write: (mappings) => {
@@ -90,13 +98,17 @@ export function createSignalBindingPersistence(
 
   if (!nodeMappings.has(target.node)) nodeMappings.set(target.node, legacyNodeMappings(target));
   const carrierName = carrierSignalNameFor(viewer, target.nodePath);
+  // plan-769 F15: the persisted record (the SignalLinks op → the planner save) names the
+  // component by ADDRESS relative to the carrier; read() hands the in-memory copy out.
+  const stored = (m: SignalMapping): SignalMapping => toStoredMapping(m, target.node, viewer.registry ?? null, viewer.signalStore ?? null);
+  const live = (m: SignalMapping): SignalMapping => fromStoredMapping(m, target.node, viewer.registry ?? null, viewer.signalStore ?? null);
   const prepare = (mappings: readonly SignalMapping[]): { prev: SignalMapping[]; next: SignalMapping[] } => ({
     prev: (nodeMappings.get(target.node) ?? legacyNodeMappings(target)).map((mapping) => ({ ...mapping })),
-    next: mappings.map((mapping) => (
+    next: mappings.map((mapping) => stored(
       carrierName ? { ...mapping, carrierSignalName: carrierName } : { ...mapping })),
   });
   return {
-    read: () => (nodeMappings.get(target.node) ?? []).map((mapping) => ({ ...mapping })),
+    read: () => (nodeMappings.get(target.node) ?? []).map(live),
     write: (mappings) => {
       const { prev, next } = prepare(mappings);
       syncNodeSignalBindingPersistence(target.node, next);

@@ -185,7 +185,7 @@ describe('commissioningTrust_ProvenanceLifecycle', () => {
     expect(viewerSource).toContain('if (this._loadGeneration === loadGeneration) {');
     // …and resets in clearModel, which every load runs FIRST — so a failed load
     // cannot leave the previous model's record on screen.
-    const clearAt = viewerSource.indexOf('clearModel(): void {');
+    const clearAt = viewerSource.indexOf('clearModel(opts?:');
     expect(clearAt).toBeGreaterThan(-1);
     // Bounded by the plugin notification rather than a fixed character window:
     // plan-757 added per-document problem resets ahead of it, which pushed the

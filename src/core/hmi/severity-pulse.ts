@@ -5,7 +5,7 @@
  * severity-pulse — shared alarm flash for the message system.
  *
  * Frames a scene component in 3D and flashes it in the severity color for a
- * few seconds. This is the generalized form of the Toray showcase's
+ * few seconds. This is the generalized form of the CAD-import showcase model's
  * motor-alarm effect, wired into TileCard so EVERY message card with a
  * related component (standard WebError panel, demo messages, customer HMIs)
  * gets the same behavior — colored by the card's severity via the standard

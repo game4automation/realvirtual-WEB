@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, removeLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * maintenance-progress-store.ts — Persist maintenance step progress in localStorage.
  *
@@ -30,7 +32,7 @@ type ProgressMap = Record<string, MaintenanceProgress>;
 /** Load all persisted progress from localStorage. */
 function loadAll(): ProgressMap {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = readLocalStorage(STORAGE_KEY);
     if (!raw) return {};
     return JSON.parse(raw) as ProgressMap;
   } catch {
@@ -41,7 +43,7 @@ function loadAll(): ProgressMap {
 /** Save all progress to localStorage. */
 function saveAll(map: ProgressMap): void {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(map));
+    writeLocalStorage(STORAGE_KEY, JSON.stringify(map));
   } catch {
     // Silently ignore storage errors (quota, private mode, etc.)
   }
@@ -78,5 +80,5 @@ export function clearMaintenanceProgress(procedureName: string): void {
 
 /** Clear all maintenance progress. */
 export function clearAllMaintenanceProgress(): void {
-  localStorage.removeItem(STORAGE_KEY);
+  removeLocalStorage(STORAGE_KEY);
 }

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage, listLocalStorageKeys, readLocalStorage, removeLocalStorage } from '../rv-safe-storage';
+
 /**
  * rv-scene-glb-store — scene GLB bodies for the browser backend (plan-397
  * phase 5).
@@ -92,7 +94,7 @@ export function readSceneGlbPointer(sceneId: string): SceneGlbPointer | null {
   if (!sceneId) return null;
   let raw: string | null;
   try {
-    raw = localStorage.getItem(pointerKey(sceneId));
+    raw = readLocalStorage(pointerKey(sceneId));
   } catch {
     return null;
   }
@@ -168,7 +170,7 @@ export async function writeSceneGlb(
     ...(meta.baseSha ? { baseSha: meta.baseSha } : {}),
   };
   try {
-    localStorage.setItem(pointerKey(sceneId), JSON.stringify(pointer));
+    getLocalStorage()!.setItem(pointerKey(sceneId), JSON.stringify(pointer));
   } catch (e) {
     // A pointer that cannot be written means the body is unreachable, which
     // is a failed save — unlike the ownership marker, this one must NOT be
@@ -184,9 +186,7 @@ export async function writeSceneGlb(
 /** Drop the pointer and the body. Idempotent. */
 export async function deleteSceneGlb(sceneId: string): Promise<void> {
   const pointer = readSceneGlbPointer(sceneId);
-  try {
-    localStorage.removeItem(pointerKey(sceneId));
-  } catch { /* private mode — the blob cleanup below is still worth doing */ }
+  removeLocalStorage(pointerKey(sceneId));
   if (pointer) await deleteBlobIfUnreferenced(pointer.sha);
 }
 
@@ -201,8 +201,12 @@ export async function deleteSceneGlb(sceneId: string): Promise<void> {
  */
 function isShaReferenced(sha: string): boolean {
   try {
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
+    const storage = getLocalStorage();
+    if (!storage) return true;
+    const keys = listLocalStorageKeys();
+    // A failed snapshot must not make a live blob appear unreferenced.
+    if (keys.length !== storage.length) return true;
+    for (const k of keys) {
       if (!k || !k.startsWith(LS_KEY_SCENE_GLB_PREFIX)) continue;
       if (readSceneGlbPointer(k.slice(LS_KEY_SCENE_GLB_PREFIX.length))?.sha === sha) return true;
     }
@@ -257,7 +261,7 @@ export function moveSceneGlbPointer(
   try {
     if (target) {
       if (target.sha !== source.sha) return 'conflict';
-      localStorage.removeItem(pointerKey(from));
+      getLocalStorage()!.removeItem(pointerKey(from));
       return 'same';
     }
     const moved: SceneGlbPointer = { ...source };
@@ -268,8 +272,8 @@ export function moveSceneGlbPointer(
     else if (typeof stamp.movedAt === 'string' && stamp.movedAt) moved.movedAt = stamp.movedAt;
     // Write-new, then remove-old: interrupted in between, both keys name the
     // same blob, which duplicates a name and loses nothing.
-    localStorage.setItem(pointerKey(to), JSON.stringify(moved));
-    localStorage.removeItem(pointerKey(from));
+    getLocalStorage()!.setItem(pointerKey(to), JSON.stringify(moved));
+    getLocalStorage()!.removeItem(pointerKey(from));
     return 'moved';
   } catch {
     return 'conflict';
@@ -285,8 +289,7 @@ export function listSceneGlbSlots(prefix: string): string[] {
 export function listSceneGlbIds(): string[] {
   const out: string[] = [];
   try {
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
+    for (const k of listLocalStorageKeys()) {
       if (k && k.startsWith(LS_KEY_SCENE_GLB_PREFIX)) {
         out.push(k.slice(LS_KEY_SCENE_GLB_PREFIX.length));
       }

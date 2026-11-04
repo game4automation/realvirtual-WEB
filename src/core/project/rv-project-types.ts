@@ -66,7 +66,8 @@ export const PROJECT_FOLDER = {
   connect: 'connect',
   settings: 'settings',
   rag: 'rag',
-  thumbnails: 'thumbnails',
+  /** Saved document previews (plan-776). A dot folder: hidden from every listing by the internals rule. */
+  thumbnails: '.thumbnails',
   /**
    * Gaussian splat captures (plan-372 Phase 11).
    *
@@ -86,15 +87,22 @@ export const PROJECT_SETTINGS_REF = `${PROJECT_FOLDER.settings}/${PROJECT_SETTIN
 // ─── Types ──────────────────────────────────────────────────────────────
 
 /**
- * A scene entry in the manifest. Mirrors `RvSceneMeta` plus the on-disk
- * `path`, so the Models panel renders identically whether it is fed from
- * disk or from localStorage.
+ * A member of a legacy `scenes[]` manifest array — **migration input only**
+ * (plan-777 F1).
+ *
+ * Every live row is an {@link RvDocumentEntry}. This shape survives for the
+ * code that reads a manifest written before plan-413 (the lift helpers in
+ * `rv-project-documents.ts`, `rv-project-documents-migration.ts`,
+ * `rv-workspace-migration.ts`); `tests/document-vocabulary-guard.node.test.ts`
+ * pins that nothing else names it.
  *
  * The index signature is deliberate: it is what makes field-level
  * read-modify-write expressible. A future `tags` field on one entry must
- * survive a save by an older client.
+ * survive a save by an older client. `baseKind`, `baseLabel` and `parentId`
+ * are historically persisted fields no live code reads; the index signature
+ * of {@link RvDocumentEntry} carries them through a save untouched.
  */
-export interface RvProjectSceneEntry {
+export interface LegacyProjectSceneEntry {
   id: string;
   name: string;
   path: string;
@@ -124,17 +132,16 @@ export interface RvProjectSceneEntry {
   [key: string]: unknown;
 }
 
-/** `{path, label, sha256, sizeBytes}` artefact reference (models[], library[]). */
-export interface RvProjectAssetEntry {
+/**
+ * A member of a legacy `models[]` / `library[]` manifest array —
+ * `{path, label, sha256, sizeBytes}`. **Migration input only** (plan-777 F1),
+ * fenced exactly like {@link LegacyProjectSceneEntry}.
+ */
+export interface LegacyProjectAssetEntry {
   /**
    * Stable identity of the artefact, independent of where it currently sits
-   * (plan-397 F2, §2.7).
-   *
-   * Until now `path` was the de-facto key, which made every rename a broken
-   * reference: an `AssetReference` resolves by id **first** and falls back to
-   * the path, so a moved file keeps its referrers. Optional, because a
-   * manifest written before this plan has none — `assetEntryKey()` is the one
-   * place that decides what to use.
+   * (plan-397 F2, §2.7). Optional, because a manifest written before plan-397
+   * has none — the documents migration mints one for every entry without.
    */
   id?: string;
   path: string;
@@ -147,18 +154,6 @@ export interface RvProjectAssetEntry {
   [key: string]: unknown;
 }
 
-/**
- * The key an artefact is addressed by: its id when it has one, else its path.
- *
- * The fallback is what makes the `id` field additive — an entry without one
- * behaves exactly as it did before, and gaining an id later does not change
- * the answer for anybody who still refers to it by path.
- */
-export function assetEntryKey(entry: RvProjectAssetEntry): string {
-  const id = typeof entry.id === 'string' ? entry.id.trim() : '';
-  return id !== '' ? id : entry.path;
-}
-
 /** Mint an artefact id. Same shape rationale as {@link newProjectId}. */
 export function newAssetId(): string {
   return 'ast_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
@@ -168,7 +163,7 @@ export function newAssetId(): string {
  * One document of the project — the entry type that replaces all three
  * (plan-413 §2.3).
  *
- * `RvProjectSceneEntry` and `RvProjectAssetEntry` described the same thing from
+ * `LegacyProjectSceneEntry` and `LegacyProjectAssetEntry` described the same thing from
  * two directions: a GLB the project owns, plus whatever the section it happened
  * to sit in needed. Since plan-397 they are literally the same bytes; the
  * difference that survives is a **role** ("this one is opened", "this one is
@@ -177,7 +172,7 @@ export function newAssetId(): string {
  * Two fields are worth reading twice:
  *
  *  - **`id` is mandatory** (F2). It is what a reference, a fork and a move all
- *    survive on. `RvProjectAssetEntry.id` was optional because the manifests
+ *    survive on. `LegacyProjectAssetEntry.id` was optional because the manifests
  *    that predate plan-397 have none — the documents migration mints one for
  *    every entry that arrives without, which is why this field can be required
  *    while the old one stays optional.
@@ -189,6 +184,13 @@ export function newAssetId(): string {
  * entry types carry: a field written by a newer client survives a save by this
  * one.
  */
+/** Provenance of an imported document — see {@link RvDocumentEntry.source}. */
+export interface RvDocumentSource {
+  /** The importer that wrote it, e.g. `simready`. */
+  provider: string;
+  [key: string]: unknown;
+}
+
 export interface RvDocumentEntry {
   /** Mandatory (F2). The migration mints one for every entry that lacks it. */
   id: string;
@@ -235,11 +237,25 @@ export interface RvDocumentEntry {
   revision?: string;
   createdAt?: string;
   modifiedAt?: string;
+  /**
+   * Relative path of the saved preview, e.g. `.thumbnails/doc_conveyor_1a2b.3fa9c2d1.webp`
+   * (plan-776). Written ONLY by a save (`ProjectStore.setDocumentThumbnail`);
+   * absent = the card shows its type placeholder. A URL or an absolute path a
+   * delivered manifest states is passed through by the reader, never written.
+   */
   thumbnail?: string;
   /** Id of the bundled entry this one was forked from (§2.3). */
   forkedFrom?: string;
-  /** Id of the document this one was copied from (plan-413 §2.7, phase 5). */
-  copiedFrom?: string;
+  /** Source document id (plan-413); `{ projectId, documentId }` for a fork out of a library (plan-778). */
+  copiedFrom?: string | { projectId: string; documentId: string };
+  /**
+   * Where an IMPORTED document came from (plan-660): the remote catalog and the
+   * pinned asset it was converted from. This row is how an importer finds its
+   * own earlier copy again — the GLB's top-level glTF extras do not survive an
+   * editor save (GLTFExporter writes its own `asset`/`extras`), the manifest row
+   * does. The importer writes it; nothing else interprets it.
+   */
+  source?: RvDocumentSource;
   sizeBytes?: number;
   sha256?: string;
   /**
@@ -252,6 +268,12 @@ export interface RvDocumentEntry {
    * filing) and are computed by the catalog, never stored here.
    */
   collections?: string[];
+  /**
+   * Legacy ids this document answers to (plan-778 F5) — for UNQUALIFIED
+   * references only, and only after every source's canonical ids were asked.
+   * Written by the library builder; never consulted for a qualified reference.
+   */
+  aliases?: string[];
   /**
    * When the adopt verb first found this row's file missing, ISO-8601
    * (plan-717 §2.2 step 4).
@@ -305,8 +327,22 @@ export interface RvDocumentEntry {
    * Carried by a manifest row since plan-731: it used to live in the curated
    * `scenes/index.json`, the second catalogue that plan abolished. A `?mode=`
    * in the URL still wins over it.
+   *
+   * With {@link modes} set it is also the DEFAULT of the restriction: the mode
+   * the workspace moves to when the active one is not allowed.
    */
   mode?: string;
+  /**
+   * The workspace modes this document may be used in (e.g.
+   * `["commissioning", "viewer"]`). Optional — absent means every mode.
+   *
+   * While the document is open the mode switcher offers only these, and a
+   * switch to any other mode (UI, MCP, `?mode=`) is refused with
+   * `mode-not-allowed:<mode> for <document id>`. Authoring modes (the asset
+   * editor, `runtime: 'detached'`) are never restricted, so the document stays
+   * editable. Opening another document lifts the restriction.
+   */
+  modes?: string[];
   /**
    * Repo fixture: visible in the dev checkout, removed by every staging path
    * (plan-731 §2.4).
@@ -327,7 +363,31 @@ export interface RvDocumentEntry {
    * `models/` path fallback beside it.
    */
   settingsPath?: string;
+  /**
+   * The DES experiment archive this document ships, a project-relative path —
+   * `experiments/<id>.rvexp.ndjson`.
+   *
+   * The declaration is what lets a READ-ONLY deploy load the archive without
+   * probing: an HTTP deploy cannot list its folder, so a viewer that guessed the
+   * filename for every document it opened met a 404 for every document without
+   * experiments. A writable project still probes its own storage (no network),
+   * and its save path writes this pointer once it has written the archive.
+   */
+  experiments?: string;
   [key: string]: unknown;
+}
+
+/**
+ * The experiment archive a document row declares, or null.
+ *
+ * Only a contained relative path to an `.rvexp.ndjson` file counts: a URL, an
+ * absolute path or a `.`/`..` segment is never fetched on the manifest's word.
+ */
+export function declaredExperimentsPath(row: { experiments?: unknown } | null | undefined): string | null {
+  const raw = typeof row?.experiments === 'string' ? row.experiments.trim().replace(/\\/g, '/') : '';
+  if (!raw || !/\.rvexp\.ndjson$/i.test(raw) || raw.startsWith('/') || /^[a-z][a-z0-9+.-]*:/i.test(raw)) return null;
+  if (raw.split('/').some(s => s === '' || s === '.' || s === '..')) return null;
+  return raw;
 }
 
 /**
@@ -340,9 +400,21 @@ export interface RvDocumentEntry {
  * two-level library SSOT; the other half is the user's global localStorage list.
  */
 export interface RvProjectLibraryRef {
-  /** Catalog URL, GitHub repo/folder URL, or any other `addCatalog` key. */
-  url: string;
+  /**
+   * Identity of a library PROJECT — its `project.json` id (plan-778). The key of
+   * the entry since plan-778: a library leaves the project only by identity,
+   * never by path. A writer produces either this or {@link url}; a reader accepts both.
+   */
+  projectId?: string;
+  /** Catalog URL, GitHub repo/folder URL, or any other `addCatalog` key (legacy / external catalogs). */
+  url?: string;
   label?: string;
+  /**
+   * Where the library project was last seen (plan-778): a URL for a hosted
+   * project, a folder name for a local one (message only), a relative path only
+   * when CONNECT writes it. A hint is tried as a location, never as identity.
+   */
+  hint?: string;
   [key: string]: unknown;
 }
 
@@ -468,7 +540,8 @@ export interface RvProject {
    *
    * The name is pre-plan-716 and the value is a document id. A plan-720 audit
    * classified the field as dead on the name alone; the review caught it. Rename
-   * it if you like, but do not remove it (Z6).
+   * it if you like, but do not remove it (Z6). Persisted name — do not rename
+   * (plan-777 P1): every delivered `project.json` carries it.
    */
   activeSceneId?: string | null;
   /**
@@ -523,6 +596,39 @@ export interface RvProject {
 
   /** Unknown/future sections travel through untouched. */
   [key: string]: unknown;
+}
+
+// ─── Hosted start document (plan-640) ───────────────────────────────────
+
+/**
+ * `project.json` → `settings.start` (plan-640): what the ROOT of a hosted
+ * deploy opens instead of the dashboard. Opt-in; read only on a hosted boot
+ * (`settings.json` → `hostedDeploy: true`, no `mode.lock`). Nothing is locked —
+ * the dashboard and every mode stay reachable through the UI.
+ */
+export interface RvProjectStart {
+  /** Document id or path from `documents[]`. */
+  document: string;
+  /** Registered workspace mode id, e.g. `'hmi'`. Optional. */
+  mode?: string;
+}
+
+/**
+ * Read `settings.start` defensively: only an object with a non-empty string
+ * `document` counts, and `mode` only as a non-empty string. Anything else —
+ * absent, malformed, an older runtime's guess — is `null`, i.e. "no start
+ * document", and the hosted root stays the dashboard (D14).
+ */
+export function readProjectStart(project: RvProject | null | undefined): RvProjectStart | null {
+  const settings = project?.settings;
+  if (!isPlainObject(settings)) return null;
+  const raw = (settings as Record<string, unknown>).start;
+  if (!isPlainObject(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  const document = typeof record.document === 'string' ? record.document.trim() : '';
+  if (document === '') return null;
+  const mode = typeof record.mode === 'string' ? record.mode.trim() : '';
+  return mode === '' ? { document } : { document, mode };
 }
 
 // ─── Id + slug ──────────────────────────────────────────────────────────
@@ -750,7 +856,20 @@ function isPlainObject(value: unknown): boolean {
 
 // ─── Construction ───────────────────────────────────────────────────────
 
-/** Build a fresh, minimal `rv-project/1.0` manifest. */
+/** Manifest key recording that the realvirtual library reference was adopted (plan-778 F14). */
+export const LIBRARY_PROJECT_MIGRATION_MARKER = 'rv-project/library-project-migration';
+/** Identity of the realvirtual library project (twin of `REALVIRTUAL_LIBRARY_PROJECT_ID` in library-origin). */
+export const REALVIRTUAL_LIBRARY_PROJECT_REF = 'prj_realvirtual_library';
+/** Label of the `libraries[]` entry of the realvirtual library. */
+export const REALVIRTUAL_LIBRARY_LABEL = 'realvirtual Library';
+
+/**
+ * Build a fresh, minimal `rv-project/1.0` manifest.
+ *
+ * It lists the realvirtual library (plan-778 Decision 7: explicit but pre-filled)
+ * and carries the library-migration marker from the start, so the migration
+ * never runs on it and a later removal of the library is never undone.
+ */
 export function newProject(name: string): RvProject {
   const now = new Date().toISOString();
   return {
@@ -764,5 +883,7 @@ export function newProject(name: string): RvProject {
     documents: [],
     activeSceneId: null,
     settingsRef: { ref: PROJECT_SETTINGS_REF },
+    libraries: [{ projectId: REALVIRTUAL_LIBRARY_PROJECT_REF, label: REALVIRTUAL_LIBRARY_LABEL }],
+    [LIBRARY_PROJECT_MIGRATION_MARKER]: { at: now, added: false, hadLibraries: false, replaced: [], born: true },
   };
 }

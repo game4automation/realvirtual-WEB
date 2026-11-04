@@ -52,6 +52,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { nodeRegistryDouble } from './fixtures/node-registry-double';
 
 const h = vi.hoisted(() => ({
   /** Slot name → bytes, as the OPFS/project body store would answer. */
@@ -166,7 +167,7 @@ function makeViewer(): FakeViewer {
     // Null on purpose: `_adoptFromLoadedGlb` returns immediately without a
     // model root, and adoption is another plan's seam.
     currentModelRoot: null,
-    registry: { getGltfNodeNames: () => [], getGltfNodeIndex: () => -1 },
+    registry: nodeRegistryDouble(),
     lastLoadResult: null,
     modes: { has: () => true, setMode: vi.fn() },
     loadScene: vi.fn(async (s: RvScene, _mode?: unknown, opts?: unknown) => {
@@ -528,10 +529,10 @@ describe('plan-716 Phase 1 — boot with no project (My Workspace)', () => {
     const resolved = await ps.resolveActiveProject({ bundledBackend: bundled() });
 
     expect(resolved.backend.kind).toBe('browser');
-    // UNCHANGED: an empty catalogue still yields no scenes, and booting still
+    // UNCHANGED: an empty catalogue still yields no documents, and booting still
     // records nothing as "the project to reopen" — that pointer is written for
     // folder projects only.
-    expect(resolved.scenes).toEqual([]);
+    expect(resolved.documents).toEqual([]);
     expect(localStorage.getItem(LS_KEY_LAST_PROJECT)).toBeNull();
     await ps.closeProject();
   });

@@ -11,6 +11,9 @@ import {
   saveLastEditedAsset,
   loadLastEditedAsset,
   clearLastEditedAsset,
+  saveEditorDescent,
+  loadEditorDescent,
+  clearEditorDescent,
 } from '@rv-private/plugins/asset-editor/last-edited-asset-store';
 import { EDITOR_LAST_ASSET_KEY, ALL_RV_STORAGE_KEYS } from '../src/core/hmi/rv-storage-keys';
 import { projectDocumentBase } from '../src/core/editor/active-asset-store';
@@ -117,5 +120,29 @@ describe('last-edited-asset-store', () => {
 
   it('the key is registered so "Reset all" clears it too', () => {
     expect(ALL_RV_STORAGE_KEYS as readonly string[]).toContain(EDITOR_LAST_ASSET_KEY);
+  });
+});
+
+describe('editor descent (drill-in stack across a reload)', () => {
+  beforeEach(() => clearEditorDescent());
+
+  it('round-trips root, reference ids and the child it ended in', () => {
+    const root = projectDocumentBase('layouts/line.glb', 'line');
+    saveEditorDescent({ root, referenceNodeIds: ['n1', 'n2'], topPath: 'library/cell.glb' });
+    expect(loadEditorDescent()).toEqual({ root, referenceNodeIds: ['n1', 'n2'], topPath: 'library/cell.glb' });
+  });
+
+  it('forgets the descent when the chain is back at the root', () => {
+    const root = projectDocumentBase('layouts/line.glb', 'line');
+    saveEditorDescent({ root, referenceNodeIds: ['n1'], topPath: 'library/cell.glb' });
+    saveEditorDescent({ root, referenceNodeIds: [], topPath: 'layouts/line.glb' });
+    expect(loadEditorDescent()).toBeNull();
+  });
+
+  it('reads a corrupt record as no descent', () => {
+    localStorage.setItem(`${EDITOR_LAST_ASSET_KEY}:descent`, '{"v":1,"root":{"kind":"empty"},"referenceNodeIds":["x"]}');
+    expect(loadEditorDescent()).toBeNull();
+    localStorage.setItem(`${EDITOR_LAST_ASSET_KEY}:descent`, 'not json');
+    expect(loadEditorDescent()).toBeNull();
   });
 });

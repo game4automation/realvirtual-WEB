@@ -18,6 +18,27 @@ import type { SxProps, Theme } from '@mui/material';
  */
 export const CHIP_RADIUS = '2px';
 
+/**
+ * The ONE look of a document label chip: the open mode a document card or row
+ * names ("DES", "Commissioning") and the Bundled tier wear exactly this, so the
+ * two read as one family. Placement (margins, absolute position) is the
+ * caller's; the look is not.
+ */
+export const LABEL_CHIP_SX = {
+  flexShrink: 0,
+  px: 0.75,
+  py: 0.25,
+  borderRadius: CHIP_RADIUS,
+  border: '1px solid rgba(255,255,255,0.14)',
+  fontSize: 10,
+  letterSpacing: 0.4,
+  color: 'text.secondary',
+  whiteSpace: 'nowrap',
+} as const;
+
+/** Backdrop of a label chip painted over a card preview, so it reads on any thumbnail. */
+export const LABEL_CHIP_ON_PREVIEW_BG = 'rgba(0,0,0,0.55)';
+
 // ─── Design values (plan-510) ───────────────────────────────────────────
 //
 // The ONE place the inspector's colours and type sizes live. Inspector files
@@ -34,6 +55,16 @@ export const INK_MID = 'rgba(255,255,255,0.70)';
 /** Tertiary text — labels, hints, units, subheaders. 0.5 = the design system's
  *  Ink Low (private DESIGN.md) and the contrast floor on glass. */
 export const INK_LOW = 'rgba(255,255,255,0.5)';
+/**
+ * Panel surface — the darkest near-opaque glass for floating panels whose
+ * content is text and values (FloatingPanel, the operator-panel plate, the USD
+ * menu). Over the worst-case #505050 scene it lands at #1A1A1A, over a white
+ * scene at #222222, so Ink Low and the state colours keep >= 4.5:1; the lighter
+ * theme Paper default (rgba(30,30,30,0.6)) does not (private DESIGN.md,
+ * "Floating Glass Panel"). Paper sets its background with `!important`
+ * (theme.ts), so a Paper takes this as `${PANEL_SURFACE} !important`.
+ */
+export const PANEL_SURFACE = 'rgba(15,15,15,0.92)';
 /** Hairline separators between inspector blocks. */
 export const DIVIDER = 'rgba(255,255,255,0.06)';
 /** Row hover tint. */
@@ -186,10 +217,10 @@ export function compactToggleGroupSx(
         border: '1px solid rgba(255,255,255,0.1) !important',
       },
       '& .MuiToggleButton-root': {
-        color: 'rgba(255,255,255,0.4)',
+        color: INK_MID,
         bgcolor: 'transparent',
         borderColor: 'rgba(255,255,255,0.1)',
-        fontSize: 10,
+        fontSize: FS.label,
         lineHeight: 1,
         px: 0.6,
         py: 0,
@@ -204,6 +235,7 @@ export function compactToggleGroupSx(
           bgcolor: `rgba(${accentRgb},0.18)`,
         },
         '&:hover': { bgcolor: 'rgba(255,255,255,0.04)' },
+        '&.Mui-disabled': { color: 'text.disabled', bgcolor: 'transparent' },
       },
     },
     ...(Array.isArray(extraSx) ? extraSx : extraSx ? [extraSx] : []),

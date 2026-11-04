@@ -18,7 +18,7 @@ extension APIs. A standalone Community checkout builds without Unity or a privat
 repository. You can use GLB files from any compatible authoring tool.
 
 Commercial WEB builds can additionally include the browser **Asset & Kinematics
-Editor**, CAD import, DES and other licensed modules. These features are not enabled
+Editor**, CAD import and other licensed modules. Discrete event simulation is part of the Community source. These features are not enabled
 by installing the Community source. See the [edition comparison](README.md#community-edition-vs-commercial).
 
 realvirtual on Unity remains an optional authoring and virtual-commissioning platform.
@@ -145,15 +145,23 @@ UI inside Unity make that the wrong place for them.
 ### 0.1 `NodeId` and the Unity → WEB → Unity round-trip
 
 WEB addresses nodes by a stable `NodeId` in `extras.realvirtual` (plan-397,
-rv-ODT §5a) as well as by path. It matters to a Unity user in exactly one
+rv-ODT §5a); since plan-769 every reference a web save writes is such an
+address, and a path is only input. It matters to a Unity user in exactly one
 situation: a **round-trip**, where a GLB exported from Unity is edited in WEB
 and comes back.
 
+- **A GLB saved by WEB cannot be imported into Unity (plan-769 F20).** Unity reads
+  the PATH form of references only; a web save (`idVersion: 1` on
+  `scenes[0].extras.realvirtual`) stores addresses. Keep the Unity scene as the
+  source of the Unity side and re-export from there; WEB reads Unity's paths and
+  migrates them on load.
+
 - **Unity does not have to produce `NodeId`s.** A file without them loads
   unchanged — that is the entire existing Unity export corpus. For such a file
-  WEB *derives* the id deterministically from the file's own hash plus the glTF
-  node index, so the same bytes always yield the same ids and an override
-  written against them survives a reload.
+  WEB *seeds* the id deterministically from the node's authored path (a UUIDv5,
+  plan-769; the older sha256 + node-index derivation is gone), so the same file
+  always yields the same ids and an override written against them survives a
+  reload — and a re-export from Unity with unchanged names keeps them.
 - **Unity must not strip them.** If a GLB that already carries `NodeId` is
   re-imported and re-exported by Unity, dropping the field silently orphans
   every override a referencing file holds against it. `NodeId` deliberately has
@@ -166,7 +174,7 @@ and comes back.
 
 See [`doc-node-paths.md`](doc-node-paths.md) for the addressing model and
 [`schema/v1/specification.md`](schema/v1/specification.md) §5a for the
-normative derivation.
+normative seed.
 
 ---
 

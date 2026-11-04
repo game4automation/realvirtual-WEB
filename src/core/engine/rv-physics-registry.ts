@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage } from '../rv-safe-storage';
+
 /**
  * rv-physics-registry.ts — Public interface + registry for the optional
  * zone-based physics provider (plan-276).
@@ -97,6 +99,11 @@ export interface PhysicsZoneConfig {
    *  {@link PHYSICS_DEFAULT_MU_MASS_KG}. Rapier's own default is DENSITY-based
    *  and gives a 0.2 m cube 8 g, which makes every payload meaningless. */
   muMassKg?: number;
+  /** plan-2219: soft-CCD look-ahead (m) of every DYNAMIC MU created in this
+   *  zone — guards thin fixed floors against tunnelling. 0 = off. Omitted →
+   *  {@link PHYSICS_DEFAULT_SOFT_CCD_PREDICTION_M}. Kinematic parts keep their
+   *  own per-tick soft CCD. */
+  softCcdPrediction?: number;
 }
 
 // ─── Provider contract (implemented by the private Rapier provider) ────────
@@ -245,7 +252,7 @@ export const PHYSICS_FLAG_KEY = 'rv.physics';
  *  missing key) leaves them disabled. */
 export function isPhysicsFlagEnabled(): boolean {
   try {
-    const v = typeof localStorage !== 'undefined' ? localStorage.getItem(PHYSICS_FLAG_KEY) : null;
+    const v = readLocalStorage(PHYSICS_FLAG_KEY);
     return v === 'on' || v === 'true' || v === '1';
   } catch {
     return false;
@@ -272,7 +279,7 @@ export const PHYSICS_FULL_FLAG_KEY = 'rv.physics.full';
  *  missing key) leaves it disabled. */
 export function isFullPhysicsFlagEnabled(): boolean {
   try {
-    const v = typeof localStorage !== 'undefined' ? localStorage.getItem(PHYSICS_FULL_FLAG_KEY) : null;
+    const v = readLocalStorage(PHYSICS_FULL_FLAG_KEY);
     return v === 'on' || v === 'true' || v === '1';
   } catch {
     return false;

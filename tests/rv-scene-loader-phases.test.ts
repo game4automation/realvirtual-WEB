@@ -64,10 +64,9 @@ describe('loadGLB phase functions', () => {
     expect(typeof mod.buildReplayRecordings).toBe('function');
   });
 
-  it('exports buildLogicEngine as a function', async () => {
+  it('builds no logic (plan-769 Phase 6: the viewer merges the main model\'s LogicSteps after scene-ready)', async () => {
     const mod = await import('../src/core/engine/rv-scene-loader');
-    expect(mod.buildLogicEngine).toBeDefined();
-    expect(typeof mod.buildLogicEngine).toBe('function');
+    expect('buildLogicEngine' in mod).toBe(false);
   });
 
   it('exports applyWebGPUFixes as a function', async () => {

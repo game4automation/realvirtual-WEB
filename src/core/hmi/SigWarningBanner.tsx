@@ -72,7 +72,7 @@ export function SigWarningBanner({ compact = false }: SigWarningBannerProps) {
         py: compact ? 1 : 1.25,
         bgcolor: 'rgba(68, 48, 15, 0.97)',
         border: `1px solid ${ISA_AMBER}`,
-        borderRadius: 2,
+        borderRadius: 1,
         boxShadow: '0 4px 16px rgba(0,0,0,0.4)',
         backdropFilter: 'blur(calc(8px * var(--rv-ui-blur-scale, 1)))',
       }}>

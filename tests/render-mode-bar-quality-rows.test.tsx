@@ -26,7 +26,8 @@ import {
   type VisualPreset,
 } from '../src/core/hmi/visual-presets';
 import { loadVisualSettings, saveVisualSettings } from '../src/core/hmi/visual-settings-store';
-import { fakeRenderViewer, type FakeRenderViewer } from './helpers/fake-render-viewer';
+import { fakeRaytracedBackendFactory, fakeRenderViewer, type FakeRenderViewer } from './helpers/fake-render-viewer';
+import { registerRaytracedBackend } from '../src/core/engine/rv-raytraced-hook';
 
 const mount = (viewer: FakeRenderViewer) =>
   render(<RVViewerProvider value={viewer as never}><RenderModeGroup /></RVViewerProvider>);
@@ -169,9 +170,26 @@ describe('render-mode menu — quality rows', () => {
     const proxy = trigger().getAttribute('data-rv-button-proxy') ?? '';
     expect(proxy).toContain('view.visualPreset:Default');
     expect(proxy).toContain('view.visualPreset:Fast');
-    // Three shading keys + wireframe + two quality keys = 6 = PROXY_KEY_SLOTS.
-    // A seventh key would be silently ignored by the trigger's fixed hook list.
-    expect(proxy.split(/[\s,]+/).filter(Boolean)).toHaveLength(6);
+    // Four shading keys (the gated ray traced key included, plan-762) +
+    // wireframe + two quality keys = 7 = PROXY_KEY_SLOTS. An eighth key would
+    // be silently ignored by the trigger's fixed hook list.
+    expect(proxy.split(/[\s,]+/).filter(Boolean)).toHaveLength(7);
+  });
+
+  it('the quality rows stay after the shading rows, also when the ray traced row is gated in (plan-762)', async () => {
+    registerRaytracedBackend(fakeRaytracedBackendFactory);
+    try {
+      const v = presetViewer() as unknown as Record<string, unknown>;
+      v['hasCompute'] = true;
+      mount(v as unknown as FakeRenderViewer);
+      await openMenu();
+      const ids = [...menu().querySelectorAll('[data-testid]')].map((el) => el.getAttribute('data-testid'));
+      expect(within(menu()).getAllByRole('menuitemradio')).toHaveLength(4);
+      expect(ids.indexOf('render-mode-raytraced')).toBeLessThan(ids.indexOf('visual-preset-default'));
+      expect(ids.indexOf('visual-preset-default')).toBeLessThan(ids.indexOf('visual-preset-fast'));
+    } finally {
+      registerRaytracedBackend(null);
+    }
   });
 
   it('the trigger keeps naming the MODE, never the quality row', async () => {

@@ -1,0 +1,5 @@
+# plan-900 fixture — a file list for `scripts/test-shard-plan.mjs --files-from`, so the CLI can be
+# exercised without asking vitest for the real 2000-file list.
+tests/first.test.ts
+tests/second.test.ts
+tests/third.test.ts

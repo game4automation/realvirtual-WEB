@@ -14,7 +14,7 @@ import {
   BoxGeometry, ConeGeometry, CylinderGeometry, Line, LineDashedMaterial, Mesh,
   Object3D, PerspectiveCamera, Scene, TorusGeometry, Vector3,
 } from 'three';
-import { DriveAxisGizmoPlugin } from '../src/plugins/drive-axis-gizmo-plugin';
+import { DriveAxisGizmoPlugin, driveFeedsTransportSurface } from '../src/plugins/drive-axis-gizmo-plugin';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { RVDrive, DriveDirection } from '../src/core/engine/rv-drive';
 import { HIGHLIGHT_OVERLAY_LAYER } from '../src/core/engine/rv-group-registry';
@@ -436,5 +436,55 @@ describe('DriveAxisGizmoPlugin', () => {
     expect(gizmos(w.scene)).toHaveLength(0);
     w.select([path]); // no listener anymore → nothing happens
     expect(gizmos(w.scene)).toHaveLength(0);
+  });
+});
+
+describe('plan-655 F8 — no rotation ring on a drive that feeds a transport surface', () => {
+  it('a rotary BELT drive (live, isTransportSurface) gets no gizmo; a turntable drive keeps its ring', () => {
+    const w = createWorld();
+    const belt = addDrive(w, w.scene, 'CurveBelt', DriveDirection.RotationY);
+    belt.drive.isTransportSurface = true; // what RVTransportSurface.init stamps on its drive
+    const table = addDrive(w, w.scene, 'Turntable', DriveDirection.RotationY);
+    w.select([belt.path]);
+    expect(gizmos(w.scene)).toHaveLength(0);
+    w.select([table.path]);
+    expect(gizmos(w.scene)).toHaveLength(1);
+    expect(countGeometries(gizmos(w.scene)[0]).tori).toBeGreaterThan(0);
+  });
+
+  it('authoring (no live flag): a TransportSurface on the drive node or below it, without DriveReference, feeds the nearest Drive', () => {
+    const root = new Object3D(); root.name = 'Curve';
+    const driveNode = new Object3D(); driveNode.name = 'Belt';
+    driveNode.userData.realvirtual = { Drive: { Direction: 'RotationY' } };
+    const surf = new Object3D(); surf.name = 'Surface';
+    surf.userData.realvirtual = { TransportSurface: { Radial: true } };
+    root.add(driveNode); driveNode.add(surf);
+    const src = { node: driveNode, isRotary: true } as never;
+    expect(driveFeedsTransportSurface(src)).toBe(true);
+    // A nested drive between them claims the surface instead.
+    const inner = new Object3D(); inner.name = 'Inner';
+    inner.userData.realvirtual = { Drive: {} };
+    driveNode.remove(surf); driveNode.add(inner); inner.add(surf);
+    expect(driveFeedsTransportSurface(src)).toBe(false);
+  });
+
+  it('authoring: an external DriveReference (object form, asset-relative or with the root name) feeds; removing it (undo) restores the ring', () => {
+    const root = new Object3D(); root.name = 'Machine';
+    const mount = new Object3D(); mount.name = 'Mount';
+    const driveNode = new Object3D(); driveNode.name = 'Belt';
+    driveNode.userData.realvirtual = { Drive: {} };
+    const surf = new Object3D(); surf.name = 'Surface';
+    root.add(mount); mount.add(driveNode); root.add(surf);
+    const src = { node: driveNode, isRotary: true } as never;
+    expect(driveFeedsTransportSurface(src)).toBe(false);
+    surf.userData.realvirtual = { TransportSurface: { DriveReference: { type: 'ComponentReference', path: 'Mount/Belt' } } };
+    expect(driveFeedsTransportSurface(src)).toBe(true);
+    surf.userData.realvirtual = { TransportSurface: { DriveReference: { path: 'Machine/Mount/Belt' } } };
+    expect(driveFeedsTransportSurface(src)).toBe(true);
+    surf.userData.realvirtual = { TransportSurface: { DriveReference: { path: 'Other/Belt2' } } };
+    expect(driveFeedsTransportSurface(src)).toBe(false);
+    // Undo of the authoring step = the extras without the reference again.
+    surf.userData.realvirtual = { TransportSurface: {} };
+    expect(driveFeedsTransportSurface(src)).toBe(false);
   });
 });

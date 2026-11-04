@@ -28,7 +28,7 @@ import { getDefaultAgvFleet, type AgvMotionInfo } from '../../src/core/engine/rv
 import { setOverlayVisible } from '../../src/core/overlay-visibility-store';
 import { AgvScannerFieldPlugin } from '../../src/plugins/agv-scanner-field-plugin';
 import type { RVViewer } from '../../src/core/rv-viewer';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
+import { DESRunner } from '@rv/plugins/des/des-runner';
 import { TICK, makeHost, makeAgvRoot, bindDes, clearShared } from '../helpers/agv-harness';
 
 beforeEach(() => clearShared());
@@ -80,7 +80,7 @@ function runCase(pathId: string, mirrorX: boolean): Placement {
   for (let i = 0; i < 60; i++) { runner.tick(TICK); runner.lateTick(TICK); plugin.onRender(); }
 
   const info: AgvMotionInfo = {
-    speed: 0, field: 'clear', protectiveLength: 0, warningLength: 0, front: 0, width: 0, scanner: false,
+    speed: 0, field: 'clear', protectiveLength: 0, warningLength: 0, front: 0, rear: 0, width: 0, dir: 1, scanner: false,
   };
   expect(getDefaultAgvFleet().get('Veh')!.motion!(info)).toBe(true);
 

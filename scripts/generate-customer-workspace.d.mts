@@ -35,6 +35,8 @@ export function snapshotPush(options: {
   replaceProjects?: string[];
   force?: boolean;
   acceptNewPrivateFiles?: boolean;
+  /** plan-679 Phase 4: the approved new private files (release path) instead of the blanket flag. */
+  approvedPrivateFiles?: string[] | null;
 }): {
   pushed: boolean;
   remote: string;

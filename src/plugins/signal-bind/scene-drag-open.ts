@@ -27,6 +27,7 @@ import {
   getLastSignalDragResult,
 } from '../../core/hmi/signal-drag-store';
 import { openSignalBindPopover, closeSignalBindPopover } from './signal-bind-store';
+import { isSignalLinkingAllowed } from './signal-link-gate';
 import { findBindableAncestor, signalBindTargetId, type SignalBindTarget } from './signal-bind-target';
 
 /** Debounce before the popover opens/closes for a new hover target (anti-flicker). */
@@ -67,7 +68,8 @@ export class SceneDragOpenController {
   // ─── internal ──────────────────────────────────────────────────────────
 
   private _onPhaseChange(): void {
-    const dragging = getSignalDragPhase() === 'dragging';
+    // Never auto-opens the binding popover in an operator workspace (signal-link-gate.ts).
+    const dragging = getSignalDragPhase() === 'dragging' && isSignalLinkingAllowed(this._viewer);
     if (dragging && !this._unsubPos) {
       this._lastRaycastMs = 0;
       this._unsubPos = subscribeSignalDragPos((x, y) => this._onMove(x, y));

@@ -65,6 +65,31 @@ RV_INTERNAL=1 npm run build    # internal build — everything included
 
 The same pattern is reusable if you develop on top of realvirtual WEB yourself: gate your own work-in-progress plugins behind `__RV_INTERNAL__` (or your own `define` flag) so your production deployments only ship what you intend to release. The AGPL/commercial licensing terms in section 7 apply to your extensions as usual.
 
+### Feature chunks and on-demand features (plan-652)
+
+Since plan-652 a generated `private-plugins.ts` (customer workspaces, demo build) no longer imports
+feature adapters statically. It starts every entitled adapter import in parallel up front
+(`const adapterN = early(import('…'))`) and registers them in manifest order with
+`await useFeature(viewer, '<id>', () => adapterN)` — the same download as the old single entry, but
+each adapter is its own chunk. Registrations whose `activation` (in `tier-manifest.json`) is not just
+`startup` — today `asset-editor` (`mode:editor`) and `des` (`mode:des`, `command:sim.discrete`, the DES
+component types) — register only a stub at startup; their body chunks load on first use.
+
+What this means for a deploy:
+
+- Every production build writes **`dist/feature-chunks.json`** (files and bytes per feature, from the
+  Rollup bundle — no `.vite/` folder lands in `dist/`). The viewer reads it for its diagnostics and
+  for the idle prefetch; it is part of the deploy like `features.json`.
+- A deploy that deletes the previous version's chunks breaks an open tab's first switch into the
+  Editor or DES. The viewer reports *"New version available — reload"* instead of failing silently;
+  keeping old assets for a grace period is a separate cache plan.
+- **Commit order across the two repositories is public first, private second.** The public core
+  tolerates an older private side, and a private stub that meets a core without the FeatureLoader
+  loads its body eagerly (logged once) — so a skew in either direction degrades to the old eager
+  behaviour instead of breaking the build.
+- Before a merge that touches imports of private features, run `npm run test:bundle-guard` (see
+  [doc-web-debugging.md](doc-web-debugging.md#on-demand-features-feature-and-the-bundle-guard)).
+
 ---
 
 <a id="7-deploy-it-yourself"></a>
@@ -73,11 +98,20 @@ The same pattern is reusable if you develop on top of realvirtual WEB yourself: 
 
 realvirtual WEB is the open standard for browser-based 3D HMI in manufacturing. You can run your own deployment two ways: reuse the built-in tool with your own Bunny account, or treat the build as plain static files and host them anywhere.
 
-> **AGPL obligations apply to self-hosting.** realvirtual WEB is licensed under the **GNU Affero General Public License v3 (AGPL-3.0)**. Deploying it on your own infrastructure — including serving it as a network service — triggers the AGPL: you must publish your **complete project** under AGPL-3.0 and make it freely available. This includes all source code, configuration, and **all content delivered through the application**, such as GLB model files, `settings.json`, and plugins. This applies whether the application is served over a network or distributed directly.
+> **AGPL obligations apply when you deliver to others.** realvirtual WEB is licensed under the **GNU Affero General Public License v3 (AGPL-3.0)**. Running it yourself triggers nothing. If you deploy it so that other people use it — a hosted link, a delivery package, an offline installation — everyone who receives it must be able to get the complete source of the delivered software under AGPL-3.0: realvirtual with your changes, tightly coupled plugins and HMI components, and embedded scripts that take over core code. Your model data (geometry, layout, parameters, GLB metadata) stays yours and need not be disclosed. You need not publish to the world, but recipients may pass the AGPL parts on.
 
-> The "Powered by realvirtual WEB" watermark and the realvirtual logo must remain visible and unmodified in all AGPL deployments. Removing or modifying branding requires a commercial license.
+> The "Powered by realvirtual WEB · AGPL-3.0" attribution notice stays reasonably visible and legible in every AGPL deployment (additional term under AGPL §7(b), see `NOTICE.md`); position, size and style may be adapted. Removing it or replacing it with your own brand requires a commercial license.
 
-> **Keeping a project private?** To self-host with proprietary models, private configuration, or closed plugins — or to remove branding — use a [commercial license](https://realvirtual.io/en/company/license). See the [README license section](README.md#license) for the canonical terms.
+> **Which builds carry the watermark (plan-679 Phase 9).** A pure AGPL / community build — built
+> without the private tree (this repository on its own, or `VITE_PUBLIC_BUILD=1`) — always shows it,
+> and it cannot be switched off without changing code. Every build that compiles the commercial
+> private tree — the public demo, commercial customer workspaces (dev server and build) and hosted
+> customer deploys — is built without it: `scripts/lib/rv-agpl-attribution.mjs` removes the
+> watermark, the noscript "Source on GitHub" link and the JSON-LD `license` from `index.html`. The
+> switch is the build stage (`__RV_AGPL_ATTRIBUTION__ = !HAS_PRIVATE`), not `RV_COMMERCIAL`, which
+> only controls installability. The third-party notices are in every build.
+
+> **Keeping a project private?** To keep your own plugins or changes confidential in a delivery, or to remove the attribution notice, use a [commercial license](https://realvirtual.io/en/company/license). See the [README license section](README.md#license) for the canonical terms.
 
 ### Use the built-in tool with your own Bunny account
 
@@ -233,6 +267,25 @@ server {
 
 ---
 
+## Terms consent gate (plan-2209)
+
+A blocking terms dialog runs before the viewer boots. The build-time constant `__RV_TERMS_GATE__` (`vite.config.ts`, resolved by `termsGateMode()` in `scripts/lib/rv-agpl-attribution.mjs`) selects one of three modes:
+
+| Mode | When |
+|---|---|
+| `demo` | Production build with `RV_DEMO_NOTICE=1` and path `demo`, without `VITE_PRIVATE_BUILD` |
+| `developer` | Dev server in a commercial customer workspace (detected by `delivery-manifest.json`) |
+| `off` | Everything else: community and customer builds, vitest |
+
+- **Language:** English only; both modes link to https://realvirtual.io/en/terms/#part-b.
+- **Versions:** `DEMO_TERMS_VERSION` and `DEVELOPER_TERMS_VERSION` (`src/core/hmi/terms-consent-store.ts`). Bumping one re-asks every visitor for that mode; the two modes are acknowledged independently.
+- **Storage:** localStorage key `rv-terms-consent`. If storage is blocked, the acknowledgement lasts for the session only.
+- **Automation:** with `navigator.webdriver === true` (Playwright, recording scripts, smoke tests) the gate is skipped and nothing is stored. Do not seed the key in scripts.
+- **Order:** terms gate, then analytics gate.
+- **Bundle check:** `rv-terms-gate-root` must be absent from community and customer builds. The demo chunk is about 3.5 kB gzip.
+
+---
+
 ## Maintainer operations
 
 The remaining deployment procedures use realvirtual infrastructure or private tools.
@@ -251,7 +304,7 @@ npm run deploy -- --dry-run          # stage only; build and upload nothing
 npm run deploy -- --demo --path demo --base /demo/   # hosted demo of the COMMERCIAL product
 ```
 
-`--demo` is the same public deploy with a different **code tier**: instead of the core-only AGPL build it compiles the full commercial feature set (the 15 features a customer receives — asset editor, CAD importers, DES, PLC, physics, machining, IK, …) into the very same public demo site. Everything else is identical: same remote prefix, same model allowlist, same test-scene prune, same GA/news/SEO injection, same signing.
+`--demo` is the same public deploy with a different **code tier**: instead of the core-only AGPL build it compiles the full commercial feature set (every commercial registration of the tier manifest a customer receives — asset editor, CAD importers, PLC, physics, machining, IK, …; `FEATURES.md` lists the current set) into the very same public demo site. Everything else is identical: same remote prefix, same model allowlist, same test-scene prune, same GA/news/SEO injection, same signing.
 
 What the demo form does **not** do: it never sets `RV_INTERNAL` (agents and Omniverse are restricted features and stay out), it never emits source maps, and it stages no customer project. The private TypeScript ships as compiled chunks only — a `.map` next to a commercial chunk would be the source code itself, so the deploy refuses to upload any `.map`, `.ts` or `.tsx` found in the build output.
 
@@ -265,11 +318,11 @@ What happens, in order:
 2. **Build in the staging workspace** — `npm ci` **inside that temp workspace**, then `npm run build` with `VITE_PUBLIC_BUILD=1`. The fresh `npm ci` installs into an empty `node_modules` and routinely runs for **several minutes with no output** — that silence is the install, not a hang. Deploys to `--path dev` and `--path demo-beta` skip it when they can: they reuse a machine-local `node_modules` cache keyed by the lockfiles **and** the Node major/ABI, platform and architecture, and log `build-cache: hit` (or `rebuild` on the first run after a change). `/demo`, `--root` and private deploys always install fresh. Parallel local builds share that cache safely: a build holds a reader lease on its cache profile until it ends, and a profile is only deleted — on a failed restore, or when it has been unused for 30 days — while nobody reads it. The build output is stamped with `.rv-build-provenance.json` (source-tree hash, mode, project) and re-checked by `assertBuildProvenance()` before a single byte is uploaded. Your working `dist/` is neither read nor written.
 3. **Model allowlist** — the demo manifest in `demo-realvirtual/project.json` declares its documents; the app-level component library stays under `library/`. The deploy applies its manifest-based pruning and verifies that referenced GLBs remain present. Legacy root-manifest/prefix behavior is compatibility handling, not the current directory layout. See [Public model allowlist](#public-model-allowlist).
 4. **Dev-only prune** — documents the manifest marks `devOnly: true` are dropped from `dist/`, file and manifest row alike. See [Public dev-only prune](#public-dev-only-prune).
-5. **Sign + stamp + inject** — GLBs are signed when `RV_SIGN_PRIVATE_KEY` is configured (see [GLB signing](#glb-signing-and-password-protection)); **then** every `catalog.json` in the build output is re-stamped with the `sha256` + `sizeBytes` of the bytes that now ship (`stampCatalogHashes`, see [Library catalog hashes](#library-catalog-hashes-and-the-post-deploy-probe-plan-508)); then the GA id, the news feed URL and the SEO tags are written into the built artifact only.
-6. **Diff** — the deploy first takes the **publish lock** of its target (`rv-publish-<zone>:<prefix>`, a Windows named pipe) and holds it until after the probe and the demo smoke (steps 9 and 10); a second local deploy to the same target waits with `waiting for publish lock …` (see [Automatic /dev deploys](#automatic-dev-deploys)). Inside the lock it reads the **currently published** `catalog.json` and selects every catalogued file (`glbUrl` and `splatUrl`) whose hash changed — regardless of size (no published catalog: all of them). Then the remote file list is fetched; unchanged files (same size) are skipped. `*.html`, `settings.json`, `models.json`, `manifest.json`, `project.json` and every `catalog.json` are always re-uploaded, and so is every GLB once signing is active (re-signing is size-preserving, so a size diff would skip it). `*.map` files are never uploaded.
-7. **Upload** — changed files are uploaded in parallel (`RV_DEPLOY_CONCURRENCY`, default 8, and at most `RV_DEPLOY_MAX_INFLIGHT_BYTES`, default 64 MB, of file data in flight — a larger file uploads alone). Every `catalog.json` waits until **all** other asset uploads have finished and goes next — so a failed binary leaves the OLD catalog remote and the next run's hash diff selects the binary again. Every `*.html` file follows after that, one by one, `index.html` last, so the live site never points at missing assets mid-deploy. If an asset upload still fails after its retries, the deploy stops there: no HTML, no deletions. Remote files that no longer exist locally are then deleted (also in parallel, at most 8); a delete Bunny refuses is counted and reported but never stops the deploy or the purge. Storage requests retry up to three times with backoff and honour `Retry-After`. The remote listing retries too and **fails the deploy** on an auth, network or server error instead of continuing half-blind — only a missing prefix (404, the first deploy to a new path) counts as empty.
+5. **Sign + stamp + inject** — GLBs are signed when `RV_SIGN_PRIVATE_KEY` is configured (see [GLB signing](#glb-signing-and-password-protection)); **then** every `catalog.json` in the build output — and the rows of the realvirtual library's `library/project.json` (plan-778) — is re-stamped with the `sha256` + `sizeBytes` of the bytes that now ship (`stampCatalogHashes`, see [Library catalog hashes](#library-catalog-hashes-and-the-post-deploy-probe-plan-508)); then the GA id, the news feed URL and the SEO tags are written into the built artifact only.
+6. **Diff** — the deploy first takes the **publish lock** of its target (`rv-publish-<zone>:<prefix>`, a Windows named pipe) and holds it until after the probe and the demo smoke (steps 9 and 10); a second local deploy to the same target waits with `waiting for publish lock …` (see [Automatic /dev deploys](#automatic-dev-deploys)). Inside the lock it reads the **currently published** `catalog.json` files and library `project.json` manifests (`library/project.json`, a hosted `p/libraries/<id>/project.json`) and selects every catalogued file (`glbUrl` / `splatUrl`, or a document row's `path`) whose hash changed — regardless of size (nothing published yet: all of them). Then the remote file list is fetched; unchanged files (same size) are skipped. `*.html`, `settings.json`, `models.json`, `manifest.json`, `project.json` and every `catalog.json` are always re-uploaded, and so is every GLB once signing is active (re-signing is size-preserving, so a size diff would skip it). `*.map` files are never uploaded.
+7. **Upload** — changed files are uploaded in parallel (`RV_DEPLOY_CONCURRENCY`, default 8, and at most `RV_DEPLOY_MAX_INFLIGHT_BYTES`, default 64 MB, of file data in flight — a larger file uploads alone). Every `catalog.json` and every library `project.json` waits until **all** other asset uploads have finished and goes next — so a failed binary leaves the OLD catalog remote and the next run's hash diff selects the binary again. Every `*.html` file follows after that, one by one, `index.html` last, so the live site never points at missing assets mid-deploy. If an asset upload still fails after its retries, the deploy stops there: no HTML, no deletions. Remote files that no longer exist locally are then deleted (also in parallel, at most 8); a delete Bunny refuses is counted and reported but never stops the deploy or the purge. Storage requests retry up to three times with backoff and honour `Retry-After`. The remote listing retries too and **fails the deploy** on an auth, network or server error instead of continuing half-blind — only a missing prefix (404, the first deploy to a new path) counts as empty.
 8. **Purge** — the CDN cache is purged once (only if something was uploaded, and only when the account/pull-zone purge credentials are present).
-9. **Probe** — still inside the lock, the live host is asked three things (`probePublishedAssets`): a missing asset answers 404 (Bunny's HTML error page is accepted, a 200 is not), `library/catalog.json` is byte-equal to the build output, and the first catalogued asset hashes to its catalog `sha256`. Any finding fails the deploy with exit 1 and a plain-text cause; `--skip-probe` skips it (offline runs). A failed probe stops the deploy before the demo smoke.
+9. **Probe** — still inside the lock, the live host is asked three things (`probePublishedAssets`): a missing asset answers 404 (Bunny's HTML error page is accepted, a 200 is not), `library/project.json` is byte-equal to the build output, and the first listed asset hashes to its row's `sha256`. Any finding fails the deploy with exit 1 and a plain-text cause; `--skip-probe` skips it (offline runs). A failed probe stops the deploy before the demo smoke.
 10. **Demo smoke** (plan-503) — still inside the publish lock and after the probe, the deploy opens every `demos` document of the demo manifest on the **live** target with Playwright and runs two visitor journeys. The build is already live at this point; the smoke only reports. Details below.
 
 #### The demo smoke after every public deploy
@@ -309,20 +362,21 @@ npm run smoke:prod -- --expected .smoke\<time>\expected.json --out .smoke\manual
 
 ### Library catalog hashes and the post-deploy probe (plan-508)
 
-Every entry of a library `catalog.json` may carry two optional fields next to `glbUrl` / `splatUrl`:
+Every document row of a library `project.json` (since plan-778 the realvirtual library's own manifest, `public/library/project.json`) and every entry of an external `catalog.json` may carry these optional fields next to its `path` (`glbUrl` / `splatUrl` in a catalog):
 
 | Field | Meaning |
 |---|---|
 | `sha256` | SHA-256 of the file behind `glbUrl` / `splatUrl` — hex, lowercase, 64 characters. The viewer's blob cache keys on it and verifies every download against it. It is **never** a resolution key: a reference resolves by id/path exactly as before. |
 | `sizeBytes` | Size of that file in bytes (diagnostics; the probe falls back to it for an entry without a hash). |
+| `thumbnail` | The saved preview of the entry (plan-776), relative to the catalog: `<Category>/.thumbnails/<id>.<hash8>.<webp\|png>`. `build-local-library-catalog.mjs` (which writes `public/library/project.json`, no `catalog.json` any more) derives it on every build from the category folder (newest hashed file wins); absent = the library card shows its placeholder. Library thumbnails live **per category** because a customer delivery copies whole category folders. |
 
 Who writes them: `scripts/build-local-library-catalog.mjs` (runs in `prebuild` — the unsigned dev bytes, correct for `vite dev`), `scripts/build-library-catalog.mjs` (the GitHub library; downloads each GLB once to hash it), and the deploy's `stampCatalogHashes` **after** signing — signing changes every GLB at the same size, and a hash stamped before it would make every signed library GLB a "hash mismatch" in every browser. A catalog without the fields stays valid: the viewer then keeps its url-keyed, revalidating cache path. The private deploy stamps its staging tree too (after signing and, when password-protected, encryption — the hash describes the bytes the browser downloads).
 
 The post-deploy probe (public deploys) asks the live host, with a cache-busting `rv-probe` query on the catalog and asset requests:
 
 1. `GET <base>library/__rv-probe-missing__.glb` must answer **404** — any content type; Bunny's standard `text/html` error page is accepted (observed 2026-09-27), since the status is what keeps a missing asset out of the viewer's cache. A 200 (any type) means a global SPA fallback / "rewrite 404 to 200" rule is catching asset paths — fix the pull zone's edge rules; any other status fails too. The path is reserved: a build output that contains it is refused.
-2. `GET <base>library/catalog.json` must answer 200 with JSON **byte-equal** to `dist/library/catalog.json` — catches a size-skipped upload or a stale edge copy (e.g. purge credentials missing).
-3. The first catalogued asset must answer 200 as `model/gltf-binary` or `application/octet-stream`, and its bytes must hash to the catalog `sha256` — catches a size-preserving re-sign that was not stamped.
+2. `GET <base>library/project.json` must answer 200 with JSON **byte-equal** to `dist/library/project.json` (rows in `documents[]`; an external catalog can still be probed through `catalogRel`) — catches a size-skipped upload or a stale edge copy (e.g. purge credentials missing).
+3. The first listed asset must answer 200 as `model/gltf-binary` or `application/octet-stream`, and its bytes must hash to its row's `sha256` — catches a size-preserving re-sign that was not stamped.
 
 Private (`--private`) deploys are stamped but not probed.
 
@@ -360,8 +414,17 @@ into a JS chunk), `exceptions` and `vendorTerms`, each with `reason`, `decidedBy
 private-tier packages live in `realvirtual-WebViewer-Private~/third-party/license-policy.json`, read only
 when the private tree is part of the build. An entry with `decidedBy: "proposed"` is a proposal: it never
 silences a violation. Unknown/missing licences or texts, non-allowed licences, bundled LGPL, third-party
-GPL/AGPL and **stale** entries (public policy: every tier; private policy: private tier only) are
-violations. An entry is stale only when it covers nothing the product can ship: an approval for a
+GPL/AGPL and **stale** entries are violations. Which policy is stale-checked depends on the build's
+notices tier (plan-679 Phase 3): the public policy in every tier; the private policy in the full
+private build (`private`: dev and Bunny private builds) and in a **customer workspace build**, which
+runs as its delivery tier (`runBuild` sets `RV_NOTICES_TIER=<delivery.tier>`; never inherited, an
+unknown value is a hard error). A policy entry may name the tiers that carry it — `"tiers":
+["commercial"]`, or `["private"]` for a package only the full build carries (the staging prunes
+every `@nvidia/` dependency for every delivery tier). A delivery-tier build checks only the entries
+that name its tier (and those without `tiers`); the others are a `not-in-tier` info line. The full
+private build checks every entry. `tests/third-party-notices-tiers.node.test.ts` runs the rule
+statically in the normal suite: every entry must be declared by the manifest each tier it names
+receives. An entry is stale only when it covers nothing the product can ship: an approval for a
 component the product *declares* (any manual-list entry, any dependency of the root or the Private
 `package.json`) but this build does not ship — the demo AASX files in a customer workspace, an
 internal-tier package in a customer build — is not stale (CONNECT: any manual-list entry, e.g. the
@@ -372,7 +435,7 @@ Windows-only vendor DLLs in the linux build). The number of exceptions has a shr
 the top of the file and records `"mode": "warn"` in the JSON. `RV_NOTICES_MODE=warn|enforce` always wins.
 Without it our own staged builds (`runBuild`: Bunny, delivery, CONNECT staging — they set
 `RV_NOTICES_RELEASE_BUILD=1`) and the embed build use the release default, a plain `npm run build`
-(local, customer workspace) uses `warn`. **Until plan-544 Phase 6 the release default is `warn` too**
+(local, customer workspace) uses `warn`. **Since plan-544 Phase 6 (2026-10-21) the release default is `enforce`**
 (`RELEASE_DEFAULT_MODE` in the core). `bunny-deploy.mjs` and `embed-deploy.mjs` print the mode and a
 loud banner when it is `warn` or the notices are missing. `RV_NOTICES_MODE=warn` is the emergency switch;
 there is no `off`. CONNECT has its own switch, `-p:ThirdPartyNoticesMode=warn|enforce`
@@ -636,15 +699,65 @@ npm run deploy:private -- --list                       # list available private 
 npm run deploy:private -- --project "Customer XY"      # build + publish one project
 ```
 
-The viewer boots the served project through `settings.json` (`projectUrl: "p/"`) exactly as the appliance does with `?projectUrl=` (§6b): the dashboard, the document list, every `cad/`, `scenes/` or root-level document and the project's assets come from `p/project.json` and the files beside it. There is **no `models.json`, no `scenes/index.json` and no `private-assets/`** any more — a folder name inside the project is a place, not a type. The root of a hosted deploy always opens the project's **dashboard**; a document opens through its own `?doc=<id>` link (`settings.defaultModel` is not consulted).
+The viewer boots the served project through `settings.json` (`projectUrl: "p/"`) exactly as the appliance does with `?projectUrl=` (§6b): the dashboard, the document list, every `cad/`, `scenes/` or root-level document and the project's assets come from `p/project.json` and the files beside it. There is **no `models.json`, no `scenes/index.json` and no `private-assets/`** any more — a folder name inside the project is a place, not a type. The root of a hosted deploy opens the project's **dashboard**; a document opens through its own `?doc=<id>` link (`settings.defaultModel` is not consulted).
+
+**Opt-in start document (plan-640).** A project can make its hosted root open one document directly, in a mode, instead of the dashboard — without any lock: the dashboard, the editor and every other mode stay reachable through the UI. It is declared in `project.json`, which travels verbatim under `p/`, so no deploy option is involved:
+
+```json
+"settings": { "start": { "document": "doc_untitled_gnqvqp", "mode": "hmi" } }
+```
+
+- `document` is a document id or path from `documents[]` (or a file name exactly one document carries — the `findStartDocument` rule). `mode` is optional; without it the usual mode cascade applies.
+- Precedence: `?doc=` in the link beats `settings.start`, which beats the dashboard; `?mode=` in the link beats `start.mode`. An explicit `?scene=empty` / `?doc=new` still opens an empty scene, while `?mode=planner` alone opens the start document in the planner. A remembered session or active-scene pointer of the visitor's browser is ignored at the hosted root — every visitor of the bare link sees the same document.
+- It applies **only to a real hosted deploy**: the generated `settings.json` carries `hostedDeploy: true` (written by `generateHostedSettings`, a reserved key a project file cannot set). A `?projectUrl=` boot elsewhere (dev, agent window, other deliveries) follows the deep-link rule below instead; a local project folder, the CONNECT embed and the kiosk (`mode.lock`) ignore `settings.start`. A deploy published before plan-640 carries no marker and keeps its dashboard until it is republished.
+- **Deep link (plan-2018):** a `?projectUrl=<path>` link on a deploy WITHOUT the `hostedDeploy` marker (dev viewer, agent window, an unlocked customer loader) opens the project's start document: `settings.start.document` (in `start.mode`), else `settings.defaultModel` (path, id or unique file name), else the dashboard. `?doc=` and `?scene=` still win, the start beats the implicit planner empty route and the remembered scene, and a heavy CAD model asks first (`guardHeavyRestore`; refusal shows the dashboard). An unresolvable start shows the dashboard with a `projecturl-start-unresolved` Problems warning. Whoever needs the dashboard explicitly for such a link has no `defaultModel`/`start` in `project.json` or uses the dashboard's project list; the marked hosted deploy and the dashboard click are unchanged.
+- A `start.document` that names no document keeps the dashboard and puts a `hosted-start-unresolved` warning in the Problems panel; a document that fails to open shows the error card (`hosted-start-failed`) — never a different model. `validate-project.mjs` fails the deploy on an unknown `start.document` before anything is uploaded, and warns on a non-string `mode`.
 
 What the stager does, in order: `validate-project.mjs` (mandatory — a CDN upload cannot be undone, so a committed secret or a broken manifest fails before the build), the filtered private build, the verbatim copy (`copyProjectVerbatim`, with `lstat` — a symlink is never followed, it is skipped and reported), the per-file GLB signing/encryption below, the generated `settings.json`, a printed **preflight** (every document the manifest names — and whether it is on disk —, every removed file with its reason, every skipped symlink, every file above 256 MB), ONE upload pass (`p/**` enters the pool first, `settings.json` goes last with the catalogs), and a reconcile of `{code}/` against the staging listing: whatever the staging did not produce is deleted, a previous layout's `models/`, `models.json` and `private-assets/` included. On success it records `provenance.lastPublishedBy['bunny-private']` with `layout: "hosted-v2"` in `project.json`.
 
 **The deny list** (`_rv-guards.mjs` → `hostedDeployDenyReason()`, one rule for the Bunny deploy and the CONNECT embed): secrets (`isSecretPath`), the folders `.git`, `.trash`, `.cad-cache`, `node_modules`, editor leftovers (`*.bak`, `*.tmp`, OS noise), plugin **sources** (`*.ts`, `*.tsx`, `tsconfig*.json` — the compiled bundle ships in the runtime, the source is realvirtual's), the publish artefact rule (`project-config.json`, `llm.json`, `comments.json`, RAG `index/`/`runtime/`, `*.key`) — and the project's own `.rvprojectignore` on top. `project.json` is **never** removed; the stager refuses to continue if it were.
 
-`settings.json` is generated on top of the project's own `settings/project-settings.json` when it has one. The project file is a **base**: `projectUrl`, `projectAssetsPath`, `analytics`, `encryption` and `generated` are written afterwards and always win, and a `defaultModel` from it is dropped.
+`settings.json` is generated on top of the project's own `settings/project-settings.json` when it has one. The project file is a **base**: `projectUrl`, `projectAssetsPath`, `hostedDeploy`, `analytics`, `encryption` and `generated` are written afterwards and always win, and a `defaultModel` from it is dropped.
 
 Set the private projects root with `--projects-dir <dir>` or the `BUNNY_PRIVATE_PROJECTS_DIR` environment variable.
+
+### Libraries in deliveries (plan-778)
+
+A project that lists library projects in `libraries[]` (see [doc-projects.md](doc-projects.md#libraries-are-projects-plan-778))
+ships them beside itself, **trimmed**: every channel stages
+`libraries/<projectId>/` next to the project's `project.json` — the hosted deploy under `{code}/p/libraries/<id>/`,
+`deliver.mjs` / the generated customer workspace under `projects/<key>/libraries/<id>/`, the CONNECT embed through
+`tools/stage-project.mjs`. One algorithm decides what ships (`src/core/project/rv-library-trim-core.mjs`, Node half
+`scripts/lib/rv-library-trim.mjs`, called by the shared stagers `stageFilteredSourceTree` and `stageHostedProject`):
+
+- the qualified `AssetReference`s (and splat `PlacementMeta`) of the shipped documents are followed **transitively**
+  through the library documents (depth ≤ 16, cycles harmless); only the documents that are used ship, with their
+  thumbnails, **bytes unchanged**; every library a shipped manifest lists ships, trimmed to zero documents when unused;
+- the delivered copy's hints are rewritten to `libraries/<id>/project.json` (the sources are never touched), so the
+  viewer finds each library relative to the project it opened;
+- the **realvirtual library is never trimmed**: it is public and stays the app-level `library/` of every build. The
+  hosted stager publishes `library/` only when the project needs it (lists it, places from it, or carries a legacy id
+  of it);
+- an unqualified (legacy) reference is attributed only inside its own project and otherwise reported once, never fatal;
+  a qualified reference that does not resolve, or a library nobody lists, **fails the delivery (exit 1)** naming the
+  document and the library, and nothing is written.
+
+**Where the library sources come from** — by id, folder names do not matter:
+
+1. `--library <projectId>=<folder>` (repeatable; `bunny-deploy.mjs --private`, `deliver.mjs`, `publish-project.mjs`,
+   CONNECT `stage-project.mjs`);
+2. `--projects-dir <dir>` — every project folder in it whose `project.json` carries that id (a delivery defaults to the
+   private `projects/` working tree — the working tree, not the Git index);
+3. the staged project's own `libraries/` — a re-publish of a delivered copy.
+
+**Checks.** `validate-project.mjs` knows `libraries` as a project folder and refuses a `libraries[]` entry without
+`projectId` or `url` and a path-like `projectId` (`/`, `\`, `..`). With `--delivered` (the project's own `libraries/`)
+or `--projects-dir` / `--library` it also resolves every library and every qualified reference (exit 1 naming document
+and library); without sources it checks the shape only. The register Doctor (`/customers doctor`) reports the same
+problems for every customer project that lists a library project other than the realvirtual library.
+
+**Locally:** *Pack with libraries…* in the Projects dashboard's project menu (folder projects, Chromium) writes the same
+layout into a picked empty folder — the same trim core, the same rows and hashes as a delivery.
 
 ### GLB signing and password protection
 
@@ -663,6 +776,8 @@ Without a password the deploy goes out in plaintext and says so in red. `/custom
 Signing runs over the plaintext GLB first, encryption wraps the signed bytes. Because re-signing and re-encryption are size-preserving, signed and encrypted GLBs deliberately bypass the size-only upload diff.
 
 **Project AASX (plan-596).** With a password, `aasx/*.aasx` (flat, like the viewer's scan) and `aasx/index.json` are encrypted exactly like the GLBs (`encryptablePathsBelow`, same salt, path as `hkdfInfo`). Signing stays on `.glb` — an AASX or a JSON index is never signed. Every file the staging encrypted is uploaded on every publish regardless of its size: the stager reports them `p/`-relative (`aasx/a.aasx`), the deploy translates them to staging paths (`p/aasx/a.aasx`, `hostedForcedUploadRels`) and unites them with the catalog-hash diff. `aasx/index.json` is an always-upload file in any case, encrypted or not. On an unencrypted deploy the viewer opens an AASX with HTTP range reads (directory + the few XML parts); on an encrypted one the whole file is downloaded and decrypted before zip.js reads it — the detail of a large AASX is slower there, the index stays small. `curl` on `p/aasx/<file>.aasx` of a password deploy returns an `RVE1` envelope, not a ZIP header.
+
+**Saved thumbnails (plan-776).** A project's `.thumbnails/<id>.<hash8>.<webp|png>` sidecars travel with the verbatim copy (a dot folder is not on the deny list) and, with a password, are encrypted like the GLBs (`isEncryptablePath`): a picture rendered from a protected model never sits in the clear beside it. The viewer reads them through `BundledBackend.readDocumentUrl`, which decrypts on an encrypted deploy; before the password is entered a card simply shows its placeholder. The app-level library outside `p/` (and its per-category `.thumbnails/`) stays unencrypted, like the library GLBs themselves. Thumbnails are written only by a SAVE: a delivered project is read-only and never writes one, so a project that was never saved on the dev side — and every Unity export — shows placeholders until somebody saves its documents there and redelivers.
 
 The crypto form of a hosted deploy: **one PBKDF2 salt per publish** (one key derivation, held per salt in the tab), every envelope header carries the file's `p/`-relative path as `hkdfInfo` (bound into each chunk's AAD, so chunks of two files under the same key are not interchangeable), 96-bit random IVs per 16 MiB chunk, and a tiny **key probe** in `settings.json` (`encryption.probe`, an envelope over a fixed plaintext with the publish salt). The boot gate derives the key once from the probe's header, verifies it there, and only then reads the project — no document is fetched before the password is right, and a `?doc=` link cannot bypass the gate. Every GLB byte path of the served project (the backend, the blob URLs it hands out, the model cache — which bypasses its persistent blob cache on an encrypted deploy) goes through the one decrypt seam `src/core/persistence/rv-served-bytes.ts`.
 
@@ -815,7 +930,7 @@ The one automatic deploy is realvirtual's internal `/dev` channel: a local watch
 4. compares the SHA pair with the last deployed one and, when it moved, **reserves** the attempt in `state.json` before anything runs, resets both clones hard to exactly the captured pair (`git clean -ffdxq -e node_modules` — the smoke runtime survives), makes sure the **smoke runtime** of the web clone is current (see [Demo smoke on /dev](#demo-smoke-on-dev)), and runs `scripts/bunny-deploy.mjs --demo --path dev` from the clone as a non-detached child. Several pushes between two ticks collapse into one deploy of the newest pair;
 5. books the result: exit `0` is `DEPLOY OK` + the smoke line, exit `3` is `DEPLOY OK` + `SMOKE FAILED` (the pair **is** deployed — no backoff, no redeploy), anything else is `DEPLOY FAILED`.
 
-Every tick writes one line to `<root>\watch.log` (`IDLE`, `DEPLOY START`, `DEPLOY OK … duration=`, `SMOKE OK|FAILED|SKIPPED … failures=<n> (see …smoke-result.json)`, `RUNTIME INSTALL`, `RUNTIME FAILED`, `DEPLOY FAILED`, `GIVING UP`, `FETCH FAILED`, `FETCH RECOVERED after <n> failed ticks`, `STALE LOCK REMOVED <clone>/<path> age=<min>m [(after kill)]`, `STALE LOCK NOT REMOVED …`, `STALE GC PID …`, `LOCK SWEEP REFUSED …`, `NOTIFY FAILED …`, `SKIP …` incl. `SKIP git-locked <clone>/<path> age=<s>s`); the output of the last deploy is in `<root>\last-deploy.log`. `<root>` defaults to `rv-dev-deploy` next to the workspace root (`<WS>\..\rv-dev-deploy`).
+Every tick writes one line to `<root>\watch.log` (`IDLE`, `DEPLOY START`, `DEPLOY OK … duration=`, `SMOKE OK|FAILED|SKIPPED … failures=<n> (see …smoke-result.json)`, `RUNTIME INSTALL`, `RUNTIME FAILED`, `DEPLOY FAILED`, `GIVING UP`, `FETCH FAILED`, `FETCH RECOVERED after <n> failed ticks`, `STALE LOCK REMOVED <clone>/<path> age=<min>m [(after kill)]`, `STALE LOCK NOT REMOVED …`, `STALE GC PID …`, `LOCK SWEEP REFUSED …`, `NOTIFY FAILED …`, `SKIP …` incl. `SKIP git-locked <clone>/<path> age=<s>s`, `DEFER …`, `TIMING …`); the output of the last deploy is in `<root>\last-deploy.log`. `<root>` defaults to `rv-dev-deploy` next to the workspace root (`<WS>\..\rv-dev-deploy`).
 
 #### Installation
 
@@ -850,6 +965,17 @@ node <root>\bin\dev-deploy-watch.mjs --purge         # remove the task and delet
 
 **Self-heal and blocked notifications (plan-547).** A git that is killed mid-operation (the 2-minute limit force-kills the whole git process tree) leaves its lock file behind, and every later git command in that clone then fails at once — on 2026-09-28 that silently stopped `/dev` for five days. The watcher therefore heals stale locks itself, in two places and only while it holds its own instance lock: right after killing a timed-out git it removes the lock files of **that** clone without any age check (`STALE LOCK REMOVED … (after kill)`), and at the start of every tick, before the fetch, it sweeps both clones (`.git/*.lock`, `.git/refs/**/*.lock`, `.git/objects/info/**/*.lock`, `.git/objects/pack/*.lock`) and removes every lock older than `staleLockMinutes` (`config.json`, default 10). A younger lock is left alone and ends the tick as `SKIP git-locked` — like a failed fetch, it uses no attempt. A stale `gc.pid` is only logged; a clone path that fails the reset guard (not a configured clone, or a junction) is refused and logged. Two situations that need a human now raise a Windows notification once: `GIVING UP` (title *DEPLOY BLOCKED*, with the pair, the error and the `--retry` hint) and the third `FETCH FAILED` tick in a row (title *FETCH FAILING*, with the last error). `state.json` keeps the streak as `fetchFailures`; a successful fetch of both clones resets it to 0, and `--status` shows `fetch fails : <n>` while it is above 0 (`--json`: `fetchFailures`). The installed copy only learns this after `--install`.
 
+#### Speed and machine load (2026-10-25)
+
+A `/dev` deploy runs on the developer PC beside everything else, so the watcher keeps it cheap and out of the way. Every part can be switched off in `<root>\config.json`; a reinstall keeps these keys (`deployArgs`, `lowPriority`, `minFreeMemoryMb`, `deferWhileTestLockHeld`, `testLockPort`, `maxCpuPercent`, `cpuSampleMs`, `maxDeferMinutes`, `prepublishTimeoutSeconds`, `deployTimeoutMs`).
+
+- **Dependency cache.** `/dev` (and `/demo-beta`) build with the shared build cache of `--fast` deliveries: `realvirtual-web/node_modules` is a junction into `<RV_BUILD_CACHE|%TEMP%>\rv-build-cache\<profile>\` when the profile key (lockfiles of core and private package + Node runtime) is unchanged, and `npm ci` runs only on a miss. The profile also keeps the private package's own dependencies (`<profile>\private\node_modules`): a hit **copies** them into `realvirtual-web-pro\node_modules` (a copy, so module resolution sees exactly the `npm ci` layout) instead of running the private `npm ci` (~1 min). `/demo` and every customer deploy keep their fresh `npm ci`.
+- **`--dev-fast`** in `deployArgs` (default on a fresh install) is the lighter build profile: `bunny-deploy.mjs` sets `RV_DEV_FAST_BUILD=1` for Vite, which then skips the gzip size report. Source maps stay off and minification stays on (esbuild) like in every deploy. `bunny-deploy` refuses the flag for any target other than `--path dev`. Remove it from `deployArgs` to build `/dev` exactly like `/demo`.
+- **Below-normal priority** (`lowPriority`, default `true`): the watcher lowers its own priority before the deploy; git, the deploy child, npm and Vite inherit it, so interactive work and test runs win the CPU.
+- **Deferred ticks.** A tick that would deploy is postponed — logged as `DEFER low-memory: free memory 2.1 GB < 3.0 GB`, `DEFER test-lock: …` or `DEFER cpu-busy: CPU 97 % > 85 % over 15 s`, **no attempt used, no backoff** — while free physical memory is below `minFreeMemoryMb` (default 3072, `0` turns it off), while a foreign process holds the machine-wide test lock (`scripts/test-lock.mjs`, port 47177 or `testLockPort`; `deferWhileTestLockHeld: false` turns this off), or while the machine-wide CPU load averaged over `cpuSampleMs` (default 15 000) is above `maxCpuPercent` (default 85, `0` turns it off). Below-normal priority alone does not help against agent dev servers running at normal priority. The next tick decides again. `state.json` → `deferred` records since when a deploy has been pending (a new push does not restart that clock). After `maxDeferMinutes` (default 60) the test lock and the CPU stop deferring it (`DEFER LIMIT … deploying despite test lock / CPU load`), so a machine that is always busy cannot stop `/dev` for good. Low memory still defers.
+- **Timing.** Each deploy writes one `TIMING fetch=… reset=… deploy-child=… features=… stage=… deps=… private-deps=… vite-build=… provenance=… postprocess=… lock-wait=… upload=… purge=… probe=… total=…` line into `watch.log`. The watcher measures the first three itself; the rest are the `[timing] <step> <s>s` lines `bunny-deploy.mjs` prints (every run, every target). `deps` includes `private-deps`.
+- **Failed logs are kept.** After a failed attempt the watcher copies `last-deploy.log` to `<root>\failed-deploys\deploy-<time>-<web>-<private>.log` (the newest 20 are kept) before the next attempt overwrites it; the `DEPLOY FAILED` line names the copy.
+
 #### Demo smoke on /dev
 
 Every `/dev` deploy runs the [demo smoke](#the-demo-smoke-after-every-public-deploy), so the watcher is also the daily check of `main`: a regression in a public demo shows up minutes after the push.
@@ -858,6 +984,7 @@ Every `/dev` deploy runs the [demo smoke](#the-demo-smoke-after-every-public-dep
 - **Notification.** When the smoke turns red (any status → `failed`), a Windows balloon notification names the first failing test and the report path. A lasting red does not notify again; `--status` shows it every time. Notifications come from `rv-notify.mjs` (PowerShell `NotifyIcon`, no module, no npm package) and are visible because the task runs in the logged-on session.
 - **Runtime.** The smoke runs from the web clone, which has no `node_modules` of its own. Each tick checks `node_modules/playwright/cli.js`, a `chromium*` folder under `<root>\playwright-browsers\` and the SHA-256 of `package-lock.json` (`state.json` → `runtime.lockHash`); when anything is missing or the lockfile moved, it runs `npm ci --ignore-scripts` and `playwright install chromium --only-shell` (10 min limit each, output in `<root>\last-runtime.log`, log line `RUNTIME INSTALL`). `--ignore-scripts` is required: the `postinstall` would run `npm ci` in the private clone, which has no `.npmrc`. A failed install logs `RUNTIME FAILED` and notifies; the deploy still runs and its smoke then ends `runtime-missing`. The headless shell alone (262 MB) is enough for the smoke.
 - **Retry without a deploy.** A smoke that was red for an infrastructure reason is not repeated by the next tick (the pair counts as deployed). `--retry-smoke` runs only the runner against `<root>\last-smoke\expected.json` — the stand the deploy wrote right after its purge, so it exists even when the smoke died at `runtime-missing` — waits for a running tick (watcher lock), books `lastSmoke` for the pair named in that file and deploys nothing. Its output is in `<root>\last-retry-smoke.log`.
+- **Smoke off.** `--no-smoke` in `deployArgs` of `<root>\config.json` switches the smoke off for the watcher: no runtime refresh (log `runtime: skipped (smoke disabled)`), no `lastSmoke` booking, and `--retry-smoke` only says the smoke is disabled. A reinstall keeps the existing `deployArgs`.
 - **Install once more.** The installed copy only learns all this after `--install` (it copies `rv-notify.mjs` too and writes `browsersPath`/`smokeOutDir` into `config.json`).
 
 #### The publish lock — a contract
@@ -928,6 +1055,81 @@ next door.
 
 ---
 
+## 6c. A partner publishing into his own zone (plan-603)
+
+A commercial partner with his own projects can publish them **over our CDN** without us
+deploying for him and without his own CDN contract. He does not get access to our zone: a
+Bunny storage-zone password is scoped to a whole zone, with write **and delete**, so the key
+of `realvitual-web` would give him every other customer's private project. He gets a zone of
+his own in our account instead.
+
+| | `hosted-link` (§3, plan-759) | **Partner zone** (this section) | Own Bunny account (§"Deploy it yourself") |
+|---|---|---|---|
+| Who publishes | we do | the partner | the partner |
+| Whose infrastructure | ours | ours | his |
+| Credential he holds | none | his zone password | his own account key |
+| Hostname | `web.realvirtual.io/{code}/` | `<slug>.web.realvirtual.io/{code}/` | his |
+
+**Provisioning (we do this once, in the private repo):**
+
+```bash
+node scripts/provision-partner-zone.mjs create --customer <slug> --dry-run
+node scripts/provision-partner-zone.mjs create --customer <slug>
+```
+
+It creates the storage zone (`rv-partner-<slug>`), a pull zone with a **monthly bandwidth
+cap**, the hostname `<slug>.web.realvirtual.io` and its free certificate, then writes zone,
+ids, hostname, cap and key into `customers/<slug>.json` (`publishing`). The run is idempotent.
+DNS needs to point at Bunny; a single wildcard `*.web.realvirtual.io` covers every partner.
+`show` prints the state with the key redacted, `rotate-key` issues a new key, and `revoke`
+detaches the hostname and rotates the key — it never deletes a zone or a published file.
+
+**What the partner does.** Nothing new beyond four `.env` lines; the deploy path, the staging,
+the `{code}/` isolation and the unguessable path token are the same as §3:
+
+```bash
+BUNNY_STORAGE_ZONE=rv-partner-<slug>
+BUNNY_STORAGE_KEY=<his zone password>
+BUNNY_PRIVATE_PROJECTS_DIR=projects
+RV_PUBLIC_BASE_URL=https://<slug>.web.realvirtual.io
+
+npm run deploy:private -- --list
+npm run deploy:private -- --project "<name>"
+```
+
+`RV_PUBLIC_BASE_URL` is what makes the success line print his hostname. Without it the deploy
+would hand him a `web.realvirtual.io` url that does not serve his files.
+
+
+### What the partner already has in his repository (plan-604)
+
+His delivered workspace carries the publish path itself, so "we provisioned a zone" is the
+whole handover — there is nothing to send him afterwards:
+
+| In every delivered workspace | What it is |
+|---|---|
+| `scripts/publish-project.mjs` + `npm run publish:project` | the CLI: `--list`, `--project`, `--dry-run`, `--no-build`, `--force` |
+| `scripts/_bunny-lib.mjs` and its closure (9 modules) | the SHARED staging, diff, client and reconcile contract — the same code this pipeline uses |
+| `doc-publishing.md` | the guide: realvirtual-hosted zone, own account, any static host, password protection, troubleshooting |
+| `README.md` → Publishing a project | the pointer, so it is found without being told |
+
+What it deliberately does NOT carry is `bunny-deploy.mjs`: the demo allowlist, the SEO
+artifacts, the publish lock, the smoke run and the customer register are about operating
+`web.realvirtual.io`. Before plan-604 that separation did not exist as code — the register and
+the whole delivery machinery hung off `_bunny-lib.mjs` by one import, which is why no publish
+path could be delivered at all and the delivered `package.json` advertised a `deploy` script
+whose file was never staged. `tests/publish-project.node.test.ts` now fails if either edge
+comes back.
+
+Public-facing version of the same material: the documentation site under
+**Hosting & Operations → Publishing a Project**
+(`Documentation/web/src/content/docs/hosting/publishing-a-project.md`).
+Publishing runs **on his machine**, not in CI: our hub (`git.realvirtual.io`) has no Actions
+runner, and partner-controlled build code has no business executing next to every customer's
+source repository. The GLBs come out of Unity on his machine anyway.
+
+---
+
 
 ## Command reference
 
@@ -967,8 +1169,9 @@ Exit codes: `0` OK, `1` deploy failed, `3` deployed but the demo smoke failed �
 ## Customer source delivery
 
 Customer source repositories are generated snapshots, not development mirrors. The generator reads
-`tier-manifest.json` from the private WebViewer repository, applies the customer profile from
-`delivery/<config>.json`, and creates a flat workspace containing `realvirtual-web/`,
+`tier-manifest.json` from the private WebViewer repository, applies the customer profile from the
+customer register (`customers/<slug>.json`, see below; a legacy `delivery/<config>.json` is only a
+deprecated fallback), and creates a flat workspace containing `realvirtual-web/`,
 `realvirtual-web-pro/`, the customer's `projects/<key>/` directories, and the pinned `connect/` RAG
 pair. Internal source and unlicensed restricted features are physically absent.
 
@@ -1306,6 +1509,58 @@ clean. The generated `delivery-manifest.json` records both commits, the entitlem
 project tree hash, and the immutable CONNECT pin. A customer delivery is dry-run by default; a remote
 push requires the explicit `--push` option after review.
 
+A project's saved thumbnails (`.thumbnails/<id>.<hash8>.<webp|png>`, plan-776) are ordinary project
+files: the delivery carries what Git tracks, so **commit `.thumbnails/` with the project** — an
+untracked sidecar stops the delivery like any other untracked file, and a pointer whose sidecar was
+not committed shows the placeholder at the customer. The library is delivered per category folder,
+and its thumbnails live inside those folders (`library/<Category>/.thumbnails/`), so they arrive with
+their category.
+
+#### Release dry-run and receipt (plan-679)
+
+A release proves it can reach **every** target before it is tagged. The order is
+`deliver-release --dry-run` → approval → release commit → `--verify-release-commit` → tag → push →
+`deliver-release --push --receipt` (driven by `/release-web`).
+
+- **Release check of one target** — `deliver.mjs <slug> --release-check <out.json> --release-version
+  X.Y.Z` (no tag required, clean trees only, never combined with `--push`). It runs staging, the guards
+  in collect mode (every finding; structure guards — links, nested `.git`, secret file names — do not
+  enter the subtree, content guards go on), the build including the third-party notices (the built
+  `index.html` must not carry the AGPL watermark), and the tier diff against the target's last
+  delivery. The baseline is read with `readRemoteBaselineInventory`: a bare, blob-filtered clone into
+  `RV_DELIVER_TMP`, two blobs (`HEAD:delivery-manifest.json` to name the baseline tag, then
+  `<tag>:delivery-manifest.json`), a timeout, cleanup in `finally` — nothing is written to the remote.
+  A missing diagnosis input is a finding, and the target is still staged, built and checked without the
+  package (`diagnosis: failed`, never deliverable). Dependent checks are `not-run: <reason>`, never
+  passed. No dependency archive is packed or uploaded. New private files are approval findings, not
+  errors. The result file names `target`, both HEADs, `ok`, `checks`, `findings`, `tierDiff`, the
+  CONNECT pin, the diagnosis cache key and hashes, and timings.
+- **Diagnosis package cache** — `--rag-cache <dir>` (set by `deliver.mjs` on the release path) keys
+  `rag.zip` + `project-config.json` by content: project key, seed index, preset, the `docs/` corpus,
+  `bundle-rag.mjs`, the `build-rag-index` sources (not its build output), the Requesty base URL and a
+  hash of the key. The release push passes `--rag-expect <key>,<zipSha>,<configSha>`; a changed input,
+  a missing entry or a tampered file refuses that target with "a new dry-run is needed".
+- **Receipt** — `deliver-release --dry-run --release-version X.Y.Z` runs the check for every target
+  (shared repository first, then own repositories without diagnosis, then with), keeps going after a
+  failure, and writes `RV_DELIVER_TMP/release-X.Y.Z.receipt.json` plus
+  `release-X.Y.Z.approval.template.json`. The approval (`release-X.Y.Z.approval.json`: `version`,
+  `releaseNotes` = the approved section text, `privateFiles` per target) is also the
+  `--accept-private-files` file — the blanket `--accept-new-private-files` is refused on the release
+  path.
+- **Bound push** — `--verify-release-commit` (before the tag) and `--push --receipt` (again, as the
+  backstop) refuse unless the release commit is exactly one commit after the dry-run, changes
+  `package.json` only in `version` and `CHANGELOG.md` only by the approved promotion; the push also
+  checks both tags and that every private commit after the dry-run is a provenance commit
+  (`provenance.lastPublishedBy` only, JSON-compared), and that targets, remotes, options, hub and the
+  approval match. Each child gets the receipt's CONNECT pin (`--connect-lock`), the cached diagnosis
+  package and the receipt itself.
+- **Commit body** — a delivery with a receipt carries the released `CHANGELOG.md` sections between the
+  customer's baseline version (`delivery/<version>`) and this one, without `**Internal**`; a missing
+  section is an error. A manual single delivery falls back to the feat/fix subject summary.
+- **Diagnosis from the register** — only `support: "managed"` customers get the diagnosis package;
+  `deliver.mjs` and `deliver-release` derive `--no-rag` for everyone else (`deliversDiagnosis()`), and
+  the register doctor fails on a managed project without a preset.
+
 Builds and deployments always run from the filtered staging tree. Reusing an arbitrary `dist/` via
 `--no-build` or `-SkipBuild` is disabled. Bunny deployment reconciles the remote snapshot after upload
 and removes files that are no longer present locally. Unity Editor and Unity MCP publish commands are
@@ -1355,7 +1610,7 @@ but still present in the unpushed commit range — a plain push publishes that r
 history. Publishing only the end state requires a snapshot commit instead of the range; the guard
 prints the exact command.
 
-> Two documents that used to live here — the internal render-picking guide and `PRODUCT.md` — have **moved to
+> Two documents that used to live here — the internal bake-picking guide and `PRODUCT.md` — have **moved to
 > the private sibling repository** and are no longer in this tree. They are still listed in
 > `NEVER_DELIVERED_DOCS` (`scripts/_workspace-lib.mjs`), which is harmless: that constant governs the
 > *customer workspace*, and what the *public mirror* publishes is a separate decision. Links to either

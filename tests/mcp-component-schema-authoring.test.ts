@@ -74,7 +74,8 @@ describe('web_component_schema list ↔ editor.addComponent (plan-517 F7)', () =
       const { node, root } = freshNode();
       const verdict = addImpl.enabled(contextFor(node, root), { path: 'Root/Part', type });
       expect(verdict, type).not.toBe(true);
-      expect(createVia, type).toMatch(/^web_editor_/);
+      // plan-2007: the hint names the command (editor.*) now; tools only where one remains.
+      expect(createVia, type).toMatch(/^(editor\.|web_)/);
     }
   });
 });

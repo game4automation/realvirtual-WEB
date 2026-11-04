@@ -77,6 +77,16 @@ describe('converter in the cache key', () => {
   it('no quality preset can forge the connect token (dots are sanitised)', () => {
     expect(cadGlbFileName('abc', 'standard.connect')).not.toBe(cadGlbFileName('abc', 'standard', 'connect'));
   });
+
+  it('plan-621: adding `solidcraft` leaves the browser and connect keys byte-identical', async () => {
+    // Literal shapes, so a change in keyToken shows up as a diff here, not as orphaned entries.
+    expect(cadGlbFileName('abc', 'standard')).toBe('v2.abc.standard.glb');
+    expect(cadGlbFileName('abc', 'standard', 'connect')).toBe('v2.abc.standard.connect.glb');
+    expect(await cadGlbOpfsKey('abc', 'standard', 'connect')).toBe(await hex('v2:abc:standard.connect'));
+    expect(cadGlbFileName('abc', 'standard', 'solidcraft')).toBe('v2.abc.standard.solidcraft.glb');
+    expect(await cadGlbOpfsKey('abc', 'standard', 'solidcraft')).toBe(await hex('v2:abc:standard.solidcraft'));
+    expect(cadGlbFileName('abc', 'standard.solidcraft')).not.toBe(cadGlbFileName('abc', 'standard', 'solidcraft'));
+  });
 });
 
 describe.each([
@@ -96,6 +106,17 @@ describe.each([
   it('a connect lookup never falls through to the browser entry', async () => {
     await putCadGlb('shaY', 'standard', bytesOf('BROWSER'));
     expect(await getCadGlb('shaY', 'standard', 'connect')).toBeNull();
+  });
+
+  it('plan-621: a solidcraft entry neither overwrites nor shadows browser / connect', async () => {
+    await putCadGlb('shaZ', 'standard', bytesOf('BROWSER'));
+    await putCadGlb('shaZ', 'standard', bytesOf('CONNECT'), 'connect');
+    await putCadGlb('shaZ', 'standard', bytesOf('SOLIDCRAFT'), 'solidcraft');
+    expect(textOf(await getCadGlb('shaZ', 'standard'))).toBe('BROWSER');
+    expect(textOf(await getCadGlb('shaZ', 'standard', 'connect'))).toBe('CONNECT');
+    expect(textOf(await getCadGlb('shaZ', 'standard', 'solidcraft'))).toBe('SOLIDCRAFT');
+    await putCadGlb('shaW', 'standard', bytesOf('BROWSER'));
+    expect(await getCadGlb('shaW', 'standard', 'solidcraft')).toBeNull();
   });
 });
 

@@ -25,6 +25,8 @@ const INITIAL: McpBridgeSnapshot = {
   toolCount: 0,
   toolNames: [],
   enabled: false,
+  aiEnabled: false,
+  channelReason: 'none',
   reconnectAttempt: 0,
   reconnectDelay: 0,
   serverStatus: null,

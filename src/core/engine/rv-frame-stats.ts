@@ -118,7 +118,11 @@ export interface RenderInfoLike {
  */
 export function drawCallsOf(info: RenderInfoLike): number {
   const r = info.render;
-  return r.calls ?? r.drawCalls ?? 0;
+  // three/webgpu's Info carries BOTH: `calls` is the cumulative count of
+  // `renderer.render()` invocations that `info.reset()` never clears, and
+  // `drawCalls` the per-frame draw count (plan-763). WebGL has only `calls`,
+  // which IS its per-frame draw count — so prefer `drawCalls` when present.
+  return r.drawCalls ?? r.calls ?? 0;
 }
 
 const BUCKETS: readonly FrameStatsBucket[] = ['scene', 'shadow', 'reflection', 'ao', 'outline', 'post', 'overlay', 'plugins', 'other'];
@@ -278,6 +282,72 @@ export function instrumentComposerPasses(
 /** Bucket a pass was attributed to, or undefined when it is not wrapped. */
 export function passBucketOf(pass: Pass): FrameStatsBucket | undefined {
   return (pass as MarkedPass)[PASS_MARK];
+}
+
+/** Run `fn` with `bucket` as the active nesting host (restored afterwards). */
+export function withActiveBucket<T>(bucket: FrameStatsBucket, fn: () => T): T {
+  const prev = activeBucket;
+  activeBucket = bucket;
+  try {
+    return fn();
+  } finally {
+    activeBucket = prev;
+  }
+}
+
+/** A TSL pass node of the post pipeline and the bucket it books into (plan-763). */
+export interface TslPassLike {
+  node: { updateBefore(frame: unknown): unknown } & { __rvFrameStatsBucket?: FrameStatsBucket };
+  bucket: FrameStatsBucket;
+}
+
+/**
+ * Per-pass accounting for the TSL post pipeline (plan-763 Phase 4) — the
+ * `instrumentComposerPasses` of the WebGPURenderer paths.
+ *
+ * Every pass node (scene pass, GTAO, outline nodes, bloom, overlay pass)
+ * renders inside its `updateBefore`, which three calls once per frame before
+ * the output quad. The wrapper books the node's delta into its bucket and
+ * SUBTRACTS it from the bucket that was active around the whole pipeline
+ * render (the viewer books the pipeline as `post`), so the sum of all buckets
+ * stays equal to the frame total and the output quad is what remains in
+ * `post`. Nested passes inside a pass (the floor mirror inside the scene
+ * pass) see their host through `activeBucket` exactly like the composer path.
+ *
+ * Idempotent per node (marker property); the pipeline calls this hook at the
+ * END of every graph build, so no frame renders between build and wrap.
+ */
+export function instrumentTslPasses(
+  passes: ReadonlyArray<TslPassLike>,
+  info: RenderInfoLike,
+  frame: FrameStats,
+): void {
+  for (const { node, bucket } of passes) {
+    if (node.__rvFrameStatsBucket) continue;
+    node.__rvFrameStatsBucket = bucket;
+    const orig = node.updateBefore;
+    node.updateBefore = function (this: TslPassLike['node'], f: unknown): unknown {
+      const c0 = drawCallsOf(info);
+      const t0 = info.render.triangles;
+      const host = activeBucket;
+      activeBucket = bucket;
+      try {
+        return orig.call(this, f);
+      } finally {
+        activeBucket = host;
+        if (activeFrame === frame) {
+          const dc = drawCallsOf(info) - c0;
+          const dt = info.render.triangles - t0;
+          frame[bucket].calls += dc;
+          frame[bucket].triangles += dt;
+          if (host && host !== bucket) {
+            frame[host].calls -= dc;
+            frame[host].triangles -= dt;
+          }
+        }
+      }
+    };
+  }
 }
 
 const SHADOW_MARK = '__rvFrameStatsShadow';

@@ -31,6 +31,7 @@
 
 import { Vector3, Quaternion } from 'three';
 import { lastPathSegment } from '../core/engine/rv-constants';
+import { stripIdentity } from '../core/engine/rv-decode-identity';
 import { setRemoteOwnershipActive } from '../core/engine/rv-slot-authority';
 import { RVBehavior } from '../core/rv-behavior';
 import type { LoadResult } from '../core/engine/rv-scene-loader';
@@ -1063,6 +1064,8 @@ export class MultiuserPlugin extends RVBehavior {
         if (source?.muTemplate && source.spawnParent) {
           const template = source.muTemplate;
           const clone = template.clone();
+          // plan-769 Inventory C: a mirrored MU is a runtime clone — no identity.
+          stripIdentity(clone);
           clone.visible = true;
           clone.traverse((child) => { child.visible = true; });
           clone.name = lastSeg;
@@ -1072,8 +1075,7 @@ export class MultiuserPlugin extends RVBehavior {
 
           const info = computeTemplateAABBInfo(clone);
           const newMU = new RVMovingUnit(clone, sourceName, info.halfSize, info.localCenter);
-          tm.mus.push(newMU);
-          tm.totalSpawned++;
+          tm.trackSpawnedMU(newMU);
         }
       }
     }

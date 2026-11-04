@@ -119,3 +119,18 @@ export const PHYSICS_CONTACT_FORCE_THRESHOLD_N = 0.05;
  * unit value; authored masses always win.
  */
 export const PHYSICS_DEFAULT_MU_MASS_KG = 1;
+
+/**
+ * Soft-CCD look-ahead (m) of a dynamic MU when its zone does not say otherwise
+ * (plan-2219, `WebPhysicsZone.SoftCcdPrediction`; keep equal to the rv-ODT default).
+ *
+ * Rapier 0.20 does not sweep a slow/resting body against a fixed one, so a small
+ * falling part can step through a thin floor (measured: 26 mm cube onto a 15 mm
+ * floor, 20 of 300 drops tunnel). 30 mm of speculative contact closes that
+ * (0 of 300) at a cost of one WASM call per body creation.
+ */
+export const PHYSICS_DEFAULT_SOFT_CCD_PREDICTION_M = 0.03;
+
+/** Upper bound (m) of `WebPhysicsZone.SoftCcdPrediction` (rv-ODT `maximum`). The inspector clamps at the
+ *  input; the provider clamps again, because a GLB or an MCP write can carry any number (plan-2219). */
+export const PHYSICS_MAX_SOFT_CCD_PREDICTION_M = 0.2;

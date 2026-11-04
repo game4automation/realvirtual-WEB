@@ -259,6 +259,21 @@ describe('GaussianSplatPlugin multi-instance API', () => {
     expect(plugin.instanceCount).toBe(0);
   });
 
+  it('plan-2215: onRender skips a strategy (stereo) frame and draws mono capture frames', async () => {
+    const plugin = new GaussianSplatPlugin();
+    const viewer = Object.assign(makeViewer(), { renderStrategyActive: true, strategyFrame: true });
+    (plugin as any)._viewer = viewer;
+    await plugin.loadSplat('a.splat');
+    mockRender.mockClear();
+    // Live stereo frame: the splat library would draw over both eyes with the mono camera.
+    plugin.onRender(0.016);
+    expect(mockRender).not.toHaveBeenCalled();
+    // Screenshot / video capture: the strategy is still installed, but the frame is mono.
+    viewer.strategyFrame = false;
+    plugin.onRender(0.016);
+    expect(mockRender).toHaveBeenCalledTimes(1);
+  });
+
   it('onRender iterates all visible instances', async () => {
     const plugin = new GaussianSplatPlugin();
     const viewer = makeViewer();

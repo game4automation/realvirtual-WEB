@@ -1,0 +1,14 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
+// plan-2051 Phase 3 - throwaway browser-config for the TaktSource seed-variance proof
+// (outside both repos, same pattern as tests/des/fixtures/s10/vitest.m3.config.ts.txt).
+
+import base from '__PUBLIC_ROOT__/vite.config.ts';
+export default ((env: any) => {
+  const c: any = (base as any)(env);
+  c.root = '__PUBLIC_ROOT__';
+  c.test.include = ['__PUBLIC_ROOT__/node_modules/.plan2051-takt/taktsource-variance.test.ts'];
+  c.test.exclude = [];
+  c.server.fs.allow.push('__PUBLIC_ROOT__/node_modules/.plan2051-takt');
+  return c;
+});

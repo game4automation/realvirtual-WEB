@@ -1,0 +1,65 @@
+{
+  "untouched": {
+    "activeElement": "BODY[]",
+    "w": {
+      "held": {
+        "vx": 0,
+        "vy": 0,
+        "yaw": 1,
+        "recovering": false
+      },
+      "released": {
+        "vx": 0.25,
+        "vy": 0,
+        "yaw": 0,
+        "recovering": false
+      }
+    },
+    "space": {
+      "pushCountBefore": 0,
+      "pushCountAfter": 1
+    }
+  },
+  "canvas": {
+    "activeElement": "DIV[]",
+    "w": {
+      "held": {
+        "vx": 0.25,
+        "vy": 0,
+        "yaw": 0,
+        "recovering": false
+      },
+      "released": {
+        "vx": 0.25,
+        "vy": 0,
+        "yaw": 0,
+        "recovering": false
+      }
+    },
+    "space": {
+      "pushCountBefore": 1,
+      "pushCountAfter": 2
+    }
+  },
+  "panel": {
+    "activeElement": "SPAN[radio]",
+    "w": {
+      "held": {
+        "vx": 0,
+        "vy": 0,
+        "yaw": 1,
+        "recovering": true
+      },
+      "released": {
+        "vx": 0.25,
+        "vy": 0,
+        "yaw": 0,
+        "recovering": true
+      }
+    },
+    "space": {
+      "pushCountBefore": 2,
+      "pushCountAfter": 3
+    }
+  }
+}

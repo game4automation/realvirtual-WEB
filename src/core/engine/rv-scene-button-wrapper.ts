@@ -7,9 +7,16 @@
  *
  * A wrapper is the node the user authored in Unity; the actual click target is
  * the `SceneButtonBase` on a descendant (Unity `GetComponentInChildren`). The
- * wrapper therefore carries NO event hooks — the dispatcher must reach the
- * base, not the wrapper — and only configures it: PLC signal, toggle/timer
- * behavior and the optional light subscription.
+ * wrapper configures it: PLC signal, toggle/timer behavior and the optional
+ * light subscription.
+ *
+ * Event hooks: a hit on the base (or below it) reaches the base first in the
+ * dispatcher's parent walk. The cap, however, is the base's SIBLING
+ * (`SimpleButton/Base` + `SimpleButton/Button`): in Unity the base's box
+ * collider encloses the cap, in the browser the cap mesh owns the hit, and the
+ * walk up from it never meets the base. The wrapper is the common ancestor, so
+ * it forwards click and hover to its base — reached only when nothing below it
+ * took the event.
  */
 
 import type { Object3D } from 'three';
@@ -18,6 +25,7 @@ import { removeComponentInstance } from './rv-component-registry';
 import { NodeRegistry } from './rv-node-registry';
 import type { RVSceneButtonBase } from './rv-scene-button-base';
 import type { SceneButtonManager } from './rv-scene-button-manager';
+import { slotDeclare, slotUndeclare } from './rv-slot-io';
 
 /** Common base of the three wrapper components. */
 export abstract class RVSceneButtonWrapper implements RVComponent {
@@ -72,7 +80,12 @@ export abstract class RVSceneButtonWrapper implements RVComponent {
       return;
     }
     this.configure(this.base);
-    this.base.setStateSignal(typeof this.stateSignal === 'string' ? this.stateSignal : null);
+    // The unwired `stateSignal` stays bindable in the viewer (SlotIO, keyed by
+    // this wrapper): the base publishes every flank it writes. The initial
+    // value is the current state as the signal reads it (NC: inverted).
+    const initial = this.base.invertSignal ? !this.base.active : this.base.active;
+    slotDeclare(this, 'stateSignal', 'feedback', { initial });
+    this.base.setStateSignal(typeof this.stateSignal === 'string' ? this.stateSignal : null, this);
     this.onWired(this.base);
     this.runActiveOnStart();
   }
@@ -85,6 +98,16 @@ export abstract class RVSceneButtonWrapper implements RVComponent {
     // default: nothing
   }
 
+  /** A click on the cap (sibling of the base) — forwarded to the base. */
+  onClick(): void {
+    this.base?.onClick();
+  }
+
+  /** Hover on the cap — forwarded to the base, which animates the cap. */
+  onHover(hovered: boolean): void {
+    this.base?.onHover(hovered);
+  }
+
   /** Unity `Start()` tail: `if (activeOnStart) sceneButtonBase.Click();` */
   protected runActiveOnStart(): void {
     if (this._clickedOnStart || !this.activeOnStart || !this.base) return;
@@ -94,6 +117,7 @@ export abstract class RVSceneButtonWrapper implements RVComponent {
   }
 
   dispose(): void {
+    slotUndeclare(this);
     this._manager?.unregister(this);
     this._manager = undefined;
     this.base = undefined;

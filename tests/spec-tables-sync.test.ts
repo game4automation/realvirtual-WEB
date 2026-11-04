@@ -17,7 +17,7 @@ import specText from '../schema/v1/specification.md?raw';
 import rvOdt from '../schema/v1/rv-odt.json';
 
 interface OdtProperty {
-  type?: string;
+  type?: string | string[];
   $ref?: string;
   items?: { $ref?: string; type?: string };
   enum?: string[];
@@ -46,6 +46,7 @@ const ALL_TYPES = [
 
 /** Expected type-cell text for a JSON property (the table grammar). */
 function expectedTypeCell(p: OdtProperty): string {
+  if (Array.isArray(p.type)) return p.type.join(' or ');
   if (p.$ref === '#/$defs/ComponentReference') return 'ComponentReference';
   if (p.$ref === '#/$defs/Vector3') return 'Vector3';
   if (p.$ref === '#/$defs/ActiveOnly') return 'ActiveOnly';
@@ -66,8 +67,21 @@ function expectedDefaultCell(p: OdtProperty): string {
 interface ParsedRow { field: string; type: string; def: string; desc: string }
 
 /** Heading regex for a Section-7 subsection: `#### 7a.3 <Name>` (groups 7a-7g). */
+/**
+ * The heading number may carry a letter suffix (`7a.71b`).
+ *
+ * A component inserted next to the one it belongs with gets `Nb` rather than
+ * forcing a renumber of the twenty headings after it: `GripLoad` sits beside
+ * `7a.71 DynamicAxis` because that is where a reader looks for it. The number
+ * is a position marker; the NAME is the identity, and the name is still
+ * matched exactly and its table still compared field by field.
+ *
+ * Before this, a correct and complete subsection read as a MISSING one, which
+ * is the worst answer a drift guard can give: it sends the next reader off to
+ * write a section that is already there.
+ */
 function headingRegexFor(name: string): RegExp {
-  return new RegExp(`^#### 7[a-g]\\.\\d+ ${name}\\s*$`, 'm');
+  return new RegExp(`^#### 7[a-g]\\.\\d+[a-z]? ${name}\\s*$`, 'm');
 }
 
 /** Parse the Section-7 subsection for one component: heading `#### 7x.N <Name>`

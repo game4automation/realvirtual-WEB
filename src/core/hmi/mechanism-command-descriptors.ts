@@ -5,8 +5,8 @@
  * mechanism-command-descriptors — EAGER descriptors of the rigid-body
  * MECHANISM commands (plan-504).
  *
- * The Quick Edit "Mechanism (Rigid-Body)" section and eleven of the twelve
- * `web_editor_mechanism_*` write tools are views of these commands: one
+ * The Quick Edit "Mechanism (Rigid-Body)" section, bound mechanism tools and
+ * the migrated path / trajectory commands share these descriptors: one
  * `enabled()` rule per action (tooltip == tool `{error}`), one `run()`, one
  * afterglow target. Open on purpose, exactly like `editor-command-descriptors`:
  * the MCP bridge needs label, button key, args shape and capability before the
@@ -53,7 +53,7 @@ import type { MechanismForcesSnapshot } from '../engine/rv-kinematic-registry';
  */
 export const MECHANISM_UNAVAILABLE =
   'Rigid-body mechanisms are not available in this build (private bundle missing). '
-  + 'Axis-group kinematics are available via web_editor_create_kinematic.';
+  + 'Axis-group kinematics are available via editor.createKinematic.';
 export const NEEDS_NODE = 'Needs an existing node';
 export const NEEDS_JOINT = 'Needs a joint component on this node';
 export const NEEDS_SOLVED_JOINT = 'Needs a solved joint (rebuild the mechanism first)';
@@ -116,6 +116,22 @@ export interface MechStaticsArgs { readonly mechanismPath: string }
 export interface MechFixArgs { readonly path: string; readonly code: string }
 /** UI batch "Add Bodies (n)" — a JSON string array of link paths. No MCP tool. */
 export interface MechAddBodiesArgs { readonly pathsJson: string }
+
+export interface MechSetAnchorArgs { readonly path: string; readonly componentType: string; readonly anchorAJson?: string; readonly anchorBJson?: string }
+
+export interface MechAddTargetArgs { readonly path: string; readonly interpolation?: string; readonly speedToTarget?: number; readonly waitForSeconds?: number; readonly mechanismPath?: string }
+
+export interface MechPathCreateArgs { readonly path: string; readonly mechanismPath: string; readonly targetLinkPath: string; readonly waypointPaths?: string; readonly loopPath?: boolean; readonly linearSpeed?: number; readonly linearAcceleration?: number }
+
+export interface MechPathAddWaypointArgs { readonly path: string; readonly waypointPath: string; readonly index?: number }
+
+export interface MechPathRemoveWaypointArgs { readonly path: string; readonly index: number }
+
+export interface MechPathMoveWaypointArgs { readonly path: string; readonly from: number; readonly to: number }
+
+export interface MechTrajectoryImportArgs { readonly path: string; readonly csv?: string; readonly relPath?: string; readonly mechanismPath?: string; readonly targetLinkPath?: string; readonly name?: string }
+
+export interface MechTrajectoryRunArgs { readonly path: string }
 
 // ─── Button keys (row-exact) ────────────────────────────────────────────
 
@@ -255,6 +271,10 @@ const req = (name: string, type = 'string'): P => ({ name, type, required: true 
 const opt = (name: string, type = 'string'): P => ({ name, type, required: false });
 
 interface Spec {
+  readonly readOnly?: boolean;
+  readonly timeoutMs?: number;
+  readonly cancellable?: boolean;
+  readonly toolClass?: CommandDescriptor['toolClass'];
   readonly id: string;
   readonly label: string | ((args: never) => string);
   readonly undoLabel?: string | ((args: never) => string);
@@ -263,17 +283,107 @@ interface Spec {
   readonly argsSchema: Readonly<Record<string, CommandArgType>>;
   readonly buttonKey: (args: never) => string;
   readonly mcp?: CommandMcpMirror;
+  /**
+   * plan-641: recordable in a macro. Every AUTHORING command is one;
+   * transient jog / statics / trajectoryRun are not. The private implementation
+   * carries the matching `resolveArgs` (gate test in the private repo).
+   */
+  readonly macro?: boolean;
 }
 
 const SPECS: readonly Spec[] = [
   {
-    id: 'mechanism.create', label: 'Add mechanism', undoLabel: 'Create mechanism', scope: 'editor',
+    id: 'mechanism.inspect', label: 'mechanism.inspect', scope: 'none', readOnly: true,
+    argsSchema: { path: 'string', include: 'string' },
+    buttonKey: () => 'mechanism.inspect',
+  },
+  {
+    id: 'mechanism.forces', label: 'mechanism.forces', scope: 'none', readOnly: true,
+    argsSchema: { mechanismPath: 'string', channelId: 'string', series: 'boolean' },
+    buttonKey: () => 'mechanism.forces',
+  },
+  {
+    id: 'mechanism.pathInspect', label: 'mechanism.pathInspect', scope: 'none', readOnly: true,
+    argsSchema: { path: 'string' },
+    buttonKey: () => 'mechanism.pathInspect',
+  },
+  {
+    id: 'mechanism.snapList', label: 'mechanism.snapList', scope: 'none', readOnly: true,
+    argsSchema: { x: 'number', y: 'number', maxCandidates: 'number' },
+    buttonKey: () => 'mechanism.snapList',
+  },
+  {
+    id: 'mechanism.trajectoryExport', label: 'mechanism.trajectoryExport', scope: 'none', readOnly: true,
+    argsSchema: { path: 'string' },
+    buttonKey: () => 'mechanism.trajectoryExport',
+  },
+  {
+    id: 'mechanism.trajectoryInspect', label: 'mechanism.trajectoryInspect', scope: 'none', readOnly: true,
+    argsSchema: { path: 'string', maxPoints: 'number' },
+    buttonKey: () => 'mechanism.trajectoryInspect',
+  },
+  {
+    id: 'mechanism.validate', label: 'mechanism.validate', scope: 'none', readOnly: true,
+    argsSchema: { path: 'string' },
+    buttonKey: () => 'mechanism.validate',
+  },
+  {
+    id: 'mechanism.setAnchor', label: 'Set anchors', scope: 'editor',
+    macro: true, undoLabel: 'Set joint anchor',
+    argsSchema: { path: 'string', componentType: 'string', anchorAJson: 'string', anchorBJson: 'string' },
+    buttonKey: () => 'mechanism.setAnchor',
+  },
+  {
+    id: 'mechanism.targetCreate', label: 'Create mechanism target', scope: 'editor',
+    macro: true, undoLabel: 'Add mechanism target',
+    argsSchema: { path: 'string', interpolation: 'string', speedToTarget: 'number', waitForSeconds: 'number', mechanismPath: 'string' },
+    buttonKey: () => 'mechanism.targetCreate',
+  },
+  {
+    id: 'mechanism.pathCreate', label: 'Create mechanism path', scope: 'editor',
+    macro: true, undoLabel: 'Add mechanism path',
+    argsSchema: { path: 'string', mechanismPath: 'string', targetLinkPath: 'string', waypointPaths: 'string', loopPath: 'boolean', linearSpeed: 'number', linearAcceleration: 'number' },
+    buttonKey: () => 'mechanism.pathCreate',
+  },
+  {
+    id: 'mechanism.pathAddWaypoint', label: 'Add waypoint', scope: 'editor',
+    macro: true, undoLabel: 'Add path waypoint',
+    argsSchema: { path: 'string', waypointPath: 'string', index: 'number' },
+    buttonKey: () => 'mechanism.pathAddWaypoint',
+  },
+  {
+    id: 'mechanism.pathRemoveWaypoint', label: 'Remove waypoint', scope: 'editor',
+    macro: true, undoLabel: 'Remove path waypoint',
+    argsSchema: { path: 'string', index: 'number' },
+    buttonKey: () => 'mechanism.pathRemoveWaypoint',
+  },
+  {
+    id: 'mechanism.pathMoveWaypoint', label: 'Move waypoint', scope: 'editor',
+    macro: true, undoLabel: 'Reorder path waypoints',
+    argsSchema: { path: 'string', from: 'number', to: 'number' },
+    buttonKey: () => 'mechanism.pathMoveWaypoint',
+  },
+  {
+    id: 'mechanism.trajectoryImport', label: 'Import trajectory', scope: 'editor',
+    macro: true, undoLabel: 'Import trajectory',
+    argsSchema: { path: 'string', csv: 'string', relPath: 'string', mechanismPath: 'string', targetLinkPath: 'string', name: 'string' },
+    buttonKey: () => 'mechanism.trajectoryImport',
+  },
+  {
+    id: 'mechanism.trajectoryRun', label: 'Run trajectory', scope: 'editor',
+    timeoutMs: 600_000, cancellable: true, toolClass: 'sim',
+    argsSchema: { path: 'string' },
+    buttonKey: () => 'mechanism.trajectoryRun',
+  },
+
+  {
+    id: 'mechanism.create', macro: true, label: 'Add mechanism', undoLabel: 'Create mechanism', scope: 'editor',
     argsSchema: { path: 'string' },
     buttonKey: () => 'mech.create',
     mcp: { tool: 'web_editor_mechanism_create', params: [req('path')] },
   },
   {
-    id: 'mechanism.addJoint', label: (a: MechAddJointArgs) => `Add ${s(a?.jointType) || 'joint'} joint`,
+    id: 'mechanism.addJoint', macro: true, label: (a: MechAddJointArgs) => `Add ${s(a?.jointType) || 'joint'} joint`,
     undoLabel: (a: MechAddJointArgs) => `Add ${s(a?.jointType)} joint`, scope: 'editor',
     argsSchema: {
       path: 'string', jointType: 'string', bodyBPath: 'string', bodyAPath: 'string',
@@ -286,7 +396,7 @@ const SPECS: readonly Spec[] = [
     },
   },
   {
-    id: 'mechanism.assignDrive',
+    id: 'mechanism.assignDrive', macro: true,
     label: (a: MechAssignDriveArgs) => (s(a?.drivePath).trim() ? 'Assign drive' : 'Clear drive'),
     undoLabel: (a: MechAssignDriveArgs) => (s(a?.drivePath).trim() ? 'Assign drive to joint' : 'Clear joint drive'),
     scope: 'editor',
@@ -302,7 +412,7 @@ const SPECS: readonly Spec[] = [
     mcp: { tool: 'web_editor_mechanism_jog', params: [req('path'), req('value', 'number'), opt('componentType')] },
   },
   {
-    id: 'mechanism.setAnchorSnap',
+    id: 'mechanism.setAnchorSnap', macro: true,
     label: (a: MechSetAnchorSnapArgs) => `Set anchor ${s(a?.side).trim().toUpperCase() || 'A'}`,
     undoLabel: (a: MechSetAnchorSnapArgs) => `Set anchor ${s(a?.side).trim().toUpperCase()}`,
     scope: 'editor',
@@ -318,7 +428,7 @@ const SPECS: readonly Spec[] = [
     },
   },
   {
-    id: 'mechanism.setAxis', label: 'Set joint axis', undoLabel: 'Set joint axis', scope: 'editor',
+    id: 'mechanism.setAxis', macro: true, label: 'Set joint axis', undoLabel: 'Set joint axis', scope: 'editor',
     argsSchema: {
       path: 'string', componentType: 'string', candidateId: 'string',
       axisWorldJson: 'string', secondaryAxisWorldJson: 'string', snapToPrincipal: 'boolean',
@@ -330,13 +440,13 @@ const SPECS: readonly Spec[] = [
     },
   },
   {
-    id: 'mechanism.addBody', label: 'Add Body', undoLabel: 'Add mechanism body', scope: 'editor',
+    id: 'mechanism.addBody', macro: true, label: 'Add Body', undoLabel: 'Add mechanism body', scope: 'editor',
     argsSchema: { path: 'string', densityPreset: 'string' },
     buttonKey: (a: MechAddBodyArgs) => bodyRowKey(s(a?.path)),
     mcp: { tool: 'web_editor_mechanism_add_body', params: [req('path'), opt('densityPreset')] },
   },
   {
-    id: 'mechanism.setMass', label: 'Set body mass', undoLabel: 'Set body mass properties', scope: 'editor',
+    id: 'mechanism.setMass', macro: true, label: 'Set body mass', undoLabel: 'Set body mass properties', scope: 'editor',
     argsSchema: { path: 'string', densityPreset: 'string', densityKgM3: 'number', massKg: 'string', comJson: 'string' },
     buttonKey: (a: MechSetMassArgs) => setMassButtonKey(a),
     mcp: {
@@ -345,7 +455,7 @@ const SPECS: readonly Spec[] = [
     },
   },
   {
-    id: 'mechanism.setLimits', label: 'Apply limits',
+    id: 'mechanism.setLimits', macro: true, label: 'Apply limits',
     undoLabel: (a: MechSetLimitsArgs) => (a?.useLimits ? 'Set joint limits' : 'Disable joint limits'),
     scope: 'editor',
     argsSchema: { path: 'string', componentType: 'string', useLimits: 'boolean', lower: 'number', upper: 'number' },
@@ -363,7 +473,7 @@ const SPECS: readonly Spec[] = [
     mcp: { tool: 'web_editor_mechanism_statics', params: [req('mechanismPath')] },
   },
   {
-    id: 'mechanism.fix', label: (a: MechFixArgs) => `Fix ${s(a?.code)}`,
+    id: 'mechanism.fix', macro: true, label: (a: MechFixArgs) => `Fix ${s(a?.code)}`,
     undoLabel: (a: MechFixArgs) => `Fix ${s(a?.code)}`, scope: 'editor',
     argsSchema: { path: 'string', code: 'string' },
     buttonKey: (a: MechFixArgs) => findingRowKey(s(a?.path), s(a?.code)),
@@ -371,7 +481,7 @@ const SPECS: readonly Spec[] = [
   },
   {
     // UI-only batch (no tool): one transaction, one undo step for n links.
-    id: 'mechanism.addBodies', label: 'Add Bodies', undoLabel: 'Add mechanism bodies', scope: 'editor',
+    id: 'mechanism.addBodies', macro: true, label: 'Add Bodies', undoLabel: 'Add mechanism bodies', scope: 'editor',
     argsSchema: { pathsJson: 'string' },
     buttonKey: () => 'mech.add-bodies',
   },
@@ -387,7 +497,11 @@ export function createMechanismCommandDescriptors(opts: MechanismDescriptorOptio
   return SPECS.map((sp): CommandDescriptor<never, unknown> => ({
     id: sp.id,
     label: sp.label,
-    readOnly: false,
+    readOnly: sp.readOnly === true,
+    timeoutMs: sp.timeoutMs,
+    cancellable: sp.cancellable,
+    toolClass: sp.toolClass,
+    ...(sp.macro ? { macro: true } : {}),
     ...(sp.undoLabel ? { undoLabel: sp.undoLabel } : {}),
     scope: sp.scope,
     available: opts.available,
@@ -405,7 +519,7 @@ const loadMechanismCommands = (): Promise<MechanismCommandsModule> =>
 
 const registered = new WeakSet<CommandRegistry>();
 
-/** Idempotent eager registration of the twelve mechanism descriptors. */
+/** Idempotent eager registration of the mechanism descriptors. */
 export function ensureMechanismCommandsRegistered(registry: CommandRegistry = commandRegistry): void {
   if (registered.has(registry)) return;
   registered.add(registry);

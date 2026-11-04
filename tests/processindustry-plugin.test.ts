@@ -9,6 +9,7 @@ import { RVPump } from '../src/core/engine/rv-pump';
 import { ProcessIndustryPlugin } from '../src/plugins/processindustry-plugin';
 import type { RVViewer } from '../src/core/rv-viewer';
 import type { LoadResult } from '../src/core/engine/rv-scene-loader';
+import { legacyRegistry } from './helpers/legacy-registry-fake';
 
 /** Build a fake scene with the given number of pipes/tanks/pumps. */
 function buildFakeScene(nPipes: number, nTanks: number, nPumps: number) {
@@ -152,7 +153,7 @@ describe('ProcessIndustryPlugin', () => {
     const pathToNode = new Map<string, Object3D>([['TankA', tankANode], ['TankB', tankBNode]]);
     const viewer = {
       scene,
-      registry: { getNode: (p: string) => pathToNode.get(p) ?? null },
+      registry: legacyRegistry((p: string) => pathToNode.get(p) ?? null),
     } as unknown as RVViewer;
 
     randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.6);
@@ -201,7 +202,7 @@ describe('ProcessIndustryPlugin', () => {
     ]);
     const viewer = {
       scene,
-      registry: { getNode: (p: string) => pathToNode.get(p) ?? null },
+      registry: legacyRegistry((p: string) => pathToNode.get(p) ?? null),
     } as unknown as RVViewer;
 
     randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.6);
@@ -236,7 +237,7 @@ describe('ProcessIndustryPlugin', () => {
     const pathToNode = new Map<string, Object3D>([['Full', fullNode], ['Empty', emptyNode]]);
     const viewer = {
       scene,
-      registry: { getNode: (p: string) => pathToNode.get(p) ?? null },
+      registry: legacyRegistry((p: string) => pathToNode.get(p) ?? null),
     } as unknown as RVViewer;
 
     randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.6);
@@ -266,7 +267,7 @@ describe('ProcessIndustryPlugin', () => {
     const small = new RVTank(smallNode, { capacity: 1000, amount: 500 });
     const large = new RVTank(largeNode, { capacity: 1000, amount: 500 });
 
-    const viewer = { scene, registry: { getNode: () => null } } as unknown as RVViewer;
+    const viewer = { scene, registry: legacyRegistry(() => null) } as unknown as RVViewer;
     plugin.onModelLoaded({} as LoadResult, viewer);
 
     // Capacities now reflect geometry volume (1000 L vs 24000 L).
@@ -283,7 +284,7 @@ describe('ProcessIndustryPlugin', () => {
     scene.add(empty);
     const tank = new RVTank(empty, { capacity: 1234, amount: 500 });
 
-    const viewer = { scene, registry: { getNode: () => null } } as unknown as RVViewer;
+    const viewer = { scene, registry: legacyRegistry(() => null) } as unknown as RVViewer;
     plugin.onModelLoaded({} as LoadResult, viewer);
 
     expect(tank.capacity).toBe(1234);
@@ -314,7 +315,7 @@ describe('ProcessIndustryPlugin', () => {
     ]);
     const viewer = {
       scene,
-      registry: { getNode: (p: string) => pathToNode.get(p) ?? null },
+      registry: legacyRegistry((p: string) => pathToNode.get(p) ?? null),
     } as unknown as RVViewer;
 
     plugin.onModelLoaded({} as LoadResult, viewer);
@@ -363,7 +364,7 @@ describe('ProcessIndustryPlugin', () => {
     ]);
     const viewer = {
       scene,
-      registry: { getNode: (p: string) => pathToNode.get(p) ?? null },
+      registry: legacyRegistry((p: string) => pathToNode.get(p) ?? null),
     } as unknown as RVViewer;
 
     plugin.onModelLoaded({} as LoadResult, viewer);
@@ -406,7 +407,7 @@ describe('ProcessIndustryPlugin', () => {
     ]);
     const viewer = {
       scene,
-      registry: { getNode: (p: string) => pathToNode.get(p) ?? null },
+      registry: legacyRegistry((p: string) => pathToNode.get(p) ?? null),
     } as unknown as RVViewer;
 
     plugin.onModelLoaded({} as LoadResult, viewer);
@@ -443,7 +444,7 @@ describe('ProcessIndustryPlugin', () => {
     ]);
     const viewer = {
       scene,
-      registry: { getNode: (p: string) => pathToNode.get(p) ?? null },
+      registry: legacyRegistry((p: string) => pathToNode.get(p) ?? null),
     } as unknown as RVViewer;
 
     plugin.onModelLoaded({} as LoadResult, viewer);

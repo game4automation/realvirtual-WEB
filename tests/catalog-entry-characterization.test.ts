@@ -205,11 +205,23 @@ describe('plan-717 R1-T5 baseline — the fields that do not vary', () => {
     expect(entry.pivotToFloor).toBe(true);
   });
 
-  it('the thumbnail comes straight off the row, or is empty', async () => {
+  it('the row pointer becomes thumbnailPointer (resolved by the card), a URL passes as thumbnailUrl', async () => {
+    // plan-776 F9: a relative pointer is NOT a URL — the card resolves it
+    // through the project backend. A hash-less name is still carried as it
+    // stands: the provider does not validate it, the reader does.
     const [withThumb] = await entriesFor([
       row('library/Roll2m.glb', { thumbnail: '.thumbnails/Roll2m.png' } as never),
     ]);
-    expect(withThumb.thumbnailUrl).toBe('.thumbnails/Roll2m.png');
+    expect(withThumb.thumbnailUrl).toBe('');
+    expect(withThumb.thumbnailPointer).toBe('.thumbnails/Roll2m.png');
+
+    uninstallProjectLibraryProvider();
+    resetLibrarySourceRegistryForTests();
+    const [withUrl] = await entriesFor([
+      row('library/Roll2m.glb', { thumbnail: 'https://cdn.example/roll.webp' } as never),
+    ]);
+    expect(withUrl.thumbnailUrl).toBe('https://cdn.example/roll.webp');
+    expect(withUrl.thumbnailPointer).toBeUndefined();
 
     uninstallProjectLibraryProvider();
     resetLibrarySourceRegistryForTests();

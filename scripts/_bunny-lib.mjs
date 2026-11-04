@@ -35,9 +35,10 @@ import { sha256Buffer } from './lib/rv-hash.mjs';
 import { signGlbBytes } from './rv-sign-glb.mjs';
 import { join, extname, basename, dirname, sep } from 'node:path';
 import { tmpdir } from 'node:os';
-import { hasDeliveryConfig, loadDeliveryConfig } from './_workspace-lib.mjs';
+
 import { withDerivedDocuments } from './_rv-manifest.mjs';
 import { hostedDeployDenyReason, readProjectIgnoreRules, HOSTED_DEPLOY_WARN_FILE_BYTES } from './_rv-guards.mjs';
+import { DELIVERED_LIBRARIES_FOLDER, trimProjectLibraries } from './lib/rv-library-trim.mjs';
 
 // ─── Constants ───────────────────────────────────────────────────────────
 
@@ -55,16 +56,25 @@ import { hostedDeployDenyReason, readProjectIgnoreRules, HOSTED_DEPLOY_WARN_FILE
 //! zone is purged afterwards (`maybePurge`), which together are what let the
 //! rollback in plan-726 §5.6 be "replace one file" rather than "redeploy".
 //!
-//! `catalog.json` (every file with that basename — the bundled library's and
-//! any other) joined in plan-508 F2b: it carries `sha256` per asset, and a
+//! `catalog.json` (every file with that basename — external catalogs; the bundled
+//! library ships `library/project.json` since plan-778, deferred the same way)
+//! joined in plan-508 F2b: it carries `sha256` per asset, and a
 //! changed hash leaves the byte count untouched. A size-skipped catalog would
 //! keep the OLD hashes on the CDN while the browser verifies the NEW bytes.
+//!
+//! `feature-chunks.json` (plan-652) and `features.json` (plan-646) are build tables at a FIXED
+//! url. `feature-chunks.json` names the hashed chunk files per feature, and a rebuild swaps
+//! every 8-char hash for another 8-char hash — same byte count. Size-skipped, the CDN kept the
+//! table of the PREVIOUS build, the idle prefetch asked for ~28 chunks that the stale-delete had
+//! just removed, and the /demo smoke of 2026-10-23 10:56 went red on their 404s.
 export const ALWAYS_UPLOAD_FILES = new Set([
   'settings.json',
   'models.json',
   'manifest.json',
   'project.json',
   'catalog.json',
+  'feature-chunks.json',
+  'features.json',
 ]);
 
 const DEFAULT_REGION = 'storage.bunnycdn.com';
@@ -223,6 +233,8 @@ export function buildEnvForMode(mode, opts = {}) {
     delete env.VITE_PRIVATE_BUILD;
     delete env.RV_INTERNAL;
     delete env.RV_SOURCEMAP;
+    // Installability. The AGPL watermark follows the build stage instead (plan-679 Phase 9,
+    // scripts/lib/rv-agpl-attribution.mjs): with the private tree it is never in the HTML.
     env.RV_COMMERCIAL = '1';
   } else {
     // Private build: ensure VITE_PUBLIC_BUILD is NOT inherited from a prior public run.
@@ -230,7 +242,15 @@ export function buildEnvForMode(mode, opts = {}) {
     delete env.VITE_PUBLIC_BUILD;
     env.VITE_PRIVATE_BUILD = '1';
   }
+  // plan-679 Phase 3: a Bunny build is never a customer delivery tier; never inherit one.
+  delete env.RV_NOTICES_TIER;
   if (opts.base) env.VITE_BASE = opts.base;
+  // plan-646 F14: explicit for every build, never inherited (same rule as runBuild()).
+  env.RV_DEMO_WELCOME = mode === 'demo' && opts.demoWelcome === true ? '1' : '0';
+  // The "realvirtual public demo for evaluation" notice: only the public demo (target path `demo`,
+  // the same decision as the welcome window: demoWelcomeForTarget), never /dev or /demo-beta;
+  // explicit, never inherited.
+  env.RV_DEMO_NOTICE = mode === 'demo' && opts.demoWelcome === true ? '1' : '0';
   return env;
 }
 
@@ -532,6 +552,28 @@ export class BunnyClient {
 
 // ─── Private project: load / validate ────────────────────────────────────
 
+/**
+ * The delivery-config lookup, registered by the caller that HAS one (plan-604).
+ *
+ * This module used to import `hasDeliveryConfig`/`loadDeliveryConfig` from
+ * `_workspace-lib.mjs` directly, and that one edge decided who could publish at all:
+ * `_workspace-lib` pulls in the customer register (`_rv-customers.mjs`) and the whole
+ * delivery/tier machinery, ~330 kB of material that describes OTHER customers'
+ * arrangements. A commercial partner publishing his own project needs the staging and
+ * the uploader, and must never receive that. So the dependency is inverted: internal
+ * tooling (`bunny-deploy.mjs`) registers the lookup, the delivered partner CLI
+ * (`publish-project.mjs`) does not, and a project simply carries no `delivery` there —
+ * which is exactly true, because a delivered workspace has no delivery configs.
+ *
+ * `null` is the honest default: no lookup registered means nothing claims the project.
+ */
+let deliveryLookup = null;
+
+//! Registers the lookup above. `(privateRoot, folderName) => deliveryConfig | null`.
+export function setDeliveryLookup(lookup) {
+  deliveryLookup = typeof lookup === 'function' ? lookup : null;
+}
+
 //! Loads + validates a project.json. Throws (with filename) when missing or
 //! when `code` / `name` are absent — so a deploy never lands under `undefined/`.
 //!
@@ -560,13 +602,11 @@ export function loadProject(projectDir) {
   if (typeof project.name !== 'string' || !project.name.trim()) {
     throw new Error(`Invalid project.json (missing "name"): ${jsonPath}`);
   }
-  const privateRoot = dirname(dirname(projectDir));
   // A delivery config may be named after the CUSTOMER and claim this project in its
-  // `projects[]` (§2.10), so probing for delivery/<folder>.json is no longer the
-  // question. hasDeliveryConfig() answers the real one: does any config claim it?
-  if (hasDeliveryConfig(privateRoot, basename(projectDir))) {
-    project.delivery = loadDeliveryConfig(privateRoot, basename(projectDir));
-  }
+  // `projects[]` (§2.10), so probing for delivery/<folder>.json is not the question.
+  // The registered lookup answers the real one: does any config claim it?
+  const delivery = deliveryLookup?.(dirname(dirname(projectDir)), basename(projectDir)) ?? null;
+  if (delivery) project.delivery = delivery;
   return project;
 }
 
@@ -594,10 +634,12 @@ export function discoverPrivateProjects(baseDir) {
 
 //! Keys of the generated settings.json that a project file must never set.
 //! `analytics` and `encryption` are security statements about the artifact,
-//! `projectAssetsPath` and `generated` are deploy mechanics.
+//! `projectAssetsPath`, `hostedDeploy` (plan-640) and `generated` are deploy
+//! mechanics.
 export const SETTINGS_RESERVED_KEYS = Object.freeze([
   'projectUrl',
   'projectAssetsPath',
+  'hostedDeploy',
   'analytics',
   'encryption',
   'generated',
@@ -726,11 +768,15 @@ export function copyProjectVerbatim(projectDir, destDir, { ignoreRules = null } 
 }
 
 //! True for a `p/`-relative path a password-protected deploy encrypts: every
-//! `.glb` (any depth) plus the project AASX — `aasx/*.aasx` (flat, like the
-//! viewer's scan) and `aasx/index.json` (plan-596).
+//! `.glb` (any depth), the project AASX — `aasx/*.aasx` (flat, like the
+//! viewer's scan) and `aasx/index.json` (plan-596) — and every saved preview
+//! `.thumbnails/*.webp|png` (plan-776 P2): a picture rendered from a protected
+//! model must not travel in the clear beside it. The viewer reads all of them
+//! through `BundledBackend.readDocumentUrl`, which decrypts on an encrypted deploy.
 export function isEncryptablePath(rel) {
   const p = normalizePath(rel);
   if (extname(p).toLowerCase() === '.glb') return true;
+  if (/(^|\/)\.thumbnails\/[^/]+\.(webp|png)$/i.test(p)) return true;
   return /^aasx\/[^/]+\.aasx$/i.test(p) || /^aasx\/index\.json$/i.test(p);
 }
 
@@ -769,9 +815,11 @@ export function hostedForcedUploadRels(encrypted = [], catalogDiff = []) {
 //!
 //! A hosted deploy carries NO `defaultModel` (D14): the root always opens the
 //! dashboard of the served project, a document opens through its own `?doc=`
-//! URL. The project's `settings/project-settings.json` is the BASE; every key
-//! this function owns (`projectUrl`, `projectAssetsPath`, `analytics`,
-//! `encryption`, `generated`) is written afterwards and wins, so a project file
+//! URL — unless the project opts in with `project.json` → `settings.start`
+//! (plan-640), which the runtime honours only next to `hostedDeploy: true`.
+//! The project's `settings/project-settings.json` is the BASE; every key
+//! this function owns (`projectUrl`, `projectAssetsPath`, `hostedDeploy`,
+//! `analytics`, `encryption`, `generated`) is written afterwards and wins, so a project file
 //! can add settings but never re-enable analytics, aim the project elsewhere
 //! or claim the build is unencrypted. Private customer deploys never carry
 //! analytics: the GA id is hardcoded empty.
@@ -786,6 +834,10 @@ export function generateHostedSettings(opts = {}) {
   delete settings.defaultModel;
   settings.projectUrl = HOSTED_PROJECT_PREFIX;
   settings.projectAssetsPath = HOSTED_PROJECT_PREFIX;
+  // plan-640: the marker that makes `project.json` → `settings.start` apply.
+  // Only a real hosted deploy carries it; a `?projectUrl=` boot elsewhere does
+  // not, so the opt-in start document can never leak into other deliveries.
+  settings.hostedDeploy = true;
   // plan-267 / plan-759: signal the runtime to install the boot password gate.
   // `probe` is a tiny envelope over a fixed plaintext with the publish salt, so
   // the gate verifies the key without downloading a model (F5).
@@ -810,6 +862,17 @@ export function generateHostedSettings(opts = {}) {
 //! Signing, when configured, runs on the plaintext BEFORE encryption — and ONLY
 //! on `.glb` (SOL #2): an AASX or a JSON index is no GLB container.
 //!
+//! Library projects (plan-778 F15): the project's libraries ship TRIMMED under
+//! `p/libraries/<projectId>/` (`trimProjectLibraries`, the same step the
+//! customer staging runs), found by id through `librarySources`
+//! (`{ projectsDir, libraries }` = `--projects-dir` / `--library <id>=<folder>`)
+//! or the project's own `libraries/`; an unresolvable one throws (exit 1). The
+//! realvirtual library is never trimmed: the build's app-level `library/` is
+//! published beside the runtime whenever the project needs it (lists it, places
+//! from it, or carries a legacy id of it) — otherwise it stays out, as before.
+//! Trimming runs BEFORE signing/encryption, so library GLBs get the same
+//! treatment as the project's own; `stampCatalogHashes` re-stamps their rows.
+//!
 //! Returns the staging directory path. Does NOT build (caller builds first).
 //! Caller is responsible for cleaning up the returned dir (try/finally). The
 //! preflight report is handed to `onReport` when given.
@@ -819,11 +882,13 @@ export function generateHostedSettings(opts = {}) {
  *   projectDir: string,
  *   encryption?: { password: string, fragmentSecret: Uint8Array, iterations?: number, chunkSize?: number } | null,
  *   signing?: { privateKey: import('node:crypto').KeyObject, customerCert?: object | null } | null,
- *   onReport?: (report: { copied: string[], denied: {rel:string,reason:string}[], symlinks: string[], oversized: string[], encrypted: string[] }) => void,
+ *   onReport?: (report: { copied: string[], denied: {rel:string,reason:string}[], symlinks: string[], oversized: string[], encrypted: string[], libraries: string[], realvirtualLibrary: boolean }) => void,
+ *   librarySources?: { projectsDir?: string | null, libraries?: Record<string, string> } | null,
+ *   onLog?: ((line: string) => void) | null,
  * }} opts
  * @returns {Promise<string>} staging directory path
  */
-export async function stageHostedProject({ distDir, projectDir, encryption = null, signing = null, onReport = null }) {
+export async function stageHostedProject({ distDir, projectDir, encryption = null, signing = null, onReport = null, librarySources = null, onLog = null }) {
   if (!existsSync(distDir)) {
     throw new Error(`dist/ not found: ${distDir}`);
   }
@@ -856,6 +921,31 @@ export async function stageHostedProject({ distDir, projectDir, encryption = nul
   if (!existsSync(join(projectStage, 'project.json'))) {
     throw new Error(`Hosted staging of ${basename(projectDir)} lost project.json — the deny list must never remove it.`);
   }
+
+  // plan-778 F15: the libraries it uses, trimmed, beside it under p/libraries/.
+  // A failure removes the staging dir: the caller never received it.
+  const appLibraryDir = join(distDir, 'library');
+  let trim;
+  try {
+    trim = trimProjectLibraries(projectStage, {
+      projectsDir: librarySources?.projectsDir ?? null,
+      libraries: librarySources?.libraries ?? {},
+      realvirtualLibraryDir: existsSync(join(appLibraryDir, 'project.json')) ? appLibraryDir : null,
+      label: `project "${project.name}"`,
+    }, { log: onLog });
+  } catch (error) {
+    rmSync(stagingDir, { recursive: true, force: true });
+    throw error;
+  }
+  report.libraries = trim.shipped;
+  report.realvirtualLibrary = trim.plan.realvirtualLibraryUsed && existsSync(appLibraryDir);
+  if (trim.plan.realvirtualLibraryUsed && !existsSync(appLibraryDir)) {
+    onLog?.('[libraries] WARNING: the project needs the realvirtual library but dist/library is missing - '
+      + 'run "npm run build" (or build:library) first; the hosted copy would ship without it.');
+  }
+  // The realvirtual library is app-level and untrimmed (N2): published only for a
+  // project that needs it, so a project without it keeps the plan-759 layout.
+  if (report.realvirtualLibrary) copyDirRecursive(appLibraryDir, join(stagingDir, 'library'));
 
   // Provenance order is security-sensitive: sign the finished plaintext GLB
   // first, then wrap those signed bytes in the optional RVE1 envelope.
@@ -1140,7 +1230,10 @@ export function publicDemoManifestMisses(distDir) {
     // demo's rows are root-level in its own folder today, so the old rule
     // checked precisely nothing. `library/` stays exempt for its original
     // reason — it is an app-level subscription, staged by another step.
-    if (rel.split('/')[0].toLowerCase() === 'library') continue;
+    // `libraries/` (plan-778) likewise: delivered library projects are checked by
+    // the trim and by `validate-project`, against their own manifests.
+    const top = rel.split('/')[0].toLowerCase();
+    if (top === 'library' || top === DELIVERED_LIBRARIES_FOLDER) continue;
     if (!existsOnDiskExactly(root, rel)) misses.push(rel);
   }
   return misses;
@@ -1211,6 +1304,12 @@ export function applyPublicScenePruning(distDir, { prefix = PUBLIC_TEST_SCENE_PR
         if (row.devOnly === true) {
           dropped.push(path);
           if (!dryRun) rmSync(join(manifestRoot, path), { force: true });
+          // Its saved preview (plan-776 `.thumbnails/<id>.<hash8>.<ext>`) goes with it:
+          // the row that pointed at it is leaving the shipped manifest.
+          const thumb = typeof row.thumbnail === 'string' ? normalizePath(row.thumbnail) : '';
+          if (!dryRun && /^\.thumbnails\/[^/]+\.(webp|png)$/i.test(thumb)) {
+            rmSync(join(manifestRoot, thumb), { force: true });
+          }
         } else {
           kept.push(path);
           survivors.push(row);
@@ -1375,13 +1474,16 @@ export function findCatalogFiles(rootDir) {
     .map((f) => f.rel);
 }
 
-//! The deploy-relative path of an entry's binary (`glbUrl`, else `splatUrl`),
-//! or null when the url is not a relative file url (http(s), blob, data,
-//! root-absolute): such an entry is not part of this deploy's upload set.
+//! The deploy-relative path of an entry's binary (`glbUrl`, else `splatUrl`,
+//! else — a library PROJECT document row, plan-778 — `path`), or null when the
+//! url is not a relative file url (http(s), blob, data, root-absolute): such an
+//! entry is not part of this deploy's upload set.
 export function catalogEntryBinaryRel(catalogRel, entry) {
   const url = typeof entry?.glbUrl === 'string' && entry.glbUrl !== ''
     ? entry.glbUrl
-    : (typeof entry?.splatUrl === 'string' ? entry.splatUrl : '');
+    : (typeof entry?.splatUrl === 'string' && entry.splatUrl !== ''
+      ? entry.splatUrl
+      : (typeof entry?.path === 'string' ? entry.path : ''));
   if (!url || /^[a-z][a-z0-9+.-]*:/i.test(url) || url.startsWith('/')) return null;
   let decoded;
   try { decoded = decodeURIComponent(url.split(/[?#]/, 1)[0]); } catch { return null; }
@@ -1399,6 +1501,30 @@ export function catalogEntryBinaryRel(catalogRel, entry) {
   return parts.join('/');
 }
 
+//! The id of the realvirtual library project (plan-778): its `project.json` rows are
+//! stamped like catalog entries. Customer projects are never touched here.
+export const REALVIRTUAL_LIBRARY_PROJECT_ID = 'prj_realvirtual_library';
+
+//! Every library `project.json` under `rootDir`, as forward-slash rels: the
+//! realvirtual library's (id `prj_realvirtual_library`, plan-778 Phase 3) and every
+//! delivered trimmed library `libraries/<id>/project.json` whose id is its folder
+//! name (Phase 4 — signing/encryption changed its documents' bytes after the
+//! trim copied the rows). A project's own `project.json` is never one of them.
+export function findLibraryProjectFiles(rootDir) {
+  return collectLocalFiles(rootDir)
+    .filter((f) => basename(f.rel).toLowerCase() === 'project.json')
+    .filter((f) => {
+      let id;
+      try { id = JSON.parse(readFileSync(join(rootDir, f.rel), 'utf8'))?.id; } catch { return false; }
+      if (id === REALVIRTUAL_LIBRARY_PROJECT_ID) return true;
+      const segments = f.rel.split('/');
+      return segments.length >= 3
+        && segments[segments.length - 3] === DELIVERED_LIBRARIES_FOLDER
+        && segments[segments.length - 2] === id;
+    })
+    .map((f) => f.rel);
+}
+
 //! Re-stamps `sha256` + `sizeBytes` into every `catalog.json` under `rootDir`
 //! from the bytes that are there NOW (plan-508 F2).
 //!
@@ -1406,10 +1532,14 @@ export function catalogEntryBinaryRel(catalogRel, entry) {
 //! but changes the bytes, and the hash must describe what the browser gets —
 //! a catalog stamped before signing makes every signed library GLB a hash
 //! mismatch. Entries whose file is absent keep what they had (a 404 is its own,
-//! louder failure). Returns { catalogs, stamped }.
+//! louder failure). The realvirtual library's `project.json` documents are
+//! re-stamped the same way (plan-778). Returns
+//! { catalogs, stamped, libraryProjects, projectRows }.
 export function stampCatalogHashes(rootDir, { dryRun = false } = {}) {
   let catalogs = 0;
   let stamped = 0;
+  let libraryProjects = 0;
+  let projectRows = 0;
   for (const rel of findCatalogFiles(rootDir)) {
     const path = join(rootDir, rel);
     let catalog;
@@ -1426,7 +1556,23 @@ export function stampCatalogHashes(rootDir, { dryRun = false } = {}) {
     }
     if (!dryRun) writeFileSync(path, JSON.stringify(catalog, null, 2) + '\n', 'utf8');
   }
-  return { catalogs, stamped };
+  for (const rel of findLibraryProjectFiles(rootDir)) {
+    const path = join(rootDir, rel);
+    let project;
+    try { project = JSON.parse(readFileSync(path, 'utf8')); } catch { continue; }
+    if (!Array.isArray(project?.documents)) continue;
+    libraryProjects++;
+    for (const doc of project.documents) {
+      const binRel = catalogEntryBinaryRel(rel, doc);
+      if (!binRel || !existsSync(join(rootDir, binRel))) continue;
+      const bytes = readFileSync(join(rootDir, binRel));
+      doc.sha256 = sha256Buffer(bytes);
+      doc.sizeBytes = bytes.byteLength;
+      projectRows++;
+    }
+    if (!dryRun) writeFileSync(path, JSON.stringify(project, null, 2) + '\n', 'utf8');
+  }
+  return { catalogs, stamped, libraryProjects, projectRows };
 }
 
 //! The catalogued binaries of ONE local catalog whose hash differs from the
@@ -1439,14 +1585,15 @@ export function stampCatalogHashes(rootDir, { dryRun = false } = {}) {
 export function catalogChangedBinaries(localDir, catalogRel, remoteText) {
   let local;
   try { local = JSON.parse(readFileSync(join(localDir, catalogRel), 'utf8')); } catch { return []; }
-  const entries = Array.isArray(local?.entries) ? local.entries : [];
+  const entries = Array.isArray(local?.entries) ? local.entries : (Array.isArray(local?.documents) ? local.documents : []);
+  const keyOf = (e) => e?.glbUrl || e?.splatUrl || e?.path;
   let remoteByUrl = null;
   if (remoteText != null) {
     try {
       const remote = JSON.parse(String(remoteText));
       remoteByUrl = new Map();
-      for (const e of Array.isArray(remote?.entries) ? remote.entries : []) {
-        const key = e?.glbUrl || e?.splatUrl;
+      for (const e of Array.isArray(remote?.entries) ? remote.entries : (Array.isArray(remote?.documents) ? remote.documents : [])) {
+        const key = keyOf(e);
         if (key) remoteByUrl.set(key, e.sha256 ?? null);
       }
     } catch { remoteByUrl = null; }
@@ -1455,7 +1602,7 @@ export function catalogChangedBinaries(localDir, catalogRel, remoteText) {
   for (const e of entries) {
     const binRel = catalogEntryBinaryRel(catalogRel, e);
     if (!binRel || typeof e.sha256 !== 'string') continue;
-    const before = remoteByUrl?.get(e.glbUrl || e.splatUrl);
+    const before = remoteByUrl?.get(keyOf(e));
     if (remoteByUrl === null || before !== e.sha256) changed.push(binRel);
   }
   return changed;
@@ -1468,10 +1615,12 @@ export function catalogChangedBinaries(localDir, catalogRel, remoteText) {
 //!     its standard `text/html` error page (observed on the live pull zone
 //!     2026-09-27), and a 404 is never stored as an asset by the viewer. Only
 //!     a 200 (any type) or another non-404 status is a finding,
-//!  2. `library/catalog.json` is served, is JSON and is BYTE-EQUAL to the one
-//!     in `distDir` (catches a size-skipped or edge-cached catalog),
-//!  3. the first catalogued asset is served as a binary and its bytes hash to
-//!     the catalog `sha256` (catches a size-preserving re-sign not stamped).
+//!  2. the library manifest — `library/project.json` since plan-778 Phase 4 (the
+//!     bundled `catalog.json` is gone) — is served, is JSON and is BYTE-EQUAL to
+//!     the one in `distDir` (catches a size-skipped or edge-cached manifest),
+//!  3. the first listed asset (`documents[]` row, or `entries[]` of a catalog
+//!     passed as `catalogRel`) is served as a binary and its bytes hash to the
+//!     manifest `sha256` (catches a size-preserving re-sign not stamped).
 //! `baseUrl` ends with `/` (e.g. `https://web.realvirtual.io/demo/`). The
 //! catalog and asset GETs carry an `rv-probe` query so a stale edge copy cannot
 //! answer for them. Returns { ok, findings[], checks[] }; never throws.
@@ -1480,7 +1629,7 @@ export async function probePublishedAssets({
   distDir,
   timeoutMs = FETCH_TIMEOUT_MS,
   fetchImpl = globalThis.fetch,
-  catalogRel = 'library/catalog.json',
+  catalogRel = 'library/project.json',
   now = Date.now,
 }) {
   const base = String(baseUrl).endsWith('/') ? String(baseUrl) : `${baseUrl}/`;
@@ -1521,7 +1670,7 @@ export async function probePublishedAssets({
     }
   }
 
-  // 2 — the catalog, byte for byte.
+  // 2 — the library manifest, byte for byte.
   const localCatalogPath = join(distDir, catalogRel);
   if (!existsSync(localCatalogPath)) {
     checks.push(`${catalogRel}: not in the build output — catalog checks skipped`);
@@ -1549,8 +1698,9 @@ export async function probePublishedAssets({
   let catalog = null;
   try { catalog = JSON.parse(localBytes.toString('utf8')); } catch { catalog = null; }
 
-  // 3 — the first catalogued asset, hashed.
-  const entries = Array.isArray(catalog?.entries) ? catalog.entries : [];
+  // 3 — the first listed asset, hashed (project rows or catalog entries).
+  const entries = Array.isArray(catalog?.documents) ? catalog.documents
+    : (Array.isArray(catalog?.entries) ? catalog.entries : []);
   const first = entries.find((e) => catalogEntryBinaryRel(catalogRel, e) !== null);
   if (!first) {
     checks.push(`${catalogRel}: no relative asset entry — asset check skipped`);
@@ -1584,4 +1734,40 @@ export async function probePublishedAssets({
     }
   }
   return done();
+}
+
+// ─── Upload bookkeeping shared with the delivered partner CLI (plan-604) ─
+//
+// These three used to live in `bunny-deploy.mjs`. They moved here because the
+// delivered partner CLI (`publish-project.mjs`) needs exactly them and must NOT
+// import `bunny-deploy.mjs`: that module carries the customer register, the demo
+// allowlist, the publish lock and the smoke runner — internal machinery that has no
+// place in a partner workspace. `bunny-deploy.mjs` re-exports all three, so every
+// caller, test and parity comment that names them at the old address still resolves.
+
+//! Is `rel` a library catalog? The default `deferUntilLast` predicate (plan-508 F2b).
+export function isCatalogFile(rel) {
+  // `library/project.json` (plan-778) is the same kind of file: the hashes of the binaries beside it —
+  // and so is a delivered trimmed library's `libraries/<id>/project.json` (Phase 4).
+  return /(^|\/)(catalog\.json|library\/project\.json|libraries\/[^/]+\/project\.json)$/i.test(String(rel).replace(/\\/g, '/'));
+}
+
+//! What a hosted publish leaves on the CDN: exactly the staging listing (plan-759 F9).
+//! Deriving this from the staged tree — not from a second walk of the project with its
+//! own deny rule — is what keeps the reconciler from deleting a file the upload just wrote.
+export function expectedHostedSnapshot(stagingDir) {
+  return new Set(collectLocalFiles(stagingDir).map((file) => file.rel.replace(/\\/g, '/').toLowerCase()));
+}
+
+//! Deletes every remote file that is absent from the validated local snapshot manifest.
+export async function reconcileRemoteSnapshot(client, remotePrefix, expectedPaths) {
+  const entries = await client.listRecursive(remotePrefix);
+  const prefix = remotePrefix.replace(/^\/+|\/+$/g, '');
+  let deleted = 0;
+  for (const entry of entries) {
+    if (expectedPaths.has(entry.rel.replace(/\\/g, '/').toLowerCase())) continue;
+    await client.deleteFile(prefix ? `${prefix}/${entry.rel}` : entry.rel);
+    deleted++;
+  }
+  return deleted;
 }

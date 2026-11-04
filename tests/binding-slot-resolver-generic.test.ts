@@ -93,6 +93,36 @@ describe('generic slot resolution (plan-325 9.1)', () => {
     });
   });
 
+  it('links a slot value only in the forms the runtime wiring recognises; malformed values never crash', () => {
+    registerComponentSchema('RefFormGadget325', {
+      Run: { type: 'componentRef', signal: 'PLCOutputBool' },
+    });
+    const f = fixture({ RefFormGadget325: {} }, 'RefForm');
+    f.store.register('DB.Run', 'RefForm/Signals/Run', false, 'PLCOutputBool');
+    const instance: Record<string, unknown> = {
+      Run: null,
+      commandRun: (_v: boolean | number) => { /* command */ },
+      neutralizeRun: () => { /* neutral */ },
+    };
+    f.registry.register('RefFormGadget325', 'RefForm', instance);
+    const kindFor = (value: unknown) => {
+      instance['Run'] = value;
+      const slots = resolveBindableSlots(f.root, f.store, f.registry);
+      return slots[0]?.kind === 'mapped-signal' ? `linked:${slots[0].targetName}` : slots[0]?.kind;
+    };
+
+    expect(kindFor('RefForm/Signals/Run')).toBe('linked:DB.Run');
+    expect(kindFor('DB.Run')).toBe('linked:DB.Run');
+    expect(kindFor({ type: 'ComponentReference', path: 'RefForm/Signals/Run', componentType: 'PLCOutputBool' }))
+      .toBe('linked:DB.Run');
+    // Not recognised by the wiring → shown unlinked, never a throw.
+    expect(kindFor({ path: 'RefForm/Signals/Run' })).toBe('direct-property');
+    expect(kindFor({ type: 'ComponentReference', address: '#abc', componentType: 'PLCOutputBool' })).toBe('direct-property');
+    expect(kindFor({ type: 'ComponentReference', unresolvedPath: 'X/Y', reason: 'missing' })).toBe('direct-property');
+    expect(kindFor(42)).toBe('direct-property');
+    expect(kindFor('')).toBe('direct-property');
+  });
+
   it('ignores rv keys with non-object values and unregistered instances', () => {
     registerComponentSchema('OrphanGadget325', {
       Run: { type: 'componentRef', signal: 'PLCOutputBool' },

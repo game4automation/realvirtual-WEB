@@ -69,7 +69,7 @@ describe('feature matrix toggle guards', () => {
   });
 
   it('leaves other and unknown plugins toggleable', () => {
-    expect(isProtected('des-plugin')).toBe(false);
+    expect(isProtected('des-hmi')).toBe(false);
     expect(isProtected('unknown')).toBe(false);
     expect(protectedReason('unknown')).toBeNull();
     expect(protectedTooltip('unknown')).toBe('');
@@ -85,6 +85,6 @@ describe('feature matrix toggle guards', () => {
       expect(isPluginOverrideProtected(id), id).toBe(true);
     }
     expect(isPluginOverrideProtected('feature-matrix,lifecycle')).toBe(false);
-    expect(isPluginOverrideProtected('des-plugin')).toBe(false);
+    expect(isPluginOverrideProtected('des-hmi')).toBe(false);
   });
 });

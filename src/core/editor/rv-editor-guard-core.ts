@@ -82,7 +82,8 @@ export function resolveEditorContext(
   viewer: RVViewer | undefined,
 ): ActiveAssetContext | { error: string } {
   if (!viewer) return { error: ERR_NO_VIEWER };
-  if (viewer.modes.activeMode !== EDITOR_MODE) return { error: ERR_NOT_EDITOR };
+  // A viewer without a mode manager (headless host, embed) is not in the editor.
+  if (viewer.modes?.activeMode !== EDITOR_MODE) return { error: ERR_NOT_EDITOR };
   const ctx = getActiveAssetContext();
   if (!ctx) return { error: ERR_EDITOR_ACTIVATING };
   return ctx;
@@ -143,8 +144,8 @@ export function requireDocument(
   if (!ctx) {
     return {
       error: need === 'scene'
-        ? 'No document is open — open one with web_document_open or web_document_new.'
-        : 'No document is open — open one with web_document_open, web_document_new or web_editor_open.',
+        ? 'No document is open — open one with web_document_open or web_execute("document.create", {name}).'
+        : 'No document is open — open one with web_document_open, web_execute("document.create", {name}) or web_editor_open.',
     };
   }
   return {

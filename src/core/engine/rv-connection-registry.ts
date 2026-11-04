@@ -32,6 +32,8 @@
  */
 
 import type { ScriptMuRef } from '../sdk/rv-script-hook';
+import type { Object3D } from 'three';
+import { storedRefString } from './rv-stored-ref-label';
 
 // ─── Data model (rv-ODT `Connections` block) ────────────────────────────────
 
@@ -120,12 +122,14 @@ function parseParamSchema(raw: unknown): Record<string, ConnectionParamType> | u
 }
 
 /** Defensive parse of ONE raw edge record. Null when structurally unusable. */
-export function parseConnection(raw: unknown): RvConnection | null {
+export function parseConnection(raw: unknown, owner?: Object3D | null): RvConnection | null {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const r = raw as Record<string, unknown>;
   const id = typeof r.id === 'string' && r.id.length > 0 ? r.id : null;
-  const source = typeof r.source === 'string' && r.source.length > 0 ? r.source : null;
-  const target = typeof r.target === 'string' && r.target.length > 0 ? r.target : null;
+  // plan-769 Phase 3: an endpoint is a path, or a web-saved `{ address }` /
+  // `{ unresolvedPath }` kept as a label the owner's `readStoredRef` reads back.
+  const source = storedRefString(owner, r.source);
+  const target = storedRefString(owner, r.target);
   const type = typeof r.type === 'string' && r.type.length > 0 ? r.type : null;
   if (!id || !source || !target || !type) return null;
   const config = (r.config !== null && typeof r.config === 'object' && !Array.isArray(r.config))
@@ -152,13 +156,13 @@ export function parseConnectionType(raw: unknown): ConnectionType | null {
  * `Connections` block). GLBs without the block (or with a malformed one)
  * yield the empty result — old GLBs load unchanged (plan-259 backward compat).
  */
-export function parseConnectionsExtras(raw: unknown): ParsedConnections {
+export function parseConnectionsExtras(raw: unknown, owner?: Object3D | null): ParsedConnections {
   const out: ParsedConnections = { connections: [], connectionTypes: [] };
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return out;
   const r = raw as Record<string, unknown>;
   if (Array.isArray(r.connections)) {
     for (const c of r.connections) {
-      const parsed = parseConnection(c);
+      const parsed = parseConnection(c, owner);
       if (parsed) out.connections.push(parsed);
       else console.warn('[connections] skipping malformed connection entry:', c);
     }

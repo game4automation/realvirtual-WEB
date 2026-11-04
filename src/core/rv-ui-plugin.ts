@@ -53,6 +53,8 @@ export interface UISlotEntry {
   component: ComponentType<UISlotProps>;
   /** Sort order within the slot (lower = further left/top). Default: 100. */
   order?: number;
+  /** For activity-bar: 'bottom' renders the entry in the lower group (Problems/Multiuser). Default: 'top'. */
+  placement?: 'top' | 'bottom';
   /** For settings-tab: tab label text. */
   label?: string;
   /** Optional visibility element ID for context-aware hiding. */
@@ -60,4 +62,24 @@ export interface UISlotEntry {
   /** Optional visibility rule — when provided, the entry is hidden/shown per active contexts.
    *  Entries WITHOUT this field are always visible (invariant). */
   visibilityRule?: UIVisibilityRule;
+  /**
+   * button-group only (plan-2010): the toolbar SECTION this entry belongs to.
+   *
+   * Well-known ids are `TOOL_GROUP` in `hmi/button-panel-sections.ts` (`editing`,
+   * `model`, `analysis`, `view`) and render in that fixed rank order, whatever
+   * the entries' `order` values are — so a group sits at the same place in every
+   * mode. Any other string forms its own section after the well-known ones.
+   * Entries WITHOUT a group render first, in today's order (third-party plugins
+   * and the HMI operator buttons keep their place). `order` still sorts entries
+   * WITHIN a section. A divider separates two non-empty sections.
+   */
+  group?: string;
+  /**
+   * @internal Stable identity of this declaration — auto-stamped by
+   * `UIPluginRegistry.register()` as `${pluginId}:${slot}:${declarationIndex}`
+   * (anonymous entries: `anon:${seq}:${declarationIndex}`). Used as the React
+   * key of the rendered slot component, so an entry keeps its state when another
+   * plugin registers entries that sort in before it. Never set it yourself.
+   */
+  slotKey?: string;
 }

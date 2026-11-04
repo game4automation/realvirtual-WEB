@@ -23,6 +23,16 @@
  *   - Left mousedown within the pixel threshold of the active snap opens
  *     the picker popup.
  *
+ * Pointer owners (plan-628 8.2): things the viewer's raycast does not hover,
+ * such as a path line, reveal their snaps through an injected resolver
+ * ({@link SnapPointController.setPointerOwnerResolver}) that maps the pointer
+ * to owner roots. A path line's owner is the holder of its two end snaps, so
+ * hovering the line shows its free ends with the same marker as any GLB snap.
+ *
+ * Pinned owners (plan-628 8.8): {@link SnapPointController.setPinnedOwners}
+ * keeps the free snaps of some owners revealed without hover — the selected
+ * path block and the ends a block move freed.
+ *
  * Lifecycle: `activate()` installs DOM + viewer event listeners; `deactivate()`
  * removes everything and cancels the RAF / grace timer.
  */
@@ -80,6 +90,11 @@ export class SnapPointController {
 
   /** Asset currently considered "hovered" by the viewer's raycast manager. */
   private hoveredOwner: Object3D | null = null;
+  /** plan-628 8.2: owner roots under the pointer that the raycast does not see (path lines). */
+  private pointerOwners: readonly Object3D[] = [];
+  private pointerOwnerResolver: ((clientX: number, clientY: number) => readonly Object3D[]) | null = null;
+  /** plan-628 8.8: owner roots whose free snaps stay revealed without hover (selected path block, freed ends). */
+  private pinnedOwners: readonly Object3D[] = [];
   /** Snaps currently revealed (by ownerRoot match or grace period). */
   private revealedSnapIds = new Set<string>();
   /** Grace timer handle; null when no grace is pending. */
@@ -163,6 +178,7 @@ export class SnapPointController {
     }
 
     if (snapToolbarStore.getState().showAllSnaps) this._revealAllSnaps();
+    else this._revealPinned();
   }
 
   deactivate(): void {
@@ -183,6 +199,7 @@ export class SnapPointController {
     if (this.graceTimer !== null) { clearTimeout(this.graceTimer); this.graceTimer = null; }
     this.dirty = false;
     this.hoveredOwner = null;
+    this.pointerOwners = [];
     this.revealedSnapIds.clear();
 
     snapHoverStore.setHovered(null, Infinity);
@@ -196,6 +213,47 @@ export class SnapPointController {
   /** Test helper — feed a synthetic hover event. */
   testHover(node: Object3D | null): void {
     this._onObjectHover(node ? ({ node, nodeType: '', nodePath: '', pointer: { x: 0, y: 0 }, hitPoint: null, mesh: node }) : null);
+  }
+
+  /**
+   * plan-628 8.2: install (or clear) the pointer-owner resolver. Called on every
+   * canvas mousemove with client coordinates; returns the owner roots whose
+   * snaps the pointer reveals (empty = none).
+   */
+  setPointerOwnerResolver(fn: ((clientX: number, clientY: number) => readonly Object3D[]) | null): void {
+    this.pointerOwnerResolver = fn;
+  }
+
+  /**
+   * plan-628 8.8: owner roots whose FREE snaps stay revealed without hover or
+   * grace (the selected path block, ends freed by a move). Replaces the
+   * previous set; empty clears.
+   */
+  setPinnedOwners(owners: readonly Object3D[]): void {
+    this.pinnedOwners = owners;
+    if (!this.active) return;
+    this.reapplyReveals();
+  }
+
+  /**
+   * Re-derive the revealed markers from hover, pointer owners and pins — after
+   * the marker renderer was rebuilt (new handles start hidden) or the pins
+   * changed.
+   */
+  reapplyReveals(): void {
+    if (!this.active) return;
+    if (snapToolbarStore.getState().showAllSnaps) { this._revealAllSnaps(); return; }
+    this._hideAllReveals();
+    if (this.hoveredOwner) this._addOwnerReveals(this.hoveredOwner);
+    for (const o of this.pointerOwners) this._addOwnerReveals(o);
+    this._revealPinned();
+    this.dirty = true;
+    this._scheduleTick();
+  }
+
+  /** Test helper: feed a synthetic pointer-owner result (what the resolver returns). */
+  testPointerOwners(owners: readonly Object3D[]): void {
+    this._setPointerOwners(owners);
   }
 
   /** Test helper — current revealed set (read-only snapshot). */
@@ -220,6 +278,9 @@ export class SnapPointController {
       // Enter — show all snaps belonging to this owner immediately.
       if (this.graceTimer !== null) { clearTimeout(this.graceTimer); this.graceTimer = null; }
       this._revealSnapsForOwner(newOwner);
+    } else if (this.pointerOwners.length > 0) {
+      // Left the asset but the pointer still rests on a path line: show its ends.
+      this._revealOwners(this.pointerOwners);
     } else {
       // Leave — start grace timer. If the cursor enters a marker during the
       // grace window the proximity tick keeps everything visible.
@@ -246,14 +307,48 @@ export class SnapPointController {
     const showAll = snapToolbarStore.getState().showAllSnaps;
     if (!showAll) this._hideAllReveals();
     // Use byOwnerRoot index: O(deg) instead of O(n) full scan.
+    this._addOwnerReveals(owner);
+    this._revealPinned();
+    this.dirty = true;
+    this._scheduleTick();
+  }
+
+  /** plan-628 8.2: the pointer-owner set changed (path line entered / left). */
+  private _setPointerOwners(owners: readonly Object3D[]): void {
+    const same = owners.length === this.pointerOwners.length
+      && owners.every((o, i) => o === this.pointerOwners[i]);
+    if (same) return;
+    this.pointerOwners = owners;
+    if (this.hoveredOwner) return; // the raycast-hovered asset owns the reveal
+    if (owners.length > 0) {
+      if (this.graceTimer !== null) { clearTimeout(this.graceTimer); this.graceTimer = null; }
+      this._revealOwners(owners);
+    } else {
+      this._startGrace();
+    }
+  }
+
+  private _revealOwners(owners: readonly Object3D[]): void {
+    if (!snapToolbarStore.getState().showAllSnaps) this._hideAllReveals();
+    for (const owner of owners) this._addOwnerReveals(owner);
+    this._revealPinned();
+    this.dirty = true;
+    this._scheduleTick();
+  }
+
+  /** Reveal the free snaps of one owner (no hide first). */
+  private _addOwnerReveals(owner: Object3D): void {
     for (const sp of this.registry.getByOwnerRoot(owner)) {
       if (sp.occupied) continue;
       if (!sp.object3D.parent) continue;
       this.revealedSnapIds.add(sp.id);
       this.markerRenderer.setVisibility(sp.id, true);
     }
-    this.dirty = true;
-    this._scheduleTick();
+  }
+
+  /** plan-628 8.8: the pinned owners' free snaps (added on top of any reveal). */
+  private _revealPinned(): void {
+    for (const owner of this.pinnedOwners) this._addOwnerReveals(owner);
   }
 
   private _revealAllSnaps(): void {
@@ -280,7 +375,7 @@ export class SnapPointController {
       this.graceTimer = null;
       // Only hide if the cursor is NOT currently over one of our markers and
       // no new owner became active in the meantime.
-      if (this.hoveredOwner !== null) return;
+      if (this.hoveredOwner !== null || this.pointerOwners.length > 0) return;
       const px = this._proximityWithinThreshold();
       if (px) {
         // Still hovering a marker — keep them on; the proximity tick will
@@ -288,6 +383,7 @@ export class SnapPointController {
         return;
       }
       this._hideAllReveals();
+      this._revealPinned();
       this.markerRenderer.hideActive();
       snapHoverStore.setHovered(null, Infinity);
       this.viewer.markRenderDirty?.();
@@ -301,6 +397,7 @@ export class SnapPointController {
     if (!rect) return;
     this.mouseX = e.clientX - rect.left;
     this.mouseY = e.clientY - rect.top;
+    if (this.pointerOwnerResolver) this._setPointerOwners(this.pointerOwnerResolver(e.clientX, e.clientY));
     this.dirty = true;
     this._scheduleTick();
   }

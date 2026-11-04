@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from './rv-safe-storage';
+
 import { useSyncExternalStore } from 'react';
 import type { SignatureState } from './persistence/rv-sig-verify';
 import type { LogicRunState, RVViewer } from './rv-viewer';
@@ -34,7 +36,7 @@ export function signatureUnlockKey(modelName: string): string {
 export function isSignatureUnlocked(modelName: string): boolean {
   if (!modelName) return false;
   try {
-    return localStorage.getItem(signatureUnlockKey(modelName)) === '1';
+    return readLocalStorage(signatureUnlockKey(modelName)) === '1';
   } catch {
     return false;
   }
@@ -42,11 +44,7 @@ export function isSignatureUnlocked(modelName: string): boolean {
 
 export function persistSignatureUnlock(modelName: string): void {
   if (!modelName) return;
-  try {
-    localStorage.setItem(signatureUnlockKey(modelName), '1');
-  } catch {
-    // Storage unavailable/private mode: activation still applies for this load.
-  }
+  writeLocalStorage(signatureUnlockKey(modelName), '1');
 }
 
 export function setSignatureUiState(next: SignatureUiState): void {

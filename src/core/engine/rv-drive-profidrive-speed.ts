@@ -12,6 +12,7 @@ import {
   type SignalWriter,
 } from './rv-signal-store';
 import { debug } from './rv-debug';
+import { slotDeclare, slotRead, slotUndeclare, slotWrite } from './rv-slot-io';
 
 /** True when bit `n` of `word` is set. */
 function bit(word: number, n: number): boolean {
@@ -104,6 +105,11 @@ export class RVDriveProfidriveSpeed implements IDriveBehavior, RVComponent {
 
     // Register self as a drive behavior so drive.update() calls our update().
     drive.driveBehaviors.push(this);
+    // Unwired slots stay bindable in the viewer (SlotIO, rv-slot-io.ts).
+    slotDeclare(this, 'ControlWord', 'poll');
+    slotDeclare(this, 'SpeedSetpoint', 'poll');
+    slotDeclare(this, 'StatusWord', 'feedback');
+    slotDeclare(this, 'SpeedActual', 'feedback');
 
     debug('loader',
       `  Drive_ProfidriveSpeed "${drive.name}": stw1="${this.ControlWord}" nsoll="${this.SpeedSetpoint}"`);
@@ -116,7 +122,7 @@ export class RVDriveProfidriveSpeed implements IDriveBehavior, RVComponent {
     if (!drive || !store) return;
 
     // ── Decode control word STW1 (PLC → drive) ──
-    const stw1 = this.ControlWord ? Math.round(store.getFloatByPath(this.ControlWord)) : 0;
+    const stw1 = Math.round(slotRead(store, this, 'ControlWord', this.ControlWord, 0));
     const onOff1 = bit(stw1, 0);
     const noOff2 = bit(stw1, 1);
     const noOff3 = bit(stw1, 2);
@@ -183,7 +189,7 @@ export class RVDriveProfidriveSpeed implements IDriveBehavior, RVComponent {
 
     // ── Apply the speed setpoint while in operation ──
     if (allowMotion && enableSetpoint && enableRampGen && continueRampGen) {
-      const nsoll = this.SpeedSetpoint ? Math.round(store.getFloatByPath(this.SpeedSetpoint)) : 0;
+      const nsoll = Math.round(slotRead(store, this, 'SpeedSetpoint', this.SpeedSetpoint, 0));
       let target = (this.SetpointScale !== 0 ? nsoll / this.SetpointScale : 0) * this.ReferenceSpeed;
       if (invertSetpoint) target = -target;
       if (commands) {
@@ -221,16 +227,15 @@ export class RVDriveProfidriveSpeed implements IDriveBehavior, RVComponent {
     this.ZSW1 = zsw1;
 
     // ── Feedback (drive → PLC) — ALWAYS ──
-    const writer = this.signalWriter!;
-    if (this.StatusWord) writer.setByPath(this.StatusWord, zsw1);
-    if (this.SpeedActual) {
-      writer.setByPath(this.SpeedActual, this.ReferenceSpeed !== 0
-        ? Math.round(drive.currentSpeed / this.ReferenceSpeed * this.SetpointScale)
-        : 0);
-    }
+    const writer = this.signalWriter;
+    slotWrite(this, 'StatusWord', this.StatusWord, zsw1, writer);
+    slotWrite(this, 'SpeedActual', this.SpeedActual, this.ReferenceSpeed !== 0
+      ? Math.round(drive.currentSpeed / this.ReferenceSpeed * this.SetpointScale)
+      : 0, writer);
   }
 
   dispose(): void {
+    slotUndeclare(this);
     if (this.drive) {
       const index = this.drive.driveBehaviors.indexOf(this);
       if (index >= 0) this.drive.driveBehaviors.splice(index, 1);

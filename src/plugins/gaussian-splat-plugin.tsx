@@ -187,6 +187,10 @@ export class GaussianSplatPlugin implements RVViewerPlugin {
 
   onRender(_dt: number): void {
     if (this._instances.length === 0) return;
+    // plan-2215: the splat library draws over the whole back buffer with the
+    // navigation camera — skipped on a frame a render strategy (stereo) drew;
+    // mono screenshots and video captures bypass the strategy and keep the splats.
+    if (this._viewer?.strategyFrame) return;
 
     const renderer = this._viewer?.renderer as unknown as {
       setRenderTarget: (t: null) => void;

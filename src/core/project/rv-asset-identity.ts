@@ -429,27 +429,10 @@ export function isStagingPath(path: string): boolean {
   return segments.length > 1 && segments[0]!.toLowerCase() === IMPORT_STAGING_FOLDER;
 }
 
-/**
- * True for a document the `?model=` SELECTOR catalogue lists.
- *
- * The last surviving "model" notion, and deliberately out of plan-744's scope
- * — it is a URL contract (`?model=`) plus CONNECT's auto-load, and retiring it
- * is its own plan. What plan-744 changed is only where the answer comes from:
- * a place filter over `listDocuments()` instead of a `listModels()` listing of
- * its own.
- *
- * Two shapes count, and the second is not a special case. A `models/` path is
- * the ordinary one — with or without a leading slash, because a deploy
- * manifest writes root-relative paths. The other is an absolute URL: a bundled
- * backend reached with `discover: true` folds a FOREIGN deploy's `models.json`
- * in, and those rows carry the URL the foreign host published
- * (`https://cdn…/customer/models/Press.glb`). They used to be found because a
- * stored `section: 'models'` said so.
- */
-export function isModelCataloguePath(path: unknown): boolean {
-  const p = typeof path === 'string' ? path : '';
-  return /^\/?models\//i.test(p) || /^https?:\/\//i.test(p);
-}
+// `isModelCataloguePath` stood here until plan-777 (P3). It fed the project
+// store's `models` view, a place filter over the one document list whose only
+// reader already had the document row in hand. The `?model=` URL contract does
+// not depend on it: `viewer.availableModels` is fed by `rv-model-catalog`.
 
 /**
  * True for a scanned path that may become a row.

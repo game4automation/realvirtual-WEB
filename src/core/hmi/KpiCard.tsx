@@ -3,6 +3,7 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { Box, Typography, Paper } from '@mui/material';
+import { ACCENT, FIELD_BORDER, FIELD_BORDER_HOVER, FS, INK_MID, MONO } from './shared-sx';
 
 interface KpiCardProps {
   label: string;
@@ -31,6 +32,7 @@ function MiniSparkline({ data, color }: { data: number[]; color: string }) {
 
   return (
     <svg
+      aria-hidden="true"
       viewBox={`0 0 ${w} ${h}`}
       preserveAspectRatio="none"
       style={{
@@ -39,7 +41,7 @@ function MiniSparkline({ data, color }: { data: number[]; color: string }) {
         left: 0,
         width: '100%',
         height: '50%',
-        opacity: 0.5,
+        opacity: 0.25,
       }}
     >
       <polyline
@@ -112,13 +114,15 @@ function useAnimatedKpi(seed: number[], baseValue: string, active: boolean) {
   return { sparkData: data, displayValue };
 }
 
-export function KpiCard({ label, value, unit, secondary, color = '#4fc3f7', sparkline, animate = true, onClick }: KpiCardProps) {
+export function KpiCard({ label, value, unit, secondary, color = ACCENT, sparkline, animate = true, onClick }: KpiCardProps) {
   const seed = sparkline ?? SPARKLINES[label] ?? [];
   const { sparkData, displayValue } = useAnimatedKpi(seed, value, animate && seed.length >= 2);
 
   return (
     <Paper
-      elevation={4}
+      component={onClick ? 'button' : 'div'}
+      type={onClick ? 'button' : undefined}
+      elevation={0}
       onClick={onClick}
       sx={{
         position: 'relative',
@@ -127,51 +131,62 @@ export function KpiCard({ label, value, unit, secondary, color = '#4fc3f7', spar
         flexShrink: 1,
         px: { xs: 1, sm: 1.5 },
         py: 1,
-        borderRadius: 2,
+        borderRadius: 1,
+        border: `1px solid ${FIELD_BORDER}`,
+        boxShadow: 'none',
+        font: 'inherit',
+        textAlign: 'left',
+        appearance: 'none',
         pointerEvents: 'auto',
         cursor: onClick ? 'pointer' : 'default',
-        transition: 'transform 0.15s ease, box-shadow 0.15s ease',
-        '&:hover': onClick ? { transform: 'translateY(-1px)', boxShadow: 8 } : undefined,
+        transition: 'border-color 120ms ease',
+        '&:hover': onClick ? { borderColor: FIELD_BORDER_HOVER } : undefined,
+        '&:focus-visible': { outline: `2px solid ${ACCENT}`, outlineOffset: '2px' },
       }}
     >
-      <MiniSparkline data={sparkData} color={color} />
-      <Box sx={{ position: 'relative', zIndex: 1 }}>
+      {/* Not animated: the caller owns the series (it may change every render). */}
+      <MiniSparkline data={animate ? sparkData : seed} color={color} />
+      <Box component="span" sx={{ display: 'block', position: 'relative', zIndex: 1 }}>
         <Typography
+          component="span"
           sx={{
-            color: 'text.secondary',
-            textTransform: 'uppercase',
-            letterSpacing: 1,
-            fontSize: 10,
-            lineHeight: 1,
+            display: 'block',
+            color: INK_MID,
+            fontSize: FS.label,
+            lineHeight: 1.3,
             mb: 0.25,
           }}
         >
           {label}
         </Typography>
-        <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 0.75 }}>
+        <Box component="span" sx={{ display: 'flex', alignItems: 'baseline', gap: 0.75 }}>
           <Typography
+            component="span"
             sx={{
               fontWeight: 700,
               color,
               lineHeight: 1.1,
               fontSize: { xs: '1.35rem', sm: '1.75rem' },
-              fontFamily: '"Inter", "Roboto", sans-serif',
+              fontFamily: MONO,
+              fontVariantNumeric: 'tabular-nums',
               transition: 'opacity 0.3s ease',
             }}
           >
             {animate ? displayValue : value}
           </Typography>
-          <Typography sx={{ color: 'text.secondary', fontSize: 12 }}>
+          <Typography component="span" sx={{ color: INK_MID, fontSize: FS.body }}>
             {unit}
           </Typography>
         </Box>
         {secondary && (
           <Typography
+            component="span"
             sx={{
-              color: 'text.secondary',
-              fontSize: 10,
+              display: 'block',
+              color: INK_MID,
+              fontSize: FS.label,
               mt: 0.25,
-              lineHeight: 1,
+              lineHeight: 1.3,
             }}
           >
             {secondary}

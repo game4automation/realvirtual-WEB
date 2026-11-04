@@ -22,6 +22,19 @@ export const RV_DRIVE_HOME_KEY = '_rvDriveHome';
 /** Pre-computed sensor beam (origin offset, direction, length in mm). */
 export const RV_SENSOR_BEAM_KEY = '_rvBeam';
 
+/**
+ * Pre-computed collision box of a sensor (plan-655 B1): centre `c` and half
+ * extents `h` in the sensor NODE's local frame (its own units — mm on a
+ * SolidCraft body), measured over its mesh subtree before the bake merges it.
+ */
+export const RV_SENSOR_BOX_KEY = '_rvSensorBox';
+
+/** Plain-data sensor box — node-local centre + half extents, JSON-cloneable. */
+export interface PreBakedSensorBox {
+  c: [number, number, number];
+  h: [number, number, number];
+}
+
 /** Plain-data home pose — position, quaternion, scale. */
 export interface DriveHomePose {
   p: [number, number, number];

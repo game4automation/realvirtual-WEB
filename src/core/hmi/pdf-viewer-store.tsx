@@ -18,6 +18,7 @@ import { useSyncExternalStore } from 'react';
 import { Box, Typography, CircularProgress, Modal } from '@mui/material';
 import { extractAasEntryBlob } from '../../plugins/aas-link-parser';
 import { asAasSource, getAasSourceByKey, getActiveAasSource, type AasSource } from '../aas/rv-aas-source';
+import { lookupMirroredDocument, openMirroredDocument, pageOfUrl } from '../aas/rv-aas-document-mirror';
 import { tooltipRegistry } from './tooltip/tooltip-registry';
 import { DocViewerOverlay } from './DocViewerOverlay';
 
@@ -26,6 +27,15 @@ import { DocViewerOverlay } from './DocViewerOverlay';
 /** Source descriptor for a PDF document. */
 export type PdfSource =
   | { type: 'url'; url: string }
+  /**
+   * A document on another site (an AAS File element whose value is an http(s)
+   * address, e.g. festo.com). Opened in a NEW BROWSER TAB: the overlay's reader
+   * fetches the bytes, which a site without CORS headers refuses — and such
+   * links often answer with a download, not a page. Exception: the open project
+   * mirrors the address (`docs/aas/mirror.json`, rv-aas-document-mirror.ts) —
+   * then the project copy opens inline, `#page=N` included.
+   */
+  | { type: 'external'; url: string }
   | {
     type: 'blob';
     aasId: string;
@@ -72,12 +82,26 @@ function notifyPdf(): void {
  * Open the PDF viewer overlay.
  * source.type === 'url': direct URL (standalone PDFs)
  * source.type === 'blob': lazy extraction from AASX ZIP
+ * source.type === 'external': the project's mirrored copy in the overlay when
+ *   `docs/aas/mirror.json` lists the address, else a new browser tab (no overlay)
  */
 export function openPdfViewer(
   title: string,
   source: PdfSource,
   options?: { initialPage?: number; /** `source.url` is an object URL the viewer now OWNS — revoked on close / switch. */ ownsUrl?: boolean },
 ): void {
+  if (source.type === 'external') {
+    if (!/^https?:\/\//i.test(source.url)) return; // an AASX value is untrusted input
+    const mirrored = lookupMirroredDocument(source.url);
+    if (mirrored) {
+      openMirrored(title, mirrored, options?.initialPage ?? pageOfUrl(source.url));
+      return;
+    }
+    // Called from the click handler, so the browser treats it as a user gesture
+    // and does not block the tab.
+    window.open(source.url, '_blank', 'noopener,noreferrer');
+    return;
+  }
   // Revoke previous blob URL if switching PDFs
   if (_pdfState.url && _activeBlobUrls.has(_pdfState.url)) {
     URL.revokeObjectURL(_pdfState.url);
@@ -110,6 +134,27 @@ export function openPdfViewer(
   }
 }
 
+/** Open a project-mirrored external document in the overlay (async read, loading state meanwhile). */
+function openMirrored(title: string, path: string, initialPage: number | undefined): void {
+  if (_pdfState.url && _activeBlobUrls.has(_pdfState.url)) {
+    URL.revokeObjectURL(_pdfState.url);
+    _activeBlobUrls.delete(_pdfState.url);
+  }
+  _pdfState = { open: true, url: '', title, initialPage, loading: true, error: '' };
+  notifyPdf();
+  openMirroredDocument(path)
+    .then(({ url, owned }) => {
+      if (_pdfState.title !== title || !_pdfState.loading) { if (owned) URL.revokeObjectURL(url); return; }
+      if (owned) _activeBlobUrls.add(url);
+      _pdfState = { ..._pdfState, url, loading: false, error: '' };
+      notifyPdf();
+    })
+    .catch((err) => {
+      _pdfState = { ..._pdfState, loading: false, error: err instanceof Error ? err.message : String(err) };
+      notifyPdf();
+    });
+}
+
 /** The AAS source a blob link names: its source key, a legacy base path, or the active source. */
 function aasSourceOf(source: { basePath?: string; sourceKey?: string }): AasSource {
   if (source.sourceKey) {
@@ -138,6 +183,11 @@ export function disposePdfViewer(): void {
   _activeBlobUrls.clear();
   _pdfState = { open: false, url: '', title: '', loading: false, error: '' };
   notifyPdf();
+}
+
+/** Current viewer state (read-only snapshot) — for tests and diagnostics. */
+export function getPdfViewerState(): Readonly<PdfViewerState> {
+  return _pdfSnapshot;
 }
 
 function usePdfViewerState(): PdfViewerState {

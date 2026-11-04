@@ -12,6 +12,7 @@ import {
   type SignalWriter,
 } from './rv-signal-store';
 import { debug } from './rv-debug';
+import { slotDeclare, slotUndeclare, slotWrite } from './rv-slot-io';
 
 /**
  * RVDriveProportionalValve — TypeScript port of Drive_ProportionalValve.cs
@@ -76,6 +77,7 @@ export class RVDriveProportionalValve implements IDriveBehavior, RVComponent {
   private signalStore: SignalStore | null = null;
   private signalWriter: SignalWriter | null = null;
   private heldCommand = 0;
+  private authoredSetpoint = 0;
 
   constructor(node: Object3D) {
     this.node = node;
@@ -102,6 +104,17 @@ export class RVDriveProportionalValve implements IDriveBehavior, RVComponent {
 
     // Register self as a drive behavior so drive.update() calls our update().
     drive.driveBehaviors.push(this);
+    // Unwired slots stay bindable in the viewer (SlotIO, rv-slot-io.ts).
+    // A direct setpoint overrides Setpoint; neutralize restores the authored one.
+    this.authoredSetpoint = this.Setpoint;
+    slotDeclare(this, 'SignalSetpoint', 'setter', {
+      apply: (value) => { this.Setpoint = Number(value); },
+      neutral: () => { this.Setpoint = this.authoredSetpoint; },
+      reapply: context.reapply,
+    });
+    slotDeclare(this, 'SignalSpoolPosition', 'feedback');
+    slotDeclare(this, 'SignalCurrentSpeed', 'feedback');
+    slotDeclare(this, 'SignalCurrentPosition', 'feedback');
 
     debug('loader',
       `  Drive_ProportionalValve "${drive.name}": setpoint="${this.SignalSetpoint}" maxSpeed=${this.MaxSpeed}`);
@@ -154,13 +167,14 @@ export class RVDriveProportionalValve implements IDriveBehavior, RVComponent {
     }
 
     // ── Feedback (drive → PLC) — previous-tick drive state, like C# ──
-    const writer = this.signalWriter!;
-    if (this.SignalSpoolPosition) writer.setByPath(this.SignalSpoolPosition, this.SpoolPosition);
-    if (this.SignalCurrentSpeed) writer.setByPath(this.SignalCurrentSpeed, drive.currentSpeed);
-    if (this.SignalCurrentPosition) writer.setByPath(this.SignalCurrentPosition, drive.currentPosition);
+    const writer = this.signalWriter;
+    slotWrite(this, 'SignalSpoolPosition', this.SignalSpoolPosition, this.SpoolPosition, writer);
+    slotWrite(this, 'SignalCurrentSpeed', this.SignalCurrentSpeed, drive.currentSpeed, writer);
+    slotWrite(this, 'SignalCurrentPosition', this.SignalCurrentPosition, drive.currentPosition, writer);
   }
 
   dispose(): void {
+    slotUndeclare(this);
     if (this.drive) {
       const index = this.drive.driveBehaviors.indexOf(this);
       if (index >= 0) this.drive.driveBehaviors.splice(index, 1);

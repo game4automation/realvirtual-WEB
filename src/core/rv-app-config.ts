@@ -44,6 +44,15 @@ export interface RVAppConfig {
    * project's dashboard (D14); a document opens through its own `?doc=`.
    */
   projectUrl?: string;
+  /**
+   * Set to `true` by the hosted deploy itself (`generateHostedSettings`,
+   * plan-640). It is what distinguishes a real hosted deploy from any other
+   * served-project boot (`?projectUrl=` in a dev or agent window): only with
+   * it does the project's `settings.start` (`project.json`) replace the
+   * dashboard at the root. A project file cannot set it — the generator
+   * writes it after the project settings.
+   */
+  hostedDeploy?: boolean;
   /** Public corresponding-source URL for the exact embedded AGPL WebViewer build. */
   sourceUrl?: string;
 
@@ -140,7 +149,7 @@ export interface RVAppConfig {
    *
    * `lock` is the generic kiosk switch: the deployment comes up in that mode and
    * cannot leave it — `ModeManager.lock()`, the same mechanism CONNECT-embed and
-   * the Mauser/Toray project plugins already use, but declared in configuration
+   * the large CAD line/a CAD-import showcase model project plugins already use, but declared in configuration
    * instead of in code. An appliance delivery sets `{ "lock": "hmi" }`; removing
    * the key is how commissioning unlocks the box, and then the full resume
    * cascade (URL deep links included) applies again.

@@ -18,12 +18,15 @@
 import { useMemo, useSyncExternalStore } from 'react';
 import type { RVViewer } from '../core/rv-viewer';
 import type { SimulationMode, SimSubMode } from '../core/material-flow/simulation-kernel';
+import { computeDesRunState, type DesRunStatus } from '../core/material-flow/rv-des-run-state';
 
 /**
  * Snapshot of the kernel state the sim UI renders. Compared field-by-field
  * (`sameSnapshot`) so `useSyncExternalStore` re-renders only on real changes.
  */
 export interface KernelSnapshot {
+  readonly runState: DesRunStatus;
+  readonly runGeneration: number;
   /** False when the unified kernel is not active (flag OFF / no model). */
   readonly available: boolean;
   readonly mode: SimulationMode;
@@ -106,9 +109,11 @@ function makeStore(viewer: RVViewer): KernelStore {
 
 function readSnapshot(viewer: RVViewer, version: number): KernelSnapshot {
   const kernel = viewer.simulationKernel;
+  const env = { simulationPaused: viewer.isSimulationPaused, pauseReasons: viewer.simulationPauseReasons };
   if (!kernel) {
     return {
       available: false, mode: 'continuous', hasDes: false, switching: false,
+      runState: computeDesRunState(null, env), runGeneration: 0,
       subMode: null, multiplier: 1, ffProgress: null,
       simTime: 0, processed: 0, pending: 0, endTime: Infinity, statResetTime: 0, version,
     };
@@ -118,6 +123,8 @@ function readSnapshot(viewer: RVViewer, version: number): KernelSnapshot {
   const stats = ctl?.eventStats?.();
   return {
     available: true,
+    runState: computeDesRunState(ctl, env),
+    runGeneration: ctl?.lifecycleGeneration ?? 0,
     mode: kernel.mode,
     hasDes: kernel.hasDesRunner(),
     switching: kernel.isSwitching,
@@ -135,6 +142,10 @@ function readSnapshot(viewer: RVViewer, version: number): KernelSnapshot {
 
 function sameSnapshot(a: KernelSnapshot, b: KernelSnapshot): boolean {
   return a.available === b.available
+    && a.runGeneration === b.runGeneration
+    && a.runState.runState === b.runState.runState
+    && a.runState.reason === b.runState.reason
+    && a.runState.finishedAt === b.runState.finishedAt
     && a.mode === b.mode
     && a.hasDes === b.hasDes
     && a.switching === b.switching

@@ -34,9 +34,12 @@ import {
   SpriteMaterial,
   TextureLoader,
 } from 'three';
-import type { Material, Texture } from 'three';
+import type { Camera, Material, OrthographicCamera, PerspectiveCamera, Texture, WebGLRenderer } from 'three';
+import { Vector3 } from 'three';
 
 import { buildBadgeTexture, ERROR_COLOR } from '../../core/engine/rv-error-visual';
+import { NO_AO_LAYER } from '../../core/engine/rv-constants';
+import { worldPerPixelAt } from '../../core/engine/rv-screen-space-scale';
 import type { LibraryCatalogEntry } from './rv-layout-store';
 
 /** Instrument Blue — the single working accent of the Glass Control Room. */
@@ -49,9 +52,18 @@ const PLACEHOLDER_ERROR_COLOR = ERROR_COLOR;
  *  the dashed outline is the third, non-textual carrier. */
 const ERROR_BADGE_TEXT = '⚠ Ladefehler';
 
-/** World height (m) of the warning badge. Fixed rather than footprint-relative:
- *  a badge that shrinks with a small asset stops being readable. */
-const ERROR_BADGE_HEIGHT_M = 0.28;
+/** On-screen height (px) of the loading label and the warning badge. Screen
+ *  constant, not world sized: a project document carries no footprint, so its
+ *  placeholder is the 0.5 m fallback box — next to a 70 m plant seen from
+ *  150 m away, any world-sized marker is a few pixels and the load looks like
+ *  nothing is happening. */
+const BADGE_HEIGHT_PX = 24;
+
+/** Longest asset name the loading label spells out before it is shortened. */
+const LABEL_MAX_NAME = 40;
+
+/** Object name of the loading label — tells it apart from the thumbnail sprite. */
+export const PLACEHOLDER_LABEL_NAME = 'rv-placeholder-loading-label';
 
 /** Millimetre → metre. */
 const MM_TO_M = 0.001;
@@ -94,6 +106,10 @@ interface PlaceholderResources {
   badge: Sprite | null;
   badgeMaterial: SpriteMaterial | null;
   badgeTexture: Texture | null;
+  /** "Loading <name>…" label — screen-constant, hidden while the error badge shows. */
+  label: Sprite | null;
+  labelMaterial: SpriteMaterial | null;
+  labelTexture: Texture | null;
   /** Height (m) of the wireframe box — where the badge is parked. */
   heightM: number;
   /** Set by {@link disposePlaceholderNode}; makes a late thumbnail arrival a no-op. */
@@ -184,13 +200,31 @@ export function buildPlaceholderNode(entry: LibraryCatalogEntry): PlaceholderNod
     badge: null,
     badgeMaterial: null,
     badgeTexture: null,
+    label: null,
+    labelMaterial: null,
+    labelTexture: null,
     heightM: h,
     disposed: false,
     error: false,
   };
   _resources.set(group, resources);
 
-  const thumbnailUrl = entry.thumbnailUrl?.trim();
+  // The loading label is the part of the placeholder that is readable at ANY
+  // scale — centred on the box, so even a box of a few pixels is marked.
+  const name = entry.name.length > LABEL_MAX_NAME ? `${entry.name.slice(0, LABEL_MAX_NAME - 1)}…` : entry.name;
+  const label = buildScreenBadge(`Loading ${name}…`, PLACEHOLDER_COLOR);
+  label.sprite.name = PLACEHOLDER_LABEL_NAME;
+  label.sprite.position.y = h / 2;
+  group.add(label.sprite);
+  resources.label = label.sprite;
+  resources.labelMaterial = label.material;
+  resources.labelTexture = label.texture;
+
+  // No billboard for a `noPrefetch` entry (plan-660, SimReady): its load is a
+  // server-side download + conversion that takes minutes, and a card picture
+  // hanging in the scene that long reads as a left-over drag image rather than
+  // as "loading" — the pulsing box and the progress toast carry that state.
+  const thumbnailUrl = entry.noPrefetch === true ? undefined : entry.thumbnailUrl?.trim();
   if (thumbnailUrl) attachThumbnail(group, resources, thumbnailUrl, Math.max(w, d), h);
 
   return group;
@@ -220,6 +254,9 @@ function attachThumbnail(
       sprite.scale.set(size, size, 1);
       sprite.position.y = heightM + size * 0.6;
       sprite.frustumCulled = false;
+      // In-scene UI: never part of the AO depth/normal pass, or GTAO/N8AO paint
+      // a dark box around the transparent billboard.
+      sprite.layers.set(NO_AO_LAYER);
       group.add(sprite);
 
       resources.sprite = sprite;
@@ -263,20 +300,54 @@ export function setPlaceholderError(node: PlaceholderNode, on: boolean): void {
   }
 }
 
+const _badgePos = new Vector3();
+const _parentScale = new Vector3();
+
+/**
+ * A worded badge sprite that keeps {@link BADGE_HEIGHT_PX} on screen at any
+ * camera distance or zoom, drawn over the scene and never hit by a raycast.
+ *
+ * Sized in `onBeforeRender` rather than with `sizeAttenuation: false`, because
+ * three.js ignores that flag under an orthographic camera (see `bbox-snap.ts`).
+ * The renderer computes the model-view matrix AFTER `onBeforeRender`, so the
+ * scale set here applies to the very frame being drawn.
+ */
+function buildScreenBadge(text: string, color: number): { sprite: Sprite; material: SpriteMaterial; texture: Texture } {
+  const { texture, aspect } = buildBadgeTexture(text, color);
+  // depthTest off: the label must stay visible inside or behind geometry —
+  // it marks WHERE the asset is coming, and that spot is often occluded.
+  const material = new SpriteMaterial({ map: texture, transparent: true, depthWrite: false, depthTest: false });
+  const sprite = new Sprite(material);
+  sprite.frustumCulled = false;
+  sprite.renderOrder = 12;
+  sprite.layers.set(NO_AO_LAYER);
+  // A marker, not a target: it must never steal hover or a pick from the
+  // placement it labels (Sprite.raycast also throws without raycaster.camera).
+  sprite.raycast = () => {};
+  sprite.onBeforeRender = (renderer: WebGLRenderer, _scene, camera: Camera) => {
+    const flags = camera as Partial<PerspectiveCamera & OrthographicCamera>;
+    if (!flags.isPerspectiveCamera && !flags.isOrthographicCamera) return;
+    const cam = camera as PerspectiveCamera | OrthographicCamera;
+    sprite.getWorldPosition(_badgePos);
+    const wpp = worldPerPixelAt(cam, renderer.domElement.clientHeight, _badgePos);
+    sprite.parent?.getWorldScale(_parentScale);
+    const ps = sprite.parent ? Math.max(Math.abs(_parentScale.x), Math.abs(_parentScale.y), Math.abs(_parentScale.z)) || 1 : 1;
+    const hWorld = (BADGE_HEIGHT_PX * wpp) / ps;
+    sprite.scale.set(hWorld * aspect, hWorld, 1);
+    sprite.updateMatrixWorld();
+  };
+  return { sprite, material, texture };
+}
+
 /** Hang the worded warning badge over the box. No-op when already present. */
 function attachErrorBadge(node: PlaceholderNode, resources: PlaceholderResources): void {
   if (resources.badge) return;
 
-  const { texture, aspect } = buildBadgeTexture(ERROR_BADGE_TEXT, PLACEHOLDER_ERROR_COLOR);
-  const material = new SpriteMaterial({ map: texture, transparent: true, depthWrite: false });
-  const sprite = new Sprite(material);
-  sprite.scale.set(ERROR_BADGE_HEIGHT_M * aspect, ERROR_BADGE_HEIGHT_M, 1);
-  // Just above the box — and above the thumbnail billboard when that exists,
-  // because the failure is the more important of the two messages.
-  sprite.position.y = resources.heightM + ERROR_BADGE_HEIGHT_M * 1.6;
-  sprite.frustumCulled = false;
-  sprite.renderOrder = 12;
+  const { sprite, material, texture } = buildScreenBadge(ERROR_BADGE_TEXT, PLACEHOLDER_ERROR_COLOR);
+  // Where the loading label was — the failure replaces that message.
+  sprite.position.y = resources.heightM / 2;
   node.add(sprite);
+  if (resources.label) resources.label.visible = false;
 
   resources.badge = sprite;
   resources.badgeMaterial = material;
@@ -286,6 +357,7 @@ function attachErrorBadge(node: PlaceholderNode, resources: PlaceholderResources
 /** Remove + free the warning badge (retry succeeded, or the node is going away). */
 function detachErrorBadge(resources: PlaceholderResources): void {
   if (!resources.badge) return;
+  if (resources.label) resources.label.visible = true; // retry: loading again
   resources.badge.parent?.remove(resources.badge);
   resources.badgeTexture?.dispose();
   (resources.badgeMaterial as Material | null)?.dispose();
@@ -326,6 +398,14 @@ export function disposePlaceholderNode(node: PlaceholderNode | Group): void {
 
   // Warning badge — same rule, same three resources.
   detachErrorBadge(resources);
+
+  // Loading label — same rule again: texture + material, never the geometry.
+  resources.labelTexture?.dispose();
+  (resources.labelMaterial as Material | null)?.dispose();
+  resources.label?.parent?.remove(resources.label);
+  resources.label = null;
+  resources.labelMaterial = null;
+  resources.labelTexture = null;
 
   resources.dashedMaterial = null;
   resources.sprite = null;

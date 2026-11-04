@@ -24,6 +24,7 @@
 import { Box3, Vector3, Quaternion } from 'three';
 import type { Object3D } from 'three';
 import {
+  type AcceptPose,
   type MaterialFlowSelf,
   type MU,
   type TweenSpec,
@@ -55,8 +56,53 @@ export interface TransitTimer {
   readonly exitPos: [number, number, number];
   /** Build the straight entry→exit position-tween spec for an in-transit MU. */
   tween(mu: MU): TweenSpec;
+  /**
+   * Take-over at an arbitrary belt position (plan-631 F1): project the MU origin
+   * `pose` onto the SAME leading-edge path `tween()` rides (snap planes, else the
+   * bounds entry/exit; height = the roller top). Pure unless `opts.commit` —
+   * then the MU's heading is set to the belt flow exactly like `tween()` does.
+   * A pose outside the alignment tolerance returns `ok: false` with the reason.
+   */
+  fromPose(mu: MU, pose: AcceptPose, opts?: { commit?: boolean }): PoseProjection;
   /** Recompute the timing model (e.g. after a speed / topology change). */
   refresh(): void;
+}
+
+/**
+ * Alignment tolerance (m) of a pose take-over (plan-631 F3): lateral offset,
+ * height (MU origin above / below the roller top) and the overshoot beyond both
+ * belt ends. An alignment tolerance — NOT a support-area computation.
+ */
+export const POSE_ALIGN_TOLERANCE_M = 0.02;
+
+/**
+ * Result of {@link TransitTimer.fromPose}. All lengths in metres along the
+ * leading-edge path; `remaining` in seconds.
+ */
+export interface PoseProjection {
+  readonly ok: boolean;
+  /** Why the take-over is refused (`ok: false` only). */
+  readonly reason?: 'off-belt-length' | 'off-belt-lateral' | 'off-belt-height' | 'degenerate-belt';
+  /** Origin position along the flow from the leading-edge entry (m). */
+  readonly along: number;
+  /** Leading edge (origin + bug) along the flow, clamped to [0, lengthM] (m). */
+  readonly s: number;
+  /** Leading-edge path length L (m) — the same distance `transitTime` uses. */
+  readonly lengthM: number;
+  /** MU bug offset (origin → leading edge, m) — template-preset for headless MUs. */
+  readonly bug: number;
+  /** Horizontal distance of the origin from the flow axis (m, ≥ 0). */
+  readonly lateral: number;
+  /** Origin height above the roller top, i.e. MU underside − roller top (m, signed). */
+  readonly height: number;
+  /** World Y of the roller top the transit rides on (m). */
+  readonly rollerTop: number;
+  /** Heading error pose.yaw − belt heading, wrapped to (−π, π]; 0 without a yaw. */
+  readonly yawError: number;
+  /** Remaining transit time (L − s) / v (s). */
+  readonly remaining: number;
+  /** Tween from the pose to exit − bug (only when `ok`). */
+  readonly tween: TweenSpec | null;
 }
 
 // Pre-allocated scratch values — no per-call allocation.
@@ -217,6 +263,65 @@ export function createTransitTimer(
           muId: mu.id,
           from: [_le.x - _dir.x * bug, _le.y - _dir.y * bug, _le.z - _dir.z * bug],
           to: [_lx.x - _dir.x * bug, _lx.y - _dir.y * bug, _lx.z - _dir.z * bug],
+        },
+      };
+    },
+    fromPose(mu: MU, pose: AcceptPose, opts?: { commit?: boolean }): PoseProjection {
+      // Same leading-edge path, same height (roller top) and same L as tween() /
+      // transitTime — never compute()'s raw bounds (#200: a baked belt's bounds
+      // and its snaps disagree; the transit rides the snaps).
+      leadingEdge();
+      const lex = _le.x, ley = _le.y, lez = _le.z;
+      const lxx = _lx.x, lxy = _lx.y, lxz = _lx.z;
+      let dx = lxx - lex, dy = lxy - ley, dz = lxz - lez;
+      const lengthM = Math.hypot(dx, dy, dz);
+      const bug = muBugOffset(mu);
+      const [px, py, pz] = pose.position;
+      if (!(lengthM > 1e-6)) {
+        return {
+          ok: false, reason: 'degenerate-belt', along: 0, s: 0, lengthM: 0, bug,
+          lateral: 0, height: py - ley, rollerTop: ley, yawError: 0, remaining: 0, tween: null,
+        };
+      }
+      dx /= lengthM; dy /= lengthM; dz /= lengthM;
+      const ox = px - lex, oy = py - ley, oz = pz - lez;
+      const along = ox * dx + oy * dy + oz * dz;
+      // Residual off the flow axis: horizontal part = lateral, vertical = height.
+      const rx = ox - along * dx, ry = oy - along * dy, rz = oz - along * dz;
+      const lateral = Math.hypot(rx, rz);
+      const height = ry;
+      const s = Math.min(lengthM, Math.max(0, along + bug));
+      const remaining = ((lengthM - s) * METRES_TO_MM) / speed;
+      let yawError = 0;
+      if (typeof pose.yaw === 'number' && Number.isFinite(pose.yaw)) {
+        yawError = pose.yaw - Math.atan2(dx, dz);
+        yawError = Math.atan2(Math.sin(yawError), Math.cos(yawError));
+      }
+      const tol = POSE_ALIGN_TOLERANCE_M;
+      // Lengthwise range checked BEFORE clamping (R1 #6): the origin may sit from
+      // one bug behind the entry (leading edge at the entry) to one bug before the
+      // exit (leading edge at the exit), each end ± the alignment tolerance.
+      const reason: PoseProjection['reason'] =
+        along < -bug - tol || along > lengthM - bug + tol ? 'off-belt-length'
+          : lateral > tol ? 'off-belt-lateral'
+            : Math.abs(height) > tol ? 'off-belt-height'
+              : undefined;
+      if (reason) {
+        return { ok: false, reason, along, s, lengthM, bug, lateral, height, rollerTop: ley, yawError, remaining, tween: null };
+      }
+      if (opts?.commit) setMuForward(mu, dx, dz);
+      return {
+        ok: true, along, s, lengthM, bug, lateral, height, rollerTop: ley, yawError, remaining,
+        tween: {
+          tween: {
+            kind: 'position',
+            target: (mu as { visual?: unknown }).visual ?? null,
+            muId: mu.id,
+            // From the pose itself (no jump at the hand-over) to the same end
+            // point tween() uses: exit − bug along the flow.
+            from: [px, py, pz],
+            to: [lxx - dx * bug, lxy - dy * bug, lxz - dz * bug],
+          },
         },
       };
     },

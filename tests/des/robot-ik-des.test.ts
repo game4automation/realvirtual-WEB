@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { Object3D, Vector3 } from 'three';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
+import { DESRunner } from '@rv/plugins/des/des-runner';
 import { RVDrive, DriveDirection } from '../../src/core/engine/rv-drive';
 import { RVMovingUnit } from '../../src/core/engine/rv-mu';
 import {

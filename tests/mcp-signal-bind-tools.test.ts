@@ -18,7 +18,9 @@
  * be gone on reload with nothing having said so.
  */
 
+import { executeDelegateValue } from './helpers/execute-value';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { queryCommand } from './helpers/query-command';
 import { Object3D } from 'three';
 import '../src/core/engine/rv-signal-construction';
 import { SignalStore } from '../src/core/engine/rv-signal-store';
@@ -143,6 +145,8 @@ function makeFixture(options?: { placed?: boolean }): Fixture {
     signalBindingManager: mgr,
     getPlugin: (id: string) => (placed && id === 'layout-planner' ? planner : undefined),
     behaviors: { getActiveBinds: () => [] },
+    // plan-641 Nachtrag: bind / unbind dispatch through the command registry (reads the mode).
+    modes: { activeMode: 'hmi' },
   } as unknown as RVViewer;
 
   recorder.state.apply = (op) => { void applyForward(op, { viewer }); };
@@ -162,7 +166,7 @@ afterEach(() => setActiveEditTarget(null));
 describe('web_signal_bindings_list', () => {
   it('publishes the FULL slot identity, not just the slot name', async () => {
     const f = makeFixture();
-    const answer = parse(await f.tools.webSignalBindingsList());
+    const answer = await queryCommand(f.viewer, 'signal.bindingsList');
     const slots = answer.slots as Array<Record<string, unknown>>;
     const forwards = slots.filter((s) => s.slot === 'Forward');
     // Two slots called Forward — and each carries the componentPath that tells
@@ -181,7 +185,7 @@ describe('web_signal_bindings_list', () => {
       slot: 'Forward', signal: 'PLC.Start', interfaceId: 'plc-1',
       direction: 'plcInput', enabled: true,
     }]);
-    const answer = parse(await f.tools.webSignalBindingsList());
+    const answer = await queryCommand(f.viewer, 'signal.bindingsList');
     const orphans = answer.orphans as Array<Record<string, unknown>>;
     expect(orphans).toHaveLength(1);
     expect(orphans[0].signal).toBe('PLC.Start');
@@ -194,7 +198,7 @@ describe('web_signal_bindings_list', () => {
 describe('web_signal_sources_list', () => {
   it('lists the CONNECT signals with their provider and comment', async () => {
     const f = makeFixture();
-    const answer = parse(await f.tools.webSignalSourcesList('PLC.Start'));
+    const answer = await queryCommand(f.viewer, 'signal.sourcesList', { filter: 'PLC.Start' });
     const signals = answer.signals as Array<Record<string, unknown>>;
     expect(signals).toHaveLength(1);
     expect(signals[0].interfaceId).toBe('plc-1');
@@ -207,7 +211,7 @@ describe('web_signal_sources_list', () => {
 describe('web_signal_bind', () => {
   it('binds and persists the slot it was given', async () => {
     const f = makeFixture();
-    const answer = parse(await f.tools.webSignalBind('p1', 'Left', 'Forward', 'PLC.Start'));
+    const answer = parse(await executeDelegateValue(f.tools, 'signal.bind', { targetId: 'p1', componentPath: 'Left', slot: 'Forward', signal: 'PLC.Start' }));
     expect(answer.error).toBeUndefined();
     expect(answer.componentPath).toBe('Left');
     // `persisted` is read BACK out of the persistence adapter, not asserted from
@@ -218,7 +222,7 @@ describe('web_signal_bind', () => {
 
   it('records a real op for a NODE target, so a reload finds the link', async () => {
     const f = makeFixture({ placed: false });
-    const answer = parse(await f.tools.webSignalBind('Machine/Left', '.', 'Forward', 'PLC.Start'));
+    const answer = parse(await executeDelegateValue(f.tools, 'signal.bind', { targetId: 'Machine/Left', componentPath: '.', slot: 'Forward', signal: 'PLC.Start' }));
     expect(answer.persisted).toBe(true);
     const written = recorder.ops.filter((op) => op.kind === 'setField');
     expect(written).toHaveLength(1);
@@ -227,7 +231,7 @@ describe('web_signal_bind', () => {
 
   it('refuses an ambiguous slot instead of picking one', async () => {
     const f = makeFixture();
-    const answer = parse(await f.tools.webSignalBind('p1', '', 'Forward', 'PLC.Start'));
+    const answer = parse(await executeDelegateValue(f.tools, 'signal.bind', { targetId: 'p1', componentPath: '', slot: 'Forward', signal: 'PLC.Start' }));
     expect(answer.error).toContain('ambiguous');
     expect((answer.candidates as string[]).sort()).toEqual(['Left', 'Right']);
     // And nothing was written on the way to the refusal.
@@ -236,7 +240,7 @@ describe('web_signal_bind', () => {
 
   it('gives the SAME words a manual drag would give on a type mismatch', async () => {
     const f = makeFixture();
-    const answer = parse(await f.tools.webSignalBind('p1', 'Left', 'Forward', 'PLC.Speed'));
+    const answer = parse(await executeDelegateValue(f.tools, 'signal.bind', { targetId: 'p1', componentPath: 'Left', slot: 'Forward', signal: 'PLC.Speed' }));
     expect(answer.error).toContain('Type mismatch');
     expect(answer.reason).toBe('type');
     expect(recorder.ops).toEqual([]);
@@ -244,15 +248,15 @@ describe('web_signal_bind', () => {
 
   it('refuses a signal that does not exist', async () => {
     const f = makeFixture();
-    const answer = parse(await f.tools.webSignalBind('p1', 'Left', 'Forward', 'PLC.Nope'));
+    const answer = parse(await executeDelegateValue(f.tools, 'signal.bind', { targetId: 'p1', componentPath: 'Left', slot: 'Forward', signal: 'PLC.Nope' }));
     expect(answer.error).toContain('not found');
   });
 
   it('refuses an unknown target and says where to find real ones', async () => {
     const f = makeFixture();
-    const answer = parse(await f.tools.webSignalBind('Nowhere', 'Left', 'Forward', 'PLC.Start'));
+    const answer = parse(await executeDelegateValue(f.tools, 'signal.bind', { targetId: 'Nowhere', componentPath: 'Left', slot: 'Forward', signal: 'PLC.Start' }));
     expect(answer.error).toContain('not found');
-    expect(answer.hint).toContain('web_signal_bindings_list');
+    expect(answer.hint).toContain('web_query("signal.bindingsList", {})');
   });
 
   it('fails WITHOUT mutating when the binding could not be saved', async () => {
@@ -262,7 +266,7 @@ describe('web_signal_bind', () => {
     // edit-target seam, which is a silent no-op when nothing is editable.
     setActiveEditTarget(UNAVAILABLE);
     const f = makeFixture({ placed: false });
-    const answer = parse(await f.tools.webSignalBind('Machine/Left', '.', 'Forward', 'PLC.Start'));
+    const answer = parse(await executeDelegateValue(f.tools, 'signal.bind', { targetId: 'Machine/Left', componentPath: '.', slot: 'Forward', signal: 'PLC.Start' }));
     expect(answer.error).toContain('cannot be saved');
     expect(answer.persisted).toBe(false);
     expect(f.mgr.getBindingLiveness('Machine/Left', 'Forward', '.')).toBeUndefined();
@@ -303,10 +307,10 @@ describe('keeping broken links while changing a good one', () => {
 describe('web_signal_unbind', () => {
   it('removes exactly the slot it was given', async () => {
     const f = makeFixture();
-    await f.tools.webSignalBind('p1', 'Left', 'Forward', 'PLC.Start');
-    await f.tools.webSignalBind('p1', 'Right', 'Forward', 'PLC.Start');
+    await executeDelegateValue(f.tools, 'signal.bind', { targetId: 'p1', componentPath: 'Left', slot: 'Forward', signal: 'PLC.Start' });
+    await executeDelegateValue(f.tools, 'signal.bind', { targetId: 'p1', componentPath: 'Right', slot: 'Forward', signal: 'PLC.Start' });
 
-    const answer = parse(await f.tools.webSignalUnbind('p1', 'Left', 'Forward'));
+    const answer = parse(await executeDelegateValue(f.tools, 'signal.unbind', { targetId: 'p1', componentPath: 'Left', slot: 'Forward' }));
     expect(answer.unbound).toBe(true);
     expect(answer.remaining).toBe(1);
     expect(answer.persisted).toBe(true);
@@ -315,23 +319,23 @@ describe('web_signal_unbind', () => {
 
   it('refuses an ambiguous slot rather than unbinding the wrong one', async () => {
     const f = makeFixture();
-    await f.tools.webSignalBind('p1', 'Left', 'Forward', 'PLC.Start');
-    const answer = parse(await f.tools.webSignalUnbind('p1', '', 'Forward'));
+    await executeDelegateValue(f.tools, 'signal.bind', { targetId: 'p1', componentPath: 'Left', slot: 'Forward', signal: 'PLC.Start' });
+    const answer = parse(await executeDelegateValue(f.tools, 'signal.unbind', { targetId: 'p1', componentPath: '', slot: 'Forward' }));
     expect(answer.error).toContain('ambiguous');
     expect(f.mgr.getBindingLiveness('p1', 'Forward', 'Left')).toBeDefined();
   });
 
   it('says so when the slot carries nothing', async () => {
     const f = makeFixture();
-    const answer = parse(await f.tools.webSignalUnbind('p1', 'Left', 'Forward'));
+    const answer = parse(await executeDelegateValue(f.tools, 'signal.unbind', { targetId: 'p1', componentPath: 'Left', slot: 'Forward' }));
     expect(answer.error).toContain('no binding');
   });
 
   it('fails WITHOUT mutating when the change could not be saved', async () => {
     const f = makeFixture({ placed: false });
-    await f.tools.webSignalBind('Machine/Left', '.', 'Forward', 'PLC.Start');
+    await executeDelegateValue(f.tools, 'signal.bind', { targetId: 'Machine/Left', componentPath: '.', slot: 'Forward', signal: 'PLC.Start' });
     setActiveEditTarget(UNAVAILABLE);
-    const answer = parse(await f.tools.webSignalUnbind('Machine/Left', '.', 'Forward'));
+    const answer = parse(await executeDelegateValue(f.tools, 'signal.unbind', { targetId: 'Machine/Left', componentPath: '.', slot: 'Forward' }));
     expect(answer.error).toContain('cannot be saved');
     expect(f.mgr.getBindingLiveness('Machine/Left', 'Forward', '.')).toBeDefined();
   });

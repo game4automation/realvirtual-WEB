@@ -12,7 +12,23 @@
  * in the bar starts using the hook, and then fails with a bare
  * `viewer.modes.list is not a function` far from the test that caused it.
  *
- * Kept in one place so the four suites that render the bar cannot drift apart
+ * A second incident followed when commit b4edac68 ("per-document workspace-mode
+ * restriction") introduced `ModeManager.available()`: the shared double fell
+ * behind again. The measured surface is therefore every
+ * `.modes.([A-Za-z_][A-Za-z0-9_]*)` hit in `src` and the sibling private
+ * checkout's `src` (17 members today), excluding the verified
+ * `plugin.modes` string-array hits for `includes`, `length`, and `map`.
+ * `tests/mode-manager-double-surface.node.test.ts` enforces that rule.
+ *
+ * plan-900 E18 deliberately models only `available`. The other newly surfaced
+ * members throw: a neutral stub is not protection. No current path calls those
+ * members, but a future test could otherwise take a path the real manager never
+ * would and silently stay green even though `register`, `setMode`, and `lock`
+ * mutate real state. A throwing stub makes that path loudly red and forces the
+ * behavior to be modelled deliberately. The surface invariant checks presence
+ * only and never invokes a member, so throwing stubs satisfy it.
+ *
+ * Kept in one place so suites that render shared viewer UI cannot drift apart
  * on what a mode manager looks like.
  */
 export interface ModeManagerDoubleOptions {
@@ -29,7 +45,41 @@ export function modeManagerDouble(options: ModeManagerDoubleOptions = {}) {
     setActive(id: string | null) { activeMode = id; },
     get lockedMode() { return options.locked ? activeMode : null; },
     list: () => [],
+    // The real available() is list().filter(isAllowed); without a document
+    // restriction nothing is filtered, so it is the same empty list here.
+    available: () => [],
+    setMode: (_id: string): void => {
+      throw new Error('mode-manager-double: setMode is not modelled — model it deliberately (plan-900 R10)');
+    },
+    register: (_descriptor: unknown): never => {
+      throw new Error('mode-manager-double: register is not modelled — model it deliberately (plan-900 R10)');
+    },
+    descriptor: (_id: string): never => {
+      throw new Error('mode-manager-double: descriptor is not modelled — model it deliberately (plan-900 R10)');
+    },
+    has: (_id: string): boolean => {
+      throw new Error('mode-manager-double: has is not modelled — model it deliberately (plan-900 R10)');
+    },
+    restrictedFallback: (): string | null => {
+      throw new Error('mode-manager-double: restrictedFallback is not modelled — model it deliberately (plan-900 R10)');
+    },
+    releaseSwitchLock: (_token: symbol): void => {
+      throw new Error('mode-manager-double: releaseSwitchLock is not modelled — model it deliberately (plan-900 R10)');
+    },
+    registerExitGuard: (_modeId: string, _guard: unknown): (() => void) => {
+      throw new Error('mode-manager-double: registerExitGuard is not modelled — model it deliberately (plan-900 R10)');
+    },
+    lock: (_id: string): void => {
+      throw new Error('mode-manager-double: lock is not modelled — model it deliberately (plan-900 R10)');
+    },
+    acquireSwitchLock: (): symbol | null => {
+      throw new Error('mode-manager-double: acquireSwitchLock is not modelled — model it deliberately (plan-900 R10)');
+    },
     requestMode: async () => {},
+    // plan-652: the awaited switch, enter guards and the boot's restore target.
+    setModeAsync: async (id: string) => { activeMode = id; return true; },
+    registerEnterGuard: () => () => undefined,
+    peekRestoreTarget: (fallback = 'hmi') => activeMode ?? fallback,
     subscribe: () => () => undefined,
     getSnapshot: () => 0,
   };

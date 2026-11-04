@@ -1,0 +1,10 @@
+{"type":"thread.started","thread_id":"fixture-codex-thread"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item-message-1","type":"agent_message","text":"I will inspect the WebViewer."}}
+{"type":"item.started","item":{"id":"item-status","type":"mcp_tool_call","server":"realvirtual-CONNECT","tool":"web_status","arguments":{},"result":null,"error":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item-status","type":"mcp_tool_call","server":"realvirtual-CONNECT","tool":"web_status","arguments":{},"result":{"content":[{"type":"text","text":"{\"connected\":true,\"mode\":\"hmi\"}"}],"structured_content":null},"error":null,"status":"completed"}}
+{"type":"item.started","item":{"id":"item-shot","type":"mcp_tool_call","server":"realvirtual-CONNECT","tool":"web_screenshot","arguments":{},"result":null,"error":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item-shot","type":"mcp_tool_call","server":"realvirtual-CONNECT","tool":"web_screenshot","arguments":{},"result":{"content":[{"type":"image","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=","mimeType":"image/png"},{"type":"text","text":"{\"width\":1,\"height\":1}"}],"structured_content":null},"error":null,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item-message-2","type":"agent_message","text":"WebViewer is connected, and the screenshot was captured."}}
+{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":20,"reasoning_output_tokens":5}}
+{"type":"connect_exit","code":0}

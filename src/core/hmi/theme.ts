@@ -2,7 +2,7 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { createTheme, type Theme } from '@mui/material/styles';
-import { ACCENT, CHIP_RADIUS, ERROR, SECONDARY, SUCCESS, WARN } from './shared-sx';
+import { ACCENT, CHIP_RADIUS, ERROR, FIELD_BORDER, PANEL_SURFACE, SECONDARY, SUCCESS, WARN } from './shared-sx';
 
 /** Create a branded theme with custom primary/secondary colors. */
 export function createBrandedTheme(primary?: string, secondary?: string): Theme {
@@ -88,6 +88,7 @@ export const rvDarkTheme = createTheme({
           // the dialog separated from the scene behind the glass.
           boxShadow: 'none',
           border: '1px solid rgba(255,255,255,0.08)',
+          '&&': { backgroundColor: `${PANEL_SURFACE} !important` },
         },
       },
     },
@@ -116,6 +117,7 @@ export const rvDarkTheme = createTheme({
     MuiIconButton: {
       styleOverrides: {
         root: {
+          borderRadius: 4,
           // Touch-friendly targets on coarse-pointer devices (Apple HIG: 44px)
           '@media (pointer: coarse)': {
             minWidth: 44,

@@ -192,6 +192,8 @@ describe('prepareAndBake — the recipe (plan-757 D1)', () => {
     // The authored path of the moved subtree travels on the asset (D4).
     expect(baked.aliases.map((a) => a.path)).toContain('Cad/Kine');
     expect(baked.aliases.find((a) => a.path === 'Cad/Kine')!.template).toBe(kineT);
+    // … flagged as a SUBTREE alias: the place step registers it as a prefix alias too (plan-610 Phase 5c).
+    expect(baked.aliases.find((a) => a.path === 'Cad/Kine')!.subtree).toBe(true);
     baked.dispose();
   });
 });

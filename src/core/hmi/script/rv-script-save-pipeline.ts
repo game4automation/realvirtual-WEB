@@ -48,6 +48,8 @@ export interface ScriptSaveDiagnostic {
 export interface ValidateScriptOptions {
   /** The component's `DesSafe` claim — escalates DES-lint warnings to errors. */
   desSafe?: boolean;
+  /** Caller awaits loadDesAstCheck() before requesting the state gate. */
+  checkState?: boolean;
   /** The component's declared `ApiVersion` (default 1). */
   apiVersion?: number;
   /**
@@ -116,7 +118,7 @@ export function validateScriptForSave(
   }
 
   // 2. DES-safety lint (structured diagnostics; DesSafe escalates).
-  for (const d of lintDesSafety(js, { desSafe: opts.desSafe === true })) {
+  for (const d of lintDesSafety(js, { desSafe: opts.desSafe === true, checkState: opts.checkState })) {
     diagnostics.push({ ...d });
   }
 

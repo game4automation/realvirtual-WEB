@@ -141,6 +141,11 @@ export function unitRig(opts: {
     registry, signalStore: store, signalBindingManager: manager,
     markRenderDirty: () => {}, logicEngine: null,
     modes: { activeMode: 'hmi' }, currentModelRoot: null,
+    // plan-2010 phase 3: SignalBindPlugin.init() subscribes to 'mode-changed'
+    // to rest the link mode in DES. A double without `on` makes every plugin
+    // init() throw; the rig never changes mode, so a no-op unsubscribe is the
+    // whole truthful answer here.
+    on: () => () => {},
     getPlugin: (id: string) => (id === 'rv-extras-editor' ? overlaySource : undefined),
   } as unknown as RVViewer;
 

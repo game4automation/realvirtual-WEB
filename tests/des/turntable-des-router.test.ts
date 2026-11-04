@@ -143,10 +143,10 @@ describe('Turntable DES router — acceptance', () => {
   });
 
   it('accepts only at the aligned input port when a port is supplied', () => {
-    const { self } = makeFakeSelf([makeOutputPort('a', 1, 0)]);
-    self.prop['alignedPort'] = 'IN-A';
     const aligned = { id: 'IN-A' } as unknown as Port;
     const other = { id: 'IN-B' } as unknown as Port;
+    const { self } = makeFakeSelf([makeOutputPort('a', 1, 0)], [aligned, other]);
+    self.prop['alignedPort'] = 0; // plan-2059 P8: the aligned input is stored as its index (load-stable), not its id
     expect(des.canAccept!(self, { id: 1 } as MU, aligned)).toBe(true);
     expect(des.canAccept!(self, { id: 1 } as MU, other)).toBe(false);
   });
@@ -183,7 +183,7 @@ describe('Turntable DES router — rotate timing + dispatch', () => {
     expect(events.length).toBe(2);
     expect(events[1].hook).toBe('RotateComplete');
     expect(events[1].delay).toBeCloseTo(Math.max(0.001, Math.abs(expectedAngle) / 45), 3);
-    expect(self.prop['selectedOutput']).toBe('a');
+    expect(self.prop['selectedOutput']).toBe(0); // output index (plan-2059 P8: load-stable, not the port id)
     expect(self.prop['driveTarget']).toBeCloseTo(expectedAngle, 3);
   });
 

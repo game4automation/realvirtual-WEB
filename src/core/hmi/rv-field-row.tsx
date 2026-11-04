@@ -8,10 +8,13 @@
  * a reference badge, or a read-only display value.
  */
 
+import { Suspense, useCallback, useMemo, useState, useSyncExternalStore, type ReactNode } from 'react';
 import {
   Box,
+  Button,
   Typography,
   IconButton,
+  Tooltip,
 } from '@mui/material';
 import { Circle, Link as LinkIcon, LinkOff, WarningAmber } from '@mui/icons-material';
 import type { RVViewer } from '../rv-viewer';
@@ -21,16 +24,20 @@ import { isFieldDisplayReadonly } from '../engine/rv-component-registry';
 import {
   inferFieldType,
   isComponentRef,
+  isStoredAddressRecord,
   isScriptableObject,
   formatDisplayValue,
   type FieldStatus,
 } from './rv-inspector-helpers';
-import { FieldEditor } from './rv-field-editors';
+import { getActivePersistenceTarget } from './rv-edit-target';
+import { FieldEditor, NumberEditor } from './rv-field-editors';
 import { ReferenceDisplay, ScriptableObjectDisplay } from './rv-reference-display';
 import { InspectorRow } from './rv-inspector-row';
-import { ACCENT, FS, ICON_SIZE, INK_LOW } from './shared-sx';
+import { ACCENT, ERROR, FS, ICON_SIZE, INK_LOW } from './shared-sx';
+import type { FieldEditState } from './rv-extras-editor';
 import { getAiTouchMs, useAiTouch, useButtonSimState, type AiTouchView, type ButtonSimPhase } from './button-sim-state';
 import { aiSimPhaseSx, aiTouchSx } from './rv-command-view';
+import { fieldRowActionsFor, fieldRowDecorationFor } from './rv-field-row-actions';
 const HIT_MIN = 24;
 
 // ── Editability decision (pure, React-free → unit-testable) ─────────────────
@@ -67,6 +74,8 @@ export function isFieldEditable(
 // ── FieldRow ──────────────────────────────────────────────────────────────
 
 export interface FieldRowProps {
+  /** Custom value editor for editable rows outside confirmation/applying states. */
+  valueEditor?: ReactNode;
   fieldName: string;
   value: unknown;
   status: FieldStatus;
@@ -97,6 +106,18 @@ export interface FieldRowProps {
    * like a button and leaves the AI afterglow on it. Absent → no AI visuals.
    */
   aiKey?: string;
+  /**
+   * Concrete component key of the section (`Source`, `Drive_1`). Set → plugin field-row
+   * actions (`rv-field-row-actions.ts`, e.g. "Show in planning window") may add a control
+   * to the row's trailing slot. Absent → no actions.
+   */
+  componentType?: string;
+  /** Variant apply/refusal state for this exact row. */
+  editState?: FieldEditState;
+  onConfirmEdit?: () => void;
+  onCancelEdit?: () => void;
+  /** Base reset is unavailable while edits persist to a variant. */
+  resetDisabled?: boolean;
 }
 
 /** Row sx for the AI choreography: hover/press while the write is on its way, then the afterglow. */
@@ -145,9 +166,42 @@ function UnitScaleBadge({ fieldName, derived }: { fieldName: string; derived: Fi
   );
 }
 
-export function FieldRow({ fieldName, value, status, isOverridden, onEdit, onReset, viewer, signalStore, descriptor, unit, nodePath, derived, aiKey }: FieldRowProps) {
+export function FieldRow({ fieldName, value, status, isOverridden, onEdit, onReset, viewer, signalStore, descriptor, unit, nodePath, derived, aiKey, componentType, editState, onConfirmEdit, onCancelEdit, resetDisabled = false, valueEditor }: FieldRowProps) {
   const aiPhase = useButtonSimState(aiKey ?? '');
   const aiTouch = useAiTouch(aiKey ?? '');
+  const actionCtx = componentType ? { viewer, nodePath, componentType, fieldName } : null;
+  const rowActions = actionCtx ? fieldRowActionsFor(actionCtx) : [];
+  const actionIds = JSON.stringify(rowActions.map((action) => action.id));
+  const valueActions = useMemo(
+    () => componentType ? fieldRowActionsFor({ viewer, nodePath, componentType, fieldName }) : [],
+    [actionIds, viewer, nodePath, componentType, fieldName],
+  );
+  const subscribeValue = useCallback((listener: () => void) => {
+    const removers = valueActions.map((action) => action.subscribeValue?.(listener));
+    return () => removers.forEach((remove) => remove?.());
+  }, [valueActions]);
+  // The snapshot must retain the parent's value when an action stops supplying
+  // an override, even after this render selects a different effective value.
+  const authoredValue = value;
+  const effectiveValue = useSyncExternalStore(
+    subscribeValue,
+    () => {
+      if (actionCtx) for (const action of rowActions) {
+        const next = action.readValue?.(actionCtx);
+        if (next !== undefined) return next;
+      }
+      return authoredValue;
+    },
+  );
+  value = effectiveValue;
+  const rowDecoration = actionCtx ? fieldRowDecorationFor(actionCtx, rowActions) : undefined;
+  const trailing = rowActions.length > 0 ? (
+    <Suspense fallback={null}>
+      {rowActions.map((a) => (
+        <a.component key={a.id} viewer={viewer} nodePath={nodePath} componentType={componentType!} fieldName={fieldName} />
+      ))}
+    </Suspense>
+  ) : undefined;
   // The schema knows the type; the value-based guess is only for fields the
   // schema does not describe. Before this, every enum outside the small
   // name-keyed ENUM_FIELDS list (RibbonRoller.Axis, RibbonSide, SpinMode, ...)
@@ -206,11 +260,33 @@ export function FieldRow({ fieldName, value, status, isOverridden, onEdit, onRes
     </>
   );
 
+  const shared = editState?.kind === 'error' && editState.code === 'shared-field';
+  const [confirmBase, setConfirmBase] = useState(false);
+  const [editorRevision, setEditorRevision] = useState(0);
+  const deferNumber = getActivePersistenceTarget() === 'variant' && (viewer?.simTime ?? 0) > 0;
+  const editorValue = editState?.kind === 'confirm' ? editState.value : value;
+  const confirmEditor = editState?.kind === 'confirm' ? (
+    <Box role="alertdialog" aria-label={`Apply ${fieldName}`} sx={{ width: '100%' }}>
+      <Typography sx={{ fontSize: FS.micro, color: INK_LOW }}>Applying this value resets the simulation to t = 0.</Typography>
+      <Box sx={{ display: 'flex', gap: 0.5, mt: 0.25 }}>
+        <Button size="small" onClick={onConfirmEdit} sx={{ minHeight: 24, px: 0.5, fontSize: FS.micro, textTransform: 'none' }}>Apply and reset</Button>
+        <Button size="small" autoFocus onClick={() => { setEditorRevision(r => r + 1); onCancelEdit?.(); }} sx={{ minHeight: 24, px: 0.5, fontSize: FS.micro, textTransform: 'none' }}>Cancel</Button>
+      </Box>
+    </Box>
+  ) : null;
+  const switchBase = async () => {
+    const plugin = viewer?.getPlugin('variants') as { commandRuntime(): Promise<{ activate(id: null): Promise<unknown> }> } | undefined;
+    await (await plugin?.commandRuntime())?.activate(null);
+    setConfirmBase(false);
+  };
+
   return (
     <InspectorRow
       label={labelNode}
       dataAttrs={aiKey ? { 'data-rv-button-id': aiKey, ...(aiPhase ? { 'data-rv-sim-phase': aiPhase } : {}) } : undefined}
-      sx={aiKey ? fieldRowAiSx(aiPhase, aiTouch) : undefined}
+      sx={aiKey || rowDecoration
+        ? { ...(aiKey ? fieldRowAiSx(aiPhase, aiTouch) : {}), ...(rowDecoration ?? {}) }
+        : undefined}
       labelTitle={
         isDeprecated
           ? `${fieldName} — deprecated: the value is kept in the document but nothing reads it`
@@ -218,10 +294,25 @@ export function FieldRow({ fieldName, value, status, isOverridden, onEdit, onRes
       }
       labelColor={isEditable || isReference ? 'text.primary' : INK_LOW}
       fullWidthField={fullWidthField}
+      trailing={trailing}
       alignField={isReference ? 'end' : 'stretch'}
       opacity={isEditable || isReference ? 1 : (status === 'consumed' ? 1 : 0.5)}
       rowTooltip={tooltipText}
-      dot={isOverridden ? (
+      dot={isOverridden ? (resetDisabled ? (
+        // A disabled button shows no title, so the reason goes on a wrapping tooltip.
+        <Tooltip title="Switch to Base to reset base values">
+          <span>
+            <IconButton
+              size="small"
+              disabled
+              sx={{ width: HIT_MIN, height: HIT_MIN, p: 0, color: ACCENT }}
+              aria-label={`reset ${fieldName} to default`}
+            >
+              <Circle sx={{ fontSize: ICON_SIZE.dot }} />
+            </IconButton>
+          </span>
+        </Tooltip>
+      ) : (
         <IconButton
           size="small"
           onClick={(e) => { e.stopPropagation(); onReset(); }}
@@ -231,14 +322,46 @@ export function FieldRow({ fieldName, value, status, isOverridden, onEdit, onRes
         >
           <Circle sx={{ fontSize: ICON_SIZE.dot }} />
         </IconButton>
-      ) : undefined}
+      )) : undefined}
     >
-      {isComponentRef(value) ? (
-        <ReferenceDisplay value={value} viewer={viewer} signalStore={signalStore} ownerPath={nodePath} />
+      {editState?.kind === 'applying' ? (
+        <Typography data-testid="variant-field-applying" sx={{ fontSize: FS.label, color: INK_LOW }}>
+          Applying…
+        </Typography>
+      ) : isComponentRef(value) || isStoredAddressRecord(value) ? (
+        <ReferenceDisplay
+          value={value as { type: string; path?: string; address?: string; unresolvedPath?: string; componentType: string }}
+          viewer={viewer} signalStore={signalStore} ownerPath={nodePath}
+        />
       ) : isScriptableObject(value) ? (
         <ScriptableObjectDisplay value={value as Record<string, unknown>} />
       ) : isEditable ? (
-        <FieldEditor value={value} onChange={onEdit} fieldType={fieldType} fieldName={fieldName} editable unit={unit} options={schemaEnum} />
+        <Box sx={{ width: '100%', minWidth: 0 }}>
+          {valueEditor !== undefined ? valueEditor : fieldType === 'number' && (deferNumber || editState?.kind === 'confirm') ? <NumberEditor
+            key={`${editorRevision}:${editState?.revision ?? 0}`}
+            value={editorValue as number} onChange={onEdit} liveCommit={false}
+            unit={unit} min={descriptor?.min} max={descriptor?.max} step={descriptor?.step}
+          /> : <FieldEditor
+            key={`${editorRevision}:${editState?.revision ?? 0}`}
+            value={editorValue} onChange={onEdit} fieldType={fieldType} fieldName={fieldName} editable
+            unit={unit} options={schemaEnum}
+            min={descriptor?.min} max={descriptor?.max} step={descriptor?.step}
+          />}
+          {confirmEditor}
+          {editState?.kind === 'error' && (<>
+            <Typography data-testid="variant-field-error" sx={{ mt: 0.25, fontSize: FS.micro, color: shared ? INK_LOW : ERROR, overflowWrap: 'anywhere' }}>
+              {shared ? 'Shared by all variants. Edit in Base configuration.' : editState.reason}
+            </Typography>
+            {shared && <>
+              <Button size="small" sx={{ minHeight: 24, px: 0.5, fontSize: FS.micro, textTransform: 'none' }} onClick={() => (viewer?.simTime ?? 0) > 0 ? setConfirmBase(true) : void switchBase()}>Switch to Base…</Button>
+              {confirmBase && <Box role="alertdialog" aria-label="Switch to Base">
+                <Typography>Switching to Base resets the simulation to t = 0.</Typography>
+                <Button size="small" sx={{ minHeight: 24, px: 0.5, fontSize: FS.micro, textTransform: 'none' }} onClick={() => void switchBase()}>Switch and reset</Button>
+                <Button size="small" sx={{ minHeight: 24, px: 0.5, fontSize: FS.micro, textTransform: 'none' }} onClick={() => setConfirmBase(false)}>Cancel</Button>
+              </Box>}
+            </>}
+          </>)}
+        </Box>
       ) : (
         <Typography
           sx={{

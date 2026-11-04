@@ -23,6 +23,7 @@ import {
 } from '../src/core/rv-mode-manager';
 import { UIPluginRegistry } from '../src/core/rv-ui-registry';
 import { evaluateVisibilityRule } from '../src/core/hmi/ui-context-store';
+import { KPI_BAR_DEFAULT_RULE } from '../src/core/hmi/KpiBar';
 import {
   HIERARCHY_BROWSER_GATE, CONNECT_PANEL_GATE, LEFT_PANEL_GATES,
 } from '../src/core/hmi/left-panel-visibility';
@@ -103,11 +104,18 @@ function entriesFor(plugin: object, slot: UISlot): UISlotEntry[] {
  * `?raw` import (see rv-viewer-mode.test.ts), and reading the list back means
  * the assertions below evaluate the REAL rule instead of a copy of it.
  */
+// Rules a shell passes by name instead of inline (`useUIVisible('kpi-bar', KPI_BAR_DEFAULT_RULE)`),
+// because a plugin has to read the same default.
+const NAMED_RULES: Record<string, { hiddenIn?: readonly string[] }> = { KPI_BAR_DEFAULT_RULE };
+
 function hiddenInOf(source: string, id: string): string[] {
   const re = new RegExp(`useUIVisible\\('${id}',\\s*\\{\\s*hiddenIn:\\s*\\[([^\\]]*)\\]`);
   const m = re.exec(source);
-  if (!m) throw new Error(`no useUIVisible('${id}', { hiddenIn: […] }) in source`);
-  return [...m[1].matchAll(/'([^']*)'/g)].map((x) => x[1]);
+  if (m) return [...m[1].matchAll(/'([^']*)'/g)].map((x) => x[1]);
+  const named = new RegExp(`useUIVisible\\('${id}',\\s*([A-Z_]+)\\)`).exec(source);
+  const rule = named ? NAMED_RULES[named[1]] : undefined;
+  if (!rule?.hiddenIn) throw new Error(`no useUIVisible('${id}', { hiddenIn: […] }) in source`);
+  return [...rule.hiddenIn];
 }
 
 const shellShows = (source: string, id: string, ctx: ReadonlySet<string>) =>
@@ -308,17 +316,20 @@ describe('commissioningMode_OtherWorkspacesUnaffected', () => {
     }
   });
 
-  it('signal-bind keeps its four original modes and stays out of the viewer', () => {
+  it('signal-bind lives in the engineering modes and stays out of hmi, viewer and des', () => {
+    // Thomas, 2026-10-24: "Im HMI-Modus hat Signal-Linking nichts zu suchen."
+    // Thomas, 2026-10-27 (plan-2010): the two toolbar buttons are not in DES either.
     const [entry] = entriesFor(new SignalBindPlugin(), 'button-group');
     expect(entry.visibilityRule).toEqual({
       shownOnlyInAny: [
-        modeContext('hmi'), modeContext('planner'), modeContext('des'),
-        modeContext('editor'), modeContext('commissioning'),
+        modeContext('commissioning'), modeContext('editor'), modeContext('planner'),
       ],
     });
-    for (const m of ['hmi', 'planner', 'des', 'editor'] as ModeId[]) {
+    for (const m of ['commissioning', 'planner', 'editor'] as ModeId[]) {
       expect(buttonPanelShows(entry, ctxFor(m), m), m).toBe(true);
     }
+    expect(buttonPanelShows(entry, ctxFor('des'), 'des')).toBe(false);
+    expect(buttonPanelShows(entry, ctxFor('hmi'), 'hmi')).toBe(false);
     expect(buttonPanelShows(entry, ctxFor('viewer'), 'viewer')).toBe(false);
   });
 

@@ -1,0 +1,61 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
+// plan-559 Phase 0 M3 - PalletYard null measurement (DES FastForward, 8 h sim time, two runs).
+// Throwaway: lives outside tests/, read-only on pallet-yard/**. Sim time only; wall clock informative.
+import { describe, expect, it } from 'vitest';
+import { DESRunner } from '@rv/plugins/des/des-runner';
+import '@rv/behaviors/Conveyor';
+import '@rv/behaviors/Source';
+import '@rv/behaviors/Sink';
+import '@rv/behaviors/Agv';
+import { bindDesYard, startDesRuntime } from '__PUBLIC_ROOT__/src/plugins/models/PalletYard/index';
+import { expectNoWaitTimeouts } from '__PUBLIC_ROOT__/tests/fleet/expect-no-wait-timeouts';
+import { loadPalletYardScene } from '__PUBLIC_ROOT__/tests/des/pallet-yard-scene-load';
+
+const SIM_SEC = 8 * 3600;
+const VEHICLES = ['Stapler_1', 'Stapler_2', 'Stapler_3'];
+
+async function runOnce() {
+  const wall0 = performance.now();
+  const y = await loadPalletYardScene();
+  const runner = new DESRunner({ subMode: 'fastforward', durationSeconds: SIM_SEC });
+  try {
+    runner.start([], { root: y.root, host: y.host as never });
+    const r = bindDesYard({ runner, root: y.root, drives: y.drives });
+    if (!r.ok) throw new Error('bind: ' + r.missing.join(', '));
+    const rt = startDesRuntime(r.backend, () => {});
+    const mgr = runner.getManager() as unknown as { currentTime: number; isComplete: boolean; totalEventsProcessed: number };
+    const shipped = (): number => r.backend.sinkOf('V1')!.totalProcessed + r.backend.sinkOf('V2')!.totalProcessed;
+    const first50: Array<{ i: number; t: number; job: string }> = [];
+    // Exact sim time per started job: wrap the instance's logJob (runtime only, no source change).
+    const rtAny = rt as unknown as { logJob: (e: string) => void };
+    const origLog = rtAny.logJob.bind(rt);
+    let jobs = 0;
+    rtAny.logJob = (e: string) => { if (first50.length < 50) first50.push({ i: jobs, t: r.backend.clock.now(), job: e }); jobs++; origLog(e); };
+    let ticks = 0, idle = 0;
+    while (!mgr.isComplete) {
+      const before = mgr.totalEventsProcessed;
+      runner.tick(1 / 60); runner.lateTick(1 / 60); rt.frame(); ticks++;
+      idle = mgr.totalEventsProcessed === before ? idle + 1 : 0;
+      if (idle >= 3) throw new Error('stall at sim t=' + mgr.currentTime.toFixed(0));
+    }
+    expectNoWaitTimeouts(rt as never);   // plan-559 Phase 6: every wait timeout fails the run (Thomas 2026-10-28)
+    const c = rt.counters;
+    const perVehicle = Object.fromEntries(VEHICLES.map((id) => { const s = rt.stats(id)!; return [id, { ordersDone: s.ordersDone, charges: s.charges, minSoc: Math.round(s.minSoc * 1e6) / 1e6 }]; }));
+    return {
+      simTimeSec: mgr.currentTime, palletsShipped: shipped(), counters: { ...c }, perVehicle, first50,
+      waits: (rt as never as { fleetStats(): { waits: unknown } }).fleetStats().waits,
+      workCounters: { desEvents: mgr.totalEventsProcessed, jobsStarted: jobs, runnerTicks: ticks },
+      wallMsInformative: Math.round(performance.now() - wall0),
+    };
+  } finally { runner.dispose(); y.dispose(); }
+}
+
+describe('plan-559 M3 PalletYard null measurement', () => {
+  it('8 h DES FastForward, one run per process', async () => {
+    const a = await runOnce();
+    console.log('M3_RESULT ' + JSON.stringify(a));
+    expect(a.simTimeSec).toBeGreaterThanOrEqual(SIM_SEC - 1);
+    expect(a.palletsShipped).toBeGreaterThan(0);
+  }, 900_000);
+});

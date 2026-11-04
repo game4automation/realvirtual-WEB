@@ -13,13 +13,14 @@
  * the panel needs a left-panel manager, a cloud store and a full catalog before
  * it will paint a single card, none of which this behaviour depends on.
  *
- * Real timers, not fake ones — the component under test is MUI-based and the
- * intent window is 80 ms, so a couple of short real waits are cheaper and less
- * brittle than faking the clock underneath a transition-heavy tree.
+ * plan-602 F12: the intent timer runs on a FAKE clock. Real waits with a 120 ms
+ * margin failed under load (the suite's own parallel run starved the timer), so
+ * only `setTimeout`/`clearTimeout` are faked — after the render, so MUI's
+ * transitions keep their real clock — and the tests advance it explicitly.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { ReactNode } from 'react';
-import { render, screen, cleanup, fireEvent } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, act } from '@testing-library/react';
 import { ThemeProvider } from '@mui/material/styles';
 
 import { rvDarkTheme } from '../src/core/hmi/theme';
@@ -49,11 +50,12 @@ const VIRTUAL_ENTRY: LibraryCatalogEntry = {
   gizmoSize: [500, 500, 500],
 };
 
-/** Comfortably past the intent window, without being slow. */
+/** Past the intent window — on the fake clock, so the margin costs nothing. */
 const PAST_INTENT_MS = PREFETCH_INTENT_MS + 120;
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => { setTimeout(resolve, ms); });
+/** Advances the fake clock (the intent timer) past `ms`. */
+function advance(ms: number): void {
+  act(() => { vi.advanceTimersByTime(ms); });
 }
 
 function mockViewer(): RVViewer {
@@ -71,9 +73,13 @@ function mockPlugin() {
     // placement instancer under its ONE key derivation (plan-753): a url entry
     // is a decode-only warm-up (`bake: false`).
     prefetchEntry: prefetch,
-    store: { setPlacementMode: vi.fn() },
+    store: {
+      setPlacementMode: vi.fn(),
+      // The card reads its "preparing" state from the planner store.
+      subscribe: () => () => {},
+      getSnapshot: () => ({ preparingEntryIds: [] }),
+    },
     setDragEntry: vi.fn(),
-    saveThumbnail: vi.fn(async () => null),
     placeComponent: vi.fn(async () => null),
   } as unknown as LayoutPlannerPlugin;
   return { plugin, prefetch };
@@ -91,9 +97,11 @@ function renderCard(entry: LibraryCatalogEntry) {
   const viewer = mockViewer();
   const { plugin, prefetch } = mockPlugin();
   render(wrap(
-    <ThumbnailCard entry={entry} isPlacing={false} isPending={false} plugin={plugin} />,
+    <ThumbnailCard entry={entry} isPlacing={false} plugin={plugin} />,
     viewer,
   ));
+  // Fake only the timer pair the intent delay uses, and only from here on.
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   // The entry name is rendered as the card's caption — the most stable handle
   // onto the draggable Box (the card has no role of its own).
   const card = screen.getByText(entry.name).closest('div[draggable], div');
@@ -103,26 +111,28 @@ function renderCard(entry: LibraryCatalogEntry) {
 
 describe('plan-371 T9 — library hover-intent prefetch', () => {
   beforeEach(() => { try { localStorage.clear(); } catch { /* ignore */ } });
-  afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+  afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
-  it('does not prefetch for a pointer that only passes over the card', async () => {
+  it('does not prefetch for a pointer that only passes over the card', () => {
     const { card, prefetch } = renderCard(GLB_ENTRY);
 
     fireEvent.mouseEnter(card);
     fireEvent.mouseLeave(card);
-    await sleep(PAST_INTENT_MS);
+    advance(PAST_INTENT_MS);
 
     expect(prefetch).not.toHaveBeenCalled();
   });
 
-  it('prefetches once the pointer has rested for the intent delay', async () => {
+  it('prefetches once the pointer has rested for the intent delay', () => {
     const { card, prefetch } = renderCard(GLB_ENTRY);
 
     fireEvent.mouseEnter(card);
     // Nothing yet — the whole point is that the request is deferred.
     expect(prefetch).not.toHaveBeenCalled();
+    advance(PREFETCH_INTENT_MS - 1);
+    expect(prefetch).not.toHaveBeenCalled();
 
-    await sleep(PAST_INTENT_MS);
+    advance(PAST_INTENT_MS);
     expect(prefetch).toHaveBeenCalledTimes(1);
     expect(prefetch).toHaveBeenCalledWith(GLB_ENTRY, { bake: false });
   });
@@ -138,11 +148,11 @@ describe('plan-371 T9 — library hover-intent prefetch', () => {
     expect(prefetch).toHaveBeenCalledWith(GLB_ENTRY, { bake: false });
   });
 
-  it('does not double-fire when a rested hover is followed by pointerdown', async () => {
+  it('does not double-fire when a rested hover is followed by pointerdown', () => {
     const { card, prefetch } = renderCard(GLB_ENTRY);
 
     fireEvent.mouseEnter(card);
-    await sleep(PAST_INTENT_MS);
+    advance(PAST_INTENT_MS);
     fireEvent.pointerDown(card);
 
     // The second call is harmless (prefetch is idempotent per url) but it
@@ -150,22 +160,32 @@ describe('plan-371 T9 — library hover-intent prefetch', () => {
     expect(prefetch).toHaveBeenCalledTimes(2);
   });
 
-  it('never prefetches a virtual entry — it has no GLB to warm', async () => {
+  it('never prefetches a virtual entry — it has no GLB to warm', () => {
     const { card, prefetch } = renderCard(VIRTUAL_ENTRY);
 
     fireEvent.mouseEnter(card);
     fireEvent.pointerDown(card);
-    await sleep(PAST_INTENT_MS);
+    advance(PAST_INTENT_MS);
 
     expect(prefetch).not.toHaveBeenCalled();
   });
 
-  it('drops a scheduled prefetch when the card unmounts mid-intent', async () => {
+  it('never prefetches a noPrefetch entry — its resolve converts server-side (plan-660)', () => {
+    const { card, prefetch } = renderCard({ ...GLB_ENTRY, id: 'simready:a/b/APM2@' + 'c'.repeat(40), glbUrl: undefined, noPrefetch: true });
+
+    fireEvent.mouseEnter(card);
+    fireEvent.pointerDown(card);
+    advance(PAST_INTENT_MS);
+
+    expect(prefetch).not.toHaveBeenCalled();
+  });
+
+  it('drops a scheduled prefetch when the card unmounts mid-intent', () => {
     const { card, prefetch } = renderCard(GLB_ENTRY);
 
     fireEvent.mouseEnter(card);
     cleanup();
-    await sleep(PAST_INTENT_MS);
+    advance(PAST_INTENT_MS);
 
     expect(prefetch).not.toHaveBeenCalled();
   });

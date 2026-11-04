@@ -26,22 +26,22 @@ describe('feature matrix user toggles', () => {
     harness.addPlugin({ id: 'project-tool' }, 'project');
     render(<FeatureMatrixPanel viewer={harness.viewer} />);
 
-    const switchInput = within(rowFor('project-tool')).getByRole('switch', { name: 'project-tool ausschalten' });
+    const switchInput = within(rowFor('project-tool')).getByRole('switch', { name: 'project-tool switch off' });
     expect((switchInput as HTMLInputElement).checked).toBe(true);
     fireEvent.click(switchInput);
 
     expect(harness.userToggleCalls).toEqual([{ id: 'project-tool', enabled: false }]);
     await waitFor(() => {
       expect((within(rowFor('project-tool')).getByRole('switch', {
-        name: 'project-tool einschalten',
+        name: 'project-tool switch on',
       }) as HTMLInputElement).checked).toBe(false);
-      expect(within(rowFor('project-tool')).getByText('ausgeschaltet')).toBeTruthy();
+      expect(within(rowFor('project-tool')).getByText('switched off')).toBeTruthy();
     });
 
     harness.setPluginUserEnabled('project-tool', true);
     await waitFor(() => {
       const input = within(rowFor('project-tool')).getByRole('switch', {
-        name: 'project-tool ausschalten',
+        name: 'project-tool switch off',
       }) as HTMLInputElement;
       expect(input.checked).toBe(true);
     });
@@ -55,9 +55,9 @@ describe('feature matrix user toggles', () => {
 
     for (const id of ['feature-matrix', 'asset-editor']) {
       const row = within(rowFor(id));
-      expect((row.getByRole('switch', { name: `${id} ausschalten` }) as HTMLInputElement).disabled).toBe(true);
+      expect((row.getByRole('switch', { name: `${id} switch off` }) as HTMLInputElement).disabled).toBe(true);
       expect(row.getByLabelText('Protected').getAttribute('tabindex')).toBe('0');
-      fireEvent.click(row.getByRole('switch', { name: `${id} ausschalten` }));
+      fireEvent.click(row.getByRole('switch', { name: `${id} switch off` }));
     }
     expect(harness.userToggleCalls).toEqual([]);
   });
@@ -68,13 +68,13 @@ describe('feature matrix user toggles', () => {
     render(<FeatureMatrixPanel viewer={harness.viewer} />);
 
     for (let index = 0; index < 20; index++) {
-      const action = index % 2 === 0 ? 'ausschalten' : 'einschalten';
+      const action = index % 2 === 0 ? 'switch off' : 'switch on';
       fireEvent.click(within(rowFor('rapid')).getByRole('switch', { name: `rapid ${action}` }));
     }
 
     await waitFor(() => {
       const input = within(rowFor('rapid')).getByRole('switch', {
-        name: 'rapid ausschalten',
+        name: 'rapid switch off',
       }) as HTMLInputElement;
       expect(input.checked).toBe(true);
     });
@@ -92,9 +92,9 @@ describe('feature matrix user toggles', () => {
 
     const row = rowFor('planner-only');
     expect((within(row).getByRole('switch', {
-      name: 'planner-only ausschalten',
+      name: 'planner-only switch off',
     }) as HTMLInputElement).checked).toBe(true);
-    expect(within(row).getByText('nicht in diesem Modus')).toBeTruthy();
+    expect(within(row).getByText('not in this mode')).toBeTruthy();
     expect(getComputedStyle(row).opacity).toBe('0.62');
   });
 });

@@ -40,7 +40,7 @@
  * is a callback and not a prop of bytes.
  */
 
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
   Alert,
   Box,
@@ -68,6 +68,8 @@ import { ContentCopy, Check, Link as LinkIcon } from '@mui/icons-material';
 
 import {
   SHARE_TERMS_VERSION,
+  fetchShareLimits,
+  type ShareLimits,
   clearShareDraft,
   describeShareApiError,
   getShareSession,
@@ -180,6 +182,39 @@ export function ShareDialog({
     setTerms(draft.terms);
   }, [open]);
 
+  const [limitsResult, setLimitsResult] = useState<{ token?: string; limits: ShareLimits | null } | null>(null);
+  const [limitsRevision, setLimitsRevision] = useState(0);
+  const limitsRequest = useRef(0);
+  const refreshLimits = useCallback(() => setLimitsRevision(n => n + 1), []);
+  useEffect(() => {
+    const request = ++limitsRequest.current;
+    setLimitsResult(null);
+    if (!open) return;
+    const token = session?.token;
+    void fetchShareLimits().then(limits => {
+      if (request !== limitsRequest.current || getShareSession()?.token !== token) return;
+      setLimitsResult({ token, limits });
+    });
+    return () => { ++limitsRequest.current; };
+  }, [open, session, limitsRevision]);
+  // Three states, never conflated: `loading` until the answer for the CURRENT
+  // session is in, `loaded` with the server's limits, `fallback` once the request
+  // failed or the server has no /limits. Only the fallback offers the four
+  // historic lifetimes — while loading there is no lifetime and so no upload,
+  // otherwise a click could beat a reply with `expiries: []` or a restricted list.
+  const currentLimits = limitsResult && limitsResult.token === session?.token ? limitsResult : null;
+  const limitsState: 'loading' | 'loaded' | 'fallback' = !currentLimits
+    ? 'loading' : currentLimits.limits ? 'loaded' : 'fallback';
+  const limits = currentLimits?.limits ?? null;
+  const expiryOptions = limitsState === 'loaded' && limits
+    ? limits.expiries.flatMap(value => EXPIRY_LABELS.filter(option => option.value === value))
+    : limitsState === 'fallback' ? EXPIRY_LABELS : [];
+  const validExpiry = expiryOptions.some(option => option.value === expiry)
+    ? expiry : expiryOptions[0]?.value;
+  useEffect(() => {
+    if (validExpiry && validExpiry !== expiry) setExpiry(validExpiry);
+  }, [validExpiry, expiry]);
+
   const persistDraft = useCallback(() => {
     saveShareDraft({ name, author, license, target, ownUrl, expiry, allowDownload, terms });
   }, [name, author, license, target, ownUrl, expiry, allowDownload, terms]);
@@ -197,7 +232,7 @@ export function ShareDialog({
 
   const canShare = target === 'own-url'
     ? ownUrl.trim().length > 0
-    : Boolean(terms);
+    : Boolean(terms) && Boolean(validExpiry);
 
   /**
    * Link options for BOTH builders — one always-present object rather than the
@@ -222,7 +257,7 @@ export function ShareDialog({
       const result = await uploadSharedGlb(bytes, meta, {
         session: active,
         terms: accepted,
-        expiry,
+        expiry: validExpiry!,
         allowDownload,
         filename: name,
         onProgress: p => setPhase(p.phase),
@@ -231,13 +266,14 @@ export function ShareDialog({
       setExpiresAt(result.expiresAt);
       clearShareDraft();
       setView('done');
+      refreshLimits();
     } catch (e) {
       setError(describeShareApiError(e));
       setView('form');
     } finally {
       setBusy(false);
     }
-  }, [getBytes, meta, expiry, allowDownload, name, linkOptions]);
+  }, [getBytes, meta, validExpiry, allowDownload, name, linkOptions, refreshLimits]);
 
   const handleShare = useCallback(async () => {
     setError(null);
@@ -256,7 +292,7 @@ export function ShareDialog({
     }
 
     const accepted = terms;
-    if (!accepted) return;          // button is disabled; belt and braces (F9c)
+    if (!accepted || !validExpiry) return;          // button is disabled; belt and braces (F9c)
 
     const active = getShareSession();
     if (!active) {
@@ -267,7 +303,7 @@ export function ShareDialog({
       return;
     }
     await doUpload(active, accepted);
-  }, [target, ownUrl, terms, persistDraft, doUpload, linkOptions]);
+  }, [target, ownUrl, terms, validExpiry, persistDraft, doUpload, linkOptions]);
 
   const handleRequestMail = useCallback(async () => {
     setError(null);
@@ -313,7 +349,7 @@ export function ShareDialog({
         {error && <Alert severity="error" sx={{ mb: 1.5 }} data-testid="share-error">{error}</Alert>}
 
         {view === 'shares' && session && (
-          <MySharesPanel session={session} />
+          <MySharesPanel session={session} onDeleted={refreshLimits} />
         )}
 
         {view === 'form' && (
@@ -390,13 +426,23 @@ export function ShareDialog({
 
             {target === 'upload' && (
               <>
+                <Typography sx={{ fontSize: 12 }} data-testid="share-limits">
+                  {limitsState === 'loaded' && limits ? <>
+                    Maximum file size: {formatSize(limits.maxFileBytes)}. Storage quota: {formatSize(limits.quotaBytes)}.
+                    {limits.usedBytes !== undefined && ` Used: ${limits.usedBytes === 0 ? '0 KB' : formatSize(limits.usedBytes)}.`}
+                    {` Link lifetimes: ${expiryOptions.map(option => option.label).join(', ') || 'none'}.`}
+                  </> : limitsState === 'fallback'
+                    ? 'Upload size and storage are limited per account; exceeding a limit is reported before anything is stored.'
+                    : 'Loading upload limits…'}
+                </Typography>
+                {limitsState === 'loaded' && !validExpiry && <Alert severity="info">Sharing is currently not available for your account.</Alert>}
                 <FormControl>
                   <FormLabel sx={{ fontSize: 12 }}>Delete automatically</FormLabel>
                   <RadioGroup
-                    row value={expiry}
+                    row value={validExpiry ?? ''}
                     onChange={e => setExpiry(e.target.value as ShareExpiry)}
                   >
-                    {EXPIRY_LABELS.map(o => (
+                    {expiryOptions.map(o => (
                       <FormControlLabel
                         key={o.value} value={o.value}
                         control={<Radio size="small" inputProps={{ 'data-testid': `share-expiry-${o.value}` } as never} />}

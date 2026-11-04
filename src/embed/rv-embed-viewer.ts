@@ -46,7 +46,8 @@ import {
 import { BakeRegistry } from '../core/engine/rv-bake-registry';
 import { buildInitContext, type InitContextBase, type InitSubsystems } from '../core/engine/rv-init-context';
 import { collectDeferredPlacements, type PlacementInstancer } from '../core/engine/rv-placement-instancer';
-import { createViewerPlacementInstancer, type PlacementHost } from '../core/engine/rv-placement-integrate';
+import { createViewerPlacementInstancer, mergePlacedLogic, type PlacementHost } from '../core/engine/rv-placement-integrate';
+import { lazyCoreComponentFeatures } from '../core/engine/rv-lazy-core-components';
 import { createUberMaterial, type RVUberMaterial } from '../core/engine/rv-uber-material';
 import type { RVLogicEngine } from '../core/engine/rv-logic-engine';
 import { SimulationLoop } from '../core/engine/rv-simulation-loop';
@@ -267,6 +268,12 @@ export class RVEmbedViewer {
   /** ONE uber material per embed session — the loader and the placement bake must share it (plan-752 S2). */
   private uber: RVUberMaterial | null = null;
   private ikPaths: RVIKPath[] = [];
+  /**
+   * The LogicStep engine of the current model (plan-769 Phase 6): created by the
+   * first `mergePlacedLogic` — a placement's, or the model's own once its scene
+   * is complete (`loadModel`). The loader builds no logic any more.
+   */
+  private logicEngine: RVLogicEngine | null = null;
   private readonly core: CoreSubsystems;
   private runner: ContinuousRunner | null = null;
   private dprCap: number;
@@ -351,7 +358,7 @@ export class RVEmbedViewer {
     this.core = new CoreSubsystems({
       get isConnected() { return false; },
       get playback() { return viewer.result?.playback ?? null; },
-      get logicEngine() { return viewer.result?.logicEngine ?? null; },
+      get logicEngine() { return viewer.logicEngine; },
       get ikPaths() { return viewer.ikPaths; },
       get replayRecordings() { return viewer.result?.replayRecordings ?? []; },
       get drives() { return viewer.result?.drives ?? []; },
@@ -400,12 +407,14 @@ export class RVEmbedViewer {
     const noDrives: LoadResult['drives'] = [];
     return {
       get scene() { return viewer.scene; },
+      // plan-2227: a placed asset may carry a SignalConnector too.
+      features: lazyCoreComponentFeatures,
       get registry() { return viewer.result?.registry ?? null; },
       get signalStore() { return viewer.result?.signalStore ?? null; },
       get transportManager() { return viewer.result?.transportManager ?? null; },
       get drives() { return viewer.result?.drives ?? noDrives; },
-      get logicEngine(): RVLogicEngine | null { return viewer.result?.logicEngine ?? null; },
-      set logicEngine(engine: RVLogicEngine | null) { if (viewer.result) viewer.result.logicEngine = engine; },
+      get logicEngine(): RVLogicEngine | null { return viewer.logicEngine; },
+      set logicEngine(engine: RVLogicEngine | null) { if (viewer.result) viewer.logicEngine = engine; },
       groups: null,
       get bakeRegistry() { return viewer.bakeRegistry; },
       get placementUberMaterial() { return viewer.uber; },
@@ -454,6 +463,8 @@ export class RVEmbedViewer {
       sharedUber: this.uber,
       allowUntrustedLogic: true,
       loadKinematicsSidecar: false,
+      // plan-2227: on-demand core components (SignalConnector) — the embed has no FeatureLoader.
+      features: lazyCoreComponentFeatures,
       // plan-757 Phase 2b (F8): a reference is a placement here as well — the
       // loader leaves every reference node empty and `this.placements` fills
       // them in below, through the same recipe the main viewer uses.
@@ -493,6 +504,11 @@ export class RVEmbedViewer {
     if (this.disposed || this.lifecycleSignal.aborted || generation !== this.loadGeneration) {
       throw new DOMException('RVEmbedViewer load aborted', 'AbortError');
     }
+    // plan-769 Phase 6 (D20): the model's own LogicSteps, built ONCE against the
+    // complete scene through the function a placement uses — a step addressed
+    // into a placed asset finds its target. (Placement content is skipped: each
+    // placement merged its own steps at its integration.)
+    mergePlacedLogic(this.placementHost(), result.root);
     this.sceneScale.invalidate();
     this.fitCamera();
     this.renderOnce();
@@ -1162,6 +1178,9 @@ export class RVEmbedViewer {
     // the load result's own teardown frees the tree they hang in.
     this.placements?.clearDocument();
     this.result = null;
+    // The model's engine (its own steps and its placements') goes with it.
+    try { this.logicEngine?.reset(); } catch { /* continue teardown */ }
+    this.logicEngine = null;
     if (!current) return;
     this.disposeLoadResult(current);
   }
@@ -1178,7 +1197,6 @@ export class RVEmbedViewer {
       if (loadResult.bakedAsset.instances === 0) loadResult.bakedAsset.dispose();
     }
     try { loadResult.playback?.stop(); } catch { /* continue teardown */ }
-    try { loadResult.logicEngine?.reset(); } catch { /* continue teardown */ }
     try { loadResult.transportManager.reset(); } catch { /* continue teardown */ }
     disposeComponentsInSubtree(loadResult.registry, loadResult.root);
     loadResult.registry.clear();

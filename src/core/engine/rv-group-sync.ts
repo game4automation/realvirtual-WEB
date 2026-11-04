@@ -49,8 +49,15 @@ export function resolveGroupName(
   if (data['_enabled'] === false) return null;
   const groupName = data['GroupName'];
   if (typeof groupName !== 'string' || groupName.length === 0) return null;
-  const prefix = data['GroupNamePrefix'];
-  if (typeof prefix === 'string' && prefix.length > 0) {
+  // A path string or a reference object carrying `path` — the two spellings the
+  // load-time `Group` / `Kinematic` hooks accept (`rv-pre-bake-hooks.ts`).
+  const prefixRef = data['GroupNamePrefix'];
+  const prefix = typeof prefixRef === 'string'
+    ? prefixRef
+    : (prefixRef && typeof prefixRef === 'object' && typeof (prefixRef as { path?: unknown }).path === 'string'
+      ? (prefixRef as { path: string }).path
+      : '');
+  if (prefix.length > 0) {
     const prefixNode = registry?.getNode(prefix) ?? null;
     if (prefixNode) return prefixNode.name + groupName;
   }

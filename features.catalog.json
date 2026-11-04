@@ -1,0 +1,339 @@
+{
+  "$comment": "Public presentation of the realvirtual WEB editions (plan-646). Labels, groups, summaries and links live here; the licence tier and the beta status of a commercial row come ONLY from the private tier manifest, referenced through `ids`. Never add a tier here, and never add a restricted or internal registration (not even with public:false). Generate with `npm run features:generate`.",
+  "version": 1,
+  "editions": {
+    "community": "Community (AGPL)",
+    "commercial": "Commercial",
+    "demo": "Public demo"
+  },
+  "groups": [
+    { "id": "visualize", "label": "Visualize & HMI" },
+    { "id": "simulate", "label": "Simulate" },
+    { "id": "build", "label": "Build the twin" },
+    { "id": "connect", "label": "Connect" },
+    {
+      "id": "interfaces",
+      "label": "Industrial interfaces (realvirtual CONNECT)",
+      "note": "* with a realvirtual CONNECT licence (annual or lifetime) or a licensed realvirtual site. Every tier supports every protocol."
+    },
+    { "id": "integrate", "label": "Integrate" }
+  ],
+  "rows": [
+    {
+      "id": "viewer-hmi",
+      "label": "3D viewer and HMI (GLB with rv_extras, panels, overlays, camera views, PDF links, machine information)",
+      "group": "visualize",
+      "summary": "Opens realvirtual GLB models in the browser and adds operator panels, overlays, camera views and documents linked to machine parts.",
+      "edition": "community",
+      "docs": "hmi/overview/",
+      "demo": { "doc": "doc_demorealvirtualweb_7l7hfw", "mode": "hmi" }
+    },
+    {
+      "id": "webxr",
+      "label": "WebXR (VR/AR in the browser)",
+      "group": "visualize",
+      "summary": "Shows the twin in VR and AR on browsers and devices that support WebXR.",
+      "edition": "community"
+    },
+    {
+      "id": "cinematic",
+      "label": "Cinematic rendering and video recording",
+      "group": "visualize",
+      "summary": "Renders path-traced frames and records videos of the running twin.",
+      "ids": ["cinematic-render", "video-record-ui"],
+      "docs": "getting-started/viewer/cinematic-videos/"
+    },
+    {
+      "id": "virtual-camera",
+      "label": "Virtual camera displays",
+      "group": "visualize",
+      "summary": "Shows the live image of a camera placed in the scene on a display in the twin.",
+      "ids": ["virtual-camera"]
+    },
+    {
+      "id": "stereo",
+      "label": "Stereo 3D",
+      "group": "visualize",
+      "summary": "Shows the twin in side-by-side stereo on a compatible 3D display.",
+      "ids": ["stereo"],
+      "docs": "immersive/stereo-3d/"
+    },
+    {
+      "id": "display-wall",
+      "label": "Display walls",
+      "group": "visualize",
+      "summary": "Renders calibrated views for LED walls and projectors with optional head tracking.",
+      "ids": ["display-wall"],
+      "docs": "immersive/display-wall/"
+    },
+    {
+      "id": "flystick",
+      "label": "Flystick control",
+      "group": "visualize",
+      "summary": "Uses an ART Flystick to point, select, move parts and navigate at a display wall.",
+      "ids": ["flystick"],
+      "docs": "immersive/display-wall/#use-flysticks"
+    },
+    {
+      "id": "guided-maintenance",
+      "label": "Guided maintenance (the machine follows the steps)",
+      "group": "visualize",
+      "summary": "Animates the machine through a step-by-step maintenance guide: doors open, housings turn transparent, coolant sprays, parts unscrew, and every step can be replayed backwards.",
+      "ids": ["maintenance-runtime"],
+      "docs": "hmi/guided-maintenance/"
+    },
+    {
+      "id": "transport-sim",
+      "label": "Transport simulation (drives, sensors, conveyors, sources/sinks, grippers, LogicSteps)",
+      "group": "simulate",
+      "summary": "Simulates material flow in the browser at a fixed time step with drives, sensors, conveyors, sources, sinks, grippers and LogicStep sequences.",
+      "edition": "community",
+      "docs": "components/material-flow/"
+    },
+    {
+      "id": "collision",
+      "label": "Collision detection",
+      "group": "simulate",
+      "summary": "Checks bodies with different collision roles against each other while the simulation runs.",
+      "edition": "community",
+      "docs": "components/collision-detection/"
+    },
+    {
+      "id": "smooth-motion",
+      "label": "Smooth drive motion",
+      "group": "simulate",
+      "summary": "Moves drives along jerk-limited motion profiles.",
+      "ids": ["smooth-motion"]
+    },
+    {
+      "id": "motion-trail",
+      "label": "Motion trail (swept volume)",
+      "group": "simulate",
+      "summary": "Visualizes the swept volume of moving parts during simulation.",
+      "ids": ["motion-trail"],
+      "public": false
+    },
+    {
+      "id": "physics",
+      "label": "Physics",
+      "group": "simulate",
+      "summary": "Simulates parts with rigid-body physics.",
+      "ids": ["physics"],
+      "docs": "components/physics/"
+    },
+    {
+      "id": "detail-physics",
+      "label": "Detail physics (MuJoCo)",
+      "group": "simulate",
+      "summary": "Simulates contact, friction and force-limited axes in detail: a gripper that holds by contact and can slip, a part that jams in a fixture, a free body that gets shoved out of place.",
+      "ids": ["mujoco"],
+      "docs": "components/detail-physics/",
+      "demo": {"doc": "doc_mujocowalker_15i4u8p", "mode": "commissioning"}
+    },
+    {
+      "id": "des",
+      "label": "Discrete event simulation",
+      "group": "simulate",
+      "summary": "Runs event-driven material flow simulations much faster than real time, with statistics, snapshots and scripts. The experiment manager (variants, repeated runs, run comparison) is Commercial.",
+      "edition": "community",
+      "docs": "des/overview/",
+      "demo": { "doc": "doc_test-des-turntable-loop_1y3v7m0", "mode": "des" }
+    },
+    {
+      "id": "des-experiments",
+      "label": "DES experiment manager",
+      "group": "simulate",
+      "summary": "Compares variants with replication matrices, batch runs, confidence intervals and experiment export/import.",
+      "ids": ["des-experiments"],
+      "docs": "des/experiments/",
+      "demo": { "doc": "doc_palletyard_hzmdb6", "mode": "des" }
+    },
+    {
+      "id": "machining",
+      "label": "Machining simulation",
+      "group": "simulate",
+      "summary": "Simulates material removal on a workpiece.",
+      "ids": ["machining"],
+      "docs": "components/machining/"
+    },
+    {
+      "id": "virtual-plc",
+      "label": "Virtual PLC (Structured Text in the browser)",
+      "group": "simulate",
+      "summary": "Programs and runs Structured Text PLC logic directly in the browser.",
+      "ids": ["plc"],
+      "docs": "components/virtual-plc/",
+      "demo": { "doc": "doc_laserweldingassemblystation_1n66y05", "mode": "commissioning" }
+    },
+    {
+      "id": "layout-planner",
+      "label": "Layout planner",
+      "group": "build",
+      "summary": "Assembles factory layouts in the browser from library parts connected by snap points.",
+      "edition": "community",
+      "docs": "planner/overview/",
+      "demo": { "doc": "doc_demoplanner_gf4m6v", "mode": "planner" }
+    },
+    {
+      "id": "editor",
+      "label": "Asset and kinematics editor",
+      "group": "build",
+      "summary": "Groups parts, assigns materials, creates drives and saves the result as a GLB in the browser.",
+      "ids": ["asset-editor"],
+      "docs": "editor/overview/"
+    },
+    {
+      "id": "cad-import",
+      "label": "CAD import (STEP, JT, USD, FBX, Onshape, Unity Asset Manager)",
+      "group": "build",
+      "summary": "Imports CAD data from common formats and sources into the editor.",
+      "ids": ["step-import", "jt-import", "usd-import", "simready-import", "fbx-import", "onshape-import", "asset-manager-import"],
+      "docs": "editor/importing/"
+    },
+    {
+      "id": "robot-ik",
+      "label": "Robot inverse kinematics",
+      "group": "build",
+      "summary": "Solves the joint positions of a robot for a target pose.",
+      "ids": ["ik-solver"]
+    },
+    {
+      "id": "mechanisms",
+      "label": "Kinematic mechanisms (cranks, couplers, parallel kinematics)",
+      "group": "build",
+      "summary": "Solves closed-loop mechanisms such as cranks, couplers and parallel kinematics.",
+      "ids": ["kinematic-mechanism"],
+      "docs": "components/mechanism/",
+      "demo": { "doc": "doc_autonox-delta-rl5-1900-6kg_torq7x", "mode": "commissioning" }
+    },
+    {
+      "id": "signals-plc",
+      "label": "Signals and PLC connectivity (WebSocket, MQTT, ctrlX, REST; drag-and-drop signal linking)",
+      "group": "connect",
+      "summary": "Connects the twin to live PLC signals over WebSocket, MQTT, ctrlX and REST, with drag-and-drop signal linking.",
+      "edition": "community",
+      "docs": "commissioning/connect-a-plc/"
+    },
+    {
+      "id": "multiuser",
+      "label": "Multiuser sessions",
+      "group": "connect",
+      "summary": "Lets several people work in one twin at the same time with avatars and shared views.",
+      "edition": "community",
+      "status": "beta",
+      "docs": "getting-started/multi-user-sessions/"
+    },
+    {
+      "id": "iface-siemens",
+      "label": "Siemens (S7, PLCSIM Advanced)",
+      "group": "interfaces",
+      "summary": "Couples S7-300/400/1200/1500 controllers over S7comm and PLCSIM Advanced instances through the native Siemens simulation API.",
+      "docs": "connect/interfaces/protocols/#siemens-s7",
+      "cells": {
+        "community": "Free tier: 20 signals",
+        "commercial": "Unlimited*",
+        "demo": "Free tier: 20 signals"
+      }
+    },
+    {
+      "id": "iface-open-standards",
+      "label": "OPC UA, MQTT, Modbus TCP (client and server)",
+      "group": "interfaces",
+      "summary": "Connects to any OPC UA server, to MQTT brokers (single values, Siemens process images), to SEW MOVI-C over MQTT JSON or UDP and to Modbus TCP devices, or acts as a Modbus TCP server for a PLC or SCADA system.",
+      "docs": "connect/interfaces/protocols/",
+      "cells": {
+        "community": "Free tier: 20 signals",
+        "commercial": "Unlimited*",
+        "demo": "Free tier: 20 signals"
+      }
+    },
+    {
+      "id": "iface-controllers",
+      "label": "Controllers (Beckhoff TwinCAT ADS, EtherNet/IP for Allen-Bradley and Omron, B&R PVI, Mitsubishi MELSEC, Keba, Festo AX / PLCnext, Bosch Rexroth ctrlX)",
+      "group": "interfaces",
+      "summary": "Reads and writes controller variables by symbol, tag or address; most controllers can be browsed, so signals are selected rather than typed.",
+      "docs": "connect/interfaces/protocols/",
+      "cells": {
+        "community": "Free tier: 20 signals",
+        "commercial": "Unlimited*",
+        "demo": "Free tier: 20 signals"
+      }
+    },
+    {
+      "id": "iface-robots",
+      "label": "Robots (FANUC, KUKA, ABB, Universal Robots, Denso, igus, RoboDK, Wandelbots NOVA)",
+      "group": "interfaces",
+      "summary": "Couples robot controllers and their virtual controllers (RoboGuide, OfficeLite, iiQKA/RSI, RobotStudio, URSim, WinCaps VRC) for IOs and joint positions.",
+      "docs": "connect/interfaces/protocols/",
+      "cells": {
+        "community": "Free tier: 20 signals",
+        "commercial": "Unlimited*",
+        "demo": "Free tier: 20 signals"
+      }
+    },
+    {
+      "id": "iface-simulation",
+      "label": "Simulation and custom couplings (SIMIT, WINMOD, shared memory, UDP telegrams, WebSocket Realtime)",
+      "group": "interfaces",
+      "summary": "Couples simulation tools on the same PC through shared memory, exchanges fixed binary UDP telegrams, and links realvirtual for Unity or another CONNECT over WebSocket.",
+      "docs": "connect/interfaces/protocols/",
+      "cells": {
+        "community": "Free tier: 20 signals",
+        "commercial": "Unlimited*",
+        "demo": "Free tier: 20 signals"
+      }
+    },
+    {
+      "id": "iface-cad-conversion",
+      "label": "CAD conversion (STEP, JT)",
+      "group": "interfaces",
+      "summary": "Converts large STEP and JT files to GLB on the gateway, for the CAD import of the asset editor.",
+      "docs": "connect/services/cad-conversion/",
+      "cells": {
+        "community": "Not included (CAD import is part of the editor)",
+        "commercial": "Unlimited*",
+        "demo": "Free tier: 25 MB STEP / 12 MB JT"
+      }
+    },
+    {
+      "id": "ai-mcp",
+      "label": "Plugin system and MCP bridge for AI assistants",
+      "group": "integrate",
+      "summary": "Extends the viewer with plugins and lets AI assistants inspect and operate the twin through MCP.",
+      "edition": "community",
+      "docs": "connect/development/ai-bridge/"
+    },
+    {
+      "id": "isaac-live-link",
+      "label": "USD live link to NVIDIA Isaac Sim (incl. Kit extension)",
+      "group": "integrate",
+      "summary": "Mirrors the running twin live into NVIDIA Isaac Sim through a Kit extension.",
+      "edition": "community",
+      "docs": "physical-ai/isaac-sim-live-link/"
+    },
+    {
+      "id": "usd-export",
+      "label": "USD export",
+      "group": "integrate",
+      "summary": "Exports the twin as USD including its realvirtual component data.",
+      "ids": ["usd-export"],
+      "docs": "physical-ai/isaac-sim-live-link/"
+    },
+    {
+      "id": "ai-prompt",
+      "label": "AI prompt window (Claude Code CLI)",
+      "group": "integrate",
+      "summary": "Runs the local Claude Code CLI from a prompt window in the viewer.",
+      "ids": ["ai-prompt"],
+      "public": false
+    },
+    {
+      "id": "internal-tools",
+      "label": "Internal tools (diagnostics, feature matrix, share decryption, SolidCraft sync)",
+      "group": "integrate",
+      "summary": "Supporting infrastructure that is counted as commercial but not presented as a feature.",
+      "ids": ["diagnostics", "feature-matrix", "share-decrypt", "solidcraft-sync", "dxf-import"],
+      "public": false
+    }
+  ]
+}

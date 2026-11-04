@@ -1,0 +1,70 @@
+{
+  "plan": "645",
+  "measurement": "S10 soak scale: PalletYard soak (3 sim days) + plan-559 M3 (8 h), each in its own vitest process",
+  "date": "2026-10-21",
+  "state": {
+    "webviewer": "95ed3489",
+    "private": "feature/plan-645-l3 (L3: DesSimClock on scheduleCallback/onLifecycle)",
+    "note": "Values identical before L3 (origin/main PRIV 9d025e8) and after L3, measured 2026-10-21 in E:/rv-worktrees/645-des-lifecycle. Original fix point: soak at WV 8c852f82 / PRIV d0693f8, M3 at assets/plan-559/baseline-palletyard.json."
+  },
+  "runner": "tests/des/pallet-yard-s10-compare.node.test.ts",
+  "soak": {
+    "test": "tests/des/pallet-yard-soak.test.ts",
+    "invocation": "node node_modules/vitest/vitest.mjs run tests/des/pallet-yard-soak.test.ts",
+    "configuration": "public/demo-realvirtual/PalletYard.glb via tests/des/pallet-yard-scene-load.ts, DESRunner fastforward, bindDesYard + startDesRuntime, tick 1/60",
+    "seed": "DESRunner default master seed (deterministic)",
+    "simDurationSec": 259200,
+    "resultLine": "SOAK_RESULT",
+    "expected": {
+      "days": 3,
+      "simTimeSec": 259200,
+      "produced": 3797,
+      "shipped": 3787,
+      "picks": 3795,
+      "stored": 8,
+      "retrieved": 2,
+      "desEvents": 398106,
+      "perVehicle": {
+        "Stapler_1": {
+          "ordersDone": 1408,
+          "charges": 80,
+          "minSoc": 26.64274
+        },
+        "Stapler_2": {
+          "ordersDone": 1252,
+          "charges": 93,
+          "minSoc": 26.196187
+        },
+        "Stapler_3": {
+          "ordersDone": 1136,
+          "charges": 112,
+          "minSoc": 26.951463
+        }
+      },
+      "deadHours": [],
+      "stuck": [],
+      "problems": [],
+      "serviceOvershoot": 0,
+      "turnGuardTrips": 0
+    }
+  },
+  "m3": {
+    "script": "m3-palletyard.test.ts.txt",
+    "config": "vitest.m3.config.ts.txt",
+    "scriptPathPrefix": "__PUBLIC_ROOT__/",
+    "baseline": "baseline-palletyard.json",
+    "configuration": "DESRunner fastforward 28800 s, bindDesYard + startDesRuntime, tick 1/60",
+    "seed": "DESRunner default master seed (deterministic)",
+    "simDurationSec": 28800,
+    "resultLine": "M3_RESULT",
+    "compare": [
+      "simTimeSec",
+      "palletsShipped",
+      "counters",
+      "perVehicle",
+      "first50",
+      "workCounters.desEvents",
+      "workCounters.jobsStarted"
+    ]
+  }
+}

@@ -1,0 +1,911 @@
+{
+  "plan": 673,
+  "phase": 1,
+  "generatedAt": "2026-10-24T11:43:46.806Z",
+  "node": "v24.18.0",
+  "platform": "win32-x64",
+  "clock": {
+    "minTickUs": 0.09999999997489795,
+    "medianTickUs": 0.10000000000331966,
+    "p99TickUs": 0.2000000000066393
+  },
+  "hullMinWidthMm": 83.66025403784438,
+  "model": {
+    "nq": 22,
+    "nv": 20,
+    "nu": 7,
+    "nbody": 15,
+    "ngeom": 43,
+    "boardGeoms": 28,
+    "timestepS": 0.002,
+    "stepsPer60HzFrame": 9,
+    "solverIterationLimit": 100,
+    "totalMassKg": 40.89999999999999,
+    "robotDeclaredSumKg": 39,
+    "datasheetMassKg": 39,
+    "partMassKg": 0.3,
+    "partThicknessMm": 35,
+    "boardMassKg": 1.5,
+    "clearancePerFlankMmDefault": 0.5,
+    "gripForceTotalN": 100,
+    "padFriction": 0.5,
+    "padTorsionalFrictionM": 0.01,
+    "jawStrokeMm": 15.5,
+    "armature": 0.1,
+    "jointDamping": [
+      10,
+      5,
+      2,
+      2,
+      1,
+      1
+    ]
+  },
+  "gripHoldCapacityKg": 5.09683995922528,
+  "forceRange": {
+    "method": "qfrc_bias at rest over 3 canonical + 10 task poses, worst case per axis, x2.5, floor 20 Nm",
+    "staticWorstCaseNm": [
+      4.927855883166185e-14,
+      146.41425000000015,
+      37.75869000000003,
+      3.825900000000014,
+      3.163725000000003,
+      3.0818742491334206e-7
+    ],
+    "factor": 2.5,
+    "chosenNm": [
+      20,
+      370,
+      95,
+      20,
+      20,
+      20
+    ],
+    "perPoseNm": {
+      "extended-horizontal": [
+        1.6990409079653555e-15,
+        108.6089625000001,
+        -0.04659750000000429,
+        -5.8000822681183685e-16,
+        -0.04659749999999896,
+        2.0693446955988225e-17
+      ],
+      "upright": [
+        1.6990409079653555e-15,
+        37.75869000000003,
+        37.75869000000003,
+        -3.825900000000014,
+        3.1637250000000012,
+        0
+      ],
+      "elbow-up-horizontal": [
+        1.6990409079653555e-15,
+        146.41425000000015,
+        37.75869000000003,
+        -3.825900000000014,
+        3.163725000000003,
+        -4.440892098500626e-16
+      ],
+      "task:free:press": [
+        3.9459411697258366e-14,
+        90.4679181039462,
+        6.6922040713348,
+        -0.5887765102000001,
+        3.16209045910818,
+        9.292968161656034e-8
+      ],
+      "task:free:start": [
+        3.4356956192810464e-14,
+        78.61414942880076,
+        15.225179753190929,
+        -1.6850344184090935,
+        3.1484717410137364,
+        -3.4015102734485936e-8
+      ],
+      "task:fits:press": [
+        4.2084777129220055e-14,
+        96.56331750735328,
+        2.3035481541568785,
+        -0.020999695184632364,
+        3.163723315936748,
+        8.557439046263937e-8
+      ],
+      "task:fits:start": [
+        3.9459722290820643e-14,
+        90.46863864399523,
+        6.691933989583433,
+        -0.5887419347106757,
+        3.162090257497013,
+        1.0480543100044315e-9
+      ],
+      "task:wrong-rotation:press": [
+        4.526706866564232e-14,
+        104.07906984226821,
+        11.03192955119885,
+        -1.5741585487108805,
+        2.927274964721196,
+        3.0818742491334206e-7
+      ],
+      "task:wrong-rotation:start": [
+        4.281114832854061e-14,
+        98.33949104533917,
+        14.728063718041398,
+        -1.9598756222035847,
+        2.7773109365356934,
+        2.2523058973433763e-9
+      ],
+      "task:wrong-shape:press": [
+        4.927855883166185e-14,
+        112.0087130433041,
+        15.373707556076354,
+        -1.617311671291262,
+        3.15545915745869,
+        6.606557345634201e-8
+      ],
+      "task:wrong-shape:start": [
+        4.741367956121608e-14,
+        107.73666736558306,
+        18.449258402685395,
+        -1.997831636838676,
+        3.149953311335043,
+        1.5100590777805678e-9
+      ],
+      "task:skew-push:press": [
+        4.168196499626808e-14,
+        95.5752960118206,
+        3.7649222303804706,
+        -0.21541313808434123,
+        3.10735956691237,
+        1.7483828829156778e-7
+      ],
+      "task:skew-push:start": [
+        3.8920406037513046e-14,
+        89.1625753239511,
+        8.44370366023685,
+        -0.8186770505914824,
+        3.104146726348768,
+        4.049943824746549e-9
+      ]
+    },
+    "datasheetNote": "CRX-10iA/L 34.8/26/11 Nm are J4-J6 permissible LOAD moments, not motor limits (Phase-0 correction 1); J1-J3 have no datasheet figure at all"
+  },
+  "servoSweep": {
+    "sagLimitMm": 2,
+    "rows": [
+      {
+        "timestepS": 0.002,
+        "kpScale": 1,
+        "kpA2": 5000,
+        "stable": true,
+        "error": null,
+        "droopMaxDeg": 1.0678759657934924,
+        "hubSagMm": -14.855093685203865,
+        "msPerFrameP95": 0.4097000000000435,
+        "realTimeFactor": 49.43691355461298
+      },
+      {
+        "timestepS": 0.002,
+        "kpScale": 4,
+        "kpA2": 20000,
+        "stable": true,
+        "error": null,
+        "droopMaxDeg": 0.2971082400141434,
+        "hubSagMm": -3.7089801367597848,
+        "msPerFrameP95": 0.6200999999999794,
+        "realTimeFactor": 44.777589711901
+      },
+      {
+        "timestepS": 0.002,
+        "kpScale": 16,
+        "kpA2": 80000,
+        "stable": true,
+        "error": null,
+        "droopMaxDeg": 0.10275015920161115,
+        "hubSagMm": -0.9234353605470091,
+        "msPerFrameP95": 0.7891999999999371,
+        "realTimeFactor": 37.00971381621963
+      },
+      {
+        "timestepS": 0.002,
+        "kpScale": 64,
+        "kpA2": 320000,
+        "stable": true,
+        "error": null,
+        "droopMaxDeg": 0.06000519965218628,
+        "hubSagMm": -0.22713766117202216,
+        "msPerFrameP95": 0.582300000000032,
+        "realTimeFactor": 42.80452386744581
+      },
+      {
+        "timestepS": 0.001,
+        "kpScale": 1,
+        "kpA2": 5000,
+        "stable": true,
+        "error": null,
+        "droopMaxDeg": 1.0678739109419628,
+        "hubSagMm": -14.855007251900378,
+        "msPerFrameP95": 0.9128999999998086,
+        "realTimeFactor": 22.385311653905163
+      },
+      {
+        "timestepS": 0.001,
+        "kpScale": 4,
+        "kpA2": 20000,
+        "stable": true,
+        "error": null,
+        "droopMaxDeg": 0.30153129981486443,
+        "hubSagMm": -3.708955590143975,
+        "msPerFrameP95": 0.7817000000000007,
+        "realTimeFactor": 24.559152971186794
+      },
+      {
+        "timestepS": 0.001,
+        "kpScale": 16,
+        "kpA2": 80000,
+        "stable": true,
+        "error": null,
+        "droopMaxDeg": 0.1068635758773309,
+        "hubSagMm": -0.9234264668734338,
+        "msPerFrameP95": 0.7113999999999123,
+        "realTimeFactor": 26.456169622849675
+      },
+      {
+        "timestepS": 0.001,
+        "kpScale": 64,
+        "kpA2": 320000,
+        "stable": true,
+        "error": null,
+        "droopMaxDeg": 0.032789596391694396,
+        "hubSagMm": -0.2271501182172786,
+        "msPerFrameP95": 0.6652000000003682,
+        "realTimeFactor": 30.008057163348347
+      }
+    ],
+    "chosen": {
+      "kpScale": 16,
+      "timestepS": 0.002
+    },
+    "chosenFound": true
+  },
+  "clearanceSweep": {
+    "planClaim": "0.5 mm easy, 0.1 mm only with a chamfer (plan 3.1)",
+    "chamfer": "none in this geometry",
+    "rows": [
+      {
+        "clearancePerFlankMm": 0.25,
+        "slotWidthMm": 20.5,
+        "wentIn": false,
+        "hubRefusedMm": -0.9359306017668323,
+        "partSlipInJawsMm": 19.919441230910795,
+        "boardSlideMm": 0.8355936093650014,
+        "maxFollowingErrorDeg": 0.06916884543187923,
+        "nconMean": 21.808483290488432
+      },
+      {
+        "clearancePerFlankMm": 0.5,
+        "slotWidthMm": 21,
+        "wentIn": true,
+        "hubRefusedMm": -0.9544636298295522,
+        "partSlipInJawsMm": -4.203689871089863,
+        "boardSlideMm": 0.2526748053821364,
+        "maxFollowingErrorDeg": 0.0707295537006555,
+        "nconMean": 13.809768637532134
+      },
+      {
+        "clearancePerFlankMm": 1,
+        "slotWidthMm": 22,
+        "wentIn": true,
+        "hubRefusedMm": -0.9515220537041451,
+        "partSlipInJawsMm": -4.666107119633903,
+        "boardSlideMm": 0.09844616030115058,
+        "maxFollowingErrorDeg": 0.07073727920589234,
+        "nconMean": 13.931876606683804
+      },
+      {
+        "clearancePerFlankMm": 2,
+        "slotWidthMm": 24,
+        "wentIn": true,
+        "hubRefusedMm": -0.9514914369911677,
+        "partSlipInJawsMm": -5.9458093631983395,
+        "boardSlideMm": 0.2596500564350113,
+        "maxFollowingErrorDeg": 0.07071222303336844,
+        "nconMean": 13.605398457583547
+      },
+      {
+        "clearancePerFlankMm": 3,
+        "slotWidthMm": 26.000000000000004,
+        "wentIn": true,
+        "hubRefusedMm": -0.9520277194548301,
+        "partSlipInJawsMm": -6.064063800931944,
+        "boardSlideMm": 0.19823222575533878,
+        "maxFollowingErrorDeg": 0.07009217906350154,
+        "nconMean": 13.758354755784062
+      }
+    ],
+    "smallestWorkingPerFlankMm": 0.5,
+    "chosenPerFlankMm": 0.5
+  },
+  "scenarios": [
+    {
+      "scenario": "free",
+      "note": "moves in free space above the board — the cost floor",
+      "simSeconds": 20,
+      "steps": 10000,
+      "timestepS": 0.002,
+      "kpScale": 16,
+      "clearanceMm": 0.5,
+      "roundSegments": 12,
+      "stepsPerFrame": 9,
+      "partSlipInJawsMm": -38.17480978543333,
+      "nconMin": 10,
+      "nconMean": 11.846223021582734,
+      "nconMax": 14,
+      "nefcMax": 77,
+      "solverIterMean": 2.0179856115107913,
+      "solverIterMax": 5,
+      "msPerStepFrom60": 0.03366199517781842,
+      "msPerFrameMean": 0.30021474820142696,
+      "msPerFrameP50": 0.29460000000017317,
+      "msPerFrameP95": 0.37039999999979045,
+      "msPerFrameMax": 0.6156000000000859,
+      "realTimeFactor": 59.44697077557195,
+      "followingErrorMaxDeg": [
+        0.00015661062542495475,
+        0.06640216799422555,
+        0.011794939691757557,
+        0.01583941321449236,
+        0.06433388584879446,
+        0.010166877093319468
+      ],
+      "actuatorForceMaxNm": [
+        0.1479319343343377,
+        108.12128354074957,
+        16.56951323345129,
+        1.941038848565313,
+        3.6748686207465653,
+        0.18924967265434134
+      ],
+      "saturationFraction": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "hubZStartM": 0.2761096951617488,
+      "hubZEndM": 0.12607474970662516,
+      "hubZCommandedM": 0.127,
+      "hubTravelRefusedMm": -0.9252502933748408,
+      "boardSlideMm": 1.9768453540799747e-7,
+      "partBelowBoardTop": false,
+      "ikStartResidualMm": 0.00933594006045822,
+      "ikEndResidualMm": 0.005605870349862187,
+      "hubZTraceMm": [
+        276.1096944546894,
+        226.7095548222762,
+        176.63190006736005,
+        126.6498111142077,
+        126.07645063834283,
+        126.07632619119103,
+        126.07611389444858,
+        126.0757926260869,
+        126.07543237570637,
+        126.07507522686379,
+        126.07475001050031
+      ]
+    },
+    {
+      "scenario": "fits",
+      "note": "right shape, right rotation — slides in",
+      "simSeconds": 20,
+      "steps": 10000,
+      "timestepS": 0.002,
+      "kpScale": 16,
+      "clearanceMm": 0.5,
+      "roundSegments": 12,
+      "stepsPerFrame": 9,
+      "partSlipInJawsMm": -5.405629714309985,
+      "nconMin": 12,
+      "nconMean": 14.367805755395683,
+      "nconMax": 22,
+      "nefcMax": 105,
+      "solverIterMean": 2.1843525179856114,
+      "solverIterMax": 6,
+      "msPerStepFrom60": 0.04627474382157875,
+      "msPerFrameMean": 0.4137200539568297,
+      "msPerFrameP50": 0.4074000000000524,
+      "msPerFrameP95": 0.5182999999997264,
+      "msPerFrameMax": 0.9791999999997643,
+      "realTimeFactor": 43.216108199305786,
+      "followingErrorMaxDeg": [
+        0.0001565492125907769,
+        0.07072927506429508,
+        0.011571576403995292,
+        0.006135624755339613,
+        0.04510454238669574,
+        0.004809002906295655
+      ],
+      "actuatorForceMaxNm": [
+        0.5964912567433203,
+        110.99613049952313,
+        7.17798415402649,
+        1.0192530341339534,
+        3.7917950316023052,
+        0.33187494410680785
+      ],
+      "saturationFraction": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "hubZStartM": 0.12606746917897574,
+      "hubZEndM": 0.027048807181530375,
+      "hubZCommandedM": 0.028,
+      "hubTravelRefusedMm": -0.9511928184696254,
+      "boardSlideMm": 0.055240216591153656,
+      "partBelowBoardTop": true,
+      "ikStartResidualMm": 0.004422749092579963,
+      "ikEndResidualMm": 0.0050352223421641275,
+      "hubZTraceMm": [
+        126.06746852122347,
+        93.710600422008,
+        60.70136234826437,
+        27.4209997563383,
+        27.035884593657293,
+        27.035126095524042,
+        27.044987363414876,
+        27.04354066095389,
+        27.050235435790224,
+        27.05052341985324,
+        27.048714189044563
+      ]
+    },
+    {
+      "scenario": "wrong-rotation",
+      "note": "60 deg off: all three arms rest on the surface",
+      "simSeconds": 20,
+      "steps": 10000,
+      "timestepS": 0.002,
+      "kpScale": 16,
+      "clearanceMm": 0.5,
+      "roundSegments": 12,
+      "stepsPerFrame": 9,
+      "partSlipInJawsMm": 20.005074171830994,
+      "nconMin": 12,
+      "nconMean": 15.409172661870503,
+      "nconMax": 47,
+      "nefcMax": 205,
+      "solverIterMean": 1.360611510791367,
+      "solverIterMax": 6,
+      "msPerStepFrom60": 0.045086206550129855,
+      "msPerFrameMean": 0.4030655575539557,
+      "msPerFrameP50": 0.36669999999958236,
+      "msPerFrameP95": 0.8343000000004395,
+      "msPerFrameMax": 1.241399999999885,
+      "realTimeFactor": 44.3783502880821,
+      "followingErrorMaxDeg": [
+        0.0018077684897264091,
+        0.07448006822147328,
+        0.016515455449295495,
+        0.017626816173905813,
+        0.028334998002349322,
+        0.01694347772637146
+      ],
+      "actuatorForceMaxNm": [
+        1.9476766094594495,
+        114.30128263516235,
+        15.213672964926445,
+        2.271104232979269,
+        3.4324238220142433,
+        0.5750345075653058
+      ],
+      "saturationFraction": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "hubZStartM": 0.12596990117441592,
+      "hubZEndM": 0.0269774363843536,
+      "hubZCommandedM": 0.028,
+      "hubTravelRefusedMm": -1.022563615646399,
+      "boardSlideMm": 0.6081864582341074,
+      "partBelowBoardTop": false,
+      "ikStartResidualMm": 0.004352990019728217,
+      "ikEndResidualMm": 0.004184620843178893,
+      "hubZTraceMm": [
+        125.96990067028216,
+        93.5297961109028,
+        60.53310686416364,
+        27.68503378177883,
+        26.977563879863865,
+        26.977444304614973,
+        26.977436878140907,
+        26.977436415207645,
+        26.97743638635284,
+        26.97743638455516,
+        26.97743638444352
+      ]
+    },
+    {
+      "scenario": "wrong-shape",
+      "note": "three-star into the round hole — the physics says no",
+      "simSeconds": 20,
+      "steps": 10000,
+      "timestepS": 0.002,
+      "kpScale": 16,
+      "clearanceMm": 0.5,
+      "roundSegments": 12,
+      "stepsPerFrame": 9,
+      "partSlipInJawsMm": 20.31871484734348,
+      "nconMin": 12,
+      "nconMean": 44.88309352517986,
+      "nconMax": 56,
+      "nefcMax": 241,
+      "solverIterMean": 1.4118705035971224,
+      "solverIterMax": 5,
+      "msPerStepFrom60": 0.0943397227245333,
+      "msPerFrameMean": 0.8454991906474975,
+      "msPerFrameP50": 0.9537000000000262,
+      "msPerFrameP95": 1.2150000000001455,
+      "msPerFrameMax": 1.6177999999999884,
+      "realTimeFactor": 21.198508557731916,
+      "followingErrorMaxDeg": [
+        0.00024327039278917938,
+        0.08022965799624121,
+        0.019134547626338677,
+        0.01723866743205424,
+        0.04074728346516719,
+        0.0036936029337730943
+      ],
+      "actuatorForceMaxNm": [
+        0.3678852349839872,
+        122.33576627545699,
+        19.495466151931396,
+        2.284160634975933,
+        3.5906115900615987,
+        0.26777418943743214
+      ],
+      "saturationFraction": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "hubZStartM": 0.125497253202299,
+      "hubZEndM": 0.026535834608714472,
+      "hubZCommandedM": 0.028,
+      "hubTravelRefusedMm": -1.4641653912855281,
+      "boardSlideMm": 0.7983446919783244,
+      "partBelowBoardTop": false,
+      "ikStartResidualMm": 0.004304197889602652,
+      "ikEndResidualMm": 0.006013588297423883,
+      "hubZTraceMm": [
+        125.49725242653231,
+        93.00275065514127,
+        60.01566198725644,
+        27.439670131392838,
+        26.535981801842794,
+        26.535877036479476,
+        26.53584694312946,
+        26.53583815176006,
+        26.53583557363357,
+        26.53583482209017,
+        26.535834608791816
+      ]
+    },
+    {
+      "scenario": "skew-push",
+      "note": "skewed press on the FREE board — the environment reacts",
+      "simSeconds": 20,
+      "steps": 10000,
+      "timestepS": 0.002,
+      "kpScale": 16,
+      "clearanceMm": 0.5,
+      "roundSegments": 12,
+      "stepsPerFrame": 9,
+      "partSlipInJawsMm": 16.749684120549993,
+      "nconMin": 12,
+      "nconMean": 23.60251798561151,
+      "nconMax": 35,
+      "nefcMax": 167,
+      "solverIterMean": 3.697841726618705,
+      "solverIterMax": 7,
+      "msPerStepFrom60": 0.07909596142254381,
+      "msPerFrameMean": 0.7093223920863225,
+      "msPerFrameP50": 0.7894999999998618,
+      "msPerFrameP95": 0.9695000000001528,
+      "msPerFrameMax": 1.1932000000006155,
+      "realTimeFactor": 25.258817632220776,
+      "followingErrorMaxDeg": [
+        0.0001459358873249599,
+        0.06542071005995494,
+        0.012430420584130162,
+        0.007865280380448161,
+        0.8701335110792744,
+        0.006535639943759416
+      ],
+      "actuatorForceMaxNm": [
+        0.5724286622280488,
+        106.4083590057271,
+        17.5261660299293,
+        1.0407239976382243,
+        20,
+        0.8905044002904958
+      ],
+      "saturationFraction": [
+        0,
+        0,
+        0,
+        0,
+        0.7068345323741008,
+        0
+      ],
+      "hubZStartM": 0.12607530767449107,
+      "hubZEndM": 0.030230948044268055,
+      "hubZCommandedM": 0.028,
+      "hubTravelRefusedMm": 2.2309480442680543,
+      "boardSlideMm": 0.3374902240149957,
+      "partBelowBoardTop": false,
+      "ikStartResidualMm": 0.0044165796468523325,
+      "ikEndResidualMm": 0.009944422840118337,
+      "hubZTraceMm": [
+        126.07530729789069,
+        93.67522034637472,
+        60.6687068381011,
+        30.30918911824206,
+        30.23104177352525,
+        30.23101092109031,
+        30.230954640427775,
+        30.230995827307712,
+        30.23100645967602,
+        30.230928176132682,
+        30.23075037436603
+      ]
+    }
+  ],
+  "gate": {
+    "budgetMsPerFrame": 2,
+    "worstP95MsPerFrame": 1.2150000000001455,
+    "worstScenario": "wrong-shape",
+    "singleRunVerdict": "PASS",
+    "headroomFactor": 1.6460905349792267,
+    "caveat": "This is ONE pass of the scenario loop. The repeatability block re-runs the worst scenario three times in isolation; the verdict to quote is in `repeatability`, because the loop pass and the isolated runs differed by up to 35 % on IDENTICAL physics (same ncon mean to 0.1)."
+  },
+  "jamChannel": {
+    "finding": "The grip is the weakest link in the force chain: 2 x 50 N x mu 0.5 = 50 N transmissible along the insertion axis against >100 N of TCP push, so a jam appears at the GRIPPER before it appears at the axes. The plan expects the opposite order.",
+    "transmissibleGripForceN": 50,
+    "jamThresholdMm": 3,
+    "channels": [
+      {
+        "scenario": "wrong-rotation",
+        "axisRefusalMm": -1.022563615646399,
+        "jawSlipMm": 20.005074171830994,
+        "maxSaturationFraction": 0,
+        "carriedBy": "gripper (part slipped in the jaws)"
+      },
+      {
+        "scenario": "wrong-shape",
+        "axisRefusalMm": -1.4641653912855281,
+        "jawSlipMm": 20.31871484734348,
+        "maxSaturationFraction": 0,
+        "carriedBy": "gripper (part slipped in the jaws)"
+      },
+      {
+        "scenario": "skew-push",
+        "axisRefusalMm": 2.2309480442680543,
+        "jawSlipMm": 16.749684120549993,
+        "maxSaturationFraction": 0.7068345323741008,
+        "carriedBy": "gripper (part slipped in the jaws)"
+      }
+    ]
+  },
+  "repeatability": {
+    "scenario": "wrong-shape",
+    "runs": 3,
+    "p95MsPerFrame": [
+      1.2136000000000422,
+      1.1467999999986205,
+      1.1105999999999767
+    ],
+    "msPerStep": [
+      0.09398119349005342,
+      0.09252048422744841,
+      0.09058168575447026
+    ],
+    "nconMean": [
+      44.88309352517986,
+      44.88309352517986,
+      44.88309352517986
+    ],
+    "worstP95": 1.2136000000000422,
+    "spreadFactor": 1.092742661624408,
+    "nconDeterministic": true,
+    "verdictAgainstBudget": "PASS",
+    "loopPassP95": 1.2150000000001455,
+    "note": "This is THE gate number. `ncon` is bit-identical across the three runs, so any difference between them, and between them and the single loop pass, is measurement environment and not physics."
+  },
+  "segmentLever": {
+    "scenario": "wrong-shape",
+    "rows": [
+      {
+        "segments": 12,
+        "shape": "round (dodecagon)",
+        "nconMean": 44.88309352517986,
+        "nconMax": 56,
+        "nefcMax": 241,
+        "msPerFrameP50": 0.9237000000011903,
+        "msPerFrameP95": 1.2247999999999593,
+        "msPerStep": 0.0917604781997216,
+        "stillBlocks": true
+      },
+      {
+        "segments": 8,
+        "shape": "octagon",
+        "nconMean": 40.330935251798564,
+        "nconMax": 50,
+        "nefcMax": 217,
+        "msPerFrameP50": 0.8493999999991502,
+        "msPerFrameP95": 1.0727000000006228,
+        "msPerStep": 0.08374243520192928,
+        "stillBlocks": true
+      },
+      {
+        "segments": 6,
+        "shape": "hexagon",
+        "nconMean": 28.303956834532375,
+        "nconMax": 34,
+        "nefcMax": 153,
+        "msPerFrameP50": 0.6134999999994761,
+        "msPerFrameP95": 0.7147000000004482,
+        "msPerStep": 0.06209784006429703,
+        "stillBlocks": true
+      },
+      {
+        "segments": 4,
+        "shape": "square",
+        "nconMean": 34.927158273381295,
+        "nconMax": 42,
+        "nefcMax": 185,
+        "msPerFrameP50": 0.7449999999989814,
+        "msPerFrameP95": 0.8888999999999214,
+        "msPerStep": 0.0736762607996787,
+        "stillBlocks": true
+      }
+    ],
+    "monotonicInSegmentCount": false,
+    "bestVariant": {
+      "segments": 6,
+      "shape": "hexagon",
+      "nconMean": 28.303956834532375,
+      "nconMax": 34,
+      "nefcMax": 153,
+      "msPerFrameP50": 0.6134999999994761,
+      "msPerFrameP95": 0.7147000000004482,
+      "msPerStep": 0.06209784006429703,
+      "stillBlocks": true
+    },
+    "gainFromRoundToBest": 1.7137260388963078,
+    "recommendation": "With O11 removing the cylinder, the second opening only has to be a shape the three-star does not fit — it need not be round. The measured cheapest is the HEXAGON (6 walls), not the square, and it is the single cheapest way to buy the headroom the 2 ms budget currently lacks."
+  },
+  "negativeProbe": {
+    "rule": "MuJoCo convexifies every collision mesh; the hull of a planar three-star is a hexagon and does not fit through its own Y slot",
+    "hullMinWidthMm": 83.66025403784438,
+    "slotWidthMm": 21,
+    "threeBoxes": {
+      "partCentreZmm": 17.496618947981137,
+      "partUndersideZmm": -0.003381052018865127,
+      "boardTopZmm": 27,
+      "passedThrough": true,
+      "ngeom": 43
+    },
+    "oneConvexMesh": {
+      "partCentreZmm": 44.485892918165895,
+      "partUndersideZmm": 26.985892918165895,
+      "boardTopZmm": 27,
+      "passedThrough": false,
+      "ngeom": 41
+    }
+  },
+  "boardSweep": {
+    "criteria": {
+      "skewMinSlideMm": 5,
+      "cleanMaxSlideMm": 2
+    },
+    "skewDeg": 10,
+    "transmissibleGripForceN": 50,
+    "rows": [
+      {
+        "massKg": 0.3,
+        "floorFriction": 0.1,
+        "muMgN": 0.2943,
+        "skewSlideMm": 0.49374447625791207,
+        "cleanSlideMm": 5.3363878812048835,
+        "cleanInsertionSucceeded": false,
+        "inWindow": false
+      },
+      {
+        "massKg": 1,
+        "floorFriction": 0.1,
+        "muMgN": 0.9810000000000001,
+        "skewSlideMm": 0.466628679270397,
+        "cleanSlideMm": 4.695658128302239,
+        "cleanInsertionSucceeded": false,
+        "inWindow": false
+      },
+      {
+        "massKg": 3,
+        "floorFriction": 0.1,
+        "muMgN": 2.9430000000000005,
+        "skewSlideMm": 0.20633164933731876,
+        "cleanSlideMm": 0.8464555701472632,
+        "cleanInsertionSucceeded": true,
+        "inWindow": false
+      },
+      {
+        "massKg": 0.3,
+        "floorFriction": 0.25,
+        "muMgN": 0.73575,
+        "skewSlideMm": 0.42811206563044063,
+        "cleanSlideMm": 3.2458988641681303,
+        "cleanInsertionSucceeded": false,
+        "inWindow": false
+      },
+      {
+        "massKg": 1,
+        "floorFriction": 0.25,
+        "muMgN": 2.4525,
+        "skewSlideMm": 0.32919749742304105,
+        "cleanSlideMm": 0.2830803715601886,
+        "cleanInsertionSucceeded": true,
+        "inWindow": false
+      },
+      {
+        "massKg": 3,
+        "floorFriction": 0.25,
+        "muMgN": 7.3575,
+        "skewSlideMm": 0.1530781454311255,
+        "cleanSlideMm": 0.11098168894868582,
+        "cleanInsertionSucceeded": true,
+        "inWindow": false
+      },
+      {
+        "massKg": 0.3,
+        "floorFriction": 0.4,
+        "muMgN": 1.1772,
+        "skewSlideMm": 0.44456010925574824,
+        "cleanSlideMm": 2.8595603919244486,
+        "cleanInsertionSucceeded": false,
+        "inWindow": false
+      },
+      {
+        "massKg": 1,
+        "floorFriction": 0.4,
+        "muMgN": 3.9240000000000004,
+        "skewSlideMm": 0.314042034718983,
+        "cleanSlideMm": 0.36141497771439735,
+        "cleanInsertionSucceeded": true,
+        "inWindow": false
+      },
+      {
+        "massKg": 3,
+        "floorFriction": 0.4,
+        "muMgN": 11.772000000000002,
+        "skewSlideMm": 0.168621895807384,
+        "cleanSlideMm": 0.10343706314303165,
+        "cleanInsertionSucceeded": true,
+        "inWindow": false
+      }
+    ],
+    "window": [],
+    "chosen": null
+  }
+}

@@ -147,6 +147,10 @@ export async function deriveNodeId(fileSha256: string, gltfNodeIndex: number): P
 /**
  * Stamp derived ids across a subtree that came from a file we do not write.
  *
+ * @deprecated plan-769 F12 — composition no longer derives ids: every decoded node
+ * carries its identity (authored id, else the decode seed, `identityIdOf`). Kept
+ * only for its own tests and external callers; nothing in the viewer calls it.
+ *
  * Nodes that already carry a `NodeId` keep it — an authored id always beats a
  * derived one, which is what lets a producer opt into stable identity simply by
  * writing the field. Nodes with no glTF index (op-created nodes, planner

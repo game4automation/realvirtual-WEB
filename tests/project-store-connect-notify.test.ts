@@ -51,6 +51,10 @@ function manifestOf(documents: RvDocumentEntry[]): RvProject {
     name: 'Linie',
     canonicalName: 'linie',
     documents,
+    // plan-778: a project the library reference migration already ran for. A manifest without
+    // the marker is migrated by its FIRST write (that write is then a real change); these tests
+    // are about the notify rules of every LATER write.
+    'rv-project/library-project-migration': { at: '2026-11-03T00:00:00.000Z', added: false, hadLibraries: false, replaced: [] },
   } as unknown as RvProject;
 }
 

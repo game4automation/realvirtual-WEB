@@ -85,6 +85,8 @@ interface PlacementSpec {
   name: string;
   position: [number, number, number];
   overrides?: Parameters<typeof setAssetOverrides>[1];
+  /** The stored record exactly as an older file wrote it (plan-769: e.g. `trsByNodeId`). */
+  rawOverrides?: Record<string, unknown>;
 }
 
 /** A layout document as the save writes it: reference + meta + transform, no geometry. */
@@ -99,6 +101,7 @@ async function documentBytes(specs: PlacementSpec[]): Promise<ArrayBuffer> {
     setAssetReference(node, { assetId: CATALOG_ID, path: ASSET_URL });
     setPlacementMeta(node, {});
     if (s.overrides) setAssetOverrides(node, s.overrides);
+    if (s.rawOverrides) (node.userData.realvirtual as Record<string, unknown>).AssetOverrides = s.rawOverrides;
     root.add(node);
   }
   return objectToGlb(root);
@@ -288,20 +291,24 @@ describe('layout reload = planner instances (plan-753)', () => {
 });
 
 describe('(d) AssetOverrides on a deferred placement', () => {
-  it('trsByNodeId forces the chunk split and lands the saved TRS on the split node after the pivot', async () => {
-    const trs: [number, number, number] = [5, 6, 7];
+  it('an old trsByNodeId neither splits the bake nor moves the part (plan-769 F14) — its count is a problem on the placement', async () => {
+    const { getProblems, resetProblemsForTests } = await import('../src/core/hmi/problems-store');
+    resetProblemsForTests();
     const L2 = await loadLayout(await documentBytes([
       { id: 'plc_o', name: 'Moved', position: [1, 0, 1],
-        overrides: { byNodeId: {}, trsByNodeId: { [PART_ID]: { position: trs } } } },
+        rawOverrides: { byNodeId: {}, trsByNodeId: { [PART_ID]: { position: [5, 6, 7] } } } },
     ]));
     const [root] = placementNodes(L2.result.root);
     const inst = L2.registry.instanceOf(root)!;
-    expect(inst.chunks.map((m) => m.name).sort()).toEqual(['mover:Drive-A', 'mover:Part', 'static']);
-    const part = inst.logicNodes.find((n) => n.name === 'Part')!;
-    expect(part.position.toArray()).toEqual(trs);
-    expect(inst.chunks.find((m) => m.name === 'mover:Part')!.parent).toBe(part);
-    // The split bake is a second entry under the same base key (`#split:`).
+    expect(inst.chunks.map((m) => m.name)).not.toContain('mover:Part');
+    // One bake per asset — no `#split:` derivative any more.
     expect(L2.cache.getBakeStats().assets).toBe(1);
+    const dropped = getProblems().filter((p) => p.code === 'override-transforms-dropped');
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0].title).toContain('1 moved part');
+    // The placement node holds the 769 form: nothing left to store → no AssetOverrides at all.
+    expect((root.userData.realvirtual as Record<string, unknown>).AssetOverrides).toBeUndefined();
+    resetProblemsForTests();
   });
 });
 

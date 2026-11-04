@@ -220,7 +220,7 @@ export function RecentDocumentsPopover({
       onMouseEnter={cancelRecentDocumentsClose} onMouseLeave={scheduleRecentDocumentsClose}
       onFocusCapture={onPanelFocus} onBlur={onPanelBlur}
       sx={{ width: 'min(400px, calc(100vw - 16px))', boxSizing: 'border-box', p: 1.5,
-        borderRadius: 1.5, bgcolor: '#1e1e1e', color: 'text.primary', boxShadow: 8 }}>
+        borderRadius: 1, bgcolor: '#1e1e1e', color: 'text.primary', boxShadow: 8 }}>
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mb: 1 }}>
         <Typography sx={{ flex: 1, fontSize: 13, fontWeight: 600 }}>Recently opened</Typography>
         {onClear && <Tooltip title="Clear recently opened">

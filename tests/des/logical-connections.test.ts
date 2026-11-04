@@ -8,6 +8,11 @@
  * instance's node world transform (the resolver reads the node world-AABB; a
  * geometry-less Object3D falls back to its world position), so tests just place
  * the nodes and assert the wiring.
+ *
+ * plan-633 Phase 2: `autoConnectByDistance` is a thin adapter over the public
+ * core resolver's distance stage (`src/core/connect/rv-connection-resolver.ts`),
+ * so these cases now run against the resolver; `breakTwoCycles` is the DES
+ * binding's guard and `detectCycles` is unchanged.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -17,7 +22,7 @@ import {
   breakTwoCycles,
   detectCycles,
   type ConnectableInstance,
-} from '@rv-private/plugins/des/logical-connections';
+} from '@rv/plugins/des/logical-connections';
 
 type MockAdapter = {
   node: Object3D;

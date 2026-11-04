@@ -140,7 +140,7 @@ describe('RVPhysicsZone', () => {
     expect(zone2.Restitution).toBeCloseTo(0.5);
     expect(zone2.RemoveBelowY).toBe(-2);
     expect(zone2.ShowGizmo).toBe(false);
-    expect(zone2.toZoneConfig()).toEqual({ friction: 0.3, restitution: 0.5, removeBelowY: -2 });
+    expect(zone2.toZoneConfig()).toEqual({ friction: 0.3, restitution: 0.5, removeBelowY: -2, softCcdPrediction: 0.03 });
   });
 
   it('zone without BoxCollider extras (and WholeScene=false) is ignored with a warning', () => {

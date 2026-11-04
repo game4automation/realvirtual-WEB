@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /** Tiny global store for HMI overlay visibility (persisted in localStorage). */
 
 import { useEffect, useSyncExternalStore } from 'react';
@@ -12,9 +14,16 @@ const STORAGE_KEY = 'rv-hmi-visible';
 let visible = loadInitial();
 const listeners = new Set<() => void>();
 
-function loadInitial(): boolean {
+export function parseHmiParam(search: string): boolean | undefined {
+  const value = new URLSearchParams(search).get('hmi');
+  return value === '0' ? false : value === '1' ? true : undefined;
+}
+
+export function loadInitial(search = typeof location === 'undefined' ? '' : location.search): boolean {
+  const override = parseHmiParam(search);
+  if (override !== undefined) return override;
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = readLocalStorage(STORAGE_KEY);
     return raw === null ? true : raw === '1';
   } catch {
     return true;
@@ -27,7 +36,7 @@ function notify() {
 
 export function toggleHmiVisible(): void {
   visible = !visible;
-  try { localStorage.setItem(STORAGE_KEY, visible ? '1' : '0'); } catch { /* ignore */ }
+  writeLocalStorage(STORAGE_KEY, visible ? '1' : '0');
   notify();
 }
 

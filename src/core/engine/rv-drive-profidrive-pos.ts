@@ -13,6 +13,13 @@ import {
 } from './rv-signal-store';
 import { debug } from './rv-debug';
 import type { ProfidriveState } from './rv-drive-profidrive-speed';
+import { slotBound, slotDeclare, slotRead, slotUndeclare, slotWrite } from './rv-slot-io';
+
+/** PLCOutput slots of Drive_ProfidrivePos (PLC → drive). */
+const COMMAND_SLOTS = ['ControlWord', 'PosControlWord1', 'PosControlWord2', 'Override', 'MdiTargetPosition', 'MdiVelocity'] as const;
+type CommandSlot = typeof COMMAND_SLOTS[number];
+/** PLCInput slots of Drive_ProfidrivePos (drive → PLC). */
+const FEEDBACK_SLOTS = ['StatusWord', 'PosStatusWord1', 'PosStatusWord2', 'PositionActual', 'SpeedActual'] as const;
 
 /** True when bit `n` of `word` is set. */
 function bit(word: number, n: number): boolean {
@@ -130,18 +137,24 @@ export class RVDriveProfidrivePos implements IDriveBehavior, RVComponent {
 
     // Register self as a drive behavior so drive.update() calls our update().
     drive.driveBehaviors.push(this);
+    // Unwired slots stay bindable in the viewer (SlotIO, rv-slot-io.ts).
+    for (const slot of COMMAND_SLOTS) slotDeclare(this, slot, 'poll');
+    for (const slot of FEEDBACK_SLOTS) slotDeclare(this, slot, 'feedback');
 
     debug('loader',
       `  Drive_ProfidrivePos "${drive.name}": stw1="${this.ControlWord}" tarpos="${this.MdiTargetPosition}"`);
   }
 
-  private readInt(address: string | null): number {
-    return address ? Math.round(this.signalStore!.getFloatByPath(address)) : 0;
+  /** A command slot as integer: the wired signal, else the direct value, else `fallback`. */
+  private readInt(slot: CommandSlot, fallback = 0): number {
+    return Math.round(slotRead(this.signalStore!, this, slot, this[slot], fallback));
   }
 
-  /** MDI speed in drive units: |MDI_VELOCITY| · VelocityScale · override (falls back to the drive's target speed when unwired). */
+  /** MDI speed in drive units: |MDI_VELOCITY| · VelocityScale · override (falls back to the drive's target speed when unbound). */
   private speedFromMdi(drive: RVDrive, over: number): number {
-    const base = this.MdiVelocity ? Math.abs(this.readInt(this.MdiVelocity)) * this.VelocityScale : drive.targetSpeed;
+    const base = slotBound(this, 'MdiVelocity', this.MdiVelocity)
+      ? Math.abs(this.readInt('MdiVelocity')) * this.VelocityScale
+      : drive.targetSpeed;
     return base * over;
   }
 
@@ -152,9 +165,9 @@ export class RVDriveProfidrivePos implements IDriveBehavior, RVComponent {
     if (!drive || !store) return;
 
     // ── Decode control words (PLC → drive) ──
-    const stw1 = this.readInt(this.ControlWord);
-    const posStw1 = this.readInt(this.PosControlWord1);
-    const posStw2 = this.readInt(this.PosControlWord2);
+    const stw1 = this.readInt('ControlWord');
+    const posStw1 = this.readInt('PosControlWord1');
+    const posStw2 = this.readInt('PosControlWord2');
 
     const onOff1 = bit(stw1, 0);
     const noOff2 = bit(stw1, 1);
@@ -185,7 +198,7 @@ export class RVDriveProfidrivePos implements IDriveBehavior, RVComponent {
     const setRefRising = setReferencePoint && !this.oldSetRef;
     this.oldSetRef = setReferencePoint;
 
-    const over = this.Override ? this.readInt(this.Override) / 16384 : 1; // OVERRIDE 0x4000 = 100 %
+    const over = this.readInt('Override', 16384) / 16384; // OVERRIDE 0x4000 = 100 % (also while unbound)
 
     const commands = !drive.positionOverwrite;
     if (commands) {
@@ -267,7 +280,7 @@ export class RVDriveProfidrivePos implements IDriveBehavior, RVComponent {
             drive.jogForward = false;
             drive.jogBackward = false;
             drive.targetSpeed = this.speedFromMdi(drive, over);
-            const tarpos = this.readInt(this.MdiTargetPosition);
+            const tarpos = this.readInt('MdiTargetPosition');
             const targetMm = mdiAbsolute
               ? tarpos * this.PositionScale + this.PositionOffset
               : drive.currentPosition + tarpos * this.PositionScale;
@@ -320,24 +333,21 @@ export class RVDriveProfidrivePos implements IDriveBehavior, RVComponent {
     this.POS_ZSW2 = posZsw2;
 
     // ── Feedback (drive → PLC) — ALWAYS ──
-    const writer = this.signalWriter!;
-    if (this.StatusWord) writer.setByPath(this.StatusWord, zsw1);
-    if (this.PosStatusWord1) writer.setByPath(this.PosStatusWord1, zsw1); // POS_ZSW1 mirrors ZSW1 in this model
-    if (this.PosStatusWord2) writer.setByPath(this.PosStatusWord2, posZsw2);
-    if (this.PositionActual) {
-      writer.setByPath(this.PositionActual, this.PositionScale !== 0
-        ? Math.round((drive.currentPosition - this.PositionOffset) / this.PositionScale)
-        : 0);
-    }
-    if (this.SpeedActual) {
-      // NIST_B: 0x40000000 = 100 % of reference speed
-      writer.setByPath(this.SpeedActual, this.ReferenceSpeed !== 0
-        ? toInt32(speed / this.ReferenceSpeed * 0x40000000)
-        : 0);
-    }
+    const writer = this.signalWriter;
+    slotWrite(this, 'StatusWord', this.StatusWord, zsw1, writer);
+    slotWrite(this, 'PosStatusWord1', this.PosStatusWord1, zsw1, writer); // POS_ZSW1 mirrors ZSW1 in this model
+    slotWrite(this, 'PosStatusWord2', this.PosStatusWord2, posZsw2, writer);
+    slotWrite(this, 'PositionActual', this.PositionActual, this.PositionScale !== 0
+      ? Math.round((drive.currentPosition - this.PositionOffset) / this.PositionScale)
+      : 0, writer);
+    // NIST_B: 0x40000000 = 100 % of reference speed
+    slotWrite(this, 'SpeedActual', this.SpeedActual, this.ReferenceSpeed !== 0
+      ? toInt32(speed / this.ReferenceSpeed * 0x40000000)
+      : 0, writer);
   }
 
   dispose(): void {
+    slotUndeclare(this);
     if (this.drive) {
       const index = this.drive.driveBehaviors.indexOf(this);
       if (index >= 0) this.drive.driveBehaviors.splice(index, 1);

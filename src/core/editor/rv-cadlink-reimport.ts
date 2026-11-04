@@ -32,6 +32,8 @@ import { weldImportedGlb } from '../import/rv-glb-weld';
 import { assetOpHeader, type CADLinkExtras } from './rv-asset-ops';
 import { dedupeSiblingNames } from './rv-asset-executors';
 import { deepCloneJSON } from '../ops/rv-op-utils';
+import { identityIdOf } from '../engine/rv-decode-identity';
+import type { NodeIdMap } from '../engine/rv-subtree-instantiate';
 
 export interface ReimportUnmatched {
   /** Relative name-path under the old CAD root. */
@@ -120,6 +122,44 @@ export function matchCadTrees(oldRoot: Object3D, newRoot: Object3D): Map<Object3
     result.set(oldNode, newMap.get(path) ?? null);
   }
   return result;
+}
+
+/**
+ * plan-769 Phase 2: the id map of a re-import — every NEW node that has an old
+ * counterpart (same relative match key, and the two roots) maps its own key (its
+ * decode seed, `@<preorder index>` without one — the `importCad` executor's keying)
+ * to the OLD node's identity. Old ids that are missing (an old node without one) are
+ * left to the executor, which mints.
+ */
+export function reimportIdMap(
+  oldRoot: Object3D,
+  newRoot: Object3D,
+  oldMap: ReadonlyMap<string, Object3D>,
+  newMap: ReadonlyMap<string, Object3D>,
+): NodeIdMap {
+  // The executor's key of a new node: its identity id, else its preorder index.
+  const keyOf = new Map<Object3D, string>();
+  let i = 0;
+  const used = new Set<string>();
+  newRoot.traverse((n) => {
+    let key = identityIdOf(n) ?? `@${i}`;
+    if (used.has(key)) key = `@${i}`;
+    used.add(key);
+    keyOf.set(n, key);
+    i++;
+  });
+  const out: NodeIdMap = {};
+  const take = (oldNode: Object3D, newNode: Object3D): void => {
+    const id = identityIdOf(oldNode);
+    const key = keyOf.get(newNode);
+    if (id && key) out[key] = id;
+  };
+  take(oldRoot, newRoot);
+  for (const [relPath, oldNode] of oldMap) {
+    const newNode = newMap.get(relPath);
+    if (newNode) take(oldNode, newNode);
+  }
+  return out;
 }
 
 /**
@@ -249,6 +289,12 @@ export async function reimportCad(
     rootCarryOver[type] = deepCloneJSON(fields);
   }
 
+  // plan-769 Phase 2 (F11): the new revision takes over the IDS of the nodes it
+  // replaces, by the same match the components travel by — a reference to a part
+  // keeps its target across a re-import. Keyed like the importCad executor keys a
+  // decoded node (its seed); unmatched new nodes get fresh ids there.
+  const idMap = reimportIdMap(oldRoot, newRoot, oldMap, newMap);
+
   // New root inherits the OLD root's name + local transform.
   const oldName = oldRoot.name;
   newRoot.position.copy(oldRoot.position);
@@ -262,7 +308,7 @@ export async function reimportCad(
     // be suffixed (`Gearbox_1`) while the old one still occupies the name.
     doc.deleteNode(cadRootPath);
     await doc.whenIdle();
-    const rootPath = await doc.importCad({ glb, cadlink }, { name: oldName, root: newRoot });
+    const rootPath = await doc.importCad({ glb, cadlink }, { name: oldName, root: newRoot, idMap });
 
     for (const [type, fields] of Object.entries(rootCarryOver)) {
       await doc.applyOp({
@@ -292,6 +338,11 @@ export async function reimportCad(
       report.matched++;
     }
   });
+  // plan-766 §2.4.4 safety net: every step above is an op the arena listener
+  // already reconciled, but a re-import swaps a whole subtree — one more
+  // O(meshes) pass at the end of the transaction costs little and guarantees
+  // the batched display matches the tree. No arenas (runtime, tests) = no-op.
+  viewer.editorArena?.reconcile();
 
   return report;
 }

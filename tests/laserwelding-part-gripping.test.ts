@@ -41,6 +41,7 @@ const PROGRAMS = 11;
 /* eslint-disable @typescript-eslint/no-explicit-any */
 let handle: TestViewerHandle;
 let viewer: RVViewer;
+let plc: PlcPlugin;
 let simTime = 0;
 const v = (): any => viewer as any;
 const tm = (): any => v().transportManager;
@@ -72,13 +73,11 @@ function until(pred: () => boolean, max: number, what: string, each?: () => void
   if (pred()) return simTime - t0;
   throw new Error(`timeout after ${max} s: ${what}`);
 }
-async function plcRunning(): Promise<void> {
-  for (let i = 0; i < 300; i++) {
-    const ps = getPlcRuntime()?.programs() ?? [];
-    if (ps.length >= PROGRAMS && ps.every((p: any) => p.state === 'running')) return;
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  throw new Error('PLC programs not running');
+/** Every program runs — the final state check after the plugin's ready/reset promises (plan-602 F11). */
+function plcRunning(): void {
+  const ps = getPlcRuntime()?.programs() ?? [];
+  if (ps.length >= PROGRAMS && ps.every((p: any) => p.state === 'running')) return;
+  throw new Error(`PLC programs not running: ${JSON.stringify(ps.map((p: any) => [p.name, p.state, p.lastError]))}`);
 }
 async function restart(): Promise<void> {
   store().unforceAll();
@@ -88,8 +87,8 @@ async function restart(): Promise<void> {
   // The state the reset restored — read synchronously: while the test awaits the PLC below, the
   // render loop may already tick the plant on (wall-clock dependent).
   atReset = { trees: loadTrees(), poses: poses() };
-  await new Promise((r) => setTimeout(r, 500)); // let the cold reset land before the first tick
-  await plcRunning();
+  await plc.whenResetSettled(); // let the cold reset land before the first tick
+  plcRunning();
   tick(DT);
 }
 function connect(): void {
@@ -137,11 +136,12 @@ beforeAll(async () => {
   handle = await createTestViewer('webgl');
   viewer = handle.viewer;
   registerPlcProgramComponent();
-  viewer.use(new PlcPlugin(), 'internal');
+  plc = new PlcPlugin();
+  viewer.use(plc, 'internal');
   await viewer.loadModel(MODEL);
   await viewer.whenSceneReady();
-  await new Promise((r) => setTimeout(r, 500));
-  await plcRunning();
+  await plc.whenProgramsReady();
+  plcRunning();
   viewer.scene.updateMatrixWorld();
   afterLoad = { trees: loadTrees(), poses: poses() };
   await restart();
@@ -418,6 +418,18 @@ describe('plan-569 — FG05 feed and grip with forced PLC outputs (F3, F6, SOL #
     force('FG05_Y_AxisZ2_WorkPos', false);
     force('FG05_Y_AxisZ2_HomePos', true);
     until(() => sig('FG05_Y_AxisZ2_InHome'), 2, 'Z2 up');
+    // Z2 lifts 20 mm (FG05_Z2 Drive_Cylinder MaxPos -20), the cap is 25 mm tall
+    // (FG05_CapTemplate BoxCollider size.y 0.025): the picked cap still hangs 5 mm into the
+    // queue's height, so the next cap must NOT move up yet - a held MU is an accumulation
+    // leader (transport manager, 2026-10-15). This expectation used to pass only because
+    // held MUs were invisible to the queue. The machine's next step is X to the valve,
+    // which takes the cap clear; only then does the queue advance and the inlet refill.
+    const createdAtLift = capSource().Created;
+    tick(2);
+    expect(capSource().Created, 'cap still in the queue height → no refill yet').toBe(createdAtLift);
+    force('FG05_Y_AxisX_HomePos', false);
+    force('FG05_Y_AxisX_WorkPos', true);
+    until(() => sig('FG05_Y_AxisX_InWork'), 3, 'X to the valve');
     until(() => capSource().Created > created, 10, 'refill after the release');
     store().unforceAll();
   }, 400_000);

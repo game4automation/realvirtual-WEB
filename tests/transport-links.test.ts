@@ -2,7 +2,7 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { describe, it, expect } from 'vitest';
-import { Object3D } from 'three';
+import { Object3D, Vector3 } from 'three';
 import {
   createBindContext,
   applyKinematicsSpec,
@@ -15,6 +15,7 @@ import { ContextMenuStore } from '../src/core/hmi/context-menu-store';
 import type { SnapLite, PortConnection } from '../src/behaviors/_shared/snap-graph-helpers';
 import {
   declareFlowSignals,
+  createDownstreamInterlock,
   outputLink,
   outputLinks,
   linkOf,
@@ -39,6 +40,70 @@ function makeStore() {
   };
 }
 type Store = ReturnType<typeof makeStore>;
+
+describe('continuous sink-at-output interlock', () => {
+  function fixture() {
+    const output = new Object3D(); output.position.set(0, 0.5, 2);
+    const f = makeRv({ rootName: 'ConveyorOut', buildSnaps: root => {
+      root.add(output);
+      return [{ id: 'out', object3D: output, flow: 'out', ownerRoot: root }];
+    } });
+    const sink = { isOwner: true, DeleteMus: true, DeleteOnlyTag: '', aabb: {
+      min: new Vector3(-0.5, 0.4, 1.8), max: new Vector3(0.5, 0.7, 2.8),
+    } };
+    const tm = { sinks: [sink] };
+    Object.assign(f.rv.viewer, { transportManager: tm });
+    return { ...f, output, sink, tm, interlock: createDownstreamInterlock(f.rv, { sinkAtOutput: true }) };
+  }
+
+  it('releases into a sink containing the output only when opted in', () => {
+    const f = fixture();
+    expect(createDownstreamInterlock(f.rv).occupied()).toBe(true);
+    expect(f.interlock.occupied()).toBe(false);
+    f.tm.sinks.length = 0;
+    expect(f.interlock.occupied()).toBe(true); // genuine dead end after removal
+  });
+
+  it.each(['x', 'y', 'z'] as const)('rejects a sink away from the output along %s', axis => {
+    const f = fixture();
+    f.sink.aabb.min[axis] += 5; f.sink.aabb.max[axis] += 5;
+    expect(f.interlock.occupied()).toBe(true);
+  });
+
+  it('reads sink acceptance changes without waiting for a new transport tick', () => {
+    const f = fixture();
+    f.sink.DeleteMus = false;
+    expect(f.interlock.occupied()).toBe(true);
+    f.sink.DeleteMus = true; f.sink.DeleteOnlyTag = 'restricted';
+    expect(f.interlock.occupied()).toBe(true);
+    f.sink.DeleteOnlyTag = ''; f.sink.isOwner = false;
+    expect(f.interlock.occupied()).toBe(true);
+    f.sink.isOwner = true;
+    expect(f.interlock.occupied()).toBe(false);
+  });
+
+  it('uses the output world position for a transformed conveyor', () => {
+    const f = fixture();
+    f.root.position.x = 10;
+    f.root.rotation.y = Math.PI / 2;
+    f.sink.aabb.min.set(11.8, 0.4, -0.5); f.sink.aabb.max.set(12.8, 0.7, 0.5);
+    expect(f.interlock.occupied()).toBe(false);
+  });
+
+  it('never overrides a paired downstream conveyor with a nearby sink', () => {
+    const partner = new Object3D(); partner.name = 'Next';
+    const f = makeRv({ rootName: 'Conveyor', buildSnaps: root => [
+      { id: 'out', object3D: new Object3D(), flow: 'out', pairedSnapId: 'in', ownerRoot: root },
+      { id: 'in', object3D: new Object3D(), flow: 'in', pairedSnapId: 'out', ownerRoot: partner },
+    ] });
+    Object.assign(f.rv.viewer, { transportManager: { sinks: [{
+      isOwner: true, DeleteMus: true, DeleteOnlyTag: '',
+      aabb: { min: new Vector3(-1, -1, -1), max: new Vector3(1, 1, 1) },
+    }] } });
+    f.store.set('Next.Flow.Occupied', true);
+    expect(createDownstreamInterlock(f.rv, { sinkAtOutput: true }).occupied()).toBe(true);
+  });
+});
 
 /** Snap-point plugin from a flat snap list (keyed by ownerRoot identity / id). */
 function snapPluginFrom(snaps: readonly SnapLite[]) {

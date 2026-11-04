@@ -171,14 +171,17 @@ describe('onPreBake hooks (plan-754 D18 / §9.5)', () => {
     registerBuiltInPreBakeHooks();
   });
 
-  it('the context exposes only resolvePath / localBounds / keepMaterial / notifyReparented', () => {
+  it('the context exposes only resolvePath / resolveStored / localBounds / keepMaterial / notifyReparented', () => {
     const root = staged(node('Plant'));
     const part = mesh('Part', [2, 0, 0]);
     root.add(part);
     const { ctx } = createPreBakeContext(root);
+    // plan-769 Phase 1b: `resolveStored` reads a STORED path field by the file's verdict.
     expect(Object.keys(ctx).sort()).toEqual(
-      ['keepMaterial', 'localBounds', 'notifyReparented', 'resolvePath', 'root'],
+      ['keepMaterial', 'localBounds', 'notifyReparented', 'resolvePath', 'resolveStored', 'root'],
     );
+    // Without an identity record (a hand-built tree) it is the plain resolver.
+    expect(ctx.resolveStored!('Plant/Part')).toBe(part);
     expect(ctx.resolvePath('Plant/Part')).toBe(part);
     expect(ctx.resolvePath('Plant/Nope')).toBeNull();
     expect(ctx.localBounds(part)!.isEmpty()).toBe(false);
@@ -380,7 +383,8 @@ describe('ONE init for every entry (plan-754 F13 / D19)', () => {
     expect([...source.matchAll(/\binitSubtree\(/g)].length).toBe(3);
     // …and the wrapper delegates immediately, with no traversal of its own.
     expect(source).toMatch(
-      /export function processExtras\([\s\S]{0,1200}?\): ProcessExtrasResult \{\s*const result = initSubtree\(/,
+      // plan-652: one synchronous safety-net note (no construction) may precede it.
+      /export function processExtras\([\s\S]{0,1200}?\): ProcessExtrasResult \{\s*(?:\/\/[^\n]*\n\s*)*(?:noteDeferredComponentTypes\([^)]*\);\s*)?const result = initSubtree\(/,
     );
   });
 });

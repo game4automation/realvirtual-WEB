@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage, readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * ProblemsPanel — the readable half of "a reference that resolved to nothing"
  * (plan-703 Phase 8, §2.8, F16).
@@ -25,12 +27,14 @@
  * a rejection and is used for nothing but the icon.
  */
 
-import { useSyncExternalStore, useCallback } from 'react';
-import { Box, Button, Tooltip, Typography } from '@mui/material';
-import { ErrorOutlineRounded, WarningAmberRounded, InfoOutlined } from '@mui/icons-material';
+import { useSyncExternalStore, useCallback, useState } from 'react';
+import { Box, Button, IconButton, Snackbar, Tooltip, Typography } from '@mui/material';
+import { CloseRounded, ErrorOutlineRounded, WarningAmberRounded, InfoOutlined } from '@mui/icons-material';
 import {
   getProblems,
+  getProblemsAnnouncement,
   subscribeProblems,
+  subscribeProblemsAnnouncement,
   type ProblemEntry,
   type ProblemSeverity,
 } from './problems-store';
@@ -48,12 +52,51 @@ export function useProblems(): ProblemEntry[] {
 // ── Open state ──────────────────────────────────────────────────────────────
 // Shared by the panel and its ActivityBar entry, which owns the toggle: the
 // panel's own collapse chevron floated over the viewport and could end up under
-// the floating tool strip (2026-10-12). Open by default, and re-opened whenever
-// the list goes from empty to non-empty — a new batch of problems is news; a
-// user's "close" holds only while the batch they closed is still there.
+// the floating tool strip (2026-10-12).
+//
+// The panel opens on NEWS, nothing else (2026-10-18). Closing it acknowledges
+// every entry currently listed — by fingerprint (id + severity + title), kept
+// across page reloads. It comes back up only when an entry appears that has not
+// been acknowledged: a new problem, or an existing one whose headline changed.
+// An identical set re-reported by a reload, a model re-opened under a fresh blob
+// url, or a problem that flickers out and back in does not count as news. The
+// ActivityBar entry and its count stay visible throughout, so a closed panel is
+// always one click away.
 
-let _open = true;
-let _hadProblems = getProblems().length > 0;
+const ACKED_KEY = 'rv-problems-acked';
+const ACKED_MAX = 1000;
+
+function fingerprint(e: ProblemEntry): string {
+  return `${e.id}|${e.severity}|${e.title}`;
+}
+
+function loadAcked(): string[] {
+  try {
+    // The per-model close list it replaces; its keys cannot be mapped to entries.
+    getLocalStorage()!.removeItem('rv-problems-dismissed');
+    const raw = readLocalStorage(ACKED_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.filter((k): k is string => typeof k === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+const _acked = new Set<string>(loadAcked());
+
+function saveAcked(): void {
+  try {
+    // Oldest first (insertion order), so the cap drops the longest-acknowledged entries.
+    writeLocalStorage(ACKED_KEY, JSON.stringify([..._acked].slice(-ACKED_MAX)));
+  } catch { /* private window / blocked storage: the acknowledgement holds for this session only */ }
+}
+
+function hasNews(): boolean {
+  // plan-628 8.11g: a `quiet` entry (its marker sits in the view) is never news.
+  return getProblems().some(e => !e.quiet && !_acked.has(fingerprint(e)));
+}
+
+let _open = hasNews();
 const _openListeners = new Set<() => void>();
 
 function setProblemsPanelOpenInternal(open: boolean): void {
@@ -63,18 +106,62 @@ function setProblemsPanelOpenInternal(open: boolean): void {
 }
 
 subscribeProblems(() => {
-  const has = getProblems().length > 0;
-  if (has && !_hadProblems) setProblemsPanelOpenInternal(true);
-  _hadProblems = has;
+  if (!_open && hasNews()) setProblemsPanelOpenInternal(true);
 });
 
-export function setProblemsPanelOpen(open: boolean): void { setProblemsPanelOpenInternal(open); }
-export function toggleProblemsPanel(): void { setProblemsPanelOpenInternal(!_open); }
+// ── Code filter (plan-778 §2.7) ────────────────────────────────────────────
+// "Show" on a summary line opens the panel filtered to that line's problems
+// ("2 libraries unavailable — Show"). Closing the panel drops the filter, so
+// the next open is the whole list again.
+
+let _codeFilter: string | null = null;
+const _filterListeners = new Set<() => void>();
+
+function setCodeFilter(code: string | null): void {
+  if (_codeFilter === code) return;
+  _codeFilter = code;
+  for (const l of _filterListeners) l();
+}
+function subscribeProblemsFilter(l: () => void): () => void {
+  _filterListeners.add(l);
+  return () => { _filterListeners.delete(l); };
+}
+const getProblemsFilter = () => _codeFilter;
+/** Test seam: the active code filter without React. */
+export const getProblemsFilterForTests = getProblemsFilter;
+export function useProblemsFilter(): string | null {
+  return useSyncExternalStore(subscribeProblemsFilter, getProblemsFilter, getProblemsFilter);
+}
+
+/** Open the panel — filtered to one problem `code` when given, the whole list otherwise. */
+export function showProblems(opts: { code?: string | null } = {}): void {
+  setCodeFilter(opts.code ?? null);
+  setByUser(true);
+}
+
+/** User intent: closing acknowledges everything currently listed; opening just opens. */
+function setByUser(open: boolean): void {
+  if (!open) {
+    setCodeFilter(null);
+    for (const e of getProblems()) {
+      const fp = fingerprint(e);
+      _acked.delete(fp); // re-insert so it counts as most recent
+      _acked.add(fp);
+    }
+    saveAcked();
+  }
+  setProblemsPanelOpenInternal(open);
+}
+
+export function setProblemsPanelOpen(open: boolean): void { setByUser(open); }
+export function toggleProblemsPanel(): void { setByUser(!_open); }
 function subscribeProblemsPanelOpen(l: () => void): () => void {
   _openListeners.add(l);
   return () => { _openListeners.delete(l); };
 }
 const getProblemsPanelOpen = () => _open;
+/** Test seam: the open flag without React. */
+export const getProblemsPanelOpenForTests = getProblemsPanelOpen;
 export function useProblemsPanelOpen(): boolean {
   return useSyncExternalStore(subscribeProblemsPanelOpen, getProblemsPanelOpen, getProblemsPanelOpen);
 }
@@ -164,16 +251,58 @@ function ProblemRow({ entry }: { entry: ProblemEntry }) {
   );
 }
 
+/**
+ * The summary line of quiet problems (plan-778 §2.7): one sentence and **Show**,
+ * which opens this panel filtered to them. Dismissing it hides that one
+ * announcement; a new one (another project, another count) shows again.
+ */
+function ProblemsAnnouncementLine() {
+  const announcement = useSyncExternalStore(
+    subscribeProblemsAnnouncement, getProblemsAnnouncement, getProblemsAnnouncement);
+  const [dismissed, setDismissed] = useState<string | null>(null);
+  const token = announcement ? `${announcement.key}|${announcement.seq ?? announcement.message}` : null;
+  const open = !!announcement && dismissed !== token;
+  const show = useCallback(() => {
+    if (!announcement) return;
+    setDismissed(token);
+    showProblems({ code: announcement.code });
+  }, [announcement, token]);
+  return (
+    <Snackbar
+      open={open}
+      anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+      message={<span data-testid="problems-announcement">{announcement?.message ?? ''}</span>}
+      action={(
+        <>
+          <Button size="small" onClick={show} data-testid="problems-announcement-show" sx={{ textTransform: 'none' }}>
+            Show
+          </Button>
+          <IconButton size="small" aria-label="Dismiss" onClick={() => setDismissed(token)}>
+            <CloseRounded sx={{ fontSize: 16 }} />
+          </IconButton>
+        </>
+      )}
+    />
+  );
+}
+
 export function ProblemsPanel() {
   const problems = useProblems();
   const open = useProblemsPanelOpen();
+  const filter = useProblemsFilter();
   const close = useCallback(() => setProblemsPanelOpen(false), []);
+  const showAll = useCallback(() => setCodeFilter(null), []);
+  // A filter whose problems are all gone shows the whole list rather than nothing.
+  const filtered = filter ? problems.filter(p => p.code === filter) : problems;
+  const shown = filtered.length > 0 ? filtered : problems;
+  const isFiltered = shown.length !== problems.length;
 
   // The standard window (drag via title bar, resize via corner, Escape closes,
   // geometry remembered under `rv-panel-geo:problems`). Opened from the
   // ActivityBar it anchors next to the icon; on its own it starts bottom-left,
   // right of the bar.
   return (
+    <>
     <FloatingPanel
       open={open && problems.length > 0}
       onClose={close}
@@ -187,8 +316,20 @@ export function ProblemsPanel() {
       minWidth={320}
     >
       <Box data-testid="problems-panel" sx={{ flex: 1, minHeight: 0, overflowY: 'auto', px: 1.25, py: 0.75 }}>
-        {problems.map(entry => <ProblemRow key={entry.id} entry={entry} />)}
+        {isFiltered && (
+          <Box data-testid="problems-filter" sx={{ display: 'flex', alignItems: 'center', gap: 0.75, pb: 0.5 }}>
+            <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.6)' }}>
+              Showing {shown.length} of {problems.length}
+            </Typography>
+            <Button size="small" onClick={showAll} sx={{ fontSize: 11, textTransform: 'none', minWidth: 0, py: 0, px: 0.75 }}>
+              Show all
+            </Button>
+          </Box>
+        )}
+        {shown.map(entry => <ProblemRow key={entry.id} entry={entry} />)}
       </Box>
     </FloatingPanel>
+    <ProblemsAnnouncementLine />
+    </>
   );
 }

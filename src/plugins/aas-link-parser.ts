@@ -54,7 +54,26 @@ export interface AasProperty {
 export interface AasDocument {
   title: string;     // VDI2770_Title (first found) or filename fallback
   mimeType: string;  // from <file><mimeType> element
-  zipPath: string;   // path inside ZIP, leading "/" stripped
+  zipPath: string;   // path inside ZIP, leading "/" stripped; '' for an external document
+  /**
+   * Absolute http(s) address when the File element points OUTSIDE the package
+   * (Festo's type AAS link every manual on festo.com instead of shipping it).
+   * Opened in a new browser tab: the in-viewer PDF reader cannot fetch a
+   * cross-origin file that sends no CORS headers.
+   */
+  url?: string;
+  /** Document language as written (IDTA DocumentVersion Language, upper case), e.g. 'DE'. */
+  language?: string;
+  /** Kind of document (KeyWords, else the classification ClassName), e.g. 'Operating instructions'. */
+  kind?: string;
+  /** plan-682: IDTA Title in the preferred language, without language / kind additions ('' = none). */
+  baseTitle?: string;
+  /** plan-682: IDTA Subtitle in the preferred language. */
+  subtitle?: string;
+  /** plan-682: IDTA Version of the document version (shown as a tag, never in the title). */
+  version?: string;
+  /** plan-682: idShort of the document container (`Document07_ApplicationNoteDE`), title fallback. */
+  documentIdShort?: string;
 }
 
 /** A qualifier attached to the AssetAdministrationShell (semantically: validity/origin annotations). */

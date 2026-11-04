@@ -138,23 +138,18 @@ describe('the main model is the placement at the origin — its references are p
     expect(reg.getNodeByAddress(SLIDE_NODE_ID, 'nowhere')).toBeNull();
   });
 
-  it('a byPath override that leads INTO a nested reference orphans with the reason "nested-reference" (F6 boundary)', async () => {
+  it('plan-769 4b: a byPath override that leads INTO a nested reference is routed there and applied (the F6 boundary is gone)', async () => {
     const outer = await outerDataUrl(await innerDataUrl());
     const doc = new Group();
     doc.name = 'Layout';
     const ref = referenceNode('Machine_1', 'plc-machine', outer, true, [10, 0, 0], 'cat:machine');
-    setAssetOverrides(ref, { byNodeId: {}, byPath: { 'Cell_1/Slide': { Drive: { TargetSpeed: 9 } } } });
+    setAssetOverrides(ref, { byAddress: {}, legacyByPath: { 'Cell_1/Slide': { Drive: { TargetSpeed: 9 } } } });
     doc.add(ref);
     const { h } = await load(await objectToGlb(doc), 'ovr.glb');
-    const orphans = getProblems().filter((p) => p.code === 'override-orphaned');
-    expect(orphans).toHaveLength(1);
-    expect(orphans[0].title).toContain('nested reference');
-    expect(orphans[0].detail).toContain('"Cell_1"');
-    expect(orphans[0].detail).toContain('nested placement');
-    expect(orphans[0].nodePath).toMatch(/Layout[/]Machine_1$/);
-    // The nested drive keeps its authored speed — nothing was applied silently.
+    expect(getProblems().filter((p) => p.code === 'override-orphaned')).toEqual([]);
+    // The nested drive carries the outer value once the nested placement materialised.
     const slide = findByName(h.viewer.currentModelRoot!, 'Slide')!;
-    expect((slide.userData.realvirtual as { Drive: { TargetSpeed: number } }).Drive.TargetSpeed).toBe(200);
+    expect((slide.userData.realvirtual as { Drive: { TargetSpeed: number } }).Drive.TargetSpeed).toBe(9);
   });
 
   it('Phase 2 exit: save → reload → the same structure, nested included; the nested drive still moves', async () => {

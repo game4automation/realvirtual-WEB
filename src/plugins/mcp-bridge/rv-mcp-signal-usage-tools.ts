@@ -13,46 +13,37 @@
  * so bridge usages are not missing just because the CONNECT panel was never
  * opened.
  *
- * Delegate class of McpBridgePlugin (see rv-mcp-instances.ts).
+ * Implementation routines for registry commands (plan-2007).
  */
 
 import type { RVViewer } from '../../core/rv-viewer';
-import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
 import { groupSignalUsages, isAmbiguousSignalName } from '../../core/engine/rv-signal-usage-index';
 import { ensureSignalUsageWiring, isSignalUsageNavigable } from '../../core/hmi/use-signal-usages';
 import { getConnectBridges, getConnectSnapshot, reloadConnectBridges } from '../../core/hmi/connect-store';
 
-export class McpSignalUsageTools {
-  constructor(private readonly getViewer: () => RVViewer | undefined) {}
-
-  @McpTool(
-    'List where a signal is used: component fields, logic steps, PLC program lines (read/write), '
-    + 'operator panels, bindings and CONNECT bridges — the inspector\'s "Used by" list.',
-    { readOnly: true },
-  )
-  async webSignalUsage(
-    @McpParam('name', 'Signal name as web_signal_list reports it') name: string,
-  ): Promise<string> {
-    const viewer = this.getViewer();
-    if (!viewer) return JSON.stringify({ error: 'No viewer' });
-    const signal = (name ?? '').trim();
-    if (!signal) return JSON.stringify({ error: 'name is required' });
-    const service = ensureSignalUsageWiring(viewer);
-    if (!service) return JSON.stringify({ error: 'Signal usage index unavailable' });
-    if (getConnectSnapshot().state === 'connected' && !getConnectBridges().loaded) {
-      await reloadConnectBridges();
-    }
-    const usages = service.usages(signal);
-    const store = viewer.signalStore;
-    return JSON.stringify({
-      signal,
-      known: store ? store.get(signal) !== undefined : null,
-      ...(isAmbiguousSignalName(store, signal) ? { ambiguous: true } : {}),
-      count: usages.length,
-      groups: groupSignalUsages(usages).map((g) => ({
-        kind: g.kind,
-        usages: g.usages.map((u) => ({ ...u, navigable: isSignalUsageNavigable(u) })),
-      })),
-    });
+/** Read-only command body (plan-2007). */
+export async function querySignalUsage(
+  viewer: RVViewer | undefined,
+  name: string,
+): Promise<string> {
+  if (!viewer) return JSON.stringify({ error: 'No viewer' });
+  const signal = (name ?? '').trim();
+  if (!signal) return JSON.stringify({ error: 'name is required' });
+  const service = ensureSignalUsageWiring(viewer);
+  if (!service) return JSON.stringify({ error: 'Signal usage index unavailable' });
+  if (getConnectSnapshot().state === 'connected' && !getConnectBridges().loaded) {
+    await reloadConnectBridges();
   }
+  const usages = service.usages(signal);
+  const store = viewer.signalStore;
+  return JSON.stringify({
+    signal,
+    known: store ? store.get(signal) !== undefined : null,
+    ...(isAmbiguousSignalName(store, signal) ? { ambiguous: true } : {}),
+    count: usages.length,
+    groups: groupSignalUsages(usages).map((g) => ({
+      kind: g.kind,
+      usages: g.usages.map((u) => ({ ...u, navigable: isSignalUsageNavigable(u) })),
+    })),
+  });
 }

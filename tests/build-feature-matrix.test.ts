@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import type { RVViewerPlugin } from '../src/core/rv-plugin';
 import type { ModeDescriptor } from '../src/core/rv-mode-manager';
 import {
+  appendOnDemandRows,
   buildFeatureMatrix,
   groupFeatureMatrix,
   ORIGIN_RANK,
@@ -30,6 +31,28 @@ function build(
     (id) => disabled.has(id),
   );
 }
+
+describe('appendOnDemandRows (plan-652 §2.6)', () => {
+  const statuses = [
+    { id: 'asset-editor', state: 'declared', activation: ['mode:planner'], origin: 'commercial' },
+    { id: 'des', state: 'active', activation: ['mode:des'], origin: 'internal' },
+    { id: 'eager', state: 'declared', activation: ['startup'] },
+    { id: 'shared', state: 'failed', activation: ['mode:hmi'], origin: 'commercial' },
+  ];
+
+  it('adds one "on demand" row per declared, inactive on-demand feature without a plugin row', () => {
+    const rows = appendOnDemandRows(build([{ id: 'shared' }]), statuses, MODES);
+    const editor = rows.find((row) => row.id === 'asset-editor');
+    expect(editor).toMatchObject({ onDemand: true, activeNow: false, origin: 'commercial' });
+    expect(editor?.modes).toEqual({ hmi: false, planner: true });
+    expect(rows.map((row) => row.id)).toEqual(['shared', 'asset-editor']);
+  });
+
+  it('adds nothing for an active feature or a startup-only one', () => {
+    const rows = appendOnDemandRows([], statuses, MODES);
+    expect(rows.some((row) => row.id === 'des' || row.id === 'eager')).toBe(false);
+  });
+});
 
 describe('buildFeatureMatrix', () => {
   it('marks core plugins as participating in every mode', () => {

@@ -68,9 +68,12 @@
 
 import type { RecentBackend, RecentDocumentEntry } from '../../project/rv-project-recents';
 import {
+  allowedModesOf,
   effectiveOpenMode,
   handoffParkMode,
+  isModeAllowedForRow,
   plannedDeparture,
+  restrictedOpenTarget,
 } from '../../project/rv-document-mode';
 import { openProjectById, type OpenProjectDeps } from './open-project-by-id';
 
@@ -95,6 +98,10 @@ export interface OpenRecentModes {
   lockedMode?: string | null;
   has(id: string): boolean;
   list(): readonly { id: string }[];
+  /** The modes the OPEN document allows (`ModeManager.available`). Optional for headless fakes. */
+  available?(): readonly { id: string }[];
+  /** A mode's descriptor - its `runtime` marks authoring modes, which no restriction forbids. */
+  descriptor?(id: string): { runtime?: string } | undefined;
   setMode(id: string): void;
   runExitGuards(to: string, token?: symbol): Promise<boolean>;
   /** The shared workspace switch lock (plan-478 R3-2). Null when held. */
@@ -141,7 +148,7 @@ export interface OpenChainBaseDeps extends OpenProjectDeps {
    * `mode` is the row's own declared workspace mode — one of the inputs of the
    * target decision (plan-513), read live after the project open.
    */
-  documents(): readonly { id: string; mode?: string }[];
+  documents(): readonly { id: string; mode?: string; modes?: unknown }[];
   /**
    * `openDocumentAsWorkingScene` bound to the live viewer + scene store.
    *
@@ -180,6 +187,11 @@ export interface OpenRecentDeps extends OpenChainBaseDeps {
 /** `mode` when this build registers it, else null — an unknown mode is no target. */
 function registered(mode: string | undefined, modes: OpenRecentModes): string | null {
   return mode && modes.has(mode) ? mode : null;
+}
+
+/** The target row's `modes` restriction (live, after the project open), or null. */
+function liveRowAllowedOf(target: OpenDocumentTarget, deps: OpenChainBaseDeps): string[] | null {
+  return allowedModesOf(deps.documents().find(d => d.id === target.documentId));
 }
 
 /** The mode the open project's own row for the target declares, or null. */
@@ -279,13 +291,27 @@ export async function openProjectDocument(
 
     // (3) The ONE decision: the live row and the project's kind are readable
     // now. A demo takes no last mode (plan-478 stays).
+    // The row's mode restriction (`documents[].modes`) is part of that decision:
+    // a last mode the document forbids is no target, and when nothing names one
+    // the active mode is kept only if the document allows it.
+    const declaredMode = liveRowModeOf(entry, deps);
+    const allowed = liveRowAllowedOf(entry, deps);
+    const isAllowed = (m: string) =>
+      isModeAllowedForRow(allowed, m, (id) => modes.descriptor?.(id)?.runtime);
     const decided = effectiveOpenMode({
       lastMode,
-      declaredMode: liveRowModeOf(entry, deps),
+      declaredMode,
       isDemo: deps.isDemoProject(),
       has: (m) => modes.has(m),
+      isAllowed,
     });
-    const target = decided ?? modes.activeMode;
+    const target = decided ?? restrictedOpenTarget({
+      active: modes.activeMode,
+      declaredMode,
+      allowed,
+      has: (m) => modes.has(m),
+      isAllowed,
+    });
     const departure = target ? plannedDeparture(modes.activeMode, target, park) : null;
     if (departure !== null && departure !== asked
       && !(await modes.runExitGuards(departure, token))) {

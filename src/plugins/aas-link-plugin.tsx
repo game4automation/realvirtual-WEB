@@ -21,13 +21,12 @@ import {
   getActiveAasSource,
   getAasSourcesVersion,
   lookupAas,
-  setAasDeployContext,
   subscribeAasSources,
   type AasSource,
 } from '../core/aas/rv-aas-source';
-import { useState, useEffect, useSyncExternalStore, useCallback } from 'react';
+import { useState, useEffect, useSyncExternalStore, useCallback, useMemo } from 'react';
 import { Box, Typography, CircularProgress, IconButton, Button, Tooltip as MuiTooltip } from '@mui/material';
-import { OpenInNew, PictureAsPdf, Description, ShoppingCart, WarningAmber } from '@mui/icons-material';
+import { OpenInNew, PictureAsPdf, Description, ShoppingCart, WarningAmber, ExpandMore, ChevronRight } from '@mui/icons-material';
 import type { RVViewerPlugin } from '../core/rv-plugin';
 import type { LoadResult } from '../core/engine/rv-scene-loader';
 import type { RVViewer } from '../core/rv-viewer';
@@ -41,17 +40,20 @@ import { registerCapabilities } from '../core/engine/rv-component-registry';
 import { NodeRegistry } from '../core/engine/rv-node-registry';
 import { FloatingPanel } from '../core/hmi/FloatingPanel';
 import { RV_SCROLL_CLASS } from '../core/hmi/shared-sx';
+import { prefetchAasDocumentMirrorFor } from '../core/aas/rv-aas-document-mirror';
 import { loadIndex, loadAasDetail, type AasParsedData, type AasIndexEntry, type AasDocument } from './aas-link-parser';
 import {
-  beginAasLoadGeneration,
   getAasResolution,
   getAasResolutionVersion,
   isAasNodeVisible,
   isAasVisible,
-  resolveAasSubtree,
+  collectAasNodes,
   subscribeAasResolution,
   type AasResolution,
 } from './aas-resolution';
+import { useCartAvailable } from '../core/hmi/cart-gate';
+import { AasModeController, type AasModeState } from './aas-mode';
+import { displayTitle, groupDocuments, summarizeDocuments, uiLanguages } from './aas-tooltip-groups';
 import type { OrderManagerPluginAPI } from '../core/types/plugin-types';
 import { useCustomBranding } from '../core/hmi/branding-store';
 import { extractOrderData } from './order-manager-plugin';
@@ -92,45 +94,36 @@ export interface AasTooltipData extends TooltipData {
  * component the user can look at, so it must neither be counted nor highlighted.
  */
 function getAasNodes(viewer: RVViewer): import('three').Object3D[] {
-  const nodes: import('three').Object3D[] = [];
-  viewer.scene.traverse(node => {
-    if (node.userData?._rvAasLink && isAasNodeVisible(node)) nodes.push(node);
-  });
-  return nodes;
+  return collectAasNodes(viewer.scene);
 }
 
-/** Left sidebar button — highlights all AASLink nodes on click. */
+const NO_AAS_MODE: AasModeState = { on: false, count: 0 };
+const noSubscribe = () => () => {};
+
+/**
+ * Left sidebar button — the AAS mode switch (plan-682 F6). Badge = number of
+ * resolvable AAS parts; no button at all while there is none (F2).
+ */
 function AasButton({ viewer }: UISlotProps) {
-  const [active, setActive] = useState(false);
-  // Re-render when a resolution pass finishes so the badge count is never stale.
+  const mode = viewer.getPlugin<AasLinkPlugin>('aas-link')?.aasMode ?? null;
+  // Re-render when a resolution pass finishes so the count is never stale even
+  // before the plugin's mode controller exists (tests, early boot).
   useSyncExternalStore(subscribeAasResolution, getAasResolutionVersion, getAasResolutionVersion);
+  const state = useSyncExternalStore(mode?.subscribe ?? noSubscribe, mode?.getSnapshot ?? (() => NO_AAS_MODE));
+  // Live count (cheap traversal, re-run on every resolution pass): also right
+  // for content that arrived without a resolution notification.
+  const count = getAasNodes(viewer).length;
 
-  const handleClick = useCallback(() => {
-    if (active) {
-      viewer.highlighter.clear();
-      setActive(false);
-    } else {
-      const nodes = getAasNodes(viewer);
-      if (nodes.length > 0) {
-        viewer.highlighter.highlightMultiple(nodes);
-        setActive(true);
-      }
-    }
-  }, [active, viewer]);
+  const handleClick = useCallback(() => { mode?.toggle(); }, [mode]);
 
-  // Clear active state when something else clears the highlight
-  useEffect(() => {
-    if (!active) return;
-    const off = viewer.on('object-hover', () => setActive(false));
-    return off;
-  }, [active, viewer]);
+  if (count === 0) return null;
 
   return (
     <NavButton
       icon={<Description />}
       label="AAS Components"
-      badge={getAasNodes(viewer).length || undefined}
-      active={active}
+      badge={count}
+      active={state.on}
       onClick={handleClick}
     />
   );
@@ -228,6 +221,12 @@ export function openDocModeDetailAtPoint(viewer: RVViewer, hitPoint: [number, nu
 
 export class AasLinkPlugin implements RVViewerPlugin {
   readonly id = 'aas-link';
+  /**
+   * plan-682: a core plugin, registered once in main.ts. `core` keeps it in
+   * selective mode (`rv_plugins`) — its UI gates itself on resolvable AAS links,
+   * so a document without any never shows a trace of it.
+   */
+  readonly core = true;
 
   readonly slots: UISlotEntry[] = [
     { slot: 'button-group', component: AasButton, order: 45 },
@@ -238,37 +237,90 @@ export class AasLinkPlugin implements RVViewerPlugin {
   private unhoverOff: (() => void) | null = null;
   private sourcesOff: (() => void) | null = null;
   private readonly docHoverTipId = 'tooltip-hover:aas-docmode';
-  /** plan-435 §2.10 abort generation — bumped by `onDeactivate`, checked by
-   *  the async AASX indexing before it writes anything into the scene. */
+  /** plan-435 §2.10 abort generation — bumped by `onDeactivate` and
+   *  `onModelCleared`, checked by every deferred / async model step. */
   private _generation = 0;
+  /** The load result whose `model-loaded` event has already fired (replay marker). */
+  private _emittedResult: LoadResult | null = null;
+  private _emittedOff: (() => void) | null = null;
+  private _clearedOff: (() => void) | null = null;
+  /** One-shot `model-loaded` listener of a load still in progress. */
+  private _pendingOff: (() => void) | null = null;
+  /** The AAS mode of this viewer (plan-682 Phase 2), created in `init`. */
+  aasMode: AasModeController | null = null;
 
+  init(viewer: RVViewer): void {
+    this.viewer = viewer;
+    // Replay marker: `onModelLoaded` arrives during a load (BEFORE the event,
+    // model packs' AAS rewriters still to come) or as a replay of a finished
+    // load (`onActivate`, late registration). The event tells them apart.
+    // Registered after a load already finished: that load counts as emitted.
+    this._emittedResult = viewer.lastLoadResult ?? null;
+    this._emittedOff = viewer.on('model-loaded', (payload: { result?: LoadResult }) => {
+      this._emittedResult = payload?.result ?? null;
+    });
+    this._clearedOff = viewer.on('model-cleared', () => { this._emittedResult = null; });
+    this.aasMode = new AasModeController(viewer);
+  }
+
+  /** Keeps AAS-mode badges on moving parts (no-op while the mode is off). */
+  onRender(): void {
+    this.aasMode?.update();
+  }
+
+  /**
+   * plan-682 §2.1: the hook stays (it is what puts the plugin into the viewer's
+   * `_modelLoadedIds`, and so what delivers `onModelCleared`), but the model work
+   * runs AFTER `model-loaded` — that event fires only after every plugin's
+   * `onModelLoaded`, i.e. after model packs rewrote or attached AAS links (demo
+   * supplier swap, a CAD-import showcase model attach). Packs register after the core plugins, so
+   * running here directly would read the links before they are final.
+   */
   onModelLoaded(result: LoadResult, viewer: RVViewer): void {
     this.viewer = viewer;
+    this._pendingOff?.();
+    this._pendingOff = null;
     const generation = this._generation;
+    if (this._emittedResult === result) {
+      // Replay of a finished load: everything is final already.
+      this._initForModel(result, viewer, generation);
+      return;
+    }
+    const off = viewer.on('model-loaded', (payload: { result?: LoadResult }) => {
+      if (payload?.result !== result) return;
+      off();
+      if (this._pendingOff === off) this._pendingOff = null;
+      if (generation !== this._generation) return;
+      this._initForModel(result, viewer, generation);
+    });
+    this._pendingOff = off;
+  }
 
-    // Motor datasheet on hover (normal viewing modes — this plugin is not loaded
-    // in the planner; the layout-planner plugin runs the same augmenter there).
+  /**
+   * The model work proper. Resolvability is NOT decided here:
+   * `installAasResolution(viewer)` (main.ts) owns it, and its `model-loaded`
+   * listener is registered before this plugin exists, so it runs first.
+   */
+  private _initForModel(result: LoadResult, viewer: RVViewer, generation: number): void {
+    if (generation !== this._generation) return;
+    _activeViewer = viewer;
+    // The AAS document mirror (docs/aas/mirror.json) is NOT probed here: it is
+    // loaded when an AAS detail with an external document is read
+    // (loadActiveAas), so a project without a mirror never requests it.
+
+    // Motor datasheet on hover. In the layout planner the planner plugin runs
+    // the same augmenter with its own placement-aware gate — skip there, or the
+    // motor would get two tooltips.
     this.hoverOff?.();
     this.unhoverOff?.();
-    this.hoverOff = viewer.on('object-hover', (h: ObjectHoverState | null) => showDocModeDatasheet(viewer, h, this.docHoverTipId));
+    this.hoverOff = viewer.on('object-hover', (h: ObjectHoverState | null) => {
+      if (viewer.modes?.activeMode === 'planner') { tooltipStore.hide(this.docHoverTipId); return; }
+      showDocModeDatasheet(viewer, h, this.docHoverTipId);
+    });
     this.unhoverOff = viewer.on('object-unhover', () => tooltipStore.hide(this.docHoverTipId));
 
-    // Read optional assetsBasePath from model config for project-specific AASX/PDF.
-    // Falls back to viewer.projectAssetsPath (set via settings.json in private deploys).
     const aasConfig = result.modelConfig?.pluginConfig?.['aas-link'] as
       { assetsBasePath?: string; pdfLinks?: Record<string, string> } | undefined;
-    // plan-596: ONE active AAS source for every surface: the open project's
-    // aasx/ folder over the deploy-wide directory (an explicit per-model path
-    // still names the deploy directory).
-    setAasDeployContext({ explicitBase: aasConfig?.assetsBasePath ?? null, deployBase: viewer.projectAssetsPath });
-    _activeViewer = viewer;
-    const source = getActiveAasSource();
-
-    // Decide ONCE whether each AAS link can be resolved, and mark the nodes.
-    // Runs on the load result's own root, not `viewer.scene`, so a model switch
-    // during the index fetch cannot classify the new model against the old
-    // source; the load generation drops the stale completion (plan-373 F1/F2b).
-    void resolveAasSubtree(result.root, source, beginAasLoadGeneration());
 
     // Search text from the INDEX metadata (idShort, product name, manufacturer)
     // only. No archive is opened at model start (plan-596 SOL #8): the package
@@ -299,12 +351,15 @@ export class AasLinkPlugin implements RVViewerPlugin {
           for (const [pathPattern, pdfUrl] of entries) {
             if (nodePath.endsWith(pathPattern) || nodePath.endsWith('/' + pathPattern)) {
               if (!node.userData._rvPdfLinks) node.userData._rvPdfLinks = [];
+              const links = node.userData._rvPdfLinks as PdfLink[];
               // Resolve PDF URL: if a docs base applies and the URL is
               // relative, prepend it. Absolute URLs are left untouched.
               const resolvedUrl = docsBasePath && !pdfUrl.startsWith('http') && !pdfUrl.startsWith('/')
                 ? `${docsBasePath}${pdfUrl}`
                 : pdfUrl;
-              (node.userData._rvPdfLinks as PdfLink[]).push({
+              // Idempotent: a replay (onActivate) must not add the link twice.
+              if (links.some(l => l.source.type === 'url' && l.source.url === resolvedUrl)) continue;
+              links.push({
                 title: pdfUrl.split('/').pop()?.replace(/\.pdf$/i, '') ?? pdfUrl,
                 source: { type: 'url', url: resolvedUrl },
               });
@@ -343,15 +398,11 @@ export class AasLinkPlugin implements RVViewerPlugin {
     }).catch(() => { /* index unavailable: search just won't include it */ });
   }
 
-  /**
-   * plan-435: the hover subscriptions live until `dispose()`, so the fallback
-   * would leave the datasheet tooltip alive behind a switched-off plugin.
-   * Detach them and cancel the in-flight AASX indexing (§2.10). The scene
-   * markings written by a completed index are model data owned by
-   * `onModelCleared`-style teardown, not by this hook (invariant 3).
-   */
-  onDeactivate(): void {
+  /** Detach everything bound to the current model (clear / deactivate / dispose). */
+  private _detachModel(): void {
     this._generation++;
+    this._pendingOff?.();
+    this._pendingOff = null;
     this.sourcesOff?.();
     this.sourcesOff = null;
     this.hoverOff?.();
@@ -361,21 +412,36 @@ export class AasLinkPlugin implements RVViewerPlugin {
     tooltipStore.hide(this.docHoverTipId);
   }
 
-  /** Re-attach the hover augmenter for the model that is still loaded. */
+  onModelCleared(): void {
+    this._detachModel();
+    this.aasMode?.reset();
+  }
+
+  /**
+   * plan-435: switched off — detach the hover augmenter, drop a pending deferred
+   * init and cancel the in-flight AASX indexing (§2.10). The scene markings
+   * written by a completed index are model data owned by `onModelCleared`-style
+   * teardown, not by this hook (invariant 3).
+   */
+  onDeactivate(): void {
+    this._detachModel();
+    this.aasMode?.reset();
+  }
+
+  /** Re-attach the model work for the model that is still loaded (a replay). */
   onActivate(viewer: RVViewer): void {
     const result = viewer.lastLoadResult;
     if (result) this.onModelLoaded(result, viewer);
   }
 
   dispose(): void {
-    this._generation++;
-    this.sourcesOff?.();
-    this.sourcesOff = null;
-    this.hoverOff?.();
-    this.unhoverOff?.();
-    this.hoverOff = null;
-    this.unhoverOff = null;
-    tooltipStore.hide(this.docHoverTipId);
+    this._detachModel();
+    this.aasMode?.dispose();
+    this.aasMode = null;
+    this._emittedOff?.();
+    this._clearedOff?.();
+    this._emittedOff = null;
+    this._clearedOff = null;
     disposePdfViewer();
     if (_activeViewer === this.viewer) _activeViewer = null;
     this.viewer = null;
@@ -400,7 +466,7 @@ export function replaceAasPdfLinks(node: Object3D, aasId: string, docs: readonly
   const kept = existing.filter(l => l.aasGenerated !== aasId);
   const added: AasPdfLink[] = docs.map(doc => ({
     title: doc.title,
-    source: { type: 'blob', aasId, zipPath: doc.zipPath, ...(sourceKey ? { sourceKey } : {}) },
+    source: doc.url ? { type: 'external', url: doc.url } : { type: 'blob', aasId, zipPath: doc.zipPath, ...(sourceKey ? { sourceKey } : {}) },
     aasGenerated: aasId,
   }));
   const next = [...kept, ...added];
@@ -448,6 +514,9 @@ function loadActiveAas(
       if (!lookup) throw new Error(`AAS ID not found in index: ${aasId}`);
       const parsed = await loadAasDetail(lookup, aasId);
       if (stale()) return;
+      // An AAS that links an external document needs the project's mirror
+      // mapping before the first click; one without such a link never reads it.
+      void prefetchAasDocumentMirrorFor((parsed.documents ?? []).map((d) => d.url));
       handlers.onDetail(parsed, lookup.source);
     })
     .catch((err) => {
@@ -546,6 +615,136 @@ function SectionHeader({ text }: { text: string }) {
   );
 }
 
+// ─── Grouped documents (plan-682 Phase 3) ───────────────────────────────
+
+/** Where a document opens: external address in a new tab, package entry in the PDF viewer. */
+function documentSource(doc: AasDocument, aasId: string, sourceKey: string | null): PdfLink['source'] {
+  return doc.url
+    ? { type: 'external', url: doc.url }
+    : { type: 'blob', aasId, zipPath: doc.zipPath, ...(sourceKey ? { sourceKey } : {}) };
+}
+
+function openDocument(doc: AasDocument, aasId: string, sourceKey: string | null): void {
+  openPdfViewer(displayTitle(doc), documentSource(doc, aasId, sourceKey));
+}
+
+/** Small language chip; clickable when it opens a translation. */
+function LangChip({ lang, active, onClick }: { lang: string; active: boolean; onClick?: () => void }) {
+  return (
+    <Box
+      component={onClick ? 'button' : 'span'}
+      onClick={onClick ? (e: React.MouseEvent) => { e.stopPropagation(); onClick(); } : undefined}
+      title={onClick ? `Open the ${lang} version` : undefined}
+      sx={{
+        font: 'inherit', fontSize: 9, fontWeight: 700, lineHeight: '14px', px: 0.5, borderRadius: 0.5,
+        border: '1px solid', borderColor: active ? 'rgba(79,195,247,0.6)' : 'rgba(255,255,255,0.25)',
+        color: active ? '#4fc3f7' : 'rgba(255,255,255,0.6)', bgcolor: 'transparent',
+        cursor: onClick ? 'pointer' : 'default', flexShrink: 0,
+        '&:hover': onClick ? { borderColor: '#4fc3f7', color: '#4fc3f7' } : undefined,
+      }}
+    >
+      {lang}
+    </Box>
+  );
+}
+
+/**
+ * Documents grouped by kind, every group collapsed by default with its count in
+ * the header ("Application description (7)"); translations of one document are
+ * one row in the UI language with the other languages as chips.
+ */
+export function AasDocumentGroups({ docs, aasId, sourceKey, large = false }: {
+  docs: readonly AasDocument[];
+  aasId: string;
+  sourceKey: string | null;
+  large?: boolean;
+}) {
+  const groups = useMemo(() => groupDocuments(docs, uiLanguages()), [docs]);
+  const [open, setOpen] = useState<ReadonlySet<string>>(() => new Set());
+  if (groups.length === 0) return null;
+  const fs = large ? 12 : 10;
+  const toggle = (key: string) => setOpen(prev => {
+    const next = new Set(prev);
+    if (next.has(key)) next.delete(key); else next.add(key);
+    return next;
+  });
+  return (
+    <Box data-testid="aas-document-groups">
+      <SectionHeader text="Documents" />
+      {groups.map((g) => {
+        const expanded = open.has(g.key);
+        return (
+          <Box key={g.key} data-testid={`aas-doc-group:${g.key}`}>
+            <Box
+              component="button"
+              onClick={() => toggle(g.key)}
+              aria-expanded={expanded}
+              sx={{
+                all: 'unset', boxSizing: 'border-box', width: '100%', display: 'flex', alignItems: 'center', gap: 0.5,
+                cursor: 'pointer', py: 0.25, borderRadius: 0.5, color: 'rgba(255,255,255,0.85)',
+                '&:hover': { bgcolor: 'rgba(255,255,255,0.05)' },
+              }}
+            >
+              {expanded ? <ExpandMore sx={{ fontSize: fs + 4 }} /> : <ChevronRight sx={{ fontSize: fs + 4 }} />}
+              <Typography component="span" sx={{ fontSize: fs, fontWeight: 600, flex: 1 }}>
+                {g.label} ({g.entries.length})
+              </Typography>
+            </Box>
+            {expanded && g.entries.map((e, i) => {
+              const primaryLang = (e.primary.language ?? '').toUpperCase();
+              return (
+                <Box
+                  key={`${g.key}-${i}`}
+                  onClick={() => openDocument(e.primary, aasId, sourceKey)}
+                  sx={{
+                    display: 'flex', alignItems: 'center', gap: 0.5, pl: 2, py: 0.25,
+                    cursor: 'pointer', borderRadius: 0.5,
+                    '&:hover': { bgcolor: 'rgba(255,255,255,0.05)' },
+                  }}
+                >
+                  <PictureAsPdf sx={{ fontSize: fs + 2, color: '#ef5350', flexShrink: 0 }} />
+                  <Typography component="span" sx={{ color: '#fff', fontSize: fs, flex: 1, minWidth: 0, wordBreak: 'break-word' }}>
+                    {e.title}
+                  </Typography>
+                  {e.primary.version && (
+                    <Typography component="span" sx={{ color: 'rgba(255,255,255,0.4)', fontSize: fs - 1, flexShrink: 0 }}>
+                      v{e.primary.version}
+                    </Typography>
+                  )}
+                  {primaryLang && <LangChip lang={primaryLang} active />}
+                  {e.alternates.map((alt, j) => (
+                    <LangChip
+                      key={j}
+                      lang={(alt.language ?? '?').toUpperCase()}
+                      active={false}
+                      onClick={() => openDocument(alt, aasId, sourceKey)}
+                    />
+                  ))}
+                </Box>
+              );
+            })}
+          </Box>
+        );
+      })}
+    </Box>
+  );
+}
+
+/** Hover tooltip: one compact line, never the list (plan-682 F12). */
+function AasDocumentSummary({ docs }: { docs: readonly AasDocument[] }) {
+  const text = useMemo(() => summarizeDocuments(groupDocuments(docs, uiLanguages())), [docs]);
+  if (!text) return null;
+  return (
+    <Typography
+      variant="caption"
+      sx={{ color: 'rgba(255,255,255,0.45)', fontSize: 10, mt: 0.5, display: 'flex', alignItems: 'center', gap: 0.5 }}
+    >
+      <PictureAsPdf sx={{ fontSize: 10, color: '#ef5350' }} />
+      {text}
+    </Typography>
+  );
+}
+
 /** Max rows shown in hover mode (non-pinned). Pinned shows all with scroll. */
 const HOVER_MAX_ROWS = 5;
 
@@ -557,6 +756,9 @@ export function AasTooltipContent({ data, isPinned, viewer }: TooltipContentProp
   const [parsed, setParsed] = useState<AasParsedData | null>(null);
   const [indexEntry, setIndexEntry] = useState<AasIndexEntry | null>(null);
   const [error, setError] = useState('');
+  const [docSourceKey, setDocSourceKey] = useState<string | null>(null);
+  // plan-682 §2.7: the same gate as the cart panel (hidden in `mode:viewer`).
+  const cartAvailable = useCartAvailable();
   // The data resolver already refuses an unresolvable link; this repeats the gate
   // for tooltip data built by other callers. Hooks stay above the early return.
   const hidden = data.resolution !== undefined && !isAasVisible(data.resolution);
@@ -581,6 +783,7 @@ export function AasTooltipContent({ data, isPinned, viewer }: TooltipContentProp
       onEntry: (entry) => setIndexEntry(entry),
       onDetail: (result, source) => {
         setParsed(result);
+        setDocSourceKey(source.key);
         setState('success');
         applyAasPdfLinks(viewer, data.aasId, result.documents, source.key);
       },
@@ -687,12 +890,16 @@ export function AasTooltipContent({ data, isPinned, viewer }: TooltipContentProp
                 +{hiddenCount} more (click to expand)
               </Typography>
             )}
+            {/* plan-682 F10/F12: documents grouped by kind (pinned), one summary line (hover). */}
+            {isPinned
+              ? <AasDocumentGroups docs={parsed.documents} aasId={data.aasId} sourceKey={docSourceKey} />
+              : <AasDocumentSummary docs={parsed.documents} />}
           </Box>
         );
       })()}
 
       {/* ── "Add to Cart" full-width button at bottom (pinned only — hover tooltips have no pointer events) ── */}
-      {isPinned && (() => {
+      {isPinned && cartAvailable && (() => {
         const orderPlugin = viewer.getPlugin<OrderManagerPluginAPI>('order-manager');
         if (!orderPlugin) return null;
         return (
@@ -931,23 +1138,7 @@ export function AasDetailPanel() {
               </>
             )}
             {parsed.documents.length > 0 && (
-              <>
-                <SectionHeader text="Documents" />
-                {parsed.documents.map((doc, i) => (
-                  <Box
-                    key={`doc-${i}`}
-                    onClick={() => openPdfViewer(doc.title, { type: 'blob', aasId: state.aasId, zipPath: doc.zipPath, ...(sourceKey ? { sourceKey } : {}) })}
-                    sx={{
-                      display: 'flex', alignItems: 'center', gap: 1, py: 0.5, px: 0.5,
-                      cursor: 'pointer', borderRadius: 0.5,
-                      '&:hover': { bgcolor: 'rgba(255,255,255,0.05)' },
-                    }}
-                  >
-                    <PictureAsPdf sx={{ fontSize: 16, color: '#ef5350' }} />
-                    <Typography sx={{ color: '#fff', fontSize: 12 }}>{doc.title}</Typography>
-                  </Box>
-                ))}
-              </>
+              <AasDocumentGroups docs={parsed.documents} aasId={state.aasId} sourceKey={sourceKey} large />
             )}
             {parsed.nameplate.length === 0 && parsed.technicalData.length === 0 && parsed.documents.length === 0 && (
               <Typography sx={{ color: 'rgba(255,255,255,0.4)', fontSize: 12, py: 2, textAlign: 'center' }}>

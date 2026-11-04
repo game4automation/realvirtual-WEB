@@ -274,7 +274,7 @@ describe('plan-411 T8 — hover budget', () => {
     );
 
     // The 50 ms throttle IS the CPU budget of one hover sample
-    // (doc-render-picking.md §2.4). The warm path must fit inside it with room
+    // (contract-bake-picking.md §2.4). The warm path must fit inside it with room
     // for the two raycasts that share the same sample.
     expect(warm).toBeLessThan(50);
   });

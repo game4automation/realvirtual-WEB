@@ -10,6 +10,18 @@ function tool(name: string): ToolSchema {
 }
 
 describe('ToolRegistry', () => {
+  it.each([false, true])('keeps tombstones callable but hidden with listAliases=%s', (listAliases) => {
+    const reg = new ToolRegistry(listAliases);
+    reg.replace([
+      { ...tool('web_moved'), listed: false, tombstone: true, annotations: { readOnlyHint: true } },
+      { ...tool('web_visible'), tombstone: false },
+    ]);
+    expect(reg.has('web_moved')).toBe(true);
+    expect(reg.isReadOnly('web_moved')).toBe(true);
+    expect(reg.list().map((t) => t.name)).toEqual(['web_visible']);
+    expect(reg.list()[0]).not.toHaveProperty('tombstone');
+  });
+
   it('replaces the whole set on each replace()', () => {
     const reg = new ToolRegistry();
     reg.replace([tool('web_status'), tool('web_logs')]);

@@ -29,6 +29,7 @@ import {
   findRegistryOrigin,
   rebaseLocalLibraryUrl,
 } from '../../core/library/rv-placement-source';
+import { findQualifiedOriginSettled, isQualifiedRef } from '../../core/library/library-origin';
 
 // `PROJECT_PLACEMENT_PREFIX`, `findRegistryOrigin` and `rebaseLocalLibraryUrl` moved
 // to the core (`core/library/rv-placement-source`, 2026-09-17): the viewer's
@@ -102,11 +103,29 @@ async function probeProjectPlacement(comp: PlacedComponent): Promise<string | nu
   }
 }
 
+/**
+ * Liveness probe for a QUALIFIED placement (plan-778 F4) — the library-project
+ * twin of {@link probeProjectPlacement}: the answer is the `catalogId` marker
+ * when the ONE library it names holds the document (waiting for that library
+ * while it is pending), else null. Never a url, never another source.
+ */
+async function probeQualifiedPlacement(comp: PlacedComponent): Promise<string | null> {
+  const ref = { assetId: comp.catalogId, providerId: comp.providerId, sourceId: comp.sourceId };
+  const found = await findQualifiedOriginSettled(ref);
+  if (!found) {
+    console.warn(`[LayoutPlanner] "${comp.label}" (${comp.catalogId}) is not available from library "${comp.sourceId}".`);
+    return null;
+  }
+  return comp.catalogId;
+}
+
 export async function resolvePlacementUrl(
   store: LayoutStore,
   cloudStore: LayoutPlannerCloudStore | null,
   comp: PlacedComponent,
 ): Promise<string | null> {
+  // plan-778 F4: a qualified placement is checked first — its library alone.
+  if (isQualifiedRef(comp)) return probeQualifiedPlacement(comp);
   // Project documents come first: they carry `glbUrl: ''` and are re-resolved
   // through the library registry, never through a saved URL (plan-723 F5).
   if (comp.catalogId.startsWith(PROJECT_PLACEMENT_PREFIX)) {
@@ -203,6 +222,9 @@ export async function refreshCloudGlbUrl(
   onProgress?: (msg: string) => void,
 ): Promise<string | null> {
   let glbUrl = comp.glbUrl;
+
+  // plan-778 F4: a qualified placement resolves in its library only.
+  if (isQualifiedRef(comp)) return probeQualifiedPlacement(comp);
 
   // Project documents: same story as in `resolvePlacementUrl` — the saved
   // `glbUrl` is empty (or a dead handle), the identity is the `catalogId`, and

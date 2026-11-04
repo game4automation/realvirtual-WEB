@@ -8,12 +8,22 @@
  *
  * The host shape is loose so these are testable without a real RVViewer:
  * just `getPlugin('snap-point') → { getRegistry() → { getByOwnerRoot, getById } }`.
+ *
+ * plan-633 Phase 2: the registry comes from the ONE connection-core access
+ * point `getConnectionRegistry(host)` (snap-point plugin → its live registry;
+ * no plugin → the headless registry a DES binding attached), and the port role
+ * from the core's `portRoleOf` — the single place the input/output decision is
+ * made for planner, DES binding, SDK ports and Turntable alike.
  */
 
-import { Vector3 } from 'three';
 import type { Object3D } from 'three';
-import type { SnapPointPlugin } from '../../plugins/snap-point';
-import { findAll, NODE_KIND_TESTS } from '../../core/library-component-loader';
+import { getConnectionRegistry } from '../../core/connect/rv-connection-registry';
+import {
+  portRoleOf,
+  surfacesFromComponentRegistry,
+  type SurfaceComponentRegistry,
+  type SurfacesOf,
+} from '../../core/connect/rv-connection-resolver';
 
 export interface SnapLite {
   readonly id: string;
@@ -52,16 +62,6 @@ interface SnapHost {
   getPlugin?(id: string): unknown;
 }
 
-/** Minimal slice of the node registry needed to resolve a connected belt's surface. */
-interface ComponentRegistryShape {
-  findInChildren<T = unknown>(node: Object3D, type: string): T | null;
-}
-
-/** Structural type for the bit of RVTransportSurface we read (avoids an import cycle). */
-interface TransportSurfaceLike {
-  getWorldDirection(out?: Vector3): Vector3;
-}
-
 interface ClassifyHost extends SnapHost {
   registry?: unknown;
 }
@@ -72,9 +72,7 @@ interface SnapRegistryShape {
 }
 
 function getRegistry(host: SnapHost): SnapRegistryShape | null {
-  const plugin = host.getPlugin?.('snap-point') as SnapPointPlugin | undefined;
-  const reg = plugin?.getRegistry?.();
-  return (reg as unknown as SnapRegistryShape | undefined) ?? null;
+  return getConnectionRegistry(host) as unknown as SnapRegistryShape | null;
 }
 
 /**
@@ -128,85 +126,51 @@ export function findInputSnapNode(host: SnapHost, root: Object3D): Object3D | nu
 }
 
 /** Read the component registry off the host (RVViewer), or null in tests/minimal hosts. */
-function getComponentRegistry(host: ClassifyHost): ComponentRegistryShape | null {
-  const reg = host.registry as Partial<ComponentRegistryShape> | undefined | null;
+export function getComponentRegistry(host: ClassifyHost): SurfaceComponentRegistry | null {
+  const reg = host.registry as Partial<SurfaceComponentRegistry> | undefined | null;
   return reg && typeof reg.findInChildren === 'function'
-    ? (reg as ComponentRegistryShape)
+    ? (reg as SurfaceComponentRegistry)
     : null;
-}
-
-// Scratch vectors — module-local, never escape this file.
-const _dir = new Vector3();
-const _matingPos = new Vector3();
-const _tableCentre = new Vector3();
-const _toCentre = new Vector3();
-
-/** Map an authored flow to a role for the ambiguous/near-perpendicular fallback. */
-function roleFromFlow(flow: SnapLite['flow']): 'input' | 'output' {
-  return flow === 'in' ? 'input' : 'output';
 }
 
 /**
  * Classify every PAIRED snap on `root` as an input or output port, based on the
  * direction the connected conveyor transports goods relative to this turntable.
  *
- * For each paired snap we resolve the partner conveyor, read its belt's world
- * transport direction (`RVTransportSurface.getWorldDirection`), and compare it to
- * the vector pointing from the conveyor toward the mating point:
- *   - moving TOWARD the turntable  → goods exit the conveyor here → `input`
- *   - moving AWAY from the turntable → `output`
- * When the registry/surface is unavailable or the projection is ~0 we fall back
- * to the snap's authored `flow` (so it degrades to the legacy behaviour).
+ * The decision itself is the connection core's `portRoleOf` (plan-633): the
+ * authored flow, refined by the partner's most aligned transport surface — a
+ * belt moving TOWARD `root` feeds it (`input`), one moving AWAY is fed by it
+ * (`output`). Without a component registry (no surfaces) or with a ~0
+ * projection the authored `flow` decides (legacy behaviour).
+ *
+ * `surfaces` (additive, plan-644): a caller-supplied surface source — `null`
+ * means "no surfaces" (authored flow only); omitted, the surfaces come from
+ * the host's component registry as before. The DES port cache
+ * (`resolvePorts` with a `PortResolveCacheScope`) passes its memoised source
+ * so a hot call does not traverse the partner subtree again.
  */
-export function classifyConnections(host: ClassifyHost, root: Object3D): PortConnection[] {
+export function classifyConnections(
+  host: ClassifyHost,
+  root: Object3D,
+  surfaces?: SurfacesOf | null,
+): PortConnection[] {
   const reg = getRegistry(host);
   if (!reg) return [];
-  const compReg = getComponentRegistry(host);
+  let surfacesOf: SurfacesOf | undefined;
+  if (surfaces === undefined) {
+    const compReg = getComponentRegistry(host);
+    surfacesOf = compReg ? surfacesFromComponentRegistry(compReg) : undefined;
+  } else {
+    surfacesOf = surfaces ?? undefined;
+  }
   const out: PortConnection[] = [];
 
   for (const sp of reg.getByOwnerRoot(root)) {
     if (!sp.pairedSnapId) continue;
     const partner = reg.getById(sp.pairedSnapId);
     if (!partner || partner.ownerRoot === root) continue;
-    const ownerRoot = partner.ownerRoot;
-
-    let role: 'input' | 'output' = roleFromFlow(sp.flow);
-
-    // Try to refine from the connected conveyor's transport direction.
-    // Reference vector: from the mating connection point toward the TURNTABLE
-    // CENTRE (`root`). A belt moving toward the centre feeds the table (input);
-    // one moving away discharges from it (output). Using the turntable centre —
-    // NOT the connected conveyor's root origin — keeps the sign correct for
-    // conveyors with an off-centre pivot (origin at the discharge end), a common
-    // library-asset case that otherwise flipped the classification.
-    if (compReg) {
-      partner.object3D.getWorldPosition(_matingPos);
-      root.getWorldPosition(_tableCentre);
-      _toCentre.copy(_tableCentre).sub(_matingPos);
-
-      // A partner may carry SEVERAL transport surfaces (e.g. a ChainTransfer has
-      // both a straight roller line and a perpendicular cross chain). Picking the
-      // first one found would read a surface that is ~perpendicular to this
-      // connection (projection ≈ 0) and silently fall back to the authored flow —
-      // which for a forced-bidi turntable port resolves to 'output', so the table
-      // never recognises the upstream and the handover stalls. Evaluate ALL of the
-      // partner's transport surfaces and keep the one most aligned with the
-      // connection axis (largest |projection|). Single-surface partners are
-      // unaffected — the result is identical to the first-match behaviour.
-      let bestProj = 0;
-      let bestAbs = 1e-4;
-      for (const tNode of findAll(ownerRoot, NODE_KIND_TESTS.transport)) {
-        const surface = compReg.findInChildren<TransportSurfaceLike>(tNode, 'TransportSurface');
-        if (!surface) continue;
-        surface.getWorldDirection(_dir);
-        const proj = _dir.dot(_toCentre);
-        const abs = Math.abs(proj);
-        if (abs > bestAbs) { bestAbs = abs; bestProj = proj; }
-      }
-      if (bestProj !== 0) role = bestProj > 0 ? 'input' : 'output';
-    }
-
-    out.push({ role, ownerRoot, snap: sp, pairedSnap: partner });
+    const role = portRoleOf(root, sp, partner, surfacesOf);
+    out.push({ role, ownerRoot: partner.ownerRoot, snap: sp, pairedSnap: partner });
   }
   return out;
 }

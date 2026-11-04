@@ -41,6 +41,9 @@
  * every entry and frees an entry no document holds any more.
  */
 
+import { decodeIdentity, type DecodedGltfLike } from './rv-decode-identity';
+import { registerFileLayerNames } from './rv-layers';
+
 // ─── GLB constants ──────────────────────────────────────────────────────
 
 const GLB_MAGIC = 0x46546c67; // 'glTF'
@@ -367,7 +370,20 @@ export async function parseGlbCollectingResources<T>(
     console.warn('[binary-resources] resource collection failed — parsing without:', e);
   }
   // Self-contained GLB (textures + buffers embedded) → empty resource path.
-  return loader.parseAsync(bytes, '');
+  const result = await loader.parseAsync(bytes, '');
+  // plan-769 F2/F3: identity at decode — seeded NodeIds, the file's authored
+  // index and the migration of its stored paths, while the parser JSON is still
+  // there. ONE hook for every decode that goes through this wrapper (main model,
+  // subtree parse / compose frames, ModelCache, document replace). Never throws.
+  decodeIdentity(result as unknown as DecodedGltfLike, { fileKey: documentId });
+  // plan-2016 S6c: the file's layer index→name table (scene extras `layerNames`),
+  // viewer-wide like Unity's one TagManager — sensors filter by layer NAME.
+  try {
+    registerFileLayerNames((result as unknown as { scene?: { userData?: unknown } }).scene?.userData);
+  } catch (e) {
+    console.warn('[binary-resources] layer table registration failed:', e);
+  }
+  return result;
 }
 
 // ─── GLB writing ────────────────────────────────────────────────────────

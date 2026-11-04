@@ -20,6 +20,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Scene } from 'three';
 import { loadGLB, type LoadResult } from '../src/core/engine/rv-scene-loader';
+import { RVLogicEngine } from '../src/core/engine/rv-logic-engine';
 import { DEV_GLB } from './fixtures/glb-paths.mjs';
 import { devAssetAvailable } from './fixtures/dev-asset-available';
 
@@ -64,8 +65,11 @@ describe.skipIf(!DEV_ASSETS)('writer inventory on the demo model (plan-320 Phase
 
     // Standalone sim loop in CoreSubsystems order: logic → drives → transport.
     const ticks = Math.round(SIM_SECONDS / DT);
+    // plan-769 Phase 6: loadGLB builds no logic any more — the engine it used to
+    // return, built the same way here (never started, as before).
+    const logic = RVLogicEngine.build(result.root, result.registry, result.signalStore);
     for (let i = 0; i < ticks; i++) {
-      result.logicEngine?.fixedUpdate(DT);
+      logic.fixedUpdate(DT);
       for (const drive of result.drives) drive.update(DT);
       result.transportManager.update(DT);
     }

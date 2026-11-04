@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, removeLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * rv-project-code-consent — the trust gate in front of native project code
  * (plan-718 §2.6, stage 2b.3, R8; user decision 2026-08-14).
@@ -70,7 +72,7 @@ let sessionTable: ConsentTable = {};
 function readTable(): ConsentTable {
   let stored: ConsentTable = {};
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = readLocalStorage(STORAGE_KEY);
     const parsed: unknown = raw ? JSON.parse(raw) : null;
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
       stored = parsed as ConsentTable;
@@ -82,14 +84,14 @@ function readTable(): ConsentTable {
 function writeRecord(projectId: string, record: ProjectCodeConsentRecord): void {
   sessionTable = { ...sessionTable, [projectId]: record };
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = readLocalStorage(STORAGE_KEY);
     const parsed: unknown = raw ? JSON.parse(raw) : null;
     const table: ConsentTable =
       parsed && typeof parsed === 'object' && !Array.isArray(parsed)
         ? (parsed as ConsentTable)
         : {};
     table[projectId] = record;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(table));
+    writeLocalStorage(STORAGE_KEY, JSON.stringify(table));
   } catch { /* private mode: the session mirror still holds the decision */ }
 }
 
@@ -136,14 +138,14 @@ export function resetProjectCodeConsent(projectId?: string): void {
   }
   try {
     if (!projectId) {
-      localStorage.removeItem(STORAGE_KEY);
+      removeLocalStorage(STORAGE_KEY);
     } else {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      const raw = readLocalStorage(STORAGE_KEY);
       const parsed: unknown = raw ? JSON.parse(raw) : null;
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
         const table = parsed as ConsentTable;
         delete table[projectId];
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(table));
+        writeLocalStorage(STORAGE_KEY, JSON.stringify(table));
       }
     }
   } catch { /* private mode */ }
@@ -245,6 +247,6 @@ export function _resetProjectCodeConsentForTests(): void {
   pendingPromise = null;
   hostMounted = false;
   sessionTable = {};
-  try { localStorage.removeItem(STORAGE_KEY); } catch { /* private mode */ }
+  removeLocalStorage(STORAGE_KEY);
   listeners.clear();
 }

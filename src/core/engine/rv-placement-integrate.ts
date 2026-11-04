@@ -40,15 +40,16 @@
 
 import type { Object3D, Scene } from 'three';
 import {
-  collectKinematicGroupMembers, processExtras, type DeferredLogic, type ProcessExtrasResult,
+  collectKinematicGroupMembers, processExtras, disposeComponentsInSubtree, type DeferredLogic, type ProcessExtrasResult,
 } from './rv-scene-loader';
+import { syncSignalSubtree } from './rv-signal-editor-sync';
 import { buildInitContext, subsystemsOf, type InitContextBase, type InitSubsystems } from './rv-init-context';
 import type { SignalStore } from './rv-signal-store';
 import type { RVTransportManager } from './rv-transport-manager';
 import type { RVDrive } from './rv-drive';
 import type { RVUberMaterial } from './rv-uber-material';
 import type { BakeRegistry } from './rv-bake-registry';
-import { getNodeId } from './rv-node-id';
+import { ID_VERSION_CURRENT, ensureRuntimeIdentity, identityIdOf, isIdVersionNewer } from './rv-decode-identity';
 import { RVLogicEngine } from './rv-logic-engine';
 import { applyNamingScan } from './rv-naming-scan';
 import { NodeRegistry } from './rv-node-registry';
@@ -56,20 +57,22 @@ import { GroupRegistry } from './rv-group-registry';
 import { freezeStaticMatrices } from './rv-freeze-static';
 import { isFrameGated, weakestSignatureState } from './rv-glb-compose';
 import { getAssetReference, getPlacementMeta } from './rv-asset-reference';
-import { buildMissingReferencePlaceholder, missingReferenceLabel } from './rv-missing-reference-placeholder';
+import { buildMissingReferencePlaceholder, missingPlacementLabel, missingReferenceLabel } from './rv-missing-reference-placeholder';
 import {
-  describeLoadError, reportLogicGated, reportMissingReference, reportNestedReferenceRefused, reportPlacementCapReached,
+  clearProblem, describeLoadError, missingReferenceProblemId, reportLogicGated, reportMissingReference, reportNestedReferenceRefused, reportParametricChildMissing,
+  reportPlacementCapReached, reportReferenceMigrationProblems, reportIdVersionNewer,
   reportPlacementRegisterFailed, reportPluginClaimNotApplicable,
 } from '../hmi/problems-store';
-import { resolveReferencePath } from './rv-reference-resolver';
+import { joinScopePath, resolveReferencePath, type ReferenceScope } from './rv-reference-resolver';
 import { syncSubtreeGroups } from './rv-group-sync';
 import type { PlacementInstance } from './rv-bake-registry';
 import type { BakedAsset } from './rv-bake-chunk';
 import type { SignatureState } from '../persistence/rv-sig-verify';
 import {
-  PlacementInstancer, type DeferredPlacementEntry, type NestedReferenceRefusal, type PlacementRef,
+  PlacementInstancer, isParametricReferenceNode, type DeferredPlacementEntry, type NestedReferenceRefusal, type PlacementRef,
 } from './rv-placement-instancer';
 import { createReferenceResolver } from './rv-glb-reference-resolver';
+import { canRegenerate, type StandstillView } from './rv-parametric-component';
 
 /**
  * What a placement needs from the shell it lives in (plan-757 F4/F8) — the
@@ -82,11 +85,18 @@ import { createReferenceResolver } from './rv-glb-reference-resolver';
  */
 export interface PlacementHost {
   readonly scene: Scene;
+  /** plan-652 Phase 3: on-demand features a placement's component types activate (DES). */
+  readonly features?: { ensureForComponentTypes(types: Iterable<string>): Promise<void> };
   registry: NodeRegistry | null;
   signalStore: SignalStore | null;
   transportManager: RVTransportManager | null;
   /** The runtime drives — a placement's drives are PUSHED here. */
   drives: RVDrive[];
+  /**
+   * The IK paths the sim loop ticks (`rv-core-subsystems`) — a placement's paths
+   * are PUSHED here like its drives. Optional: a duck-typed host without robots.
+   */
+  ikPaths?: { node: Object3D; fixedUpdate(dt: number): void }[];
   /** Created lazily by the first placed LogicStep when the document had none. */
   logicEngine: RVLogicEngine | null;
   /**
@@ -229,12 +239,15 @@ export function effectivePlacedState(chainState: SignatureState | undefined, ass
 }
 
 /**
- * Merge the LogicSteps carried by a placed subtree into the viewer's logic
- * engine. `loadGLB()` builds the engine for the main model only; placed assets
- * register through `processExtras()`, which deliberately handles components
- * but not logic — without this merge a placed asset's sequences never run. The
- * engine is created lazily when the main model itself carried no logic; roots
- * added after the engine started run immediately.
+ * Merge the LogicSteps carried by a subtree into the viewer's logic engine —
+ * THE one way logic enters the runtime (plan-769 Phase 6, D20): a placed asset
+ * after its integration, and the MAIN model once the scene is complete (the
+ * loader builds no logic; `RVViewer` and the embed facade call this for the
+ * model root after its placements materialised, so a step addressed into a
+ * placement finds its target when it is built). Placed assets register through
+ * `processExtras()`, which deliberately handles components but not logic. The
+ * engine is created lazily by the first subtree that carries steps; roots added
+ * after the engine started run immediately.
  *
  * A subtree the trust gate holds (F6) is NEVER merged here — `integratePlacedContent`
  * hands it to `viewer.holdPlacementLogic()` instead, and the viewer merges it
@@ -292,6 +305,137 @@ export function releasePlacedGroups(viewer: PlacementHost, root: Object3D): bool
   return changed;
 }
 
+/** What {@link disposePlacedRoot} needs of the viewer beyond {@link PlacementHost}. */
+export interface PlacedRootDisposeHost extends PlacementHost {
+  readonly signalBindingManager?: { unbindAll(id: string): void } | null;
+  readonly behaviors?: {
+    dispatchPlaced(root: Object3D): void;
+    disposeObject?(root: Object3D): void;
+    disposeBindsUnder?(root: Object3D): void;
+  };
+  readonly raycastManager?: { removeAuxRaycastTarget(node: Object3D): void } | null;
+  ikPaths?: { node: Object3D; fixedUpdate(dt: number): void }[];
+  readonly placements?: { release(root: Object3D): boolean } | null;
+}
+
+/** Options of {@link disposePlacedRoot}. */
+export interface DisposePlacedRootOptions {
+  /** Id of the planner's signal links of this placement (`signalBindingManager.unbindAll`). */
+  bindingId?: string;
+  /**
+   * Takes the root out of the scene and releases its instance. Default: detach
+   * from the parent, then `placements.release(root)` (instancer bookkeeping +
+   * `BakeRegistry.releaseSubtree`, nested instances innermost first). The
+   * planner passes its own for splats and pending placeholders.
+   */
+  detach?: (root: Object3D) => void;
+  /** Called with the registry path of the root BEFORE it is unregistered. */
+  onRootPath?: (path: string | null) => void;
+  /** Where nested instance roots are looked up (default: `viewer.bakeRegistry`). */
+  bakeRegistry?: Pick<BakeRegistry, 'instanceRootsUnder'> | null;
+}
+
+/**
+ * The CORE clean-up of a placement root (plan-681 §2.3, Gate-R1 #4 / R2 #3) —
+ * everything `removePlacedFromScene` of the planner does that is not planner
+ * bookkeeping, usable without a planner (a structural rebuild removes the
+ * conveyors and stackers of a smaller PalletYard through it):
+ *
+ *  1. the planner's signal links (`signalBindingManager.unbindAll`, when an id
+ *     is given), behaviours, LogicEngine roots, auxiliary raycast targets;
+ *  2. the viewer-wide groups; `layout-content-removed` ONCE PER INSTANCE ROOT,
+ *     innermost first, the outer root last (the plan-757 event contract);
+ *  3. components disposed while their paths resolve, the subtree unregistered,
+ *     the SignalStore brought in line (after the unregister — it derives "not
+ *     live" from the registry), drives / IK paths / transport lists filtered;
+ *  4. detach + instance release (`placements.release`, never the bake registry
+ *     alone — the instancer's own books must follow).
+ *
+ * Snap pairings release themselves through the event (the snap plugin listens).
+ */
+export function disposePlacedRoot(viewer: PlacedRootDisposeHost, root: Object3D, opts: DisposePlacedRootOptions = {}): void {
+  if (opts.bindingId) viewer.signalBindingManager?.unbindAll(opts.bindingId);
+  viewer.behaviors?.disposeObject?.(root);
+  // A placement the file brought has its payload binds owned by the scene
+  // lifecycle, not by a placement key — they go by subtree (plan-681).
+  viewer.behaviors?.disposeBindsUnder?.(root);
+  viewer.logicEngine?.removeSubtree(root);
+  const rm = viewer.raycastManager;
+  if (rm) root.traverse((node) => { if ((node as { isMesh?: boolean }).isMesh) rm.removeAuxRaycastTarget(node); });
+
+  const rootPath = viewer.registry?.getPathForNode(root) ?? null;
+  opts.onRootPath?.(rootPath);
+  const nested = (opts.bakeRegistry ?? viewer.bakeRegistry)?.instanceRootsUnder(root).filter((r) => r !== root) ?? [];
+  releasePlacedGroups(viewer, root);
+  for (const n of nested) {
+    viewer.behaviors?.disposeObject?.(n);
+    viewer.emit?.('layout-content-removed', { root: n, path: viewer.registry?.getPathForNode(n) ?? null });
+  }
+  viewer.emit?.('layout-content-removed', { root, path: rootPath });
+
+  const registry = viewer.registry;
+  if (registry) {
+    const disposed = disposeComponentsInSubtree(registry, root);
+    const removedPaths = registry.unregisterSubtree(root);
+    // Entries addressed BELOW the root whose node is not in its scene subtree —
+    // the bake's synthetic `mover:` chunk nodes of a placed asset are registered
+    // under the placement's path but hang elsewhere — would outlive it (plan-681
+    // 9.3: a removed PalletScanner left 9). Everything addressed under a removed
+    // root is dead.
+    if (rootPath) {
+      const prefix = `${rootPath}/`;
+      const orphans: Array<[string, Object3D]> = [];
+      registry.forEachNode((p, n) => { if (p.startsWith(prefix)) orphans.push([p, n]); });
+      for (const [p, n] of orphans) { registry.unregisterNode(p, n); removedPaths.add(p); }
+    }
+    try {
+      syncSignalSubtree(viewer as unknown as Parameters<typeof syncSignalSubtree>[0], root);
+    } catch (e) {
+      console.warn('[placement] signal release failed for the removed placement:', e);
+    }
+    if (removedPaths.size > 0) {
+      if (viewer.drives.length > 0) viewer.drives = viewer.drives.filter((d) => registry.getPathForNode(d.node) !== null);
+      if (viewer.ikPaths?.length) viewer.ikPaths = viewer.ikPaths.filter((ik) => registry.getPathForNode(ik.node) !== null);
+      const tm = viewer.transportManager;
+      if (tm) {
+        const isRemoved = (c: { node: Object3D }): boolean => removedPaths.has(NodeRegistry.computeNodePath(c.node));
+        tm.sensors = tm.sensors.filter((s) => !isRemoved(s));
+        tm.surfaces = tm.surfaces.filter((s) => !isRemoved(s));
+        for (const s of tm.sources) if (isRemoved(s) && !disposed.has(s)) s.dispose?.();
+        tm.sources = tm.sources.filter((s) => !isRemoved(s));
+        tm.sinks = tm.sinks.filter((s) => !isRemoved(s));
+        tm.grips = tm.grips.filter((s) => !isRemoved(s));
+        tm.gripTargets = tm.gripTargets.filter((s) => !isRemoved(s));
+        tm.notifyTopologyChanged?.();
+      }
+    }
+  }
+
+  if (opts.detach) {
+    opts.detach(root);
+  } else {
+    root.parent?.remove(root);
+    if (viewer.placements) viewer.placements.release(root);
+    else viewer.bakeRegistry?.releaseSubtree(root);
+  }
+  viewer.markRenderDirty?.();
+}
+
+/**
+ * The main-model reading of a claim path (plan-757 F7, steps 1 and 2 of the ONE
+ * resolver, textual — the claimed node itself was baked away): relative to the
+ * enclosing scope `outer` as written, else with `outer`'s root name stripped.
+ * True when one of those readings is `rootPath` or lies below it.
+ */
+function outerReadingHitsPlacement(claimPath: string, outer: ReferenceScope, rootPath: string): boolean {
+  const p = claimPath.trim().replace(/^\/+/, '');
+  if (p === '') return false;
+  const readings = [joinScopePath(outer.rootPath, p)];
+  const slash = p.indexOf('/');
+  if (slash > 0 && outer.rootNames.has(p.slice(0, slash))) readings.push(joinScopePath(outer.rootPath, p.slice(slash + 1)));
+  return readings.some((r) => r === rootPath || r.startsWith(rootPath + '/'));
+}
+
 /**
  * plan-757 §2.6 / D5: plugin bake claims are a MAIN-MODEL input. A claim
  * ADDRESSED INTO this placement kept nothing — the asset was baked without a
@@ -299,20 +443,27 @@ export function releasePlacedGroups(viewer: PlacementHost, root: Object3D): bool
  * line. "Addressed into" is the ONE resolver's reading (F7): the claim path
  * starts with the placement's registry path, or its first segment is one of
  * the asset root's names (`Conveyor/Label` for a placed `Conveyor`), or it
- * resolves inside the instance. Whether the node happens to survive for
- * another reason does not matter — the claim did nothing. Idempotent per
- * (placement, claim).
+ * resolves inside the instance, or — read the way the main-model bake reads
+ * a claim (relative to the scope ENCLOSING the placement: as written, else with
+ * that scope's root name stripped) — it lands on or below the placement root.
+ * The last reading is the document-root spelling a model plugin writes
+ * (`PalletYardRoot/Stapler_1/Lift/ForkAnchor` for the placement
+ * `PalletYard/PalletYardRoot/Stapler_1`, plan-612 b1-2); without it such a claim
+ * was lost silently. Whether the node happens to survive for another reason
+ * does not matter — the claim did nothing. Idempotent per (placement, claim).
  */
 function reportClaimsInsidePlacement(viewer: PlacementHost, root: Object3D, rootPath: string, assetId: string): number {
   const claims = viewer.collectedBakeClaims;
   if (!claims || claims.length === 0 || !viewer.registry) return 0;
   const scope = viewer.registry.scopeFor(root);
+  const outer = root.parent ? viewer.registry.enclosingScope(root.parent) : null;
   let reported = 0;
   for (const c of claims) {
     const first = c.path.split('/')[0];
     const inside = c.path === rootPath || c.path.startsWith(rootPath + '/')
       || scope.rootNames.has(first)
-      || resolveReferencePath(viewer.registry, c.path, scope).node !== null;
+      || resolveReferencePath(viewer.registry, c.path, scope).node !== null
+      || (outer !== null && outer.root !== root && outerReadingHitsPlacement(c.path, outer, rootPath));
     if (!inside) continue;
     if (wantsProblems(viewer)) {
       reportPluginClaimNotApplicable({ nodePath: rootPath, label: root.name, assetId, claimPath: c.path, role: c.role, pluginId: c.pluginId });
@@ -369,6 +520,28 @@ export function integratePlacedContent(
     scene: viewer.scene,
     ...fallbackSubsystems(viewer),
   });
+  // plan-769 F5 / spike conditions b + c: the instance's ids under this
+  // placement's occurrence BEFORE `processExtras` — its components resolve their
+  // stored references by address inside the init. The reference node keeps its
+  // own address (its file's); the asset's root id is a forward-only entry onto
+  // it, and the walk stops at nested reference nodes (their content is theirs).
+  // plan-769 F12: the occurrence segment is the reference node's IDENTITY — its
+  // authored NodeId, its decode seed, or (a live drop no file produced) a runtime
+  // id minted here. The registry-path fallback is gone: a path is not an identity.
+  const occurrence = viewer.registry
+    ? (opts?.occurrence ?? ensureRuntimeIdentity(root))
+    : null;
+  if (viewer.registry && occurrence !== null) {
+    // plan-769 Phase 2 (F5): the reference node itself is a node of its PARENT's
+    // document. A placement the file holds was registered there with that document;
+    // a live drop / duplicate / paste was not — index it now (its record id), so the
+    // id index equals the traversal and an address to the placement resolves.
+    if (!viewer.registry.getAddressForNode?.(root)) viewer.registry.registerNodeIdInParentDocument?.(root);
+    viewer.registry.registerOccurrence(root, occurrence, {
+      identity: baked?.identity ?? null,
+      contentRootId: baked ? identityIdOf(baked.template) : null,
+    });
+  }
   const result = processExtras(root, base, {
     logicRunState: viewer.logicRunState,
     logicGated: assetGated,
@@ -383,16 +556,18 @@ export function integratePlacedContent(
     // own root name is what a root-prefixed reference in the file starts with.
     assetRootNames: baked ? [baked.template.name] : undefined,
   });
-  // plan-757 Phase 2b (F10): the instance's NodeIds under this placement's
-  // occurrence — what a composed frame got from `registerNodeIdsForSubtree`.
-  // Authored ids only (the template carries them; a node without one stays
-  // reachable by path, as the whole pre-existing corpus is).
-  if (viewer.registry) {
-    const occurrence = opts?.occurrence
-      ?? getNodeId(root)
-      ?? viewer.registry.getPathForNode(root)
-      ?? NodeRegistry.computeNodePath(root);
-    viewer.registry.registerNodeIdsForSubtree(root, occurrence);
+  // plan-769 F4: what the migration on load found in this asset, located here.
+  if (viewer.registry && occurrence !== null && wantsProblems(viewer)) {
+    reportReferenceMigrationProblems(viewer.registry.identityProblemsOf(occurrence));
+    // 9.19: an asset written by a newer viewer is read as stored, not migrated.
+    const assetIdentity = baked?.identity ?? null;
+    if (assetIdentity && isIdVersionNewer(assetIdentity)) {
+      reportIdVersionNewer({
+        file: assetIdentity.fileKey || baked?.assetId || '', idVersion: assetIdentity.idVersion!,
+        supported: ID_VERSION_CURRENT,
+        nodePath: viewer.registry.getPathForNode(root) ?? NodeRegistry.computeNodePath(root),
+      });
+    }
   }
   if (result.deferredLogic) {
     if (assetGated && viewer.holdPlacementLogic) viewer.holdPlacementLogic(result.deferredLogic, root);
@@ -429,6 +604,17 @@ export function integratePlacedContent(
   // Append new drives to the viewer. NO whole-scene BVH rebuild (plan-745
   // Phase 2c, F11): a baked placement picks through its own chunk meshes.
   if (result.drives.length > 0) viewer.drives.push(...result.drives);
+
+  // The placement's IK paths into the sim loop. The loader fills `ikPaths` once,
+  // for the main model; without this a placed robot's path is constructed,
+  // resolves its axes — and is never ticked, so `StartPath` does nothing
+  // (2026-10-25, library CRX). Removal filters them out again
+  // (`scene-mutations.ts`, next to the drives).
+  if (viewer.ikPaths && viewer.registry) {
+    for (const { instance } of viewer.registry.findAllInChildren<{ node: Object3D; fixedUpdate(dt: number): void }>(root, 'IKPath')) {
+      if (!viewer.ikPaths.includes(instance)) viewer.ikPaths.push(instance);
+    }
+  }
 
   // Groups into the viewer-wide registry (names global), then the Groups
   // panel refresh the editor's group ops also trigger.
@@ -494,14 +680,43 @@ export function registerMaterializedPlacement(
 }
 
 /**
+ * The reverse of {@link registerMaterializedPlacement} for a placement whose
+ * library source went away while it stands (plan-778 Decision D): the runtime
+ * registration is undone through the one core clean-up
+ * ({@link disposePlacedRoot}) and the instance is released, but the REFERENCE
+ * NODE stays in the scene — the caller draws the placeholder on it, and the
+ * content comes back through the ordinary materialise order when the source
+ * answers again.
+ */
+export function unseatMaterializedPlacement(
+  viewer: PlacedRootDisposeHost,
+  entry: DeferredPlacementEntry,
+  opts: { bindingId?: string } = {},
+): void {
+  disposePlacedRoot(viewer, entry.node, {
+    bindingId: opts.bindingId,
+    detach: (root) => {
+      if (viewer.placements) viewer.placements.release(root);
+      else viewer.bakeRegistry?.releaseSubtree(root);
+    },
+  });
+}
+
+/**
  * A deferred placement whose asset could not be loaded: the hole you can see +
  * its problem entry. `error` is what the instancer caught — carried into the
  * entry so the panel says WHY (a parse error is not "not found").
  */
 export function placeMissingPlacement(viewer: PlacementHost, entry: DeferredPlacementEntry, error?: unknown): void {
   const node = entry.node;
+  // plan-769 F13: a reference waiting for this placement's content waits in vain.
+  viewer.registry?.dropPendingRefs('placement-missing', [node]);
   const ref = getAssetReference(node);
-  const label = missingReferenceLabel({ assetId: entry.ref.catalogId, path: entry.ref.glbUrl });
+  // plan-778 §3.2: a qualified placement names its library in the label.
+  const label = missingPlacementLabel({
+    assetId: entry.ref.catalogId, path: entry.ref.glbUrl,
+    providerId: entry.ref.providerId, sourceId: entry.ref.sourceId,
+  });
   node.add(buildMissingReferencePlaceholder({
     label, bounds: ref?.bounds, assetId: entry.ref.catalogId, path: entry.ref.glbUrl,
   }));
@@ -514,6 +729,15 @@ export function placeMissingPlacement(viewer: PlacementHost, entry: DeferredPlac
       nodePath: viewer.registry?.getPathForNode(node) ?? undefined,
       reason: error === undefined ? undefined : describeLoadError(error),
     });
+    // plan-650 Phase 5b: a nested child FAMILY that is not in the project -
+    // its own code, the parent variant stays standing.
+    if (entry.nestedOf !== undefined && isParametricReferenceNode(node)) {
+      reportParametricChildMissing({
+        family: entry.ref.catalogId,
+        nodePath: viewer.registry?.getPathForNode(node) ?? NodeRegistry.computeNodePath(node),
+        parentId: entry.nestedOf,
+      });
+    }
   }
   viewer.markRenderDirty?.();
 }
@@ -534,7 +758,9 @@ export function placeRefusedNestedReference(viewer: PlacementHost, r: NestedRefe
   const node = r.node;
   const ref = getAssetReference(node);
   const assetLabel = missingReferenceLabel({ assetId: r.ref.catalogId, path: r.ref.glbUrl });
-  const label = r.reason === 'cycle' ? `${assetLabel} (reference cycle)` : `${assetLabel} (nested too deep)`;
+  const label = r.reason === 'cycle' || r.reason === 'parametric-cycle' ? `${assetLabel} (reference cycle)`
+    : r.reason === 'parametric-budget' ? `${assetLabel} (child budget exceeded)`
+    : `${assetLabel} (nested too deep)`;
   if (!node.children.some((c) => c.userData?.__rvMissingPlaceholder === true)) {
     node.add(buildMissingReferencePlaceholder({
       label, bounds: ref?.bounds, assetId: r.ref.catalogId, path: r.ref.glbUrl,
@@ -571,13 +797,28 @@ export function createViewerPlacementInstancer(viewer: PlacementHost, opts?: Vie
     // load, merging off) — the parity guard plan-752 S4 asks for.
     uber: () => viewer.placementUberMaterial,
     isWebGPU: () => viewer.isWebGPU,
+    // plan-650 §2.6a: a parametric variant is never generated while the simulation runs.
+    canRunParametricGenerator: () => canRegenerate(viewer as unknown as StandstillView),
     applyRenderMode: (root) => viewer.applyRenderModeToSubtree?.(root),
+    ensureComponentTypes: viewer.features
+      ? (types) => viewer.features!.ensureForComponentTypes(types)
+      : undefined,
     // A cleared / superseded model is detached from the scene before disposal.
     isLive: (node) => isUnder(node, viewer.scene),
     registerDefault: (entry, instance) => registerMaterializedPlacement(viewer, entry, instance),
     missingDefault: (entry, err) => {
       console.warn(`[PlacementInstancer] Cannot restore "${entry.label}" (${entry.ref.catalogId}): ${err}`);
       placeMissingPlacement(viewer, entry, err);
+    },
+    // plan-778 Decision D: the library of a standing qualified placement went away —
+    // the content is unseated, the placeholder drawn by `missingDefault` follows.
+    lostDefault: (entry) => unseatMaterializedPlacement(viewer as unknown as PlacedRootDisposeHost, entry),
+    // plan-778 F8: a placeholder whose library became ready is re-resolved in
+    // place — the instancer removed the placeholder, the problem goes with it
+    // (planner or not: both report under the occurrence id).
+    onReresolve: (entry) => {
+      clearProblem(missingReferenceProblemId(entry.occurrence));
+      viewer.markRenderDirty?.();
     },
     // plan-757 Phase 2b: a deferred reference the instancer cannot source
     // itself (no url, no registry origin — e.g. an `assetId` that only the open
@@ -593,6 +834,8 @@ export function createViewerPlacementInstancer(viewer: PlacementHost, opts?: Vie
     // load, its nodes stay empty.
     onNestedRefused: (r) => placeRefusedNestedReference(viewer, r),
     onCapReached: (info) => {
+      // plan-769 F13: references waiting for a capped placement are dropped with the reason.
+      viewer.registry?.dropPendingRefs('placement-cap', info.nodes);
       if (problems) reportPlacementCapReached({ cap: info.cap, refused: info.refused, nodePaths: info.nodes.map(pathOf) });
       else console.warn(`[placement] placement cap ${info.cap} reached — ${info.refused} nested reference(s) left empty`);
     },
@@ -614,7 +857,11 @@ export function createViewerPlacementInstancer(viewer: PlacementHost, opts?: Vie
  */
 async function resolveDeferredReferenceBytes(ref: PlacementRef): Promise<{ url: string; revokeUrl(): void } | null> {
   const resolved = await createReferenceResolver()(
-    { assetId: ref.catalogId },
+    {
+      assetId: ref.catalogId,
+      ...(ref.providerId ? { providerId: ref.providerId } : {}),
+      ...(ref.sourceId ? { sourceId: ref.sourceId } : {}),
+    },
     { baseUrl: '', occurrence: '', depth: 0, resolvedPath: ref.url || ref.glbUrl || '' },
   );
   if (!resolved) return null;

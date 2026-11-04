@@ -17,12 +17,23 @@
  *  - {@link LatchGroup}      one of N, latched, with the active one lit
  *  - {@link MomentaryButton} press-and-hold; the effect lasts while it is held
  *  - {@link ControlSlider}   a continuous value, live in its own label
+ *
+ * Two more for a value a planner types rather than drags (plan-630 §2.6):
+ *
+ *  - {@link ControlNumber}   a bounded number with its unit, committed on
+ *                            Enter / blur — never per keystroke
+ *  - {@link ChipToggleRow}   one on/off chip per element of a set
+ *                            (`[A1 ●] [A2 ○]`), the compact form of N
+ *                            independent booleans that belong together
  */
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { Box, Typography, ToggleButton, ToggleButtonGroup, Slider, Button } from '@mui/material';
+import {
+  Box, Typography, ToggleButton, ToggleButtonGroup, Slider, Button, TextField, Tooltip,
+} from '@mui/material';
 import { createTheme, ThemeProvider, type Theme } from '@mui/material/styles';
 import { FloatingPanel } from './FloatingPanel';
+import { PANEL_SURFACE } from './shared-sx';
 
 const ACCENT = '#4fc3f7';
 
@@ -55,11 +66,23 @@ export interface ControlWindowProps {
   surface?: 'glass' | 'plate';
   /** Start collapsed until the user changes it (the stored state wins afterwards). */
   defaultCollapsed?: boolean;
+  /**
+   * Let the user resize the window (plan-659). Default `false` — a control box
+   * has the size of its plate, which is why every operator window before this
+   * was fixed and content-high.
+   *
+   * A window that carries live telemetry is the exception: how much of it fits
+   * is the operator's call, so it gets a real height and a resize handle. The
+   * two go together — a handle on a content-high window has no height to drag.
+   */
+  resizable?: boolean;
+  /** Window height in px when {@link resizable}; ignored otherwise. Default 420. */
+  defaultHeight?: number;
   children: ReactNode;
 }
 
 /** The plate surface: the darkest glass tier, near-opaque. */
-export const PLATE_SURFACE = 'rgba(15,15,15,0.92)';
+export const PLATE_SURFACE = PANEL_SURFACE;
 
 /**
  * A theme layer that puts every Paper below it on the plate. The global theme
@@ -83,6 +106,8 @@ export function ControlWindow({
   collapsedHeaderExtras,
   surface = 'glass',
   defaultCollapsed,
+  resizable = false,
+  defaultHeight = 420,
   children,
 }: ControlWindowProps) {
   const toolbar = (
@@ -96,8 +121,9 @@ export function ControlWindow({
       collapsible
       persistCollapsed
       defaultCollapsed={defaultCollapsed}
-      autoHeight
-      resizable={false}
+      autoHeight={!resizable}
+      resizable={resizable}
+      defaultHeight={defaultHeight}
       // Non-modal and permanently present: a landmark region, not a dialog.
       // https://github.com/w3c/aria-practices/issues/1021
       role="region"
@@ -408,6 +434,178 @@ export function ControlSlider({
           '& .MuiSlider-rail': { height: 2, opacity: 0.2 },
         }}
       />
+    </Box>
+  );
+}
+
+// ─── ControlNumber ──────────────────────────────────────────────────────
+
+export interface ControlNumberProps {
+  label: string;
+  unit?: string;
+  value: number;
+  /** Committed on Enter / blur — NOT per keystroke (a live change per digit floods the log). */
+  onCommit(v: number): void;
+  min?: number;
+  max?: number;
+  /** `true` = only whole numbers are accepted. */
+  integer?: boolean;
+  /** A rejection to show under the field (cross rule, out of range from the model side). */
+  error?: string;
+  disabled?: boolean;
+  color?: string;
+  /** Shown as the field's tooltip (the parameter's description). */
+  description?: string;
+}
+
+/**
+ * A number a planner TYPES: a parameter with no useful drag range (a pause of
+ * 1200 s), or one with no range at all.
+ *
+ * The text is local while it is being edited and committed once, on Enter or on
+ * blur — the same rule as {@link ControlSlider}'s `onCommit`, and for the same
+ * reason: every commit is a change of the running plant. Escape puts the field
+ * back to the model value. Input that is not a number of the declared kind is
+ * never committed; the field says why and keeps the text so it can be fixed.
+ */
+export function ControlNumber({
+  label, unit, value, onCommit, min, max, integer, error, disabled, color, description,
+}: ControlNumberProps) {
+  const c = color ?? ACCENT;
+  const [text, setText] = useState<string | null>(null);
+  const [local, setLocal] = useState<string | null>(null);
+
+  const shown = text ?? String(value);
+  const message = local ?? error;
+
+  const commit = useCallback((raw: string) => {
+    const s = raw.trim();
+    const n = Number(s);
+    if (s === '' || !Number.isFinite(n)) { setLocal(`'${raw}' is not a number`); return; }
+    if (integer && !Number.isInteger(n)) { setLocal('expected a whole number'); return; }
+    if ((min !== undefined && n < min) || (max !== undefined && n > max)) {
+      setLocal(`outside [${min ?? '-∞'}, ${max ?? '∞'}]`);
+      return;
+    }
+    setLocal(null);
+    setText(null);
+    if (n !== value) onCommit(n);
+  }, [integer, min, max, onCommit, value]);
+
+  const field = (
+    <TextField
+      size="small"
+      value={shown}
+      disabled={disabled}
+      error={!!message}
+      inputProps={{
+        'aria-label': label,
+        inputMode: 'decimal',
+        style: { fontFamily: 'monospace', fontSize: 12, fontWeight: 600, textAlign: 'right', padding: '4px 6px' },
+      }}
+      onChange={(e) => { setText(e.target.value); setLocal(null); }}
+      onBlur={(e) => commit(e.target.value)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') { e.preventDefault(); commit((e.target as HTMLInputElement).value); }
+        if (e.key === 'Escape') { e.preventDefault(); setText(null); setLocal(null); }
+      }}
+      sx={{
+        width: unit ? 78 : 96,
+        '& .MuiOutlinedInput-root': { color: message ? undefined : c },
+      }}
+    />
+  );
+
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.25 }}>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+        <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.6)' }}>{label}</Typography>
+        <Box sx={{ ml: 'auto' }} />
+        {description ? <Tooltip title={description}>{field}</Tooltip> : field}
+        {unit && (
+          <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.45)', minWidth: 28 }}>{unit}</Typography>
+        )}
+      </Box>
+      {message && (
+        <Typography role="alert" sx={{ fontSize: 10, color: '#ef9a9a' }}>{message}</Typography>
+      )}
+    </Box>
+  );
+}
+
+// ─── ChipToggleRow ──────────────────────────────────────────────────────
+
+export interface ChipToggleItem {
+  id: string;
+  label: string;
+  value: boolean;
+  /** Pending value of this chip, when one is waiting for the next reset. */
+  pending?: boolean;
+  disabled?: boolean;
+  /** Tooltip (the parameter's description). */
+  description?: string;
+}
+
+export interface ChipToggleRowProps {
+  label?: string;
+  items: readonly ChipToggleItem[];
+  onToggle(id: string, next: boolean): void;
+  ariaLabel: string;
+  color?: string;
+}
+
+/**
+ * One on/off chip per element of a set — `[A1 ●] [A2 ○] [V1 ●]`.
+ *
+ * N independent booleans that belong together (every output, every vehicle):
+ * a {@link LatchGroup} per boolean would be a wall of two-button groups, and a
+ * checkbox list loses the at-a-glance reading of which elements are in.
+ * A chip whose value is waiting for the next reset carries a dashed outline and
+ * says so in its accessible name, so "on" and "about to be on" never look alike.
+ */
+export function ChipToggleRow({ label, items, onToggle, ariaLabel, color }: ChipToggleRowProps) {
+  const c = color ?? ACCENT;
+  return (
+    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flexWrap: 'wrap' }} role="group" aria-label={ariaLabel}>
+      {label && (
+        <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.6)', minWidth: 76 }}>{label}</Typography>
+      )}
+      {items.map((item) => {
+        const pending = item.pending !== undefined && item.pending !== item.value;
+        const effective = pending ? item.pending! : item.value;
+        const chip = (
+          <Box
+            component="button"
+            type="button"
+            key={item.id}
+            disabled={item.disabled}
+            aria-pressed={item.value}
+            aria-label={pending ? `${item.label} (pending: ${item.pending ? 'on' : 'off'})` : item.label}
+            onClick={() => onToggle(item.id, !item.value)}
+            sx={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 0.5,
+              minHeight: 28,
+              px: 0.9,
+              fontSize: 11,
+              fontWeight: 600,
+              fontFamily: 'inherit',
+              borderRadius: 1,
+              cursor: item.disabled ? 'default' : 'pointer',
+              color: effective ? c : 'rgba(255,255,255,0.5)',
+              bgcolor: effective ? `${c}20` : 'rgba(255,255,255,0.05)',
+              border: `1px ${pending ? 'dashed' : 'solid'} ${effective ? `${c}80` : 'rgba(255,255,255,0.18)'}`,
+              opacity: item.disabled ? 0.45 : 1,
+              '&:hover': { bgcolor: effective ? `${c}30` : 'rgba(255,255,255,0.1)' },
+            }}
+          >
+            {item.label}
+            <Box component="span" aria-hidden sx={{ fontSize: 9 }}>{effective ? '●' : '○'}</Box>
+          </Box>
+        );
+        return item.description ? <Tooltip key={item.id} title={item.description}>{chip}</Tooltip> : chip;
+      })}
     </Box>
   );
 }

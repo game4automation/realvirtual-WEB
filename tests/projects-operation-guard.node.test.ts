@@ -13,7 +13,7 @@ const source = ts.createSourceFile('host.tsx', readFileSync(new URL(
 ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 const names = new Set([
   'runVerb', 'openProject', 'handleOpenProject', 'addProjectFolder', 'handleAdd',
-  'handleAddPick', 'handleLocate',
+  'handleAddPick', 'handleLocate', 'handlePackWithLibraries',
 ]);
 const declarations: string[] = [];
 function visit(node: ts.Node) {
@@ -47,14 +47,22 @@ function setup() {
     pickFolder: vi.fn(async () => dir),
     getAddJobSnapshot: () => ({ status: 'idle' }),
     verdictForAdd: vi.fn(async () => ({ kind: 'project', manifest, probe: {} })),
-    probeAddTarget: vi.fn(async () => ({ hasManifest: true })),
     readManifest: vi.fn(async () => ({ project: manifest })),
+    // plan-778: Locate's verdict is the shared `locateProjectFolder` (it replaced
+    // the host's own probeAddTarget + readManifest pair); same answer, by id.
+    locateProjectFolder: vi.fn(async (id: string) => (manifest.id === id
+      ? { kind: 'ok', project: manifest }
+      : { kind: 'mismatch', project: manifest, found: { id: manifest.id, name: manifest.name }, expected: { id, label: id }, message: 'mismatch' })),
+    // plan-778 review U6: the pre-778 manifest refusal runs first.
+    probeAddTarget: vi.fn(async () => ({ hasManifest: true, manifestBroken: false, childProjectFolders: [] as string[] })),
+    getLibraryProjectLoader: () => null, REALVIRTUAL_LIBRARY_PROJECT_ID: 'prj_realvirtual_library',
     relinkProject: vi.fn(async () => {}), unlinkProject: vi.fn(async () => {}),
     forgetProjectTraces: vi.fn(async () => {}),
-    window: { confirm: () => true },
+    startProjectOp: vi.fn(), resetProjectOpProgress: vi.fn(),
+    window: { confirm: () => true, showDirectoryPicker: vi.fn((_opts?: unknown): Promise<unknown> => Promise.resolve(dir)) },
   };
   const callbacks = new Function(...Object.keys(deps), `${executable}\n
-    return { handleAddPick, handleAdd, handleLocate, handleOpenProject };`)(...Object.values(deps));
+    return { handleAddPick, handleAdd, handleLocate, handleOpenProject, handlePackWithLibraries };`)(...Object.values(deps));
   return { ...deps, ...callbacks, dir };
 }
 
@@ -127,4 +135,37 @@ describe('dashboard project operation guard', () => {
     expect(h.store.openProjectFolder).toHaveBeenCalledTimes(2);
     expect(h.setProjectsView).toHaveBeenCalledWith('project');
   });
+
+  it('plan-778 review U6: Locate keeps the pre-778 refusal of a missing / broken project.json', async () => {
+    const h = setup();
+    h.probeAddTarget.mockResolvedValueOnce({ hasManifest: true, manifestBroken: true, childProjectFolders: [] });
+    h.handleLocate('plant');
+    await vi.waitFor(() => expect(h.operationRef.current).toBe(false));
+    expect(h.setMessage).toHaveBeenCalledWith('"Plant" does not hold a readable project.json.');
+    expect(h.locateProjectFolder).not.toHaveBeenCalled();
+    expect(h.relinkProject).not.toHaveBeenCalled();
+  });
+
+  it('plan-778 review U5: Pack with libraries opens no picker while another verb runs; a failed pick is reported, never unhandled', async () => {
+    const h = setup();
+    h.operationRef.current = true;
+    h.handlePackWithLibraries();
+    expect(h.window.showDirectoryPicker).not.toHaveBeenCalled();
+    expect(h.setMessage).toHaveBeenCalledWith(expect.stringMatching(/still running/));
+    h.operationRef.current = false;
+
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown): void => { unhandled.push(e); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      h.window.showDirectoryPicker.mockImplementationOnce(() => Promise.reject(new Error('SecurityError: no activation')));
+      h.handlePackWithLibraries();
+      await vi.waitFor(() => expect(h.setMessage).toHaveBeenCalledWith('SecurityError: no activation'));
+      await new Promise((r) => setTimeout(r, 10));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
 });
+

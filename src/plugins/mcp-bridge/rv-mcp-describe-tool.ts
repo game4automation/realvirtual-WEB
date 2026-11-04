@@ -38,7 +38,7 @@ import type { RVViewer } from '../../core/rv-viewer';
 import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
 import { requireEditor, isGuardError } from './rv-mcp-editor-guard';
 
-/** The open asset document, as much of it as an agent needs to act. */
+/** The document open in the editor, as much of it as an agent needs to act. */
 export interface DescribeDocument {
   name: string;
   /** 'empty' | 'document' | … — a document with nodeCount <= 1 is the A2 dead end. */
@@ -61,7 +61,7 @@ export interface DescribeResult {
   /** Active workspace, null before the first mode switch. */
   mode: string | null;
   availableModes: string[];
-  /** The open asset document — null when the asset editor is not active. */
+  /** The document open in the editor — null when the asset editor is not active. */
   document: DescribeDocument | null;
   selection: { count: number; firstPath: string | null };
   runtime: {
@@ -119,7 +119,7 @@ export const NEXT_RULES: readonly NextRule[] = [
     // field, so a stale literal here fails silently rather than at compile time.
     when: (f) => f.doc !== null && f.doc.baseKind === 'document' && f.doc.nodeCount <= 1,
     next: 'Document is EMPTY although it was opened from the library — re-import the asset with '
-      + 'web_editor_import_glb from the project\'s imports/ folder',
+      + 'web_execute("editor.importGlb", …) from the project\'s imports/ folder',
     guide: 'web_help("editor")',
   },
   {
@@ -139,7 +139,7 @@ export const NEXT_RULES: readonly NextRule[] = [
   },
   {
     when: (f) => !f.hasModel && f.mode === 'planner',
-    next: 'Pick a part with web_catalog_list, then place it with web_layout_place',
+    next: 'Pick a part with web_query("library.catalogList", {}), then place it with layout.place',
     guide: 'web_help("layout")',
   },
   {
@@ -149,17 +149,17 @@ export const NEXT_RULES: readonly NextRule[] = [
   },
   {
     when: (f) => f.mode === 'planner',
-    next: 'Extend the layout: web_layout_list, then web_layout_snap_attach to chain parts',
+    next: 'Extend the layout: web_query("layout.list", {}), then layout.snapAttach to chain parts',
     guide: 'web_help("layout")',
   },
   {
     when: (f) => f.mode === 'des',
-    next: 'Inspect the event simulation with web_des_status, then web_des_bottleneck',
+    next: 'Inspect the event simulation with web_query("des.status", {}), then web_query("des.bottleneck", {})',
     guide: 'web_help("des")',
   },
   {
     when: () => true,
-    next: 'Orient in the running model: web_drive_list, then web_signal_status',
+    next: 'Orient in the running model: web_query("drive.list", {}), then web_signal_status',
     guide: 'web_help("simulation")',
   },
 ];
@@ -185,19 +185,19 @@ export function computeBlocked(facts: DescribeFacts): DescribeBlocked[] {
   if (facts.mode !== 'planner') {
     out.push({
       family: 'web_layout_*',
-      reason: 'Needs planner mode — call web_mode_set("planner")',
+      reason: 'Needs planner mode — call web_execute("workspace.setMode", {mode:"planner"})',
     });
   }
   if (facts.doc === null) {
     out.push({
       family: 'web_editor_*',
-      reason: 'No asset document is open — call web_editor_open(source=new|library)',
+      reason: 'No document is open in the editor — call web_editor_open(source=new|library)',
     });
   }
   if (facts.mode !== 'des') {
     out.push({
       family: 'web_des_*',
-      reason: 'Needs the DES workspace — call web_mode_set("des") (internal builds only)',
+      reason: 'Needs the DES workspace — call web_execute("workspace.setMode", {mode:"des"}) (internal builds only)',
     });
   }
   return out;
@@ -212,7 +212,7 @@ export class McpDescribeTool {
 
   @McpTool(
     'Report where you are and what to do next in one read-only call: active and available modes, '
-    + 'the open asset document (name, base kind, dirty, busy, op/node counts, undo), selection '
+    + 'the open editor document (name, base kind, dirty, busy, op/node counts, undo), selection '
     + 'size, runtime (connection, simulation running, model URL, drive and signal counts). Two '
     + 'derived fields make it actionable: `blocked` names each gated tool family with the tool '
     + 'that unblocks it, and `next` names the ONE recommended action for this exact state — a busy '
@@ -244,7 +244,7 @@ export class McpDescribeTool {
 
     const result: DescribeResult = {
       mode: facts.mode,
-      availableModes: v.modes?.list().map((m) => m.id) ?? [],
+      availableModes: (v.modes?.available?.() ?? v.modes?.list() ?? []).map((m) => m.id),
       document: doc,
       selection: {
         count: selectedPaths.length,

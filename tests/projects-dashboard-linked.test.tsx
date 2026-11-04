@@ -245,6 +245,19 @@ describe('Add (F2)', () => {
     expect(said).toContain('Broken');
   });
 
+  it('two copied siblings with the same id link once, the second is a duplicate', async () => {
+    const parent = new FakeDir('OldRoot');
+    parent.seedDir('PlantA').seedText('project.json', manifestJson('p_a', 'PlantA'));
+    parent.seedDir('PlantA copy').seedText('project.json', manifestJson('p_a', 'PlantA'));
+
+    const verdict = await verdictForAdd(asDirHandle(parent), []);
+    const summary = await linkChildProjects(asDirHandle(parent), verdict.childProjects, []);
+
+    expect(summary.linked).toBe(1);
+    expect(summary.duplicates).toHaveLength(1);
+    expect(readLinkedProjects().filter(r => r.id === 'p_a')).toHaveLength(1);
+  });
+
   it('writes nothing into the parent folder', async () => {
     const parent = new FakeDir('OldRoot');
     parent.seedDir('PlantA').seedText('project.json', manifestJson('p_a', 'PlantA'));

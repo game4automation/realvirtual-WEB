@@ -16,7 +16,7 @@
  * placement cost" or "what would chunk instancing across placements save",
  * which are the questions the optimisation plans need answered.
  *
- * Hard contracts this file keeps (doc-render-picking.md §1.5, §2.3):
+ * Hard contracts this file keeps (contract-bake-picking.md §1.5, §2.3):
  *  - Placement = `PlacementInstancer.resolveBaked` + `materialize`. This module
  *    never calls `BakeRegistry.instantiate()` — a source guard in
  *    `tests/placement-instancer.test.ts` enforces it for `src/core/engine/perf/**`.
@@ -94,14 +94,23 @@ export const CELL_MOTIONS: readonly CellMotion[] = ['none', 'conveyor', 'robot',
 /** The one name the matrix root carries in the document. */
 export const CELL_MATRIX_ROOT_NAME = 'CellMatrix';
 
-/** Catalog id of the robot asset produced by `scripts/perf-extract-robot-asset.mjs`. */
-export const DEFAULT_ROBOT_ASSET = 'robots-fanuccrx-10ia-l';
+/**
+ * Identity of the robot asset: the benchmark's OWN copy of the library robot,
+ * `public/perf/Robots/FanucCRX-10iA-L-erratic.glb` (`scripts/build-perf-robot-asset.mjs`),
+ * with `Drive_ErraticPosition` on A1..A6. Since 2026-10-25 the library robot
+ * itself carries a RobotIK rig and a demo IKPath instead of the sweep (Thomas);
+ * this copy is not in the library catalog, so the id is never resolved through it
+ * — the url below always wins (`PlacementInstancer.sourceOf`).
+ */
+export const DEFAULT_ROBOT_ASSET = 'perf-fanuccrx-10ia-l-erratic';
 /** Catalog id of the lane conveyor. */
 export const DEFAULT_CONVEYOR_ASSET = 'pallethandling-chainconveyor-2m';
 /** Bundled library paths. `rebaseLocalLibraryUrl` re-roots them onto the
  *  deploy's BASE_URL, so one constant works in dev, in a build and in a test. */
 export const DEFAULT_CONVEYOR_URL = 'library/PalletHandling/ChainConveyor-2m.glb';
-export const DEFAULT_ROBOT_URL = 'library/Robots/FanucCRX-10iA-L.glb';
+/** The benchmark robot is not a library path, so `rebaseLocalLibraryUrl` leaves it
+ *  alone — it is rooted onto BASE_URL here instead, for the same three contexts. */
+export const DEFAULT_ROBOT_URL = `${import.meta.env?.BASE_URL ?? '/'}perf/Robots/FanucCRX-10iA-L-erratic.glb`;
 /** Node name of the robot asset root — the prefix its internal refs carry. */
 export const ROBOT_ASSET_ROOT = 'FanucCRX-10iA-L';
 
@@ -382,7 +391,7 @@ function placeOne(
   // constructed. `resolveComponentRefs()` resolves without a scope, so an
   // asset-internal `FanucCRX-10iA-L/Gripper/…` path would suffix-match across
   // all placements once there is more than one.
-  rescopeComponentRefs(root, NodeRegistry.computeNodePath(root));
+  rescopeComponentRefs(root, NodeRegistry.computeNodePath(root), baked.identity);
 
   const host = viewer as unknown as IntegrationHost;
   if (canIntegratePlacedContent(host)) integratePlacedContent(host, root);
@@ -404,9 +413,21 @@ function placeOne(
  *
  * Safe to mutate: `BakeRegistry` deep-copies `userData` per instance
  * (`cloneLogicNode`), so the shared template is untouched.
+ *
+ * plan-769 Phase 1b (§2.4): only for a LEGACY asset. An asset whose decode built an
+ * identity record (`identity`, migrated) resolves every stored reference by its
+ * file-relative address inside the placement's own occurrence — no cross-placement
+ * suffix match can happen, and rewriting the path would turn a file reference
+ * into a web-written one (the old guessing chain). Address-form refs carry no
+ * `path` and are never touched.
  */
-export function rescopeComponentRefs(root: Object3D, placementPath: string): number {
+export function rescopeComponentRefs(
+  root: Object3D,
+  placementPath: string,
+  identity?: { readonly migrated: boolean } | null,
+): number {
   if (!placementPath) return 0;
+  if (identity?.migrated) return 0;
   let rewritten = 0;
   const assetRoot = (root.userData._originalName as string | undefined) ?? root.name;
   const visit = (value: unknown): void => {

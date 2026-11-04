@@ -16,6 +16,11 @@
  * mesh-bounds footprint never measures the field as vehicle body (that made
  * the field walk away from the vehicle on every re-configure).
  *
+ * The field sits at the LEADING end (plan-595): at the body front, pointing
+ * along +Z, on a forward plan; at the body rear, pointing along −Z (outward),
+ * on a reverse plan — a direction change at standstill moves it even though
+ * the lengths stay the same.
+ *
  * The field LENGTHS follow the vehicle's speed at RENDER time — read
  * through the fleet handle's `motion()` (the plan speed at the time the pose
  * tween last sampled the vehicle), so they are right between DES events too,
@@ -62,6 +67,11 @@ interface FieldEntry {
   warnLen: number;
   protLen: number;
   state: AgvMotionInfo['field'];
+  /** Placement inputs of the last update (direction + body), so a change without a length change still moves it. */
+  dir: 1 | -1;
+  front: number;
+  rear: number;
+  width: number;
 }
 
 interface SharedResources {
@@ -118,7 +128,7 @@ export class AgvScannerFieldPlugin implements RVViewerPlugin {
   private producing = false;
   /** Per-frame motion scratch (no allocation in onRender). */
   private readonly info: AgvMotionInfo = {
-    speed: 0, field: 'clear', protectiveLength: 0, warningLength: 0, front: 0, width: 0, scanner: false,
+    speed: 0, field: 'clear', protectiveLength: 0, warningLength: 0, front: 0, rear: 0, width: 0, dir: 1, scanner: false,
   };
 
   init(viewer: RVViewer): void {
@@ -243,6 +253,7 @@ export class AgvScannerFieldPlugin implements RVViewerPlugin {
     node.add(group);
     const e: FieldEntry = {
       id, node, group, warnFill, warnLine, protFill, protLine, warnLen: -1, protLen: -1, state: 'clear',
+      dir: 1, front: -1, rear: -1, width: -1,
     };
     this.entries.set(id, e);
     return e;
@@ -252,11 +263,16 @@ export class AgvScannerFieldPlugin implements RVViewerPlugin {
   private updateEntry(e: FieldEntry, info: AgvMotionInfo): boolean {
     const width = info.width + FIELD_EXTRA_WIDTH;
     let changed = false;
-    if (Math.abs(info.warningLength - e.warnLen) > LENGTH_EPS || Math.abs(info.protectiveLength - e.protLen) > LENGTH_EPS) {
+    if (Math.abs(info.warningLength - e.warnLen) > LENGTH_EPS || Math.abs(info.protectiveLength - e.protLen) > LENGTH_EPS
+      || info.dir !== e.dir || info.front !== e.front || info.rear !== e.rear || info.width !== e.width) {
       e.warnLen = info.warningLength;
       e.protLen = info.protectiveLength;
-      for (const o of [e.warnFill, e.warnLine]) { o.scale.set(width, 1, Math.max(1e-4, e.warnLen)); o.position.z = info.front; }
-      for (const o of [e.protFill, e.protLine]) { o.scale.set(width, 1, Math.max(1e-4, e.protLen)); o.position.z = info.front; }
+      e.dir = info.dir; e.front = info.front; e.rear = info.rear; e.width = info.width;
+      // Leading end: the front along +Z, or the rear turned by 180° about Y so the field points outward (−Z).
+      const z = info.dir === -1 ? -info.rear : info.front;
+      const yaw = info.dir === -1 ? Math.PI : 0;
+      for (const o of [e.warnFill, e.warnLine]) { o.scale.set(width, 1, Math.max(1e-4, e.warnLen)); o.position.z = z; o.rotation.y = yaw; }
+      for (const o of [e.protFill, e.protLine]) { o.scale.set(width, 1, Math.max(1e-4, e.protLen)); o.position.z = z; o.rotation.y = yaw; }
       changed = true;
     }
     if (info.field !== e.state) {

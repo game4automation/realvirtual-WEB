@@ -17,9 +17,11 @@
  */
 
 import {
+  buildMultiDispatcher,
   generateToolSchemasMulti,
   type ToolSchema,
 } from '../../src/core/engine/rv-mcp-tools';
+import { boundAliasToolNames, withAliasListing } from '../../src/plugins/mcp-bridge/rv-mcp-command-tools';
 import { McpBridgePlugin } from '../../src/plugins/mcp-bridge-plugin';
 
 /**
@@ -42,5 +44,7 @@ export function delegateCensus(): Record<string, number> {
 
 /** Merged schemas of every announced delegate instance. */
 export function allSchemas(): ToolSchema[] {
-  return generateToolSchemasMulti(allInstances());
+  // As announced: command-bound aliases carry `listed: false` (plan-641 Nachtrag 2026-10-21).
+  const instances = allInstances();
+  return withAliasListing(generateToolSchemasMulti(instances), boundAliasToolNames(buildMultiDispatcher(instances)), false);
 }

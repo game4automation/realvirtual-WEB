@@ -4,27 +4,30 @@
 /**
  * test-des-experiment-param-apply (plan-265 §9.2) — the KERN-BLOCKER guard.
  *
- * Proves that the re-config path (DESComponent.reconfigureFromExtras, §2.4
+ * Proves that the re-config path (DESRunner.reconfigureFromExtras, §2.4
  * Option A) actually makes a parameter override take effect at the REAL kernel:
  *   1. mutating node.userData.realvirtual[type][field] + reconfigureFromExtras()
  *      re-reads the field into the live instance (applySchema round-trip);
- *   2. two runs with a DIFFERENT InterArrivalTime override produce DIFFERENT
+ *   2. two runs with a DIFFERENT ProcessingTime override produce DIFFERENT
  *      throughput (not identical KPIs) — the silent-failure this test exists to
  *      catch. No SimDesControl mock: a mock would not prove the value reaches the
  *      model.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { Object3D, Scene } from 'three';
-import { DESManager } from '@rv-private/plugins/des/rv-des-manager';
-import { DES } from '@rv-private/plugins/des/rv-des-api';
-import { DESSource } from '@rv-private/plugins/des/rv-des-source';
-import { DESSink } from '@rv-private/plugins/des/rv-des-sink';
-import { DESStation } from '@rv-private/plugins/des/rv-des-station';
-import type { DESComponent } from '@rv-private/plugins/des/rv-des-component';
-import { resetDESMUCounter } from '@rv-private/plugins/des/rv-des-mu';
-import { NodeRegistry } from '../../src/core/engine/rv-node-registry';
+import { resetDESMUCounter } from '@rv/plugins/des/rv-des-mu';
 import { SignalStore } from '../../src/core/engine/rv-signal-store';
+import { DESRunner } from '@rv/plugins/des/des-runner';
+import { bindSceneToRunner } from '@rv/plugins/des/des-scene-binding';
+import type { MaterialFlowAdapter } from '@rv/plugins/des/material-flow-adapter';
+import { Station } from '@rv/plugins/des/material-flow/Station';
+import Source from '../../src/behaviors/Source';
+import Sink from '../../src/behaviors/Sink';
+import { getMaterialFlow, registerMaterialFlow } from '../../src/core/material-flow/registry';
+import type { MaterialFlowDefinition } from '../../src/core/material-flow/define-material-flow';
+import type { BindContextHost } from '../../src/core/behavior-runtime';
+import { ContextMenuStore } from '../../src/core/hmi/context-menu-store';
 
 function createNode(name: string, x: number, extras?: Record<string, unknown>): Object3D {
   const node = new Object3D();
@@ -34,53 +37,64 @@ function createNode(name: string, x: number, extras?: Record<string, unknown>): 
   return node;
 }
 
+void Source; void Sink;
+const definitions = [
+  getMaterialFlow('Source')!, getMaterialFlow('Sink')!, Station,
+] as MaterialFlowDefinition[];
+const runners: DESRunner[] = [];
+afterEach(() => { for (const runner of runners.splice(0)) runner.dispose(); });
+
+/** Bind real behaviour payloads, then let each case wire its explicit test graph. */
+function bindRunner(scene: Scene): DESRunner {
+  for (const def of definitions) registerMaterialFlow(def);
+  scene.updateMatrixWorld(true);
+  const host: BindContextHost = {
+    signalStore: new SignalStore(), registry: null, drives: [],
+    on: () => () => {}, contextMenu: new ContextMenuStore(),
+    getPlugin: () => undefined,
+  };
+  const runner = new DESRunner({ subMode: 'animated' });
+  runners.push(runner);
+  bindSceneToRunner(runner, scene, host);
+  // These cases explicitly wire the graph below (including deliberate fan-out).
+  for (const { adapter } of runner.liveInstances) {
+    adapter.nextComponents = [];
+    adapter.previousComponents = [];
+  }
+  return runner;
+}
+
+function component(runner: DESRunner, node: Object3D): MaterialFlowAdapter {
+  return runner.liveInstances.find(i => i.adapter.node === node)!.adapter;
+}
+
 /** Build a source→station→sink kernel and run it `time` sim-seconds. Returns
  *  the station throughput (processed count) as the observable KPI. */
-function runScenario(interArrival: number, time: number): number {
+function runScenario(processingTime: number, time: number): number {
   const scene = new Scene();
-  const ctx = {
-    registry: new NodeRegistry(),
-    signalStore: new SignalStore(),
-    scene,
-    transportManager: {} as never,
-    root: scene,
-  };
-  const manager = new DESManager();
-  DES.setManager(manager);
-  resetDESMUCounter();
-  manager.setMasterSeed(42);
-
-  // Source carries its config in rv_extras, like a GLB-loaded node.
-  const sourceNode = createNode('Source', 0, { DESSource: { InterArrivalTime: 999 } });
-  const stationNode = createNode('Station', 1);
-  const sinkNode = createNode('Sink', 2);
+  const sourceNode = createNode('Source', 0, { Source: { Interval: 1 } });
+  const stationNode = createNode('Station', 1, { Station: { ProcessingTime: 999 } });
+  const sinkNode = createNode('Sink', 2, { Sink: {} });
   scene.add(sourceNode, stationNode, sinkNode);
-
-  const source = new DESSource(sourceNode);
-  const station = new DESStation(stationNode);
-  station.ProcessingTime = 1;
-  const sink = new DESSink(sinkNode);
-
+  const runner = bindRunner(scene);
+  const manager = runner.getManager();
+  manager.setMasterSeed(42);
+  const source = component(runner, sourceNode);
+  const station = component(runner, stationNode);
+  const sink = component(runner, sinkNode);
   source.nextComponents = [station];
   station.nextComponents = [sink];
   station.previousComponents = [source];
   sink.previousComponents = [station];
 
-  const components: DESComponent[] = [source, station, sink];
-  for (const c of components) manager.registerComponent(c);
-  for (const c of components) c.init(ctx);
+  stationNode.userData.realvirtual.Station.ProcessingTime = processingTime;
+  runner.reconfigureFromExtras();
+  expect(station.self.prop.ProcessingTime).toBe(processingTime);
 
-  // Apply the parameter override into the raw rv_extras bag, then re-read it via
-  // the plan-265 re-config path — BEFORE start() (the §2.2 ordering).
-  (sourceNode.userData.realvirtual as { DESSource: { InterArrivalTime: number } }).DESSource.InterArrivalTime = interArrival;
-  source.reconfigureFromExtras();
-  expect(source.InterArrivalTime).toBe(interArrival); // (1) field re-read
-
-  source.start();
+  runner.start([], { root: scene });
   manager.duration = time;
   let guard = 0;
   while (manager.currentTime < time && guard++ < 1_000_000) manager.processAnimated(0.5);
-
   return station.totalProcessed;
 }
 
@@ -91,25 +105,24 @@ describe('DES experiment parameter apply (kernel re-config)', () => {
 
   it('reconfigureFromExtras re-reads the overridden field into the instance', () => {
     const scene = new Scene();
-    const node = createNode('Source', 0, { DESSource: { InterArrivalTime: 10 } });
+    const node = createNode('Source', 0, { Source: { Interval: 10 } });
     scene.add(node);
-    const manager = new DESManager();
-    DES.setManager(manager);
-    const source = new DESSource(node);
-    manager.registerComponent(source);
-    source.init({ registry: new NodeRegistry(), signalStore: new SignalStore(), scene, transportManager: {} as never, root: scene });
+    const runner = bindRunner(scene);
+    const source = component(runner, node);
 
-    source.reconfigureFromExtras();
-    expect(source.InterArrivalTime).toBe(10);
+    runner.reconfigureFromExtras();
+    expect(source.self.prop.Interval).toBe(10);
 
-    (node.userData.realvirtual as { DESSource: { InterArrivalTime: number } }).DESSource.InterArrivalTime = 2.5;
-    source.reconfigureFromExtras();
-    expect(source.InterArrivalTime).toBe(2.5);
+    node.userData.realvirtual.Source.Interval = 2.5;
+    runner.reconfigureFromExtras();
+    expect(source.self.prop.Interval).toBe(2.5);
   });
 
-  it('different InterArrivalTime overrides yield DIFFERENT throughput (not identical KPIs)', () => {
-    const slow = runScenario(20, 400); // ~20 arrivals
-    const fast = runScenario(4, 400);  // ~100 arrivals
+  // Source.Interval is now a demand-pull heartbeat, not a production cadence.
+  // Use the station timing parameter to retain the end-to-end KPI apply contract.
+  it('different ProcessingTime overrides yield DIFFERENT throughput (not identical KPIs)', () => {
+    const slow = runScenario(20, 400); // ~20 completions
+    const fast = runScenario(4, 400);  // ~100 completions
     expect(fast).toBeGreaterThan(slow);
     expect(slow).toBeGreaterThan(0);
   });

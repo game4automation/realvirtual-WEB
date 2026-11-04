@@ -91,16 +91,27 @@ function qualityToken(quality: string): string {
  * address the LEGACY key — bit-identical to every entry written before plan-561 — while
  * `'connect'` appends `.connect` to the quality token. `qualityToken` maps `.` to `-`, so no
  * quality preset can ever produce the suffixed token on its own.
+ *
+ * `'solidcraft'` (plan-621) is the geometry a live CAD link writes per body — a normalised
+ * single-mesh GLB, never a converted file — and gets its own `.solidcraft` suffix by the same
+ * rule, so it can neither shadow nor be shadowed by a browser or CONNECT entry.
+ *
+ * `'parametric'` (plan-650) is a variant of a parametric component family, keyed by its
+ * `InputHash` under the fixed quality `'param-v2'` — its own `.parametric` suffix, so a
+ * variant never collides with a converted file of the same hash.
  */
-export type CadConverter = 'connect' | 'browser';
+export type CadConverter = 'connect' | 'browser' | 'solidcraft' | 'parametric';
 
 /** Quality token including the converter suffix (legacy token for the browser). */
 function keyToken(quality: string, converter?: CadConverter): string {
   const q = qualityToken(quality);
-  return converter === 'connect' ? `${q}.connect` : q;
+  if (converter === 'connect') return `${q}.connect`;
+  if (converter === 'solidcraft') return `${q}.solidcraft`;
+  if (converter === 'parametric') return `${q}.parametric`;
+  return q;
 }
 
-/** `<version>.<sha256>.<quality>[.connect].glb` — the Cache-API entry name. */
+/** `<version>.<sha256>.<quality>[.connect|.solidcraft|.parametric].glb` — the Cache-API entry name. */
 export function cadGlbFileName(sha256: string, quality: string, converter?: CadConverter): string {
   return `${CACHE_VERSION}.${sha256}.${keyToken(quality, converter)}.glb`;
 }

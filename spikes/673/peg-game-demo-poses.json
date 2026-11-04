@@ -1,0 +1,247 @@
+{
+  "_generator": "scripts/solve-peg-game-poses.mjs (plan-673 Phase 5)",
+  "_asset": "public/library/Robots/FanucCRX-10iA-L.glb",
+  "axes": [
+    {
+      "name": "A1",
+      "direction": "RotationY",
+      "reverse": true,
+      "axis": [
+        0,
+        1,
+        0
+      ],
+      "lower": -180,
+      "upper": 180
+    },
+    {
+      "name": "A2",
+      "direction": "RotationZ",
+      "reverse": true,
+      "axis": [
+        0,
+        0,
+        1
+      ],
+      "lower": -180,
+      "upper": 180
+    },
+    {
+      "name": "A3",
+      "direction": "RotationZ",
+      "reverse": true,
+      "axis": [
+        0,
+        0,
+        1
+      ],
+      "lower": -270,
+      "upper": 270
+    },
+    {
+      "name": "A4",
+      "direction": "RotationX",
+      "reverse": true,
+      "axis": [
+        -1,
+        0,
+        0
+      ],
+      "lower": -190,
+      "upper": 190
+    },
+    {
+      "name": "A5",
+      "direction": "RotationZ",
+      "reverse": true,
+      "axis": [
+        0,
+        0,
+        1
+      ],
+      "lower": -180,
+      "upper": 180
+    },
+    {
+      "name": "A6",
+      "direction": "RotationX",
+      "reverse": true,
+      "axis": [
+        -1,
+        0,
+        0
+      ],
+      "lower": -190,
+      "upper": 190
+    }
+  ],
+  "grip": {
+    "padTipYM": 0.2028,
+    "padGripDepthM": 0.01,
+    "partCentreInGripperM": [
+      0,
+      0.2103,
+      -0.02
+    ],
+    "hubBackM": 0.02
+  },
+  "layout": {
+    "boardOriginXZ": [
+      0.75,
+      0
+    ],
+    "boardTopYM": 0.027,
+    "pickXZ": [
+      0.45,
+      -0.45
+    ],
+    "pickTopYM": 0.2,
+    "roundCentreXM": 0.22
+  },
+  "poses": {
+    "pick": {
+      "q": [
+        -31.367,
+        -16.7606,
+        -23.23,
+        0,
+        -50.0093,
+        121.367
+      ],
+      "gripperPos": [
+        0.45,
+        0.4278,
+        -0.45
+      ],
+      "yawDeg": 0,
+      "posErrMm": 0,
+      "rotErrDeg": 0
+    },
+    "lift": {
+      "q": [
+        -31.367,
+        -8.5607,
+        -9.7096,
+        0,
+        -71.7297,
+        121.367
+      ],
+      "gripperPos": [
+        0.45,
+        0.6278,
+        -0.45
+      ],
+      "yawDeg": 0,
+      "posErrMm": 0,
+      "rotErrDeg": 0
+    },
+    "approach": {
+      "q": [
+        -78.7667,
+        -29.8665,
+        -12.0726,
+        0,
+        -48.0609,
+        168.7667
+      ],
+      "gripperPos": [
+        0.77,
+        0.3498,
+        0
+      ],
+      "yawDeg": 0,
+      "posErrMm": 0,
+      "rotErrDeg": 0
+    },
+    "insert": {
+      "q": [
+        -78.7667,
+        -37.2154,
+        -15.6715,
+        0,
+        -37.1131,
+        168.7667
+      ],
+      "gripperPos": [
+        0.77,
+        0.2298,
+        0
+      ],
+      "yawDeg": 0,
+      "posErrMm": 0,
+      "rotErrDeg": 0
+    },
+    "approach-wrong-rotation": {
+      "q": [
+        -78.7667,
+        -29.8665,
+        -12.0726,
+        0,
+        -48.0609,
+        -131.2333
+      ],
+      "gripperPos": [
+        0.77,
+        0.3498,
+        0
+      ],
+      "yawDeg": 60,
+      "posErrMm": 0,
+      "rotErrDeg": 0
+    },
+    "insert-wrong-rotation": {
+      "q": [
+        -78.7667,
+        -37.2154,
+        -15.6715,
+        0,
+        -37.1131,
+        -131.2333
+      ],
+      "gripperPos": [
+        0.77,
+        0.2298,
+        0
+      ],
+      "yawDeg": 60,
+      "posErrMm": 0,
+      "rotErrDeg": 0
+    },
+    "approach-wrong-shape": {
+      "q": [
+        -81.2853,
+        -44.7335,
+        17.2058,
+        0,
+        -62.4723,
+        171.2853
+      ],
+      "gripperPos": [
+        0.99,
+        0.3498,
+        0
+      ],
+      "yawDeg": 0,
+      "posErrMm": 0,
+      "rotErrDeg": 0
+    },
+    "insert-wrong-shape": {
+      "q": [
+        -81.2853,
+        -50.0583,
+        13.5819,
+        0,
+        -53.5236,
+        171.2853
+      ],
+      "gripperPos": [
+        0.99,
+        0.2298,
+        0
+      ],
+      "yawDeg": 0,
+      "posErrMm": 0,
+      "rotErrDeg": 0
+    }
+  }
+}

@@ -11,9 +11,13 @@
  * same parsers the worker uses at connect time — the dialog shows the identical error message a
  * bad address (e.g. S7 `%IW13` declared Bool) would produce in the gateway log.
  *
- * Saving writes through the store's addSignal/updateSignal → PUT full interface (collision check,
- * atomic save and worker hot-reload included). For MQTT this creates a Single-mode signal exactly
- * like the Unity MQTTInterface: one topic per signal, the payload is one scalar value.
+ * Saving goes through `saveSignalFromDialog` (plan-2025 F10): one `signal.upsert` on CONNECT's write
+ * core (`POST /config/ops`) that names every field the dialog edits and leaves the rest — the OPC UA
+ * acquisition fields among them — as the gateway has it; an older CONNECT gets the pre-ops PUT. A
+ * changed name is a RENAME through `/config/signals/rename` first, then the upsert under the new name;
+ * if that second step fails the dialog says "Renamed to X — other changes not saved" and offers a
+ * Retry that repeats only the second step. For MQTT this creates a Single-mode signal exactly like
+ * the Unity MQTTInterface: one topic per signal, the payload is one scalar value.
  *
  * **plan-589: the dialog edits a PLACE, not a name.** `topic` + `mode` say which container of the
  * interface the signal lives in (the flat `signals` list, or one MQTT topic's own list), and the
@@ -29,7 +33,7 @@
  *    (`%IW13`) and is checked locally against the gateway's own address syntax.
  */
 
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useSyncExternalStore } from 'react';
 import {
   Box,
   Typography,
@@ -50,15 +54,18 @@ import {
 } from '@mui/material';
 import { Add, Edit, CheckCircleOutline } from '@mui/icons-material';
 import {
-  addSignal,
-  updateSignal,
+  saveSignalFromDialog,
   validateSignalAddress,
+  type SignalRenameProgress,
   isTextDataType,
   type ConnectInterface,
   type ConnectInterfaceSignal,
   type ConnectSignalSchema,
   type MqttTopicMode,
   type SignalValidationResult,
+  holdConnectConfigEditing,
+  getConnectConfigNotice,
+  subscribeConnectConfigNotice,
 } from './connect-store';
 import { addressRuleFor, isProcessImageAddress } from '../import/rv-iface-signal-slots';
 
@@ -146,6 +153,16 @@ export function seedSignalDataType(
   return dataTypes[0] ?? '';
 }
 
+/** The OPC UA acquisition fields a signal carries (plan-2025 F10) — copied verbatim into a dialog save. */
+export function opcUaFieldsOf(signal: ConnectInterfaceSignal | null | undefined): Pick<ConnectInterfaceSignal, 'subscribeValue' | 'pollValue' | 'pollCycleMs'> {
+  if (!signal) return {};
+  return {
+    ...(typeof signal.subscribeValue === 'boolean' ? { subscribeValue: signal.subscribeValue } : {}),
+    ...(typeof signal.pollValue === 'boolean' ? { pollValue: signal.pollValue } : {}),
+    ...(typeof signal.pollCycleMs === 'number' ? { pollCycleMs: signal.pollCycleMs } : {}),
+  };
+}
+
 export function SignalEditDialog({
   open,
   onClose,
@@ -185,6 +202,13 @@ export function SignalEditDialog({
   seed?: { name?: string; type?: string; dataType?: string };
 }) {
   const isEdit = !!editSignal;
+  // plan-2024 F3: while this dialog is open a config push is held, so an interface deleted or
+  // changed elsewhere never tears the dialog (or the typed input) away - a notice says so instead.
+  useEffect(() => {
+    if (!open) return undefined;
+    return holdConnectConfigEditing();
+  }, [open]);
+  const configNotice = useSyncExternalStore(subscribeConnectConfigNotice, getConnectConfigNotice);
   // The address rule of THIS place. null = the gateway states none (older gateway): no requirement
   // and no warning, which is the plan's explicit compatibility promise (§5.4).
   const addressRule = addressRuleFor({ topic, mode }, schema);
@@ -206,6 +230,10 @@ export function SignalEditDialog({
   const [validating, setValidating] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  // plan-2025 F10: a save that renamed but could not store the other fields (or whose rename is not
+  // confirmed yet). Kept until the dialog closes; the next Save resumes from it instead of renaming again.
+  const [renameProgress, setRenameProgress] = useState<SignalRenameProgress | null>(null);
+  const [renameNotice, setRenameNotice] = useState<string | null>(null);
 
   // (Re)seed the form whenever the dialog opens for a different signal / mode.
   useEffect(() => {
@@ -223,6 +251,8 @@ export function SignalEditDialog({
     setRecord(editSignal?.record ?? false);
     setValidation(null);
     setSaveError(null);
+    setRenameProgress(null);
+    setRenameNotice(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, editSignal]);
 
@@ -293,18 +323,31 @@ export function SignalEditDialog({
       ...(dataType ? { dataType } : {}),
       ...(comment.trim() ? { comment: comment.trim() } : {}),
       record,
+      // plan-2025 F10: the OPC UA acquisition fields are not edited here, so they travel unchanged —
+      // a save never resets them to the gateway default (the write core would keep them anyway).
+      ...opcUaFieldsOf(editSignal),
     };
     try {
       // plan-589: into the SLOT's container — a topic's own `signals` list when the dialog was
       // opened on one, the interface-level list otherwise.
-      if (isEdit) await updateSignal(iface.id, editSignal!.name, signal, topic);
-      else await addSignal(iface.id, signal, topic);
-      onClose();
+      const outcome = await saveSignalFromDialog({
+        interfaceId: iface.id,
+        topic,
+        originalName: isEdit ? editSignal!.name : null,
+        signal,
+        resume: renameProgress,
+      });
+      if (outcome.kind === 'saved') {
+        onClose();
+      } else {
+        setRenameProgress(outcome.progress);
+        setRenameNotice(outcome.message);
+      }
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : String(err));
     }
     setSaving(false);
-  }, [iface.id, isEdit, editSignal, name, address, dataType, comment, record, wireType, validation, topic, onClose]);
+  }, [iface.id, isEdit, editSignal, name, address, dataType, comment, record, wireType, validation, topic, onClose, renameProgress]);
 
   // plan-589: a ProcessImage place is addressed by a Siemens byte offset, so the MQTT schema's
   // "Topic" label and topic hint would be the wrong words for it.
@@ -335,6 +378,16 @@ export function SignalEditDialog({
         {topic ? ` · ${topic}` : ''}
       </DialogTitle>
       <DialogContent>
+        {configNotice.pending && (
+          <Alert
+            severity="info"
+            variant="outlined"
+            data-testid="signal-edit-config-changed"
+            sx={{ mb: 1, fontSize: 11, py: 0 }}
+          >
+            Configuration changed outside. Your input is kept; the change loads when this dialog closes.
+          </Alert>
+        )}
         <Tooltip
           title={nameReadOnly ? SIGNAL_NAME_HERE_READONLY : ''}
           disableInteractive
@@ -491,6 +544,11 @@ export function SignalEditDialog({
           </Tooltip>
         </Box>
 
+        {renameNotice && (
+          <Alert severity="warning" data-testid="signal-edit-rename-partial" sx={{ mt: 1, fontSize: 11, py: 0 }}>
+            {renameNotice}
+          </Alert>
+        )}
         {saveError && (
           <Alert severity="error" sx={{ mt: 1, fontSize: 11, py: 0 }}>
             {saveError}
@@ -500,7 +558,7 @@ export function SignalEditDialog({
       <DialogActions>
         <Button onClick={onClose} sx={{ textTransform: 'none' }}>Cancel</Button>
         <Button variant="contained" onClick={handleSave} disabled={!canSave} sx={{ textTransform: 'none' }}>
-          {saving ? 'Saving...' : isEdit ? 'Save' : 'Add'}
+          {saving ? 'Saving...' : renameProgress ? 'Retry' : isEdit ? 'Save' : 'Add'}
         </Button>
       </DialogActions>
     </Dialog>

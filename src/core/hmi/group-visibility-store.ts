@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * group-visibility-store.ts — Persists group visibility state to localStorage.
  *
@@ -80,7 +82,7 @@ export function loadGroupVisibilitySettings(): GroupVisibilitySettings {
  */
 export function saveGroupVisibilitySettings(settings: GroupVisibilitySettings): void {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+    writeLocalStorage(STORAGE_KEY, JSON.stringify(settings));
   } catch { /* quota exceeded — silently ignore */ }
   for (const cb of _listeners) {
     try { cb(); } catch { /* a listener must not break the save */ }
@@ -94,7 +96,7 @@ const _listeners = new Set<() => void>();
  * filters its Groups list by `excludedFromOverlay`, and until 2026-09-24 it
  * read that list inside a memo keyed on the group array only — a change made
  * in Settings → Groups or by an MCP tool stayed invisible until the list
- * happened to rebuild (Festo `Cover`). Returns the unsubscribe.
+ * happened to rebuild (pick-and-place cell `Cover`). Returns the unsubscribe.
  */
 export function subscribeGroupVisibilitySettings(cb: () => void): () => void {
   _listeners.add(cb);

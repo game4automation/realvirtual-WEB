@@ -378,7 +378,7 @@ describe('Voller Eltern-Reload: die vier Abnahmekriterien nach Back', () => {
     const reference = findByName(plant, 'Station')!;
     // Addressed by PATH: node ids are minted at save time and a test that
     // hand-mints them would be testing its own fixture.
-    setAssetOverrides(reference, { byNodeId: {}, byPath: { Axis: { Drive: { TargetSpeed: 42 } } } });
+    setAssetOverrides(reference, { byAddress: {}, legacyByPath: { Axis: { Drive: { TargetSpeed: 42 } } } });
     plantBytes = await objectToGlb(plant);
 
     const before = await loadPlant();

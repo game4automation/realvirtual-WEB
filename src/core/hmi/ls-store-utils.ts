@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * ls-store-utils.ts — Tiny helpers for the recurring "load/save settings JSON
  * to localStorage" pattern used by 6+ stores in the WebViewer.
@@ -74,7 +76,7 @@ export function lsLoad<T extends object>(
 ): T {
   let parsed: Partial<T> = {};
   try {
-    const raw = localStorage.getItem(key);
+    const raw = readLocalStorage(key);
     if (raw) {
       const json = JSON.parse(raw) as unknown;
       if (options?.migrate) {
@@ -110,7 +112,7 @@ export function lsLoad<T extends object>(
 export function lsSave<T>(key: string, value: T): void {
   if (isSettingsLocked()) return;
   try {
-    localStorage.setItem(key, JSON.stringify(value));
+    writeLocalStorage(key, JSON.stringify(value));
   } catch {
     /* quota exceeded or storage disabled — silently ignore */
   }

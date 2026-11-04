@@ -1,31 +1,40 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { RV_INACTIVE_KEY } from './rv-authored-inactive';
+import { groupLabelsOf, RV_GROUP_LABELS_KEY } from './rv-mu-group-labels';
 import {
-  Object3D, Mesh, Vector3, Quaternion, MeshBasicMaterial,
+  Object3D, Mesh, Vector3, Box3, Quaternion, MeshBasicMaterial,
   LineSegments, EdgesGeometry, LineBasicMaterial,
   type Material, type Sprite, type Texture,
 } from 'three';
 import {
   RVMovingUnit, InstancedMovingUnit, MUInstancePool,
-  computeTemplateAABBInfo, analyzeTemplate,
+  computeTemplateAABBInfo, analyzeTemplate, spawnCloneScale,
 } from './rv-mu';
 import type { IMUAccessor } from './rv-mu';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
 import { registerComponent, loadSchemaFromSpec } from './rv-component-registry';
 import type { CollisionRoleName } from './rv-collision-role';
 import { NodeRegistry } from './rv-node-registry';
+import { stripIdentity } from './rv-decode-identity';
 import { debug } from './rv-debug';
 import { findByNameInSubtree } from './rv-traverse-utils';
 import { MM_TO_METERS } from './rv-constants';
+import { scaleSimDt } from './rv-speed-override';
 import { buildSourceMarker } from './rv-source-marker';
 import { applyShadowFlags } from './rv-mesh-classifier';
 import type { RVTransportManager } from './rv-transport-manager';
 import { RVTransportSurface } from './rv-transport-surface';
 import { AABB } from './rv-aabb';
+import { RV_LAYER_KEY, layerOfNode } from './rv-layers';
 import { wireBoolSignal } from './rv-signal-wiring';
-import { readMUColliderTemplate, type MUColliderTemplate } from './rv-mu-collider-template';
+import { slotBound } from './rv-slot-io';
+import { readMUColliderTemplate } from './rv-mu-collider-template';
+import { computeMUDetectionFrameBox, type DetectPartObb } from './rv-mu-collider-bounds';
+import { getColliderExtras, RV_COLLIDERS_KEY, RV_IS_MU_KEY, RV_OWN_OBJECT_KEY } from './rv-collider-extras';
 import { readLoadSeatDepth } from './rv-mu-load';
+import { templateSizeOf } from '../../behaviors/_shared/mu-reference';
 import type { EventEmitter } from '../rv-events';
 import type { ViewerEvents } from '../rv-viewer-events';
 import {
@@ -33,6 +42,21 @@ import {
   OCCUPANCY_GATED_BEHAVIORS, SURFACE_TOP_EPS_M,
   type SourcePlacement,
 } from './rv-source-placement';
+import { storedRefString } from './rv-stored-ref-label';
+import { storedReferenceValue } from './rv-node-path-rewrite.mjs';
+
+/** One id per distinct (node, collider index) pair, in part order (plan-2016 Codex review). */
+function colliderIds(nodes: readonly Object3D[], obbs: readonly DetectPartObb[]): number[] {
+  const ids: number[] = [];
+  for (let i = 0; i < obbs.length; i++) {
+    let id = i;
+    for (let j = 0; j < i; j++) {
+      if (nodes[j] === nodes[i] && obbs[j].colliderIndex === obbs[i].colliderIndex) { id = ids[j]; break; }
+    }
+    ids.push(id);
+  }
+  return ids;
+}
 
 /** The source's own ghost / overlay / preview / marker children — never an MU template. */
 const isSourceRuntimeHelper = (node: Object3D): boolean => {
@@ -140,10 +164,47 @@ const PLACEMENT_REFRESH_SEC = 0.5;
  * the source. Removing the metadata from clones breaks that cycle. Pure-visual
  * markers (`_isSourceGhost`, `_isSourcePreview`) are intentionally preserved.
  */
+/**
+ * The node of `clone` that corresponds to `node` of `template` (same child-index
+ * path, same name), or null. A spawned MU is a structural copy of its template.
+ */
+function cloneCounterpart(template: Object3D, clone: Object3D, node: Object3D): Object3D | null {
+  if (node === template) return clone;   // the root is renamed per spawn
+  const path: number[] = [];
+  for (let n: Object3D | null = node; n && n !== template; n = n.parent) {
+    const parent: Object3D | null = n.parent;
+    if (!parent) return null;
+    path.push(parent.children.indexOf(n));
+  }
+  let c: Object3D | undefined = clone;
+  for (let i = path.length - 1; i >= 0 && c; i--) c = c.children[path[i]];
+  return c && c.name === node.name ? c : null;
+}
+
 function stripComponentMetadata(obj: Object3D): void {
+  // plan-769 F10 / Inventory C: a ghost / spawned MU is no node of any file — its
+  // copied identity (decode seed + authored NodeId) goes with the extras.
+  stripIdentity(obj);
   obj.traverse((child) => {
     const ud = child.userData;
     if (!ud) return;
+    // plan-2016 S5: the group labels outlive the extras — MUSwitcher switches
+    // a spawned MU's variant groups by them (resolved bake labels preferred).
+    const labels = groupLabelsOf(child);
+    if (labels.length > 0) ud[RV_GROUP_LABELS_KEY] = [...labels];
+    // plan-2016 S5: the parsed colliders too — sensors detect a clone's ACTIVE
+    // colliders, and a MUSwitcher changes which ones are active.
+    const colliders = getColliderExtras(child);
+    if (colliders.length > 0) ud[RV_COLLIDERS_KEY] = JSON.parse(JSON.stringify(colliders));
+    // ...and the two structural facts the collider walks read from the extras:
+    // own object (primitive assignment of MeshColliders) and MU root (walk stop).
+    const rv = ud.realvirtual as Record<string, unknown> | undefined;
+    if (rv && typeof rv === 'object') {
+      ud[RV_OWN_OBJECT_KEY] = true;
+      if (rv['MU']) ud[RV_IS_MU_KEY] = true;
+      // plan-2016 S6c: the Unity layer too — raycast sensors filter by it.
+      if (typeof rv['layer'] === 'number') ud[RV_LAYER_KEY] = rv['layer'];
+    }
     delete ud.realvirtual;
     delete ud._layoutObject;
     delete ud._layoutId;
@@ -177,6 +238,20 @@ const _sourceEdgeMaterial = new LineBasicMaterial({ color: 0xffffff, transparent
 const _engineSourceByNode = new WeakMap<Object3D, RVSource>();
 
 const _sourceTemplateMaterials = new WeakMap<Mesh, { mesh: Mesh; real: Material | Material[] }>();
+
+/**
+ * MU → the RVSource that spawned it (plan-637). A reference to the source
+ * OBJECT, not its name: two sources may share a node name, and the USD live
+ * link needs the exact template a spawned MU was cloned from. A WeakMap rather
+ * than a field on the MU so neither MU class changes and a disposed MU frees
+ * its entry; pre-placed MUs have no entry.
+ */
+const _sourceByMu = new WeakMap<object, RVSource>();
+
+/** The source that spawned `mu`, or null (pre-placed / foreign MU). */
+export function getMuSource(mu: object): RVSource | null {
+  return _sourceByMu.get(mu) ?? null;
+}
 
 /** Authored material hidden by a source preview, including subsequent editor paint. */
 export function getSourceTemplateMaterial(mesh: Mesh): Material | Material[] | null {
@@ -227,6 +302,16 @@ export class RVSource implements RVComponent {
   SourceGenerate: string | null = null;
   SourceGenerateOnDistance: string | null = null;
   private unityControls = false;
+  /** `unityControls` as authored, before a bound signal slot forces it on. */
+  private authoredUnityControls = false;
+  /** `SourceGenerateOnDistance` carries a value (wired or bound directly) — drives `AutomaticGeneration`. */
+  private onDistanceBound = false;
+  /** A bound signal slot currently governs `AutomaticGeneration`. */
+  private automaticGoverned = false;
+  /** `AutomaticGeneration` from before a bound slot took it over — restored on unbind. */
+  private automaticUnbound = true;
+  /** `SourceGenerate` carries a value — `AutomaticGeneration` is forced off on the way in. */
+  private generateBound = false;
   private generatedBefore = false;
   private deleteBefore = false;
   private distanceSignal = false;
@@ -237,11 +322,31 @@ export class RVSource implements RVComponent {
   private signalUnsubs: (() => void)[] = [];
   private generated = new Set<RVMovingUnit | InstancedMovingUnit>();
   private pendingGenerated: (RVMovingUnit | InstancedMovingUnit)[] = [];
-  private colliderTemplate: MUColliderTemplate | undefined;
+  /** Sensor detection box of spawned MUs: the template's authored BoxCollider in
+   *  the MU rotation frame (plan-2016 S5 fix); null = sensors use the mesh box. */
+  private templateDetectHalf: Vector3 | null = null;
+  private templateDetectCenter: Vector3 | null = null;
+  /** The single collider boxes behind the detection box (plan-2016 S5 Codex fix). */
+  private templateDetectParts: Box3[] = [];
+  /** Layer of each {@link templateDetectParts} entry (plan-2016 S6c, -1 = unknown). */
+  private templateDetectLayers: number[] = [];
+  /** Template node carrying each {@link templateDetectParts} entry (the collider identity). */
+  private templateDetectNodes: Object3D[] = [];
+  /** Exact oriented box + collider index of each {@link templateDetectParts} entry. */
+  private templateDetectObbs: DetectPartObb[] = [];
   Interval = 0;
   GenerateIfDistance = 300;
   PlaceOnTransportSurface = true;
   ThisObjectAsMU = '';
+  /** Scene path of the node new MUs are parented to (Unity `Source.Destination`). The
+   *  instance field is display only — `init()` reads the RAW stored value, which may
+   *  also be an address (`{ address }`) after a web save. */
+  Destination = '';
+  /** Resolved `Destination` node (null = spawn under {@link spawnParent}). */
+  destination: Object3D | null = null;
+  /** Registry `init()` resolved `Destination` through — kept so a config edit
+   *  (`reapplyConfig`) resolves it again (plan-2016 S1 review fix). */
+  private _destinationRegistry: NodeRegistry | null = null;
   /** Collision role handed to every MU this source spawns (plan-394). It cannot
    *  live on the MU itself: `stripComponentMetadata()` deletes the clone's
    *  rv_extras, so the role travels via the transport manager's spawn hook. */
@@ -254,6 +359,8 @@ export class RVSource implements RVComponent {
   muName = '';
   sourceIsTemplate = false;
 
+  /** World scale of the MU template at `setTemplate` time (plan-655 F10). */
+  private readonly _templateWorldScale = new Vector3(1, 1, 1);
   /** Template to clone for new MUs */
   muTemplate: Object3D | null = null;
   /** Cached half-size from template (computed once) */
@@ -392,14 +499,19 @@ export class RVSource implements RVComponent {
     if (this.rawExtras) {
       this.computeSpawnConfig(this.rawExtras);
     }
-    this.unityControls ||= !!this.SourceGenerate || !!this.SourceGenerateOnDistance;
-    if (this.SourceGenerate) this.AutomaticGeneration = false;
+    this.authoredUnityControls = this.unityControls;
+    this.syncSlotFlags();
     this.nextDistance = this.GenerateIfDistance;
     this.nextInterval = this.StartInterval;
+    // Unwired slots are bound directly (SlotIO). Binding counts as wiring for
+    // the flags above, so a direct setter re-evaluates them; neutralize applies
+    // the unbound default (GenerateMU as authored, no distance signal).
     this.signalUnsubs.push(wireBoolSignal(context.signalStore, this.SourceGenerate,
-      v => { this.GenerateMU = v; }, undefined, context.reapply).unsubscribe);
+      v => { this.GenerateMU = v; if (!this.SourceGenerate) this.syncSlotFlags(); }, undefined, context.reapply,
+      { instance: this, field: 'SourceGenerate', unbound: this.GenerateMU }).unsubscribe);
     this.signalUnsubs.push(wireBoolSignal(context.signalStore, this.SourceGenerateOnDistance,
-      v => { this.distanceSignal = v; }, undefined, context.reapply).unsubscribe);
+      v => { this.distanceSignal = v; if (!this.SourceGenerateOnDistance) this.syncSlotFlags(); }, undefined,
+      context.reapply, { instance: this, field: 'SourceGenerateOnDistance', unbound: false }).unsubscribe);
     this.spawnParent = this._resolveSpawnParent(context.root);
 
     // Find MU template.
@@ -415,8 +527,14 @@ export class RVSource implements RVComponent {
       // when both assets share internal node names. Fall back to the global
       // registry only when the subtree search comes up empty (e.g. the main
       // loadGLB path where context.root is the whole model root).
-      template = this._resolveTemplateInSubtree(context.root, this.muName)
-        ?? context.registry.getNode(this.muName);
+      // plan-769 Phase 1b: `ThisObjectAsMU` is a stored NAME field — a name the
+      // file carries is read by the file's verdict (`migrateName`: unique in the
+      // owner's subtree, else in the file, else as a path; ambiguous = no
+      // template, reported as `reference-ambiguous`), never by the lookups below.
+      template = context.registry.storedNode(this.node, this.muName, {
+        kind: 'name',
+        legacy: (name) => this._resolveTemplateInSubtree(context.root, name) ?? context.registry.getNode(name),
+      });
       if (template) {
         debug('loader', `Source: ${this.node.name} mode=${this.spawnMode} interval=${this.spawnInterval}s template="${this.muName}"`);
       } else {
@@ -436,6 +554,10 @@ export class RVSource implements RVComponent {
     if (template) {
       this.setTemplate(template);
     }
+
+    // AFTER setTemplate: the destination is checked against the template subtree.
+    this._destinationRegistry = context.registry;
+    this.destination = this._resolveDestination(context.registry);
 
     // Placement detection wiring: keep the live surface/MU sets and invalidate
     // the cached placement whenever a layout object is moved in the planner so
@@ -461,6 +583,70 @@ export class RVSource implements RVComponent {
   }
 
   /**
+   * Resolve `Destination` (plan-2016 S1) through the registry's ONE stored-reference
+   * read: a Unity path (relative to the asset root, migrated through the file's
+   * authored index), a `{ address }` / ComponentReference — `PATH_FIELDS` declares the
+   * field, so the load migration, the save writer, the bake survival and the reference
+   * audit (`reference-unresolved` in Problems) all know it. A miss keeps the old
+   * behaviour (spawn parent) with a warning; never a name guess.
+   */
+  private _resolveDestination(registry: NodeRegistry): Object3D | null {
+    const stored = storedReferenceValue(this.rawExtras?.['Destination']);
+    if (stored === null) return null;
+    const node = registry.storedNode(this.node, stored, {
+      legacy: (path) => registry.resolveWithStage({ path }, null, this.node)?.node ?? null,
+    });
+    if (!node) {
+      console.warn(`  Source: ${this.node.name} - Destination "${typeof stored === 'string' ? stored : JSON.stringify(stored)}" not found, MUs spawn at the scene root`);
+      return null;
+    }
+    // Invariant 1 of resolveSpawnParent: an MU parented inside the (hidden) template —
+    // the source itself for a self-template, else the separate MU template — would be
+    // invisible and cloned into every later MU. Checked against the ACTUAL template subtree.
+    const template = this.muTemplate ?? (this.sourceIsTemplate ? this.node : null);
+    if (template) {
+      for (let p: Object3D | null = node; p; p = p.parent) {
+        if (p === template) {
+          console.warn(`  Source: ${this.node.name} - Destination "${node.name}" lies inside the MU template "${template.name}", ignored (MUs spawn under the spawn parent)`);
+          return null;
+        }
+      }
+    }
+    return node;
+  }
+
+  /**
+   * Flags that follow whether a signal slot carries a value — wired in the GLB
+   * or bound directly in the viewer (SlotIO `slotBound`). Runs once in init and
+   * again whenever a direct binding commands or releases an unwired slot:
+   * a bound slot switches the Unity control semantics on, and while one
+   * governs `AutomaticGeneration` (off under `SourceGenerate`, the distance
+   * signal under `SourceGenerateOnDistance`) the value from before is kept and
+   * restored once neither is bound any more.
+   */
+  private syncSlotFlags(): void {
+    const generate = slotBound(this, 'SourceGenerate', this.SourceGenerate);
+    this.onDistanceBound = slotBound(this, 'SourceGenerateOnDistance', this.SourceGenerateOnDistance);
+    this.unityControls = this.authoredUnityControls || generate || this.onDistanceBound;
+    const governed = generate || this.onDistanceBound;
+    if (governed !== this.automaticGoverned) {
+      this.automaticGoverned = governed;
+      if (governed) this.automaticUnbound = this.AutomaticGeneration;
+      else this.AutomaticGeneration = this.automaticUnbound;
+    }
+    // Forced off only on the transition into "bound" — not on every pulse or replay.
+    if (generate !== this.generateBound) {
+      this.generateBound = generate;
+      if (generate) this.AutomaticGeneration = false;
+    }
+  }
+
+  /** A direct viewer binding (not a GLB wire) currently governs `AutomaticGeneration`. */
+  private get automaticDirectlyGoverned(): boolean {
+    return this.automaticGoverned && !this.SourceGenerate && !this.SourceGenerateOnDistance;
+  }
+
+  /**
    * Compute derived spawn properties from schema properties.
    * Called by loader after applySchema + legacy field handling.
    */
@@ -472,7 +658,9 @@ export class RVSource implements RVComponent {
       || extras['Spawn'] === 'OnSignal';
     const interval = this.Interval;
     const distance = this.GenerateIfDistance;
-    const autoGen = this.AutomaticGeneration;
+    // While a direct binding governs AutomaticGeneration, the spawn mode follows
+    // the unbound value — it must survive an inspector edit made during binding.
+    const autoGen = this.automaticDirectlyGoverned ? this.automaticUnbound : this.AutomaticGeneration;
 
     let mode: 'Interval' | 'Distance' | 'OnSignal' = 'Interval';
     if (interval > 0) {
@@ -489,8 +677,13 @@ export class RVSource implements RVComponent {
     this.spawnInterval = interval > 0 ? interval : 3; // default 3s if not set
     this.spawnDistance = distance;
 
-    // ThisObjectAsMU is serialized as a relative path string (or null/empty if self)
-    const templateRef = this.ThisObjectAsMU;
+    // ThisObjectAsMU is serialized as a relative path string (or null/empty if self).
+    // plan-769 Phase 3: a web-saved file stores the TARGET's `{ address }` instead — kept
+    // as a label the stored read below resolves (`storedRefString`).
+    const rawTemplateRef = extras['ThisObjectAsMU'];
+    const templateRef = rawTemplateRef && typeof rawTemplateRef === 'object'
+      ? (storedRefString(this.node, rawTemplateRef) ?? '')
+      : this.ThisObjectAsMU;
     // Use the ORIGINAL (pre-rename) node name when available. The Layout-Planner
     // renames placed clones (`Foo` → `Foo_2`) BEFORE this runs, which would
     // otherwise break the `templateRef === nodeName` self-reference test for the
@@ -508,21 +701,58 @@ export class RVSource implements RVComponent {
    *  subscriptions, so it is safe to call post-load.
    *  IMPLEMENTS RVComponent::reapplyConfig */
   reapplyConfig(): void {
-    if (this.rawExtras) this.computeSpawnConfig(this.rawExtras);
+    // An edit writes the extras clone-on-write (new object identity) — read the live one.
+    const live = (this.node.userData?.realvirtual as Record<string, unknown> | undefined)?.['Source'];
+    if (live && typeof live === 'object') this.rawExtras = live as Record<string, unknown>;
+    if (!this.rawExtras) return;
+    // The schema re-apply may have written the authored AutomaticGeneration over
+    // the value a direct SourceGenerate binding forced off: adopt it as the
+    // unbound value and keep the binding's state.
+    if (this.automaticDirectlyGoverned && this.generateBound && this.AutomaticGeneration) {
+      this.automaticUnbound = true;
+      this.AutomaticGeneration = false;
+    }
+    this.computeSpawnConfig(this.rawExtras);
+    this.authoredUnityControls = this.unityControls;
+    // A direct binding of an unwired slot keeps its Unity control semantics.
+    if (!this.SourceGenerate && !this.SourceGenerateOnDistance) this.syncSlotFlags();
+    // plan-2016 S1: a changed / cleared Destination applies to the next spawn
+    // (already spawned MUs stay where they are, like Unity). Only after init().
+    if (this._destinationRegistry) this.destination = this._resolveDestination(this._destinationRegistry);
   }
 
   /** Set the template MU and pre-compute its half-size and center offset */
   setTemplate(template: Object3D): void {
-    this.colliderTemplate = undefined;
     this.muTemplate = template;
     const info = computeTemplateAABBInfo(template);
-    this.templateHalfSize = info.halfSize;
-    this.templateLocalCenter = info.localCenter;
+    // plan-655 F10 (SOL finding 2): a template under a SCALED parent (a
+    // SolidCraft body authored in millimetres sits under a 0.001 scale) is
+    // measured in its own frame, i.e. in parent units. The spawned MU lives in
+    // world units, so the box and the clone take the template's WORLD scale.
+    template.updateWorldMatrix(true, false);
+    template.getWorldScale(this._templateWorldScale);
+    const ws = this._templateWorldScale;
+    const scaled = Math.abs(ws.x - 1) > 1e-6 || Math.abs(ws.y - 1) > 1e-6 || Math.abs(ws.z - 1) > 1e-6;
+    this.templateHalfSize = scaled ? info.halfSize.multiply(ws) : info.halfSize;
+    this.templateLocalCenter = scaled ? info.localCenter.multiply(ws) : info.localCenter;
+
+    // plan-2016 S5 fix (Unity parity): sensors detect the MU's ACTIVE colliders
+    // (triggers included), not its mesh. World units in the MU rotation frame.
+    const detect = new Box3();
+    if (computeMUDetectionFrameBox(template, detect, undefined, this.templateDetectParts, this.templateDetectLayers, this.templateDetectNodes, this.templateDetectObbs)) {
+      this.templateDetectHalf = detect.getSize(new Vector3()).multiplyScalar(0.5);
+      this.templateDetectCenter = detect.getCenter(new Vector3());
+    } else {
+      this.templateDetectHalf = null;
+      this.templateDetectCenter = null;
+    }
 
     // Analyze template for instancing capability FIRST — captures the real
     // geometry + material before any ghost recolor below, so spawned instances
     // keep the original look.
-    const analysis = analyzeTemplate(template);
+    // A scaled template takes the clone path: the instance pool places
+    // instances with position + rotation only.
+    const analysis = scaled ? null : analyzeTemplate(template);
     if (analysis) {
       this.useInstancing = true;
       this.pool = new MUInstancePool(
@@ -532,6 +762,23 @@ export class RVSource implements RVComponent {
         this.templateHalfSize,
         this.templateLocalCenter ?? undefined,
       );
+      this.pool.ownsGeometry = analysis.ownsGeometry;
+      // plan-2016 S7: an instance carries the same Unity layers as a clone of this
+      // template (root layer + one per collider box) — layer filters must not
+      // depend on whether a Source pools or clones.
+      this.pool.layer = layerOfNode(template);
+      this.pool.detectPartLayers = this.templateDetectHalf ? [...this.templateDetectLayers] : undefined;
+      if (this.templateDetectHalf) {
+        this.pool.detectHalf = this.templateDetectHalf;
+        this.pool.detectCenter = this.templateDetectCenter ?? undefined;
+        // plan-2016 Codex review: exact per-collider OBBs for the ray, and one
+        // stable id per template collider (node + index in its collider list).
+        this.pool.detectObbs = this.templateDetectObbs.map((o) => ({ rot: o.rot.clone(), half: o.half.clone(), colliderIndex: o.colliderIndex }));
+        this.pool.detectColliderIds = colliderIds(this.templateDetectNodes, this.templateDetectObbs);
+        this.pool.detectParts = this.templateDetectParts.length > 1
+          ? this.templateDetectParts.map((b) => ({ half: b.getSize(new Vector3()).multiplyScalar(0.5), center: b.getCenter(new Vector3()) }))
+          : undefined;
+      }
       debug('loader', `Source "${this.node.name}": using InstancedMesh for template "${template.name}"`);
     } else {
       this.useInstancing = false;
@@ -576,15 +823,19 @@ export class RVSource implements RVComponent {
     // it becomes a direct child of `this.node`).
     ghost.position.set(0, 0, 0);
     ghost.rotation.set(0, 0, 0);
-    ghost.scale.set(1, 1, 1);
+    // The template's world size under the source node (its local scale when
+    // both share the same parent, as before — plan-655 F10).
+    spawnCloneScale(template, this.node, ghost.scale);
 
     // Force every descendant visible (the template was hidden, and its
     // visibility flags carry over via clone()) and tag the subtree.
     ghost.traverse((child) => {
-      child.visible = true;
+      child.visible = child.userData?.[RV_INACTIVE_KEY] !== true;   // plan-2016 S5
       child.userData._isSourceGhost = true;
     });
+    // The root is always active (an MU template authored inactive as a whole).
     ghost.visible = true;
+    delete ghost.userData[RV_INACTIVE_KEY];
 
     // Overlay shells on top of the clone's meshes.
     this._addOverlayShells(ghost);
@@ -837,9 +1088,13 @@ export class RVSource implements RVComponent {
     }
 
     if (this.spawnMode === 'Interval') {
-      this.timer += dt;
+      this.timer += scaleSimDt(dt);
       if (this.timer >= this.spawnInterval) {
         this.timer -= this.spawnInterval;
+        // At a high simulation speed one tick can span several intervals; one
+        // spawn point takes one part per tick, so missed intervals are dropped
+        // instead of piling up a backlog that keeps spawning after slowing down.
+        if (this.spawnInterval > 0 && this.timer >= this.spawnInterval) this.timer %= this.spawnInterval;
         return this.spawn(forceClone);
       }
     } else if (this.spawnMode === 'Distance') {
@@ -948,8 +1203,66 @@ export class RVSource implements RVComponent {
    * Clone path (forceClone) so the DES runner owns each MU's lifecycle simply
    * (no shared instancing pool to reconcile). Returns null if no template.
    */
-  spawnMU(): (RVMovingUnit | InstancedMovingUnit) | null {
-    return this.spawn(true);
+  // DES owns its logical quantity count; visual clones/probes/restores do not consume that limit.
+  spawnMU(ignoreQuantityLimit = false): (RVMovingUnit | InstancedMovingUnit) | null {
+    return this.spawn(true, ignoreQuantityLimit);
+  }
+
+  /**
+   * Build the CLONE that replaces the instanced MU `inst` of this source (plan-2016 S4:
+   * a DirectlyGrip grip needs a real node). Same world pose, same engine id, same
+   * source bookkeeping; `Created` is not counted again. The caller (transport
+   * manager) swaps it into the ticked set and releases the pool slot. Null when the
+   * source cannot clone (no template / spawn parent).
+   */
+  buildPromotedClone(inst: InstancedMovingUnit): RVMovingUnit | null {
+    if (!this.muTemplate || !this.spawnParent || !this.templateHalfSize) return null;
+    const clone = this._buildRealClone();
+    clone.name = `${this.muTemplate.name}_${this.spawnCount++}`;
+    const parent = this.spawnParent;
+    parent.updateWorldMatrix(true, false);
+    // Pool positions and quaternions are world space (root-parented InstancedMesh).
+    inst.getWorldPosition(clone.position);
+    parent.worldToLocal(clone.position);
+    _spawnQuat.copy(inst.getQuaternion());
+    parent.getWorldQuaternion(_spawnParentQuat);
+    clone.quaternion.copy(_spawnParentQuat.invert()).multiply(_spawnQuat);
+    spawnCloneScale(this.muTemplate, parent, clone.scale);
+    parent.add(clone);
+    this._finishColliderClone(clone);
+
+    const mu = new RVMovingUnit(clone, inst.sourceName, this.templateHalfSize, this.templateLocalCenter ?? undefined, inst.id);
+    this._applyDetectionBox(mu);
+    _sourceByMu.set(mu, this);
+    mu.loadSeatDepth = readLoadSeatDepth(this.muTemplate);
+    mu.physicsMassKg = inst.physicsMassKg;
+    if (this.generated.delete(inst)) this.generated.add(mu);
+    const pending = this.pendingGenerated.indexOf(inst);
+    if (pending >= 0) this.pendingGenerated[pending] = mu;
+    if (this.lastSpawnedMU === inst) this.lastSpawnedMU = mu;
+    return mu;
+  }
+
+  /**
+   * Size `[x, y, z]` (m) a spawned MU of this source will measure
+   * (`measureMuVisualBugSize` of the clone, i.e. its `_bugSize`) — computed from
+   * the template WITHOUT spawning (plan-638): `Created`, `spawnCount` and
+   * `lastSpawnedMU` stay untouched. `null` without template, spawn parent or
+   * measurable geometry. Used only by the DES pose hand-over pre-check.
+   */
+  templateSize(): [number, number, number] | null {
+    if (!this.muTemplate || !this.spawnParent) return null;
+    return templateSizeOf(this.muTemplate, this.spawnParent);
+  }
+
+  /**
+   * True when `spawnMU()` would produce an MU right now — the same gates as the
+   * spawn itself (enabled, quantity limit, template + spawn parent). Read-only
+   * (plan-638: a source with a pose hand-over waits instead of spawning blind).
+   */
+  canSpawn(ignoreQuantityLimit = false): boolean {
+    if (!this.Enabled || (!ignoreQuantityLimit && this.LimitNumber && this.Created >= this.MaxNumberMUs)) return false;
+    return !!this.muTemplate && !!this.spawnParent && !!this.templateHalfSize;
   }
 
   /** Despawn a DES-spawned MU mesh (sink consumed it / reset). Safe on null. */
@@ -962,12 +1275,17 @@ export class RVSource implements RVComponent {
       const mu = this.spawn(forceClone);
       if (mu) this.pendingGenerated.push(mu);
     };
-    this.elapsed += dt;
+    this.elapsed += scaleSimDt(dt);
     if (this.Interval > 0 && this.elapsed >= this.nextInterval) {
       this.nextInterval += this.Interval;
+      // One part per tick at most (see the Interval spawn mode above): skip the
+      // intervals a fast tick jumped over instead of replaying them later.
+      if (this.nextInterval <= this.elapsed) {
+        this.nextInterval += (Math.floor((this.elapsed - this.nextInterval) / this.Interval) + 1) * this.Interval;
+      }
       generate();
     }
-    if (this.SourceGenerateOnDistance) {
+    if (this.onDistanceBound) {
       if (!this.AutomaticGeneration && this.distanceSignal) this.initAutomatic = true;
       this.AutomaticGeneration = this.distanceSignal;
     }
@@ -976,7 +1294,7 @@ export class RVSource implements RVComponent {
     if (this.AutomaticGeneration) {
       const last = this.lastSpawnedMU;
       const deleted = last && (last.markedForRemoval || (this.transportManager
-        && !this.transportManager.mus.includes(last) && !this.pendingGenerated.includes(last)));
+        && !this.transportManager.hasMU(last) && !this.pendingGenerated.includes(last)));
       if (last) { this.node.getWorldPosition(_sourcePos); last.getWorldPosition(_lastMUPos); }
       if (deleted || (last && _sourcePos.distanceTo(_lastMUPos) * MM_TO_METERS > this.nextDistance)
         || (this.initAutomatic && !last)) {
@@ -989,7 +1307,7 @@ export class RVSource implements RVComponent {
     this.deleteBefore = this.DeleteAllMU;
     // Drop references to consumed parts without resetting Unity's lifetime Created count.
     if (this.transportManager) for (const mu of this.generated) {
-      if (!this.transportManager.mus.includes(mu) && !this.pendingGenerated.includes(mu)) this.generated.delete(mu);
+      if (!this.transportManager.hasMU(mu) && !this.pendingGenerated.includes(mu)) this.generated.delete(mu);
     }
     return this.pendingGenerated.shift() ?? null;
   }
@@ -997,7 +1315,7 @@ export class RVSource implements RVComponent {
   /** Deletes this source's generated MUs; the lifetime Created count is retained, as in Unity. */
   DeleteAll(): void {
     for (const mu of this.generated) {
-      if (this.transportManager?.mus.includes(mu)) this.transportManager.removeMU(mu);
+      if (this.transportManager?.hasMU(mu)) this.transportManager.removeMU(mu);
       else mu.dispose();
     }
     this.generated.clear(); this.pendingGenerated = [];
@@ -1008,11 +1326,13 @@ export class RVSource implements RVComponent {
     return this.pendingGenerated.splice(0);
   }
 
-  private spawn(forceClone = false): (RVMovingUnit | InstancedMovingUnit) | null {
-    if (!this.Enabled || (this.LimitNumber && this.Created >= this.MaxNumberMUs)) return null;
+  private spawn(forceClone = false, ignoreQuantityLimit = false): (RVMovingUnit | InstancedMovingUnit) | null {
+    if (!this.Enabled || (!ignoreQuantityLimit && this.LimitNumber && this.Created >= this.MaxNumberMUs)) return null;
     if (!this.muTemplate || !this.spawnParent || !this.templateHalfSize) return null;
     // Authored compound bodies need per-MU transforms and collider metadata.
     forceClone ||= !!this.muTemplate.userData.realvirtual?.Rigidbody;
+    // A Destination MU rides a (moving) node; the instance pool is one mesh in one frame.
+    forceClone ||= this.destination !== null;
 
     // ── Instanced path ──
     if (this.useInstancing && this.pool && !forceClone) {
@@ -1027,6 +1347,7 @@ export class RVSource implements RVComponent {
       const muId = `imu_${this.node.name}_${this.muIdCounter++}`;
 
       const mu = this.pool.spawn(_sourcePos, _spawnQuat, muId, this.node.name);
+      _sourceByMu.set(mu, this);
       if (this.unityControls) mu.physicsMassKg = this.Mass;
       this.Created++; if (this.unityControls) this.generated.add(mu);
       this.lastSpawnedMU = mu;
@@ -1038,9 +1359,15 @@ export class RVSource implements RVComponent {
     const clone = this._buildRealClone();
     clone.name = `${this.muTemplate.name}_${this.spawnCount++}`;
 
-    // Position at source location (convert world → spawnParent local space)
+    // Unity parity (Source.Generate): SetParent(Destination ?? root), then the WORLD
+    // pose of the source. The destination may be moved/rotated/scaled — refresh its
+    // world matrix first, all conversions below go through it.
+    const parent = this.destination ?? this.spawnParent;
+    parent.updateWorldMatrix(true, false);
+
+    // Position at source location (convert world → parent local space)
     this.node.getWorldPosition(clone.position);
-    this.spawnParent.worldToLocal(clone.position);
+    parent.worldToLocal(clone.position);
 
     // Keep the source's WORLD orientation (Unity parity). `Object3D.clone()` copies the
     // template's LOCAL quaternion, but the clone is re-parented under `spawnParent` — so on a
@@ -1048,15 +1375,22 @@ export class RVSource implements RVComponent {
     // is lost and the MU would spawn visibly twisted. Convert world → spawnParent local space,
     // mirroring the position handling above.
     this.node.getWorldQuaternion(_spawnQuat);
-    this.spawnParent.getWorldQuaternion(_spawnParentQuat);
+    parent.getWorldQuaternion(_spawnParentQuat);
     clone.quaternion.copy(_spawnParentQuat.invert()).multiply(_spawnQuat);
+    // plan-655 F10: the clone keeps the template's WORLD scale under its new
+    // parent (the template's own parent chain — e.g. a mm body — is not copied).
+    spawnCloneScale(this.muTemplate, parent, clone.scale);
 
-    this.spawnParent.add(clone);
+    parent.add(clone);
+    this._finishColliderClone(clone);
 
     // Pass the template vectors by reference — AABB.fromHalfSize() copies them
     // into its own fields and they are immutable after setTemplate(), so cloning
     // per spawn was pure GC churn (the instanced path already passes by reference).
     const mu = new RVMovingUnit(clone, this.node.name, this.templateHalfSize, this.templateLocalCenter ?? undefined);
+    this._applyDetectionBox(mu);
+    mu.destinationParent = this.destination;
+    _sourceByMu.set(mu, this);
     // The clone lost its rv-extras (stripComponentMetadata) — hand the
     // template's seat depth over explicitly (plan-577 F2).
     mu.loadSeatDepth = readLoadSeatDepth(this.muTemplate);
@@ -1064,6 +1398,30 @@ export class RVSource implements RVComponent {
     this.Created++; if (this.unityControls) this.generated.add(mu);
     this.lastSpawnedMU = mu;
     return mu;
+  }
+
+  /** Hand the template's collider detection box to a spawned clone MU (plan-2016 S5 fix). */
+  private _applyDetectionBox(mu: RVMovingUnit): void {
+    if (this.templateDetectHalf && this.templateDetectCenter) {
+      mu.setDetectionBox(this.templateDetectHalf, this.templateDetectCenter);
+      const template = this.muTemplate;
+      const nodes = template ? this.templateDetectNodes.map((n) => cloneCounterpart(template, mu.node, n)) : [];
+      mu.setDetectionParts(this.templateDetectParts, this.templateDetectLayers,
+        nodes.every((n) => n !== null) ? nodes as Object3D[] : undefined, this.templateDetectObbs);
+    }
+  }
+
+  /** Stamp only after parenting; destination changes require fresh world geometry. */
+  private _finishColliderClone(clone: Object3D): void {
+    delete clone.userData.physicsBody;
+    try {
+      const template = readMUColliderTemplate(clone);
+      if (template) clone.userData.physicsBody = template;
+    } catch (err) {
+      console.warn(`[source] MU "${clone.name}": authored collider template unusable`, err);
+    } finally {
+      stripComponentMetadata(clone);
+    }
   }
 
   /**
@@ -1104,14 +1462,17 @@ export class RVSource implements RVComponent {
     // Object3D.clone(). A spawned MU (and the held preview) is a pure visual
     // driven by RVMovingUnit — it must never carry a `Source`/`LayoutObject`
     // definition, or `processExtras` would turn it into a recursive Source.
-    stripComponentMetadata(clone);
-    this.colliderTemplate ??= readMUColliderTemplate(this.muTemplate!);
-    if (this.colliderTemplate) clone.userData.physicsBody = this.colliderTemplate;
+    // Keep authored extras until the clone has its final world transform.
 
     // Force everything visible — for self-template sources the real meshes were
-    // hidden (`_hideRealMeshes`) and that flag carries over via clone().
+    // hidden (`_hideRealMeshes`) and that flag carries over via clone(). An
+    // authored-inactive node (plan-2016 S5, a MUSwitcher variant) stays hidden.
+    // The clone's ROOT is always active — Unity `Source.Generate` calls
+    // `SetActive(true)` on the new MU, so a template authored inactive as a whole
+    // still spawns visible MUs; inactive descendants stay inactive.
+    clone.traverse((child) => { child.visible = child.userData?.[RV_INACTIVE_KEY] !== true; });
     clone.visible = true;
-    clone.traverse((child) => { child.visible = true; });
+    delete clone.userData[RV_INACTIVE_KEY];
 
     // Apply the standard shadow policy so MU clones cast/receive shadows like
     // the static scene, independent of how the template entered the scene (a
@@ -1136,6 +1497,7 @@ export class RVSource implements RVComponent {
   private _ensurePreview(): void {
     if (this._previewInstance || !this.muTemplate) return;
     const inst = this._buildRealClone();
+    stripComponentMetadata(inst);
     inst.name = `${this.muTemplate.name}_preview`;
     inst.userData._isSourcePreview = true;
     inst.position.set(0, 0, 0);
@@ -1161,7 +1523,7 @@ registerComponent({
   capabilities: {
     authorable: true,   // addable in the asset editor (schema-complete)
     bake: 'keep',       // the MU preview / template is cloned at runtime — never baked
-    ui: { badge: '#ab47bc' },
+    ui: { badge: '#ab47bc', tooltip: 'des-component' },
   },
   create: (node) => new RVSource(node),
 });

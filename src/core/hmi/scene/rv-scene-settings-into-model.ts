@@ -38,6 +38,7 @@
  */
 
 import { parseGlbChunks, rebuildGlbWithJson, defaultSceneExtras } from '../../persistence/rv-glb-chunks';
+import { isUnsafeObjectKey, ownValue } from '../../engine/rv-safe-keys';
 import type { RVExtrasOverlay } from '../../engine/rv-extras-overlay-store';
 
 /** Resolves an overlay node path to a glTF `nodes[]` index, or null if unknown. */
@@ -275,12 +276,17 @@ export function writeSettingsIntoModel(
     let touched = false;
 
     for (const [componentType, componentFields] of Object.entries(overrides)) {
+      // Content-safe (rv-safe-keys.ts): no prototype-slot keys, OWN records only.
+      if (isUnsafeObjectKey(componentType)) continue;
       // Created unconditionally — `applyOverlayToNode` does the same, so a
       // component whose every field was deleted stays present in both.
-      const target = (rv[componentType] ??= {});
+      const own = ownValue(rv, componentType);
+      const target = (own !== null && typeof own === 'object' && !Array.isArray(own)
+        ? own : (rv[componentType] = {})) as Record<string, unknown>;
       for (const [fieldName, value] of Object.entries(componentFields)) {
+        if (isUnsafeObjectKey(fieldName)) continue;
         if (value === null) {
-          if (fieldName in target) { delete target[fieldName]; fields++; touched = true; }
+          if (Object.prototype.hasOwnProperty.call(target, fieldName)) { delete target[fieldName]; fields++; touched = true; }
         } else {
           target[fieldName] = value;
           fields++;

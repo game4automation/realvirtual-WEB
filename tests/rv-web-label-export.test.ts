@@ -151,7 +151,8 @@ describe('demo station credit plate (Phase 5)', () => {
     expect(credit0).toBeTruthy();
     expect(credit0!.mesh).toBeUndefined();
     const extras0 = (credit0!.extras!.realvirtual as Record<string, Record<string, unknown>>).WebLabel;
-    expect(extras0).toMatchObject({ Mode: 'Plate', Text: 'Model courtesy of\nVillette Oh (GrabCAD)', FontSize: 72, PlateWidth: 960, PlateHeight: 220 });
+    // On the operator box's touch screen since 2026-10-14 (patch-welding-demo-look.mjs).
+    expect(extras0).toMatchObject({ Mode: 'Plate', Text: 'Model courtesy of\nVillette Oh\n(GrabCAD)', FontSize: 40, PlateWidth: 300, PlateHeight: 228 });
 
     const scene = (await gltfLoader.parseAsync(bytes.slice(0), '')).scene;
     let creditNode: Object3D | null = null;
@@ -171,7 +172,7 @@ describe('demo station credit plate (Phase 5)', () => {
     const plate = (creditNode as unknown as Object3D).children.find((c) => c.userData._rvLabelPlate) as Mesh;
     expect(plate).toBeTruthy();
     plate.geometry.computeBoundingBox();
-    expect(plate.geometry.boundingBox!.max.x - plate.geometry.boundingBox!.min.x).toBeCloseTo(0.96, 6);
+    expect(plate.geometry.boundingBox!.max.x - plate.geometry.boundingBox!.min.x).toBeCloseTo(0.30, 6);
 
     const saved = await exportAssetGlb(scene, 'LaserWeldingAssemblyStation');
     const j1 = json(saved);

@@ -35,7 +35,7 @@ them.
 |---|---|---|---|---|
 | **localStorage** | Small metadata and preferences: active pointers, settings, overlays, presets and panel state; not current GLB draft bodies | ✅ | ✅ | `clearAllRVStorage()` / Settings → "Reset all" |
 | **sessionStorage** | Tab-scoped ephemeral state: sensor history panel layout, order cart, login gate auth | ✅ | ❌ | Tab close (browser-managed) |
-| **IndexedDB** (`rv-filesystem`) | `FileSystemDirectoryHandle` for a project folder (plus the retired workspace-root and working-folder slots, §7.6) | ✅ | ✅ | Project close / `removeWorkFolder()` |
+| **IndexedDB** (`rv-filesystem`) | `FileSystemDirectoryHandle` for a project folder (plus the retired workspace-root and working-folder slots, §7.6) | ✅ | ✅ | Unlinking the project (`unlinkProject()`); closing a project keeps the handle |
 | **IndexedDB** (`rv-model-index`, store `snapshots`) | Cross-project **model index** (plan-509): one snapshot per project, key `<backend>:<projectId>`, holding each document's id, name, path, tags and declared mode — what the Projects screen's "Search documents…" field searches without opening (or prompting for) a folder | ✅ | ✅ | Remove / Delete / Replace of a linked project (`forgetProjectTraces`) / browser eviction / site-data clear |
 | **IndexedDB** (`rv-document-modes`, store `modes`) | Per-document **last mode** (plan-513): key `<backend>:<projectId>:<documentId>`, value `{ mode, usedAt }` — the workspace mode each document was last used in, shown as a chip on every document row and restored by every deliberate open | ✅ | ✅ | Remove / Delete / Replace of a linked project (`forgetProjectTraces`) / opening a project as a demo / browser eviction / site-data clear |
 | **Cache API** (`rv-assets-glb-v2`, splats `rv-assets-splat-v2`) | Network cache for placeable library GLBs / splats, keyed by URL + catalog hash | ✅ | ✅ | `ModelCache.clearPersistentCache()` |
@@ -71,7 +71,7 @@ customer:
 | Root | Contents | Served in dev as | Deployed? |
 |---|---|---|---|
 | `public/demo-realvirtual/` | **The demo PROJECT** (plan-737): its `project.json` plus every document that manifest declares. One folder, delivered unchanged to every channel; a GLB here that the manifest does not declare is invisible, not a "dev built-in" | `/demo-realvirtual/<file>` | yes |
-| `public/library/` | **The component library — app-level**, one copy per installation, beside the demo rather than inside it (the delivered standard library: `PalletHandling` + `catalog.json`). Reached through a manifest `libraries[]` subscription, never through the demo backend base path | `/library/...` | yes |
+| `public/library/` | **The realvirtual library — app-level**, one copy per installation, beside the demo rather than inside it. A project of its own since plan-778 (`project.json`, id `prj_realvirtual_library`, documents in `PalletHandling/` …). Reached through a manifest `libraries[]` entry by project id (and always resolvable for references), never through the demo backend base path | `/library/...` | yes |
 | `../realvirtual-WebViewer-Private~/projects/<name>/` | Customer and internal projects. `projects/Development/` is the **internal** one: `fixtures/`, `models/`, `library/Custom/`, `scratch/` | `/private-assets/<project>/<path...>` | only on a private deploy of that project |
 
 Community users keep their own models in a project folder or browser project.
@@ -125,11 +125,11 @@ thing actually get written?**".
 
 Two patterns to internalize:
 
-1. **The working-scene op log is debounced (2 s); every other store writes
-   synchronously on change.** The auxiliary stores trade write volume for
-   simplicity — they're small enough that per-keystroke writes don't matter.
-   The op log is large enough that debouncing matters, hence the 2-second
-   window.
+1. **The working-scene autosave is debounced (2 s) and writes a GLB snapshot
+   (the draft body), not the op log; every other store writes synchronously on
+   change.** The auxiliary stores are small enough that per-keystroke writes
+   don't matter; the scene body is large enough that debouncing matters
+   (`DRAFT_AUTOSAVE_DEBOUNCE_MS` in `scene-store.ts`).
 
 2. **localStorage is the resume mechanism; the URL is the bookmark.** A reload
    restores state from localStorage; sharing a link restores state from the
@@ -175,7 +175,11 @@ A `SignalMapping` carries eleven fields — `kind`, `componentPath`, `slot`,
 `sourceKind`, `signal`, `interfaceId`, `topic`, `direction`, `enabled`, plus the
 two plan-425 anchors `carrierSignalName` and `componentType` (below). Legacy
 records omit the optional ones; every read site normalizes `sourceKind` through
-`mappingSourceKind()` (`?? 'connect'`).
+`mappingSourceKind()` (`?? 'connect'`). **Persisted** (layout store, binding
+persistence, scene GLB) the node fields are addresses since plan-769:
+`componentAddress` / `sourceAddress` (`toStoredMapping` / `fromStoredMapping`,
+`rv-signal-mapping-address.ts`); in memory the mapping keeps `componentPath` (D15), and a
+stored record that still has `componentPath` only is read and migrated.
 
 #### Surviving a model change (plan-425)
 
@@ -406,7 +410,7 @@ route it down the blob branch — a storage failure, not a badge. The gate on
 removing it was the slow delivery channels (ctrlX snap, CONNECT-embedded
 appliances) shipping a client that no longer reads the field; that gate was
 declared open, and the residual risk is **accepted and not mitigated**: a
-browser scene saved from this build on is section-less, and a client older than
+browser document saved from this build on is section-less, and a client older than
 plan-736 that meets it will misroute it. Rolling the stamp back is three lines
 and does **not** heal rows already written.
 
@@ -439,17 +443,26 @@ be able to overwrite at a known path. Staged bytes become a document when
 someone decides what they are, not when they land. The rule lives once, in
 `rv-asset-identity.ts` (`isPrivateSegment`, `isStagingPath`, `isAdoptablePath`).
 
-**Thumbnails hang on the id.** `<project>/.thumbnails/<encodeThumbnailId(id)>.png`,
-for every document. The old convention mirrored the asset's PATH under
-`library/.thumbnails/`, which lost the picture on every move or rename and only
-ever existed for `library/**` — so a model, a scene, or anything in a delivered
-project had no persisted preview and fell back to a render cache that is
-per-browser. The read chain is `doc.thumbnail` (what the manifest states) →
-the id sidecar → a lazy, `'create'`-preconditioned copy of an old
-path-mirrored file → null, and null means the card renders from the GLB.
-`applyTreeMove` runs the same copy *before* a move, or a document dragged out
-of `library/` before anything rendered its card would lose the picture for
-good. Nothing sweeps the old files; they stay for a release.
+**Thumbnails are written on save and hang on the id (plan-776).** A save writes
+`<project>/.thumbnails/<encodeThumbnailId(id)>.<hash8>.<webp|png>` and points the
+row at it: `documents[].thumbnail` holds that exact relative file name and is
+written ONLY by a save (`ProjectStore.setDocumentThumbnail`, one merging manifest
+write through `applyManifestDelta` — CAS on a folder project, the stored manifest
+on a browser project — awaited before the save's rescan; manifest deltas run one
+at a time, so an adopt `stat` delta and a pointer never overwrite each other).
+The hash in the name is the cache key: a re-saved picture is a new file name,
+and the previous one is deleted. There is no render-on-view and no read chain:
+the reader resolves the pointer and nothing else (no probing, no `.png`
+fallback, no legacy path), so a row without one shows the placeholder.
+Duplicate and cross-source copy copy the sidecar bytes under the new id (a failed
+copy leaves the row WITHOUT a pointer, never with the source's); retire deletes
+it after the row; a move or rename needs nothing. Old hash-less
+`.thumbnails/<id>.png` files and the pre-plan-744 `library/.thumbnails/<rel>.png`
+are ignored and stay until a save of that id deletes the hash-less one. The
+Cache API buckets of the former render-on-view cache (`rv-thumbnails-v4/v3/v2`,
+`rv-planner-thumbnails`) are deleted once per page. Details: `doc-webviewer.md`
+→ *Library Thumbnails*. Every save renders the SAME picture — one rule for every
+document (editor, planner, MCP replace), placed references included, in one studio look.
 
 **Save-as lands at the project root** when the document has no folder of its
 own, instead of `library/Custom`. The dialog's folder picker is where the user
@@ -524,114 +537,113 @@ world: the **v3 catalogue row** at `rv-scenes/<id>` (base plus empty ops — a
 directory entry, not a body) and the **`rv-scene-glb` store** that holds the
 bytes. §3.1 has the final keyspace table.
 
-### 2.0-0a What a reference override carries (plan-444)
+### 2.0-0a What a reference override carries (plan-769)
 
 The `AssetOverrides` block on a reference node is the parent file's entire say
-over the asset below it. It holds **three sibling maps**, not one
-([`rv-asset-reference.ts`](src/core/engine/rv-asset-reference.ts)):
+over the asset below it — **component values, nothing else**
+([`rv-asset-reference.ts`](src/core/engine/rv-asset-reference.ts)). A writer
+produces exactly one map:
 
 | Field | Key | Value | Who writes it |
 |---|---|---|---|
-| `byNodeId` | `NodeId` inside the referenced file | `ComponentPatch` — componentType → field → value, `null` deletes (RFC 7396) | every field edit made inside a reference |
-| `byPath` | path relative to the reference node | the same `ComponentPatch` | nothing any more — a read-side bridge for files written before NodeIds existed |
-| `trsByNodeId` | `NodeId` inside the referenced file | `TrsOverride` — optional `position` / `quaternion` / `scale`, glTF-native LOCAL TRS of the target node in the referenced file's own frame | the bake, for a node of a referenced asset the user moved |
+| `byAddress` | an **address relative to the referenced asset**: `#<id>` = a node of that asset, `<b>#<id>` = a node inside its nested reference `b`, `<b>/<c>#<id>` one level deeper | `ComponentPatch` — componentType → field → value, `null` deletes (RFC 7396) | every field edit made inside a reference, at any depth |
 
-**`trsByNodeId` is a sibling of `byNodeId`, never a key inside it**, and that is
-a correctness rule rather than a layout preference. `byNodeId[nodeId]` **is** the
-flat componentType → fields map, so a `trs` key living in there would be handed
-to `applyComponentPatch` as a *component type* and written into the target's
-`extras.realvirtual.trs` — a fake component in every file we save. A sibling
-field is invisible to the patch path by construction, which is what makes the
-addition genuinely additive.
+`<id>` is the node's IDENTITY in its own file: the authored `NodeId`, else the
+seed of the decode (`identityIdOf`, a UUIDv5 of the authored path — a Unity asset
+has no authored ids). The segments are the identities of the nested reference
+nodes between the reference node and the target (`overrideAddressInReference`).
+An empty `byAddress` is not stored.
 
-A transform needed a block of its own because it is **glTF-native data on
-`nodes[i]`**, not an `extras.realvirtual` component: no shape inside a component
-patch could carry it. Until plan-444 a moved node of a referenced asset was
-therefore refused outright, which made "import a STEP, drag a part into place,
-save" impossible.
+**Two writers, one field.** The planner save routes field edits through its bake
+resolver (below). The **asset editor** writes the override itself (plan-774): a
+`setField` / `unsetField` that the reference guard admits as `scope: 'override'`
+also calls `writeOverride` on the OUTERMOST reference node of the open document,
+inside the same op — no extra undo entry, a coalesced slider drag stays one entry.
+The inverse restores the override the op found at that address (or its absence).
+An `unsetField` on placed content is the Revert: the override goes and the live
+value returns to the asset's own value, which `applyOverrideLayers` records per
+instance node before the open file's layer patches it (`_rvOverrideBase`, a
+runtime key, never saved). The inspector badge reads the reference node's
+overrides; the optimistic overlay entry only bridges until the op settles. The
+editor export never copies placed content (the clone walk stops at a
+non-embedded reference node), so what is saved is the reference node plus its
+`AssetOverrides`.
 
-Every field is optional and independent — an override that only moves a part
-leaves the rotation and scale the asset authored. The routed bake in fact writes
-`position` and `quaternion` only: `NodeTransformEntry` carries no scale, the
-referenced asset owns its own (a GLB node may carry a mirror scale), and a save
-that invented one would change geometry the user never touched.
+**Older files are read, never written.** `readAssetOverridesRecord` is the one
+reader, and it is idempotent:
 
-#### The level rule: the first reference level, and no deeper
+| Stored form (pre-769, removed from every writer) | Read as | Written back as |
+|---|---|---|
+| `byNodeId[id]` | `byAddress['#' + id]` (a `byAddress` entry of the same address wins field by field) | `byAddress` |
+| `byPath[relPath]` (path relative to the reference node) | `legacyByPath` — resolved when applied; a hit is migrated to its address (`migratedPaths`) | `byAddress`; an unresolved path stays `byPath` (an orphan is never dropped) |
+| `trsByNodeId` (plan-444 part moves) | only counted (`droppedTransforms`) — **never applied** | dropped |
 
-A transform override lives on the **reference node of the file being written**.
-`writeNodeLevel` (category 5,
-[`rv-scene-glb-bake.ts`](src/core/hmi/scene/rv-scene-glb-bake.ts)) decides which
-of three outcomes applies exactly the way category 1 decides it for fields — by
-where the node lives:
+`trsByNodeId` was removed by plan-769 (F14, D11): a part inside placed content
+keeps the position its asset gives it. A file that still carries it loads, the
+component patches beside it apply, and ONE `override-transforms-dropped` problem
+per reference node names how many moves were dropped. No writer emits
+`trsByNodeId` or `byNodeId` again: the scene bake (`stampJsonIdentity`
+canonicalises every record, `applyRoutedOverrides` writes `byAddress`), the editor
+export (`canonicalizeAssetOverridesInTree`) and `setAssetOverrides` all write the
+769 form. The forced-split bake that served `trsByNodeId` (`forceSplitNodeIds`, the
+`#split:` cache key) went with it.
 
-| Where the moved node lives | What the bake writes |
+**A migrated path is written as an address, also by the planner save.** The planner
+bake works on the file's JSON, not on the live tree. Composition and the
+placement instancer therefore remember on the reference node which legacy paths
+they resolved (`recordOverridePathMigration`, runtime key
+`_rvOverridePathMigration`, never saved); the bake asks for it per glTF node
+(`BakeResolver.overridePathMigrationAt`) and rewrites those keys as `byAddress`
+(`migrateStoredOverridePaths`).
+
+#### The level rule: values at any depth, moves nowhere inside placed content
+
+A field edit on a node of referenced content lands on the **outermost** reference
+node the file being written holds, addressed through the nested references in
+between (`makeRegistryBakeResolver.locate` → `ReferencedBakeLocation.address`).
+plan-757 refused a value edit below the first level; plan-769 Phase 4b removed that
+refusal. A **move** of such a node is refused at every depth:
+
+| Where the moved node lives | What the bake does |
 |---|---|
 | the file being saved | glTF-native TRS on `nodes[i]`, as it always was (`transforms`) |
-| a referenced asset whose reference node is in this file | `AssetOverrides.trsByNodeId` on that reference node (`referenceTransforms`) |
-| a referenced asset that is itself referenced from another referenced asset | **refused** — `UnwritableTransformError` |
+| any referenced content (a composed frame or a placement instance, any depth) | **refused** — `NestedTransformRefusedError` (an `UnwritableTransformError`, code `nested-transform-refused`) naming the part and its placement; the whole save is refused, and each refused part is a `nested-transform-refused` problem until the next save attempt |
 
-The nested case stays a refusal because the reference node that would have to
-hold the override does not live in the file we may write. Writing into the
-referenced asset instead is what the user ruled out — it would move the part in
-every other instance too — and dropping the move quietly is what F9 exists to
-prevent. The error names the way out (open the referenced asset and move the
-part there, or undo the move), because `SaveDialogs.tsx` renders that reason
-verbatim. `BakeResult` counts the two writable outcomes separately, so
-`referenceTransforms` says how many moves left the file as overrides rather than
-as native TRS.
+The error names the way out (move the whole placement, or open the referenced
+asset and move the part there), because `SaveDialogs.tsx` renders that reason
+verbatim. A save that mixes own moves with a refused one writes nothing — a
+half-written file is the outcome F9 exists to prevent.
 
-#### Round-trip
+#### Precedence and late targets
 
-Move → save → reload → the part is where it was left.
+Every override set — the placement's own record and the overrides outer
+placements route into it — goes through ONE precedence point:
+`applyResolvedOverrideSets` → `applyOverrideLayers`, the record in the outer file
+(smaller depth) wins. Composition collects every set of its recursion and applies
+them together at the end; the placement instancer applies a nested placement's own
+record together with what was routed into its occurrence. A nested placement that
+is not materialised yet holds its overrides in the instancer's queue (by target
+occurrence); they apply when it materialises, are flushed with a reason on 404 /
+cap / refusal (`placement-missing` / `placement-cap` / `placement-refused`), are
+dropped silently with the document, and what is left once nothing is pending is
+an `override-orphaned` problem with the reason `missing`. Details:
+[doc-node-paths.md](doc-node-paths.md) § 9.
 
-- **Write.** `materialise` keys `nodeTransforms` by node path, so the array
-  reaching the bake is already coalesced to the FINAL TRS per node; merging is
-  last-write-wins per NodeId. Moving one part ten times leaves one entry, not a
-  history — the file states the current position, the same rule the root-file
-  branch follows.
-- **Carry-through.** `getAssetOverrides` / `setAssetOverrides` are the one
-  read-modify-write pair, and both halves carry `trsByNodeId`. So does
-  `writeOverride` ([`rv-reference-guard.ts`](src/core/ops/rv-reference-guard.ts)),
-  which is that same pattern: a block missing there would mean any later field
-  edit on any node of the asset silently drops the moved part's position.
-- **Read.** `applyAssetOverrides` applies the component patches first and the
-  transforms **last** — a patch must never be able to overwrite the position the
-  user dragged a part to — and only by `NodeId` (see the `byPath` note in
-  [doc-node-paths.md](doc-node-paths.md) §1). Composition then refreshes
-  `matrixWorld` on the grafted subtree once, and only when
-  `transformsApplied > 0`: bounds, auto-align and the first raycast all read it
-  and none of them waits for a render.
-- **Old files load unchanged.** The field is absent in everything written before
-  it existed, and absent means "no override". Parsing is defensive and per
-  FIELD, not all-or-nothing: a malformed rotation must not throw away a
-  perfectly good position written by the same save. A quaternion of length ~0 is
-  rejected (normalising it would invent a rotation), and a scale component below
-  `1e-6` is rejected rather than clamped — a zero scale makes `matrixWorld`
-  singular and poisons every later picking test with NaNs. An entry left with
-  nothing usable is dropped, and a block left empty reads as absent.
-- A node whose ONLY override is a transform still has overrides:
-  `getAssetOverrides` counts all three blocks. Answering `null` there is what
-  would make the compose hook skip the block and the moved part snap back.
+#### Orphans
 
-#### An orphaned transform reads as a hole in the layout
+An address or path whose node no longer exists in the asset is collected like
+any other orphan — `resolveAssetOverrides` RETURNS them, composition carries them
+up as `orphanedOverrides`, placements report them per reference node
+(`override-orphaned`, id = node path + addressing + key, so a re-apply replaces);
+none of it is logged away. An id that names two nodes of one asset is `ambiguous`
+— reported, never "first wins".
 
-A `trsByNodeId` entry whose NodeId no longer exists in the asset is collected
-like any other orphan — `applyAssetOverrides` RETURNS them, composition carries
-them up as `orphanedOverrides` and the load result hands them to the
-non-blocking status row; none of it is logged away. But a transform orphan gets
-its own `addressing: 'trs'` and its own sentence:
+### 2.0 What an `RvScene` record is now
 
-```
-moved part → node "a1b2c3d4" no longer exists in asset "…"
- — its saved position was dropped
-```
-
-It is kept apart from `'nodeId'` deliberately. The two orphan for the same
-reason and read completely differently to a user: "Drive.TargetSpeed no longer
-has a target" is a setting that will not apply, "the part you moved is gone" is
-a hole in the layout. One shared label would have described neither.
-
-### 2.0 What a scene is now
+`RvScene` is the planner's record of the document it has open — kept by
+`SceneStore`, the planner's session on a document. It is not a second kind of
+document: there is one (§2.0-0), and the word "scene" survives only in the
+type name and in the persisted keys listed in §3.0.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -710,11 +722,40 @@ document** — a second request while one is open answers the `SAVE_PROMPT_BUSY`
 sentinel — which is what makes the double-click guard cover every entry point
 rather than only the one that happens to call `saveDocument()` first.
 
-**After every successful document write** `viewer.emit('document-saved',
-{documentId, relPath})` fires. Caches keyed on document bytes (the layout
-planner's decoded models) hang off that event; before it, invalidation was done
-by the save flow reaching into the planner and matching `library/**`, so a
-document saved under `models/` was placed from stale bytes afterwards.
+**After every successful document write** `document-saved` (`{documentId,
+relPath}`) fires — from the one post-save step, §2.0a-3. Caches keyed on
+document bytes (the layout planner's decoded models) hang off that event;
+before it existed, invalidation was done by the save flow reaching into the
+planner and matching `library/**`, so a document saved under `models/` was
+placed from stale bytes afterwards.
+
+#### Save is the inverse of load — the scene GLB reaches a fixpoint (plan-752)
+
+`GLTFLoader` always returns a `Group` for the file's scene, and `GLTFExporter` turns
+only `scene.children` into nodes. Handing the loaded root straight back to the exporter
+therefore made it a *node* under a freshly invented `AuxScene` — one wrapper level deeper
+on every save. Both GLB write paths (`bakeSceneGlb` in `rv-scene-glb-bake.ts` and the
+`scene-store.ts` export) now go through `sceneMirroringLoad(root)`
+(`core/import/rv-import-object.ts`): the root's name becomes the scene name and its
+children become the file's nodes, so a save is the exact inverse of the load.
+
+What this guarantees, and what it does not:
+
+- **The chain never grows again.** Load → save → load keeps the same depth. Since
+  plan-769 nothing a document stores depends on it anyway: references and overrides are
+  ADDRESSES (`#<NodeId>`, see [doc-node-paths.md](doc-node-paths.md) § 9), and a node keeps
+  its id across saves — paths are input and display only.
+- **An existing `AuxScene/AuxScene_1/…` chain is preserved, not healed.** Healing would
+  need `collapseWrapperChain`, which tears up stored child paths, so it is deliberately
+  left out. A document that already carries phantom levels stays stable and fully
+  resolvable at the level it has.
+- **A root with a real transform stays a node**, because a glTF scene cannot carry a
+  transform. That case settles after one more save.
+- In the non-identity branch the scene stays unnamed on purpose: `GLTFLoader` draws scene
+  and node names from one namespace and would otherwise rename the root node
+  (`<Name>_1`) — the level every stored path starts at.
+
+Pinned by `tests/scene-glb-roundtrip-fixpoint.test.ts`.
 
 ### 2.0a-2 Authored manifests: the demo project (plan-726)
 
@@ -746,6 +787,55 @@ A manifest that is missing, unparseable or invalid under `isValidProjectV2()`
 falls back to the synthesized demo project **and logs a warning**. The demo
 still loads — the failure is visible in the console rather than as a white page.
 
+### 2.0a-3 One post-save step (plan-777)
+
+There are two save pipelines and they stay two: the **planner** save
+(`SceneStore.save()` / `saveAs()` / `saveSettingsIntoModel()`) bakes its bytes
+from the op log against the base bytes, the **editor** save (`saveDocument()` in
+`rv-save-document.ts`) exports the authored tree, and an MCP replace installs
+bytes it was handed. What happens AFTER the bytes are on disk is one function,
+`finishDocumentSave()` in
+[`rv-finish-document-save.ts`](src/core/editor/rv-finish-document-save.ts):
+
+1. **Thumbnail** — `writeDocumentThumbnail()` (plan-776) renders the open
+   document and points the row at the picture, **awaited**. A read-only backend
+   or a viewer without a renderer skips it and leaves the pointer alone;
+   `render: false` (an MCP replace of a document nobody shows) drops it.
+2. **Announce** — `announceDocumentSaved()`, the ONLY `document-saved` emit in
+   `src/`. A subscriber therefore sees the new pointer already.
+3. **Rescan** — `ProjectStore.rescanDocuments()`, **not awaited**, so a folder
+   listing never holds the save queue.
+
+Each step is guarded on its own: a failure in one never skips the next, and the
+function never throws. It is called once the saved document's identity is
+final, and only after a successful write — a conflict, a refusal or a moved
+target calls nothing:
+
+| Caller | Where |
+|---|---|
+| Editor save | after `doc.markSaved(nextBase)` / `document.markSaved()`. The bound / slot branch has no call of its own — it writes through the planner, whose save runs it, so a save announces and rescans exactly once. |
+| Planner save in place (`_saveIntoDocument`) | after `viewer.currentScene` and the `?doc=` URL update, before `_notify()`. |
+| Planner "Save as…" | same point: identity → current scene → URL → recent-document entry → this → `_notify()`. Not inside `_createDocument`, which "New" shares — a New without bytes is not a save. |
+| Planner "Save settings into model" | `documentId: null`: the row is resolved by path after the thumbnail writer's own lookup; no row → no announce. |
+| MCP replace | `announceDocumentSaved()` EARLY, where the caches are invalidated — before the reload, so the planner drops its stale bytes — and `finishDocumentSave({ announce: false, render: loaded })` after the proof. |
+
+**`rescanDocuments()` is single-flighted with a dirty re-run.** At most one scan
+runs and at most one is queued. A call that arrives while a scan runs resolves
+with the FOLLOW-UP scan, never with the running one — that one may have listed
+the folder before the caller's file existed, and the thumbnail writer and
+`SceneStore._documentRowOrAdopt()` rely on finding their new row once the
+awaited rescan resolves. Two quick saves therefore leave one consistent row set
+instead of two scans overwriting each other's listing.
+
+**The behaviour change this made** (and the plugin contract it now meets,
+`doc-webviewer-interface.md`): planner saves announce `document-saved` too, and
+editor saves rescan. The three subscribers are cache-only and synchronous —
+`PlacementInstancer.invalidateDocument` (retires a bake only at refcount 0),
+the layout planner's catalog/registry keys and the dashboard's stat refresh —
+so an announce never reloads or saves anything. The revision ledgers of the
+two pipelines stay separate. Pinned by `tests/finish-document-save.test.ts`;
+`tests/document-vocabulary-guard.node.test.ts` pins the single emit site.
+
 ### 2.0b Why the op log still exists
 
 It is the edit mechanism, not the storage format:
@@ -761,6 +851,10 @@ It is the edit mechanism, not the storage format:
 `materialise(ops)` produces seven categories, and `bakeIntoGlb()`
 ([`rv-scene-glb-bake.ts`](src/core/hmi/scene/rv-scene-glb-bake.ts)) writes all
 seven into the file. Before plan-397 the writer persisted exactly one of them.
+Later plans added three more by the same rule — authored node removals
+(plan-628) and the moves / removals of placements the base file already holds
+(plan-769 Phase 7, see *Moving or removing a placement the saved file already
+holds* in §2.1).
 
 See [`src/core/hmi/scene/rv-scene-types.ts`](src/core/hmi/scene/rv-scene-types.ts)
 and [`src/core/hmi/scene/rv-scene-edits.ts`](src/core/hmi/scene/rv-scene-edits.ts).
@@ -809,6 +903,31 @@ restore and silently drop every later placement. An unrecoverable placement
 returns `null`, which the loop logs and skips — except for virtual/DES
 placements, which have no source URL by construction.
 
+#### Moving or removing a placement the saved file already holds (plan-769 Phase 7)
+
+A placement that came in with the saved file is **adopted** on open — the log
+has no `addPlacement` for it. The planner still books every move and every
+removal on it (`transformPlacement` / `removePlacement`, addressed by the
+placement id = the reference node's `NodeId`), and `materialise` keeps them as
+**baseline edits** instead of dropping them:
+
+| Op with no `addPlacement` in the log | `materialise` field | Save (`bakeIntoGlb`) | Recovered draft tail (`loadScene`) |
+|---|---|---|---|
+| `transformPlacement` | `baselinePlacementTransforms` (id → TRS, last write wins) | TRS-only patch of the node with that `NodeId` (fast path) — `AssetReference` with its `bounds`, `PlacementMeta` and `AssetOverrides` stay as the file holds them | the reference node is moved inside `loadModel`, before any plugin's `onModelLoaded` |
+| `removePlacement` | `removedPlacementIds` (the baseline move is dropped with it) | the node with that `NodeId` is dropped (full path, its own step — not `removedNodes`) | the reference node is disposed and unregistered inside `loadModel` |
+
+So the planner adopts the moved state and never the removed one, and the core
+instancer never materialises a removed placement. An `addPlacement` with a
+removed id takes it out of the list again (redo, undo of the remove). Three
+rules keep repeated saves quiet: a removed id the file no longer holds is
+**already the target state** (after "save as" the saved bytes become the base
+while the log keeps its ops, so the same removal reaches every later save — no
+warning, no full path); a component override inside a removed placement that
+the live scene can no longer place leaves with it (no `NodeNotFoundError`); and
+a move of a placement the file no longer holds is **reported** — a save warning
+plus the Problems entry `placement-transform-orphaned`, cleared at the next save
+attempt — never dropped silently.
+
 Ops written against an **asset** (the authored GLB itself):
 
 | Kind | What it does | Inverse via |
@@ -824,6 +943,18 @@ Ops written against an **asset** (the authored GLB itself):
 | `setMaterial` | Assign a material to a mesh | `prev` material |
 | `separateMesh` | Split one mesh into its connected parts (§ *Mesh Separator* in doc-webviewer.md) | Re-merge from the snapshot |
 | `mergeMesh` | Collapse a subtree back into one mesh | Re-separate from the snapshot |
+| `replaceNodeGeometry` | Swap only `mesh.geometry` of one mesh node (or a group with exactly one mesh child) — node, material, components and children stay. Geometry by SHA-256 in the CAD-GLB cache (`sha256` + `quality` + `converter`), never inlined (plan-621) | `prevSha256` (mandatory) — the previous geometry, also from the cache, so undo works across a save |
+
+`replaceNodeGeometry` is generic (no feature knowledge); the SolidCraft live sync is its first
+user. The facade `AssetDocument.replaceNodeGeometry(nodePath, glbBytes, converter, {quality?,
+sha256?})` writes the bytes to the cache **before** the op exists, refuses when the cache tier is
+`'none'` (an op without replayable geometry is never written), and returns `null` without an op
+when the SHA is unchanged. `prevSha256` is always filled: a body imported through `importCad`
+registers its geometry under the import key; any other mesh gets a one-mesh snapshot of its
+current geometry put into the cache first. The old geometry goes to the trash (undo needs it) and
+is disposed exactly once — on `flushTrash`, or when keyed amend absorbs an intermediate step
+(`releaseAbsorbed`); only geometry the op itself built is ever disposed. Pick membership and the
+node's BVH follow the swap.
 
 Ops that belong to **both** origins:
 
@@ -1009,6 +1140,20 @@ redo ────┘
   because `prev` is preserved from the first op. Coalescing only happens
   **above the baseline** so it can never corrupt the inverse needed to reach
   the persisted starting state.
+- **Keyed amend (composites, plan-621)**: `withTransaction(label, fn, { coalesce: { key,
+  windowMs } })` lets a *stream* of composites from one source become ONE undo entry — the
+  SolidCraft sync passes `key: 'solidcraft-sync:<session>'`, `windowMs: 1000` for its deltas
+  (snapshots go without, so a connect / resync is its own step). A composite merges into the top
+  entry only when that entry belongs to the same key, the **sliding** window (from the last folded
+  step) is still open, the entry is above the baseline floor, is not a baseline id and carries no
+  journal id. The chain lives in memory only (`_coalesceTail`) and is broken by every op without the
+  key (a WEB edit), `undo`, `redo`, `replayHistory`, `markSaved`, `replayOps`, `restoreHistory` and
+  `rollbackTo`. Folding is pure (`foldKeyedComposite`): an absolute setter (`transformNode`,
+  `setField`, `setMaterial`, `replaceNodeGeometry`) is folded into the latest setter of the same
+  target (id and `prev` of the first, payload of the new one) only if both lie outside every
+  `referenceRewriteRanges` entry and everything in between commutes; everything else is appended
+  and the ranges are shifted. Absorbed intermediate states are released at once through the
+  executor hook `releaseAbsorbed(ids)`.
 - **History cap**: `MAX_OP_HISTORY = 500`. When the cap is exceeded, the
   oldest ops drop off the front and the baseline shifts in lockstep so the
   undo floor stays consistent.
@@ -1028,6 +1173,10 @@ interface MaterialisedEdits {
   connections:     RvConnection[]           // → ConnectionSystemPlugin, ADDITIVE on
                                             //   top of the GLB-authored Connections
   connectionTypes: ConnectionType[]         // → user-defined type signatures
+  removedNodes?:   string[]                 // → authored path-network nodes removed (plan-628)
+  baselinePlacementTransforms?: Map<string, PlacementTransform>
+                                            // → moves of placements the base file holds (plan-769 Ph. 7)
+  removedPlacementIds?: string[]            // → placements of the base file removed (plan-769 Ph. 7)
 }
 ```
 
@@ -1041,7 +1190,10 @@ applies materialized edits in a fixed phase order:
 0. materialise(ops)                    — fold ops
 1. resolve base URL (built-in / empty) — empty = synthesised in-memory GLB
 2. clear previous planner placements
-3. loadModel(url, { overlay })         — overlay applied during GLB traversal
+3. loadModel(url, { overlay, baselinePlacements })
+                                       — overlay applied during GLB traversal;
+                                         baseline placement moves / removals on
+                                         the loaded root before onModelLoaded
 4. planner.applyPlacements(...)        — only if scene has placements
 5. emit 'scene-loaded'                 — camera-startpos plugin re-tweens
 ```
@@ -1052,13 +1204,35 @@ applies materialized edits in a fixed phase order:
 
 ### 3.0 Vocabulary — three concepts at the workspace level
 
+**One word for what is saved and opened: document** (plan-777). A document is
+one GLB plus one `documents[]` row, whichever mode opens it. "Scene" means the
+3D scene graph only (Three.js `Scene`, `viewer.scene`, `whenSceneReady`, glTF
+`scenes[]`); "asset" means a library catalog entry only (`AssetCard`,
+`LibraryCatalogEntry`). Two class names keep their old words on purpose:
+`SceneStore` is the **planner's** session on a document and `AssetDocument` the
+**editor's** — sessions, not document kinds. The save routing names them the
+same way (`SaveSubject.lineage: 'planner' | 'editor'`).
+
+The old words survive where renaming would break stored data, open tabs or
+shared links, and only there: the draft base `{kind:'sceneDocument', sceneId,
+sceneName}`, the `project.json` field `activeSceneId`, the localStorage keys
+`rv-scenes-index`, `rv-scenes/active`, `rv-scenes/draft/`, `rv-scenes/scene-draft/`,
+`rv-scenes-retired/`, `rv-scenes-cleared-legacy`, `rv-scene-active` and
+`rv-doc-alias/`, the BroadcastChannel `rv-scene-writes`, the URL parameters
+`?scene=` and `?model=`, the round-tripped `section` field, the legacy manifest
+arrays `scenes[]`/`models[]`/`library[]` (read by the migration only, typed
+`LegacyProjectSceneEntry` / `LegacyProjectAssetEntry`) and the dashboard's
+deep-link rail kinds `'scenes'`/`'models'`. `tests/document-vocabulary-guard.node.test.ts`
+pins both halves: the persisted strings stay, the phrases that implied two
+document kinds do not come back into `src/` or these docs.
+
 To avoid confusion, this document uses three precise terms instead of the
 overloaded word "draft":
 
 | Term | What it is | Where it lives |
 |---|---|---|
 | **Working scene** | The live editing session — an op log on top of a built-in or empty base. The Inspector, Hierarchy and Planner all act on this. | `SceneStore._workspace` (in-memory) + autosave snapshot (GLB body slot) |
-| **Autosave snapshot** | A debounced backup of the working scene. The reload-survival mechanism — nothing more. Since plan-397 phase 6/7 it is a **baked GLB body**, not an op log: `_afterOpsChanged()` (`scene-store.ts:1537-1580`) debounces 2000 ms and calls `_autosaveBody()`, which writes the slot from `_bodySlots()` (`scene-store.ts:793-798`). | GLB body slot `draft/<baseKey>` (unsaved workspace) or `draft/<sceneId>` (saved scene with unsaved edits) — §3.1b. **Not** localStorage. |
+| **Autosave snapshot** | A debounced backup of the working scene. The reload-survival mechanism — nothing more. Since plan-397 phase 6/7 it is a **baked GLB body**, not an op log: `_afterOpsChanged()` (`scene-store.ts:1537-1580`) debounces 2000 ms and calls `_autosaveBody()`, which writes the slot from `_bodySlots()` (`scene-store.ts:793-798`). | GLB body slot `draft/<baseKey>` (unsaved workspace) or `draft/<sceneId>` (saved document with unsaved edits) — §3.1b. **Not** localStorage. |
 | **Saved document** | A named, persistent GLB file with a `documents[]` row. Created by Save / Save as… / Duplicate / Import. Since plan-716 the ONLY kind of owned content — the `rv-scenes/*` catalogue it replaced is a legacy keyspace being read (§2.0-00). | a project GLB (root-level, `models/…` or `library/…` — the folder is a place, not a type) + manifest row |
 
 The document list in the UI is the set of saved documents — it is **not** a
@@ -1402,6 +1576,45 @@ record cannot be elected root and take a genuine editor draft down with it.
 The **unequal** case is untouched: two documents, two writers, the pre-711
 save/restore path.
 
+#### 3.3d Drafts a bound editor wrote in THIS page session (plan-616, LOP #196)
+
+§3.3c covers a scene whose identity has a shared frame (`kind: 'document'`, no path).
+A scene that is **bindable but has no shared frame** — the bundled demo, a `builtinModel`
+identity — gets none: `sharedDocumentFrame(identity)` is `null`, so the editor facade
+writes its record under an **instance-keyed** frame (`asset_<id>`, one new id per binding).
+Without more, the next editor entry read that record as a crash draft, skipped the bind
+(`!draft`, `_resolveOpenPlan`) and built a **second document** out of it — the first entry
+bound, the second one forked, and the exit guard asked "Unsaved changes" about work that
+was alive in the scene all along.
+
+**The rule:** `_loadRecoverableDraft(live, livingDoc)` leaves a record out of recovery when a
+facade **bound to exactly the scene's living `RvDocument`** wrote it in this page session
+(`isLiveSessionDraft`, [`rv-document-drafts.ts`](src/core/ops/rv-document-drafts.ts)).
+Left out, never deleted: nothing is cleared; the record is a crash draft again after a
+reload.
+
+| Piece | What it is |
+|---|---|
+| claim registry | `WeakMap<living RvDocument, Map<rootPrefix, {rootDocumentId, projectId}>>`, **in memory only**; claimed in `RvDraftAutosave.flush`, synchronously before the write is queued |
+| who claims | only a facade that borrowed the scene's document (`boundDoc` option, set from `AssetDocument` when `_bound`). A fork editor built from a draft carries its work nowhere else, so its draft is **never** hidden |
+| keyed on | the **document object**, not the identity: the identity changes on the first save (`builtinModel` → `document`), the object does not (`SceneStore._doc` is readonly) |
+| scope | a claim covers the whole stack of its root (`projectId` + `rootDocumentId`), so a descended child's record is never left behind without its root |
+| forgotten | by `clearDocumentDraft` / `shelveDocumentDraft` / the clean branch of `flush`, and by `SceneStore._installOps` (an open replaced the history: the draft no longer describes what is on screen, so it is offered again) |
+
+`SceneStore.livingDocument()` is a plain read for exactly this question; the projection
+handover has side effects and may only run once the bind is decided. The read in
+`_resolveOpenPlan` is optional (`sceneStore?.livingDocument?.()`), so a store without the
+accessor keeps the pre-plan-616 chain.
+
+**Not covered:** a record is not cleaned up when the document becomes clean again (a
+`builtinModel` scene has no frame for `_dropSharedDraftIfClean` to name) — it stays until
+a reload offers it once, as before; and a draft of **another** document still blocks the
+bind (§ the `!draft` gate). Both are known limits, not regressions.
+
+Related, same plan: entering the DES mode no longer creates the `Simulation` node (it only
+reads the settings, `readDesManagerSettings`); the node is created by the first toolbar
+EDIT, together with its `addNode` op, so a mode visit leaves the document clean.
+
 ### 3.4 Save / Save as… / Discard / Delete semantics
 
 Every row below is on DOCUMENTS since plan-716 phase 6: a project GLB plus a
@@ -1442,7 +1655,7 @@ bookmark ever handed out stays good.
 
 | URL form | Effect on boot | Written by |
 |---|---|---|
-| `?doc=<doc_…>` | `openDocument(id)` — the form minted for every document (plan-716 §2.5) | `save()`, `saveAs()`, `updateUrlDocumentParam()`, `web_link_compose` |
+| `?doc=<doc_…>` | `openDocument(id)` — the form minted for every document (plan-716 §2.5) | `save()`, `saveAs()`, `updateUrlDocumentParam()`, `web_query("link.compose", {})` |
 | `?scene=<id>` | Read-only alias route: resolves a document id or a pre-migration `scn_…` id through `rv-doc-alias` and redirects to `?doc=` | nothing mints this any more — kept resolving forever |
 | `?scene=builtin:<filename>` | `openBuiltin(url)` for the matching entry | `openBuiltin()` |
 | `?scene=empty` | `openEmpty()` (resume per-base empty draft if present) | `newEmpty()` and `openEmpty()` |
@@ -1562,8 +1775,8 @@ folder write, the dirty open documents reported by the probe, and — since
 plan-710 — any open document whose own draft write is still armed.
 
 **It is a capability of the document layer now, not of the scene alone
-(plan-710 F7).** The timer question used to be answerable only scene-side, so an
-asset document mid-write was unguarded in *every* mode, editor included. It is
+(plan-710 F7).** The timer question used to be answerable only scene-side, so a
+document open in the editor mid-write was unguarded in *every* mode, editor included. It is
 now an optional constructor callback,
 `RvDocumentOptions.hasUnpersistedWork` — the same idiom as `onChanged` and
 `canApply`, and a callback rather than an intrinsic for the reason `RvDocument`
@@ -1621,7 +1834,24 @@ Three interchangeable backends behind one `ProjectBackend` interface
 |---|---|---|
 | **folder** | A user-picked directory via the File System Access API (`selectFolderForKey`, readwrite) | Durable, user-owned, shareable. The successor to the old "working folder". |
 | **browser** | OPFS blobs + `localStorage rv-project/browser/<id>` | Zero-setup default; evictable like all browser storage. |
-| **bundled** | Read-only, shipped with the build (`library/catalog.json` etc.) | The DemoRealvirtual project — authored in `public/demo-realvirtual/project.json`, see below. `writeDocument` is refused with a reason. |
+| **bundled** | Read-only, shipped with the build (`library/project.json` etc.) | The DemoRealvirtual project — authored in `public/demo-realvirtual/project.json`, see below. `writeDocument` is refused with a reason. |
+
+**Library projects are read-only (plan-778).** A project used as a library of the
+open project is read through a backend of its own, built by
+`src/core/library/library-project-backends.ts`: `writable: false`, never activated,
+id `folder:<projectId>` / `browser:<projectId>` / `remote:<url>`. A library folder
+is asked for READ access only, and only in a click (Grant / Locate); its
+`project.json` is never written while it serves as a library. The one write into a
+library is **Edit in library** (`src/core/library/library-document-edit.ts`): after a
+confirmation naming the library, `requestPermission({mode:'readwrite'})` on its folder
+in that click yields a writable `FolderBackend` with the SAME id `folder:<projectId>`,
+so the save ledger keyed by backend id (`rv-save-document.ts`) checks the write
+against the revision recorded when the document was opened. The save updates the
+document's row (`sha256`, `sizeBytes`) through `updateManifestCas` and re-reads the
+library. Drafts of such a `libraryDocument` are keyed by the LIBRARY's project id
+(`RvDraftFrameKey.projectId`), so the open project's own document with the same id
+never shares a draft slot with it; recovery offers them while that library is one of
+the open project's.
 
 The `rv-project/*` localStorage keyspace:
 
@@ -1689,6 +1919,8 @@ holds:
 |---|---|
 | `documents[]` | **The list.** One `RvDocumentEntry` per document: mandatory `id`, `path`, `name`, `classification?` (cache), `revision?`, `sha256?`, `sizeBytes?`, `mtimeMs?`, `forkedFrom?`, `copiedFrom?`, `collections?` (plan-717: the user's filing, successor of the `library.json` sidecar), `missingSince?` (plan-717: the adopt verb's quarantine mark, absent on every healthy row). Unknown fields survive every read-modify-write. |
 | `rv-project/documents-migration` | Marker recording that this manifest has been given a `documents[]`. Lives **in the file**, not in localStorage, because the thing being migrated travels (git, zip, a customer delivery, a second machine). |
+| `libraries[]` | The project's libraries (plan-778): `{ projectId, label?, hint? }` per library project; legacy `{ url, label? }` entries and bare strings are read and kept; unknown keys survive every writer. See [doc-projects.md](doc-projects.md#libraries-are-projects-plan-778). |
+| `rv-project/library-project-migration` | Marker of the one-time library migration (plan-778): realvirtual catalogue URLs converted to `{ projectId: 'prj_realvirtual_library', hint }`, the library added where `libraries[]` was absent. Written in the SAME manifest write as the conversion, by the first manifest-writing save; never written by itself for a `kind: customer` project (Problems row with **Update** instead). A new project is born with it. |
 
 `scenes[]`, `models[]`, `library[]` and `documentsBaseline` are **not written
 any more** (phase 6). A stored manifest that still has them is converted on the
@@ -1706,12 +1938,16 @@ agree without having to save first.
 the plan wrote the three arrays back on every save, with `documentsBaseline` as
 the base of a three-way merge so an older client's edit to `scenes[]` could be
 folded in rather than silently reverted. That was scaffolding with a stated end:
-it came down once the delivery pipeline read `documents[]` (§3.11). What the
-~80 places that used to read `project.scenes` read now is
-`sceneDocumentsOf()` / `assetDocumentsOf()` — **projections**, computed at the
-read site over the one list. A projection cannot go stale, cannot disagree with
-its source, and cannot be edited behind its back, which is why the baseline and
-the merge went with the mirror instead of following it into a new home.
+it came down once the delivery pipeline read `documents[]` (§3.11). The ~80
+places that used to read `project.scenes` went through section projections
+(`sceneDocumentsOf()` / `assetDocumentsOf()`) for a while; those were removed
+with their production call sites in plan-744, and the store's last projection —
+the snapshot's `models` view — went with plan-777. What every reader reads now
+is the one list: `snapshot.documents` / `documentsOf(project)`, filtered at the
+read site by id or by a path predicate when it needs a subset. Nothing derived
+can go stale, disagree with its source, or be edited behind its back, which is
+why the baseline and the merge went with the mirror instead of following it
+into a new home.
 
 The cost is stated rather than hidden: a client older than this build opens such
 a project and sees no scenes, and if it saves, this build refuses the result
@@ -1888,8 +2124,9 @@ HTTP) omits `listAllFiles`, and the helper falls back to the two per-ending
 walks with no plain files.
 
 **Internals** (`isInternalProjectPath`, one function, in
-`backends/project-backend.ts`): any path segment starting with a dot,
-`project.json`, `docs-index.json`, and the `thumbnails/` cache. The other
+`backends/project-backend.ts`): any path segment starting with a dot (the
+saved previews in `.thumbnails/` among them), `project.json`, `docs-index.json`,
+and an old undotted `thumbnails/` cache folder. The other
 reserved folders (`settings`, `connect`, `rag`) stay visible — the tree already
 collapses them under its *System* node, which is a better answer than hiding
 files a user legitimately reads.
@@ -2087,7 +2324,7 @@ of the same three lines:
 | Script | What changed |
 |---|---|
 | `validate-project.mjs` | Validates `documents[]`: array shape, mandatory `id` (F2), relative paths, existence at the entry's own path (plan-736: the second candidate the row's `section` used to name is gone), and a stated `sha256`. The three legacy arrays are still checked — an unmigrated customer repository is not an invalid project. |
-| `_bunny-lib.mjs` | `publishedSceneIndex()` derives the curated `scenes/index.json` from the scene documents and **requires a `.glb`**; a `.scene.json` entry would publish a catalogue row pointing at a format the viewer no longer opens. It carries `classification.level` into the catalogue, because a bundled deploy is never scanned (§3.7) and reading the level out of the GLBs would mean downloading every example to draw a list. |
+| `_bunny-lib.mjs` | `publishedSceneIndex()` derives the curated `scenes/index.json` from the documents and **requires a `.glb`**; a `.scene.json` entry would publish a catalogue row pointing at a format the viewer no longer opens. It carries `classification.level` into the catalogue, because a bundled deploy is never scanned (§3.7) and reading the level out of the GLBs would mean downloading every example to draw a list. |
 | ~~`_vendor-merge.mjs`~~ | **Gone since plan-738.** `documents` used to be merged entry-wise by `path`, with each entry classified against the project's vendor globs. There is no per-file merge and no manifest merge any more: a delivery either does not touch `projects/<key>/` at all, or it replaces the whole folder — `project.json` included — as an exact snapshot when a human named it with `--projects`. See `doc-deploy.md` § *The territorial rule*. |
 | `migrate-project-manifest.mjs` | Brings a manifest to schema 2: derives `documents[]` from the three arrays, writes the migration marker, and indexes `.scene.glb` bodies (preferring the GLB over a `.scene.json` sibling rather than listing the scene twice). Still **additive** on the Node side, and deliberately so: it is an offline tool that may run against a repository the browser has not opened, and removing a customer's arrays from outside the app is a decision the app itself makes on its first save. It writes no `documentsBaseline` — that field no longer exists. |
 | `pull-customer-project.mjs` | Unchanged — it gates on `assertValidProject()` and inherits the above. |
@@ -2252,7 +2489,7 @@ localStorage agree without explicit sync code.
 
 ---
 
-## 6. Import / export of scenes
+## 6. Import / export of documents
 
 There is **no JSON scene import or export** any more (plan-413 phase 6).
 `exportSceneJSON` / `importSceneJSON` wrote and read the full `RvScene` record,
@@ -2260,7 +2497,7 @@ which stopped being the body in plan-397: what they produced afterwards was a
 catalogue row describing bytes it did not carry, so an exported file could not
 be opened anywhere — including here.
 
-The portable form is the file itself. **Export .glb…** writes the scene's body,
+The portable form is the file itself. **Export .glb…** writes the document's body,
 with every override already folded in (§6.1), and any GLB can be brought back
 in through the normal import path. That is the same artefact a share link
 carries, so "send it to a colleague" and "keep a copy" are one format.
@@ -2354,15 +2591,16 @@ project, which is where a delivery is assembled.
 
 ---
 
-## 6.5 The Asset editor document (Editor mode)
+## 6.5 The editor's session on a document (Editor mode)
 
 The `editor` workspace mode authors the **GLB itself** rather than an overlay on
-top of one. The document behind it is
+top of one. The session behind it is
 **AssetDocument** ([`src/core/editor/rv-asset-document.ts`](src/core/editor/rv-asset-document.ts)) —
-a facade over the same [`RvDocument`](src/core/ops/rv-document.ts) the scene
-side uses (§2.1a), in `'asset'` mode. It is not a second document class and not
-a second op log; what is its own is op construction, its base bytes and its
-save path.
+the editor's session on a document (the class name is historical, §3.0), a
+facade over the same [`RvDocument`](src/core/ops/rv-document.ts) the planner
+uses (§2.1a), in `'asset'` mode. It is not a second document kind, not a second
+document class and not a second op log; what is its own is op construction, its
+base bytes and its save path.
 
 - **Ops** (`rv-asset-ops.ts`) — the asset-origin kinds of the one vocabulary:
   `importCad`, `transformNode`, `renameNode`, `deleteNode`, `setNodeVisible`,
@@ -2386,6 +2624,21 @@ save path.
   Autosave is **suspended** for the duration of an in-place test run (plan-410),
   so the slot keeps describing the pre-test authoring state rather than the
   materialised test scene.
+- **Replay over baked placements** (plan-774): the editor's references are
+  placements that materialise after the load, so a replay (draft recovery,
+  undo-by-recompose, Back) runs only after the authoring join
+  (`loadAuthoringModel`). Ops apply in log order; the first op whose target lies
+  in placed content that is still materialising waits for the late settle, and
+  everything after it waits too. The draft's waiting **tail is document state**:
+  it counts as dirty and is part of `draftOps`, so an exit-guard flush persists
+  it, Back re-attempts it on the fresh tree, and a test run refuses to start
+  while it is pending. After the budget (60 s) own-content ops are applied and
+  placed ops stay unapplied in the history. `replayOntoTreeLocked` returns
+  `{ applied, skipped }`; a skipped op on placed content becomes the Problems
+  entry `replay-op-skipped` — reason `baked-away` (the target was dropped by the
+  subasset's bake; a draft replay drops the op from the history) or `not-loaded`
+  / `still-loading` (kept). A composite is filtered child by child. A recompose
+  overtaken by a document switch answers `superseded` and replays nothing.
 
   > **Release note (plan-710).** The legacy single draft slot (DB
   > `rv-asset-editor`, store `drafts`, key `current`) is **gone, and its content
@@ -2425,10 +2678,11 @@ save path.
   `userData.realvirtual` incl. `CADLink`) into a binary GLB written to
   the document's OWN folder in the **active project** — the project ROOT when
   it has none (plan-744 F7; `library/Custom` was the last folder-as-a-type in
-  the save path and is no longer a fallback) — plus a preview under
-  `<project>/.thumbnails/<documentId>.png` (F5: keyed by IDENTITY, so a move or
-  a rename keeps it, and written for every document rather than for
-  `library/**` alone). There is exactly ONE save destination and
+  the save path and is no longer a fallback) — plus a 512 px preview
+  `<project>/.thumbnails/<encodeThumbnailId(id)>.<hash8>.<webp|png>` that the
+  row's `thumbnail` points at (plan-776; keyed by IDENTITY, so a move or a
+  rename keeps it; a failed render removes the pointer and never fails the
+  save). There is exactly ONE save destination and
   one path to it (`saveDocument()`, plan-709 §2.2): the editor's second target
   — `<workfolder>/library/Custom/` — and its browser-download fallback are both
   gone. `downloadAssetGlb` survives as an explicit menu verb, not as what
@@ -2487,7 +2741,7 @@ that cannot be taken leaves the ledger empty, which degrades to the plan-709
 behaviour. The ledger is keyed by `<backendId>\0<relPath>`, so a project switch
 cannot leak a revision from one project into a write against another.
 
-**A bound scene document routes by its BASE, not by its caller** (plan-711).
+**A bound planner document routes by its BASE, not by its caller** (plan-711).
 When the editor holds the scene's document (§2.1c), Save from the editor — the
 button, Ctrl+S and the MCP save tool alike — reaches `saveDocument()` through
 `AssetDocument`; a `document` base is then answered by the SCENE
@@ -2572,7 +2826,6 @@ them behind, one stale entry per interface id.
 |---|---|---|
 | `rv-extras-editor-width` | `rv-extras-editor.tsx` | Property editor docked width |
 | `rv-extras-editor-open` | `rv-extras-editor.tsx` | Open/closed state |
-| `rv-extras-editor-selected` | `rv-extras-editor.tsx` | Last-selected node path |
 | `rv-hierarchy-expanded` | `rv-hierarchy-browser.tsx` | Tree-view expanded node set |
 | `rv-hierarchy-type-filter` | `rv-hierarchy-browser.tsx` | Type filter chips |
 | `rv-hierarchy-signal-sort` | `rv-hierarchy-browser.tsx` | Signal sort order |
@@ -2632,8 +2885,7 @@ representation anywhere:
 - The runtime list lives in `LayoutStore.pendingPlacements` (`rv-layout-store.ts`),
   purely to drive the HMI status line. `setPendingPlacements()` writes no storage
   key, `serializeLayout()` does not read the field, and the settings bundle does
-  not carry it. It follows the same in-memory pattern as `setThumbnailPending`,
-  including the field-wise no-op guard that keeps the registry's per-generation
+  not carry it. It is an in-memory store field with a field-wise no-op guard that keeps the registry's per-generation
   notifications from re-rendering the planner UI.
 
 A reload during a pending load therefore restores the placement through the
@@ -2652,7 +2904,7 @@ These are listed as `RV_DYNAMIC_PREFIXES` in `rv-storage-keys.ts` so
 | `rv-extras-originals:<glbName>` | Pre-override values for "reset" (legacy) | Same |
 | `rv-annotations-<modelHash>` | Per-model annotation list | `plugins/annotation-plugin.ts` |
 | `rv-measurements-<modelHash>` | Per-model measurement list | `plugins/measurement-plugin.tsx` |
-| `rv-panel-…` / `rv-panel-geo:…` | Floating chart/panel geometry | `ChartPanel.tsx` |
+| `rv-panel-…` / `rv-panel-geo:…` | Floating chart/panel geometry | `floating-panel-store.ts` |
 | `rv-order-…` | Order Manager per-order state | `plugins/order-manager-plugin.tsx` |
 | `rv-camera-start:<modelKey>` | `ModelCameraStart` per model (also written through `setCamera` ops) | `core/hmi/camera-startpos-store.ts` |
 | `rv-sig-unlock:<…>` | Per-signal write-unlock acknowledgement | signal write-gate |
@@ -2779,6 +3031,18 @@ cache has been evicted. When neither can produce the geometry, replay raises
 `CadGeometryUnavailableError`, which the asset editor surfaces as a re-import
 prompt rather than logging it away.
 
+**Converter namespaces.** The key also carries the converter (`CadConverter`: `'connect' |
+'browser' | 'solidcraft'`), each with its own key token; the legacy `connect` / `browser` keys
+are byte-identical to the ones before the third converter existed. `'solidcraft'` entries are the
+geometries of the SolidCraft live sync (plan-621): one GLB per body, keyed by the SHA-256 of the
+**normalised local** GLB (vertices transformed back into the occurrence frame), so a pure move of
+a part in SolidCraft never produces a new entry. Both `importCad` (the first geometry of a body)
+and `replaceNodeGeometry` (every later one) replay from here; the live sync writes and reads back
+every GLB of a step **before** it opens the transaction, so a step whose geometry the cache refused
+is not applied at all. A replay that still misses a SolidCraft entry (evicted, other machine) is
+reported as the problem `solidcraft-geometry-missing` with the action *Resync* instead
+of the re-import prompt — a SolidCraft design is not a file to pick; a resync snapshot restores it.
+
 `clearCadGlbCache()` wipes both tiers.
 
 ---
@@ -2823,6 +3087,8 @@ only): `listExperiments`, `readManifestJson`, `saveSnapshot`, `loadSnapshot`,
 `DESManager` component (GLB-first) overrides the seed only when POSITIVE —
 missing or `<= 0` keeps the engine default (42).
 
+**RNG version and replication seeds (plan-2061).** A replication is identified by `(masterSeed, rngVersion ?? 1)`, not by the seed alone: the same seed under v1 and v2 is two different replications with different numbers. The seed derivation `baseSeed + r · 1000` is unchanged; under v2 the seed feeds `seedKey64(masterSeed, id, purpose)` for every named stream instead of `masterSeed + componentIndex`. New experiments are pinned to v2 (`NEW_EXPERIMENT_RNG_VERSION`); an archive without a pin and with replications counts as v1. Pin rules: the first recorded run or snapshot pins `ExperimentMeta.rngVersion`; the pin can neither be changed nor removed, and a run, snapshot, import or manifest write with another version is refused with `rng-version-conflict` before anything is persisted; deleting the last replication keeps the pin. A snapshot carries `rngVersion` in its fingerprint and restores only into a run of the same version (`rngVersion mismatch`); the seed itself is run config and is not compared. v2 snapshots hold the stream states in `des.rng` (`{ masterSeed, streams: [...] }`), v1 snapshots `{ rngStates }`. Details, error codes and the script RNG contract: `doc-des-randomness.md`.
+
 ### 7.5.1 Simulation runs, projects & checkpoints
 
 Simulation runs extend the same hierarchy — **a RUN is a REPLICATION** that
@@ -2865,20 +3131,7 @@ Snapshot(t)** labeled `auto`. There is no second storage system:
 - Facade additions on `SimDesControl`: `activeRunInfoJson()` and
   `patchExperimentMetaJson()` (JSON string transport, like the rest).
 
-**UI**: ONE Experiments window
-([`DESExperimentMatrixPanel`](src/plugins/sim-controller/DESExperimentMatrixPanel.tsx),
-public) renders the whole hierarchy as a tree — project header (select /
-new / rename / delete-cascade) above **Experiment → Run → Checkpoint** rows.
-The UI consistently says *run* (replication stays a data-model term). Every
-experiment of the active project is visible at once; run checkboxes across
-the whole tree feed the compare view (`des-run-compare-store`). Experiment
-rows carry snapshot-now / export / rename / delete; import + refresh sit in
-the title bar; a bottom field creates a new experiment ("+ Snapshot into
-it"). The loaded model is shown by NAME — the internal `glbHash` never
-appears; experiments recorded with a different model version get a subtle
-"other model version" chip. Both entry points (the "Experiments" button in
-the DES clock settings and the DES side-tool button) toggle the same window
-via `des-matrix-window-store.ts`.
+The experiment manager is a commercial module (realvirtual Commercial), documented in the private repository and at [des/experiments](https://doc.realvirtual.io/web/des/experiments/).
 
 ---
 

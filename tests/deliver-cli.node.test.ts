@@ -27,7 +27,10 @@ const PRIVATE_ROOT = resolve(__dirname, '../../realvirtual-WebViewer-Private~');
 // deliver.mjs has no .d.mts; a non-literal specifier keeps tsc out of it.
 const load = () => import(new URL('../scripts/deliver.mjs', import.meta.url).href) as Promise<{
   resolveDelivery: (options: { token: string | null; customerFlag: string | null }) => {
-    customer: string; primary: string | null; projects: string[]; kind: string;
+    customer: string; primary: string | null; projects: string[]; kind: string; support?: string;
+  };
+  ragDecision: (options: { argv?: string[]; projectless?: boolean; support?: string; projects?: string[] }) => {
+    noRag: boolean; reason: string;
   };
 }>;
 
@@ -80,6 +83,41 @@ describe.skipIf(!hasRegister)('T8: deliver.mjs argument forms', () => {
     const { resolveDelivery } = await load();
     expect(() => resolveDelivery({ token: 'no-such-thing-anywhere', customerFlag: null }))
       .toThrow(/Pass the customer slug/);
+  });
+});
+
+/**
+ * plan-679 Phase 2 — the register decides the diagnosis package.
+ *
+ * 6.5.0 died on cptc, toray and wmyb because nobody typed `--no-rag` and they have no preset.
+ * `support: "managed"` already means "we run diagnosis for them", so the delivery asks it.
+ */
+describe('plan-679: diagnosis from the register', () => {
+  it('basic -> no-rag without the flag; managed -> diagnosis; projectless and --no-rag -> none', async () => {
+    const { ragDecision } = await load();
+    expect(ragDecision({ argv: [], support: 'basic', projects: ['wmyb'] })).toEqual({ noRag: true, reason: 'register: support=basic' });
+    expect(ragDecision({ argv: [], support: 'managed', projects: ['mauser3dhmi'] }).noRag).toBe(false);
+    expect(ragDecision({ argv: [], projectless: true, support: 'managed', projects: [] })).toMatchObject({ noRag: true, reason: 'projectless' });
+    expect(ragDecision({ argv: ['--no-rag'], support: 'managed', projects: ['mauser3dhmi'] })).toMatchObject({ noRag: true, reason: '--no-rag' });
+    // A legacy delivery/<key>.json carries no support field and keeps its old default.
+    expect(ragDecision({ argv: [], projects: ['x'] }).noRag).toBe(false);
+  });
+
+  it.skipIf(!hasRegister)('the real register: mauser carries diagnosis, the basic customers do not', async () => {
+    const { resolveDelivery, ragDecision } = await load();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const mauser = resolveDelivery({ token: 'mauser', customerFlag: null });
+      expect(mauser.support).toBe('managed');
+      expect(ragDecision({ support: mauser.support, projects: mauser.projects }).noRag).toBe(false);
+      for (const slug of ['cptc', 'toray', 'wmyb']) {
+        if (!existsSync(join(PRIVATE_ROOT, 'customers', `${slug}.json`))) continue;
+        let resolved;
+        try { resolved = resolveDelivery({ token: slug, customerFlag: null }); } catch { continue; } // secrets absent on this machine
+        expect(resolved.support, slug).toBe('basic');
+        expect(ragDecision({ support: resolved.support, projects: resolved.projects }).noRag, slug).toBe(true);
+      }
+    } finally { warn.mockRestore(); }
   });
 });
 

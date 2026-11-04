@@ -20,7 +20,7 @@ import { EXPECTED_DEMOS } from './_live-target';
 test('demo runs by itself and the HMI chrome is usable', async ({ page }, testInfo) => {
   const errors = collectErrors(page);
   await blockAnalytics(page);
-  await page.goto(`?doc=${encodeURIComponent(EXPECTED_DEMOS.hmi)}`, { waitUntil: 'domcontentloaded' });
+  await page.goto(`?doc=${encodeURIComponent(EXPECTED_DEMOS.hmi)}&welcome=0`, { waitUntil: 'domcontentloaded' });
   await waitForViewerReady(page);
   await page.waitForTimeout(2_000);
 

@@ -461,6 +461,22 @@ describe('plan-376 — placement parity across the five paths', () => {
       expect(warnSpy).toHaveBeenCalled();
     });
 
+    it('plan-778 review C6: a legacy global+URL record keeps its url write-back (only qualified refs are exempt)', async () => {
+      const { plugin } = await bootPlanner();
+      const writes: Array<[string, string]> = [];
+      const original = plugin.store.updateGlbUrl.bind(plugin.store);
+      plugin.store.updateGlbUrl = (id: string, url: string) => { writes.push([id, url]); original(id, url); };
+      await plugin.applyPlacements({
+        placements: [
+          { ...leanRecord('p778-legacy', 'blob:stale-legacy'), providerId: 'global', sourceId: CATALOG_URL },
+        ],
+        catalogUrls: [],
+        gridSizeMm: 100,
+      });
+      expect(placedIn(plugin, 'p778-legacy')).toBeDefined();
+      expect(writes).toEqual([['p778-legacy', STABLE_URL]]);
+    });
+
     it('restores a virtual DES record even though it has no url', async () => {
       const { plugin } = await bootPlanner();
 

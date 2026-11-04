@@ -16,6 +16,13 @@
  *
  * Usage:
  *   node scripts/validate-project.mjs <project-dir> [--json]
+ *        [--delivered | --projects-dir <dir> | --library <projectId>=<folder> ...]
+ *
+ * Library projects (plan-778): every `libraries[]` entry needs a `projectId` or a
+ * `url`, and a `projectId` must never name a path. With `--delivered` the folder is
+ * a delivered / packed copy and every qualified reference must resolve in its own
+ * `libraries/<projectId>/`; with `--projects-dir` / `--library` a SOURCE project's
+ * libraries are looked up there by id. A miss is an error naming document and library.
  *
  * Exit codes: 0 = clean (warnings allowed), 1 = errors found, 2 = bad usage.
  */
@@ -39,13 +46,19 @@ import {
   isContainedRef,
   projectConnectRefs,
 } from './_rv-manifest.mjs';
+import { parseLibrarySourceArgs, planProjectLibraries } from './lib/rv-library-trim.mjs';
+import { libraryProjectIdProblem } from '../src/core/project/rv-library-trim-core.mjs';
 
 const MANIFEST = 'project.json';
 
 /** Well-known subfolders. Unknown ones are reported, never rejected. */
 const KNOWN_FOLDERS = new Set([
   'models', 'library', 'scenes', 'docs', 'aasx',
-  'connect', 'settings', 'rag', 'thumbnails', 'splats',
+  'connect', 'settings', 'rag', 'splats',
+  // plan-776: the saved previews. Dot folders are skipped before this set is
+  // asked; the entry names the folder so the list is the whole vocabulary. The
+  // undotted 'thumbnails' of older builds is no longer a known folder.
+  '.thumbnails',
   // plan-718: a project's own code and its knowledge files. Neither is a
   // reserved path — a reference may name anything inside the project — but
   // these two are the spellings the docs use, so they are not 'unrecognised'.
@@ -61,6 +74,9 @@ const KNOWN_FOLDERS = new Set([
   // neither appears in `documents[]`; they are working material, and without
   // these two spellings the validator warns about them on every single run.
   'fixtures', 'scratch',
+  // plan-778 F15: the trimmed library projects a delivered or packed project carries,
+  // one folder per library project id.
+  'libraries',
 ]);
 
 // The list of secret-bearing filenames lives in scripts/_rv-guards.mjs and
@@ -320,6 +336,103 @@ function validateKind(manifest) {
 }
 
 /**
+ * `settings.start` — the hosted start document (plan-640).
+ *
+ * Opt-in: absent is the normal case and silent. When present it must name a
+ * document of `documents[]` — by path, by id, or by a file name exactly one
+ * document carries (the same rule as the runtime's `findStartDocument`) —
+ * because the runtime falls back to the dashboard on a miss, and a customer
+ * link that quietly stops opening its machine is exactly what a deploy gate is
+ * for. `mode` is optional; a non-string one is ignored by the runtime, so it is
+ * a warning here. Whether the mode id is REGISTERED is only known in the
+ * browser (plugins register modes) and is not checked.
+ */
+function validateStart(manifest) {
+  if (!manifest) return;
+  const settings = manifest.settings;
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return;
+  if (!('start' in settings)) return;
+  const start = settings.start;
+  if (!start || typeof start !== 'object' || Array.isArray(start)) {
+    fail(`${MANIFEST}: settings.start must be an object { document, mode? } — got ${JSON.stringify(start)}.`);
+    return;
+  }
+  const wanted = typeof start.document === 'string' ? start.document.trim() : '';
+  if (wanted === '') {
+    fail(`${MANIFEST}: settings.start.document must be a non-empty document id or path.`);
+    return;
+  }
+  if (!findStartDocumentIn(documentsOf(manifest), wanted)) {
+    fail(`${MANIFEST}: settings.start.document "${wanted}" names no document of documents[] `
+      + '(by path, id or a unique file name) — the hosted root would fall back to the dashboard.');
+  }
+  if (start.mode !== undefined && typeof start.mode !== 'string') {
+    warn(`${MANIFEST}: settings.start.mode should be a mode id string (e.g. "hmi") — `
+      + `${JSON.stringify(start.mode)} is ignored.`);
+  }
+}
+
+/**
+ * The workspace modes this build registers: `main.ts` (viewer, hmi, des,
+ * planner, commissioning) plus the asset editor's feature adapter (editor).
+ * Keep in step with those registrations - there is no compiler check tying
+ * them together; `tests/validate-project.node.test.ts` pins the list.
+ */
+export const KNOWN_WORKSPACE_MODES = ['viewer', 'hmi', 'des', 'planner', 'commissioning', 'editor'];
+
+/**
+ * `documents[].modes` / `documents[].mode` - the per-document mode restriction.
+ *
+ * `modes` is optional; when present it must be a non-empty array of known mode
+ * ids (an unknown or misspelled id would silently make the document unusable in
+ * the mode the author meant). `mode` - the mode a document opens in, and the
+ * default of the restriction - must then be one of `modes`, or the runtime would
+ * fall back to the first listed mode instead of the one the row names. A
+ * document's own `mode` without `modes` keeps its old, lenient rule (unchecked).
+ */
+function validateDocumentModes(manifest) {
+  if (!manifest) return;
+  for (const entry of documentsOf(manifest)) {
+    if (!entry || typeof entry !== 'object' || !('modes' in entry)) continue;
+    const label = `${MANIFEST}: document "${entry.id ?? entry.path}"`;
+    const modes = entry.modes;
+    if (!Array.isArray(modes) || modes.length === 0) {
+      fail(`${label}: "modes" must be a non-empty array of mode ids — got ${JSON.stringify(modes)}.`);
+      continue;
+    }
+    for (const m of modes) {
+      if (m === 'editor') {
+        // The authoring workspace is never restricted, so listing it says
+        // nothing - and a list of ONLY the editor would leave the document no
+        // mode to be viewed in (the editor handoff needs one to park in).
+        fail(`${label}: "modes" must not list "editor" — the Editor is always available.`);
+        continue;
+      }
+      if (typeof m !== 'string' || !KNOWN_WORKSPACE_MODES.includes(m)) {
+        fail(`${label}: "modes" names unknown mode ${JSON.stringify(m)} — `
+          + `known: ${KNOWN_WORKSPACE_MODES.join(', ')}.`);
+      }
+    }
+    if (entry.mode !== undefined && !modes.includes(entry.mode)) {
+      fail(`${label}: "mode" ${JSON.stringify(entry.mode)} is not one of its "modes" `
+        + `(${modes.map((m) => JSON.stringify(m)).join(', ')}).`);
+    }
+  }
+}
+
+/** Mirror of `findStartDocument` (src/core/project/rv-project-documents.ts). */
+function findStartDocumentIn(documents, wanted) {
+  const byPath = documents.find((d) => d?.path === wanted);
+  if (byPath) return byPath;
+  const byId = documents.find((d) => d?.id === wanted);
+  if (byId) return byId;
+  if (wanted.includes('/') || wanted.includes('\\')) return null;
+  const fileName = (p) => (typeof p === 'string' ? p : '').split(/[\\/]/).filter(Boolean).pop() ?? '';
+  const matches = documents.filter((d) => fileName(d?.path) === wanted);
+  return matches.length === 1 ? matches[0] : null;
+}
+
+/**
  * Verifies any `sha256` a manifest entry carries against the file on disk (B9).
  *
  * `sha256` is optional and the delivery merge does not depend on it — the merge
@@ -396,6 +509,65 @@ function validateCanonicalName(root, manifest) {
   }
 }
 
+/**
+ * `libraries[]` (plan-778): the shape of every entry, and — when the caller says
+ * where libraries are found — that every library and every qualified reference
+ * resolves.
+ *
+ *  - an entry with neither `projectId` nor `url` names nothing: error;
+ *  - a `projectId` becomes a folder name (`libraries/<id>/`) and a lookup key, so a
+ *    separator or `..` in it is an error, not a warning;
+ *  - `delivered`: the project ships its libraries itself (`libraries/<id>/`), so
+ *    every qualified reference must resolve there — a delivery that would show a
+ *    placeholder is refused here, naming document and library;
+ *  - `librarySources`: a SOURCE project, its libraries found by id in a projects
+ *    folder or an explicit `--library` map (the same lookup the delivery runs).
+ */
+function validateLibraries(root, manifest, opts) {
+  if (!manifest || !Array.isArray(manifest.libraries)) return;
+  manifest.libraries.forEach((entry, index) => {
+    if (typeof entry === 'string') {
+      if (!entry.trim()) fail(`${MANIFEST}: libraries[${index}] is an empty string.`);
+      return;
+    }
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      fail(`${MANIFEST}: libraries[${index}] must be an object { projectId | url, label?, hint? }.`);
+      return;
+    }
+    const hasId = typeof entry.projectId === 'string' && entry.projectId.trim() !== '';
+    const hasUrl = typeof entry.url === 'string' && entry.url.trim() !== '';
+    if (!hasId && !hasUrl) {
+      fail(`${MANIFEST}: libraries[${index}] has neither "projectId" nor "url" — it names no library.`);
+      return;
+    }
+    if (entry.projectId !== undefined) {
+      const problem = libraryProjectIdProblem(entry.projectId);
+      if (problem) fail(`${MANIFEST}: libraries[${index}]: ${problem} — a library id must never name a path.`);
+    }
+  });
+  if (!opts.delivered && !opts.librarySources) return;
+  let plan;
+  try {
+    plan = planProjectLibraries(root, opts.delivered
+      ? { realvirtualLibraryDir: opts.realvirtualLibraryDir ?? null }
+      : { ...opts.librarySources, realvirtualLibraryDir: opts.realvirtualLibraryDir ?? null });
+  } catch (error) {
+    fail(`library resolution could not run: ${error.message}`);
+    return;
+  }
+  for (const error of plan.errors) {
+    if (error.code === 'library-unresolvable' && opts.delivered) {
+      fail(`library "${error.projectId}" (needed by ${(error.neededBy ?? []).join(', ')}) is not shipped under libraries/${error.projectId}/.`);
+    } else {
+      fail(error.message);
+    }
+  }
+  if (plan.legacyRefs.length > 0) {
+    warn(`${plan.legacyRefs.length} unqualified reference(s) are not attributed to a library `
+      + `(e.g. ${plan.legacyRefs[0].document} → "${plan.legacyRefs[0].assetId || plan.legacyRefs[0].path}").`);
+  }
+}
+
 function reportUnknownFolders(root) {
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
@@ -409,11 +581,22 @@ function reportUnknownFolders(root) {
 }
 
 function main(argv) {
-  const args = argv.filter(a => a !== '--json');
   const asJson = argv.includes('--json');
-  const root = args[0];
+  const delivered = argv.includes('--delivered');
+  let sources;
+  try {
+    sources = parseLibrarySourceArgs(argv);
+  } catch (error) {
+    console.error(error.message);
+    return 2;
+  }
+  // The positional is the first token that is neither a flag nor a flag's value.
+  const valueOf = new Set();
+  argv.forEach((token, index) => { if (token === '--projects-dir' || token === '--library') valueOf.add(index + 1); });
+  const root = argv.find((token, index) => !token.startsWith('--') && !valueOf.has(index));
   if (!root) {
-    console.error('usage: node scripts/validate-project.mjs <project-dir> [--json]');
+    console.error('usage: node scripts/validate-project.mjs <project-dir> [--json] '
+      + '[--delivered | --projects-dir <dir> | --library <projectId>=<folder> ...]');
     return 2;
   }
   if (!existsSync(root) || !statSync(root).isDirectory()) {
@@ -421,7 +604,15 @@ function main(argv) {
     return 2;
   }
 
-  const result = validateProject(root);
+  const hasSources = !!sources.projectsDir || Object.keys(sources.libraries).length > 0;
+  if (delivered && hasSources) {
+    console.error('--delivered cannot be combined with --projects-dir / --library: a delivered copy resolves its libraries from its own libraries/ folder.');
+    return 2;
+  }
+  const result = validateProject(root, {
+    delivered,
+    ...(hasSources ? { librarySources: sources } : {}),
+  });
 
   if (asJson) {
     console.log(JSON.stringify(result, null, 2));
@@ -442,8 +633,13 @@ function main(argv) {
  * shelling out: a gate that spawns a child has to parse stdout to learn *what*
  * was wrong, and one that cannot be imported tends not to be wired in at all —
  * which is exactly how this validator sat unused in every pipeline (B12).
+ *
+ * `opts` (plan-778): `delivered` — the folder is a delivered/packed copy whose
+ * qualified references must resolve in its own `libraries/`; `librarySources`
+ * (`{ projectsDir?, libraries? }`) — resolve a source project's libraries there;
+ * `realvirtualLibraryDir` — check references into the realvirtual library too.
  */
-export function validateProject(root) {
+export function validateProject(root, opts = {}) {
   errors = [];
   warnings = [];
   if (!existsSync(root) || !statSync(root).isDirectory()) {
@@ -454,8 +650,11 @@ export function validateProject(root) {
   validateDocumentRefs(root, manifest);
   validateConnectSecrets(root, manifest);
   validateKind(manifest);
+  validateStart(manifest);
+  validateDocumentModes(manifest);
   validateCanonicalName(root, manifest);
   validateAssetHashes(root, manifest);
+  validateLibraries(root, manifest, opts);
   validateSecrets(root);
   reportUnknownFolders(root);
   return { ok: errors.length === 0, errors, warnings };
@@ -468,8 +667,8 @@ export function validateProject(root) {
  * proceed past an invalid project, and a thrown error is the only outcome the
  * surrounding scripts already treat as fatal. Warnings are printed, not fatal.
  */
-export function assertValidProject(root, label = root) {
-  const result = validateProject(root);
+export function assertValidProject(root, label = root, opts = {}) {
+  const result = validateProject(root, opts);
   for (const w of result.warnings) console.warn(`[validate-project] warning: ${label}: ${w}`);
   if (!result.ok) {
     throw new Error(`Project validation failed for ${label}:\n  - ${result.errors.join('\n  - ')}`);

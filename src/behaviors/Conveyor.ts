@@ -25,7 +25,22 @@
  * Full authoring guide: doc-behavior-modelling.md
  */
 
-import { defineLibraryComponent, createTransitTimer, type RV, type TransitTimer } from './_shared/behavior-kit';
+import { captureConveyor, restoreConveyor, validateConveyor } from './_shared/conveyor-snapshot';
+import {
+  defineLibraryComponent,
+  createTransitTimer,
+  POSE_ALIGN_TOLERANCE_M,
+  type RV,
+  type TransitTimer,
+  type PoseProjection,
+} from './_shared/behavior-kit';
+import type { AcceptContext, Port } from '../core/material-flow/material-flow-self';
+import { reportProblem, clearProblem } from '../core/hmi/problems-store';
+import { isDesRestoring } from '../core/material-flow/des-restore-guard';
+import { isSurfaceOccupiedByOwner } from './_shared/surface-occupancy';
+import { createDownstreamInterlock } from './_shared/transport-links';
+import { behaviorWaitEdges } from '../core/diagnostics/rv-behavior-wait-sources';
+import { findOutputPairings } from './_shared/snap-graph-helpers';
 
 // Public 4-signal material-flow contract — auto-declared (by createSelf) as
 // `Flow.<key>` (signalNamespace: 'Flow') and exposed as typed `self.sig.<key>`
@@ -41,7 +56,7 @@ const SIGNALS = {
 // Local state slot (type-inferred from `state`). `belt`/`sensor` are resolved
 // path-agnostically in setup() (the finders work on BOTH the continuous and DES
 // paths) and stored here.
-interface ConveyorLocal {
+export interface ConveyorLocal {
   belt: RV.Node | null;
   sensor: RV.Node | null;
   beltHandle: RV.BeltHandle | null;
@@ -49,12 +64,19 @@ interface ConveyorLocal {
   partAtSensor: boolean;
   partCount: number;
   blockedMUs: RV.MU[];
+  blockedTarget: Port | null;
   /** Resolved DES transit-timing model (speed/length/transitTime + entry/exit tween). */
   timer: TransitTimer | null;
   /** MUs currently in transit → their DES arrival event id (cancel-on-reset). */
   transitMUs: Map<number, number>;
+  /** plan-645 L7: the DES `Flow.Run` edge subscription exists for this bind (once per self). */
+  runWakeSubscribed: boolean;
+  /** Last seen `Flow.Run` value (edge detection). */
+  runWasOn: boolean;
+  /** Re-entrancy guard of {@link wakeOnRun}: a nested wake is a no-op. */
+  waking: boolean;
 }
-type ConveyorSelf = RV.Self<ConveyorLocal, typeof SIGNALS>;
+export type ConveyorSelf = RV.Self<ConveyorLocal, typeof SIGNALS>;
 
 // ── ZPA rule (shared: continuous + DES) ──
 // partAtSensor is the LOCAL discharge trigger — NOT the published surface-based Flow.Occupied.
@@ -75,11 +97,49 @@ function tryRelease(self: ConveyorSelf, mu: RV.MU): boolean {
   if (self.sig.Run.get() && self.downstreamCanAccept(mu, out)) {
     self.transfer(mu, out);
     self.local.partAtSensor = false;
+    self.local.blockedTarget = null;
     return true;
   }
   self.local.blockedMUs.push(mu);
+  self.local.blockedTarget = out ?? null;
   return false;
 }
+// plan-645 L7 — Flow.Run false→true in DES releases what the stopped belt parked.
+// Bounded: the list is detached (work list = the parked MUs at this moment), each
+// MU gets at most ONE try, the first refusal ends the pass and the refused MU and
+// everything behind it go back in their order (FIFO). A nested wake (a transfer
+// that re-enters) is a no-op. Every parked MU is kept: `self.mus` is not
+// authoritative for every DES holder (a PalletYard input conveyor parks MUs that
+// are not in its adapter view; plan-645 regression fix, 2026-10-21).
+function wakeOnRun(self: ConveyorSelf): void {
+  const l = self.local;
+  if (l.waking || l.blockedMUs.length === 0 || !self.sig.Run.get()) return;
+  l.waking = true;
+  try {
+    const work = l.blockedMUs.splice(0);
+    for (let i = 0; i < work.length; i++) {
+      if (!tryRelease(self, work[i])) {      // refused → pushed back once by tryRelease
+        for (let j = i + 1; j < work.length; j++) l.blockedMUs.push(work[j]);
+        break;
+      }
+    }
+  } finally {
+    l.waking = false;
+  }
+  conveyorStat(self, false);
+}
+function onRunChanged(self: ConveyorSelf, value: boolean | number): void {
+  const on = !!value;
+  const edge = on && !self.local.runWasOn;
+  self.local.runWasOn = on;
+  if (!edge) return;
+  // plan-2059 phase 8: a Run value written by a restore is restored state, not an edge. The
+  // restored blocked list and queue already are the uninterrupted run; a catch-up wake would
+  // add one extra release attempt (blockedCount, utilization) that the uninterrupted run never made.
+  if (isDesRestoring()) return;
+  wakeOnRun(self);
+}
+
 // Canonical utilization category (shared: continuous + DES). Blocked = a part sits at
 // the exit and the downstream zone is full (DES: parked in blockedMUs; continuous: the
 // interlock is occupied). Working = a part is on the belt (in transit, at the sensor,
@@ -90,6 +150,28 @@ function conveyorStat(self: ConveyorSelf, occ: boolean): void {
   const blocked = l.blockedMUs.length > 0 || (l.partAtSensor && (l.interlock?.occupied() ?? false));
   const hasPart = blocked || l.partAtSensor || l.transitMUs.size > 0 || occ;
   self.statState(blocked ? 'Blocked' : hasPart ? 'Working' : 'Empty');
+}
+
+// ── Pose take-over (plan-631, DES only) ──
+// Problems id of a refused pose hand-over — one entry per conveyor, re-reported
+// (not appended) while the cause persists, cleared by the next good take-over.
+function poseProblemId(self: ConveyorSelf): string {
+  return `transfer-pose-off-belt:${self.root.name}`;
+}
+const mm = (m: number): string => (m * 1000).toFixed(1);
+function reportPoseOffBelt(self: ConveyorSelf, p: PoseProjection): void {
+  const tol = mm(POSE_ALIGN_TOLERANCE_M);
+  reportProblem({
+    id: poseProblemId(self),
+    severity: 'warning',
+    code: 'transfer-pose-off-belt',
+    title: `Hand-over pose is off the belt of '${self.root.name}'`,
+    detail:
+      `reason ${p.reason}; actual: along ${mm(p.along)} mm, lateral ${mm(p.lateral)} mm, ` +
+      `height ${mm(p.height)} mm (MU underside − roller top ${p.rollerTop.toFixed(4)} m); ` +
+      `expected: along ${mm(-p.bug)}…${mm(p.lengthM - p.bug)} mm, lateral 0, height 0 (±${tol} mm each)`,
+    nodePath: self.root.name,
+  });
 }
 
 const def = {
@@ -116,7 +198,8 @@ const def = {
   // the DES model-load binding so a directly-created self gets its local fields.
   state: (): ConveyorLocal => ({
     belt: null, sensor: null, beltHandle: null, interlock: null,
-    partAtSensor: false, partCount: 0, blockedMUs: [], timer: null, transitMUs: new Map(),
+    partAtSensor: false, partCount: 0, blockedMUs: [], blockedTarget: null, timer: null, transitMUs: new Map(),
+    runWakeSubscribed: false, runWasOn: false, waking: false,
   }),
 
   logic: { shouldFlow, onPartAtSensor },
@@ -127,9 +210,23 @@ const def = {
     l.belt = self.find('transport');
     l.sensor = self.find('sensor');
     if (!l.belt || !l.sensor) return self.disable('missing Transport-*/Sensor-* node');
+    self.registerWaitSource({ id: `conveyor:${self.root.uuid}`, edges: () => {
+      if (self.disabled || !self.sig.Run.get()) return [];
+      if (self.mode === 'des') {
+        if (l.blockedMUs.length === 0) return [];
+        const out = l.blockedTarget;
+        return behaviorWaitEdges(self, out?.ownerRoot ?? null,
+          out?.id ?? `output:${self.root.uuid}`, 'conveyor-interlock');
+      }
+      if (!l.partAtSensor || !(l.interlock?.occupied() ?? true)) return [];
+      const out = findOutputPairings(self.viewer as { getPlugin?(id: string): unknown }, self.root)[0];
+      return behaviorWaitEdges(self, out?.ownerRoot ?? null,
+        out?.pairedSnap.id ?? `output:${self.root.uuid}`, 'conveyor-interlock');
+    } });
 
     l.partAtSensor = false;
     l.blockedMUs.length = 0;
+    l.blockedTarget = null;
     l.transitMUs.clear();
 
     // The belt runs unless told to stop (a live CONNECT source owns Run when bound).
@@ -147,6 +244,13 @@ const def = {
 
     // DES transit timing: speed from the Transport drive, length from the belt geometry.
     l.timer = createTransitTimer(self, l.belt);
+    // plan-645 L7: DES releases parked MUs on a Run edge. Subscribed once per
+    // bind (setup re-runs on every start; the bind context drops it on unbind).
+    l.runWasOn = !!self.sig.Run.get();
+    if (self.mode === 'des' && !l.runWakeSubscribed) {
+      l.runWakeSubscribed = true;
+      self.signals.on('Flow.Run', (v) => onRunChanged(self, v));
+    }
     self.contextMenu(l.belt, [
       { id: 'run',  label: 'Run',  action: () => self.sig.Run.set(true) },
       { id: 'stop', label: 'Stop', danger: true, dividerBefore: true,
@@ -159,6 +263,7 @@ const def = {
     l.partAtSensor = false;
     l.partCount = 0;
     l.blockedMUs.length = 0;
+    l.blockedTarget = null;
     l.transitMUs.clear();
     self.sig.PartCount.set(0);
     self.sig.Occupied.set(false);
@@ -172,13 +277,13 @@ const def = {
     setup(self: ConveyorSelf): void {
       const l = self.local;
       l.beltHandle = self.attachBelt(l.belt!);
-      l.interlock = self.downstreamInterlock();
+      l.interlock = createDownstreamInterlock(self, { sinkAtOutput: true });
       self.onSensorChanged(l.sensor!, (occupied) => onPartAtSensor(self, occupied));
     },
     fixedUpdate(self: ConveyorSelf): void {
       const l = self.local;
       if (self.isWired) return;          // an interface controls the belt → stay silent
-      const occ = self.surfaceOccupied(l.belt!);
+      const occ = isSurfaceOccupiedByOwner(self.viewer, l.belt!);
       self.sig.Occupied.set(occ);
       const moving = shouldFlow(self);
       self.sig.Running.set(moving);
@@ -188,14 +293,37 @@ const def = {
   },
 
   des: {
+    // plan-631: canAccept/onAccept honour ctx.acceptPose (take-over where the MU
+    // was set down). Without a pose both hooks run exactly the legacy path.
+    acceptsPose: true,
+    // Capacity stays the runner's global MaxCapacity check (F4). A pose hand-over
+    // is additionally checked for plausibility BEFORE the owner changes (F3):
+    // off the belt → refuse, report, the current owner keeps the MU.
+    canAccept(self: ConveyorSelf, mu: RV.MU, _port?: RV.Port, ctx?: AcceptContext): boolean {
+      const pose = ctx?.acceptPose;
+      if (!pose) return true;
+      const p = self.local.timer!.fromPose(mu, pose);
+      if (p.ok) return true;
+      reportPoseOffBelt(self, p);
+      return false;
+    },
     // Accept = enter transit. Schedule the arrival at the discharge point (the
     // belt exit) after the full-belt transit time of SIM time (NOT an immediate
     // release), and attach a straight entry→exit position tween. Capacity is
     // single-zone; the runner's canAccept already enforces MaxCapacity, so
-    // returning true here accepts the MU into transit.
-    onAccept(self: ConveyorSelf, mu: RV.MU): boolean {
+    // returning true here accepts the MU into transit. With a take-over pose the
+    // transit starts AT the pose: remaining time (L − s)/v, tween pose → exit.
+    onAccept(self: ConveyorSelf, mu: RV.MU, _port?: RV.Port, ctx?: AcceptContext): boolean {
       const l = self.local;
-      l.transitMUs.set(mu.id, self.in(l.timer!.transitTime, 'Arrival', mu, l.timer!.tween(mu)));
+      const pose = ctx?.acceptPose;
+      if (pose) {
+        const p = l.timer!.fromPose(mu, pose, { commit: true });
+        if (!p.ok) { reportPoseOffBelt(self, p); return false; }
+        clearProblem(poseProblemId(self));
+        l.transitMUs.set(mu.id, self.in(p.remaining, 'Arrival', mu, p.tween!));
+      } else {
+        l.transitMUs.set(mu.id, self.in(l.timer!.transitTime, 'Arrival', mu, l.timer!.tween(mu)));
+      }
       conveyorStat(self, false); // part entered transit → Working
       return true;
     },
@@ -212,6 +340,16 @@ const def = {
       const mu = self.local.blockedMUs.shift();
       if (mu) tryRelease(self, mu);
       conveyorStat(self, false); // unblocked → Empty/Working, or re-parked → Blocked
+    },
+    validateSnapshot: validateConveyor,
+    onSnapshot(self: ConveyorSelf): unknown {
+      return captureConveyor(self.local, self.mus);
+    },
+    onRestore(self: ConveyorSelf, state?: unknown): void {
+      restoreConveyor(self, state);
+      self.local.blockedTarget = null;
+      // No catch-up wake (plan-2059 phase 8, replaces plan-645 L7): the v4 restore is exact.
+      self.local.runWasOn = !!self.sig.Run.get();
     },
   },
 };

@@ -175,3 +175,7 @@ describe('rv-sdk.d.ts generation', () => {
     expect(generateSdkDts()).toMatch(/apiVersion 1/);
   });
 });
+
+it('declares statistics-window rows', () => {
+  expect(generateSdkDts()).toContain('statValue(');
+});

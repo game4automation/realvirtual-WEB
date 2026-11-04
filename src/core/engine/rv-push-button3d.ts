@@ -21,6 +21,7 @@ import {
 import type { RVSceneButtonBase } from './rv-scene-button-base';
 import { RVSceneButtonWrapper } from './rv-scene-button-wrapper';
 import { wireValueSignal } from './rv-signal-wiring';
+import { slotBound } from './rv-slot-io';
 
 /** Browser runtime counterpart of Unity's PushButton3D component. */
 export class RVPushButton3D extends RVSceneButtonWrapper {
@@ -38,20 +39,29 @@ export class RVPushButton3D extends RVSceneButtonWrapper {
     base.isToggle = this.toggle;
     base.simpleClickTime = this.timer;
     // Unity: a wired lightSignal takes the light away from the button state.
-    base.autoLight = typeof this.lightSignal !== 'string';
+    // A direct viewer binding (SlotIO) counts as wired too.
+    base.autoLight = !slotBound(this, 'lightSignal', this.lightAddress());
   }
 
   /** Unity `Update()`: `if (useSignalLight) base.SetLight(lightSignal.Value)` — as
    *  a subscription instead of a per-frame poll. */
   protected onWired(base: RVSceneButtonBase): void {
     const ctx = this.ctx;
-    const address = typeof this.lightSignal === 'string' ? this.lightSignal : null;
-    if (!address || !ctx) return;
+    if (!ctx) return;
+    const address = this.lightAddress();
     // plan-427: idempotent level setter — a replay after reset/reconnect just
-    // re-confirms the lamp state the PLC still holds.
+    // re-confirms the lamp state the PLC still holds. Unwired, the slot is
+    // bound directly (SlotIO): binding takes the light away from the button
+    // state, neutralize hands it back — `autoLight` is re-evaluated per call.
     this._unsubLight = wireValueSignal(ctx.signalStore, address, (value) => {
-      base.setLight(Boolean(value));
-    }, undefined, ctx.reapply).unsubscribe;
+      const bound = slotBound(this, 'lightSignal', address);
+      base.autoLight = !bound;
+      base.setLight(bound ? Boolean(value) : base.active);
+    }, undefined, ctx.reapply, { instance: this, field: 'lightSignal', unbound: false }).unsubscribe;
+  }
+
+  private lightAddress(): string | null {
+    return typeof this.lightSignal === 'string' ? this.lightSignal : null;
   }
 
   dispose(): void {

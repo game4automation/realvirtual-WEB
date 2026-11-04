@@ -141,7 +141,7 @@ export class CameraStartPosPlugin implements RVViewerPlugin {
   readonly core = true;
 
   readonly slots: UISlotEntry[] = [
-    { slot: 'settings-tab', component: CameraStartTab, label: 'Start View', order: 290 },
+    { slot: 'settings-tab', component: CameraStartTab, label: 'Start View', order: 110 },
   ];
 
   /**

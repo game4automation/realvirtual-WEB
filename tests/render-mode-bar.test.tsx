@@ -35,7 +35,8 @@ import { setAppConfig } from '../src/core/rv-app-config';
 import { setActiveAssetContext, type ActiveAssetContext } from '../src/core/editor/active-asset-store';
 import { RenderModeGroup } from '../src/core/hmi/RenderModeBar';
 import { setToolbarShowLabels } from '../src/core/hmi/visual-settings-store';
-import { fakeRenderViewer, type FakeRenderViewer } from './helpers/fake-render-viewer';
+import { fakeRaytracedBackendFactory, fakeRenderViewer, type FakeRenderViewer } from './helpers/fake-render-viewer';
+import { registerRaytracedBackend } from '../src/core/engine/rv-raytraced-hook';
 
 const mount = (viewer: FakeRenderViewer) =>
   render(<RVViewerProvider value={viewer as never}><RenderModeGroup /></RVViewerProvider>);
@@ -176,17 +177,51 @@ describe('RenderModeGroup', () => {
     expect(trigger()).toHaveAttribute('aria-label', 'Render mode: Toon');
   });
 
-  it('the collapsed trigger proxies all six button keys', () => {
+  it('the collapsed trigger proxies all seven button keys', () => {
     // Fixed length in EVERY workspace — the wireframe key is simply never
     // touched outside the editor (plan-578 §2.5).
-    // plan-591 appended the two quality keys, bringing the list to exactly
-    // `PROXY_KEY_SLOTS` (6): a seventh would be silently dropped by the
+    // plan-591 appended the two quality keys; plan-762 the gated ray traced key
+    // (present even where its row is hidden), bringing the list to exactly
+    // `PROXY_KEY_SLOTS` (7): an eighth would be silently dropped by the
     // trigger's fixed hook list, so that constant must grow with this string.
     mount(fakeRenderViewer({ mode: 'viewer' }));
-    expect(trigger().getAttribute('data-rv-button-proxy')).toBe(
-      'view.renderMode:simple view.renderMode:default view.renderMode:toon editor.wireframe'
-      + ' view.visualPreset:Default view.visualPreset:Fast',
+    const keys = trigger().getAttribute('data-rv-button-proxy')!;
+    expect(keys).toBe(
+      'view.renderMode:simple view.renderMode:default view.renderMode:toon view.renderMode:raytraced'
+      + ' editor.wireframe view.visualPreset:Default view.visualPreset:Fast',
     );
+    expect(keys.split(' ')).toHaveLength(7);
+  });
+
+  // ── plan-762 §9.3: the pill follows the registry's backend gate ──
+  describe('ray traced row (plan-762)', () => {
+    afterEach(() => registerRaytracedBackend(null));
+
+    it('shows 3 modes without compute, even with a registered backend', async () => {
+      registerRaytracedBackend(fakeRaytracedBackendFactory);
+      mount(fakeRenderViewer({ mode: 'viewer', hasCompute: false }));
+      await openMenu();
+      expect(within(menu()).getAllByRole('menuitemradio')).toHaveLength(3);
+      expect(screen.queryByTestId('render-mode-raytraced')).toBeNull();
+    });
+
+    it('shows 3 modes with compute but without a registered backend', async () => {
+      mount(fakeRenderViewer({ mode: 'viewer', hasCompute: true }));
+      await openMenu();
+      expect(within(menu()).getAllByRole('menuitemradio')).toHaveLength(3);
+      expect(screen.queryByTestId('render-mode-raytraced')).toBeNull();
+    });
+
+    it('shows 4 modes with compute AND a registered backend, labelled "Ray traced"', async () => {
+      registerRaytracedBackend(fakeRaytracedBackendFactory);
+      mount(fakeRenderViewer({ mode: 'viewer', hasCompute: true }));
+      await openMenu();
+      expect(within(menu()).getAllByRole('menuitemradio')).toHaveLength(4);
+      const row = screen.getByTestId('render-mode-raytraced');
+      // An icon row carries its label in `aria-label` (action-group).
+      expect(row).toHaveAttribute('aria-label', 'Ray traced');
+      expect(within(row).getByTestId('WbSunnyIcon')).toBeInTheDocument();
+    });
   });
 
   it('a refusing command shows its reason on the row and does not execute', async () => {

@@ -98,7 +98,7 @@ export const DEFAULT_CHAIN_OUTLINE_STYLE: OutlineStyle = Object.freeze({
  *
  *  Deliberately the SAME crisp silhouette as the selection outline above: only
  *  the color and the pulse should tell an alarm apart from a selection. The
- *  original Toray values (strength 20, thickness 10, glow 1.5) were far outside
+ *  original CAD-import showcase values (strength 20, thickness 10, glow 1.5) were far outside
  *  the 1..4 px thickness the OutlinePass is built for — the blur kernel widened
  *  faster than the mask, so the "outline" rendered as a fat, washed-out halo
  *  around the part instead of an edge. Change these three numbers here and both
@@ -111,9 +111,9 @@ export const ATTENTION_OUTLINE_GEOMETRY = Object.freeze({
 
 /** Default status outline — the alarm/severity silhouette. Callers always
  *  override color + pulsePeriod per status via setStatusStyle; these defaults
- *  just keep the channel sane before first use.
- *  WebGL only — the status channel has no TSL mirror (WebGPU shows no status
- *  outline; the OutlinePass pulse never animated there anyway). */
+ *  just keep the channel sane before first use. Mirrored on the TSL pipeline
+ *  as the `status` channel since plan-763, pulse included (the pipeline drives
+ *  the channel's pulse factor from `pulsePeriod` with the OutlinePass cosine). */
 export const DEFAULT_STATUS_OUTLINE_STYLE: OutlineStyle = Object.freeze({
   visibleEdgeColor: 0xffa726,
   hiddenEdgeColor: 0x8c5c15,
@@ -176,7 +176,7 @@ export class RVOutlineManager {
     id: 'chain', pass: null, outlined: [], style: { ...DEFAULT_CHAIN_OUTLINE_STYLE },
   };
   private readonly _status: ChannelState = {
-    id: null, pass: null, outlined: [], style: { ...DEFAULT_STATUS_OUTLINE_STYLE },
+    id: 'status', pass: null, outlined: [], style: { ...DEFAULT_STATUS_OUTLINE_STYLE },
   };
   private readonly _flash: ChannelState = {
     id: 'flash', pass: null, outlined: [], style: { ...DEFAULT_FLASH_OUTLINE_STYLE },
@@ -326,7 +326,7 @@ export class RVOutlineManager {
     return this._chain.style;
   }
 
-  // ─── Status channel (alarm/severity/instruction outline — WebGL only) ──
+  // ─── Status channel (alarm/severity/instruction outline) ──────────────
 
   /** The status-channel OutlinePass instance, or null if not yet created. */
   get statusPass(): OutlinePass | null {
@@ -465,7 +465,7 @@ export class RVOutlineManager {
     const pipeline = this._viewer._ensureTslPost();
     if (!pipeline) return; // pre-warm failed — outlines stay off (F4 guard)
     this._tslPost = pipeline;
-    for (const ch of [this._selection, this._hover, this._chain, this._flash]) {
+    for (const ch of [this._selection, this._hover, this._chain, this._status, this._flash]) {
       if (ch.id) pipeline.setOutlineStyle(ch.id, ch.style);
     }
   }

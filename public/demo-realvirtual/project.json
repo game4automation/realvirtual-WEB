@@ -11,7 +11,9 @@
   },
   "libraries": [
     {
-      "url": "library/catalog.json"
+      "projectId": "prj_realvirtual_library",
+      "label": "realvirtual Library",
+      "hint": "library/project.json"
     }
   ],
   "demos": {
@@ -23,10 +25,11 @@
       "id": "doc_demorealvirtualweb_7l7hfw",
       "name": "realvirtual WEB Demo",
       "path": "DemoRealvirtualWeb.glb",
+      "mode": "hmi",
       "settingsPath": "DemoRealvirtualWeb.settings.json",
-      "sizeBytes": 8735212,
-      "mtimeMs": 1790540696798,
-      "sha256": "f3fb6183ce65c3dabb174eab5167e0ca24afb402527a4d316ca793bd7dbda6f1",
+      "sizeBytes": 8908584,
+      "mtimeMs": 1793460737773.9485,
+      "sha256": "4eb7d628b5b557aa4e918b75678f76385fa5b2564a0690fb518a1d450b42ba90",
       "documentInfo": {
         "v": 1,
         "summary": "Sandbox cell showing realvirtual WEB as a 3D machine information system: what a 3D-HMI does once it is connected to a real machine, for operators and maintenance.",
@@ -34,7 +37,8 @@
         "updatedAt": "2026-09-27T20:24:55.516Z",
         "updatedBy": "realvirtual"
       },
-      "extrasScan": 2
+      "extrasScan": 2,
+      "thumbnail": ".thumbnails/doc_demorealvirtualweb_7l7hfw.a70b3bc2.webp"
     },
     {
       "id": "doc_demoplanner_gf4m6v",
@@ -55,7 +59,28 @@
         "updatedAt": "2026-09-27T20:08:58.820Z",
         "updatedBy": "realvirtual"
       },
-      "extrasScan": 2
+      "extrasScan": 2,
+      "thumbnail": ".thumbnails/doc_demoplanner_gf4m6v.74d6046f.webp"
+    },
+    {
+      "id": "doc_palletyard_hzmdb6",
+      "name": "Pallet Yard (DES)",
+      "path": "PalletYard.glb",
+      "mode": "des",
+      "sizeBytes": 35592,
+      "mtimeMs": 1793654710905,
+      "sha256": "869f00762d110172e5ef06b33d331284a0972da560cd2597a5ad02c191cb9cf9",
+      "documentInfo": {
+        "v": 1,
+        "summary": "Discrete event simulation of a pallet yard: three AGV forklifts serve production outputs, floor slots, shipping and chargers.",
+        "description": "# Pallet Yard (DES)\n\nA pallet yard simulated with **discrete event simulation** (DES). Three AGV forklifts (AGV Stacker) run a one-way path network and serve two production outputs, six floor slots, two shipping lanes and two chargers with a wait point.\n\n## Try this\n\n- Switch to **DES** mode and press **Play**: the forklifts pick, buffer, ship and charge; the event queue and statistics show what happens.\n- Open the **planning window** to change the yard size or the takt and rebuild the layout.\n- Use FastForward to run a whole shift in seconds.\n- Open **Experiments** (flask icon in the DES toolbar) and press **Run all**: Base (3 AGVs with breakdowns, MTBF 1 h / MTTR 10 min) is compared with *2 AGVs*, *4 AGVs* and *No downtime*, 5 runs of 8 h each. Breakdowns cost about a fifth of the throughput, because a broken AGV also blocks the others. A 4th AGV does not help: the vehicles block each other on the one-way network.\n\nThe yard is assembled from library assets (Pallet Handling, Mobile Robots); its logic is the PalletYard model plugin of realvirtual WEB.",
+        "updatedAt": "2026-11-02T12:00:00.000Z",
+        "updatedBy": "realvirtual"
+      },
+      "extrasScan": 2,
+      "modifiedAt": "2026-11-02T21:25:10.906Z",
+      "thumbnail": ".thumbnails/doc_palletyard_hzmdb6.d9d31684.webp",
+      "experiments": "experiments/doc_palletyard_hzmdb6.rvexp.ndjson"
     },
     {
       "id": "doc_test-des-turntable-loop_1y3v7m0",
@@ -67,9 +92,9 @@
         "v": 1,
         "level": "scene"
       },
-      "sizeBytes": 3080,
+      "sizeBytes": 3084,
       "mtimeMs": 1790539738823,
-      "sha256": "9ebb31c977d6dc27ce92c7de6bcedc352fc5c4beaccd1d3664361cc6a732d41e",
+      "sha256": "99870b736fd184eb4813adcced4d2c0fdffc3b74a2848e475623827d15e4f107",
       "documentInfo": {
         "v": 1,
         "summary": "Developer fixture: a minimal conveyor loop with one turntable for discrete-event simulation (DES) tests.",
@@ -77,12 +102,14 @@
         "updatedAt": "2026-09-27T20:08:58.822Z",
         "updatedBy": "realvirtual"
       },
-      "extrasScan": 2
+      "extrasScan": 2,
+      "thumbnail": ".thumbnails/doc_test-des-turntable-loop_1y3v7m0.fa5ae5d4.webp"
     },
     {
       "id": "doc_fmu-demo_154b2h4",
       "name": "FMU Demo (BouncingBall)",
       "path": "fmu-demo.glb",
+      "mode": "commissioning",
       "sizeBytes": 221176,
       "mtimeMs": 1790539907838,
       "sha256": "3326aa95993d2e36a6eb631697cfc9fb2af814ecf88c889127de682a3961d750",
@@ -93,15 +120,17 @@
         "updatedAt": "2026-09-27T00:00:00.000Z",
         "updatedBy": "realvirtual"
       },
-      "extrasScan": 2
+      "extrasScan": 2,
+      "thumbnail": ".thumbnails/doc_fmu-demo_154b2h4.5210dc62.webp"
     },
     {
       "id": "doc_autonox-delta-rl5-1900-6kg_torq7x",
       "name": "Autonox DELTA RL5-1900-6kg (Kinematics)",
       "path": "Autonox-DELTA-RL5-1900-6kg.glb",
-      "sizeBytes": 9775416,
+      "mode": "commissioning",
+      "sizeBytes": 9777208,
       "mtimeMs": 1790770800000,
-      "sha256": "6a0ffcdb474913bca19365edb668c89100ee325c09f697161524e2e0f090101e",
+      "sha256": "7442a85b1add1fd5b91ed69b84cf6f695ef9ead7baebcd65ddc0e28fd88fc2d5",
       "documentInfo": {
         "v": 1,
         "summary": "Autonox DELTA RL5-1900 (6 kg) parallel kinematics robot with a solved mechanism playing back a sampled pick-and-place cycle, drawn coloured by speed.",
@@ -109,15 +138,17 @@
         "updatedAt": "2026-09-30T12:20:00.000Z",
         "updatedBy": "realvirtual"
       },
-      "extrasScan": 2
+      "extrasScan": 2,
+      "thumbnail": ".thumbnails/doc_autonox-delta-rl5-1900-6kg_torq7x.52445281.webp"
     },
     {
       "id": "doc_laserweldingassemblystation_1n66y05",
       "name": "Laser Welding Assembly Station",
       "path": "LaserWeldingAssemblyStation.glb",
-      "sizeBytes": 21867516,
-      "mtimeMs": 1791816831704,
-      "sha256": "50acef5ed888ebdc71e1b4258f7d86f0cb2a6caa2cf63ddf8887286a9077a8db",
+      "mode": "commissioning",
+      "sizeBytes": 21873864,
+      "mtimeMs": 1792173470480,
+      "sha256": "ed0c9471b4f5ef533034988e99c2faf8b837ff330ac53a8d712c0de997dbbfa0",
       "documentInfo": {
         "v": 1,
         "summary": "Five-station laser welding and assembly line with two lifts and a return conveyor, controlled by eleven IEC 61131-3 Structured Text programs on the included virtual PLC and driven by the station's real TIA tag list - ready for virtual commissioning. Model courtesy of Villette Oh (GrabCAD).",
@@ -125,16 +156,30 @@
         "updatedAt": "2026-10-09T00:14:53.635Z",
         "updatedBy": "realvirtual"
       },
-      "extrasScan": 2
+      "extrasScan": 2,
+      "thumbnail": ".thumbnails/doc_laserweldingassemblystation_1n66y05.7e700661.webp"
     },
     {
-      "id": "doc_agv-maze_1lhdkja",
-      "name": "AGV Maze",
-      "path": "agv-maze.glb",
-      "devOnly": true,
-      "sizeBytes": 5076120,
-      "mtimeMs": 1788818222546,
-      "sha256": "c26e8569e9ad2ac135283a38426e0be29fbf19fab3882abc9a9b6eca4e0f1ed2"
+      "id": "doc_mujocowalker_15i4u8p",
+      "name": "Walking Robot (MuJoCo detail physics)",
+      "path": "MuJoCoWalker.glb",
+      "mode": "commissioning",
+      "modes": [
+        "commissioning",
+        "viewer"
+      ],
+      "sizeBytes": 1120680,
+      "mtimeMs": 1792965973107,
+      "sha256": "5d7b2e08a435da7fa38b02f4c355f306c08c9c49302d220e7a47ffd4d200c8e1",
+      "documentInfo": {
+        "v": 1,
+        "summary": "Steer a two-legged robot on a trained neural policy through a field of obstacles it can push, trip over and fall against — MuJoCo detail physics in the browser.",
+        "description": "# Walking Robot — MuJoCo detail physics\n\nA small two-legged service robot walks across a field of obstacles. Nothing in this scene is\nanimated: the robot is a **MuJoCo** model stepped at 5 ms, driven by a **trained neural policy**\nthat runs in the browser through ONNX Runtime, and every obstacle is a rigid body in the same\nsolver.\n\n## What it demonstrates\n\n- **A controller that is not a script.** The policy is blind — 61 observation values, no\n  distance sensor and no image — so it absorbs a collision by yawing away from it. Walk it into\n  the same cube twice and it leaves differently. You steer it by setting a walk and a turn\n  command — nothing more — and the gait that carries it there is the network's, not a path\n  someone drew.\n- **Obstacles that are objects, not settings.** Each one carries its own components:\n  `CollisionShapeSet` for its collision geometry, `FreeBody` for mass, contact dimensionality\n  and friction, `Movable` to mark it as a body that may be repositioned, and a `ContactProfile` on the\n  balls, which need rolling friction. Click one and the Property Inspector shows the physics it\n  is actually running on.\n- **Numbers you can feel.** The robot weighs 0.737 kg and the whole model declares no friction\n  coefficient, so it runs on MuJoCo's default mu = 1.0 and can push with its own ground grip:\n  7.2 N. That one number sorts the field — a 50 g ball is played away, a 100 g cube is shoved,\n  a 200 g cube trips it, and a 2 kg block at chest height puts it on its back.\n- **A recovery policy.** It gets up again, which is the second network in the document.\n\n## Try this\n\n- **Press Play, then steer with W/A/S/D, Q/E sidestep, Space to shove.** **W**/**S** is forward\n  and back, **A**/**D** steers, **Q**/**E** steps sideways without turning, **R** puts the scene\n  back. The dial on the plate sets how fast; the keys only say which way.\n- **Or let it walk the course by itself:** turn **Autopilot** on, on the plate. It then walks at\n  the nearest obstacle it has not shifted yet, hands the robot straight back the moment you\n  touch anything, and takes over again about five seconds after your last input.\n- **Press Space to shove the robot** and watch the gait absorb it — or not, and then get up again.\n- **Click an obstacle** and change `MassKg` in the inspector. Above roughly 0.7 kg it stops\n  being something the robot can move at all — that is the 7.2 N above, not a threshold someone\n  typed in.\n- **Watch the ring at 2 m.** The field is deliberately wide rather than deep: a blind policy\n  drifts about 0.5 m per 5 m after a collision, so a single obstacle per station gets missed.\n\n## Why the obstacles look the way they do\n\nColour reads weight — sand is played away, steel trips, graphite is a wall. The cube spacing is\nmeasured and deliberate: three 90 mm cubes 0.20 m apart box the robot in and it never gets up,\nwhile the same cube alone produces trip, fall, stand up, walk on. A blind policy can only stand\nup where there is room to.\n",
+        "updatedAt": "2026-10-25T00:00:00.000Z",
+        "updatedBy": "realvirtual"
+      },
+      "extrasScan": 2,
+      "thumbnail": ".thumbnails/doc_mujocowalker_15i4u8p.537d287d.webp"
     },
     {
       "id": "doc_demo-knowledge-md_1bio4kv",
@@ -142,5 +187,5 @@
       "path": "demo.knowledge.md"
     }
   ],
-  "modifiedAt": "2026-09-30T18:25:00.000Z"
+  "modifiedAt": "2026-10-25T22:06:13.107Z"
 }

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage, listLocalStorageKeys, readLocalStorage, removeLocalStorage, writeLocalStorage } from '../../rv-safe-storage';
+
 /**
  * rv-scene-storage — the `rv-scenes/*` keyspace.
  *
@@ -72,6 +74,7 @@ import {
 
 // ─── Storage keys ───────────────────────────────────────────────────────
 
+// Persisted names — do not rename (plan-777 P1): old browsers hold these keys.
 const LS_KEY_INDEX = 'rv-scenes-index';
 const LS_KEY_ACTIVE = 'rv-scenes/active';
 const LS_KEY_SCENE_PREFIX = 'rv-scenes/';
@@ -189,7 +192,7 @@ export function reportSceneStorageError(error: SceneStorageError): void {
 
 export function listMetas(): RvSceneMeta[] {
   try {
-    const raw = localStorage.getItem(LS_KEY_INDEX);
+    const raw = readLocalStorage(LS_KEY_INDEX);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -203,7 +206,7 @@ export function listMetas(): RvSceneMeta[] {
 function writeIndex(metas: RvSceneMeta[]): void {
   const sorted = [...metas].sort((a, b) => (b.modifiedAt ?? '').localeCompare(a.modifiedAt ?? ''));
   try {
-    localStorage.setItem(LS_KEY_INDEX, JSON.stringify(sorted));
+    getLocalStorage()!.setItem(LS_KEY_INDEX, JSON.stringify(sorted));
   } catch (e) {
     reportStorageError({ op: 'write-index', cause: e });
   }
@@ -239,7 +242,7 @@ function removeMeta(id: string): void {
 export function readScene(id: string): RvScene | null {
   let parsed: RvScene;
   try {
-    const raw = localStorage.getItem(sceneKey(id));
+    const raw = readLocalStorage(sceneKey(id));
     if (!raw) return null;
     parsed = JSON.parse(raw) as RvScene;
   } catch {
@@ -258,7 +261,7 @@ export function readScene(id: string): RvScene | null {
 export function writeScene(scene: RvScene): RvScene {
   const updated: RvScene = { ...scene, modifiedAt: new Date().toISOString() };
   try {
-    localStorage.setItem(sceneKey(updated.id), JSON.stringify(updated));
+    getLocalStorage()!.setItem(sceneKey(updated.id), JSON.stringify(updated));
     upsertMeta(metaOf(updated));
   } catch (e) {
     // The index is deliberately left alone: an index row pointing at a body
@@ -270,7 +273,7 @@ export function writeScene(scene: RvScene): RvScene {
 
 export function deleteScene(id: string): void {
   try {
-    localStorage.removeItem(sceneKey(id));
+    removeLocalStorage(sceneKey(id));
   } catch {
     /* ignore */
   }
@@ -312,7 +315,7 @@ export function readActiveId(): string | null {
  */
 export function readStoredActiveId(): string | null {
   try {
-    const raw = localStorage.getItem(LS_KEY_ACTIVE);
+    const raw = readLocalStorage(LS_KEY_ACTIVE);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed.id === 'string') return parsed.id;
@@ -324,8 +327,8 @@ export function readStoredActiveId(): string | null {
 
 export function writeActiveId(id: string | null): void {
   try {
-    if (id === null) localStorage.removeItem(LS_KEY_ACTIVE);
-    else localStorage.setItem(LS_KEY_ACTIVE, JSON.stringify({ id }));
+    if (id === null) removeLocalStorage(LS_KEY_ACTIVE);
+    else writeLocalStorage(LS_KEY_ACTIVE, JSON.stringify({ id }));
   } catch {
     /* ignore */
   }
@@ -335,7 +338,7 @@ export function writeActiveId(id: string | null): void {
 
 export function clearDraft(base: SceneBase): void {
   try {
-    localStorage.removeItem(draftKey(base));
+    removeLocalStorage(draftKey(base));
   } catch {
     /* ignore */
   }
@@ -353,20 +356,18 @@ export function clearDraftsForScope(projectId: string): void {
   if (!projectId) return;
   const prefix = LS_KEY_DRAFT_PREFIX + projectId + ':';
   const doomed: string[] = [];
-  for (let i = 0; i < localStorage.length; i++) {
-    const k = localStorage.key(i);
+  for (const k of listLocalStorageKeys()) {
     if (k && k.startsWith(prefix)) doomed.push(k);
   }
   for (const k of doomed) {
-    try { localStorage.removeItem(k); } catch { /* ignore */ }
+    removeLocalStorage(k);
   }
 }
 
 /** Enumerate all per-base draft keys currently in storage. Used by tests and the cleanup tool. */
 export function listDraftBaseKeys(): string[] {
   const out: string[] = [];
-  for (let i = 0; i < localStorage.length; i++) {
-    const k = localStorage.key(i);
+  for (const k of listLocalStorageKeys()) {
     // Per-base prefix is a strict prefix of the per-saved-scene prefix
     // (`rv-scenes/draft/` vs `rv-scenes/scene-draft/`). Filter the latter
     // out so the legacy enumerator keeps its semantics.
@@ -383,7 +384,7 @@ export function listDraftBaseKeys(): string[] {
 
 export function clearSceneDraft(id: string): void {
   try {
-    localStorage.removeItem(sceneDraftKey(id));
+    removeLocalStorage(sceneDraftKey(id));
   } catch {
     /* ignore */
   }
@@ -392,8 +393,7 @@ export function clearSceneDraft(id: string): void {
 /** Enumerate all per-saved-scene draft ids currently in storage. */
 export function listSceneDraftIds(): string[] {
   const out: string[] = [];
-  for (let i = 0; i < localStorage.length; i++) {
-    const k = localStorage.key(i);
+  for (const k of listLocalStorageKeys()) {
     if (k && k.startsWith(LS_KEY_SCENE_DRAFT_PREFIX)) {
       out.push(k.slice(LS_KEY_SCENE_DRAFT_PREFIX.length));
     }
@@ -428,14 +428,14 @@ export function removeScenesFromIndex(ids: readonly string[]): void {
 export function clearAllScenes(): void {
   const metas = listMetas();
   for (const m of metas) {
-    try { localStorage.removeItem(sceneKey(m.id)); } catch { /* ignore */ }
+    try { removeLocalStorage(sceneKey(m.id)); } catch { /* ignore */ }
   }
   for (const baseKey of listDraftBaseKeys()) {
-    try { localStorage.removeItem(LS_KEY_DRAFT_PREFIX + baseKey); } catch { /* ignore */ }
+    removeLocalStorage(LS_KEY_DRAFT_PREFIX + baseKey);
   }
   for (const id of listSceneDraftIds()) {
-    try { localStorage.removeItem(LS_KEY_SCENE_DRAFT_PREFIX + id); } catch { /* ignore */ }
+    removeLocalStorage(LS_KEY_SCENE_DRAFT_PREFIX + id);
   }
-  try { localStorage.removeItem(LS_KEY_INDEX); } catch { /* ignore */ }
-  try { localStorage.removeItem(LS_KEY_ACTIVE); } catch { /* ignore */ }
+  removeLocalStorage(LS_KEY_INDEX);
+  removeLocalStorage(LS_KEY_ACTIVE);
 }

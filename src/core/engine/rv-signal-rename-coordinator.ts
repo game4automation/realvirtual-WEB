@@ -90,7 +90,7 @@ export interface SignalRenameProblemsPort {
 export interface SignalRenameEnvironment {
   /**
    * `model`: the open document (asset in the editor, else the scene) — name,
-   * string fields, panel, metadata, ST code. `overlay`: the scene document the
+   * string fields, panel, metadata, ST code. `overlay`: the planner's document the
    * node signal mappings live in; absent or the same document → `model`.
    */
   docs: { model: SignalRenameDocTarget | null; overlay?: SignalRenameDocTarget | null };

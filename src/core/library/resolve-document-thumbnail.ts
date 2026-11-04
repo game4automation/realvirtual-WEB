@@ -2,52 +2,45 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * resolve-document-thumbnail — the persisted preview of one document
- * (plan-744 §2.4, F5/F6).
+ * resolve-document-thumbnail — the saved preview of a document, read and
+ * looked after WITHOUT ever rendering one (plan-776 F3/F5/F7/F12).
+ *
+ * ## The rule this module exists to keep
+ *
+ * A thumbnail is a write-time artefact. A save renders it, writes it as a
+ * sidecar `.thumbnails/<id>.<hash8>.<webp|png>` and points the document's row
+ * at it (`rv-thumbnail-write.ts`). Everything that SHOWS a card reads that
+ * pointer through {@link resolveThumbnailUrl} and nothing else: no probing of
+ * conventional paths, no `.png` fallback, no legacy path, and above all no GLB
+ * load — a missing pointer is the type placeholder (#2). The import guard
+ * `tests/thumbnail-read-import-boundary.node.test.ts` keeps the renderer out of
+ * this module's reach.
  *
  * ## Why it lives in `library/` and not in `thumbnails/`
  *
- * `src/core/thumbnails/` is rendering: a renderer, a queue, a cache, and a
- * card-side hook. It knows nothing about projects and must not start to — a
- * module that renders an `Object3D` has no business holding a `ProjectBackend`.
- * The coupling to the backend already exists one folder over, in
- * `project-library-provider.ts`, so that is where this belongs (Review #7).
+ * `src/core/thumbnails/` renders. A module that renders an `Object3D` has no
+ * business holding a `ProjectBackend`, and a card must not import a renderer —
+ * so the backend half of thumbnails sits one folder over, beside
+ * `project-library-provider.ts`, which already couples library and backend.
  *
- * ## The chain
+ * ## Delete safety (F3)
  *
- * 1. **`doc.thumbnail`** — a URL or path the MANIFEST states. Bundled deploys
- *    fill this in, and a manifest that names a picture is the author telling
- *    us which one to use (Review #4).
- * 2. **The id-keyed sidecar**, `<project>/.thumbnails/<encodeThumbnailId(id)>.png`.
- *    This is what {@link writeDocumentThumbnail} writes on every save.
- * 3. **Lazy migration** of the pre-plan-744 path-mirrored
- *    `library/.thumbnails/<rel>.png`, copied under the id on first sight.
- * 4. **`null`** — and the caller falls back to rendering the GLB, which is the
- *    path every document took before this module existed.
- *
- * The GLB-EMBEDDED preview of plan-438 is named as tier 1 in the plan and is
- * deliberately absent here: this repo has no reader for it. Its effective
- * stand-in is step 4, the live render off the same bytes — later in the chain
- * than plan-438 would put it, which costs a render and never correctness.
- *
- * ## Why the lazy migration is not a sweep
- *
- * The old files stay where they are for a release. A destructive pass over a
- * customer's `library/.thumbnails/` buys nothing (the folder is small and
- * ignored) and risks everything (it is the only copy). Reconciling orphans is
- * a later, separate job.
- *
- * The copy is **preconditioned on the target being absent** and therefore
- * idempotent: a save that landed a fresh sidecar a moment ago must not be
- * overwritten by a migration of the stale one it replaced (Review #6). The
- * precondition is enforced by the BACKEND (`expectedRevision: 'create'`), not
- * by a read-then-write here, so there is no window between the check and the
- * write.
+ * Every delete in this plan goes through {@link deleteThumbnailSidecar}, which
+ * refuses anything that is not a project-root sidecar of exactly the document
+ * being saved or deleted (`isOwnThumbnailSidecar`). A pointer somebody typed
+ * into a manifest by hand — `https://…`, `../models/x.glb`, another id's file —
+ * is never deleted.
  */
 
 import type { ProjectBackend } from '../project/backends/project-backend';
-import type { RvDocumentEntry } from '../project/rv-project-types';
-import { legacyLibraryThumbnailPath, thumbnailSidecarPath } from './library-types';
+import {
+  isExternalThumbnailPointer,
+  isOwnThumbnailSidecar,
+  isReadableThumbnailPointer,
+  legacyThumbnailSidecarPath,
+  parseThumbnailSidecarTail,
+  thumbnailSidecarPath,
+} from './library-types';
 
 /** A loadable preview URL plus the means to let it go again. */
 export interface ResolvedDocumentThumbnail {
@@ -60,11 +53,9 @@ export interface ResolvedDocumentThumbnail {
  * How many sidecar reads may be in flight at once.
  *
  * A dashboard opening on a 200-document project would otherwise issue 200
- * concurrent File System Access reads the moment the grid mounts (Review #9).
- * The card hook already gates on visibility, so this is the second limit
- * rather than the only one — and it is a local gate rather than a detour
- * through `ThumbnailService`, whose queue carries `Object3D` renders and would
- * have to grow a second job kind to carry a byte read.
+ * concurrent File System Access reads the moment the grid mounts. The cards
+ * read on mount (plan-776 P9: there is no visibility gate any more — it existed
+ * to throttle GLB renders, which are gone), so this gate is the one limit.
  */
 const MAX_CONCURRENT_READS = 4;
 
@@ -85,108 +76,117 @@ async function withReadSlot<T>(run: () => Promise<T>): Promise<T> {
 }
 
 /**
- * The persisted preview of `doc`, or null when it has none.
+ * The loadable URL behind a row's `thumbnail` pointer, or null (placeholder).
  *
- * Never throws: a preview is decoration, and an unreadable one must not take a
- * card — let alone a dashboard — down with it.
+ *  - a pointer with a URL scheme (`http(s):`, `data:`, `blob:`) or a leading
+ *    `/` passes through unchanged — a value a delivered manifest or another
+ *    provider states; this plan never writes and never deletes one;
+ *  - a relative pointer must name a `.thumbnails/` file (`.thumbnails/x` or
+ *    `<Category>/.thumbnails/x`) with no `..`, else null;
+ *  - a valid relative pointer is read through the backend — a blob URL for a
+ *    folder or browser project, a plain (or, for an encrypted deploy, a
+ *    decrypted blob) URL for a bundled one.
+ *
+ * Never throws: a read error, or a decrypt failure before the deploy is
+ * unlocked, is null — the next project/unlock publish asks again.
  */
-export async function resolveDocumentThumbnail(
+export async function resolveThumbnailUrl(
   backend: ProjectBackend | null | undefined,
-  doc: Pick<RvDocumentEntry, 'id' | 'path'> & { thumbnail?: unknown },
+  pointer: unknown,
 ): Promise<ResolvedDocumentThumbnail | null> {
-  // 1. What the manifest states.
-  const declared = typeof doc.thumbnail === 'string' ? doc.thumbnail.trim() : '';
-  if (declared !== '') return { url: declared };
-
-  const id = typeof doc.id === 'string' ? doc.id.trim() : '';
-  if (!backend || id === '') return null;
-
+  const value = typeof pointer === 'string' ? pointer.trim() : '';
+  if (value === '') return null;
+  if (isExternalThumbnailPointer(value)) return { url: value };
+  if (!backend || !isReadableThumbnailPointer(value)) return null;
   return withReadSlot(async () => {
-    const sidecar = thumbnailSidecarPath(id);
-    // 2. The id-keyed sidecar.
-    const found = await readUrl(backend, sidecar);
-    if (found) return found;
-
-    // 3. The pre-plan-744 path-mirrored one, copied under the id on sight.
-    const legacy = legacyLibraryThumbnailPath(typeof doc.path === 'string' ? doc.path : '');
-    if (!legacy) return null;
-    const bytes = await readBytes(backend, legacy);
-    if (!bytes) return null;
-    await copyUnderId(backend, sidecar, bytes);
-    return (await readUrl(backend, sidecar)) ?? null;
+    try {
+      const resolved = await backend.readDocumentUrl(value);
+      return resolved ? { url: resolved.url, release: resolved.release } : null;
+    } catch {
+      return null;
+    }
   });
 }
 
 /**
- * Carry a document's OLD path-mirrored thumbnail under its id, before a move
- * takes the path away (plan-744 Review #5).
+ * Delete `pointer` from `backend` — only if it is a sidecar OF `documentId`
+ * (F3). Best-effort and silent: a sidecar that outlives its document is a few
+ * kilobytes of dead file, a failed delete must never fail the verb around it.
  *
- * Without this, a document moved out of `library/` before anything ever
- * rendered its card loses the picture for good: the lazy migration keys off
- * `doc.path`, and after the move that path no longer says `library/`.
- *
- * Best-effort and silent. Returns true when a copy was made, which is what the
- * move's own tests assert on.
+ * @returns true when a delete was attempted and did not throw.
  */
-export async function migrateLegacyThumbnailForMove(
-  io: {
-    readBytes(relPath: string): Promise<Blob | null>;
-    writeBytes(relPath: string, blob: Blob): Promise<void>;
-  },
+export async function deleteThumbnailSidecar(
+  backend: Pick<ProjectBackend, 'writable' | 'deleteDocument'> | null | undefined,
+  pointer: unknown,
   documentId: string,
-  fromPath: string,
 ): Promise<boolean> {
-  const legacy = legacyLibraryThumbnailPath(fromPath);
-  const id = typeof documentId === 'string' ? documentId.trim() : '';
-  if (!legacy || id === '') return false;
+  if (!backend?.writable || !isOwnThumbnailSidecar(pointer, documentId)) return false;
   try {
-    const target = thumbnailSidecarPath(id);
-    // No `create` precondition available on this IO, so the check is a read.
-    // The race it leaves open is a save landing a fresh sidecar between the
-    // two calls, and a tree move already holds the document still.
-    if (await io.readBytes(target)) return false;
-    const bytes = await io.readBytes(legacy);
-    if (!bytes) return false;
-    await io.writeBytes(target, bytes);
+    await backend.deleteDocument(pointer as string);
     return true;
   } catch {
-    return false;   // a thumbnail never fails a move
+    return false;
   }
 }
 
-async function readUrl(
-  backend: ProjectBackend,
-  relPath: string,
-): Promise<ResolvedDocumentThumbnail | null> {
-  try {
-    const resolved = await backend.readDocumentUrl(relPath);
-    return resolved ? { url: resolved.url, release: resolved.release } : null;
-  } catch {
-    return null;
-  }
-}
-
-async function readBytes(backend: ProjectBackend, relPath: string): Promise<Uint8Array | null> {
-  try {
-    const record = await backend.readDocument(relPath);
-    return record?.bytes ?? null;
-  } catch {
-    return null;
-  }
-}
-
-async function copyUnderId(
-  backend: ProjectBackend,
-  target: string,
-  bytes: Uint8Array,
+/**
+ * The id-bound cleanup of a save or a delete (F3 step 4, F12): remove every
+ * KNOWN sidecar of `documentId` except `keep` — the pointers handed in (the
+ * row's value at delete time, the one the save started from) and the
+ * hash-less legacy `.thumbnails/<id>.png` of the same id.
+ *
+ * "Known" because no backend lists the hidden `.thumbnails/` folder: the
+ * dot rule keeps it out of every listing, which is exactly what makes the
+ * folder invisible in the dashboard. A stray file this misses is dead weight,
+ * never a wrong picture — the reader goes by the pointer only.
+ */
+export async function cleanupThumbnailSidecars(
+  backend: Pick<ProjectBackend, 'writable' | 'deleteDocument'> | null | undefined,
+  documentId: string,
+  candidates: readonly unknown[],
+  keep: string | null,
 ): Promise<void> {
-  if (!backend.writable) return;
+  if (!backend?.writable) return;
+  const seen = new Set<string>();
+  for (const candidate of [...candidates, legacyThumbnailSidecarPath(documentId)]) {
+    if (typeof candidate !== 'string' || candidate === keep || seen.has(candidate)) continue;
+    seen.add(candidate);
+    await deleteThumbnailSidecar(backend, candidate, documentId);
+  }
+}
+
+/** The byte I/O a sidecar copy needs on each side. */
+export interface SidecarIO {
+  read(relPath: string): Promise<Uint8Array | null>;
+  write(relPath: string, bytes: Uint8Array): Promise<void>;
+}
+
+/**
+ * Copy the sidecar of `sourceId` to the name of `targetId` (F5): duplicate,
+ * cross-source copy and move. The bytes are copied, never re-rendered, and keep
+ * their hash and extension — the picture is the same file content.
+ *
+ * @returns the target's new pointer, or null when there is nothing to copy or
+ *   the copy failed — the caller then writes a row WITHOUT `thumbnail`, never
+ *   one that carries the source's pointer into a place it does not exist.
+ */
+export async function copyThumbnailSidecar(
+  from: Pick<SidecarIO, 'read'>,
+  to: Pick<SidecarIO, 'write'>,
+  pointer: unknown,
+  sourceId: string,
+  targetId: string,
+): Promise<string | null> {
+  if (!isOwnThumbnailSidecar(pointer, sourceId)) return null;
+  const tail = parseThumbnailSidecarTail(pointer as string);
+  if (!tail) return null;
   try {
-    // `'create'` is the whole point: the backend refuses if anything is there,
-    // so a fresh save can never be clobbered by a migration of the stale copy
-    // it replaced. The refusal is the success case for the second caller.
-    await backend.writeDocument(target, bytes, { expectedRevision: 'create' });
+    const bytes = await from.read(pointer as string);
+    if (!bytes || bytes.byteLength === 0) return null;
+    const next = thumbnailSidecarPath(targetId, tail.hash8, tail.ext);
+    await to.write(next, bytes);
+    return next;
   } catch {
-    /* already there, or read-only — either way the next read answers. */
+    return null;
   }
 }

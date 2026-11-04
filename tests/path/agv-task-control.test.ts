@@ -28,7 +28,7 @@ import { getDefaultAgvFleet, type AgvTask } from '../../src/core/engine/rv-agv-f
 import { getDefaultPathDockRegistry } from '../../src/core/engine/rv-path-dock';
 import { clearLiveControl } from '../../src/core/engine/rv-live-control';
 import { AgvFlow } from '../../src/behaviors/Agv';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
+import { DESRunner } from '@rv/plugins/des/des-runner';
 import { makeHost, makeAgvRoot as makeAgv, bindContinuous, bindDes, clearShared, sig,
   type AgvTestHost as Host,
 } from '../helpers/agv-harness';

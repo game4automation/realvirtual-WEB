@@ -267,6 +267,27 @@ export class SignalRenameCollisionError extends Error {
   }
 }
 
+/** `<namespace>:<rest>` — a synthetic flat signal key (e.g. the DES HMI's `DES:<path>.state`). */
+const NAMESPACED_KEY = /^[A-Za-z][\w-]*:/;
+
+/**
+ * A Map that counts removals (`delete` of a present key, `clear` of a non-empty
+ * map) — what lets {@link SignalStore.buildIndex} stay incremental without
+ * tracking every write site of the path index.
+ */
+class RemovalCountingMap<K, V> extends Map<K, V> {
+  removals = 0;
+  override delete(key: K): boolean {
+    const removed = super.delete(key);
+    if (removed) this.removals++;
+    return removed;
+  }
+  override clear(): void {
+    if (this.size > 0) this.removals++;
+    super.clear();
+  }
+}
+
 /** Addresses one subscription across renames (see `subscribe`). */
 interface ListenerRef {
   name: string;
@@ -277,7 +298,15 @@ export class SignalStore {
   /** Canonical value store keyed by name (Signal.Name if set, otherwise node name). */
   private byName = new Map<string, boolean | number>();
   /** Path → name mapping for path-based access. */
-  private pathToName = new Map<string, string>();
+  private pathToName = new RemovalCountingMap<string, string>();
+  /**
+   * plan-774 Phase 4: keys of {@link pathToName} whose suffixes {@link buildIndex}
+   * already added — the index is INCREMENTAL. Valid only while no key was removed
+   * since (`pathToName.removals === _indexedAtRemovals`); a removal can free a
+   * suffix another path would claim, so it forces the next build to be full.
+   */
+  private _indexedPaths = new Set<string>();
+  private _indexedAtRemovals = 0;
   /** PLC type per signal name (e.g. 'PLCOutputBool', 'PLCInputFloat'). */
   private typeByName = new Map<string, string>();
   /** Optional descriptive metadata (address/comment/source) per signal name. */
@@ -334,6 +363,17 @@ export class SignalStore {
   private pathsByName = new Map<string, Set<string>>();
   /** plan-589 spike: listeners of {@link onCatalogChanged}. */
   private catalogListeners = new Set<(change: SignalCatalogChange) => void>();
+  /**
+   * plan-673: listeners of {@link onSignalAdded}. Deliberately a SECOND, much
+   * narrower channel than {@link onCatalogChanged} — the catalog event is a
+   * once-per-wave summary the editor sync emits by hand, while this one fires
+   * per NEW name inside `register()`, which runs thousands of times during a
+   * model load. The set is therefore normally EMPTY: only a consumer that is
+   * waiting for a specific name subscribes (today: an operator panel whose
+   * config names a signal a lazy feature has not registered yet), and
+   * `register()` pays one `size > 0` check when nobody is.
+   */
+  private signalAddedListeners = new Set<(name: string) => void>();
   /**
    * Optional connection provider injected by the interface layer (e.g. CONNECT
    * adapter / InterfaceManager). Given a `SignalMeta.source` label it returns
@@ -625,7 +665,8 @@ export class SignalStore {
     now: number,
   ): void {
     this._recordWriter(name, writer, now);
-    if (name.includes('/') && !this.byName.has(name)) {
+    // A namespaced key (`DES:<component path>.state`) is a flat synthetic name, not a hierarchy path.
+    if (name.includes('/') && !this.byName.has(name) && !NAMESPACED_KEY.test(name)) {
       console.warn(`[SignalStore] set() called with path "${name}" — use setByPath() for hierarchy paths`);
     }
     if (this.forced.has(name)) {
@@ -851,6 +892,17 @@ export class SignalStore {
   }
 
   /** Number of currently forced signals. */
+  /** Replace snapshot values, bypassing live writer authority and external sinks. */
+  replaceSnapshotValues(values: ReadonlyMap<string, boolean | number>): void {
+    for (const name of this.byName.keys()) if (!values.has(name)) this.byName.delete(name);
+    for (const [name, value] of values) this._apply(name, value);
+  }
+
+  /** Restore pins without invoking external force sinks. */
+  replaceForcePins(pins: ReadonlyMap<string, boolean | number>): void {
+    this.forced = new Map(pins);
+  }
+
   get forcedCount(): number {
     return this.forced.size;
   }
@@ -1016,6 +1068,8 @@ export class SignalStore {
    * Results are cached so suffix scans only happen once per unique path.
    */
   private _resolvePath(path: string): string | undefined {
+    // Callers pass slot values straight from component data; a non-string must not throw below.
+    if (typeof path !== 'string') return undefined;
     // Fast path: exact match (covers pre-resolved paths from NodeRegistry.resolve())
     const direct = this.pathToName.get(path);
     if (direct !== undefined) return direct;
@@ -1254,7 +1308,11 @@ export class SignalStore {
    * @param initialValue Default value
    */
   register(name: string, path: string, initialValue: boolean | number, plcType?: string): void {
-    if (!this.byName.has(name)) {
+    // plan-673: "this name was not in the store a moment ago" — the one fact
+    // a late-binding consumer needs (see {@link onSignalAdded}). Taken BEFORE
+    // the insert, announced after the registration is complete.
+    const isNewName = !this.byName.has(name);
+    if (isNewName) {
       this.byName.set(name, initialValue);
     }
     // plan-589 spike: a path re-registered under ANOTHER name moves its
@@ -1274,6 +1332,52 @@ export class SignalStore {
     this.nameToPath.set(name, path);
     if (plcType) this.typeByName.set(name, plcType);
     debug('signal', `register "${name}" path="${path}" initial=${initialValue}`);
+    if (isNewName && this.signalAddedListeners.size > 0) this._notifySignalAdded(name);
+  }
+
+  /**
+   * Subscribe to "a signal name that was NOT in the store has just been
+   * registered" (plan-673). Returns the unsubscribe function.
+   *
+   * For consumers that are configured against names which may arrive LATE —
+   * a lazy feature registers its interface only when its chunk and its WASM
+   * are in, which on the MuJoCo walker is 8-17 s after the model loaded. Such
+   * a consumer subscribes while it is missing something and unsubscribes the
+   * moment it is complete, which keeps `register()`'s hot path free.
+   *
+   * It is NOT a value channel: use {@link subscribe} for values. A listener
+   * that throws is reported and does not stop the registration.
+   */
+  onSignalAdded(cb: (name: string) => void): () => void {
+    this.signalAddedListeners.add(cb);
+    return () => { this.signalAddedListeners.delete(cb); };
+  }
+
+  private _notifySignalAdded(name: string): void {
+    for (const cb of [...this.signalAddedListeners]) {
+      try { cb(name); } catch (e) { console.warn('[signal-store] signal-added listener failed:', e); }
+    }
+  }
+
+  /**
+   * Add an OWNER path to a signal WITHOUT moving its preferred path (plan-645
+   * L6, additive). Unlike {@link register}, `nameToPath` is only set when the
+   * name has none yet - a model path stays what `getPath(name)` returns while
+   * the extra owner exists and after it is released. The owner counts like any
+   * other: {@link unregisterPath} of the last owner removes the name (unless an
+   * interface owns it). Returns false (nothing changed) when the path is
+   * already claimed.
+   */
+  addOwnerPath(name: string, path: string, initialValue: boolean | number): boolean {
+    if (!path || this.pathToName.has(path)) return false;
+    if (!this.byName.has(name)) this.byName.set(name, initialValue);
+    let owners = this.pathsByName.get(name);
+    if (!owners) { owners = new Set(); this.pathsByName.set(name, owners); }
+    owners.add(path);
+    this.pathToName.set(path, name);
+    if (!this.nameToPath.has(name)) this.nameToPath.set(name, path);
+    this.resolveCache.delete(path);
+    return true;
   }
 
   /**
@@ -1314,10 +1418,25 @@ export class SignalStore {
    * so `_resolvePath()` always hits on the direct `Map.get()` call
    * without needing runtime suffix scans.
    * Call once after loading completes.
+   *
+   * plan-774 Phase 4: incremental. Every placement, every library component
+   * and every drive-behaviour construction calls this after registering its
+   * signals; rebuilding every suffix of every path each time was quadratic
+   * (PlannerGate30: 128 placements → ~480 ms of a 1.8 s editor open). A key
+   * whose suffixes were already added is skipped — re-splitting it can add
+   * nothing, because none of its suffixes was removed since (any removal from
+   * the map resets the index, so first-wins re-claims stay exactly as in a
+   * full rebuild).
    */
   buildIndex(): void {
+    if (this._indexedAtRemovals !== this.pathToName.removals) {
+      this._indexedPaths.clear();
+      this._indexedAtRemovals = this.pathToName.removals;
+    }
     const additions = new Map<string, string>();
     for (const [registeredPath, name] of this.pathToName) {
+      if (this._indexedPaths.has(registeredPath)) continue;
+      this._indexedPaths.add(registeredPath);
       const parts = registeredPath.split('/');
       for (let i = 1; i < parts.length; i++) {
         const suffix = parts.slice(i).join('/');
@@ -1330,6 +1449,9 @@ export class SignalStore {
     for (const [path, name] of additions) {
       this.pathToName.set(path, name);
     }
+    // The added suffix keys are processed too in a full rebuild; theirs are
+    // sub-suffixes of the same path, all present now — nothing left to add.
+    for (const path of additions.keys()) this._indexedPaths.add(path);
     this.resolveCache.clear();
     if (additions.size > 0) {
       debug('signal', `buildIndex: added ${additions.size} suffix entries (${this.pathToName.size} total path mappings)`);
@@ -1723,6 +1845,33 @@ export class SignalStore {
    * report a leak indicator that `size` alone cannot ("signals stable, listener
    * count climbing" is the classic teardown bug).
    */
+  /**
+   * Listener count per signal name (plan-600 F11) — the per-name number
+   * {@link stats} cannot give, which only sums a total.
+   *
+   * Reads the **`listeners`** map, NOT `listenerRefs`. The distinction is not
+   * cosmetic: `listeners` holds a `Set` of callbacks and therefore DEDUPLICATES
+   * the same callback reference, while `listenerRefs` counts `subscribe` calls.
+   * Subscribing the identical reference twice was measured as 3 -> 4 on
+   * `listeners` but 3 -> 5 on the refs (spike 2026-10-13), so a diagnostic
+   * reading the refs would report a leak that does not exist. This function
+   * must never claim to count subscribe calls.
+   *
+   * Read-only; names with zero listeners are absent, never present with 0.
+   */
+  listenerCounts(): Map<string, number> {
+    const out = new Map<string, number>();
+    for (const [name, set] of this.listeners) {
+      if (set.size > 0) out.set(name, set.size);
+    }
+    return out;
+  }
+
+  /** Listener count for one signal name; 0 when nothing is subscribed. */
+  listenerCount(name: string): number {
+    return this.listeners.get(name)?.size ?? 0;
+  }
+
   stats(): SignalStoreStats {
     let listeners = 0;
     for (const set of this.listeners.values()) listeners += set.size;

@@ -19,9 +19,12 @@
  * shrank with every migration; after plan-499 Phase 4 it held 55 of 89, after
  * plan-504 (the Mechanism section) 44 of 89, after plan-506 45 of 90 (the
  * document description is a text field) — each with a reason and none of
- * them "not yet migrated".
+ * them "not yet migrated". plan-773 Phase 3 Nachtrag (2026-10-23) made it
+ * shrink again rather than grow: its seven IK authoring writes are views of
+ * `ik.*` commands, 67 of 144.
  */
 
+import { movedToolOf } from '../src/plugins/mcp-bridge/rv-mcp-moved-tools';
 import { beforeAll, describe, expect, it } from 'vitest';
 import {
   listToolEntries,
@@ -31,12 +34,25 @@ import {
   type ToolCommandBinding,
 } from '../src/core/engine/rv-mcp-tools';
 import { CommandRegistry, type CommandArgType } from '../src/core/hmi/rv-command-registry';
-import { ensureEditorCommandsRegistered, PIVOT_BRANCHES } from '../src/core/hmi/editor-command-descriptors';
+import { ensureEditorCommandsRegistered, PIVOT_BRANCHES, PIVOT_BINDING, SHORTCUT_BRANCHES, ASSIGN_TO_KINEMATIC_BRANCHES } from '../src/core/hmi/editor-command-descriptors';
 import { ensurePlannerCommandsRegistered } from '../src/plugins/layout-planner/planner-commands';
 import { ensureSimCommandsRegistered } from '../src/plugins/sim-controller/sim-commands';
 import { ensureViewCommandsRegistered } from '../src/core/hmi/view-commands';
+import { ensureSessionOverlayCommandsRegistered } from '../src/core/hmi/session-overlay-commands';
+import { ensureComponentCommandsRegistered } from '../src/core/hmi/component-commands';
+import { ensureQueryCommandsRegistered } from '../src/core/hmi/query-commands';
+import { ensureDocumentCommandsRegistered } from '../src/core/hmi/document-commands';
+import { ensureSignalAutomapCommandsRegistered } from '../src/core/hmi/signal-automap-commands';
+import { ensureDesPlcCommandsRegistered } from '../src/core/hmi/des-plc-commands';
 import { ensureMechanismCommandsRegistered } from '../src/core/hmi/mechanism-command-descriptors';
 import { ensureMuCommandsRegistered } from '../src/plugins/mu-interaction-plugin';
+import { ensureSolidCraftCommandsRegistered } from '../src/core/hmi/solidcraft-command-descriptors';
+import { ensureKnowledgeCommandsRegistered } from '../src/plugins/mcp-bridge/rv-mcp-knowledge-tools';
+import { ensureDocumentInfoCommandsRegistered } from '../src/plugins/mcp-bridge/rv-mcp-document-info-tools';
+import { ensureSignalBindCommandsRegistered } from '../src/plugins/mcp-bridge/rv-mcp-signal-bind-tools';
+import { ensureGenerateUVsCommandRegistered, ensureSeparateCommandRegistered } from '../src/plugins/mcp-bridge/rv-mcp-editor-tools';
+import { ensureLibraryCommandsRegistered } from '../src/core/library/library-commands';
+import { ensureIkCommandsRegistered } from '../src/plugins/mcp-bridge/rv-mcp-robot-tools';
 
 // ─── The allow-list (measured, shrinking) ───────────────────────────────
 
@@ -51,32 +67,27 @@ const VIEWPORT_SELECT =
 const AGENT_CAMERA =
   'moves the AGENT camera (split view / screenshots), which has no UI of its own — the user camera is '
   + 'navigated with the mouse, so there is no button to press or to glow';
-const VIEW_SETTING =
-  'display setting / view state (a switch or eye toggle) — a state setter without an enablement rule, so '
-  + 'nothing can drift between tool and UI; settings toggles are not commands (as the planner toggles, §4 Phase 3)';
 const DOC_LIFECYCLE =
   'document / project lifecycle flow (picker, save card, dirty prompt, folder permission) with its own '
   + 'confirmation dialogs, answered for MCP by the dialog policy — not a one-click action with an enabled() rule';
-const FILE_IMPORT =
-  'file import from the open project (relPath, provider conversion, long-running) — the UI path is a file '
-  + 'picker / drag-and-drop, not a button';
-const FIELD_INPUT =
-  'numeric / text form input (a field editor per value, not a button); the op log books it undoably either way';
 const AGENT_ONLY =
   'agent-only routine without a UI counterpart';
-/** plan-504: the one mechanism write tool that stays a direct tool. */
-const FIELD_INPUT_ANCHOR =
-  'field input: millimetre anchor coordinates typed as JSON — there is no field editor to be a view of; '
-  + 'the Anchor A/B pick buttons cover web_editor_mechanism_set_anchor_snap';
-/** plan-729: path / waypoint authoring — no mechanism.* command (merge with plan-504, see the reason). */
-const MECHANISM_PATH_AUTHORING =
-  'plan-729 path / waypoint authoring: the Paths & Targets rows and the tool call the same planners (planCreateTarget / planCreatePath / planAddWaypoint / planRemoveWaypoint / planReorderWaypoints) through commitMechanismPlan without a solver rebuild; there is no mechanism.* command descriptor for them, so neither side carries an enablement rule or a button key';
-/** plan-501: CSV import of a sampled path. */
-const MECHANISM_TRAJECTORY_IMPORT =
-  'plan-501 trajectory import: a CSV text / project file payload parsed by the bridge (parseTrajectoryCsv) and written as one undoable composite — the panel\'s "Import CSV" is a file picker, not a button with an enablement rule';
-/** plan-501: the offline sizing run. */
-const MECHANISM_TRAJECTORY_RUN =
-  'plan-501 offline sizing run: a transient, cancellable bridge computation (runTrajectory) that changes no document — the panel\'s Run sizing / Cancel toggles the same bridge run, a session toggle, not an edit';
+/** plan-641: switching a macro recording on / off. */
+const MACRO_SESSION =
+  'agent-only macro recording session (plan-641): switches the recorder of MCP command calls on / off — a session '
+  + 'toggle with no UI counterpart in Stufe 1, it changes no model state itself';
+/**
+ * plan-773 Phase 3 Nachtrag (2026-10-23): the seven IK authoring tools are
+ * BOUND, so nothing of them is left here.
+ *
+ * Phase 3 had put them on this list with the reason that an `ik.*` command
+ * would have "no second caller and no button to glow". That weighed two of the
+ * three things a binding buys and missed the third: a bound tool is not listed
+ * separately in `tools/list`, so the surface an agent reads shrinks instead of
+ * growing by seven — and this list is meant to shrink with every migration.
+ * They are now views of `ik.robot.rig` / `ik.path.create` / `ik.target.add` /
+ * `_set` / `_remove` / `_reorder` / `_solve` (`rv-mcp-robot-tools.ts`).
+ */
 
 /**
  * Write tools WITHOUT a command binding, each with its reason (plan-499 Phase 4
@@ -85,16 +96,34 @@ const MECHANISM_TRAJECTORY_RUN =
  * tool means binding it to a command or adding it here with a reason
  * (webviewer.mcp.md).
  */
+/**
+ * Bound tools that are READ-ONLY, each with the reason a binding was worth it
+ * anyway (plan-773 Phase 5, 2026-10-24).
+ *
+ * Every binding before this one was a write, because the migration's purpose
+ * was to give a write tool the enablement rule and the button its UI
+ * counterpart already had. A read tool had nothing to gain — so "bound implies
+ * write" held by construction rather than by design.
+ *
+ * `web_robot_program_export` is the first tool for which the other two reasons
+ * apply on their own: it has a real UI counterpart (the Export button on the
+ * IKPath inspector, plan-773 F19), and a binding is what gives the button and
+ * the tool ONE implementation — which is the whole point of putting the licence
+ * gate (E3), the F21 forward-kinematics check and the E9 refusals on a path
+ * both callers must traverse. Annotating it as a write to satisfy the old
+ * invariant would be worse than widening the invariant: it writes nothing, and
+ * a client that gates writes would refuse a read.
+ */
+export const BOUND_READ_ONLY_TOOLS: Readonly<Record<string, string>> = {};
+
 export const NO_UI_WRITE_TOOLS: Readonly<Record<string, string>> = {
-  // ── PLC auto-map (plan-545) ──
-  web_signal_automap: 'the ConnectPanel auto-map strip (Check / Apply) and this tool call the same '
-    + 'connect-store actions (checkAutoMap / applyAutoMap); interface config, not a command-registry entry',
+  // ── USD export (plan-764) ──
+  web_export_usd: 'the document card\'s "Export USD…" verb and this tool run the same bound provider export '
+    + '(ActiveDocumentFileExport.run from the view seam, not a command-registry entry); it writes a file into '
+    + 'the project and changes no document or scene state',
   // ── Video recording (plan-537) ──
   web_record_video: 'internal recording tool (CLI npm run record + MCP); no UI button by design, '
     + 'it writes an MP4 into the project and changes no scene state',
-  // ── Simulation / PLC mode (plan-539 F15) ──
-  web_sim_mode: 'the TopBar Simulation / PLC toggle and this tool call the same controller '
-    + '(viewer.connectionMode.setMode); not yet a command-registry entry',
   // ── selection / measurement ──
   web_select: VIEWPORT_SELECT,
   web_node_bounds: 'measurement (read); its only write is selecting the measured nodes — a viewport pick, no button',
@@ -105,57 +134,43 @@ export const NO_UI_WRITE_TOOLS: Readonly<Record<string, string>> = {
   // ── agent camera ──
   web_camera_projection: AGENT_CAMERA, web_camera_set: AGENT_CAMERA, web_camera_focus: AGENT_CAMERA,
   web_camera_orbit: AGENT_CAMERA, web_camera_view: AGENT_CAMERA, web_camera_fly: AGENT_CAMERA,
-  // ── view state / settings ──
-  web_view_isolate: VIEW_SETTING, web_view_source_markers: VIEW_SETTING,
-  web_group_set_visible: VIEW_SETTING, web_group_set_listed: VIEW_SETTING,
-  web_mode_set: 'workspace switch (mode dropdown) — navigation, not an action on the document; the mode manager owns its guards',
   // ── document / project lifecycle ──
   web_editor_open: DOC_LIFECYCLE, web_editor_close: DOC_LIFECYCLE, web_editor_save: DOC_LIFECYCLE,
   web_editor_descend: DOC_LIFECYCLE, web_editor_back: DOC_LIFECYCLE,
-  web_document_open: DOC_LIFECYCLE, web_document_save: DOC_LIFECYCLE, web_document_new: DOC_LIFECYCLE,
-  web_document_update: DOC_LIFECYCLE, web_document_bind: DOC_LIFECYCLE,
+  web_document_open: DOC_LIFECYCLE, web_document_save: DOC_LIFECYCLE,
   web_project_open: DOC_LIFECYCLE, web_project_folder: DOC_LIFECYCLE,
-  // ── import ──
-  web_editor_import_glb: FILE_IMPORT, web_editor_import_cad: FILE_IMPORT,
-  // ── form input ──
-  web_editor_transform: FIELD_INPUT, web_component_set: FIELD_INPUT,
-  web_knowledge_set: 'knowledge note = an inspector TEXT FIELD (rv-node-knowledge-field-renderer), durable agent memory — not a button',
-  // plan-506: same shape as web_knowledge_set, one level up — a document, not a node.
-  web_document_info_set: 'description = a detail-pane TEXT FIELD (DocumentInfoEditor), summary + Markdown committed on blur — not a button',
-  web_signal_bind: 'signal-binding editor: target + component path + slot + source picked in the binding dialog — a form, not a button',
-  web_signal_unbind: 'signal-binding editor: target + component path + slot picked in the binding dialog — a form, not a button',
   // ── agent routines / multi-target ops ──
-  web_editor_kinematize: 'compound agent macro (group + Drive + direction/speed/limits + pivot) in one undo step — the UI reaches it in several Quick Edit steps, each a command',
   web_editor_verify_drive: AGENT_ONLY + ' (select axis, aim the agent camera, jog, capture frames)',
-  web_editor_separate:
-    'multi-target mesh operation with a per-mesh partial-success report (separated / skipped) — a command '
-    + 'refuses with ONE reason, this tool must continue past individual meshes; the context menu runs the same mesh-separator op',
   // ── prompt queue — plan-486 follow-up (plan-761) ──
   // The agent's end of the prompt queue: the UI only ENQUEUES a task on a node
   // (the prompt field), nothing in the UI claims one. A claim mutates the
   // browser-tab task store, never the scene.
   web_prompt_claim: AGENT_ONLY + ' (plan-486 prompt queue: the UI enqueues, only the agent claims; a browser-tab store mutation, not a scene action)',
-  // 8a34c524 (2026-10-08), absorbed at the 6.4.0 release: the session-only collision check.
-  web_collision_watch: AGENT_ONLY + ' (session-only collision roles for an agent check; nothing is saved into the model and there is no UI counterpart)',
-  web_collision_reset: AGENT_ONLY + ' (clears the latched pairs / roles of web_collision_watch; session-only, no UI counterpart)',
   // ── runtime sessions / kernels ──
   web_editor_test_start: 'in-place test SESSION lifecycle (async materialise / attach / restore, arms force recording) — it owns the test-run lock every authoring command refuses on; its toolbar Play/Stop is a session toggle, not an edit',
   web_editor_test_stop: 'in-place test SESSION lifecycle (restores the authoring state) — the counterpart of web_editor_test_start, a session toggle, not an edit',
-  web_des_step: 'discrete-event kernel stepping, only meaningful in DES mode — a kernel control without an enablement rule (the DES toolbar is outside the four plan-499 surfaces)',
-  web_des_set_mode: 'DES sub-mode selector (animated / hybrid / fastforward / step) — a mode setter without an enablement rule',
-  web_plc_deploy: 'virtual PLC: compiles Structured Text source passed as a parameter — the UI is a code editor, not a button',
-  web_plc_run: 'virtual PLC scan-cycle state (run) — a kernel state setter without an enablement rule; errors are reported by the compiler/scan, not as a precondition',
-  web_plc_stop: 'virtual PLC scan-cycle state (warm stop) — a kernel state setter without an enablement rule',
-  // ── mechanism authoring (plan-504: the other eleven are bound) ──
-  web_editor_mechanism_set_anchor: FIELD_INPUT_ANCHOR,
-  // ── plan-729 Cartesian paths / plan-501 drive sizing (unbound, each with its reason) ──
-  web_editor_mechanism_add_target: MECHANISM_PATH_AUTHORING,
-  web_editor_mechanism_path_create: MECHANISM_PATH_AUTHORING,
-  web_editor_mechanism_path_add_waypoint: MECHANISM_PATH_AUTHORING,
-  web_editor_mechanism_path_remove_waypoint: MECHANISM_PATH_AUTHORING,
-  web_editor_mechanism_path_move_waypoint: MECHANISM_PATH_AUTHORING,
-  web_editor_mechanism_trajectory_import: MECHANISM_TRAJECTORY_IMPORT,
-  web_editor_mechanism_trajectory_run: MECHANISM_TRAJECTORY_RUN,
+  // ── plan-641: the reduced command interface + macros ──
+  web_execute: 'generic dispatcher OF the command registry (commandRegistry.execute by id) — it is the own MCP door of the registry, '
+    + 'so binding it to one command would be a contradiction; every rule, refusal and undo step comes from the command it names',
+  web_batch: 'runs several registry commands in order through the same wrapper as web_execute (one dispatch per step) — '
+    + 'a sequence of commands, not one command with an enablement rule',
+  web_macro_record_start: MACRO_SESSION,
+  web_macro_record_stop: MACRO_SESSION,
+  web_macro_annotate: 'edits the note (reason / source) of a recorded macro line — macro metadata of the document, no model change and no button',
+  web_macro_save: 'writes a recorded macro as readable JSON into the project folder (macros/<name>.macro.json); changes no document or scene state',
+  web_macro_replay: 'starts a replay JOB that runs the recorded command lines one by one through the registry (each line IS a command '
+    + 'dispatch) — a job lifecycle (status / cancel), not one command',
+  web_macro_cancel: 'stops a running replay / batch job between two lines — a job control without an enablement rule, no model change',
+  web_macro_import: 'takes a macro from the project folder or inline JSON into the book of the open document — macro metadata, '
+    + 'no model change and no button',
+  // ── plan-650 parametric families ──
+  web_editor_parametric_define: AGENT_ONLY + ' (plan-650: defines a parametric family — schema, rule code and parts root '
+    + 'in one step plus the first variant; there is no button, the inspector only edits the values of an existing family)',
+  web_editor_parametric_set: 'parameter mask = inspector FIELD INPUTS (rv-parametric-values-field) — values typed or picked per '
+    + 'parameter, committed at the end of an edit; a form, not a button',
+  web_macro_assert: 'adds an assertion line (a geometry check with an expectation) to a macro — macro metadata of the document, '
+    + 'measured read-only; no model change and no button',
+  // ── plan-773: the seven `web_robot_*` writes are BOUND to `ik.*` — see above ──
 };
 
 /** Hand-kept branch → command expectation (NOT derived from the resolver). */
@@ -178,6 +193,7 @@ const EXPECTED_BRANCHES: Readonly<Record<string, Readonly<Record<string, string>
     '{"keys":"CTRL+Y"}': 'editor.redo',
     '{"keys":"ESCAPE"}': 'selection.clear',
     '{"keys":"SHIFT+Z"}': 'editor.wireframe',
+    '{"keys":"T"}': 'editor.toggleTransformTool',
   },
   web_editor_assign_to_kinematic: {
     '{}': 'editor.assignToKinematic',
@@ -323,8 +339,22 @@ ensureEditorCommandsRegistered(registry);
 ensurePlannerCommandsRegistered(registry);
 ensureSimCommandsRegistered(registry);
 ensureViewCommandsRegistered(registry);
+ensureSessionOverlayCommandsRegistered(registry);
+ensureComponentCommandsRegistered(registry);
+ensureQueryCommandsRegistered(registry);
+ensureDocumentCommandsRegistered(registry);
+ensureSignalAutomapCommandsRegistered(registry);
+ensureDesPlcCommandsRegistered(registry);
 ensureMechanismCommandsRegistered(registry);
 ensureMuCommandsRegistered(registry);
+ensureSolidCraftCommandsRegistered(registry);
+ensureKnowledgeCommandsRegistered(registry);
+ensureDocumentInfoCommandsRegistered(registry);
+ensureSignalBindCommandsRegistered(registry);
+ensureSeparateCommandRegistered(registry);
+ensureGenerateUVsCommandRegistered(registry);
+ensureLibraryCommandsRegistered(registry);
+ensureIkCommandsRegistered(registry);
 
 beforeAll(async () => {
   const { McpBridgePlugin } = await import('../src/plugins/mcp-bridge-plugin');
@@ -341,9 +371,99 @@ beforeAll(async () => {
 
 // ─── Tests ──────────────────────────────────────────────────────────────
 
+const FORMER_BINDINGS: Record<string, readonly string[]> = {
+  web_signal_set_bool: ['signal.setBool'],
+  web_signal_set_float: ['signal.setFloat'],
+  web_drive_jog: ['drive.jog'],
+  web_sim_play_pause: ['sim.playPause'],
+  web_view_render_mode: ['view.renderMode'],
+  web_view_visual_preset: ['view.visualPreset'],
+  web_sim_reset: ['sim.reset'],
+  web_drive_stop: ['drive.stop'],
+  web_drive_speed_override: ['sim.speedOverride'],
+  web_mu_delete: ['mu.delete'],
+  web_mu_move: ['mu.move'],
+  web_library_attach: ['library.attach'],
+  web_library_detach: ['library.detach'],
+  web_layout_place: ['layout.place'],
+  web_layout_move: ['layout.move'],
+  web_layout_remove: ['layout.remove'],
+  web_layout_snap_attach: ['layout.snapAttach'],
+  web_robot_rig_from_library: ['ik.robot.rig'],
+  web_robot_path_create: ['ik.path.create'],
+  web_robot_target_add: ['ik.target.add'],
+  web_robot_target_set: ['ik.target.set'],
+  web_robot_target_remove: ['ik.target.remove'],
+  web_robot_target_reorder: ['ik.target.reorder'],
+  web_robot_solve_target: ['ik.target.solve'],
+  web_robot_program_export: ['ik.program.export'],
+  web_signal_bind: ['signal.bind'],
+  web_signal_unbind: ['signal.unbind'],
+  web_knowledge_set: ['knowledge.set'],
+  web_document_info_set: ['document.infoSet'],
+  web_editor_undo: ["editor.undo"],
+  web_editor_redo: ["editor.redo"],
+  web_editor_transform: ["editor.transform"],
+  web_editor_zero_position: ["editor.zeroPosition"],
+  web_editor_rotate90: ["editor.rotate90"],
+  web_editor_to_ground: ["editor.toGround"],
+  web_editor_pivot: PIVOT_BRANCHES.map((b) => b.id),
+  web_editor_rename: ["editor.rename"],
+  web_editor_delete: ["editor.delete"],
+  web_editor_set_visible: ["editor.setVisible"],
+  web_editor_separate: ["editor.separate"],
+  web_editor_generate_uvs: ["editor.generateUVs"],
+  web_editor_create_empty: ["editor.createEmpty"],
+  web_editor_reparent: ["editor.reparent"],
+  web_editor_add_component: ["editor.addComponent"],
+  web_editor_remove_component: ["editor.removeComponent"],
+  web_editor_set_field: ["editor.setField"],
+  web_editor_mechanism_create: ["mechanism.create"],
+  web_editor_mechanism_add_joint: ["mechanism.addJoint"],
+  web_editor_mechanism_assign_drive: ["mechanism.assignDrive"],
+  web_editor_mechanism_jog: ["mechanism.jog"],
+  web_editor_mechanism_set_anchor_snap: ["mechanism.setAnchorSnap"],
+  web_editor_mechanism_set_axis: ["mechanism.setAxis"],
+  web_editor_mechanism_add_body: ["mechanism.addBody"],
+  web_editor_mechanism_set_mass: ["mechanism.setMass"],
+  web_editor_mechanism_set_limits: ["mechanism.setLimits"],
+  web_editor_mechanism_statics: ["mechanism.statics"],
+  web_editor_mechanism_fix: ["mechanism.fix"],
+  web_editor_solidcraft_connect: ["solidcraft.connect"],
+  web_editor_solidcraft_resync: ["solidcraft.resync"],
+  web_editor_solidcraft_disconnect: ["solidcraft.disconnect"],
+  web_editor_create_kinematic: ["editor.createKinematic"],
+  web_editor_assign_to_kinematic: ASSIGN_TO_KINEMATIC_BRANCHES.map((b) => b.id),
+  web_editor_group_assign: ["editor.groupAssign"],
+  web_editor_group_remove: ["editor.groupRemove"],
+  web_editor_group_rename: ["editor.groupRename"],
+  web_editor_group_dissolve: ["editor.groupDissolve"],
+  web_editor_add_signal: ["editor.addSignal"],
+  web_editor_convert_signal: ["editor.convertSignal"],
+  web_editor_toggle_signal_direction: ["editor.toggleSignalDirection"],
+  web_editor_signal_set_field: ["editor.signalSetField"],
+  web_editor_signal_set_binding: ["editor.signalSetBinding"],
+  web_editor_signals_create_from_interface: ["editor.signalsCreateFromInterface"],
+  web_editor_signal_rename: ["editor.signalRename"],
+  web_editor_signal_rename_repair: ["editor.signalRenameRepair"],
+  web_editor_signal_rename_recheck: ["editor.signalRenameRecheck"],
+  web_editor_add_logic_step: ["editor.addLogicStep"],
+  web_editor_shortcut: SHORTCUT_BRANCHES.map((b) => b.id),
+  web_editor_assign_material: ["editor.assignMaterial"],
+  web_editor_materialize: ["editor.materialize"],
+};
+
 describe('parity gate (metadata)', () => {
+  it('every former binding has exactly its command targets and no decorated alias', () => {
+    for (const [name, ids] of Object.entries(FORMER_BINDINGS)) {
+      expect(entries.some((e) => e.name === name), name).toBe(false);
+      expect(movedToolOf(name)?.movedTo, name).toEqual(ids);
+      for (const id of ids) expect(registry.get(id), id).toBeDefined();
+    }
+  });
   it('every write tool is bound or explicitly allow-listed with a reason', () => {
-    expect(entries.length).toBeGreaterThan(100);
+    expect(entries.length).toBe(74);
+    expect(entries.filter((e) => e.command)).toEqual([]);
     expect(() => gate(entries, registry, EXPECTED_BRANCHES, NO_UI_WRITE_TOOLS)).not.toThrow();
   });
 
@@ -380,12 +500,46 @@ describe('parity gate (metadata)', () => {
   // nothing else, until that commit's own follow-up fixes them.
   // 6.4.0 release: the two collision write tools absorbed as allow-listed (117 writes / 59
   // bound / 58 allow-listed) — the NOTE above is resolved.
-  it('allow-list final: measured counts after plan-504 + plan-506 + plan-729/501 + plan-760 + plan-539 + plan-537 + plan-545 + plan-761 + plan-486 + plan-567 + plan-589 + plan-590 + plan-591 + 6.4.0 collision (117 writes, 59 bound, 58 allow-listed)', () => {
+  // plan-764: the allow-listed `web_export_usd` (118 writes / 59 bound / 59 allow-listed).
+  // plan-764 Phase 2: the allow-listed `web_import_usd_extras_commit` (119 / 59 / 60);
+  // its preview `web_import_usd_extras` is read-only.
+  // plan-629: the allow-listed `web_trace_set` (120 / 59 / 61); `web_trace_top` is read-only.
+  // plan-621: the three BOUND SolidCraft tools `web_editor_solidcraft_connect` / `_resync` /
+  // `_disconnect` (views of `solidcraft.connect` / `.resync` / `.disconnect`; 123 / 62 / 61).
+  // plan-641 Phases 0-2: `web_editor_transform` becomes BOUND (view of `editor.transform`),
+  // eight new writes are allow-listed (web_execute, web_batch, web_macro_record_start / _stop /
+  // _annotate / _save / _replay / _cancel) — 131 / 63 / 68.
+  // plan-641 Phases 4-5: the allow-listed `web_macro_assert` (132 / 63 / 69); `web_check_gap`,
+  // `web_check_contact` and `web_part_lookup` are read-only.
+  // plan-641 Phase 2b: the allow-listed `web_macro_import` (133 / 63 / 70).
+  // plan-641 Nachtrag 2026-10-21: `web_knowledge_set` becomes BOUND (view of the macro
+  // command `knowledge.set`) — 133 / 64 / 69; `web_document_info_set` BOUND (view of
+  // `document.infoSet`, not a macro command) — 133 / 65 / 68; `web_signal_bind` / `_unbind`
+  // BOUND (macro commands `signal.bind` / `signal.unbind`) — 133 / 67 / 66; `web_editor_separate`
+  // BOUND (macro command `editor.separate`, partial via `skipped`) — 133 / 68 / 65;
+  // merged with plan-650 (+2 allow-listed writes) — 135 / 68 / 67.
+  // plan-655: the two BOUND library tools `web_library_attach` / `_detach` (views of
+  // `library.attach` / `library.detach` — the Add-library dialog and Remove library)
+  // — 137 / 70 / 67, allow-list unchanged; `web_library_list` is read-only.
+  // plan-773 Phases 1-2: the allow-listed `web_robot_rig_from_library` — 138 / 70 / 68. The other
+  // five `web_robot_*` tools are read-only (the rig DIAGNOSIS included: it derives and reports
+  // without writing).
+  // plan-773 Phase 3: six more allow-listed writes — `web_robot_path_create`, `_target_add`,
+  // `_target_set`, `_target_remove`, `_target_reorder`, `_solve_target` — 144 / 70 / 74.
+  // `web_robot_path_inspect` is read-only.
+  // plan-773 Phase 3 Nachtrag (2026-10-23): all SEVEN of those writes become BOUND — views of
+  // `ik.robot.rig` / `ik.path.create` / `ik.target.add` / `_set` / `_remove` / `_reorder` /
+  // `_solve` — so the allow-list SHRINKS by seven for the first time since plan-641:
+  // 144 / 77 / 67. No tool is added or removed, which is why the write count stays at 144.
+  it('Phase 6: 36 writes, no bound tools, 36 allow-listed', () => {
     const writes = entries.filter((e) => e.readOnly === false);
     const bound = writes.filter((e) => e.command);
-    expect(writes.length).toBe(117);
-    expect(bound.length).toBe(59);
-    expect(Object.keys(NO_UI_WRITE_TOOLS).length).toBe(58);
+    // plan-2007 Phase 3: eight more mechanism writes moved to commands (114 / 78 / 36).
+    expect(writes.length).toBe(36);
+    expect(bound.length).toBe(0);
+  // plan-675 (merged onto plan-773): `web_editor_generate_uvs` BOUND (macro command
+  // `editor.generateUVs`, partial via `skipped`) — 145 / 78 / 67, allow-list unchanged.
+    expect(Object.keys(NO_UI_WRITE_TOOLS).length).toBe(36);
     expect(Object.keys(NO_UI_WRITE_TOOLS).length).toBe(writes.length - bound.length);
     for (const e of bound) expect(NO_UI_WRITE_TOOLS[e.name], e.name).toBeUndefined();
   });
@@ -397,15 +551,48 @@ describe('parity gate (metadata)', () => {
     }
   });
 
-  it('bound tools are writes, and every bound command exists eagerly in the registry', () => {
+  it('bound tools are writes (or a NAMED read-only view), and every bound command exists eagerly', () => {
     for (const e of entries.filter((x) => x.command)) {
-      expect(e.readOnly, e.name).toBe(false);
+      if (e.readOnly === true) {
+        // Not a hole in the gate: `gate()` above still checks this tool's
+        // annotations against its descriptor (readOnly must match on BOTH
+        // sides), its params, its arity and its args schema. This list only
+        // records that a read-only binding was intended, so a second one is an
+        // edit someone made on purpose rather than a tool that slipped in with
+        // the wrong annotation.
+        expect(BOUND_READ_ONLY_TOOLS[e.name]?.trim(), `${e.name} is bound but read-only and not named`).toBeTruthy();
+      } else {
+        expect(e.readOnly, e.name).toBe(false);
+      }
       const ids = typeof e.command === 'string' ? [e.command] : (e.command as BranchBinding).branches.map((b) => b.id);
       for (const id of ids) expect(registry.get(id), `${e.name} → ${id}`).toBeDefined();
     }
   });
 
-  it('plan-504: the eleven mechanism tools are 1:1 views of mechanism.* (set_anchor stays a field input)', () => {
+  it('every named read-only binding is actually bound (the list cannot carry a stale name)', () => {
+    for (const name of Object.keys(BOUND_READ_ONLY_TOOLS)) {
+      const e = entries.find((x) => x.name === name);
+      expect(e, name).toBeDefined();
+      expect(e?.command, name).toBeTruthy();
+      expect(e?.readOnly, name).toBe(true);
+    }
+  });
+
+  it('plan-621: the three SolidCraft tools are 1:1 views of solidcraft.* — editor scope, no undo label of their own', () => {
+    const sc = Object.keys(FORMER_BINDINGS).filter((name) => name.startsWith('web_editor_solidcraft_')).map((name) => ({ name, command: movedToolOf(name)!.movedTo[0] }));
+    expect(Object.fromEntries(sc.map((e) => [e.name, e.command]))).toEqual({
+      web_editor_solidcraft_connect: 'solidcraft.connect',
+      web_editor_solidcraft_resync: 'solidcraft.resync',
+      web_editor_solidcraft_disconnect: 'solidcraft.disconnect',
+    });
+    for (const id of ['solidcraft.connect', 'solidcraft.resync', 'solidcraft.disconnect']) {
+      const d = registry.get(id)!;
+      expect(d.scope, id).toBe('editor');
+      expect(d.undoLabel, id).toBeUndefined();
+    }
+  });
+
+  it('plan-504 / plan-2007: eleven mechanism aliases and eight migrated commands share the registry', () => {
     const expected: Record<string, string> = {
       web_editor_mechanism_create: 'mechanism.create',
       web_editor_mechanism_add_joint: 'mechanism.addJoint',
@@ -420,22 +607,38 @@ describe('parity gate (metadata)', () => {
       web_editor_mechanism_fix: 'mechanism.fix',
     };
     const mech = entries.filter((e) => e.name.startsWith('web_editor_mechanism_') && e.readOnly === false);
-    expect(Object.fromEntries(mech.filter((e) => e.command).map((e) => [e.name, e.command]))).toEqual(expected);
-    expect(mech.find((e) => e.name === 'web_editor_mechanism_set_anchor')?.command).toBeUndefined();
-    // Twelve descriptors: the eleven bindings plus the UI-only batch.
+    expect(mech).toEqual([]);
+    for (const [name, id] of Object.entries(expected)) expect(movedToolOf(name)?.movedTo).toEqual([id]);
+    expect(mech.find((e) => e.name === 'web_editor_mechanism_set_anchor')).toBeUndefined();
+    // Eleven bindings, the UI-only batch, and eight migrated commands.
     const ids = registry.list().map((d) => d.id).filter((id) => id.startsWith('mechanism.'));
-    expect(ids.sort()).toEqual([...Object.values(expected), 'mechanism.addBodies'].sort());
+    expect(ids.sort()).toEqual([
+      ...Object.values(expected), 'mechanism.addBodies',
+      'mechanism.setAnchor', 'mechanism.targetCreate', 'mechanism.pathCreate',
+      'mechanism.pathAddWaypoint', 'mechanism.pathRemoveWaypoint', 'mechanism.pathMoveWaypoint',
+      'mechanism.trajectoryImport', 'mechanism.trajectoryRun',
+      // plan-2007 Phase 4A: the seven read-only mechanism queries (web_query).
+      'mechanism.inspect', 'mechanism.forces', 'mechanism.pathInspect', 'mechanism.snapList',
+      'mechanism.trajectoryExport', 'mechanism.trajectoryInspect', 'mechanism.validate',
+    ].sort());
     expect(registry.get('mechanism.addBodies')?.mcp).toBeUndefined();
     // candidateId is optional on both snap consumers; pickJson is new and optional (additive wire change).
-    const snap = entries.find((e) => e.name === 'web_editor_mechanism_set_anchor_snap')!;
+    const snap = registry.get('mechanism.setAnchorSnap')!.mcp!;
     expect(snap.params.find((p) => p.name === 'candidateId')?.required).toBe(false);
     expect(snap.params.find((p) => p.name === 'pickJson')?.required).toBe(false);
-    const axis = entries.find((e) => e.name === 'web_editor_mechanism_set_axis')!;
+    const axis = registry.get('mechanism.setAxis')!.mcp!;
     expect(axis.params.find((p) => p.name === 'candidateId')?.required).toBe(false);
   });
 
   it('negative controls fail the gate', () => {
-    const pivot = entries.find((e) => e.name === 'web_editor_pivot')!;
+    const pivot: GateEntry = {
+      name: 'web_editor_pivot', readOnly: false, command: PIVOT_BINDING,
+      params: [
+        { name: 'path', type: 'string', required: true, description: '' },
+        { name: 'mode', type: 'string', required: true, description: '' },
+        { name: 'targetPath', type: 'string', required: false, description: '' },
+      ],
+    };
     const table = { web_editor_pivot: EXPECTED_BRANCHES.web_editor_pivot };
     const withBranch = (patch: Partial<BindingBranch>, when?: Record<string, string>): GateEntry[] => {
       const base = PIVOT_BRANCHES.find((b) => b.when['mode'] === (when?.['mode'] ?? 'object_center'))!;

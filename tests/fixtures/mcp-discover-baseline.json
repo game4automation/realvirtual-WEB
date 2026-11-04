@@ -391,7 +391,7 @@
     },
     {
       "name": "web_describe",
-      "description": "Report where you are and what to do next in one read-only call: active and available modes, the open asset document (name, base kind, dirty, busy, op/node counts, undo), selection size, runtime (connection, simulation running, model URL, drive and signal counts). Two derived fields make it actionable: `blocked` names each gated tool family with the tool that unblocks it, and `next` names the ONE recommended action for this exact state — a busy editor, a library document that opened empty, an unverified drive before save. Call it first in a session and whenever a result surprises you. Changes nothing: not selection, panels or camera. Deep guides stay in web_help.",
+      "description": "Report where you are and what to do next in one read-only call: active and available modes, the open editor document (name, base kind, dirty, busy, op/node counts, undo), selection size, runtime (connection, simulation running, model URL, drive and signal counts). Two derived fields make it actionable: `blocked` names each gated tool family with the tool that unblocks it, and `next` names the ONE recommended action for this exact state — a busy editor, a library document that opened empty, an unverified drive before save. Call it first in a session and whenever a result surprises you. Changes nothing: not selection, panels or camera. Deep guides stay in web_help.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2468,7 +2468,7 @@
     },
     {
       "name": "web_project_tree",
-      "description": "Show the open project as a TREE — folders, documents and attachment files, nested, exactly as the Projects dashboard shows them. Each node: name, kind (folder/document/file/system), path (project-relative — what web_document_open / web_document_update / web_project_folder take), documentId for a GLB with a manifest row, and writable. Reserved machinery (settings/connect/rag/thumbnails/.trash) is grouped under one read-only \"System\" node. Pass dir to start at a subfolder, maxDepth to limit nesting (childrenOmitted says what was cut). The flat alternative with sizes is web_document_list; files-with-glob is web_editor_project_files.",
+      "description": "Show the open project as a TREE — folders, documents and attachment files, nested, exactly as the Projects dashboard shows them. Each node: name, kind (folder/document/file/system), path (project-relative — what web_document_open / web_document_update / web_project_folder take), documentId for a GLB with a manifest row, and writable. Reserved machinery (settings/connect/rag/.thumbnails/.trash) is grouped under one read-only \"System\" node. Pass dir to start at a subfolder, maxDepth to limit nesting (childrenOmitted says what was cut). The flat alternative with sizes is web_document_list; files-with-glob is web_editor_project_files.",
       "inputSchema": {
         "type": "object",
         "properties": {

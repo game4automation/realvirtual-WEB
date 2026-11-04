@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readSessionStorage, writeSessionStorage } from '../rv-safe-storage';
+
 /**
  * GPUWarningBanner — Top-of-screen banner shown when the active GPU
  * is integrated graphics (warning) or a software fallback (critical).
@@ -43,7 +45,7 @@ export function GPUWarningBanner() {
   // returns on a fresh tab/window but stays away during this session.
   useEffect(() => {
     try {
-      if (sessionStorage.getItem(DISMISS_KEY) === '1') setDismissed(true);
+      if (readSessionStorage(DISMISS_KEY) === '1') setDismissed(true);
     } catch { /* private mode: best-effort */ }
   }, []);
 
@@ -80,7 +82,7 @@ export function GPUWarningBanner() {
   const Icon = isCritical ? ErrorIcon : Warning;
 
   const handleDismiss = () => {
-    try { sessionStorage.setItem(DISMISS_KEY, '1'); } catch { /* private mode */ }
+    writeSessionStorage(DISMISS_KEY, '1');
     setDismissed(true);
   };
 
@@ -106,7 +108,7 @@ export function GPUWarningBanner() {
         py: 1,
         bgcolor: bg,
         border: `1px solid ${fg}`,
-        borderRadius: 2,
+        borderRadius: 1,
         boxShadow: '0 4px 16px rgba(0,0,0,0.4)',
         backdropFilter: 'blur(calc(8px * var(--rv-ui-blur-scale, 1)))',
       }}>

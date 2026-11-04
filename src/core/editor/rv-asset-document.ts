@@ -40,12 +40,16 @@
  * same records.
  */
 
-import { Matrix4, Quaternion, Vector3 } from 'three';
-import type { BufferGeometry, Mesh, Object3D } from 'three';
+import { Matrix4, Mesh, Quaternion, Vector3 } from 'three';
+import type { BufferGeometry, Object3D } from 'three';
 import type { RVViewer } from '../rv-viewer';
+import type { NodeIdMap } from '../engine/rv-subtree-instantiate';
 import { isModelRoot, isModelRootPath } from '../engine/rv-model-root';
 import {
   AssetExecutorContext,
+  ReferenceRebindError,
+  geometryFromGlb,
+  singleMeshOf,
   type MergeMeshPayload,
   type SeparateMeshPayload,
 } from './rv-asset-executors';
@@ -69,9 +73,15 @@ import {
   assetOpHeader,
   dedupeComponentKey,
 } from './rv-asset-ops';
-import { RvDocument, type RvDocumentCore, type RvHistoryInterceptor } from '../ops/rv-document';
+import {
+  RvDocument,
+  type RvDocumentCore,
+  type RvDocumentReplayOptions,
+  type RvHistoryInterceptor,
+  type RvTransactionOptions,
+} from '../ops/rv-document';
 import { RvUnifiedExecutor } from '../ops/rv-unified-executors';
-import { needsRecomposeToUndo, undoViaRecompose } from '../ops/rv-document-projection';
+import { needsRecomposeToUndo, undoViaRecompose, type RvReloadOutcome } from '../ops/rv-document-projection';
 import { journalIdOf, makeAssetComposite } from '../ops/rv-unified-ops';
 import type { RvOp, RvAssetOp, RvAssetPrimitiveOp } from '../ops/rv-unified-ops';
 import type { AssetDraft, AssetDraftBase } from './rv-asset-draft-storage';
@@ -84,17 +94,45 @@ import {
   type RvDraftFrameKey,
 } from '../ops/rv-document-drafts';
 import type { CadImportResult } from './rv-cad-provider';
-import { putCadGlb } from '../import/rv-cad-glb-cache';
+import { hasCadGlb, putCadGlb, sha256Hex, type CadConverter } from '../import/rv-cad-glb-cache';
+import { objectToGlb } from '../import/rv-import-object';
+import { AssetSimplifyController } from './rv-asset-simplify';
+import type { AssetSimplifyClient, SimplifyNodesHooks, SimplifyNodesOptions, SimplifyNodesResult, SimplifyPreview } from './rv-asset-simplify';
+export type { SimplifyNodesHooks, SimplifyNodesOptions, SimplifyNodesResult, SimplifyPreview } from './rv-asset-simplify';
 import { weldImportedGlb } from '../import/rv-glb-weld';
-import { parseGlbSubtree } from '../engine/rv-glb-parse';
+import { generatedFamilyOf } from '../engine/rv-parametric-component';
+import { reportProblem } from '../hmi/problems-store';
+import { parseGlbSubtree, RV_ORIG_NAME_KEY } from '../engine/rv-glb-parse';
+import { RV_SYNTHETIC_KEY } from '../engine/rv-bake-chunk';
 import { NodeRegistry } from '../engine/rv-node-registry';
 import { siblingNames, uniqueName } from '../engine/rv-node-naming';
-import { captureMaterialPrev } from './rv-asset-material';
+import { planMaterialAssignment, materialPrevOfPlan, type MaterialSkipReason } from './rv-asset-material';
 import { guardReferenceOp } from '../ops/rv-reference-guard';
-import { outermostReference } from '../engine/rv-reference-scope';
+import { isInsideReference, outermostReference } from '../engine/rv-reference-scope';
+import { planReferenceRewrite, writtenTailMatches, type ReferenceRewriteWarning } from '../engine/rv-node-path-rewrite.mjs';
+import { signalNameFollowsNodeName } from '../engine/rv-signal-construction';
+import { sanitizeLikeThree } from '../engine/rv-three-names';
+import { authoredAssetRelativePath, bareStringReferenceRefusal } from '../hmi/rv-reference-field';
 import { binaryResources } from '../engine/rv-binary-resources';
 import { fmuDocumentResourceId, fmuShasOfOps, restoreFmuPackagesForOps } from '../ops/rv-fmu-ops';
 import { deleteDraftFmuPackage } from './rv-asset-draft-storage';
+import {
+  DocumentLockedError,
+  documentLockedMessage,
+  type DocumentLockKind,
+  type DocumentLockToken,
+  type DocumentLockOwner,
+} from './rv-document-lock';
+
+/** What {@link AssetDocument.setMaterial} queued: meshes painted and the requested paths it could not reach. */
+export interface MaterialAssignResult {
+  /** Meshes the op paints (0 = nothing changed, no op queued). */
+  painted: number;
+  /** Registry paths of the painted meshes. */
+  meshPaths: string[];
+  /** Requested paths that contributed no mesh, with the reason. */
+  skipped: Array<{ path: string; reason: MaterialSkipReason }>;
+}
 
 /** Where the document started from. */
 export type AssetBase = AssetDraftBase;
@@ -129,59 +167,167 @@ export interface AssetDocumentSessionState {
   metaDirty: boolean;
 }
 
+// ─── Reference-safe rename / move (plan-610) ─────────────────────────────
+
+/** Why a rename (or the auto-rename of a move) was refused. */
+export type RenameRefusalReason =
+  | 'model-root'
+  | 'empty-name'
+  | 'invalid-name'
+  | 'not-found'
+  | 'reference-guard'
+  | 'signal-node'
+  | 'document-busy';
+
+/**
+ * A rename — direct, or the collision auto-rename of a move — was REFUSED
+ * before anything was mutated (plan-610 §2.4). The document is unchanged.
+ */
+export class RenameRefusedError extends Error {
+  readonly reason: RenameRefusalReason;
+  readonly nodePath: string;
+  constructor(reason: RenameRefusalReason, nodePath: string, message: string) {
+    super(message);
+    this.name = 'RenameRefusedError';
+    this.reason = reason;
+    this.nodePath = nodePath;
+  }
+}
+
+/** One notice of a rename/move: a reference left alone, a node auto-renamed. */
+export interface ReferenceRewriteNotice {
+  /** `auto-renamed`, `name-not-unique-in-file` (plan-610 Phase 5b), or a {@link ReferenceRewriteWarning} code of the rewrite core. */
+  code: string;
+  message: string;
+  /** Node the notice is about (post-change path). */
+  nodePath?: string;
+}
+
+/** What a reference-safe structural change rewrote (plan-610 F8). */
+export interface ReferenceRewriteSummary {
+  /** Stored paths rewritten (ComponentReference + declared path fields). */
+  referencesRewritten: number;
+  /** Declared name fields (e.g. `Source.ThisObjectAsMU`) rewritten. */
+  nameFieldsRewritten: number;
+  /** Auto-renames, references left unchanged, ambiguous name fields. */
+  warnings: ReferenceRewriteNotice[];
+}
+
+/** Result of {@link AssetDocument.renameNodeAwaited}. */
+export interface RenameNodeResult extends ReferenceRewriteSummary {
+  /** The node's path after the rename. */
+  path: string;
+}
+
+/** Result of {@link AssetDocument.reparentNodesDetailed} / {@link AssetDocument.reparentNodesBatchDetailed}. */
+export interface ReparentNodesResult extends ReferenceRewriteSummary {
+  /** Post-move (post-rename) paths of the nodes that actually moved. */
+  moved: string[];
+}
+
+function emptyRewrite(): ReferenceRewriteSummary {
+  return { referencesRewritten: 0, nameFieldsRewritten: 0, warnings: [] };
+}
+
+type RenameNodePrimitive = Extract<RvAssetPrimitiveOp, { kind: 'renameNode' }>;
+
+/**
+ * THE constructor of every `renameNode` op (plan-765 F2) — the direct rename
+ * and both move auto-renames go through it, so none of them can forget the
+ * authored-name stamp.
+ *
+ * A node the loader de-duplicated carries its authored name in
+ * `userData._rvOrigName`, and the export writes that name back. A rename is
+ * the user choosing a new name, so the forward op deletes the stamp and the
+ * op records it as `prevOrigName` for undo. The key is set ONLY when there is
+ * a stamp: op shapes are compared with `toEqual`, and a stored `undefined`
+ * would also make the inverse write one.
+ *
+ * `prevName` defaults to the live name; a move plan that simulated an earlier
+ * rename of the same node passes the simulated one, and then reads no stamp —
+ * that earlier op already took it.
+ */
+function makeRenameOp(node: Object3D, nodePath: string, name: string, prevName: string = node.name): RenameNodePrimitive {
+  const op: RenameNodePrimitive = { ...assetOpHeader(), kind: 'renameNode', nodePath, name, prevName };
+  const orig = node.userData?.[RV_ORIG_NAME_KEY];
+  if (prevName === node.name && typeof orig === 'string' && orig.length > 0) op.prevOrigName = orig;
+  return op;
+}
+
+/** `node`'s registry path spelled in AUTHORED names (`_rvOrigName ?? name` per segment) — the
+ *  segments of {@link NodeRegistry.computeNodePath} (everything below the parentless scene),
+ *  spelled by the ONE reference writer {@link authoredAssetRelativePath} (plan-765 F3). */
+function authoredNodePath(node: Object3D): string {
+  let top: Object3D = node;
+  while (top.parent) top = top.parent;
+  return authoredAssetRelativePath(node, top) ?? '';
+}
+
+/**
+ * plan-610 Phase 5b: the notice for a node named like another node of the
+ * document. GLTFLoader de-duplicates node names FILE-WIDE (sanitized,
+ * `createUniqueName`), so after save and reload one of the two loads as `<name>_N`
+ * and every path written through it misses — the reason the Phase-5 welding
+ * groups `FG03` / `Simulation` loaded as `FG03_1` / `Simulation_1`. A warning,
+ * never a refusal: the edit itself is valid. Compared are the sanitized node
+ * names (and the raw glTF names a dedup left in `_rvOrigName`) of the document
+ * tree, the model root included (it becomes the scene name, which claims first);
+ * content behind a reference and synthetic bake nodes are not part of the file.
+ */
+function nameNotUniqueNotice(
+  root: Object3D | null, self: Object3D, name: string, nodePath: string,
+): ReferenceRewriteNotice | null {
+  if (!root) return null;
+  const key = sanitizeLikeThree(name);
+  let other: Object3D | null = null;
+  const visit = (n: Object3D): void => {
+    if (other) return;
+    if (n !== self && n.userData?.[RV_SYNTHETIC_KEY] !== true) {
+      const orig = n.userData?.[RV_ORIG_NAME_KEY];
+      if (sanitizeLikeThree(n.name) === key || (typeof orig === 'string' && sanitizeLikeThree(orig) === key)) {
+        other = n;
+        return;
+      }
+    }
+    if (n !== root && isInsideReference(n, root)) return;
+    for (const c of n.children) visit(c);
+  };
+  visit(root);
+  if (!other) return null;
+  const otherPath = NodeRegistry.computeNodePath(other);
+  return {
+    code: 'name-not-unique-in-file',
+    message: `"${name}" is also the name of "${otherPath}" — node names are de-duplicated file-wide on load, `
+      + `so after saving one of the two loads as "${key}_N" and paths through it no longer match. Prefer a name unique in the document.`,
+    nodePath,
+  };
+}
+
 // ─── Document lock (plan-462 B3) ──────────────────────────────────────────
 
-/**
- * What a lock is being held FOR. Both kinds exclude each other, and both
- * exclude a second holder of the same kind — see {@link AssetDocument.tryLock}.
- */
-export type DocumentLockKind = 'test-run' | 'save';
-
-/** The receipt {@link AssetDocument.tryLock} hands out. Opaque on purpose. */
-export interface DocumentLockToken {
-  readonly kind: DocumentLockKind;
-  readonly token: symbol;
-  readonly generation: number;
-}
-
-/** What a caller may know about a lock it does not hold. */
-export interface DocumentLockOwner {
-  readonly kind: DocumentLockKind;
-  readonly startedAt: number;
-}
-
-/** The machine-readable code every refusal carries. */
-export const ERR_DOCUMENT_LOCKED = 'ERR_DOCUMENT_LOCKED';
+// The vocabulary lives in the leaf module `rv-document-lock` so the scene
+// lineage (`SceneStore`) can refuse with the very same error class; every name
+// is re-exported here, so existing imports keep working and `instanceof
+// DocumentLockedError` holds across both lineages.
+export {
+  ERR_DOCUMENT_LOCKED,
+  DocumentLockedError,
+  documentLockedMessage,
+  type DocumentLockKind,
+  type DocumentLockToken,
+  type DocumentLockOwner,
+} from './rv-document-lock';
 
 /**
- * A mutation was refused because something else owns the document.
+ * The asset EDITOR's session on a document — not a document kind (plan-777 #6).
  *
- * Thrown, not returned, and never swallowed: the whole point of plan-462 B3 is
- * that an edit made during a test run stops being accepted-then-silently-lost.
- * An MCP tool turns it into its JSON envelope, the UI into a toast; both read
- * {@link code}.
+ * There is one kind of document (plan-716): one GLB, one `project.json` row.
+ * This class is what the editor holds while one is open in it — the authored
+ * tree, the op log, the identity (`AssetBase`) and the save state. Its twin is
+ * `SceneStore`, the PLANNER's session on a document. The class name is
+ * historical and kept on purpose (~200 files import it); read "Asset" here as
+ * "the editor's", never as a second kind of file.
  */
-export class DocumentLockedError extends Error {
-  readonly code = ERR_DOCUMENT_LOCKED;
-
-  constructor(readonly owner: DocumentLockOwner, message: string) {
-    super(message);
-    this.name = 'DocumentLockedError';
-  }
-}
-
-/** The operator-facing half of a refusal — one sentence per owner kind. */
-function lockedMessage(owner: DocumentLockOwner, what: string): string {
-  if (owner.kind === 'test-run') {
-    return `${what} was refused: a test run is active (in-place test session). The test session `
-      + 'freezes the document history at start and puts it back verbatim on stop, so an edit '
-      + 'accepted now would be discarded together with the test scene. Stop the test run first, '
-      + 'then repeat the edit.';
-  }
-  return `${what} was refused: this document is being saved. Wait for the save to finish, then `
-    + 'repeat the operation.';
-}
-
 export class AssetDocument {
   readonly id: string;
   private _base: AssetBase;
@@ -217,7 +363,7 @@ export class AssetDocument {
   /** `opCount` at the moment of the bind — see {@link discardBoundEdits}. */
   private _bindFloor = 0;
   /** Rebuilds this projection's tree — see {@link setReprojectTree}. */
-  private _reprojectTree: (() => Promise<void>) | null = null;
+  private _reprojectTree: (() => Promise<void | RvReloadOutcome>) | null = null;
   /** What the other projection's bytes hold of this log — {@link setDraftBytesCache}. */
   private _bytesCache: (() => RvDraftBytesCache | null) | null = null;
 
@@ -233,6 +379,7 @@ export class AssetDocument {
   /** Autosave is off while an editor test run holds the document (plan-410 F5). */
   private _autosaveSuspended = false;
   private _disposed = false;
+  private readonly _simplifier: AssetSimplifyController;
 
   /**
    * Who holds the document, and with which token — see {@link tryLock}.
@@ -290,6 +437,8 @@ export class AssetDocument {
       name: string;
       base: AssetBase;
       createdAt?: number;
+      /** Injectable transport for synthetic integration tests (plan-663). */
+      simplifyClient?: AssetSimplifyClient;
       /**
        * BIND instead of construct (plan-711 §2.2, F2).
        *
@@ -303,6 +452,10 @@ export class AssetDocument {
     },
   ) {
     this.viewer = viewer;
+    this._simplifier = new AssetSimplifyController(this, viewer, () => {
+      this._assertUnlocked('Simplifying meshes');
+      if (this._disposed) throw new Error('The document is disposed');
+    }, opts.simplifyClient);
     // A FRESH context in either case — never the one the other projection was
     // driving. `_trash`/`_trashGroup` hold references into the tree that has
     // just been replaced, and carrying them over does not merely lose an undo:
@@ -377,6 +530,11 @@ export class AssetDocument {
         id: this.id, name: this._doc.name, base: this._base, createdAt: this._doc.createdAt,
       }),
       bytesCache: () => this._bytesCache?.() ?? null,
+      // plan-616 §2.3 — only a BOUND facade claims its records for the session:
+      // its work also lives in the borrowed (scene) document, so the editor's
+      // next entry may leave the record out of recovery and bind again. A facade
+      // built from bytes or from a draft holds its work nowhere else.
+      boundDoc: () => (this._bound ? this._doc : null),
     });
     // One subscription, forwarded: the document already coalesces notifications
     // across a transaction and a rollback, so this inherits that for free.
@@ -393,6 +551,23 @@ export class AssetDocument {
    * layer, which speak `RvOp`. Op AUTHORING still goes through this class.
    */
   get document(): RvDocument { return this._doc; }
+  /** Monotonic across edits, coalescing, undo and redo; unlike op-log length. */
+  get revision(): number { return this._doc.changeSeq; }
+
+  /** Compute without mutating the scene. The preview lists unselected shared users. */
+  async previewSimplify(paths: string[], opts: SimplifyNodesOptions = {}): Promise<SimplifyPreview> {
+    this._assertUnlocked('Simplifying meshes');
+    return this._simplifier.preview(paths, opts);
+  }
+
+  /** Revalidate a supplied preview, then apply all geometry swaps as one undo step. */
+  async simplifyNodes(paths: string[], opts: SimplifyNodesOptions = {}, hooks?: SimplifyNodesHooks): Promise<SimplifyNodesResult> {
+    this._assertUnlocked('Simplifying meshes');
+    return this._simplifier.apply(paths, opts, hooks);
+  }
+
+  /** Terminate pending worker work; no partial simplification is committed. */
+  cancelSimplify(): void { this._simplifier.cancel(); }
 
   // `static newUntitled(viewer)` lived here until plan-719 F3. It minted a
   // document over `{ kind: 'empty' }` — an asset with no file, no row and no
@@ -419,6 +594,18 @@ export class AssetDocument {
    * asset left open behind the planner is covered too.
    */
   hasUnpersistedWork(): boolean { return this._doc.hasUnpersistedWork(); }
+
+  /** Follow a completed file rename without discarding unsaved ops. */
+  adoptDocumentRename(base: Extract<AssetBase, { kind: 'document' }>, name: string): void {
+    this._assertUnlocked('Adopting a document rename');
+    if (this._base.kind !== 'document' || this._base.documentId !== base.documentId) {
+      throw new Error('A rename must keep the document identity.');
+    }
+    this._base = base;
+    this._doc.setNameSilently(name);
+    this._snapshot = null;
+    for (const fn of this._listeners) fn();
+  }
 
   /** Rename the DOCUMENT (not a scene node). Metadata only — not an op, but
    *  marks the document dirty so the exit guard prompts to save. */
@@ -462,12 +649,35 @@ export class AssetDocument {
     } catch (e) {
       return Promise.reject(e);
     }
+    // plan-769 D22: a reference field takes the object form — a bare string is
+    // refused HERE, before anything is applied or recorded (the MCP tool then
+    // answers with this message). Only NEW ops: replay, undo and redo never pass.
+    if (op.kind === 'setField') {
+      const refusal = bareStringReferenceRefusal(op.componentType, op.fieldName, op.value);
+      if (refusal) return Promise.reject(new Error(refusal));
+    }
     const unified: RvOp = op;
     const verdict = guardReferenceOp(unified, (nodePath) => {
       const node = this.viewer.registry?.getNode(nodePath);
       if (!node) return null;
       return { reference: outermostReference(node, this.viewer.currentModelRoot ?? null) };
     });
+    if (op.kind === 'addComponent') {
+      // plan-650 F10: simulation components under a family's `_Generated` come from its rule
+      // part alone — a hand-attached one would vanish at the next regeneration.
+      const node = this.viewer.registry?.getNode(op.nodePath);
+      const family = node ? generatedFamilyOf(node) : null;
+      if (family) {
+        const message = `"${op.componentType}" cannot be attached by hand under the generated variant of `
+          + `"${family.name}" — the rule part creates its components (attach it to the family node instead)`;
+        reportProblem({
+          id: `parametric-manual-attach:${op.nodePath}:${op.componentType}`,
+          severity: 'warning', code: 'parametric-manual-attach',
+          title: 'Component refused under a generated variant', detail: message, nodePath: op.nodePath,
+        });
+        return Promise.reject(new Error(message));
+      }
+    }
     if (!verdict.ok) {
       // F8: a structural edit inside a referenced subtree cannot be WRITTEN
       // DOWN — `AssetOverrides` is a value merge patch and has no vocabulary
@@ -491,9 +701,9 @@ export class AssetDocument {
    * the transaction did apply is rolled back, NOTHING is recorded, and the
    * original error is re-thrown at the caller.
    */
-  async withTransaction(label: string, fn: () => Promise<void>): Promise<void> {
+  async withTransaction(label: string, fn: () => Promise<void>, opts?: RvTransactionOptions): Promise<void> {
     this._assertUnlocked(`"${label}"`);
-    await this._doc.withTransaction(label, fn);
+    await this._doc.withTransaction(label, fn, opts);
   }
 
   /** Undo the newest op. The stacks move only AFTER the inverse applied — popping
@@ -537,7 +747,7 @@ export class AssetDocument {
    * Absent means "no re-projection available", and the undo path then behaves
    * exactly as it did before the binding existed.
    */
-  setReprojectTree(fn: (() => Promise<void>) | null): void {
+  setReprojectTree(fn: (() => Promise<void | RvReloadOutcome>) | null): void {
     this._reprojectTree = fn;
   }
 
@@ -623,7 +833,7 @@ export class AssetDocument {
    * silently breaks the import-equals-reload invariant. Its local transform is
    * what gets recorded.
    */
-  async importCad(result: CadImportResult, opts?: { name?: string; root?: Object3D }): Promise<string> {
+  async importCad(result: CadImportResult, opts?: { name?: string; root?: Object3D; idMap?: NodeIdMap }): Promise<string> {
     this._assertUnlocked('Importing CAD');
     const { Sha256, Quality, Converter } = result.cadlink;
     const glb = weldImportedGlb(result.glb, result.cadlink.File);
@@ -655,8 +865,118 @@ export class AssetDocument {
         quaternion: root.quaternion.toArray() as [number, number, number, number],
         scale: root.scale.toArray() as [number, number, number],
       },
+      // plan-769 Phase 2: a CADLink re-import hands the ids of the matched old
+      // nodes in (the executor mints the rest and completes the map).
+      ...(opts?.idMap ? { idMap: { ...opts.idMap } } : {}),
     });
     return rootPath;
+  }
+
+  /**
+   * Swap the geometry of ONE mesh node for the single mesh in `glbBytes`
+   * (plan-621) — an undoable op that leaves the node, its material, children and
+   * rv_extras components in place. Generic: nothing here knows who produced the
+   * bytes (`converter` only names the cache namespace).
+   *
+   * Same pattern as {@link importCad}: the bytes are cached under
+   * `(sha256, quality, converter)` BEFORE the op is queued, the op carries only
+   * the hashes, and the tree gets the geometry parsed FROM those bytes. The
+   * vertices of the GLB's one mesh are taken in that mesh's local frame; node
+   * transforms inside the GLB are ignored.
+   *
+   * `prevSha256` — mandatory on the op, so undo works after a save flushed the
+   * old geometry object — is resolved in this order:
+   *  1. the cache key the executor knows for the node's CURRENT geometry: the
+   *     geometry a previous swap installed, or the single mesh of an `importCad`
+   *     (a live-synced body's first geometry IS its import, addressed by the
+   *     import's own `CADLink.Sha256`/`Quality`/`Converter`) — trusted only when
+   *     it is in the same `quality`/`converter` namespace and still cached;
+   *  2. otherwise the current geometry is SNAPSHOT: written to a one-mesh GLB,
+   *     hashed and cached under the same namespace (a node of the loaded base,
+   *     any geometry after a reload or a save + reopen).
+   *
+   * Rejects BEFORE anything is queued when the node does not resolve to exactly
+   * one mesh, the GLB does not hold exactly one mesh, or either GLB cannot be
+   * cached (`'none'` tier): an op whose geometry cannot be re-materialised could
+   * be neither redone after a save nor replayed. Resolves `null` without an op
+   * when the new geometry IS the current one (same hash).
+   *
+   * Coalescing is the caller's choice: a sync step wraps its ops in
+   * `withTransaction(label, fn, { coalesce })`; repeated swaps of the same node
+   * outside a transaction coalesce like any primitive setter (500 ms window).
+   */
+  async replaceNodeGeometry(
+    nodePath: string,
+    glbBytes: ArrayBuffer,
+    converter: CadConverter,
+    opts?: { quality?: string; sha256?: string; sharedNodePaths?: string[]; validate?: () => void },
+  ): Promise<{ sha256: string; prevSha256: string } | null> {
+    this._assertUnlocked('Replacing a geometry');
+    const node = this.viewer.registry?.getNode(nodePath) ?? null;
+    const mesh = node ? singleMeshOf(node) : null;
+    if (!mesh) {
+      throw new Error(`replaceNodeGeometry: "${nodePath}" ${node ? 'does not hold exactly one mesh' : 'not found'}`);
+    }
+    const sourceGeometry = mesh.geometry;
+    const sharedNodePaths = [...new Set(opts?.sharedNodePaths ?? [])].filter(p => p !== nodePath).sort();
+    const validate = () => {
+      opts?.validate?.();
+      if (mesh.geometry !== sourceGeometry) throw new Error('replaceNodeGeometry: source geometry changed before Apply');
+      for (const path of sharedNodePaths) {
+        const other = this.viewer.registry?.getNode(path);
+        if (!other || singleMeshOf(other)?.geometry !== sourceGeometry) {
+          throw new Error(`replaceNodeGeometry: "${path}" no longer shares the source geometry`);
+        }
+      }
+    };
+    validate();
+    const quality = opts?.quality ?? 'source';
+    const sha256 = opts?.sha256 ?? await sha256Hex(glbBytes);
+    const prevSha256 = await this._geometryCacheKey(mesh.geometry as BufferGeometry, quality, converter);
+    if (prevSha256 === sha256) return null;
+    // Validate the bytes before they reach the cache or the queue.
+    const geometry = await geometryFromGlb(glbBytes);
+    if (await putCadGlb(sha256, quality, glbBytes, converter) === 'none') {
+      geometry.dispose();
+      throw new Error(`replaceNodeGeometry: the geometry of "${nodePath}" could not be cached — it could not be undone or replayed`);
+    }
+    const header = assetOpHeader();
+    const op: RvAssetPrimitiveOp = { ...header, kind: 'replaceNodeGeometry', nodePath, sha256, quality, converter, prevSha256,
+      ...(sharedNodePaths.length ? { sharedNodePaths } : {}) };
+    this.executor.provideGeometryPayload(header.id, geometry);
+    try {
+      validate();
+      await this.applyOp(op);
+    } finally {
+      // Consumed by a forward that ran; still here when the op was refused or dropped.
+      this.executor.discardGeometryPayload(header.id);
+    }
+    return { sha256, prevSha256 };
+  }
+
+  /** The cache key of `geometry` in `(quality, converter)` — snapshotting it when it has none. */
+  private async _geometryCacheKey(geometry: BufferGeometry, quality: string, converter: CadConverter): Promise<string> {
+    const known = this.executor.geometryKeyOf(geometry);
+    if (known && known.quality === quality && (known.converter ?? 'browser') === converter
+        && await hasCadGlb(known.sha256, quality, converter)) {
+      return known.sha256;
+    }
+    // Geometry only: a throwaway mesh, and the geometry's userData kept out of
+    // the bytes (glTF primitive extras) so the hash depends on the vertices alone.
+    const userData = geometry.userData;
+    geometry.userData = {};
+    let bytes: ArrayBuffer;
+    try {
+      bytes = await objectToGlb(new Mesh(geometry));
+    } finally {
+      geometry.userData = userData;
+    }
+    const sha = await sha256Hex(bytes);
+    if (await putCadGlb(sha, quality, bytes, converter) === 'none') {
+      throw new Error('replaceNodeGeometry: the current geometry could not be cached — the swap could not be undone');
+    }
+    this.executor.noteGeometryKey(geometry, { sha256: sha, quality, converter });
+    return sha;
   }
 
   /**
@@ -672,8 +992,16 @@ export class AssetDocument {
     this._doc.applyOpDetached(op);
   }
 
-  setField(nodePath: string, componentType: string, fieldName: string, value: unknown, prev: unknown): void {
-    this._voidApply({ ...assetOpHeader(), kind: 'setField', nodePath, componentType, fieldName, value, prev });
+  /**
+   * Fire-and-forget field edit (the inspector's path) — queued and tracked like
+   * every {@link _voidApply} op. The returned promise only tells WHEN the op
+   * settled (plan-774: the extras editor drops its optimistic badge entry for
+   * placed content then); it is already observed, so ignoring it is safe.
+   */
+  setField(nodePath: string, componentType: string, fieldName: string, value: unknown, prev: unknown): Promise<void> {
+    const applied = this._doc.applyOp({ ...assetOpHeader(), kind: 'setField', nodePath, componentType, fieldName, value, prev });
+    this._doc.trackDetached(applied);
+    return applied;
   }
 
   /**
@@ -726,9 +1054,124 @@ export class AssetDocument {
     this._voidApply({ ...assetOpHeader(), kind: 'transformNode', nodePath, transform, prev });
   }
 
+  /**
+   * Fire-and-forget form of {@link renameNodeAwaited} for the `void` UI
+   * handlers. A refusal (model root, signal node, invalid name, …) is LOGGED and
+   * changes nothing — inside a transaction it does not poison it either, the
+   * same contract `_rejectRootOp` always had. An executor failure inside a
+   * transaction still rolls the transaction back (like every void mutator).
+   *
+   * A re-bind refusal ({@link ReferenceRebindError}, plan-614 F1) arrives AFTER
+   * the composite started mutating; the composite is already rolled back when
+   * it gets here. It is reported LOUDLY — `console.warn` plus the viewer event
+   * `editor-edit-refused`, which the HMI turns into a toast — and counts as
+   * handled: the rename itself is undone, there is nothing left to poison.
+   */
   renameNode(nodePath: string, name: string, prevName: string): void {
+    // The root refusal stays synchronous: loud, immediate, nothing queued.
     if (this._rejectRootOp(nodePath, 'renameNode')) return;
-    this._voidApply({ ...assetOpHeader(), kind: 'renameNode', nodePath, name, prevName });
+    this._doc.trackDetached(this._renameNodePlanned(nodePath, name, prevName, false), (e) => {
+      if (e instanceof RenameRefusedError) {
+        console.warn(`[asset-edits] renameNode refused (${e.reason}): ${e.message}`);
+        return true;
+      }
+      if (e instanceof ReferenceRebindError) {
+        console.warn(`[asset-edits] renameNode refused and rolled back (reference re-bind): ${e.message}`, e.failures);
+        this.viewer.emit('editor-edit-refused', {
+          verb: 'Rename', nodePath, reason: 'ReferenceRebindError', message: e.message,
+        });
+        return true;
+      }
+      return false;
+    });
+  }
+
+  /**
+   * Rename a node REFERENCE-SAFELY (plan-610) and report what was rewritten.
+   *
+   * Every stored path in the document that points at the node or into its
+   * subtree — ComponentReferences anywhere in the extras, the declared path
+   * fields, the declared name fields when unique — is rewritten in the SAME
+   * undo step as the rename, in its own spelling. Planning and apply share one
+   * queue slot, so no queued op can change what was scanned.
+   *
+   * Rejects with {@link RenameRefusedError} — nothing mutated — for the model
+   * root, an empty name, a name containing `/`, a missing node, a structural
+   * edit inside a referenced asset, and a signal node whose signal name hangs
+   * on its node name (use `web_editor_signal_rename`). Rejects with the executor's
+   * error (nothing recorded) when the composite could not be applied. Renaming
+   * to the current name resolves without an op.
+   *
+   * Scope: the open document only — other documents that point into this asset
+   * by path are not searchable (the load audit reports them).
+   */
+  renameNodeAwaited(nodePath: string, name: string, prevName?: string): Promise<RenameNodeResult> {
+    return this._renameNodePlanned(nodePath, name, prevName, true);
+  }
+
+  private async _renameNodePlanned(
+    nodePath: string, name: string, _prevName: string | undefined, assertLock: boolean,
+  ): Promise<RenameNodeResult> {
+    if (assertLock) this._assertUnlocked('Renaming a node');
+    const result = await this._doc.applyPlanned(() => this._planRename(nodePath, name));
+    if (result === null) {
+      throw new RenameRefusedError('document-busy', nodePath, 'The document base is being replaced — rename dropped.');
+    }
+    return result;
+  }
+
+  /** Plan a rename against the CURRENT state (runs inside the queue slot). */
+  private _planRename(nodePath: string, name: string): { op: RvAssetOp | null; result: RenameNodeResult } {
+    const registry = this.viewer.registry;
+    if (this._rejectRootOp(nodePath, 'renameNode')) {
+      throw new RenameRefusedError('model-root', nodePath,
+        `"${nodePath}" is the model root — its name is the first segment of every node path.`);
+    }
+    if (!name.trim()) throw new RenameRefusedError('empty-name', nodePath, 'A node name must not be empty.');
+    if (name.includes('/')) {
+      throw new RenameRefusedError('invalid-name', nodePath,
+        `"${name}" contains "/" — that is the path separator and cannot be part of a node name.`);
+    }
+    const node = registry?.getNode(nodePath) ?? null;
+    if (!registry || !node) throw new RenameRefusedError('not-found', nodePath, `Node "${nodePath}" not found.`);
+    const oldPath = registry.getPathForNode(node) ?? nodePath;
+    if (node.name === name) return { op: null, result: { path: oldPath, ...emptyRewrite() } };
+    if (signalNameFollowsNodeName(node)) {
+      throw new RenameRefusedError('signal-node', oldPath, signalNodeRefusal(oldPath));
+    }
+    const renameOp = makeRenameOp(node, oldPath, name);
+    this._guardStructural([renameOp]);
+    const newPath = replacePathLeaf(oldPath, name);
+    // plan-765 F2b: references are stored in AUTHORED names (the Unity export,
+    // and the editor's writers), so the map is given in both spellings. The
+    // authored new path carries the new name at the renamed segment — the
+    // rename deletes that stamp — and authored names everywhere above it.
+    // Descendants map by prefix in both maps, as in every move.
+    const authoredOld = authoredNodePath(node);
+    const rewrite = planDocumentReferenceRewrite(
+      this.viewer,
+      new Map([[oldPath, newPath]]),
+      new Map([[authoredOld, replacePathLeaf(authoredOld, name)]]),
+    );
+    const op = rewriteComposite(`Rename ${node.name}`, [renameOp], rewrite);
+    const dup = nameNotUniqueNotice(this.viewer.currentModelRoot ?? null, node, name, newPath);
+    const warnings = dup ? [dup, ...rewrite.summary.warnings] : rewrite.summary.warnings;
+    return { op, result: { path: newPath, ...rewrite.summary, warnings } };
+  }
+
+  /**
+   * Refuse structural ops inside a referenced asset BEFORE planning on (the
+   * check `applyOp` runs, applied to ops this document builds itself).
+   */
+  private _guardStructural(ops: readonly RvAssetPrimitiveOp[], locate?: (p: string) => Object3D | null): void {
+    const root = this.viewer.currentModelRoot ?? null;
+    for (const op of ops) {
+      const verdict = guardReferenceOp(op, (p) => {
+        const node = locate?.(p) ?? this.viewer.registry?.getNode(p) ?? null;
+        return node ? { reference: outermostReference(node, root) } : null;
+      });
+      if (!verdict.ok) throw new RenameRefusedError('reference-guard', verdict.nodePath ?? '', verdict.message);
+    }
   }
 
   deleteNode(nodePath: string): void {
@@ -765,13 +1208,24 @@ export class AssetDocument {
    * in the executor, because a selection routinely spans meshes with different
    * starting materials and undo must restore each one exactly. Returns without
    * queueing when the selection contains no meshes.
+   *
+   * Returns what the op paints: `painted` is the number of meshes queued for
+   * the new material (0 = nothing changed, no op queued), `skipped` every
+   * requested path that contributed none, with the reason — unresolved,
+   * placed reference content (not paintable from this document), or no mesh.
+   * Callers that answer an agent must report a 0 as a failure.
    */
-  setMaterial(nodePaths: string[], material: MaterialValue): void {
+  setMaterial(nodePaths: string[], material: MaterialValue): MaterialAssignResult {
     const registry = this.viewer.registry;
-    if (!registry || nodePaths.length === 0) return;
-    const prev = captureMaterialPrev(registry, nodePaths);
-    if (prev.length === 0) return;
-    this._voidApply({ ...assetOpHeader(), kind: 'setMaterial', nodePaths: [...nodePaths], material, prev });
+    if (!registry) {
+      return { painted: 0, meshPaths: [], skipped: nodePaths.map((path) => ({ path, reason: 'unresolved' as const })) };
+    }
+    const plan = planMaterialAssignment(registry, nodePaths);
+    const prev = materialPrevOfPlan(plan);
+    const result: MaterialAssignResult = { painted: prev.length, meshPaths: prev.map((p) => p.meshPath), skipped: plan.skipped };
+    if (prev.length === 0) return result;
+    this._voidApply({ ...assetOpHeader(), kind: 'setMaterial', nodePaths: plan.nodePaths, material, prev });
+    return result;
   }
 
   /** Create an empty node under `parentPath` (null = the asset root) as an
@@ -798,6 +1252,43 @@ export class AssetDocument {
     return nodePath;
   }
 
+  /**
+   * plan-641 Phase 3 — deep-copy the subtree at `sourcePath` as ONE undoable op
+   * (`cloneNode`). The copy lands under `opts.parentPath` (omitted = the source's
+   * own parent, `null` = the asset root) as `opts.name` (default: the source's
+   * name), `_N`-deduped against that parent at creation so replay is
+   * deterministic. Returns the copy's path.
+   */
+  async cloneNode(
+    sourcePath: string,
+    opts?: { parentPath?: string | null; name?: string | null; index?: number },
+  ): Promise<string> {
+    this._assertUnlocked('Cloning a node');
+    const registry = this.viewer.registry;
+    const source = registry?.getNode(sourcePath) ?? null;
+    if (!registry || !source) throw new Error(`cloneNode: "${sourcePath}" not found`);
+    if (isModelRoot(source, this.viewer.currentModelRoot)) throw new Error('cloneNode: the model root cannot be cloned');
+    const parent = opts?.parentPath === undefined
+      ? source.parent
+      : opts.parentPath
+        ? registry.getNode(opts.parentPath) ?? null
+        : this.viewer.currentModelRoot;
+    if (!parent) throw new Error(`cloneNode: parent "${opts?.parentPath ?? '<source parent>'}" not found`);
+    for (let anc: Object3D | null = parent; anc; anc = anc.parent) {
+      if (anc === source) throw new Error('cloneNode: the target parent lies inside the copied subtree');
+    }
+    const name = uniqueChildName(parent, opts?.name?.trim() || source.name);
+    const nodePath = childPath(parent, name);
+    await this.applyOp({
+      ...assetOpHeader(),
+      kind: 'cloneNode',
+      sourcePath,
+      nodePath,
+      ...(opts?.index !== undefined ? { index: opts.index } : {}),
+    });
+    return nodePath;
+  }
+
   /** Move nodes under a new parent (null = the asset root), preserving each
    *  node's WORLD transform. One undo unit. Nodes that would create a cycle
    *  or are the asset root itself are skipped. Name collisions under the target
@@ -811,109 +1302,199 @@ export class AssetDocument {
    *  executor's splice consumes, and it lets drag-and-drop drop a node BETWEEN
    *  two rows. When omitted, the block is appended (classic reparent-onto).
    *  Supplying an index also enables **same-parent reordering** (a pure move
-   *  within one parent is only rejected when no index is given). */
+   *  within one parent is only rejected when no index is given).
+   *
+   *  Reference-safe (plan-610): see {@link reparentNodesDetailed}, which this
+   *  is with the result reduced to the moved paths. */
   async reparentNodes(
     nodePaths: string[],
     newParentPath: string | null,
     opts?: { index?: number; label?: string },
   ): Promise<string[]> {
+    return (await this.reparentNodesDetailed(nodePaths, newParentPath, opts)).moved;
+  }
+
+  /**
+   * {@link reparentNodes} with what the move rewrote (plan-610 F8).
+   *
+   * The moves keep their sequential semantics (node i moves after node i-1:
+   * its collision name, `prevIndex` and source path see the earlier moves), but
+   * every op is now resolved BEFORE the first mutation — on a simulation of the
+   * sibling lists and names — and applied as ONE composite together with the
+   * `setField` steps that rewrite every stored reference into the moved
+   * subtrees. Planning and apply share one queue slot.
+   *
+   * Rejects with {@link RenameRefusedError} (nothing mutated) when a collision
+   * auto-rename would rename a signal node whose signal name hangs on its node
+   * name, or when a move touches a referenced asset's structure.
+   */
+  async reparentNodesDetailed(
+    nodePaths: string[],
+    newParentPath: string | null,
+    opts?: { index?: number; label?: string },
+  ): Promise<ReparentNodesResult> {
+    this._assertUnlocked('Moving nodes');
+    const result = await this._doc.applyPlanned(() => this._planReparentSequential(nodePaths, newParentPath, opts));
+    return result ?? { moved: [], ...emptyRewrite() };
+  }
+
+  /** Plan {@link reparentNodesDetailed} against the CURRENT state (inside the queue slot). */
+  private _planReparentSequential(
+    nodePaths: string[],
+    newParentPath: string | null,
+    opts?: { index?: number; label?: string },
+  ): { op: RvAssetOp | null; result: ReparentNodesResult } {
+    const none = { op: null, result: { moved: [], ...emptyRewrite() } };
     const targetIndex = opts?.index;
-    const label = opts?.label;
     const registry = this.viewer.registry;
     const newParent = newParentPath
       ? registry?.getNode(newParentPath) ?? null
       : this.viewer.currentModelRoot;
-    if (!registry || !newParent) return [];
-    const parentPath = NodeRegistry.computeNodePath(newParent);
+    if (!registry || !newParent) return none;
 
-    // Filter out impossible moves up front so the transaction stays clean.
-    const movable = nodePaths.filter((p) => {
+    // Filter out impossible moves up front so the composite stays clean.
+    const movable: Object3D[] = [];
+    for (const p of nodePaths) {
       const node = registry.getNode(p);
-      if (!node || !node.parent) return false;
-      if (isModelRoot(node, this.viewer.currentModelRoot)) return false;
+      if (!node || !node.parent) continue;
+      if (isModelRoot(node, this.viewer.currentModelRoot)) continue;
       // Same-parent is "already there" ONLY when no explicit slot is asked for;
       // with an index it is a legitimate reorder within the parent.
-      if (node.parent === newParent && targetIndex === undefined) return false;
+      if (node.parent === newParent && targetIndex === undefined) continue;
+      let cyclic = false;
       for (let anc: Object3D | null = newParent; anc; anc = anc.parent) {
-        if (anc === node) return false; // cycle
+        if (anc === node) { cyclic = true; break; }
       }
-      return true;
-    });
-    if (movable.length === 0) return [];
+      if (cyclic) continue;
+      movable.push(node);
+    }
+    if (movable.length === 0) return none;
 
     // The requested slot is expressed against the parent's children with the
     // moved-and-staying nodes excluded, so it composes cleanly as we emit one
     // op per node: node i lands at `baseIndex + i`.
-    const baseIndex = targetIndex === undefined
-      ? undefined
-      : Math.max(0, targetIndex);
+    const baseIndex = targetIndex === undefined ? undefined : Math.max(0, targetIndex);
 
-    const movedPaths: string[] = [];
-    const doMoves = async () => {
-      for (let i = 0; i < movable.length; i++) {
-        const path = movable[i];
-        const node = registry.getNode(path);
-        if (!node || !node.parent) continue;
-        const sameParent = node.parent === newParent;
-        let nodePath = path;
-        // Pre-rename when the target parent already has a same-named child
-        // (never for a same-parent reorder — the node keeps its own name).
-        if (!sameParent && newParent.children.some((c) => c !== node && c.name === node.name)) {
-          const newName = uniqueChildName(newParent, node.name);
-          await this.applyOp({
-            ...assetOpHeader(), kind: 'renameNode', nodePath, name: newName, prevName: node.name,
-          });
-          nodePath = replacePathLeaf(nodePath, newName);
-        }
-        // World-preserving local TRS under the new parent, computed NOW so the
-        // executor only replays recorded numbers. A same-parent reorder keeps
-        // the world (and thus local) transform — snapshot it directly.
-        let transform: NodeTransform;
-        if (sameParent) {
-          transform = snapshotLocalTransform(node);
-        } else {
-          newParent.updateMatrixWorld(true);
-          node.updateMatrixWorld(true);
-          const local = new Matrix4()
-            .copy(newParent.matrixWorld).invert()
-            .multiply(node.matrixWorld);
-          transform = decomposeToTransform(local);
-        }
-        const prevParent = node.parent;
-        await this.applyOp({
-          ...assetOpHeader(),
-          kind: 'reparentNode',
-          nodePath,
-          newParentPath: parentPath,
-          ...(baseIndex !== undefined ? { newIndex: baseIndex + i } : {}),
-          transform,
-          prevParentPath: NodeRegistry.computeNodePath(prevParent),
-          prevIndex: prevParent.children.indexOf(node),
-          prevTransform: snapshotLocalTransform(node),
-        });
-        movedPaths.push(joinPaths(parentPath, node.name));
-      }
+    // ── simulation of the tree the earlier moves leave behind ──────────
+    // Names, parents and sibling lists as they stand when op i runs. World
+    // matrices need no simulation: every move is world-preserving and a
+    // same-parent reorder keeps the local pose, so no node's world changes.
+    const nameOf = new Map<Object3D, string>();
+    const parentOf = new Map<Object3D, Object3D>();
+    const kids = new Map<Object3D, Object3D[]>();
+    const nm = (n: Object3D): string => nameOf.get(n) ?? n.name;
+    const par = (n: Object3D): Object3D | null => parentOf.get(n) ?? n.parent;
+    const kidsOf = (p: Object3D): Object3D[] => {
+      let list = kids.get(p);
+      if (!list) { list = [...p.children]; kids.set(p, list); }
+      return list;
     };
+    const simPath = (n: Object3D): string => {
+      // NodeRegistry.computeNodePath over the simulated names/parents.
+      const parts: string[] = [];
+      let cur: Object3D | null = n;
+      while (cur && par(cur)) {
+        parts.unshift(nm(cur));
+        cur = par(cur);
+        if (cur && !par(cur)) break;
+      }
+      return parts.join('/');
+    };
+    // Path → node for the guard: post-op paths do not exist in the registry yet.
+    const pathIndex = new Map<string, Object3D>();
+    const locate = (p: string): Object3D | null => pathIndex.get(p) ?? registry.getNode(p);
 
-    // A single collision-free move stays ONE op; a pre-rename must share the
-    // undo unit with its reparent, so it forces a transaction.
-    const singleNode = movable.length === 1 ? registry.getNode(movable[0]) : null;
-    const singleNeedsRename = singleNode
-      ? singleNode.parent !== newParent
-        && newParent.children.some((c) => c !== singleNode && c.name === singleNode.name)
-      : false;
+    this.viewer.currentModelRoot?.updateMatrixWorld(true);
+    newParent.updateMatrixWorld(true); // covers a target outside the model root
+    const parentWorldInverse = new Matrix4().copy(newParent.matrixWorld).invert();
 
-    // Inside an outer transaction (e.g. "group into empty") the caller owns
-    // the undo unit — just emit the ops.
-    if (this._doc.inTransaction || (movable.length === 1 && !label && !singleNeedsRename)) {
-      await doMoves();
-    } else {
-      const fallback = movable.length === 1
-        ? `Move ${leafName(movable[0])}`
-        : `Move ${movable.length} objects`;
-      await this.withTransaction(label ?? fallback, doMoves);
+    const ops: RvAssetPrimitiveOp[] = [];
+    const movedPaths: string[] = [];
+    const notices: ReferenceRewriteNotice[] = [];
+    const originalPath = new Map<Object3D, string>();
+    for (let i = 0; i < movable.length; i++) {
+      const node = movable[i];
+      const prevParent = par(node);
+      if (!prevParent) continue;
+      if (!originalPath.has(node)) originalPath.set(node, registry.getPathForNode(node) ?? NodeRegistry.computeNodePath(node));
+      const sameParent = prevParent === newParent;
+      let nodePath = simPath(node);
+      pathIndex.set(nodePath, node);
+      // Pre-rename when the target parent already has a same-named child
+      // (never for a same-parent reorder — the node keeps its own name).
+      if (!sameParent && kidsOf(newParent).some((c) => c !== node && nm(c) === nm(node))) {
+        if (signalNameFollowsNodeName(node)) {
+          throw new RenameRefusedError('signal-node', nodePath, signalNodeRefusal(nodePath, true));
+        }
+        const taken = new Set(kidsOf(newParent).map(nm));
+        const sane = nm(node).replace(/[^\w\- ]+/g, '_').trim() || 'CAD';
+        const newName = uniqueName(taken, sane);
+        ops.push(makeRenameOp(node, nodePath, newName, nm(node)));
+        notices.push({
+          code: 'auto-renamed',
+          message: `"${nm(node)}" was renamed to "${newName}" — the target already has a child of that name.`,
+          nodePath: joinPaths(simPath(newParent), newName),
+        });
+        const dup = nameNotUniqueNotice(this.viewer.currentModelRoot ?? null, node, newName, joinPaths(simPath(newParent), newName));
+        if (dup) notices.push(dup);
+        nameOf.set(node, newName);
+        nodePath = simPath(node);
+        pathIndex.set(nodePath, node);
+      }
+      // World-preserving local TRS under the new parent, computed NOW so the
+      // executor only replays recorded numbers. A same-parent reorder keeps
+      // the world (and thus local) transform — snapshot it directly.
+      const transform = sameParent
+        ? snapshotLocalTransform(node)
+        : decomposeToTransform(new Matrix4().copy(parentWorldInverse).multiply(node.matrixWorld));
+      const prevList = kidsOf(prevParent);
+      const prevIndex = prevList.indexOf(node);
+      const parentPath = simPath(newParent);
+      pathIndex.set(parentPath, newParent);
+      const newIndex = baseIndex !== undefined ? baseIndex + i : undefined;
+      ops.push({
+        ...assetOpHeader(),
+        kind: 'reparentNode',
+        nodePath,
+        newParentPath: parentPath,
+        ...(newIndex !== undefined ? { newIndex } : {}),
+        transform,
+        prevParentPath: simPath(prevParent),
+        prevIndex,
+        prevTransform: snapshotLocalTransform(node),
+      });
+      // three's `add` removes from the old parent and appends; the executor
+      // then splices to the requested slot.
+      if (prevIndex >= 0) prevList.splice(prevIndex, 1);
+      const target = kidsOf(newParent);
+      target.push(node);
+      if (newIndex !== undefined) {
+        target.splice(target.indexOf(node), 1);
+        target.splice(Math.min(newIndex, target.length), 0, node);
+      }
+      parentOf.set(node, newParent);
+      const finalPath = joinPaths(parentPath, nm(node));
+      pathIndex.set(finalPath, node);
+      movedPaths.push(finalPath);
     }
-    return movedPaths;
+    if (ops.length === 0) return none;
+    this._guardStructural(ops, locate);
+
+    // Old canonical → final path of every moved/renamed node (roots suffice;
+    // a member moved again inside a moved ancestor carries its own entry).
+    const moves = new Map<string, string>();
+    for (const [node, from] of originalPath) moves.set(from, simPath(node));
+    const rewrite = planDocumentReferenceRewrite(this.viewer, moves);
+    const label = opts?.label ?? (movable.length === 1 ? `Move ${leafName(originalPath.get(movable[0]) ?? '')}` : `Move ${movable.length} objects`);
+    const op = rewriteComposite(label, ops, rewrite);
+    return {
+      op,
+      result: {
+        moved: movedPaths,
+        ...rewrite.summary,
+        warnings: [...notices, ...rewrite.summary.warnings],
+      },
+    };
   }
 
   /**
@@ -921,14 +1502,15 @@ export class AssetDocument {
    * counterpart of {@link reparentNodes}, with the same per-node result (world
    * pose preserved, sibling names deduped, full inverse payload recorded).
    *
-   * Why it exists. `reparentNodes` emits one top-level op per node and awaits each
-   * in turn, and `AssetExecutorContext._afterApply` runs once per TOP-LEVEL op — so
-   * N moves paid N `editor-structure-changed` events, and each of those costs the
-   * hierarchy panel a FULL `scene.traverse`. Measured on a 4493-node assembly with
-   * 434 moves (plan-359 Phase 2): 217 ms total, of which 158 ms (73%) was the panel
-   * re-scanning the whole scene 434 times. Matrix updates (19 ms) and registry path
-   * remapping (12 ms) together were under 15% — the plan's "possibly quadratic
-   * matrix update" suspicion did not survive measurement.
+   * Why it exists. `reparentNodes` used to emit one top-level op per node and
+   * await each in turn, and `AssetExecutorContext._afterApply` runs once per
+   * TOP-LEVEL op — so N moves paid N `editor-structure-changed` events, and each
+   * of those costs the hierarchy panel a FULL `scene.traverse`. Measured on a
+   * 4493-node assembly with 434 moves (plan-359 Phase 2): 217 ms total, of which
+   * 158 ms (73%) was the panel re-scanning the whole scene 434 times. Matrix
+   * updates (19 ms) and registry path remapping (12 ms) together were under 15%
+   * — the plan's "possibly quadratic matrix update" suspicion did not survive
+   * measurement.
    *
    * Resolving the block into ONE composite fixes that at the root: one structure
    * event, one BVH classification, one matrix flush, one undo step.
@@ -945,6 +1527,9 @@ export class AssetDocument {
    * same batch are dropped: moving an ancestor and its descendant into the same
    * parent is contradictory, and it would strand the descendant's recorded path.
    *
+   * Reference-safe (plan-610): the same composite carries the `setField` steps
+   * that rewrite every stored reference into the moved subtrees.
+   *
    * Returns the post-move (post-rename) paths of the nodes that actually moved.
    */
   async reparentNodesBatch(
@@ -952,11 +1537,32 @@ export class AssetDocument {
     newParentPath: string | null,
     opts?: { index?: number; label?: string },
   ): Promise<string[]> {
+    return (await this.reparentNodesBatchDetailed(nodePaths, newParentPath, opts)).moved;
+  }
+
+  /** {@link reparentNodesBatch} with what the move rewrote (plan-610 F8). */
+  async reparentNodesBatchDetailed(
+    nodePaths: string[],
+    newParentPath: string | null,
+    opts?: { index?: number; label?: string },
+  ): Promise<ReparentNodesResult> {
+    this._assertUnlocked('Moving nodes');
+    const result = await this._doc.applyPlanned(() => this._planReparentBatch(nodePaths, newParentPath, opts));
+    return result ?? { moved: [], ...emptyRewrite() };
+  }
+
+  /** Plan {@link reparentNodesBatchDetailed} against the CURRENT state (inside the queue slot). */
+  private _planReparentBatch(
+    nodePaths: string[],
+    newParentPath: string | null,
+    opts?: { index?: number; label?: string },
+  ): { op: RvAssetOp | null; result: ReparentNodesResult } {
+    const none = { op: null, result: { moved: [], ...emptyRewrite() } };
     const registry = this.viewer.registry;
     const newParent = newParentPath
       ? registry?.getNode(newParentPath) ?? null
       : this.viewer.currentModelRoot;
-    if (!registry || !newParent) return [];
+    if (!registry || !newParent) return none;
     const targetIndex = opts?.index;
     const parentPath = NodeRegistry.computeNodePath(newParent);
 
@@ -985,7 +1591,7 @@ export class AssetDocument {
       }
       return true;
     });
-    if (block.length === 0) return [];
+    if (block.length === 0) return none;
 
     // Names already claimed under the target, ignoring the nodes that are leaving
     // their old parents to come here.
@@ -1017,6 +1623,10 @@ export class AssetDocument {
 
     const ops: RvAssetPrimitiveOp[] = [];
     const movedPaths: string[] = [];
+    const notices: ReferenceRewriteNotice[] = [];
+    const moves = new Map<string, string>();
+    // Path → node for the guard: the post-rename paths are not registered yet.
+    const pathIndex = new Map<string, Object3D>();
     for (let i = 0; i < block.length; i++) {
       const node = block[i];
       const prevParent = node.parent!;
@@ -1026,12 +1636,20 @@ export class AssetDocument {
       let nodePath = originalPath;
       let finalName = node.name;
       if (!sameParent && taken.has(node.name)) {
+        if (signalNameFollowsNodeName(node)) {
+          throw new RenameRefusedError('signal-node', originalPath, signalNodeRefusal(originalPath, true));
+        }
         finalName = uniqueName(taken, node.name);
-        ops.push({
-          ...assetOpHeader(), kind: 'renameNode',
-          nodePath, name: finalName, prevName: node.name,
-        });
+        ops.push(makeRenameOp(node, nodePath, finalName));
         nodePath = replacePathLeaf(nodePath, finalName);
+        pathIndex.set(nodePath, node);
+        notices.push({
+          code: 'auto-renamed',
+          message: `"${node.name}" was renamed to "${finalName}" — the target already has a child of that name.`,
+          nodePath: joinPaths(parentPath, finalName),
+        });
+        const dup = nameNotUniqueNotice(this.viewer.currentModelRoot ?? null, node, finalName, joinPaths(parentPath, finalName));
+        if (dup) notices.push(dup);
       }
       if (!sameParent) taken.add(finalName);
 
@@ -1054,22 +1672,26 @@ export class AssetDocument {
         prevIndex: prevIndexOf(node, prevParent),
         prevTransform: snapshotLocalTransform(node),
       });
-      movedPaths.push(joinPaths(parentPath, finalName));
+      const finalPath = joinPaths(parentPath, finalName);
+      movedPaths.push(finalPath);
+      moves.set(originalPath, finalPath);
     }
+    this._guardStructural(ops, (p) => pathIndex.get(p) ?? null);
 
     // ── apply as ONE top-level op ──────────────────────────────────────
     const label = opts?.label ?? (block.length === 1
       ? `Move ${leafName(movedPaths[0])}`
       : `Move ${block.length} objects`);
-    if (ops.length === 1) {
-      await this.applyOp(ops[0]);
-    } else {
-      // Origin-typed constructor, not an inline record: `ops` is the batch's own
-      // asset-lineage primitives, and this is the point where that is still
-      // provable (plan-710 §2.2).
-      await this.applyOp(makeAssetComposite(label, ops));
-    }
-    return movedPaths;
+    const rewrite = planDocumentReferenceRewrite(this.viewer, moves);
+    const op = rewriteComposite(label, ops, rewrite);
+    return {
+      op,
+      result: {
+        moved: movedPaths,
+        ...rewrite.summary,
+        warnings: [...notices, ...rewrite.summary.warnings],
+      },
+    };
   }
 
   /**
@@ -1181,6 +1803,7 @@ export class AssetDocument {
       this.executor.discardMergePayload(header.id);
       throw e;
     }
+    reportMergeUVGaps(rootPath, plan.classification);
     return plan;
   }
 
@@ -1202,13 +1825,26 @@ export class AssetDocument {
 
   // ─── Draft persistence ───────────────────────────────────────────────
 
-  /** Replay a recovered draft's ops onto the freshly loaded base. */
-  async replayOps(ops: readonly RvOp[]): Promise<void> {
+  /**
+   * Replay a recovered draft's ops onto the freshly loaded base.
+   *
+   * plan-774 review fix E3: with `opts.gate` (the authoring join's replay gate,
+   * placements not ready in time) the ops from the first one on placed content
+   * that is still materialising on become the document's PENDING tail — part
+   * of the draft, applied on the document's queue once the placements arrived
+   * (bounded by `opts.waitBudgetMs`). See `RvDocument.replayOps`.
+   */
+  async replayOps(ops: readonly RvOp[], opts?: RvDocumentReplayOptions): Promise<void> {
     this._assertUnlocked('Replaying ops');
     // plan-498 F13: an `attach-fmu` in the log carries only its package SHA —
     // put the bytes back (draft side-store) BEFORE the op constructs the RVFmu.
     await restoreFmuPackagesForOps(ops, this.id);
-    await this._doc.replayOps(ops);
+    await this._doc.replayOps(ops, opts);
+  }
+
+  /** plan-774 review fix E3: recovered ops still waiting for their placed content. */
+  get hasPendingReplay(): boolean {
+    return this._doc.pendingReplayOps.length > 0;
   }
 
   /**
@@ -1225,7 +1861,8 @@ export class AssetDocument {
   toDraft(): AssetDraft {
     return {
       shell: { id: this.id, name: this._doc.name, base: this._base, createdAt: this._doc.createdAt },
-      ops: [...this._doc.ops],
+      // plan-774 review fix E3: the history PLUS a pending replay tail.
+      ops: this._doc.draftOps,
       savedAt: Date.now(),
     };
   }
@@ -1383,9 +2020,9 @@ export class AssetDocument {
   }
 
   /**
-   * Refuse a mutation while a TEST RUN owns the document.
+   * Refuse a mutation while a TEST RUN or a REPLACE (plan-527) owns the document.
    *
-   * Only a test run, and that is the contract rather than an oversight: a save
+   * Never a save, and that is the contract rather than an oversight: a save
    * legitimately calls {@link markSaved} and re-bases the log from inside its
    * own lock, so making the save owner block the document's own methods would
    * make the save block itself. Saves exclude each other, and exclude test
@@ -1393,9 +2030,11 @@ export class AssetDocument {
    */
   private _assertUnlocked(what: string): void {
     const held = this._lock;
-    if (!held || held.kind !== 'test-run') return;
+    // `save` is the one owner that may still mutate (it calls `markSaved` from
+    // inside its own lock). `test-run` and `replace` refuse everything.
+    if (!held || held.kind === 'save') return;
     const owner: DocumentLockOwner = { kind: held.kind, startedAt: held.startedAt };
-    throw new DocumentLockedError(owner, lockedMessage(owner, what));
+    throw new DocumentLockedError(owner, documentLockedMessage(owner, what));
   }
 
   /**
@@ -1533,6 +2172,7 @@ export class AssetDocument {
   }
 
   dispose(): void {
+    this._simplifier.dispose();
     this._disposed = true;
     // Whatever held the document is gone with it. The generation is bumped so a
     // timeout still armed for that holder cannot release a lock taken later on
@@ -1629,6 +2269,27 @@ export interface MergeMeshPlan {
  * Exported so the preview dialog and the worker path use the SAME plan the op is built
  * from — a second, independently derived partition would be a second truth.
  */
+/**
+ * plan-675: a merge whose textured bucket mixed sources with and without `uv`
+ * filled the gaps with zeros — those parts now render one texel of the texture.
+ * That is not silent any more: one Problems entry per bucket names the material
+ * and the meshes, and the fix (`editor.generateUVs` before merging).
+ */
+export function reportMergeUVGaps(rootPath: string, classification: MergeClassification): void {
+  for (const gap of classification.uvGaps) {
+    const names = gap.missing.slice(0, 5).map((m) => m.name || '(unnamed)');
+    reportProblem({
+      id: `merge-uv-missing:${rootPath}:${gap.bucketKey}`,
+      severity: 'warning',
+      code: 'merge-uv-missing',
+      title: `Merged textured material "${gap.materialName}" without UVs on ${gap.missing.length} of ${gap.total} parts`,
+      detail: `Parts without UVs sample a single texel (flat colour): ${names.join(', ')}${gap.missing.length > names.length ? ', …' : ''}. `
+        + 'Undo, run Generate UVs (editor.generateUVs) on them, then merge again.',
+      nodePath: rootPath,
+    });
+  }
+}
+
 export function planMergeMesh(viewer: RVViewer, rootPath: string): MergeMeshPlan | null {
   const root = viewer.registry?.getNode(rootPath) ?? null;
   if (!root) return null;
@@ -1774,4 +2435,230 @@ function decomposeToTransform(m: Matrix4): NodeTransform {
     quaternion: q.toArray() as [number, number, number, number],
     scale: s.toArray() as [number, number, number],
   };
+}
+
+// ─── Reference rewrite planning (plan-610) ────────────────────────────────
+
+/** The planned rewrite of one structural change, ready to compose. */
+interface DocumentReferenceRewrite {
+  /** `setField` steps (POST-change referrer paths, complete field values). */
+  setOps: RvAssetPrimitiveOp[];
+  /**
+   * The composite must run its end-of-range re-bind: there are steps, or a
+   * live component holds a resolved address under a moved path (a foreign
+   * referrer inside a placed asset, whose extras are never written).
+   */
+  needsRebind: boolean;
+  summary: ReferenceRewriteSummary;
+}
+
+/**
+ * Plan the reference rewrite for `moves` (old canonical → new canonical,
+ * subtree roots suffice) against the CURRENT, not yet mutated state.
+ *
+ * Referrers are every registered non-alias node with extras; those inside
+ * referenced (foreign) content are skipped — their extras belong to another
+ * asset and are re-bound at runtime instead. Each written path is resolved
+ * with its component type and authoring scope through the registry's ONE
+ * resolution chain ({@link NodeRegistry.resolveWithStage}).
+ *
+ * `authoredMoves` (plan-765 F2b) is the same change spelled in AUTHORED names
+ * (`_rvOrigName ?? name` per segment). With it, a reference written in the
+ * authored spelling of a moved node is rewritten in that spelling rather than
+ * healed onto the loader's `_N` names — see `authoredMoves` in the rewrite core.
+ */
+function planDocumentReferenceRewrite(
+  viewer: RVViewer,
+  moves: ReadonlyMap<string, string>,
+  authoredMoves?: ReadonlyMap<string, string>,
+): DocumentReferenceRewrite {
+  const registry = viewer.registry;
+  if (!registry || moves.size === 0) return { setOps: [], needsRebind: false, summary: emptyRewrite() };
+  const modelRoot = viewer.currentModelRoot ?? null;
+
+  // Leaf names (in the spellings the lookup stages tolerate) of every node in a
+  // moved subtree: a written path whose leaf is none of them cannot resolve
+  // INTO a moved subtree, so it is not resolved at all (the planner then
+  // counts it as unresolved — counts are candidates, not an audit).
+  const movedLeaves = new Set<string>();
+  const addLeaf = (name: string): void => {
+    movedLeaves.add(name);
+    movedLeaves.add(name.replace(/ /g, '_'));
+    movedLeaves.add(sanitizeLikeThree(name));
+  };
+  for (const oldPath of moves.keys()) {
+    const root = registry.getNode(oldPath);
+    if (root) {
+      root.traverse((n) => {
+        addLeaf(n.name);
+        // An authored-spelled reference ends in the authored name (plan-765 F2b).
+        const orig = n.userData?.[RV_ORIG_NAME_KEY];
+        if (typeof orig === 'string' && orig.length > 0) addLeaf(orig);
+      });
+    } else {
+      addLeaf(leafName(oldPath));
+    }
+  }
+  const mayHitMoved = (written: string): boolean => {
+    const leaf = leafName(written.replace(/\/+$/, ''));
+    return movedLeaves.has(leaf) || movedLeaves.has(leaf.replace(/ /g, '_')) || movedLeaves.has(sanitizeLikeThree(leaf));
+  };
+
+  const nodesByPath = new Map<string, Object3D>();
+  const referrers: { nodePath: string; extras: Record<string, unknown> }[] = [];
+  registry.forEachNode((path, node) => {
+    if (registry.getPathForNode(node) !== path) return; // alias entry
+    const extras = node.userData?.realvirtual as Record<string, unknown> | undefined;
+    if (!extras || typeof extras !== 'object') return;
+    nodesByPath.set(path, node);
+    referrers.push({ nodePath: path, extras });
+  });
+
+  const foreign = new Map<string, boolean>();
+  const isForeign = (path: string): boolean => {
+    let v = foreign.get(path);
+    if (v === undefined) {
+      const node = nodesByPath.get(path);
+      v = !!node && outermostReference(node, modelRoot) !== null;
+      foreign.set(path, v);
+    }
+    return v;
+  };
+
+  const plan = planReferenceRewrite({
+    referrers,
+    moves,
+    ...(authoredMoves ? { authoredMoves } : {}),
+    isForeign,
+    resolveOld: ({ path, componentType, referrerPath }) => {
+      if (!mayHitMoved(path)) return null;
+      const referrer = nodesByPath.get(referrerPath);
+      if (!referrer) return null;
+      // The reference's own chain first (a node without the target component is
+      // no hit). A typed miss that EXACTLY names a node — a late-resolved
+      // component reference (`MachiningVolume.Tools`, DES) whose target type
+      // is not built yet — still follows its node; it is never healed.
+      let hit = registry.resolveWithStage({ path }, componentType ?? '', referrer);
+      if (!hit && componentType && !isEagerRefType(componentType)) {
+        const asNode = registry.resolveWithStage({ path }, '', referrer);
+        // A path in the AUTHORED names of exactly that node (plan-765 F2b) is as
+        // good as exact: the loader's dedup alias is the only reason it is not.
+        if (asNode && (asNode.stage === 'exact' || (authoredMoves
+          && writtenTailMatches(path, authoredNodePath(asNode.node), asNode.spelling)))) hit = asNode;
+      }
+      if (!hit) return null;
+      const canonical = registry.getPathForNode(hit.node);
+      if (canonical === null) return null;
+      const out = { canonical, spelling: hit.spelling, stage: hit.stage, scopeRootPath: hit.scopeRootPath };
+      if (!authoredMoves) return out;
+      const authored = authoredNodePath(hit.node);
+      return authored === canonical ? out : { ...out, authoredCanonical: authored };
+    },
+    resolveName: ({ name, referrerPath }) => {
+      if (!movedLeaves.has(name)) return null;
+      const owner = nodesByPath.get(referrerPath);
+      if (!owner) return null;
+      // RVSource: the owner's subtree first, then the registry.
+      const inOwner = namedNodesUnder(owner, name);
+      if (inOwner.length === 1) return { canonical: registry.getPathForNode(inOwner[0]) };
+      if (inOwner.length > 1) return { canonical: null, ambiguous: true };
+      const scopeRoot = registry.enclosingScope(owner).root;
+      const inScope = namedNodesUnder(scopeRoot, name);
+      if (inScope.length > 1) return { canonical: null, ambiguous: true };
+      const node = inScope[0] ?? registry.getNode(name);
+      return node ? { canonical: registry.getPathForNode(node) } : null;
+    },
+  });
+
+  const setOps: RvAssetPrimitiveOp[] = [...plan.steps, ...plan.nameSteps].map((s) => ({
+    ...assetOpHeader(),
+    kind: 'setField',
+    nodePath: s.nodePath,
+    componentType: s.componentType,
+    fieldName: s.field,
+    // Detached copies: the op log must not share objects with the live extras.
+    value: cloneJson(s.value),
+    prev: cloneJson(s.prev),
+  }));
+  const needsRebind = setOps.length > 0 || liveAddressUnderMoves(registry, moves);
+  const summary: ReferenceRewriteSummary = {
+    referencesRewritten: plan.counts.referencesRewritten,
+    nameFieldsRewritten: plan.counts.nameFieldsRewritten,
+    warnings: plan.warnings.map((w: ReferenceRewriteWarning) => ({ code: w.code, message: w.message, nodePath: w.nodePath })),
+  };
+  return { setOps, needsRebind, summary };
+}
+
+/**
+ * Reference types `resolve` binds at load (Drive, Sensor, signals, plain
+ * nodes): a miss there is a genuinely broken reference, not a late one.
+ */
+function isEagerRefType(componentType: string): boolean {
+  const ct = componentType.slice(componentType.lastIndexOf('.') + 1);
+  return componentType === 'UnityEngine.Transform'
+    || ct.includes('Drive') || ct.includes('Sensor') || ct.includes('Signal') || ct.includes('PLC');
+}
+
+/** A JSON value detached from the live extras (`undefined` stays `undefined`). */
+function cloneJson<T>(v: T): T {
+  return v === undefined ? v : JSON.parse(JSON.stringify(v)) as T;
+}
+
+/** Nodes named `name` in `root`'s subtree (root included). */
+function namedNodesUnder(root: Object3D, name: string): Object3D[] {
+  const out: Object3D[] = [];
+  root.traverse((n) => { if (n.name === name) out.push(n); });
+  return out;
+}
+
+/**
+ * Does any live component hold a resolved address string (scalar or array
+ * element) at or below one of the moved paths? Then the composite needs the
+ * end-of-range re-bind even without a single step to write.
+ */
+function liveAddressUnderMoves(registry: NodeRegistry, moves: ReadonlyMap<string, string>): boolean {
+  const under = (s: string): boolean => {
+    if (moves.has(s)) return true;
+    for (let i = s.indexOf('/'); i > 0; i = s.indexOf('/', i + 1)) {
+      if (moves.has(s.slice(0, i))) return true;
+    }
+    return false;
+  };
+  let found = false;
+  registry.forEachNode((path, node) => {
+    if (found || registry.getPathForNode(node) !== path) return;
+    for (const [, instance] of registry.getComponentsAt(path)) {
+      if (!instance || typeof instance !== 'object') continue;
+      for (const v of Object.values(instance as Record<string, unknown>)) {
+        const hit = typeof v === 'string'
+          ? under(v)
+          : Array.isArray(v) && v.some((e) => typeof e === 'string' && under(e));
+        if (hit) { found = true; return; }
+      }
+    }
+  });
+  return found;
+}
+
+/**
+ * The op of a reference-safe structural change: the structure ops, then the
+ * rewrite's `setField` steps, as ONE composite. Marked (`referenceRewrite`)
+ * only when it needs the deferred re-bind; an unmarked change keeps exactly its
+ * old shape (a lone primitive stays a primitive).
+ */
+function rewriteComposite(label: string, structure: RvAssetPrimitiveOp[], rewrite: DocumentReferenceRewrite): RvAssetOp {
+  if (!rewrite.needsRebind) {
+    return structure.length === 1 ? structure[0] : makeAssetComposite(label, structure);
+  }
+  return makeAssetComposite(label, [...structure, ...rewrite.setOps], { referenceRewrite: true });
+}
+
+/** The refusal message of a rename that would rename a signal (plan-610 F6). */
+function signalNodeRefusal(nodePath: string, autoRename = false): string {
+  const what = autoRename
+    ? `Moving "${nodePath}" would auto-rename it (a sibling of that name exists under the target), but it`
+    : `"${nodePath}"`;
+  return `${what} is a signal node whose signal name comes from its node name (no "Name" set) — `
+    + 'renaming the node would rename the signal under every PLC/CONNECT binding. '
+    + 'Use editor.signalRename to rename the signal, or set its "Name" field first.';
 }

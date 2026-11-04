@@ -111,7 +111,7 @@ function setup() {
   const { ctx, handle } = createBindContext(root, host, accum);
   Conveyor.bind(ctx);
 
-  return { signalStore, drive, handle, root, accum };
+  return { signalStore, drive, handle, root, accum, host };
 }
 
 describe('Conveyor behavior — hierarchy badge', () => {
@@ -295,6 +295,27 @@ describe('findDownstreamRoot — snap graph', () => {
 });
 
 describe('Conveyor behavior — single zone (no downstream)', () => {
+  it('runs past its end sensor into an unpaired sink, but stops if deletion is disabled', () => {
+    const { signalStore, drive, handle, root, host } = setup();
+    const output = new Object3D(); output.position.set(1, 0.5, 0); root.add(output);
+    const port = { id: 'out', object3D: output, ownerRoot: root, flow: 'out' };
+    host.getPlugin = id => id === 'snap-point' ? { getRegistry: () => ({
+      getByOwnerRoot: (owner: Object3D) => owner === root ? [port] : [], getById: () => undefined,
+    }) } : undefined;
+    const sink = { isOwner: true, DeleteMus: true, DeleteOnlyTag: '',
+      aabb: { min: new Vector3(0.8, 0.4, -0.5), max: new Vector3(1.8, 0.7, 0.5) } };
+    Object.assign((host as unknown as { transportManager: object }).transportManager, { sinks: [sink] });
+    signalStore.set('Flow.Run', true);
+    signalStore.set('Sensor-1', true);
+    iterateFixedUpdate(handle, DT);
+    expect(drive.jogForward).toBe(true);
+    expect(signalStore.get('Flow.Running')).toBe(true);
+    sink.DeleteMus = false;
+    iterateFixedUpdate(handle, DT);
+    expect(drive.jogForward).toBe(false);
+    handle.dispose();
+  });
+
   it('runs while Run is true (when empty) and stops when cleared', () => {
     const { signalStore, drive, handle } = setup();
     signalStore.set('Flow.Run', true);
@@ -436,16 +457,16 @@ describe('Conveyor behavior — two-conveyor line (ZPA back-pressure)', () => {
     const A = placedConveyor('ConvA');
     const B = placedConveyor('ConvB');
     // Separate the belts in space so a good on B's belt doesn't also overlap A's.
-    B.root.position.set(10, 0, 0); B.root.updateMatrixWorld(true);
+    B.root.position.set(2.2, 0, 0); B.root.updateMatrixWorld(true);
 
-    // Fake transport manager so the conveyors publish SURFACE-based occupancy.
-    // Occupancy is now driven by a good (MU) physically overlapping a belt surface.
-    const mus: { aabb: AABB; markedForRemoval: boolean }[] = [];
+    // Mirror the transport manager's surface ownership for occupancy publication.
+    const mus: { aabb: AABB; markedForRemoval: boolean; currentSurface: { node: Object3D; aabb: AABB } }[] = [];
     const surf = (node: Object3D) => ({ node, aabb: AABB.fromHalfSize(node, new Vector3(1, 0.1, 1)) });
     const transportManager = { surfaces: [surf(A.drive.node), surf(B.drive.node)], mus };
     const placeGoodOn = (node: Object3D) => {
       const g = new Object3D(); node.getWorldPosition(g.position); g.updateMatrixWorld(true);
-      mus.push({ aabb: AABB.fromHalfSize(g, new Vector3(0.2, 0.2, 0.2)), markedForRemoval: false });
+      mus.push({ aabb: AABB.fromHalfSize(g, new Vector3(0.2, 0.2, 0.2)), markedForRemoval: false,
+        currentSurface: transportManager.surfaces.find(s => s.node === node)! });
     };
     const clearGoods = () => { mus.length = 0; };
 
@@ -487,6 +508,22 @@ describe('Conveyor behavior — two-conveyor line (ZPA back-pressure)', () => {
     tick();
     expect(A.drive.jogForward).toBe(true);
     expect(B.drive.jogForward).toBe(true);
+
+    // Regression: A's pallet grazes B by 8 mm but still belongs to A.
+    // B must stay clear so A can push it across the boundary.
+    placeGoodOn(A.drive.node);
+    mus[0].aabb.min.x = 0.808; mus[0].aabb.max.x = 1.208;
+    expect(transportManager.surfaces[1].aabb.overlapsXZ(mus[0].aabb)).toBe(true);
+    signalStore.set('ConvA.Sensor', true);
+    tick(); tick();
+    expect(signalStore.get('ConvA.Flow.Occupied')).toBe(true);
+    expect(signalStore.get('ConvB.Flow.Occupied')).toBe(false);
+    expect(A.drive.jogForward).toBe(true);
+    mus[0].currentSurface = transportManager.surfaces[1];
+    tick(); tick();
+    expect(signalStore.get('ConvB.Flow.Occupied')).toBe(true);
+    expect(A.drive.jogForward).toBe(false);
+    clearGoods();
 
     // A good on B's belt (B occupied, surface-based) that has reached B's sensor,
     // AND a part held at A's sensor.

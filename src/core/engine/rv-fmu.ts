@@ -182,7 +182,7 @@ export function fmuSeedOf(v: FmuVariableShape, plcType: PlcSignalType, override?
 // ─── Instance identity ──────────────────────────────────────────────────
 
 /**
- * Document id of the CURRENT scene document — the first segment of every
+ * Document id of the document CURRENTLY open in the planner — the first segment of every
  * `instanceKey`. The provisioning plugin (Phase 3) installs a provider that
  * answers with the project document id; without it the key uses a constant.
  * An instance reads the provider ONCE, at `init()`, so its key (and with it its

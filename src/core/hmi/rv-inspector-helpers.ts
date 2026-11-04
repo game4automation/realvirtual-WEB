@@ -12,6 +12,7 @@
 import { getConsumedFields, getIgnoredFields, isKnownComponentType } from '../engine/rv-extras-validator';
 import { getCapabilities, DEFAULT_BADGE_COLOR, getFieldDescriptor } from '../engine/rv-component-registry';
 import { COLLISION_ROLES } from '../engine/rv-collision-role';
+import { SUPPORT_MODES } from '../engine/rv-drop-detection';
 import { DriveDirection, isRotation } from '../engine/rv-coordinate-utils';
 import { NODE_KNOWLEDGE_PROVENANCE_FIELDS, NODE_KNOWLEDGE_TYPE } from '../engine/rv-node-knowledge';
 import type { FieldDescriptor } from '../engine/rv-component-registry';
@@ -19,6 +20,7 @@ import type { SignalStore } from '../engine/rv-signal-store';
 import { readSignalValue, formatValue } from './rv-value-resolver';
 import { formatDecimal } from './rv-number-format';
 import { FMU_STATE_COLORS, FMU_TYPE, type FmuState } from '../engine/rv-fmu-constants';
+import { isComponentReference } from '../engine/rv-node-path-rewrite.mjs';
 import {
   SIGNAL_VALUE_NEUTRAL,
   signalDirectionFromType,
@@ -88,6 +90,9 @@ const ACTIVE_OPTIONS = ['Always', 'Connected', 'Disconnected'];
 /** plan-394 — the six preset collision roles (English, not localized). */
 const COLLISION_ROLE_OPTIONS = [...COLLISION_ROLES];
 
+/** plan-2022 — the two support modes of the DropDetection component. */
+const SUPPORT_MODE_OPTIONS = [...SUPPORT_MODES];
+
 /** Map of field names to their enum options. Indexed by the BARE field name
  *  across all component types — which is why the collision field is called
  *  `CollisionRole` and not `Role` (a generic `Role` would turn every
@@ -99,6 +104,9 @@ export const ENUM_FIELDS: Record<string, string[]> = {
   Active: ACTIVE_OPTIONS,
   CollisionRole: COLLISION_ROLE_OPTIONS,
   CollisionRoleForMUs: COLLISION_ROLE_OPTIONS,
+  // Scene-wide unique field name — `SupportMode` belongs to DropDetection
+  // alone, so the bare-name indexing above cannot capture a foreign field.
+  SupportMode: SUPPORT_MODE_OPTIONS,
 };
 
 // ── Field units ──────────────────────────────────────────────────────────
@@ -202,6 +210,13 @@ export const HIDDEN_FIELDS_PER_TYPE: Record<string, ReadonlySet<string>> = {
   // would never reach it. The raw override map is edited only through that
   // section (setFmuStartOverride / clearFmuStartOverride).
   Fmu: new Set(['FmuStartOverrides']),
+  // `AxisCorrection` is a Unity-only field the web ignores (removed 2026-11-02);
+  // a Unity export still carries it, so it is hidden rather than shown as "Not used".
+  IKTarget: new Set(['AxisCorrection']),
+  // plan-650: schema and rule code are authored through web_editor_parametric_define; the
+  // parameter mask (rv-parametric-values-field.tsx) is the one row and shows the hashes.
+  ParametricComponent: new Set(['ApiVersion', 'Params', 'Code', 'CodeHash', 'PartsRoot', 'GeneratedRoot',
+    'BakedInputHash', 'DesignResource']),
 };
 
 /** True if the given field should be hidden in the inspector, considering
@@ -257,9 +272,16 @@ export type FieldType = 'number' | 'boolean' | 'string' | 'enum' | 'vector3' | '
 
 /** Check if a value is a ComponentReference ({ type: "ComponentReference", path, componentType }). */
 export function isComponentRef(value: unknown): value is { type: string; path: string; componentType: string } {
+  return isComponentReference(value); // THE guard of the rewrite core (plan-610)
+}
+
+/** plan-769: the stored `{ address }` / `{ unresolvedPath, reason }` record of a path or name field. */
+export function isStoredAddressRecord(value: unknown): boolean {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
-  const obj = value as Record<string, unknown>;
-  return obj['type'] === 'ComponentReference' && typeof obj['path'] === 'string';
+  const keys = Object.keys(value);
+  const v = value as Record<string, unknown>;
+  return (typeof v.address === 'string' && keys.length === 1)
+    || (typeof v.unresolvedPath === 'string' && keys.every((k) => k === 'unresolvedPath' || k === 'reason'));
 }
 
 /** Check if a value is a ScriptableObject reference ({ type: "ScriptableObject", ... }). */
@@ -297,6 +319,9 @@ export function inferFieldType(fieldName: string, value: unknown): FieldType {
   if (typeof value === 'number') return 'number';
   if (Array.isArray(value)) return 'object';
   if (isComponentRef(value)) return 'reference';
+  // plan-769 § 2.7: a path / name field a web save wrote as `{ address }` (or a kept
+  // `{ unresolvedPath, reason }`) is a reference to show by its target, not a struct.
+  if (isStoredAddressRecord(value)) return 'reference';
   if (isScriptableObject(value)) return 'scriptableobject';
   if (isColorValue(value)) return 'color';
   if (
@@ -495,6 +520,8 @@ export interface ReverseReference {
   sourcePath: string;
   fieldName: string;
   componentType: string;
+  /** Element index when the reference sits in an array field (plan-610). */
+  index?: number;
 }
 
 /** Check if two paths refer to the same node (handles root prefix and space normalization). */

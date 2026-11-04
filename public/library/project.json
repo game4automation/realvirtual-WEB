@@ -1,0 +1,371 @@
+{
+  "schemaVersion": 2,
+  "id": "prj_realvirtual_library",
+  "name": "realvirtual Library",
+  "kind": "demo",
+  "documents": [
+    {
+      "id": "mobilerobots-agvstacker",
+      "name": "AGV Stacker",
+      "path": "MobileRobots/AGVStacker.glb",
+      "sha256": "ee90119c80c9695e9c115ddf10e799a4a4fc601ea2ff07e0b6d276cd9f313eb4",
+      "sizeBytes": 464024,
+      "thumbnail": "MobileRobots/.thumbnails/mobilerobots-agvstacker.ceb77d21.webp",
+      "collections": [
+        "Mobile Robots"
+      ],
+      "aliases": [
+        "realvirtual-library-mobilerobots-agvstacker-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-cartonbox",
+      "name": "Carton Box",
+      "path": "PalletHandling/CartonBox.glb",
+      "sha256": "909cea385922ba675c6b3b064cc96fbd3363cb65bac6120587da5fb50645831d",
+      "sizeBytes": 15598364,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-cartonbox.37e19906.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-cartonbox-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-chainconveyor-1m",
+      "name": "Chain Conveyor 1m",
+      "path": "PalletHandling/ChainConveyor-1m.glb",
+      "sha256": "a109d534bd9c938301a7907feb308b4393724f4a38ba9b5e625602cebe4ec477",
+      "sizeBytes": 2344316,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-chainconveyor-1m.c4a2fe4f.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-chainconveyor-1m-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-chainconveyor-2m",
+      "name": "Chain Conveyor 2m",
+      "path": "PalletHandling/ChainConveyor-2m.glb",
+      "sha256": "41c1895c6627e0b8d6cb3530f8e97a2f7a1e65295fad02c5d4827cb7b6af7953",
+      "sizeBytes": 4975564,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-chainconveyor-2m.608e040a.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-chainconveyor-2m-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-chainconveyor-3m",
+      "name": "Chain Conveyor 3m",
+      "path": "PalletHandling/ChainConveyor-3m.glb",
+      "sha256": "18831a7de9c55e76ff6bca0199e21ec5c8826c165d5548a653acf33bd2722920",
+      "sizeBytes": 7199324,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-chainconveyor-3m.238f3180.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-chainconveyor-3m-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-chaintransferleft",
+      "name": "Chain Transfer Left",
+      "path": "PalletHandling/ChainTransferLeft.glb",
+      "sha256": "8f2f35359e9c80ac212847d95febe25a5b18ddae20ac65f9e64f6b8304582d9e",
+      "sizeBytes": 2458172,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-chaintransferleft.a711e54c.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-chaintransferleft-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-chaintransferright",
+      "name": "Chain Transfer Right",
+      "path": "PalletHandling/ChainTransferRight.glb",
+      "sha256": "d098f9ec8365b78ad7bada57da60474a5fa0123a9783555849a2297610281d83",
+      "sizeBytes": 2459816,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-chaintransferright.61fafca4.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-chaintransferright-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-europallet",
+      "name": "Europallet",
+      "path": "PalletHandling/Europallet.glb",
+      "sha256": "e72659d60032862c6de511c7c48328133ce37083de96ecb1e7f4b3e68a208494",
+      "sizeBytes": 1760176,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-europallet.aa0c0312.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-europallet-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-europalletloaded",
+      "name": "Europallet Loaded",
+      "path": "PalletHandling/EuropalletLoaded.glb",
+      "sha256": "d65005b73098b5e8f945b45842cf19e443adcb4f6d0bcda263132f450b4913e8",
+      "sizeBytes": 17361652,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-europalletloaded.b96ac8c0.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-europalletloaded-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-loadinggantry",
+      "name": "Loading Gantry",
+      "path": "PalletHandling/LoadingGantry.glb",
+      "sha256": "70d3cd8517a24e6707a50e386c69991be4357d38422d48a1794044e7b3737d15",
+      "sizeBytes": 1161092,
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-loadinggantry-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-palletscanner",
+      "name": "Pallet Scanner",
+      "path": "PalletHandling/PalletScanner.glb",
+      "sha256": "69b03c789e19ae2b672b763de81bd34ac805a6540886ce9ef449f17527621c7d",
+      "sizeBytes": 1529356,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-palletscanner.af2891e7.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-palletscanner-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-palletsink",
+      "name": "Pallet Sink",
+      "path": "PalletHandling/PalletSink.glb",
+      "sha256": "823ad4bea4386627ac2f86a8c0460075bb3ec0622b966fc6622839cf955e064b",
+      "sizeBytes": 4232,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-palletsink.86de479b.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-palletsink-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-palletyardchargerstation",
+      "name": "Pallet Yard Charger Station",
+      "path": "PalletHandling/PalletYardChargerStation.glb",
+      "sha256": "2882662e3f9d173f8b84554377195951168ab13fec826c87699341df1a110a58",
+      "sizeBytes": 3144,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-palletyardchargerstation.c97c63c2.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-palletyardchargerstation-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-palletyardendeast",
+      "name": "Pallet Yard End East",
+      "path": "PalletHandling/PalletYardEndEast.glb",
+      "sha256": "e5fc720f4f6303721c6b1c60b512b31360ff2e462ea37016855acb88c68829f5",
+      "sizeBytes": 26532,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-palletyardendeast.b69fe7d2.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-palletyardendeast-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-palletyardendwest",
+      "name": "Pallet Yard End West",
+      "path": "PalletHandling/PalletYardEndWest.glb",
+      "sha256": "8291951e86b55efb932299800bdae62551920e4427339ac8619b87381277a613",
+      "sizeBytes": 26528,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-palletyardendwest.488d0616.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-palletyardendwest-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-palletyardmodule",
+      "name": "Pallet Yard Module",
+      "path": "PalletHandling/PalletYardModule.glb",
+      "sha256": "d50af16c705c57ef449ea258a2c12e3cded241514b1cd9a04f7e51bad13c541a",
+      "sizeBytes": 1968,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-palletyardmodule.42f87272.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-palletyardmodule-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-palletyardslotmarking",
+      "name": "Pallet Yard Slot Marking",
+      "path": "PalletHandling/PalletYardSlotMarking.glb",
+      "sha256": "9f55fe7800ae19ef594309e3978341eb61a76c8d67741e0e3f590a4dfb351e92",
+      "sizeBytes": 3164,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-palletyardslotmarking.e45cb0ec.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-palletyardslotmarking-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-palletyardwaitmarking",
+      "name": "Pallet Yard Wait Marking",
+      "path": "PalletHandling/PalletYardWaitMarking.glb",
+      "sha256": "9f8883d27424cbd0f428de8c51e25df0a66da391b7508e1e60c7fe5bd47c4604",
+      "sizeBytes": 1736,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-palletyardwaitmarking.07fa0e9e.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-palletyardwaitmarking-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-rollconveyor-1m",
+      "name": "Roll Conveyor 1m",
+      "path": "PalletHandling/RollConveyor-1m.glb",
+      "sha256": "1cb68cec6d9641155d0190e73c22bb504644b620b1d17ff47883d36be76fbe49",
+      "sizeBytes": 1703204,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-rollconveyor-1m.82e8c946.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-rollconveyor-1m-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-rollconveyor-2m",
+      "name": "Roll Conveyor 2m",
+      "path": "PalletHandling/RollConveyor-2m.glb",
+      "sha256": "0b8053c07eb0c803b294a69c79b3e60322f6081e1c033c7669bf211ab845227b",
+      "sizeBytes": 2528204,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-rollconveyor-2m.9b8e79f6.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-rollconveyor-2m-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-rollconveyor-3m",
+      "name": "Roll Conveyor 3m",
+      "path": "PalletHandling/RollConveyor-3m.glb",
+      "sha256": "784b7df8b6324a344a5fb02658e689f8c32345c08f0ca5b78ee3ce7edc890e6a",
+      "sizeBytes": 3352996,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-rollconveyor-3m.5271101c.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-rollconveyor-3m-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-rollconveyor-3m-edit",
+      "name": "Roll Conveyor 3m edit",
+      "path": "PalletHandling/RollConveyor-3m-edit.glb",
+      "sha256": "13f6706b01b2b182bbed4c25e089d492cfea06330456706a557a2d8fb9b77995",
+      "sizeBytes": 3352972,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-rollconveyor-3m-edit.4aab4f1c.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-rollconveyor-3m-edit-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-spheremirror",
+      "name": "Sphere Mirror",
+      "path": "PalletHandling/SphereMirror.glb",
+      "sha256": "842880529aff96cc11f7081b030d4d02c895e5add432c489bd7210df1ea65372",
+      "sizeBytes": 35996,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-spheremirror.ad931bfe.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-spheremirror-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-spherered",
+      "name": "Sphere Red",
+      "path": "PalletHandling/SphereRed.glb",
+      "sha256": "ce05768478c82288dd0c631fd8e10749e47f286230b1e38ab2831ad3a36f7f03",
+      "sizeBytes": 279460,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-spherered.65c202cf.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-spherered-glb"
+      ]
+    },
+    {
+      "id": "pallethandling-turntable",
+      "name": "Turntable",
+      "path": "PalletHandling/Turntable.glb",
+      "sha256": "d95101f81abfd10a028c55e29421a71064c5052414425a26eec57dde7b60417b",
+      "sizeBytes": 1278428,
+      "thumbnail": "PalletHandling/.thumbnails/pallethandling-turntable.aeb47469.webp",
+      "collections": [
+        "Pallet Handling"
+      ],
+      "aliases": [
+        "realvirtual-library-pallethandling-turntable-glb"
+      ]
+    },
+    {
+      "id": "robots-fanuccrx-10ia-l",
+      "name": "Fanuc CRX 10i A L",
+      "path": "Robots/FanucCRX-10iA-L.glb",
+      "sha256": "3480f7739030e7ea18774b0f87d1c9d67555555838cc9328cbd272b94b5c5da3",
+      "sizeBytes": 796256,
+      "thumbnail": "Robots/.thumbnails/robots-fanuccrx-10ia-l.3f395522.webp",
+      "collections": [
+        "Robots"
+      ],
+      "aliases": [
+        "realvirtual-library-robots-fanuccrx-10ia-l-glb"
+      ]
+    }
+  ]
+}

@@ -157,10 +157,11 @@ describe('_adoptProject reads the backend listing exactly once (Review #8)', () 
   beforeEach(() => { resetProjectStore(); store = new ProjectStore(); });
   afterEach(() => { resetProjectStore(); });
 
-  it('does not walk the project a second time for the models projection', async () => {
+  it('does not walk the project a second time, and keeps no models projection', async () => {
     // Before plan-744 this method called `listDocuments()` AND `listModels()`,
     // and on a folder project each is a full recursive directory walk. The
-    // second one was a filter of the first.
+    // second one was a filter of the first — and since plan-777 (P3) the
+    // filtered `models` view itself is gone: one listing, one list.
     const documents = [
       { id: 'doc_model', name: 'Press', path: 'models/Press.glb' },
       { id: 'doc_lib', name: 'Belt', path: 'library/Belt.glb' },
@@ -178,7 +179,6 @@ describe('_adoptProject reads the backend listing exactly once (Review #8)', () 
 
     const privates = store as unknown as {
       _adoptProject(b: unknown, p: RvProject): Promise<void>;
-      _userModels: Array<{ path: string }>;
       _userDocuments: Array<{ path: string }>;
     };
     // The adopt path does a great deal more than this (drafts, reconcile,
@@ -188,8 +188,9 @@ describe('_adoptProject reads the backend listing exactly once (Review #8)', () 
     await privates._adoptProject(backend, MIXED).catch(() => {});
 
     expect(listDocuments).toHaveBeenCalledTimes(1);
-    // …and the models projection is still correct, off that one result.
-    expect(privates._userModels.map(m => m.path)).toEqual(['models/Press.glb']);
+    // …and there is no second, filtered list beside the one result.
+    expect(privates).not.toHaveProperty('_userModels');
+    expect(privates).not.toHaveProperty('_bundledModels');
     expect(privates._userDocuments.map(d => d.path))
       .toEqual(['models/Press.glb', 'library/Belt.glb']);
   });

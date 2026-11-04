@@ -61,6 +61,22 @@ beforeEach(async () => {
 });
 
 describe('AssetDocument ops', () => {
+  it('adopts a renamed document base without clearing dirty edits or undo', async () => {
+    const { viewer, boxPath, box } = makeMockViewer();
+    const base = { kind: 'document' as const, documentId: 'doc_part', path: 'Untitled.glb', name: 'Untitled' };
+    const doc = new AssetDocument(viewer, { id: 'doc_part', name: 'Untitled', base });
+    doc.setField(boxPath, 'Drive', 'TargetSpeed', 200, 50);
+    await doc.whenIdle();
+    doc.adoptDocumentRename({ ...base, path: 'Part.glb', name: 'Part' }, 'Part');
+    expect(doc.base).toMatchObject({ documentId: 'doc_part', path: 'Part.glb' });
+    expect(doc.name).toBe('Part');
+    expect(doc.dirty).toBe(true);
+    expect(doc.ops).toHaveLength(1);
+    await doc.undo();
+    expect(box.userData.realvirtual.Drive.TargetSpeed).toBe(50);
+    doc.dispose();
+  });
+
   it('setField writes userData; undo restores prev; redo re-applies', async () => {
     const { viewer, box, boxPath } = makeMockViewer();
     const doc = scratchAssetDocument(viewer);

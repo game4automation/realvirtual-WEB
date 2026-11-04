@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { Object3D, PerspectiveCamera, Scene } from 'three';
 import { TransformGizmo, type TransformGizmoHost } from '../src/core/engine/rv-transform-gizmo';
 import { HIGHLIGHT_OVERLAY_LAYER } from '../src/core/engine/rv-group-registry';
 import { EditorTransformTool } from '@rv-private/plugins/asset-editor/EditorTransformTool';
+import { resetTransformTool, setTransformToolOn } from '@rv-private/plugins/asset-editor/transform-tool-store';
 import type { RVViewer } from '../src/core/rv-viewer';
 import type { AssetDocument } from '../src/core/editor/rv-asset-document';
 
@@ -179,6 +180,11 @@ function makeToolFixture() {
 }
 
 describe('EditorTransformTool selection sync', () => {
+  // plan-766 F3: the gizmo only attaches while the transform tool is ON
+  // (default OFF) — these cases exercise the armed tool.
+  beforeEach(() => setTransformToolOn(true));
+  afterEach(() => resetTransformTool());
+
   it('attaches on single select, pivots multi-select at the centroid', () => {
     const { viewer, scene, addNode, select, doc } = makeToolFixture();
     addNode('Asset/A', 0);

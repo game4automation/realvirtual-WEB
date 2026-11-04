@@ -24,7 +24,7 @@ import { getDefaultAgvFleet } from '../../src/core/engine/rv-agv-fleet';
 import { getDefaultPathDockRegistry } from '../../src/core/engine/rv-path-dock';
 import { getDefaultMovementAuthority } from '../../src/core/engine/rv-movement-authority';
 import { positionAt } from '../../src/core/engine/rv-motion-profile';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
+import { DESRunner } from '@rv/plugins/des/des-runner';
 import {
   TICK, makeHost, makeAgvRoot, bindDes, clearShared, runAnimated, centredBody,
 } from '../helpers/agv-harness';
@@ -195,6 +195,21 @@ describe('moving block integration (plan-558 §9.4)', () => {
     console.log(`[agv-mb] cap tCap=${tCap.toFixed(2)} overlap=${m.overlapFrames} minFR=${minFR.toFixed(3)} capHits=${mb.stats.cascadeCapHitsAfterStart}`
       + ` safeHolds=${mb.stats.safeHolds} forced=${mb.stats.forced} xs=${xs.map((z) => z.toFixed(3)).join(',')}`);
     expect(tCap).toBeGreaterThan(5);
+    // plan-595 wake-up guard: with the cap at 0 the standing vehicles get wake-up re-plans with a
+    // back-off — bounded per vehicle and BEGUN sim minute (analytic worst case 70, bound 120; see
+    // agv-reverse-safe-hold.test.ts). Without the back-off this would be ~60 000.
+    // SCOPE: calibrated for operation with a cap (replanCap >= 1) and for THIS small cap-0 stand (three
+    // vehicles on a straight lane). NOT for cap 0 on a full fleet / the constructed FastForward path of
+    // agv-forward-hold-parity — ~477 per vehicle and minute from `soft-recheck` re-plans are normal there;
+    // do not carry the bound over unchecked.
+    // WHICH TEST CATCHES WHICH FAULT: missing wake-up (standstill) -> 9.10 Animated (tasks not done),
+    // not this guard (a standstill produces FEWER safe holds); missing back-off (wake-up flood) -> THIS
+    // test + the guard (mutation: Lead 25 045 per minute). In 9.10 the guard is practically toothless
+    // (load only on the timer vehicle).
+    const capMin = Math.max(1, Math.ceil((40 - tCap) / 60));
+    const perVehicle = Object.entries(mb.stats.safeHoldsBy).map(([id, n]) => [id, n / capMin] as const);
+    console.log(`[agv-mb] cap safe holds per vehicle and begun sim minute: ${perVehicle.map(([id, r]) => `${id}=${r.toFixed(1)}`).join(' ')} wakes=${mb.stats.wakes}`);
+    for (const [id, r] of perVehicle) expect(r, id).toBeLessThanOrEqual(120); // measured after the fix: max 37 (Clock), 35-36 (Lead/Mid/Tail)
     expect(mb.stats.cascadeCapHitsAfterStart).toBeGreaterThanOrEqual(2);
     expect(mb.stats.safeHolds).toBeGreaterThanOrEqual(2);
     expect(m.overlapFrames).toBe(0);

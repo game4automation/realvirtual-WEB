@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage, readLocalStorage, removeLocalStorage, writeLocalStorage } from '../../rv-safe-storage';
+
 /**
  * layout-registry — Multi-layout persistence on top of localStorage.
  *
@@ -46,7 +48,7 @@ function entryKey(id: string): string {
 
 function readIndex(): LayoutMeta[] {
   try {
-    const raw = localStorage.getItem(LS_KEY_INDEX);
+    const raw = readLocalStorage(LS_KEY_INDEX);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
@@ -57,7 +59,7 @@ function readIndex(): LayoutMeta[] {
 
 function writeIndex(metas: LayoutMeta[]): void {
   try {
-    localStorage.setItem(LS_KEY_INDEX, JSON.stringify(metas));
+    writeLocalStorage(LS_KEY_INDEX, JSON.stringify(metas));
   } catch { /* QuotaExceeded — silently ignore */ }
 }
 
@@ -72,7 +74,7 @@ export function listLayouts(): LayoutMeta[] {
 /** Read a single layout by id. Returns null if not found or unparseable. */
 export function readLayout(id: string): LayoutFile | null {
   try {
-    const raw = localStorage.getItem(entryKey(id));
+    const raw = readLocalStorage(entryKey(id));
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object') return null;
@@ -99,7 +101,7 @@ export function createLayout(name: string, file: LayoutFile): string {
 
   // Persist body first so the index never references a missing entry.
   try {
-    localStorage.setItem(entryKey(id), JSON.stringify({ ...file, name }));
+    getLocalStorage()!.setItem(entryKey(id), JSON.stringify({ ...file, name }));
   } catch {
     return id; // Quota — meta won't be persisted either; caller can retry.
   }
@@ -120,7 +122,7 @@ export function saveLayout(id: string, file: LayoutFile): void {
   const meta = metas.find(m => m.id === id);
   if (!meta) return;
   try {
-    localStorage.setItem(entryKey(id), JSON.stringify({ ...file, name: meta.name }));
+    getLocalStorage()!.setItem(entryKey(id), JSON.stringify({ ...file, name: meta.name }));
   } catch { return; }
   meta.modifiedAt = new Date().toISOString();
   writeIndex(metas);
@@ -138,14 +140,14 @@ export function renameLayout(id: string, name: string): void {
   const body = readLayout(id);
   if (body) {
     try {
-      localStorage.setItem(entryKey(id), JSON.stringify({ ...body, name }));
+      writeLocalStorage(entryKey(id), JSON.stringify({ ...body, name }));
     } catch { /* ignore */ }
   }
 }
 
 /** Delete a layout (body + index entry). Idempotent. */
 export function deleteLayout(id: string): void {
-  try { localStorage.removeItem(entryKey(id)); } catch { /* ignore */ }
+  try { removeLocalStorage(entryKey(id)); } catch { /* ignore */ }
   const metas = readIndex().filter(m => m.id !== id);
   writeIndex(metas);
 }
@@ -174,7 +176,7 @@ export function duplicateLayout(id: string): string | null {
  */
 export function migrateLegacyAutosave(): string | null {
   let raw: string | null;
-  try { raw = localStorage.getItem(LS_KEY_LEGACY_AUTOSAVE); } catch { return null; }
+  raw = readLocalStorage(LS_KEY_LEGACY_AUTOSAVE);
   if (!raw) return null;
 
   let body: LayoutFile;
@@ -182,12 +184,12 @@ export function migrateLegacyAutosave(): string | null {
     body = JSON.parse(raw) as LayoutFile;
   } catch {
     // Corrupt — drop it.
-    try { localStorage.removeItem(LS_KEY_LEGACY_AUTOSAVE); } catch { /* ignore */ }
+    removeLocalStorage(LS_KEY_LEGACY_AUTOSAVE);
     return null;
   }
 
   const name = (body.name && body.name !== 'autosave') ? body.name : 'Untitled Layout';
   const id = createLayout(name, body);
-  try { localStorage.removeItem(LS_KEY_LEGACY_AUTOSAVE); } catch { /* ignore */ }
+  removeLocalStorage(LS_KEY_LEGACY_AUTOSAVE);
   return id;
 }

@@ -1,0 +1,33 @@
+{
+  "$comment": [
+    "The GPU group: the browser test files that need a REAL WebGPU adapter. They run only under `npm run test:gpu` (vitest.gpu.config.ts: serial, real GPU via Chromium launch args, own Vite cache) — the main browser suite runs them too, without GPU, and skips them with NO_WEBGPU_ADAPTER (tests/helpers/webgpu-adapter-skip.ts).",
+    "Criterion: the file guards its suite with skipEachWithoutAdapter(navigator.gpu.requestAdapter()). Files that only use `webgpu-gl` (WebGPURenderer on its WebGL backend, e.g. renderer-kinds, plan-763-webgpu-regressions) need no adapter and stay in the main suite only.",
+    "Every file of tests/webgpu-quarantine.json must be listed here, and every listed file must use skipEachWithoutAdapter (guard: tests/test-gpu-run.node.test.ts). Private entries (`../realvirtual-WebViewer-Private~/…`) are used only when the private sibling exists. Sorted by file."
+  ],
+  "gpuTests": [
+    {
+      "file": "../realvirtual-WebViewer-Private~/tests/cinematic-capability-probe.test.ts",
+      "why": "WebGPU tracer capability probe (plan-553 F0) on a real device"
+    },
+    {
+      "file": "../realvirtual-WebViewer-Private~/tests/cinematic-motion.test.ts",
+      "why": "path A motion blur on a real WebGPU device (plan-554 §9 GPU invariant)"
+    },
+    {
+      "file": "../realvirtual-WebViewer-Private~/tests/cinematic-render-smoke.test.ts",
+      "why": "cinematic render with the aux denoiser on a real WebGPU device"
+    },
+    {
+      "file": "../realvirtual-WebViewer-Private~/tests/raytraced-kernel.test.ts",
+      "why": "ray traced backend (trace scene, tracer data, kernel, history) on a real WebGPU device (plan-762 § 9.7)"
+    },
+    {
+      "file": "tests/mu-compute-transforms.test.ts",
+      "why": "MU compute transforms (plan-271 Phase 4) — compute shaders need the real 'webgpu' renderer kind"
+    },
+    {
+      "file": "tests/real-webgpu-smoke.test.ts",
+      "why": "boots the complete demo on the real 'webgpu' renderer kind"
+    }
+  ]
+}

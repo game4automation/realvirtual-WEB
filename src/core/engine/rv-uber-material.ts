@@ -488,7 +488,7 @@ export function applyUberMaterial(
   // so we can bake in-place and share the geometry instead of cloning it
   // per mesh. This is the main heap-reduction lever for GLTFLoader scenes
   // with many shared geometries (e.g. 40k meshes → ~24k unique geometries
-  // on the Mauser scene).
+  // on the large CAD line scene).
   const geometryUsage = new Map<BufferGeometry, Set<Material>>();
   // Geometries that a runtime deformation rig (EnergyChain, plan-362) holds.
   // They are never baked themselves, and no OTHER mesh may bake them in place

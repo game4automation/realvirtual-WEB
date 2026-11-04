@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { listLocalStorageKeys, readLocalStorage, removeLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * rv-scene-owner — "which project does the *cached* scene body belong to?"
  *
@@ -75,7 +77,7 @@ export function readSceneOwner(sceneId: string): SceneOwnerRecord | null {
   if (!sceneId) return null;
   let raw: string | null;
   try {
-    raw = localStorage.getItem(ownerKey(sceneId));
+    raw = readLocalStorage(ownerKey(sceneId));
   } catch {
     return null;
   }
@@ -124,7 +126,7 @@ export function writeSceneOwner(sceneId: string, record: SceneOwnerRecordInput):
     cachedRevision: record.cachedRevision ?? null,
   };
   try {
-    localStorage.setItem(ownerKey(sceneId), JSON.stringify(clean));
+    writeLocalStorage(ownerKey(sceneId), JSON.stringify(clean));
   } catch {
     /* quota / private mode */
   }
@@ -213,18 +215,13 @@ export function isCacheFromOtherProject(
 /** Drop the record for one scene. */
 export function clearSceneOwner(sceneId: string): void {
   if (!sceneId) return;
-  try {
-    localStorage.removeItem(ownerKey(sceneId));
-  } catch {
-    /* ignore */
-  }
+  removeLocalStorage(ownerKey(sceneId));
 }
 
 /** Every scene id that currently has an ownership record. */
 export function listSceneOwnerIds(): string[] {
   const out: string[] = [];
-  for (let i = 0; i < localStorage.length; i++) {
-    const k = localStorage.key(i);
+  for (const k of listLocalStorageKeys()) {
     if (k && k.startsWith(LS_KEY_SCENE_OWNER_PREFIX)) {
       out.push(k.slice(LS_KEY_SCENE_OWNER_PREFIX.length));
     }

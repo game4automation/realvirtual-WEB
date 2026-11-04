@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, removeLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * Who the sender is, and what survives him leaving the page (plan-386 §2.6).
  *
@@ -240,7 +242,9 @@ export async function shareApiRequest<T>(req: ShareApiRequest): Promise<T> {
   if (resp.status === 401) {
     // A rejected token is a dead token: drop it rather than let every later
     // call fail the same way and leave the UI claiming the user is signed in.
-    clearShareSession();
+    if (req.path !== '/limits' || (req.session && getShareSession()?.token === req.session.token)) {
+      clearShareSession();
+    }
   }
   if (!resp.ok) throw await shareApiErrorFrom(resp);
   if (resp.status === 204) return undefined as T;
@@ -269,7 +273,7 @@ function isExpired(s: MagicLinkSession): boolean {
 
 function readStored(): MagicLinkSession | null {
   try {
-    const raw = localStorage.getItem(SHARE_SESSION_KEY);
+    const raw = readLocalStorage(SHARE_SESSION_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<MagicLinkSession>;
     if (typeof parsed?.token !== 'string' || typeof parsed?.email !== 'string') return null;
@@ -299,8 +303,8 @@ export function subscribeShareSession(listener: Listener): () => void {
 export function setShareSession(session: MagicLinkSession | null): void {
   cached = session;
   try {
-    if (session) localStorage.setItem(SHARE_SESSION_KEY, JSON.stringify(session));
-    else localStorage.removeItem(SHARE_SESSION_KEY);
+    if (session) writeLocalStorage(SHARE_SESSION_KEY, JSON.stringify(session));
+    else removeLocalStorage(SHARE_SESSION_KEY);
   } catch {
     // Private mode: the in-memory value still carries this tab.
   }
@@ -449,7 +453,7 @@ const DRAFT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 export function saveShareDraft(draft: Omit<ShareDialogDraft, 'savedAt'>): void {
   try {
-    localStorage.setItem(SHARE_DRAFT_KEY, JSON.stringify({ ...draft, savedAt: new Date().toISOString() }));
+    writeLocalStorage(SHARE_DRAFT_KEY, JSON.stringify({ ...draft, savedAt: new Date().toISOString() }));
   } catch {
     // Without storage the round trip loses the form — annoying, never fatal.
   }
@@ -465,7 +469,7 @@ export function saveShareDraft(draft: Omit<ShareDialogDraft, 'savedAt'>): void {
  */
 export function loadShareDraft(): ShareDialogDraft | null {
   try {
-    const raw = localStorage.getItem(SHARE_DRAFT_KEY);
+    const raw = readLocalStorage(SHARE_DRAFT_KEY);
     if (!raw) return null;
     const d = JSON.parse(raw) as Partial<ShareDialogDraft>;
     if (!d || typeof d !== 'object') return null;
@@ -492,7 +496,7 @@ export function loadShareDraft(): ShareDialogDraft | null {
 }
 
 export function clearShareDraft(): void {
-  try { localStorage.removeItem(SHARE_DRAFT_KEY); } catch { /* nothing stored */ }
+  removeLocalStorage(SHARE_DRAFT_KEY);
 }
 
 function isExpiryValue(v: unknown): v is ShareExpiry {
@@ -502,4 +506,27 @@ function isExpiryValue(v: unknown): v is ShareExpiry {
 /** Test seam: forget the cached session so the next read hits storage again. */
 export function resetShareSessionCache(): void {
   cached = undefined;
+}
+
+/** Account limits; null means the endpoint is unavailable, not an empty entitlement. */
+export interface ShareLimits {
+  maxFileBytes: number;
+  quotaBytes: number;
+  usedBytes?: number;
+  expiries: ShareExpiry[];
+}
+
+export async function fetchShareLimits(): Promise<ShareLimits | null> {
+  const session = getShareSession();
+  try {
+    const limits = await shareApiRequest<ShareLimits>({ path: '/limits', session });
+    if (getShareSession()?.token !== session?.token) return null;
+    if (!limits || !Number.isFinite(limits.maxFileBytes) || !Number.isFinite(limits.quotaBytes)
+      || !Array.isArray(limits.expiries)) return null;
+    return { ...limits, expiries: [...new Set(limits.expiries.filter(
+      value => ['never', '7d', '30d', '90d'].includes(value),
+    ))] };
+  } catch {
+    return null;
+  }
 }

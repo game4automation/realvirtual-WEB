@@ -56,7 +56,6 @@ import {
   newProjectId,
   type RvDocumentEntry,
   type RvProject,
-  type RvProjectSceneEntry,
 } from './rv-project-types';
 
 // ─── Migration (R4 — inline, so Phase 1 stands without the offline CLI) ──
@@ -170,7 +169,7 @@ async function finishManifestRead(
 }
 
 /**
- * Refuse a manifest whose scene documents point at pre-phase-6 JSON bodies.
+ * Refuse a manifest whose documents point at pre-phase-6 JSON bodies.
  *
  * Checked over `documents[]` after the conversion rather than over `scenes[]`
  * before it, so a project gets the benefit of the migration first — an
@@ -221,15 +220,13 @@ async function tryReadManifestFile(
 /** The subset of manifest state this build knows how to update. */
 export interface ManifestUpdate {
   /**
-   * Scene upserts, expressed in the shape the scene layer speaks.
+   * Row upserts from the folder writer, the project creator and the conflict
+   * path — the same `RvDocumentEntry` shape as {@link documents} (plan-777 P2).
    *
-   * Not a second list: they are lifted into `documents[]` and land there, in
-   * the `scenes` section. The convenience is kept because the writer, the
-   * project creator and the conflict path all hold an `RvProjectSceneEntry`
-   * already, and making each of them build a document by hand would be four
-   * places to get `section` wrong.
+   * Not a second list: they are lifted into `documents[]` and land there. The
+   * field name is the historical one; what it carries is document rows.
    */
-  scenes?: RvProjectSceneEntry[];
+  scenes?: RvDocumentEntry[];
   /** Scene ids to drop. Applied after upserts. */
   removeSceneIds?: string[];
   /** Document upserts (plan-413). Merged field-by-field, like `scenes`. */
@@ -281,7 +278,7 @@ export function mergeManifest(original: RvProject, update: ManifestUpdate): RvPr
       const key = documentKeyOf(incoming);
       const prev = byKey.get(key);
       // Field-level read-modify-write again — and here it is what keeps the
-      // classification cache alive across a plain scene save, since a scene
+      // classification cache alive across a plain planner save, since a planner
       // upsert carries no `classification` field at all.
       if (prev) byKey.set(key, { ...prev, ...incoming });
       else { byKey.set(key, { ...incoming }); order.push(key); }

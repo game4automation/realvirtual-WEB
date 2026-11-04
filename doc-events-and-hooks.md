@@ -52,6 +52,7 @@ viewer.use(myPlugin);
 | `onConnectionStateChanged(state, viewer)` | When `viewer.setConnectionState(...)` changes | Pause/resume polling |
 | `onFixedUpdatePre(dt)` | 60 Hz, **before** drive physics & transport | Drive targets, ErraticDriver, replay, CAM |
 | `onFixedUpdatePost(dt)` | 60 Hz, **after** drive physics & transport | DriveRecorder, SensorMonitor, KPIs |
+| `onBeforeFrame(dtSeconds, nowMs)` | Once per animation frame, **before** the render decision, so changes appear in the same frame. Allocation-free dispatch; marks nothing dirty itself. | Poses of externally simulated objects ([Entity stream](doc-entity-stream.md)) |
 | `onRender(frameDt)` | Per render frame, **after** `renderer.render()` | Custom overlays, post effects |
 | `onModeActivate(mode, viewer)` | When entering a workspace mode this plugin participates in | Install mode-specific scene overlays, interaction handlers, raycast filters, gizmos |
 | `onModeDeactivate(mode, viewer)` | When leaving such a mode, before the plugin is disabled (scene/model still valid). `mode` is `null` only in unusual boot edge cases. | Tear down everything created in onModeActivate |
@@ -94,13 +95,18 @@ off();                          // unsubscribe
 viewer.once('model-loaded', ({ result }) => { /* fires once only */ });
 ```
 
+`object-hover` fires when the hovered node changes, even with a stationary
+pointer: the hover ray resolves one frame after `pointermove`. Otherwise it
+fires only after more than 4 px of pointer movement.
+
 ### Event Catalog
 
 The table below is generated from `ViewerEvents`. Regenerate it with
 `npm run docs:generate`; `npm run docs:check` rejects drift. Payload type names
 refer to imports in [rv-viewer-events.ts](src/core/rv-viewer-events.ts).
 A declared event is not a promise that every edition emits it: DES run events,
-for example, require the commercial DES runtime.
+for example, are emitted only once the DES feature is loaded (part of the AGPL core since
+plan-680, imported on demand when the workspace enters DES or a model carries DES components).
 
 Use `model-loaded` for geometry/HMI state. Executable model logic must wait for
 `model-logic-activated`, which respects the signature gate; `signature-state-changed`
@@ -108,7 +114,11 @@ reports changes to that gate. `raycast-ready` means the asynchronous three-mesh-
 trees (collision, transport, instance pick) are ready — a baked model's own pick
 structure exists before the scene is shown — not that the first interaction must
 wait. `document-saved` invalidates cached
-bytes after a successful write, independent of the document's folder.
+bytes after a successful write, independent of the document's folder — every save
+announces it, the planner's as well as the editor's (plan-777). Its order is fixed by
+the one post-save step `finishDocumentSave()`: thumbnail pointer set (awaited) →
+`document-saved` → background rescan (not awaited); a listener must stay
+cache-only and synchronous — never save or reload from it.
 
 <!-- BEGIN GENERATED VIEWER EVENTS -->
 | Event | Payload |
@@ -137,6 +147,7 @@ bytes after a successful write, independent of the document's folder.
 | `renderer-context-lost` | `void` |
 | `renderer-context-restored` | `void` |
 | `render-mode-changed` | `{ mode: RenderMode; }` |
+| `wireframe-changed` | `{ on: boolean; }` |
 | `component-event` | `{ componentType: string; kind: string; path: string; payload?: unknown; }` |
 | `interface-connected` | `{ interfaceId: string; type: string; }` |
 | `interface-disconnected` | `{ interfaceId: string; reason?: string; }` |
@@ -168,6 +179,7 @@ bytes after a successful write, independent of the document's folder.
 | `mcp-bridge-log` | `McpServerLogLine[]` |
 | `context-menu-request` | `{ pos: { x: number; y: number; }; path: string; node: Object3D; }` |
 | `layout-transform-update` | `{ path: string; position: [ number, number, number ]; rotation: [ number, number, number ]; scale?: [ number, number, number ]; visible?: boolean; }` |
+| `layout-content-added` | `{ root: Object3D; chunks?: unknown; keep?: unknown; }` |
 | `layout-drag-start` | `{ node: Object3D; altKey?: boolean; }` |
 | `layout-drag-tick` | `{ node: Object3D; }` |
 | `layout-drag-end` | `{ node: Object3D; }` |
@@ -177,8 +189,10 @@ bytes after a successful write, independent of the document's folder.
 | `component-reloaded` | `{ nodePath: string; }` |
 | `component-error` | `{ nodePath: string; code?: string; message?: string; cleared?: boolean; }` |
 | `editor-structure-changed` | `{ source: 'asset-editor'; }` |
+| `editor-edit-refused` | `{ verb: string; nodePath: string; reason: string; message: string; }` |
 | `component-field-changed` | `{ nodePath: string; componentType: string; fieldName: string; }` |
-| `groups-changed` | `{ source: 'editor'; }` |
+| `layout-lock-changed` | `{ path: string; locked: boolean; }` |
+| `groups-changed` | `{ source: 'editor' \| 'placement' \| 'path-network'; }` |
 | `asset-editor-pre-export` | `{ source: 'save-flow' \| 'test-session'; }` |
 | `runtime-attach-changed` | `{ attached: boolean; }` |
 | `simulation-pause-changed` | `{ paused: boolean; reasons: readonly string[]; reason: string; }` |

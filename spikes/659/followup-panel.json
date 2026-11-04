@@ -1,0 +1,26 @@
+{
+  "panelCount": 12,
+  "found": true,
+  "width": 260,
+  "height": 272,
+  "areaPx2": 70720,
+  "gridRows": 4,
+  "cells": 10,
+  "sliders": 2,
+  "readouts": 4,
+  "stackLight": 0,
+  "statusText": "WALKING — WASD · SPACE · R",
+  "resizeHandle": 1,
+  "closable": false,
+  "titleButtons": [
+    "Collapse panel",
+    "Expand window",
+    "Reset",
+    "Push, lamp off"
+  ],
+  "configErrors": [],
+  "afterResize": {
+    "width": 398,
+    "height": 380
+  }
+}

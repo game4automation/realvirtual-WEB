@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { listLocalStorageKeys, readLocalStorage, removeLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
+/** Per-device SpaceMouse navigation preferences (plan-2215 P1). */
+export const SPACEMOUSE_SETTINGS_KEY = 'rv-spacemouse-settings';
+/** Per-device stereo display preferences of the commercial stereo plugin (plan-2215 P2). */
+export const STEREO_SETTINGS_KEY = 'rv-stereo-settings';
+
 /** Central list of all localStorage keys used by the WebViewer. */
 
 /** The CONNECT standalone signal-link hint has already been shown on this device. */
@@ -14,12 +21,41 @@ export const CONNECT_EMBED_SIGNAL_HINT_SEEN_KEY = 'rv-connect-embed-signal-hint-
  */
 export const AI_BRIDGE_CONSENT_KEY = 'rv-ai-bridge-consent';
 
+/** Versioned demo and developer terms acknowledgements (plan-2209). */
+export const TERMS_CONSENT_KEY = 'rv-terms-consent';
+
+/** Read the terms JSON; even accessing localStorage can throw in restricted browsers. */
+export function readTermsConsent(): string | null {
+  return readLocalStorage(TERMS_CONSENT_KEY);
+}
+
+/** Persist terms JSON, returning false when only a session grant is possible. */
+export function writeTermsConsent(value: string): boolean {
+  return writeLocalStorage(TERMS_CONSENT_KEY, value);
+}
+
+/** Remove persisted terms consent, including when storage access is blocked. */
+export function clearTermsConsent(): void {
+  removeLocalStorage(TERMS_CONSENT_KEY);
+}
+
+export { readLocalStorage, writeLocalStorage, removeLocalStorage } from '../rv-safe-storage';
+
+/** Preferred local CLI backend for the private AI prompt panel (plan-2041). */
+export const AI_PROMPT_BACKEND_KEY = 'rv-ai-prompt-backend';
+
+/** Workspace-partitioned local resume metadata for the private AI prompt panel (plan-2041). */
+export const AI_PROMPT_SESSIONS_KEY = 'rv-ai-prompt-sessions';
+
 /**
  * Settings > AI Bridge > "Follow agent" (plan-520): `'1'` / `'0'`, per device.
  * Absent reads as ON — the camera follows the agent's node edits while the user
  * is not using the view. Owned by `follow-agent-store.ts`.
  */
 export const MCP_FOLLOW_AGENT_KEY = 'rv-mcp-follow-agent';
+
+/** Per-device AI click animation preference: '1' / '0', default on. */
+export const MCP_AI_CLICKS_KEY = 'rv-mcp-ai-clicks';
 
 /**
  * "Read only, don't ask again" per CONNECT gateway + interface (plan-562 F8).
@@ -61,6 +97,32 @@ export const PROJECTS_CARD_SIZE_KEY = 'rv-projects-card-size';
 export const EDITOR_LAST_ASSET_KEY = 'rv-editor-last-asset';
 
 /**
+ * USD live link to Isaac Sim (plan-637): `{ port, token, rateHz }` per device.
+ * Whether sync is ON is deliberately not stored — a reload never connects to
+ * the local extension by itself. Owned by `usd-live-link/live-link-store.ts`.
+ */
+export const USD_LIVE_LINK_SETTINGS_KEY = 'rv-usd-live-link';
+
+/**
+ * USD live link (plan-637 Phase 7): '1' once this device reached `live` with
+ * Isaac Sim. Until then the "Isaac Sim extension" install steps in the USD
+ * menu start open; afterwards collapsed. Owned by `usd-live-link/live-link-store.ts`.
+ */
+export const USD_LIVE_LINK_SEEN_LIVE_KEY = 'rv-usd-live-link-seen-live';
+
+/**
+ * Variants (plan-2013 §2.7): '1' = the viewer preference "Variants" is on. Off by default;
+ * switching it on writes nothing into any document. Owned by `plugins/variants/index.ts`.
+ */
+export const VARIANTS_ENABLED_KEY = 'rv-variants-enabled';
+
+/** Statistics tab, grouping and contribution settings (never the open state). */
+export const STATS_HUB_KEY = 'rv-stats-hub';
+
+/** Settings panel: stable id of the last selected tab ('visual', 'plugin:spacemouse', ...). */
+export const SETTINGS_LAST_TAB_KEY = 'rv-settings-last-tab';
+
+/**
  * The cross-project ring of recently opened documents (plan-478).
  *
  * Declared as a literal here — the constant itself lives beside the store that
@@ -71,7 +133,15 @@ export const EDITOR_LAST_ASSET_KEY = 'rv-editor-last-asset';
  * it on every boot, so a ring stored under it would be empty at every start.
  */
 export const ALL_RV_STORAGE_KEYS = [
+  SETTINGS_LAST_TAB_KEY,
+  SPACEMOUSE_SETTINGS_KEY,
+  STEREO_SETTINGS_KEY,
+  TERMS_CONSENT_KEY,
   'rv-project/recent-documents',
+  'rv-variants-enabled',
+  // plan-2019: drive sounds on/off + master volume (sound-settings-store.ts)
+  'rv-sound-enabled',
+  'rv-sound-volume',
   'rv-visual-settings',
   'rv-visual-presets',
   'rv-search-settings',
@@ -115,7 +185,7 @@ export const ALL_RV_STORAGE_KEYS = [
   'rv-layout-neighbor-distance-max',
   'rv-unity-cloud-config',
   'rv-layouts-index',
-  'rv-scene-active',
+  'rv-scene-active', // persisted name — do not rename (plan-777 P1)
   'rv-models-window-open',
   'rv-local-folders',
   'rv-splat-transform',  // legacy — transforms now managed via PlacedComponent
@@ -134,57 +204,44 @@ export const ALL_RV_STORAGE_KEYS = [
   'rv-news-seen',  // public WEB news IDs acknowledged on this device
   'rv-welcome-dismissed',  // WelcomeModal "Got it" flag (ButtonPanel) — reset re-shows the welcome box
   'rv-auto-quality-applied',  // auto-quality boot seed already picked a preset on this device
+  'rv-trace-settings',  // congestion trace time range + window (plan-629, trace-settings-store)
   CONNECT_EMBED_SIGNAL_HINT_SEEN_KEY,
   CONNECT_WRITE_GATE_READONLY_KEY,
   AI_BRIDGE_CONSENT_KEY,
+  AI_PROMPT_BACKEND_KEY,
+  AI_PROMPT_SESSIONS_KEY,
   ASSETS_SECTIONS_COLLAPSED_KEY,
   EDITOR_LAST_ASSET_KEY,
   MCP_FOLLOW_AGENT_KEY,
+  MCP_AI_CLICKS_KEY,
+  USD_LIVE_LINK_SETTINGS_KEY,
+  USD_LIVE_LINK_SEEN_LIVE_KEY,
+  STATS_HUB_KEY,
 ] as const;
 
 /** Read the CONNECT standalone hint flag without failing when storage is unavailable. */
 export function hasSeenConnectEmbedSignalHint(): boolean {
-  try {
-    return localStorage.getItem(CONNECT_EMBED_SIGNAL_HINT_SEEN_KEY) === '1';
-  } catch {
-    return false;
-  }
+  return readLocalStorage(CONNECT_EMBED_SIGNAL_HINT_SEEN_KEY) === '1';
 }
 
 /** Persist the CONNECT standalone hint flag when storage is available. */
 export function markConnectEmbedSignalHintSeen(): void {
-  try {
-    localStorage.setItem(CONNECT_EMBED_SIGNAL_HINT_SEEN_KEY, '1');
-  } catch {
-    // Private mode or disabled storage: keep the display fallback without persistence.
-  }
+  writeLocalStorage(CONNECT_EMBED_SIGNAL_HINT_SEEN_KEY, '1');
 }
 
 /** Read the accepted AI-bridge consent version, or null when none/unreadable. */
 export function readAiBridgeConsentVersion(): string | null {
-  try {
-    return localStorage.getItem(AI_BRIDGE_CONSENT_KEY);
-  } catch {
-    return null;
-  }
+  return readLocalStorage(AI_BRIDGE_CONSENT_KEY);
 }
 
 /** Persist the accepted AI-bridge consent version when storage is available. */
 export function writeAiBridgeConsentVersion(version: string): void {
-  try {
-    localStorage.setItem(AI_BRIDGE_CONSENT_KEY, version);
-  } catch {
-    // Private mode or disabled storage: the in-memory grant carries the session.
-  }
+  writeLocalStorage(AI_BRIDGE_CONSENT_KEY, version);
 }
 
 /** Drop the stored AI-bridge consent (used by the reset paths and by tests). */
 export function clearAiBridgeConsentVersion(): void {
-  try {
-    localStorage.removeItem(AI_BRIDGE_CONSENT_KEY);
-  } catch {
-    // Nothing persisted, nothing to clear.
-  }
+  removeLocalStorage(AI_BRIDGE_CONSENT_KEY);
 }
 
 /**
@@ -231,17 +288,16 @@ export const RV_DYNAMIC_PREFIXES = [
 export function clearAllRVStorage(): void {
   // Clear static keys
   for (const key of ALL_RV_STORAGE_KEYS) {
-    localStorage.removeItem(key);
+    removeLocalStorage(key);
   }
   // Clear dynamic prefix-based keys
   const keysToRemove: string[] = [];
-  for (let i = 0; i < localStorage.length; i++) {
-    const key = localStorage.key(i);
+  for (const key of listLocalStorageKeys()) {
     if (key && RV_DYNAMIC_PREFIXES.some(prefix => key.startsWith(prefix))) {
       keysToRemove.push(key);
     }
   }
   for (const key of keysToRemove) {
-    localStorage.removeItem(key);
+    removeLocalStorage(key);
   }
 }

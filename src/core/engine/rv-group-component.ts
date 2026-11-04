@@ -29,7 +29,7 @@ registerComponentSchema('Group', {
   GroupNamePrefix: { type: 'string', readonly: true },
 }, {
   authorable: true, // appears in the asset editor's "Add Component" list
-  // plan-754 1c (Vincent 2026-09-21): a Group is pure metadata. The Mauser
+  // plan-754 1c (Vincent 2026-09-21): a Group is pure metadata. The large CAD line
   // carries 17456 of them, down to single solids — as `chunk` that made 10737
   // chunk meshes / ~10 fps, and as `select` a pick owner per solid. So it owns
   // no boundary (`bake: 'merge'`) and owns no segment (`pick: 'none'`).
@@ -44,7 +44,7 @@ registerComponentSchema('Group', {
   pick: 'none',
   bake: 'merge',
   // plan-755 D7: a Group alone does not keep its node alive through the bake
-  // (12706 group-only nodes on the Mauser). The node survives only as reference
+  // (12706 group-only nodes on the large CAD line). The node survives only as reference
   // target (`GroupNamePrefix`), plugin claim, snap, keep mesh or ancestor of a
   // survivor — or because it ALSO carries a real component. Applies to the
   // `Group_N` dedup keys too (`claimsNodeOf`).

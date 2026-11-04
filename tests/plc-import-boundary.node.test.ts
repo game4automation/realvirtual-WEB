@@ -53,6 +53,8 @@ const FORBIDDEN = [
 const QUICKJS_ALLOWED = new Set([
   'core/engine/rv-script-sandbox.ts',
   'core/engine/rv-script-host.ts',
+  // plan-650 phase 2: pure-function generator runtime of part families (own runtime per run).
+  'core/engine/rv-parametric-generator.ts',
 ]);
 
 /** Public files that legitimately host Monaco (plan-210 phase 3: the script

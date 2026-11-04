@@ -18,6 +18,7 @@ import { applySchema, setComponentInstance, loadSchemaFromSpec } from './rv-comp
 import { validateExtras } from './rv-extras-validator';
 import { NodeRegistry } from './rv-node-registry';
 import { registerTooltipComponent } from './rv-tooltip-component';
+import { storedRefString } from './rv-stored-ref-label';
 
 interface ComponentRefRaw {
   path?: string;
@@ -60,7 +61,8 @@ export class RVPump {
     validateExtras(RVPump.type, extras);
     applySchema(this as unknown as Record<string, unknown>, RVPump.schema, extras);
     const ref = (this as unknown as { pipe?: ComponentRefRaw | null }).pipe;
-    this.pipePath = ref?.path ?? null;
+    // plan-769 Phase 3: a path, or the label of an address (read back by readStoredRef).
+    this.pipePath = storedRefString(node, ref);
     // Defensive: schema can hold any string; clamp to known states.
     if (this.state !== 'ok' && this.state !== 'warning' && this.state !== 'fault') {
       this.state = 'ok';

@@ -24,6 +24,7 @@ import { RVCustomRuntimeInstruction } from '../src/core/engine/rv-custom-runtime
 import { InstructionRuntimeStore } from '../src/core/engine/rv-instruction-runtime-store';
 import { applySchema } from '../src/core/engine/rv-component-registry';
 import type { ComponentContext } from '../src/core/engine/rv-component-registry';
+import { legacyRegistry } from './helpers/legacy-registry-fake';
 import { getProblems, clearAllProblems } from '../src/core/hmi/problems-store';
 import { rvDarkTheme } from '../src/core/hmi/theme';
 import { InstructionPanel } from '../src/plugins/custom-runtime-instruction-plugin';
@@ -67,7 +68,8 @@ function makeCtx(
       getSignalMeta: () => (signalComment !== undefined ? { comment: signalComment } : undefined),
     } as never,
     instructionStore: store,
-    registry: { getNode: (p: string) => nodes.get(p) ?? null } as never,
+    // plan-769 1b: CRI reads targets through `storedNode` — a path-only fake answers `legacy`.
+    registry: legacyRegistry((p: string) => (nodes.get(p) ?? null) as never) as never,
     scene: {} as never,
     transportManager: {} as never,
     root: new Object3D(),

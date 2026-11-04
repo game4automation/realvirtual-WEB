@@ -55,7 +55,8 @@ export function AgentEyeMonitorBadge() {
 
   // Connected AND working — see "When it renders" above. After the hooks, so the
   // hook order stays stable across the visible/hidden switch.
-  if (!mcp.connected || !activity) return null;
+  // plan-668: only while AI control is on — a connected CONNECT channel alone is no AI.
+  if (!mcp.connected || !(mcp.aiEnabled ?? mcp.enabled) || !activity) return null;
 
   return (
     <Box

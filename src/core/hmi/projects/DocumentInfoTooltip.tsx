@@ -52,6 +52,8 @@ export interface DocumentInfoTooltipProps {
   classification?: DocumentClassification | null;
   /** Touch input: render the expandable line instead of a hover tooltip. */
   touch: boolean;
+  /** Keep a touch card full width; place its description toggle underneath. */
+  cardLayout?: boolean;
   /** The tile or row. Must accept a ref and hover/focus handlers (MUI Tooltip contract). */
   children: ReactElement;
   placement?: 'right' | 'bottom' | 'top' | 'left';
@@ -115,7 +117,7 @@ function TooltipContent({ name, preview, footer }: {
 }
 
 export function DocumentInfoTooltip({
-  info, name = null, classification, touch, children, placement = 'right',
+  info, name = null, classification, touch, cardLayout = false, children, placement = 'right',
 }: DocumentInfoTooltipProps) {
   const [open, setOpen] = useState(false);
   const preview = documentInfoPreview(info);
@@ -125,7 +127,7 @@ export function DocumentInfoTooltip({
     // The name needs no affordance on touch: the label is under the finger
     // already, and a chevron with only the name behind it would be noise.
     if (!preview) return children;
-    return <DocumentInfoExpandRow preview={preview}>{children}</DocumentInfoExpandRow>;
+    return <DocumentInfoExpandRow preview={preview} cardLayout={cardLayout}>{children}</DocumentInfoExpandRow>;
   }
   return (
     <Tooltip
@@ -153,21 +155,22 @@ export function DocumentInfoTooltip({
  * summary and the first paragraph inline. Local, unpersisted state — a glance,
  * not a setting.
  */
-export function DocumentInfoExpandRow({ preview, children }: {
+export function DocumentInfoExpandRow({ preview, children, cardLayout = false }: {
   preview: DocumentInfoPreview;
   children: ReactElement;
+  cardLayout?: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
   return (
     <Box data-testid="document-info-expand-row" sx={{ minWidth: 0 }}>
-      <Box sx={{ display: 'flex', alignItems: 'flex-start', minWidth: 0 }}>
-        <Box sx={{ flex: 1, minWidth: 0 }}>{children}</Box>
+      <Box sx={{ display: 'flex', flexDirection: cardLayout ? 'column' : 'row', alignItems: 'flex-start', minWidth: 0 }}>
+        <Box sx={{ flex: 1, minWidth: 0, ...(cardLayout ? { width: '100%' } : {}) }}>{children}</Box>
         <IconButton
           size="small"
           aria-label={expanded ? 'Hide description' : 'Show description'}
           aria-expanded={expanded}
           onClick={(e) => { e.stopPropagation(); setExpanded(v => !v); }}
-          sx={{ p: 0.25, color: INK_LOW, transform: expanded ? 'rotate(180deg)' : 'none' }}
+          sx={{ p: 0.25, color: INK_LOW, ...(cardLayout ? { alignSelf: 'flex-end' } : {}), transform: expanded ? 'rotate(180deg)' : 'none' }}
         >
           <ExpandMore sx={{ fontSize: 16 }} />
         </IconButton>

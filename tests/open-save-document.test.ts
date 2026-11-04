@@ -328,6 +328,17 @@ describe('plan-716 §9.3 — the forwarding open paths', () => {
 // ─── "New" mints a document, not a scn_ ─────────────────────────────────
 
 describe('plan-716 §9.3 — "New" mints a document (no scn_)', () => {
+  it('two scratch opens leave project files and manifest rows untouched', async () => {
+    const before = documentsOf(project.project());
+    const paths = [...project.files.keys()];
+    await store.openScratch();
+    await store.openScratch();
+    expect(documentsOf(project.project())).toEqual(before);
+    expect([...project.files.keys()]).toEqual(paths);
+    expect(project.writes).toEqual([]);
+    expect(store.getSnapshot().draft?.base).toEqual({ kind: 'empty' });
+  });
+
   it('newEmpty places a document and opens it', async () => {
     await store.newEmpty();
 
@@ -695,7 +706,7 @@ describe('plan-716 §9.3 — the deleted row save (F1)', () => {
 // ─── The CARD's save of a row-opened document (field finding 2026-08-14) ──
 //
 // The tests above call `store.save()` directly — below the routing gate the
-// Save button actually goes through. That gate (`saveSceneDocument`) read
+// Save button actually goes through. That gate (`savePlannerDocument`) read
 // `snap.isDraft || !snap.saved`, and a workspace opened via `openDocument`
 // reports `saved: null` — so EVERY card save of a row-opened document asked
 // for a name and forked a new file (`empty 2.glb`, `empty 2 2.glb`, …). This

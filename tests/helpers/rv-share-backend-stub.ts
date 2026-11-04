@@ -19,6 +19,8 @@
 export interface ShareBackendStubOptions {
   /** Per-file ceiling; a bigger `create` is `413 too-large`. */
   maxFileBytes?: number;
+  limitsEnabled?: boolean;
+  expiries?: string[];
   /** Per-account total; exceeding it is `507 quota-exceeded`. */
   quotaBytes?: number;
   /** Grace period after which an unconfirmed upload is swept. */
@@ -84,7 +86,7 @@ export class ShareBackendStub {
 
   private seq = 0;
 
-  constructor(opts?: ShareBackendStubOptions) {
+  constructor(private readonly opts?: ShareBackendStubOptions) {
     this.maxFileBytes = opts?.maxFileBytes ?? 100 * 1024 * 1024;
     this.quotaBytes = opts?.quotaBytes ?? 1024 * 1024 * 1024;
     this.orphanGraceMs = opts?.orphanGraceMs ?? 60_000;
@@ -215,6 +217,19 @@ export class ShareBackendStub {
     }
 
     const session = this.sessionOf(headers);
+
+    if (path === '/limits' && method === 'GET') {
+      if (this.opts?.limitsEnabled === false) return json(404, { error: { code: 'not-found' } });
+      if (headers.authorization && !session) return unauthorized();
+      const usedBytes = session ? [...this.uploads.values()]
+        .filter(rec => rec.owner === session.email && rec.state === 'confirmed')
+        .reduce((sum, rec) => sum + rec.size, 0) : undefined;
+      return json(200, {
+        maxFileBytes: this.maxFileBytes, quotaBytes: this.quotaBytes,
+        ...(session ? { usedBytes } : {}),
+        expiries: this.opts?.expiries ?? ['never', '7d', '30d', '90d'],
+      });
+    }
 
     if (path === '/auth/session' && method === 'GET') {
       if (!session) return unauthorized();

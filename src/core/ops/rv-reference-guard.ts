@@ -24,31 +24,19 @@
  *
  * `setField` / `unsetField` on the very same node are ACCEPTED. They are the
  * Override op class of §2.3, legal in every mode except `viewer` (decision 9),
- * and at the persistence step they route into `AssetOverrides.byNodeId` of the
+ * and at the persistence step they route into `AssetOverrides.byAddress` of the
  * enclosing reference node — the routing `rv-scene-glb-bake.ts` already performs
  * (`makeRegistryBakeResolver` → `kind: 'referenced'`). {@link readOverride} and
  * {@link writeOverride} here are the live-tree half of the same addressing, which
  * is what the inspector's badge and its Revert read and write.
  *
- * ## `transformNode` is structural HERE and writable in the SCENE bake
+ * ## `transformNode` is structural everywhere (plan-769 D11/F14)
  *
- * The asymmetry is deliberate (plan-444) and reading it as a bug would undo the
- * feature. Two different documents are being guarded:
- *
- *  - **The scene bake** writes the file the reference node lives in. Since
- *    plan-444 that file has a vocabulary for a foreign node's transform —
- *    `AssetOverrides.trsByNodeId`, a sibling of `byNodeId` — so a part moved
- *    after a CAD import is saved as an override instead of refused. That is F3,
- *    and it is the whole point of the plan.
- *  - **This guard** protects the ASSET EDITOR's op log, which edits one asset
- *    document at a time. There the reference in question is an INNER one, so
- *    the patch would have to be written into a file that is itself referenced —
- *    the case `ReferencedFileWriteError` refuses and plan-444 explicitly left
- *    refused (F5). `transformNode` therefore stays in the structural set.
- *
- * The general sentence above ("structural overrides do not exist") still holds
- * for every other kind in the list: none of them has a vocabulary in the
- * override schema, and `transformNode` now has one only at the outermost level.
+ * plan-444 gave the scene bake a vocabulary for a foreign node's transform
+ * (`trsByNodeId`). plan-769 removed it: inside placed content only component
+ * VALUES are overridable. A part move there is refused — here as a structural op,
+ * in the scene bake as `nested-transform-refused` — and an old file's moves are
+ * reported (`override-transforms-dropped`), never applied and never written again.
  *
  * Pure module: no Three.js beyond the `Object3D` type, no registry, no storage.
  */
@@ -57,11 +45,14 @@ import type { Object3D } from 'three';
 import type { RvOp, RvOpKind } from './rv-unified-ops';
 import {
   getAssetOverrides,
+  overrideAddressInReference,
+  overrideAddressOf,
   setAssetOverrides,
+  type AssetOverrides,
   type ComponentPatch,
 } from '../engine/rv-asset-reference';
 import { outermostReference } from '../engine/rv-reference-scope';
-import { getNodeId } from '../engine/rv-node-id';
+import { identityIdOf } from '../engine/rv-decode-identity';
 
 // ─── Structural vs. value ───────────────────────────────────────────────
 
@@ -79,9 +70,8 @@ import { getNodeId } from '../engine/rv-node-id';
  * material assignment in the file, and `AssetOverrides` patches components, not
  * materials.
  *
- * `transformNode` stays here even though the SCENE bake can now write a
- * transform override — see the module doc's "asymmetry" section for why the two
- * verdicts are about two different documents.
+ * `transformNode` is here because a part move inside placed content has no
+ * vocabulary (plan-769 D11/F14 — see the module doc).
  */
 export const RV_STRUCTURAL_OP_KINDS: ReadonlySet<RvOpKind> = new Set<RvOpKind>([
   'addNode',
@@ -96,6 +86,10 @@ export const RV_STRUCTURAL_OP_KINDS: ReadonlySet<RvOpKind> = new Set<RvOpKind>([
   'setMaterial',
   'separateMesh',
   'mergeMesh',
+  // plan-621: a geometry swap is mesh data, which an override cannot carry.
+  'replaceNodeGeometry',
+  // plan-641 Phase 3: a subtree copy adds nodes and meshes.
+  'cloneNode',
   'importCad',
   'transformNode',
 ]);
@@ -129,10 +123,14 @@ export function opTargetPaths(op: RvOp): string[] {
       return op.ops.flatMap(opTargetPaths);
     case 'setMaterial':
       return [...op.nodePaths];
+    case 'replaceNodeGeometry':
+      return [op.nodePath, ...(op.sharedNodePaths ?? [])];
     case 'mergeMesh':
       return [op.rootPath, ...op.sourcePaths];
     case 'separateMesh':
       return [op.sourcePath];
+    case 'cloneNode':
+      return [op.sourcePath, op.nodePath];
     case 'importCad':
       return [op.rootPath];
     case 'reparentNode':
@@ -220,8 +218,14 @@ function describeKind(kind: RvOpKind): string {
 export interface OverrideTarget {
   /** The reference node that OWNS the patch — always in the open file. */
   referenceNode: Object3D;
-  /** The node's id WITHIN the referenced file — `AssetOverrides.byNodeId`'s key. */
+  /** The node's id WITHIN the asset that holds it. */
   nodeId: string;
+  /**
+   * plan-769 Phase 4b — its `AssetOverrides.byAddress` key on `referenceNode`:
+   * `#<nodeId>` for a node of the referenced asset, `<b>#<nodeId>` for content of
+   * its nested reference `b` (any depth, F13). Pass THIS to read/write/revert.
+   */
+  address: string;
 }
 
 /**
@@ -241,13 +245,22 @@ export function overrideTargetOf(
 ): OverrideTarget | null {
   const referenceNode = outermostReference(node, boundary);
   if (!referenceNode || referenceNode === node) return null;
-  const nodeId = getNodeId(node);
-  return nodeId ? { referenceNode, nodeId } : null;
+  // plan-769: the node's IDENTITY — the authored id, else the decode seed (a Unity
+  // asset has no authored ids; the seed is stable for the same file) — addressed
+  // through the nested references between the two (4b: no longer refused).
+  const nodeId = identityIdOf(node);
+  const address = nodeId ? overrideAddressInReference(referenceNode, node, identityIdOf) : null;
+  return nodeId && address ? { referenceNode, nodeId, address } : null;
 }
 
-/** The patch a reference node holds for one node id, or null. */
-export function readOverride(referenceNode: Object3D, nodeId: string): ComponentPatch | null {
-  return getAssetOverrides(referenceNode)?.byNodeId?.[nodeId] ?? null;
+/** An override key: an address as given, a bare node id as `#<id>` (a node of the referenced asset). */
+function overrideKey(key: string): string {
+  return key.includes('#') ? key : overrideAddressOf(key);
+}
+
+/** The patch a reference node holds for one address (or bare node id), or null. */
+export function readOverride(referenceNode: Object3D, key: string): ComponentPatch | null {
+  return getAssetOverrides(referenceNode)?.byAddress?.[overrideKey(key)] ?? null;
 }
 
 /** Field names of `componentType` this reference node overrides for `nodeId`. */
@@ -260,8 +273,11 @@ export function overriddenFieldsOf(
   return patch ? Object.keys(patch) : [];
 }
 
+/** One field of an override record: `has: false` = the record does not set it. */
+export interface OverrideFieldState { has: boolean; value?: unknown }
+
 /**
- * Write one field into `AssetOverrides.byNodeId[nodeId][componentType]`.
+ * Write one field into `AssetOverrides.byAddress['#'+nodeId][componentType]`.
  *
  * `value === undefined` REMOVES the entry (a Revert); `value === null` writes a
  * literal null, which under RFC 7396 deletes the field in the referenced asset.
@@ -272,11 +288,13 @@ export function overriddenFieldsOf(
  * Empty containers are pruned on the way out so a revert leaves no husk behind:
  * an `AssetOverrides` with an empty patch would keep the badge lit at zero.
  *
- * `byPath` and `trsByNodeId` are carried through untouched. This is a
- * read-modify-write over the WHOLE component, so a block this function does not
- * know about is a block it deletes: before plan-444 added the carry for
- * `trsByNodeId`, editing any field on any node of a referenced asset would have
- * silently thrown away every part the user had moved in it.
+ * The legacy `byPath` entries that did not resolve are carried through untouched
+ * (an orphan is never silently dropped). This is a read-modify-write over the
+ * WHOLE record, so a block this function does not know about is a block it deletes.
+ *
+ * Returns what the record held for this one field BEFORE the write (plan-774:
+ * the editor's setField executor keeps it as the op's undo capture without a
+ * second read of the record). Callers that do not need it ignore it.
  */
 export function writeOverride(
   referenceNode: Object3D,
@@ -284,11 +302,15 @@ export function writeOverride(
   componentType: string,
   fieldName: string,
   value: unknown,
-): void {
+): OverrideFieldState {
   const current = getAssetOverrides(referenceNode);
-  const byNodeId: Record<string, ComponentPatch> = { ...(current?.byNodeId ?? {}) };
-  const patch: ComponentPatch = { ...(byNodeId[nodeId] ?? {}) };
+  const key = overrideKey(nodeId);
+  const byAddress: Record<string, ComponentPatch> = { ...(current?.byAddress ?? {}) };
+  const patch: ComponentPatch = { ...(byAddress[key] ?? {}) };
   const fields: Record<string, unknown> = { ...(patch[componentType] ?? {}) };
+  const before: OverrideFieldState = fieldName in fields
+    ? { has: true, value: fields[fieldName] }
+    : { has: false };
 
   if (value === undefined) delete fields[fieldName];
   else fields[fieldName] = value;
@@ -296,16 +318,16 @@ export function writeOverride(
   if (Object.keys(fields).length === 0) delete patch[componentType];
   else patch[componentType] = fields;
 
-  if (Object.keys(patch).length === 0) delete byNodeId[nodeId];
-  else byNodeId[nodeId] = patch;
+  if (Object.keys(patch).length === 0) delete byAddress[key];
+  else byAddress[key] = patch;
 
-  const next = {
-    byNodeId,
-    ...(current?.byPath ? { byPath: current.byPath } : {}),
-    ...(current?.trsByNodeId ? { trsByNodeId: current.trsByNodeId } : {}),
+  const next: AssetOverrides = {
+    byAddress,
+    ...(current?.legacyByPath ? { legacyByPath: current.legacyByPath } : {}),
   };
   // `setAssetOverrides` removes the key entirely when nothing is left.
   setAssetOverrides(referenceNode, next);
+  return before;
 }
 
 /** Drop every override this reference holds for one component of one node. */

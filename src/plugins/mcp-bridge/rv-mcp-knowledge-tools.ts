@@ -14,13 +14,11 @@
  * announces well over a hundred tools — a fourth "search" tool would have bought
  * nothing that a parameter does not.
  *
- * ## Why not just `web_component_set(type='NodeKnowledge')`
+ * ## Knowledge-specific authoring
  *
- * Because the persistence chain validates no names. `web_component_set` takes
- * `type` and `props` as free strings, so `NodeKnowlege` — one missing letter —
- * would be written into the GLB permanently and without a word of complaint.
- * Here the type and field names are constants from `rv-node-knowledge.ts` and
- * cannot be misspelled from outside.
+ * `web_execute("component.setFields", …)` validates component fields. These tools
+ * additionally enforce the knowledge limits and report the persistence target.
+ * Type and field names are constants from `rv-node-knowledge.ts`.
  *
  * ## Two refusals these tools make on purpose
  *
@@ -46,7 +44,14 @@
 
 import type { Object3D } from 'three';
 import type { RVViewer } from '../../core/rv-viewer';
-import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
+import { valueOrThrowToolJson } from '../../core/hmi/rv-command-context';
+import {
+  commandRegistry,
+  type CommandDescriptor,
+  type CommandImpl,
+  type CommandRegistry,
+} from '../../core/hmi/rv-command-registry';
+
 import {
   getActiveEditTarget,
   getActivePersistenceTarget,
@@ -64,6 +69,9 @@ import {
   type NodeKnowledgeExtras,
 } from '../../core/engine/rv-node-knowledge';
 import type { RvExtrasEditorPlugin } from '../../core/hmi/rv-extras-editor';
+
+/** Command id of the knowledge-note write (alias tool `web_knowledge_set`, plan-641 Nachtrag). */
+export const KNOWLEDGE_SET_COMMAND = 'knowledge.set';
 
 /** Characters of note text echoed per row by `web_knowledge_list`. */
 const LIST_EXCERPT_CHARS = 160;
@@ -88,7 +96,10 @@ interface KnowledgeRow {
 }
 
 export class McpKnowledgeTools {
-  constructor(private readonly getViewer: () => RVViewer | undefined) {}
+  constructor(private readonly getViewer: () => RVViewer | undefined) {
+    // plan-641 Nachtrag: the bound `web_knowledge_set` needs its command before discover.
+    ensureKnowledgeCommandsRegistered();
+  }
 
   private get viewer(): RVViewer | undefined { return this.getViewer(); }
 
@@ -118,13 +129,9 @@ export class McpKnowledgeTools {
     return { node, path: reg.getPathForNode(node) ?? trimmed };
   }
 
-  @McpTool('Store or replace the knowledge note on one scene node — durable agent memory that travels inside the GLB. Overwrites the entire note; it does not append. Write facts worth recalling in a LATER session (what an axis really does, measured limits, why a node is misnamed), not scratch or session state. Prefer short Markdown bullets under headings over prose. An empty or whitespace-only note deletes the entry. Set confidence honestly: "inferred" or "unverified" stops a guess from reading as a measurement later. Check persistedTo in the result — "none" means the workspace keeps nothing and the note is gone on reload.', { readOnly: false })
-  async webKnowledgeSet(
-    @McpParam('path', 'Full hierarchy path of the node (from web_node_find / web_node_tree).') path: string,
-    @McpParam('markdown', `Note body as Markdown, max ${MAX_NOTE_CHARS} UTF-16 code units. Empty or whitespace-only deletes the note.`) markdown: string,
-    @McpParam('author', '"agent" (default) or "user" — provenance only, not access control.', 'string', false) author?: string,
-    @McpParam('confidence', '"observed" (default), "inferred" or "unverified" — how the knowledge was obtained.', 'string', false) confidence?: string,
-  ): Promise<string> {
+
+  /** The note write itself — the body of the `knowledge.set` command. JSON, `{error}` on refusal. */
+  async setNote(path: string, markdown: string, author?: string, confidence?: string): Promise<string> {
     const resolved = this._resolve(path);
     if (typeof resolved === 'string') return resolved;
     const editor = this.editor;
@@ -261,9 +268,9 @@ export class McpKnowledgeTools {
     });
   }
 
-  @McpTool('Get the knowledge note stored on one scene node as raw Markdown, with its provenance header (updatedAt, author, confidence). Read this before re-deriving what a node does — an earlier session may already have worked it out. Distinguishes an unknown path from a node that simply carries no note. Note that confidence "inferred" or "unverified" marks a previous agent\'s guess, not a measurement, and updatedAt tells you how stale it may be.', { readOnly: true })
-  async webKnowledgeGet(
-    @McpParam('path', 'Full hierarchy path of the node (from web_node_find / web_knowledge_list).') path: string,
+  /** Read-only command body; preserves the original JSON value contract. */
+  async queryKnowledgeGet(
+    path: string,
   ): Promise<string> {
     const resolved = this._resolve(path);
     if (typeof resolved === 'string') return resolved;
@@ -279,7 +286,7 @@ export class McpKnowledgeTools {
       return err(`Node "${resolved.path}" has no knowledge note`, {
         path: resolved.path,
         hasNote: false,
-        hint: 'Use web_knowledge_list to see which nodes carry notes.',
+        hint: 'Use web_query("knowledge.list", {}) to see which nodes carry notes.',
       });
     }
 
@@ -301,10 +308,10 @@ export class McpKnowledgeTools {
     });
   }
 
-  @McpTool('List every scene node carrying a knowledge note, newest first, with an excerpt and provenance. Pass query to full-text filter over note text and node path. Start a session here: it maps in one call what earlier sessions already established about this machine, so you can read the relevant notes with web_knowledge_get instead of re-deriving them.', { readOnly: true })
-  async webKnowledgeList(
-    @McpParam('query', 'Case-insensitive substring matched against note text and node path.', 'string', false) query?: string,
-    @McpParam('limit', `Maximum rows returned (default ${LIST_DEFAULT_LIMIT}, max ${LIST_MAX_LIMIT}).`, 'number', false) limit?: number,
+  /** Read-only command body; preserves the original JSON value contract. */
+  async queryKnowledgeList(
+    query?: string,
+    limit?: number,
   ): Promise<string> {
     const viewer = this.viewer;
     const reg = viewer?.registry;
@@ -380,11 +387,96 @@ function mirrorIntoUserData(node: Object3D, entry: NodeKnowledgeExtras): void {
 function persistenceReport(persistedTo: PersistenceTarget): Record<string, unknown> {
   const persistence: Record<string, unknown> = { persistedTo };
   if (persistedTo === 'asset') {
-    persistence.persistenceNote = 'Stored in the asset document — call web_editor_save to write the GLB.';
+    persistence.persistenceNote = 'Stored in the document open in the editor — call web_editor_save to write the GLB.';
   } else if (persistedTo === 'scene') {
     persistence.persistenceNote = 'Optimistic: flushed by the debounced scene autosave, which is cancelled (not flushed) by a model switch.';
   } else {
     persistence.persistenceNote = 'Nothing is persisted in this workspace (transient or no edit target) — the note is gone on reload.';
   }
   return persistence;
+}
+
+// ─── plan-641 Nachtrag 2026-10-21: the `knowledge.set` command ──────────
+
+interface KnowledgeSetArgs {
+  readonly path: string;
+  readonly markdown: string;
+  readonly author?: string | null;
+  readonly confidence?: string | null;
+}
+
+const knowledgeSet: CommandImpl<KnowledgeSetArgs, Record<string, unknown>> = {
+  enabled: (_ctx, a) => (String(a?.path ?? '').trim() ? true : { reason: 'path is required' }),
+  run: async (ctx, a) => valueOrThrowToolJson(
+    await new McpKnowledgeTools(() => ctx.viewer).setNote(a.path, a.markdown, a.author ?? undefined, a.confidence ?? undefined),
+  ),
+  // M4: explicit values — no selection fallback, the defaults spelled out.
+  resolveArgs: (_ctx, a) => ({
+    path: String(a?.path ?? '').trim(),
+    markdown: String(a?.markdown ?? ''),
+    author: asAuthor(a?.author ?? undefined),
+    confidence: asConfidence(a?.confidence ?? undefined),
+  }),
+};
+
+/** Build the knowledge command (testable seam: no registry side effect). */
+export function createKnowledgeCommandDescriptors(): CommandDescriptor<never, unknown>[] {
+  const set: CommandDescriptor<KnowledgeSetArgs, Record<string, unknown>> = {
+    id: KNOWLEDGE_SET_COMMAND,
+    label: 'Set knowledge note',
+    undoLabel: 'Set knowledge note',
+    readOnly: false,
+    macro: true,
+    scope: 'none',
+    available: true,
+    unavailableReason: 'Not available',
+    mcp: {
+      tool: 'web_knowledge_set',
+      params: [
+        { name: 'path', type: 'string', required: true },
+        { name: 'markdown', type: 'string', required: true },
+        { name: 'author', type: 'string', required: false },
+        { name: 'confidence', type: 'string', required: false },
+      ],
+    },
+    argsSchema: { path: 'string', markdown: 'string', author: 'string', confidence: 'string' },
+    eagerImpl: knowledgeSet,
+    impl: () => Promise.resolve(knowledgeSet),
+  };
+  return [
+    set,
+    {
+      id: 'knowledge.get', label: 'knowledge.get', readOnly: true, scope: 'none',
+      available: true, unavailableReason: 'Not available',
+      argsSchema: { path: 'string' },
+      impl: async () => {
+        const impl: CommandImpl<{ path?: string }, unknown> = {
+          enabled: () => true,
+          run: async (ctx, a) => JSON.parse(await new McpKnowledgeTools(() => ctx.viewer).queryKnowledgeGet(a?.path!)),
+        };
+        return impl;
+      },
+    },
+    {
+      id: 'knowledge.list', label: 'knowledge.list', readOnly: true, scope: 'none',
+      available: true, unavailableReason: 'Not available',
+      argsSchema: { query: 'string', limit: 'number' },
+      impl: async () => {
+        const impl: CommandImpl<{ query?: string; limit?: number }, unknown> = {
+          enabled: () => true,
+          run: async (ctx, a) => JSON.parse(await new McpKnowledgeTools(() => ctx.viewer).queryKnowledgeList(a?.query, a?.limit)),
+        };
+        return impl;
+      },
+    },
+  ] as unknown as CommandDescriptor<never, unknown>[];
+}
+
+const registeredKnowledge = new WeakSet<CommandRegistry>();
+
+/** Idempotent eager registration of the knowledge command. */
+export function ensureKnowledgeCommandsRegistered(registry: CommandRegistry = commandRegistry): void {
+  if (registeredKnowledge.has(registry)) return;
+  registeredKnowledge.add(registry);
+  for (const d of createKnowledgeCommandDescriptors()) registry.register(d);
 }

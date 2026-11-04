@@ -23,10 +23,13 @@
  *      Multi-material meshes are split by `geometry.groups`, each group going
  *      to the chunk of its material. Uber-baked → the context's uber chunk;
  *      any other material → `tex:<material.uuid>` inside the same context.
- *   4. ORDER — within a chunk, meshes are written grouped by their PICK node
- *      (nearest ancestor-or-self with `pick !== 'none'`, the chunk owner
- *      otherwise) in DFS order, so every `nodes[]` window is contiguous by
- *      construction. Only pick nodes and owners get a window.
+ *   4. ORDER — within a chunk, items are stable-sorted by the pre-order
+ *      ordinal of a mesh's nearest SURVIVING ancestor-or-self
+ *      (`computeBakeOrdinals`), DFS order kept inside one survivor's run. The
+ *      pick-owner ordinal is part of the segment key, so an owner boundary is
+ *      always a segment boundary. After the bake this index order is DATA —
+ *      segments, cluster boxes, CSR rows and `faceIndex` address triangles by
+ *      position; nothing may re-sort it.
  *   5. STAGE — two passes per chunk (count → allocate once → write), the
  *      documented fix against `RangeError: Array buffer allocation failed`
  *      (`buildRaycastGroup`, `buildMergeBatches`). Attributes canonicalized
@@ -42,11 +45,9 @@
  *      nearest surviving ancestor-or-self, so the subtree of every surviving
  *      node is one contiguous segment run per chunk (P1), and the asset gets a
  *      CSR node table over those intervals.
- *   6. BVH — one worker build per chunk through the BVH port copy path
- *      (`transferable: false`), small chunks first; `ready` per chunk and for
- *      the asset. Builds `indirect`, so it never reorders the index the pick
- *      structure addresses. Deleted in plan-756 step 1d.
- *   7. BOUNDS — per chunk and for the asset.
+ *   6. BOUNDS — per chunk and for the asset. (The former chunk-BVH step and
+ *      `asset.ready` were deleted in plan-756 step 1d: the pick structure of
+ *      5a replaces them.)
  *
  * Epoch contract: `opts.isEpochCurrent()` is re-checked after EVERY `await`.
  * A stale bake disposes what it already staged and rejects with
@@ -72,7 +73,9 @@ import {
   type Texture,
 } from 'three';
 import { classifyShadows } from './rv-mesh-classifier';
+import { sharedVizGeometries } from './rv-shared-viz-geometry';
 import {
+  bakedKeepGeometries,
   chunkMetaOf,
   partitionExtrasOf,
   relativeNodePath,
@@ -112,6 +115,7 @@ import { buildSegmentOnlyStructure, type PickSegmentInput } from './rv-pick-buil
 import type { ChunkPickData, NodeTable } from './rv-pick-structure';
 import type { SignatureState } from '../persistence/rv-sig-verify';
 import { debug } from './rv-debug';
+import { RV_ORIG_NAME_KEY } from './rv-authored-keys';
 
 // ─── Phase 0: entry guard ────────────────────────────────────────────
 
@@ -220,10 +224,9 @@ export interface BakeOptions extends BakeGuardOptions {
   /**
    * Forced chunk split (plan-753 Phase 3, I7): a node this predicate accepts
    * opens its own chunk context exactly like a `bake:'chunk'` mover and
-   * becomes a logic node. Used for nodes that carry an
-   * `AssetOverrides.trsByNodeId` transform — the saved TRS then becomes the
-   * instance node's transform and the moved part stays visible. Evaluated
-   * once per node in the role pass; never for the root, never over `keep`.
+   * becomes a logic node. Used for the deferred placement roots of a document
+   * (`PlacementMeta`); plan-769 F14 removed its other user, `trsByNodeId`.
+   * Evaluated once per node in the role pass; never for the root, never over `keep`.
    */
   forceSplit?: (node: Object3D) => boolean;
   /**
@@ -514,11 +517,29 @@ export async function bake(root: Object3D, opts: BakeOptions): Promise<BakedAsse
         }
         g.dispose();
       }
+      // R8: the keep templates' geometries are the asset's too (every
+      // placement's keep clone shares them; the dispose guard skips them).
+      for (const k of this.keep) {
+        const g = k.mesh.geometry as BufferGeometry | undefined;
+        if (!g || !bakedKeepGeometries.has(g)) continue;
+        bakedKeepGeometries.delete(g);
+        if (g.boundsTree) {
+          if (typeof g.disposeBoundsTree === 'function') g.disposeBoundsTree();
+          else g.boundsTree = undefined;
+        }
+        g.dispose();
+      }
     },
   };
   for (const c of chunks) chunkMetaOf.set(c.geometry, { chunk: c, asset });
+  // R8: tag the keep templates' geometries — owned by this asset, never by a
+  // placement subtree. A shared sensor-viz geometry stays with its own owner.
+  for (const k of plan.keep) {
+    const g = k.mesh.geometry as BufferGeometry | undefined;
+    if (g && !sharedVizGeometries.has(g)) bakedKeepGeometries.add(g);
+  }
 
-  // No step 6 any more (plan-756 step 1d): the chunk BVH queue is gone with
+  // No BVH step any more (plan-756 step 1d): the chunk BVH queue is gone with
   // `asset.ready`. Every chunk's pick structure landed in phase 'pick' above,
   // so the asset is fully queryable the moment this function resolves (F1).
   timing.finish({ chunks: chunks.length, vertices: totalVertices, triangles: totalTriangles });
@@ -538,7 +559,7 @@ const RV_BAKE_CHUNK_KEY = '_rvBakeChunk';
  * The reference transfer is the whole point of a destructive bake: `tmp` is
  * dropped moments later and nothing else has ever seen this object, so the
  * extras block the components will read is simply handed over. It also avoids
- * `JSON.parse(JSON.stringify(...))` on ~31k surviving nodes of a Mauser-sized
+ * `JSON.parse(JSON.stringify(...))` on ~31k surviving nodes of a large CAD
  * model, which is what `cloneLogicNode` has to pay for a placement whose master
  * stays alive.
  */
@@ -563,8 +584,6 @@ function makeTemplateNode(src: Object3D): Object3D {
   return node;
 }
 
-/** Mirrors `RV_ORIG_NAME_KEY` of rv-glb-parse.ts (which drags the GLTFLoader in). */
-const RV_ORIG_NAME_KEY = '_rvOrigName';
 
 /**
  * The ONE synthetic node a (boundary, partition) pair gets (plan-755 D4/D6): a
@@ -980,7 +999,7 @@ interface TreePlan {
  * plan-755 D7: a type that declares `claimsNode: false` is an annotation, not
  * behaviour, even when it HAS a schema — `Group` has one (the inspector and the
  * asset editor need it) and would otherwise keep ~12700 group-only nodes of the
- * Mauser alive, each as a logic node with an explicit `merge`. It is treated
+ * the large CAD line alive, each as a logic node with an explicit `merge`. It is treated
  * exactly like `renderer`: no role of its own, no logic node, no survival.
  */
 export function makeBehaviouralTest(): (rv: Record<string, unknown> | undefined) => boolean {
@@ -1308,7 +1327,7 @@ function countInstancedTriangles(mesh: Mesh): number {
  * is created and every item pushed in exactly the order the combined pass
  * produced. Chunk keys and boundary inverses are read off the material and
  * matrix state of the BAKE, never of the pre-material tree: the draw-call
- * contract of `doc-render-picking.md` § 1.3 is untouched.
+ * contract of `contract-bake-picking.md` § 1.3 is untouched.
  */
 function bucketItems(root: Object3D, roles: RoleClassification, uber: Material | null): TreePlan {
   const rootInverse = new Matrix4().copy(root.matrixWorld).invert();
@@ -1597,7 +1616,7 @@ function nearestOrdinal(ordinals: BakeOrdinals, node: Object3D): number {
  *
  * One row per (surviving node, chunk) pair whose SUBTREE has segments in that
  * chunk — sparse by construction, because a dense `chunks × nodes` layout would
- * be ~40 MB on the Mauser and blow the memory gate on its own. A node's subtree
+ * be ~40 MB on the large CAD line and blow the memory gate on its own. A node's subtree
  * is the ordinal interval `[n, subtreeEnd[n]]` and a chunk's segments are sorted
  * by node ordinal, so the subtree's segments are one contiguous run per chunk
  * (that IS the P1 guarantee) and `first`/`last` describe it exactly.

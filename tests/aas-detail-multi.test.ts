@@ -33,6 +33,7 @@ import {
   publishScannedIndex,
   releaseAasPackages,
   resetAasSources,
+  setAasDeployContext,
   trackAasPackageUrl,
   urlAasSourceFor,
   type AasProjectBackend,
@@ -249,11 +250,23 @@ describe('on-demand packages', () => {
     });
     const scene = new Object3D();
     const nodes = ['urn:1', 'urn:2', 'urn:3'].map(id => { const n = linkNode(id); scene.add(n); return n; });
+    // plan-682: the deploy context is set by installAasResolution (main.ts) on
+    // 'model-loaded'; the plugin's model work runs after that event.
+    const handlers = new Map<string, Set<(p: unknown) => void>>();
     const viewer = {
-      scene, projectAssetsPath: '/start/', on: () => () => {}, getPlugin: () => undefined,
+      scene, projectAssetsPath: '/start/', getPlugin: () => undefined,
+      on: (ev: string, fn: (p: unknown) => void) => {
+        if (!handlers.has(ev)) handlers.set(ev, new Set());
+        handlers.get(ev)!.add(fn);
+        return () => handlers.get(ev)!.delete(fn);
+      },
     };
+    setAasDeployContext({ explicitBase: null, deployBase: '/start/' });
     const plugin = new AasLinkPlugin();
-    plugin.onModelLoaded({ root: scene, modelConfig: undefined } as never, viewer as never);
+    plugin.init(viewer as never);
+    const result = { root: scene, modelConfig: undefined };
+    plugin.onModelLoaded(result as never, viewer as never);
+    for (const fn of [...(handlers.get('model-loaded') ?? [])]) fn({ result });
     await vi.waitFor(() => expect((nodes[0].userData._rvAasLink as { searchText?: string }).searchText).toBe('Big One ACME One'));
     expect(fetches.some(u => u.endsWith('.aasx'))).toBe(false);
     expect(getAasPackageStats().open).toBe(0);

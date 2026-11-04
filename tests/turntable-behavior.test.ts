@@ -14,6 +14,7 @@ import { EventEmitter } from '../src/core/rv-events';
 import { ContextMenuStore } from '../src/core/hmi/context-menu-store';
 import { getCapabilities } from '../src/core/engine/rv-component-registry';
 import Turntable from '../src/behaviors/Turntable';
+import { physics2dRegistry } from '../src/core/engine/rv-physics2d-registry';
 import { matchesAny } from '../src/core/behaviors';
 import type { SnapLite } from '../src/behaviors/_shared/snap-graph-helpers';
 
@@ -449,5 +450,14 @@ describe('Turntable behavior — works without a belt drive', () => {
     iterateFixedUpdate(handle, DT);
     expect(rotary.running).toBe(true);                          // rotation still commanded
     expect(signalStore.get('Flow.Occupied')).toBe(true);
+  });
+});
+
+
+describe('Turntable 2D physics binding (plan-661 Phase 5)', () => {
+  it('binds the belt to its rotary pivot while the behavior retains control', () => {
+    const s = setup();
+    expect(physics2dRegistry.motionOf(s.belt.node)).toBe(s.rotary.node);
+    s.handle.dispose();
   });
 });

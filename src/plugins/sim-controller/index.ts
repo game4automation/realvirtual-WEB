@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+
 /**
  * SimControllerPlugin — Global Play/Pause/Reset for the continuous simulation.
  *
@@ -33,6 +34,8 @@ import { SimControllerToolbar } from './SimControllerToolbar';
 import { ModeSwitchNotice } from './ModeSwitchNotice';
 import { commandRegistry } from '../../core/hmi/rv-command-registry';
 import { ensureSimCommandsRegistered, registerRuntimeInspectorActions } from './sim-commands';
+import { ensureDiagnoseCommandsRegistered } from '../../core/diagnostics/diagnose-command-descriptors';
+import { ensureDesRunCommandsRegistered } from '../../core/hmi/des-run-commands';
 
 /** The pause-reason key used by this plugin. Exported so tests + adjacent
  *  modules (e.g. config helpers) can reference it without typo risk.
@@ -105,6 +108,9 @@ export class SimControllerPlugin implements RVViewerPlugin {
     // plan-499: the runtime commands (sim, speed, drive jog/stop, signal set)
     // and their inspector views exist as soon as the core plugin does.
     ensureSimCommandsRegistered();
+    ensureDesRunCommandsRegistered();
+
+    ensureDiagnoseCommandsRegistered();
     registerRuntimeInspectorActions();
   }
 

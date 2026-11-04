@@ -124,8 +124,6 @@ function bundled(
       ...models.map(m => ({
         id: `doc_${m.url.replace(/[^a-z0-9]+/gi, '_')}`,
         name: m.label,
-        // `label` too: `assetDocumentsOf()` projects a document row onto the
-        // asset-entry shape, which reads `label` rather than `name`.
         label: m.label,
         path: m.url,
         section: 'models',
@@ -212,12 +210,12 @@ describe('resolveActiveProject', () => {
     expect(resolved.kind).toBe('bundled');
     // The DEPLOY's id — the synthetic `prj_sample` is gone (plan-735 F6).
     expect(resolved.project?.id).toBe('prj_deploy');
-    expect(resolved.models.map(m => m.label)).toEqual(['Demo']);
-    // `scenes` is EVERY document now (plan-744 F3), not the scene-section
-    // subset. The subset was a projection over a path heuristic, and the
-    // heuristic answers nothing for a browser project — whose documents are
-    // the ones this field was most needed for. Nothing in production reads it.
-    expect(resolved.scenes.map(s => s.name)).toEqual(['Demo A', 'Demo']);
+    // `documents` is EVERY document of the manifest (plan-777 F4) — it replaced
+    // a `models` place filter and a `scenes` view that was this same list
+    // (plan-744 F3). Nothing in production reads it.
+    expect(resolved.documents.map(d => d.name)).toEqual(['Demo A', 'Demo']);
+    expect(resolved).not.toHaveProperty('models');
+    expect(resolved).not.toHaveProperty('scenes');
   });
 
   it('opens My Workspace with neither ?project= nor a last-opened project', async () => {
@@ -254,7 +252,9 @@ describe('resolveActiveProject', () => {
     const resolved = await store.resolveActiveProject({ bundledBackend: bundled() });
     expect(resolved.kind).toBe('folder');
     expect(resolved.project?.name).toBe('CustomerX');
-    expect(resolved.models.map(m => m.path)).toEqual(['models/line.glb']);
+    // Every document the manifest declares — the scene row AND the model row;
+    // the `models/**` place filter that used to answer here is gone (plan-777 F4).
+    expect(resolved.documents.map(d => d.path)).toEqual(['scenes/a-a.scene.glb', 'models/line.glb']);
   });
 
   it('an explicit projectId beats the recorded one — the ?project= path', async () => {
@@ -316,7 +316,7 @@ describe('resolveActiveProject', () => {
     });
     expect(resolved.project).toBeTruthy();
     expect(resolved.kind).toBe('bundled');
-    expect(resolved.models).toHaveLength(2);
+    expect(resolved.documents).toHaveLength(2);
     expect(documentsOf(resolved.project).map((d) => d.path))
       .toEqual(expect.arrayContaining(['/models/A.glb', '/models/B.glb']));
   });

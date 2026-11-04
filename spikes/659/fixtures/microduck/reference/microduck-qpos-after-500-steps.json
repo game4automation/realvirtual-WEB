@@ -1,0 +1,68 @@
+{
+  "meta": {
+    "runtime_versions": {
+      "python": "3.13.9",
+      "mujoco": "3.11.0",
+      "onnxruntime": "1.23.2",
+      "numpy": "2.5.4",
+      "platform": "Windows-11-10.0.26200-SP0"
+    },
+    "sources": {
+      "mjcf": {
+        "repo": "huggingface.co/spaces/pollen-robotics/microduck-simulator",
+        "revision": "ad9d41a7",
+        "path": "app/public/robot/mjlab/robot_allcollisions.xml"
+      },
+      "policies": {
+        "repo": "huggingface.co/spaces/pollen-robotics/microduck-simulator",
+        "revision": "ad9d41a7",
+        "path": "app/public/policies/"
+      },
+      "reference_loop": {
+        "repo": "github.com/pollen-robotics/microduck_rl",
+        "revision": "b02fdea4902c2b93b7d34a83a6f05da4ececb7d3",
+        "path": "scripts/infer_policy.py",
+        "mode": "--new-cmd-obs"
+      }
+    }
+  },
+  "control_steps": 500,
+  "command": [
+    0.25,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "qpos": [
+    1.0590556514451412,
+    -0.01880380760445048,
+    0.11726057356217585,
+    0.9995353011676114,
+    -0.009939954534963104,
+    -0.008472151067988175,
+    -0.0275427246273298,
+    -0.08435734268094808,
+    -0.018969164372039018,
+    -0.31932774817991183,
+    -0.18125330218501487,
+    0.18345892681519962,
+    0.3037241327199013,
+    0.40700296698859617,
+    -0.04907264706930601,
+    -0.0752093816921209,
+    0.058376101729135876,
+    0.11756739862226816,
+    0.4393312530464448,
+    -0.17275359863776424,
+    -0.45266086189299254
+  ]
+}

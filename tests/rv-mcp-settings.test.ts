@@ -69,6 +69,8 @@ type PluginInternals = {
   _ws: { readyState: number; send: Function; close: Function; onclose: null | Function; onerror: null | Function; onmessage: null | Function; onopen: null | Function } | null;
   _dispatcher: Map<string, unknown> | null;
   _destroyed: boolean;
+  _aiEnabled: boolean;
+  _sameOriginIsConnect: boolean | null;
   _reconnectTimer: ReturnType<typeof setTimeout> | null;
   _reconnectDelay: number;
   _currentPort: string;
@@ -121,6 +123,7 @@ describe('McpBridgePlugin - State Extension', () => {
     p._ws = fakeWs;
     p._dispatcher = buildToolDispatcher(plugin);
     p._destroyed = false;
+    p._aiEnabled = true;
     await p._handleMessage(STATUS_FRAME);
     viewer.emit.mockClear();
 
@@ -155,19 +158,24 @@ describe('McpBridgePlugin - State Extension', () => {
     expect(snapshot.connected).toBe(false);
   });
 
-  it('setEnabled(false) disconnects, clears timer, emits with enabled=false', () => {
+  // plan-668: "switch off = no socket" now holds only for a page CONNECT does not serve.
+  it('setEnabled(false) on a page without CONNECT disconnects, clears timer, emits with enabled=false', () => {
     const { plugin, viewer } = setupPlugin();
     const p = internals(plugin);
 
-    // Start in enabled state with a reconnect timer
+    // Start in enabled state with a reconnect timer, on a page CONNECT does not serve
     p._destroyed = false;
+    p._aiEnabled = true;
+    p._sameOriginIsConnect = false;
     p._reconnectTimer = setTimeout(() => {}, 10000);
     const fakeWs = createFakeWs();
     p._ws = fakeWs;
 
     plugin.setEnabled(false);
 
-    expect(p._destroyed).toBe(true);
+    expect(p._aiEnabled).toBe(false);
+    // plan-668: the AI switch is no longer the lifetime flag.
+    expect(p._destroyed).toBe(false);
     expect(p._reconnectTimer).toBeNull();
     expect(fakeWs.close).toHaveBeenCalled();
 
@@ -175,19 +183,40 @@ describe('McpBridgePlugin - State Extension', () => {
     expect(snapshot.enabled).toBe(false);
   });
 
-  it('setEnabled(true) starts connect, emits with enabled=true', () => {
+  it('setEnabled(false) on a CONNECT-served page keeps the socket and re-announces an empty catalog (plan-668)', () => {
+    const { plugin, viewer } = setupPlugin();
+    const p = internals(plugin);
+    p._destroyed = false;
+    p._aiEnabled = true;
+    p._sameOriginIsConnect = true;
+    const fakeWs = createFakeWs();
+    p._ws = fakeWs;
+
+    plugin.setEnabled(false);
+
+    expect(fakeWs.close).not.toHaveBeenCalled();
+    expect(p._ws).toBe(fakeWs);
+    const frames = fakeWs.send.mock.calls.map((c) => JSON.parse(c[0] as string));
+    expect(frames.find((f) => f.type === 'discover')).toMatchObject({ tools: [], ai: false });
+    expect(frames.find((f) => f.type === 'viewer_status')).toMatchObject({ ai: false });
+    const snapshot = viewer.emit.mock.calls[viewer.emit.mock.calls.length - 1][1] as McpBridgeSnapshot;
+    expect(snapshot).toMatchObject({ enabled: false, aiEnabled: false, channelReason: 'connect-origin' });
+  });
+
+  it('setEnabled(true) on a page without CONNECT starts connect, emits with enabled=true', () => {
     const { plugin, viewer } = setupPlugin();
     const p = internals(plugin);
 
-    // Start in disabled state
-    p._destroyed = true;
+    // Start in disabled state, no channel (a page CONNECT does not serve)
+    p._aiEnabled = false;
+    p._sameOriginIsConnect = false;
 
     // Spy on _connect to prevent actual WS creation
     const connectSpy = vi.spyOn(p as unknown as { _connect: () => void }, '_connect').mockImplementation(() => {});
 
     plugin.setEnabled(true);
 
-    expect(p._destroyed).toBe(false);
+    expect(p._aiEnabled).toBe(true);
     expect(connectSpy).toHaveBeenCalled();
 
     const snapshot = viewer.emit.mock.calls[viewer.emit.mock.calls.length - 1][1] as McpBridgeSnapshot;
@@ -200,8 +229,10 @@ describe('McpBridgePlugin - State Extension', () => {
     const { plugin, viewer } = setupPlugin();
     const p = internals(plugin);
 
-    // Start enabled
+    // Start enabled, on a page CONNECT does not serve
     p._destroyed = false;
+    p._aiEnabled = true;
+    p._sameOriginIsConnect = false;
     const fakeWs = createFakeWs();
     p._ws = fakeWs;
 
@@ -220,6 +251,7 @@ describe('McpBridgePlugin - State Extension', () => {
     const { plugin } = setupPlugin();
     const p = internals(plugin);
     p._destroyed = false;
+    p._aiEnabled = true;
 
     const connectSpy = vi.spyOn(p as unknown as { _connect: () => void }, '_connect').mockImplementation(() => {});
 
@@ -237,6 +269,7 @@ describe('McpBridgePlugin - State Extension', () => {
     const { plugin } = setupPlugin();
     const p = internals(plugin);
     p._destroyed = false;
+    p._aiEnabled = true;
     p._currentPort = '12345';
 
     const connectSpy = vi.spyOn(p as unknown as { _connect: () => void }, '_connect').mockImplementation(() => {});
@@ -257,6 +290,7 @@ describe('McpBridgePlugin - State Extension', () => {
     p._ws = null;
     p._dispatcher = null;
     p._destroyed = false;
+    p._aiEnabled = true;
     p._currentPort = '18712';
 
     expect(plugin.mcpConnected).toBe(false);
@@ -275,9 +309,12 @@ describe('McpBridgePlugin - State Extension', () => {
     expect(plugin.mcpConnected).toBe(true);
     expect(plugin.mcpToolCount).toBeGreaterThan(0);
 
-    // Simulate destroyed
+    // plan-668: mcpEnabled is AI control, not the lifetime flag
     p._destroyed = true;
+    expect(plugin.mcpEnabled).toBe(true);
+    p._aiEnabled = false;
     expect(plugin.mcpEnabled).toBe(false);
+    expect(plugin.aiEnabled).toBe(false);
   });
 
   it('toolCount reflects dispatcher.size after discover', () => {
@@ -294,12 +331,14 @@ describe('McpBridgePlugin - State Extension', () => {
     expect(plugin.mcpToolCount).toBe(expectedSize);
   });
 
-  it('snapshot contains all 12 McpBridgeSnapshot fields with correct types', async () => {
+  it('snapshot contains all 15 McpBridgeSnapshot fields with correct types', async () => {
     const { plugin, viewer } = setupPlugin();
     const p = internals(plugin);
 
     p._ws = createFakeWs();
     p._destroyed = false;
+    p._aiEnabled = true;
+    p._sameOriginIsConnect = false;
     p._currentPort = '19999';
     p._dispatcher = buildToolDispatcher(plugin);
     await p._handleMessage(STATUS_FRAME); // ready → resets the backoff
@@ -312,12 +351,13 @@ describe('McpBridgePlugin - State Extension', () => {
     expect(viewer.emit).toHaveBeenCalledOnce();
     const snapshot = viewer.emit.mock.calls[0][1] as McpBridgeSnapshot;
 
-    // Verify all 12 fields exist and have correct types
+    // Verify all 15 fields exist and have correct types
     expect(typeof snapshot.connected).toBe('boolean');
     expect(typeof snapshot.port).toBe('string');
     expect(typeof snapshot.toolCount).toBe('number');
     expect(Array.isArray(snapshot.toolNames)).toBe(true);
     expect(typeof snapshot.enabled).toBe('boolean');
+    expect(typeof snapshot.aiSolidCraft).toBe('boolean');
     expect(typeof snapshot.reconnectAttempt).toBe('number');
     expect(typeof snapshot.reconnectDelay).toBe('number');
     // serverStatus is the bridge's full-chain health frame — the one just received.
@@ -334,17 +374,21 @@ describe('McpBridgePlugin - State Extension', () => {
     expect(snapshot.toolCount).toBeGreaterThan(0);
     expect(snapshot.toolNames.length).toBeGreaterThan(0);
     expect(snapshot.enabled).toBe(true);
+    expect(snapshot.aiSolidCraft).toBe(false);
     expect(snapshot.reconnectAttempt).toBe(3);
     expect(snapshot.reconnectDelay).toBe(4000);
 
     // plan-564: ownership of this tab (no role in the frame = a gateway without standby).
     expect(snapshot.role).toBeNull();
     expect(snapshot.claimed).toBe(false);
+    // plan-668: AI control and the channel reason ride separately.
+    expect(snapshot.aiEnabled).toBe(true);
+    expect(snapshot.channelReason).toBe('ai');
 
-    // Verify exactly 12 keys (no extra, no missing)
-    expect(Object.keys(snapshot)).toHaveLength(12);
+    // Verify exactly 15 keys (no extra, no missing)
+    expect(Object.keys(snapshot)).toHaveLength(15);
     expect(Object.keys(snapshot).sort()).toEqual(
-      ['claimed', 'connected', 'enabled', 'failure', 'port', 'reconnectAttempt', 'reconnectDelay', 'role', 'serverStatus', 'target', 'toolCount', 'toolNames'],
+      ['aiEnabled', 'aiSolidCraft', 'channelReason', 'claimed', 'connected', 'enabled', 'failure', 'port', 'reconnectAttempt', 'reconnectDelay', 'role', 'serverStatus', 'target', 'toolCount', 'toolNames'],
     );
   });
 });

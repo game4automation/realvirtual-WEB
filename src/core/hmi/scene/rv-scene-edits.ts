@@ -32,6 +32,7 @@ import type { RVExtrasOverlay } from '../../engine/rv-extras-overlay-store';
 import type { PlacedComponent } from '../../../plugins/layout-planner/rv-layout-store';
 import type { ModelCameraStart } from '../camera-startpos-types';
 import type { RvConnection, ConnectionType } from '../../engine/rv-connection-registry';
+import type { NodeIdMap } from '../../engine/rv-subtree-instantiate';
 import type {
   RvOp,
   RvPrimitiveOp,
@@ -215,15 +216,32 @@ export interface AddNodeOp extends SceneOpHeader {
   /** Resulting full path of the new node (parentPath + '/' + name). */
   nodePath: string;
   spec: NodeSpec;
+  /**
+   * plan-769 Phase 2 (F11): the node's id under key `node` — minted on the FIRST
+   * apply and written back here, so undo/redo, a reload of the op log and a remote
+   * peer give the node the same id. Runtime only (never persisted into a GLB, F17).
+   */
+  idMap?: NodeIdMap;
 }
 
 /** Remove a node created by an `addNode` op (inverse / delete of an added node).
  *  Carries the full spec so undo can re-create it. Removal only affects nodes
- *  marked as op-created — original GLB nodes are unaffected. */
+ *  marked as op-created — original GLB nodes are unaffected — unless the op is
+ *  `authored` (plan-628 8.7). */
 export interface RemoveNodeOp extends SceneOpHeader {
   kind: 'removeNode';
   nodePath: string;
   spec: NodeSpec;
+  /**
+   * plan-628 8.7 (E36): the target is an AUTHORED node (from the file, no
+   * `__rvAdded`) that is removed persistently. Folds into the `removedNodes`
+   * category, is replayed on load and dropped from the GLB on save. The executor
+   * honours it ONLY when the live subtree passes `isAuthoredRemovalEligible`
+   * (`rv-scene-loader.ts`); for every other node it stays the old no-op.
+   */
+  authored?: true;
+  /** plan-769 Phase 2: the removed node's id (key `node`) — undo re-creates it with it. */
+  idMap?: NodeIdMap;
 }
 
 // The composite (transaction) op and the union over these payloads live in
@@ -249,6 +267,8 @@ export interface SceneEdits {
 export interface AddedNode {
   nodePath: string;
   spec: NodeSpec;
+  /** plan-769 Phase 2: the node's runtime id (`idMap.node` of its `addNode` op). */
+  idMap?: NodeIdMap;
 }
 
 /** A persisted local transform for a base-GLB node (op-log `transformNode`).
@@ -271,6 +291,39 @@ export interface MaterialisedEdits {
   connections: RvConnection[];
   /** Edit-op user-defined connection type signatures (plan-259). */
   connectionTypes: ConnectionType[];
+  /**
+   * plan-628 8.7: paths of AUTHORED nodes removed persistently (`removeNode`
+   * with `authored: true`), in removal order. Applied after the base GLB loaded
+   * and BEFORE `addedNodes` (an added node may reuse a removed name); the bake
+   * drops them from the file. Optional so pre-8.7 literals stay valid;
+   * `materialise()` always sets it.
+   */
+  removedNodes?: string[];
+  /**
+   * plan-769 Phase 7 (D23): moves of placements the BASE file already holds —
+   * a `transformPlacement` whose placement has no `addPlacement` in the log
+   * (it came in with the saved file and was adopted on open). Keyed by the
+   * placement id, which is the reference node's `NodeId`; last write wins. The
+   * bake patches only the TRS of that node; the load replay moves it before the
+   * planner adopts it. Optional so older literals stay valid; `materialise()`
+   * always sets it.
+   */
+  baselinePlacementTransforms?: Map<string, PlacementTransform>;
+  /**
+   * plan-769 Phase 7 (D23): ids of base-file placements a `removePlacement`
+   * took out (no `addPlacement` in the log). The bake drops the node with that
+   * `NodeId`; an id the file no longer holds is already in the target state.
+   * An `addPlacement` with the same id puts it back. Optional like
+   * {@link baselinePlacementTransforms}; `materialise()` always sets it.
+   */
+  removedPlacementIds?: string[];
+}
+
+/** A placement's transform as the planner records it (rotation in degrees, XYZ order). */
+export interface PlacementTransform {
+  position: [number, number, number];
+  rotation: [number, number, number];
+  scale: [number, number, number];
 }
 
 // ─── Constants + identity (shared with the asset editor's op log) ────────
@@ -304,9 +357,17 @@ export function materialise(ops: ReadonlyArray<RvOp>): MaterialisedEdits {
   const nodeTransforms = new Map<string, NodeTransformEntry>();
   const connections = new Map<string, RvConnection>();
   const connectionTypes = new Map<string, ConnectionType>();
+  const removedNodes: string[] = [];
+  const baselinePlacementTransforms = new Map<string, PlacementTransform>();
+  const removedPlacementIds = new Set<string>();
   let cameraStart: ModelCameraStart | null = null;
 
   for (const op of flattenOps(ops)) {
+    if (op.kind === 'removeNode' && op.authored === true && !addedNodes.has(op.nodePath)) {
+      foldAuthoredRemoval(op.nodePath, overlay, nodeTransforms, removedNodes);
+      continue;
+    }
+    if (foldBaselinePlacementOp(op, placements, baselinePlacementTransforms, removedPlacementIds)) continue;
     applyForwardPure(op, overlay, placements, addedNodes, nodeTransforms, connections, connectionTypes, (next) => { cameraStart = next; });
   }
 
@@ -331,7 +392,67 @@ export function materialise(ops: ReadonlyArray<RvOp>): MaterialisedEdits {
     nodeTransforms: [...nodeTransforms.values()],
     connections: [...connections.values()],
     connectionTypes: [...connectionTypes.values()],
+    removedNodes,
+    baselinePlacementTransforms,
+    removedPlacementIds: [...removedPlacementIds],
   };
+}
+
+/**
+ * plan-769 Phase 7 (D23): a placement op that addresses a placement of the BASE
+ * file — one the log never added. Returns true when it folded `op`.
+ *
+ * A placement adopted from the saved file has no `addPlacement` in the log, so
+ * its move and its removal have nothing to update in `placements`; they are
+ * kept by id instead and written onto the base node by the bake (and by the
+ * load replay). An `addPlacement` takes its id out of both — an explicit re-add
+ * (undo of the remove, a redo) restores the placement as recorded.
+ */
+function foldBaselinePlacementOp(
+  op: RvPrimitiveOp,
+  placements: ReadonlyMap<string, PlacedComponent>,
+  baselineTransforms: Map<string, PlacementTransform>,
+  removedIds: Set<string>,
+): boolean {
+  switch (op.kind) {
+    case 'addPlacement':
+      removedIds.delete(op.placement.id);
+      baselineTransforms.delete(op.placement.id);
+      return false; // the add itself folds in applyForwardPure
+    case 'transformPlacement':
+      if (placements.has(op.placementId)) return false;
+      baselineTransforms.set(op.placementId, {
+        position: [...op.position] as [number, number, number],
+        rotation: [...op.rotation] as [number, number, number],
+        scale: [...op.scale] as [number, number, number],
+      });
+      return true;
+    case 'removePlacement':
+      if (placements.has(op.placementId)) return false;
+      removedIds.add(op.placementId);
+      baselineTransforms.delete(op.placementId);
+      return true;
+    default:
+      return false;
+  }
+}
+
+/**
+ * plan-628 8.7: an authored node leaves the scene for good. Edits that targeted
+ * it or a node below it are dropped with it — otherwise a later `addNode` that
+ * reuses the name would inherit the removed node's overrides through the
+ * added-node fold above.
+ */
+function foldAuthoredRemoval(
+  nodePath: string,
+  overlay: RVExtrasOverlay,
+  nodeTransforms: Map<string, NodeTransformEntry>,
+  removedNodes: string[],
+): void {
+  const under = (p: string): boolean => p === nodePath || p.startsWith(`${nodePath}/`);
+  for (const p of Object.keys(overlay.nodes)) if (under(p)) delete overlay.nodes[p];
+  for (const p of [...nodeTransforms.keys()]) if (under(p)) nodeTransforms.delete(p);
+  if (!removedNodes.includes(nodePath)) removedNodes.push(nodePath);
 }
 
 /**
@@ -358,6 +479,9 @@ export function editsBeyondAuthoredTree(edits: MaterialisedEdits): MaterialisedE
     nodeTransforms: [],
     connections: edits.connections,
     connectionTypes: edits.connectionTypes,
+    removedNodes: [],
+    baselinePlacementTransforms: new Map(),
+    removedPlacementIds: [],
   };
 }
 
@@ -405,10 +529,24 @@ function applyForwardPure(
       return;
     }
     case 'addNode': {
-      addedNodes.set(op.nodePath, { nodePath: op.nodePath, spec: deepCloneJSON(op.spec) });
+      addedNodes.set(op.nodePath, {
+        nodePath: op.nodePath, spec: deepCloneJSON(op.spec),
+        ...(op.idMap ? { idMap: { ...op.idMap } } : {}),
+      });
       return;
     }
     case 'removeNode': {
+      // plan-628 8.9a: an op-created node takes its field overrides along (e.g. the
+      // `successors` write of a path link). Left in the overlay they address a node
+      // that no longer exists — the bake refused the whole autosave with
+      // NodeNotFoundError after a path block was deleted. Descendants that are still
+      // added nodes keep theirs (their own removeNode drops them).
+      if (addedNodes.has(op.nodePath)) {
+        const prefix = `${op.nodePath}/`;
+        for (const p of Object.keys(overlay.nodes)) {
+          if (p === op.nodePath || (p.startsWith(prefix) && !addedNodes.has(p))) delete overlay.nodes[p];
+        }
+      }
       addedNodes.delete(op.nodePath);
       nodeTransforms.delete(op.nodePath);
       return;
@@ -461,7 +599,7 @@ function applyForwardPure(
     }
     case 'transformPlacement': {
       const p = placements.get(op.placementId);
-      if (!p) return; // tolerate — base GLB may have changed
+      if (!p) return; // a base-file placement — folded by foldBaselinePlacementOp
       placements.set(op.placementId, {
         ...p,
         position: [...op.position] as [number, number, number],
@@ -602,10 +740,18 @@ export function inverseOp(op: RvSceneOp): RvSceneOp {
       };
     }
     case 'addNode': {
-      return { id: freshOpId(), ts: Date.now(), schemaV: 1, kind: 'removeNode', nodePath: op.nodePath, spec: op.spec };
+      return {
+        id: freshOpId(), ts: Date.now(), schemaV: 1, kind: 'removeNode', nodePath: op.nodePath, spec: op.spec,
+        ...(op.idMap ? { idMap: { ...op.idMap } } : {}),
+      };
     }
     case 'removeNode': {
-      return { id: freshOpId(), ts: Date.now(), schemaV: 1, kind: 'addNode', nodePath: op.nodePath, spec: op.spec };
+      // An `authored` removal is undone by dropping the op from the log (the
+      // document stack pops it); this record is the closest forward op.
+      return {
+        id: freshOpId(), ts: Date.now(), schemaV: 1, kind: 'addNode', nodePath: op.nodePath, spec: op.spec,
+        ...(op.idMap ? { idMap: { ...op.idMap } } : {}),
+      };
     }
     case 'addConnection': {
       return {

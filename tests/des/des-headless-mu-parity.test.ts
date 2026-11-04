@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 
+import { testAddressRegistry } from '../helpers/test-address-registry';
+
 /**
  * des-headless-mu-parity.test.ts — plan-262 Phase 3 (headless MUs in
  * FastForward) + R5 (Turntable ride paths without a visual).
@@ -21,16 +23,16 @@
  *  (d) snapshot JSON round-trip with `visual === null` MUs (the existing
  *      rv-des-snapshot tests never exercise the visual slot).
  *
- * Runs only in the private build (imports `@rv-private/plugins/des/*`).
+ * Imports `@rv/plugins/des/*` — DES is core code since plan-680.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Object3D, Vector3, Mesh, BoxGeometry } from 'three';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
-import { _resetDesHookCache } from '@rv-private/plugins/des/des-hook-adapter';
-import { resetDESMUCounter } from '@rv-private/plugins/des/rv-des-mu';
-import type { DESMU } from '@rv-private/plugins/des/rv-des-mu';
-import type { MaterialFlowAdapter } from '@rv-private/plugins/des/material-flow-adapter';
+import { DESRunner } from '@rv/plugins/des/des-runner';
+import { _resetDesHookCache } from '@rv/plugins/des/des-hook-adapter';
+import { resetDESMUCounter } from '@rv/plugins/des/rv-des-mu';
+import type { DESMU } from '@rv/plugins/des/rv-des-mu';
+import type { MaterialFlowAdapter } from '@rv/plugins/des/material-flow-adapter';
 import { TurntableFlow } from '../../src/behaviors/Turntable';
 import { schedulePositionMove } from '../../src/behaviors/_shared/drive-des';
 import {
@@ -106,7 +108,7 @@ function makeBindContext(root: Object3D): RVBindContext {
     on: (e, cb) => events.on(e, cb as never),
     contextMenu: new ContextMenuStore(),
     drives: [] as never,
-    registry: null,
+    registry: null, desAddresses: testAddressRegistry(),
     getPlugin: () => undefined,
   };
   const accum: KinematicsSpec = {};
@@ -473,7 +475,7 @@ async function runBeltLine(headless: boolean, registerSource = true): Promise<Be
       canAcceptDownstream: (mu: MU) => adapters[index].nextComponents.some(c => c.canAccept(mu as never)),
       ...(extra ?? {}),
     });
-    adapters.push(runner.addInstance(def, self, root));
+    adapters.push(runner.addInstance(def, self, root, undefined, { desId: root.name + '@' + def.type }));
   };
 
   add(sourceDef, srcRoot, 0, {
@@ -600,7 +602,7 @@ describe('DES headless-MU sink consume — slot recycling (no leak)', () => {
       mode: 'des',
       scheduler: runner.makeScheduler(def, () => adapter.entityId),
     });
-    adapter = runner.addInstance(def, self, node);
+    adapter = runner.addInstance(def, self, node, undefined, { desId: node.name + '@' + def.type });
     runner.start([def], { root: node });
 
     const manager = runner.getManager();

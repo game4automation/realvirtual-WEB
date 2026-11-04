@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../core/rv-safe-storage';
+
 /**
  * ProcessingUnitModePlugin — Toolbar toggle for "Processing Unit Mode".
  *
@@ -27,7 +29,7 @@ const LS_KEY = 'rv-pu-mode-enabled';
 
 export function loadProcessingUnitModeEnabled(): boolean {
   try {
-    return localStorage.getItem(LS_KEY) === 'true';
+    return readLocalStorage(LS_KEY) === 'true';
   } catch {
     return false;
   }
@@ -35,7 +37,7 @@ export function loadProcessingUnitModeEnabled(): boolean {
 
 export function saveProcessingUnitModeEnabled(enabled: boolean): void {
   try {
-    localStorage.setItem(LS_KEY, enabled ? 'true' : 'false');
+    writeLocalStorage(LS_KEY, enabled ? 'true' : 'false');
   } catch {
     /* ignore quota errors */
   }

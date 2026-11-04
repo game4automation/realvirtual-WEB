@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage, readLocalStorage } from '../rv-safe-storage';
+
 /**
  * Per-model camera start position store.
  *
@@ -47,7 +49,7 @@ function dispatchChangeEvent(modelKey: string): void {
 
 export function loadStartPos(modelKey: string): ModelCameraStart | null {
   try {
-    const raw = localStorage.getItem(keyFor(modelKey));
+    const raw = readLocalStorage(keyFor(modelKey));
     if (!raw) return null;
     const obj = JSON.parse(raw);
     return isValidPreset(obj) ? obj : null;
@@ -59,7 +61,7 @@ export function loadStartPos(modelKey: string): ModelCameraStart | null {
 /** Returns true on success, false on failure (quota, SecurityError). */
 export function saveStartPos(modelKey: string, preset: ModelCameraStart): boolean {
   try {
-    localStorage.setItem(keyFor(modelKey), JSON.stringify(preset));
+    getLocalStorage()!.setItem(keyFor(modelKey), JSON.stringify(preset));
     dispatchChangeEvent(modelKey);
     return true;
   } catch {
@@ -69,14 +71,14 @@ export function saveStartPos(modelKey: string, preset: ModelCameraStart): boolea
 
 export function clearStartPos(modelKey: string): void {
   try {
-    localStorage.removeItem(keyFor(modelKey));
+    getLocalStorage()!.removeItem(keyFor(modelKey));
     dispatchChangeEvent(modelKey);
   } catch { /* ignore */ }
 }
 
 export function hasStartPos(modelKey: string): boolean {
   try {
-    return localStorage.getItem(keyFor(modelKey)) !== null;
+    return readLocalStorage(keyFor(modelKey)) !== null;
   } catch {
     return false;
   }

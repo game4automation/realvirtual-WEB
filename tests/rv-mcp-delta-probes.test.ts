@@ -19,6 +19,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { choreographyToolOf } from '../src/plugins/mcp-bridge/rv-mcp-command-choreography';
 import {
   DELTA_PROBES,
   DELTA_MAX_ENTRIES,
@@ -34,6 +35,7 @@ import {
   type ProbeContext,
 } from '../src/plugins/mcp-bridge/rv-mcp-delta-probes';
 import { allSchemas } from './helpers/mcp-schemas';
+import { MOVED_TOOLS } from '../src/plugins/mcp-bridge/rv-mcp-moved-tools';
 
 beforeEach(() => {
   _resetInFlightForTest();
@@ -142,6 +144,16 @@ describe('T1 — a throwing probe is swallowed', () => {
 });
 
 describe('T1 — the policy table is a decision, not an accident', () => {
+  it('preserves the moved command choreography keys', () => {
+    const dispatcher = new Map();
+    expect(choreographyToolOf('workspace.setMode', dispatcher)).toBe('web_mode_set');
+    expect(DELTA_PROBES[choreographyToolOf('workspace.setMode', dispatcher)!]).toBe(DELTA_PROBES.web_mode_set);
+    for (const id of ['view.isolate', 'view.sourceMarkers']) {
+      const key = choreographyToolOf(id, dispatcher);
+      expect(key).toBeDefined();
+      expect(DELTA_PROBES[key!]).toBeUndefined();
+    }
+  });
   it('viewport-transient writes carry no probe', () => {
     for (const t of ['web_camera_set', 'web_camera_focus', 'web_camera_orbit',
       'web_camera_projection', 'web_view_isolate',
@@ -167,7 +179,10 @@ describe('T1 — the policy table is a decision, not an accident', () => {
     // silently means that tool never gets verified, which is precisely the
     // class of quiet nothing-happened this whole feature exists to expose.
     const announced = new Set(allSchemas().map((s) => s.name));
-    const unknown = Object.keys(DELTA_PROBES).filter((k) => !announced.has(k));
+    // plan-2007: a 1:1 tombstone keeps its probe — `choreographyToolOf` reaches it per command.
+    // Multiplexer probe keys are kept until the tombstones are removed (plan §2.3c).
+    const tombstoneKeys = new Set(MOVED_TOOLS.map((m) => m.tool));
+    const unknown = Object.keys(DELTA_PROBES).filter((k) => !announced.has(k) && !tombstoneKeys.has(k));
     expect(unknown, `DELTA_PROBES keys matching no announced tool: ${unknown.join(', ')}`)
       .toEqual([]);
   });

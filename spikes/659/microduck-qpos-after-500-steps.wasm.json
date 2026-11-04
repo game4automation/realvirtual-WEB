@@ -1,0 +1,54 @@
+{
+  "meta": {
+    "plan": 659,
+    "phase": 1,
+    "chain": "wasm",
+    "scene": "spikes/659/duck/rv-duck-collision.xml",
+    "note": "Golden of the WASM chain (@mujoco/mujoco + onnxruntime-node) on the COLLISION-PRIMITIVE scene (plan-659 stage 2 — no CC BY-NC-SA mesh). The run is bit-deterministic inside this chain; it is NOT bit-equal to the native Python snapshot (max |delta| 2.1e-1 after 500 steps) and NOT bit-equal to the mesh-hull scene either — do not compare across chains or across hulls. The geometry claim is carried by duck/compare-collision-walk.mjs, not here.",
+    "versions": {
+      "node": "v24.18.0",
+      "@mujoco/mujoco": "3.11.0",
+      "onnxruntime-node": "1.23.2",
+      "platform": "win32-x64"
+    }
+  },
+  "controlSteps": 500,
+  "command": [
+    0.25,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "qpos": [
+    1.04563016364028,
+    0.25446114445197116,
+    0.11922192951446842,
+    0.973358800546633,
+    -0.021960644085432426,
+    -0.00838433156442583,
+    0.22807910578128113,
+    -0.06847363313394074,
+    -0.10392554137461694,
+    -0.39744702907288665,
+    -0.008478694867778618,
+    0.3946049018783867,
+    0.33004791129989336,
+    0.4298185497297342,
+    0.08144970275500814,
+    -0.0006449384394100943,
+    0.07606226599191947,
+    0.07345923312704812,
+    0.21778597707139935,
+    -0.19070275277856552,
+    -0.3688752881030121
+  ]
+}

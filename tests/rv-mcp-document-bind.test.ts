@@ -23,6 +23,16 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
+import { ensureDocumentCommandsRegistered } from '../src/core/hmi/document-commands';
+import { McpCommandTools } from '../src/plugins/mcp-bridge/rv-mcp-command-tools';
+
+async function exec(command: string, args: Record<string, unknown> = {}) {
+  ensureDocumentCommandsRegistered();
+  const r = JSON.parse(await new McpCommandTools(() => ({} as never)).webExecute(command, JSON.stringify(args)));
+  return r.value ?? { error: r.error };
+}
+
+
 // ─── The store double ───────────────────────────────────────────────────
 
 type Row = Record<string, unknown> & { id: string };
@@ -66,9 +76,7 @@ vi.mock('../src/core/project/project-store', () => ({
 }));
 
 async function bind(document: string, field: string, ref?: string) {
-  const { McpProjectTools } = await import('../src/plugins/mcp-bridge/rv-mcp-project-tools');
-  const out = await new McpProjectTools(() => undefined).webDocumentBind(document, field, ref);
-  return JSON.parse(out) as Record<string, unknown>;
+  return exec('document.bind', { document, field, ref });
 }
 
 beforeEach(() => {

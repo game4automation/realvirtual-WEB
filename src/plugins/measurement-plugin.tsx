@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { getLocalStorage, readLocalStorage } from '../core/rv-safe-storage';
+
 /**
  * measurement-plugin.ts — 3D distance measurement tool for the realvirtual WebViewer.
  *
@@ -375,7 +377,7 @@ export class MeasurementPlugin implements RVViewerPlugin, MeasurementPluginAPI {
   _load(): void {
     try {
       const key = LS_PREFIX + this._modelHash;
-      const data = localStorage.getItem(key);
+      const data = readLocalStorage(key);
       if (!data) return;
 
       const parsed = JSON.parse(data) as Measurement[];
@@ -422,6 +424,8 @@ export class MeasurementPlugin implements RVViewerPlugin, MeasurementPluginAPI {
     if (!e.isPrimary) return;
     if (!this._viewer || !this._measurementMode) return;
     if (e.button !== 0) return;
+    // plan-2215: no screen pick while a render strategy draws other cameras.
+    if (this._viewer.pointerPickBlocked) return;
 
     // Guard: don't measure when clicking on HMI panels
     const target = e.target as HTMLElement;
@@ -440,6 +444,10 @@ export class MeasurementPlugin implements RVViewerPlugin, MeasurementPluginAPI {
 
     // Only process if we have a matching pointerdown
     if (!this._pointerDownPos) return;
+    if (this._viewer.pointerPickBlocked) {
+      this._abortPointerGesture();
+      return;
+    }
 
     // Tap detection: reject if pointer moved too far (user was panning/orbiting)
     const dx = e.clientX - this._pointerDownPos.x;
@@ -482,6 +490,10 @@ export class MeasurementPlugin implements RVViewerPlugin, MeasurementPluginAPI {
   private _handlePointerMove(e: PointerEvent): void {
     if (!e.isPrimary) return;
     if (!this._viewer || !this._measurementMode) return;
+    if (this._viewer.pointerPickBlocked) {
+      this._abortPointerGesture();
+      return;
+    }
 
     // Cancel pending tap if pointer moved too far (user is panning/orbiting)
     if (this._pointerDownPos) {
@@ -550,6 +562,15 @@ export class MeasurementPlugin implements RVViewerPlugin, MeasurementPluginAPI {
     }
   }
 
+  /** plan-2215: a render strategy took over — drop the pending tap and the cursor feedback. */
+  private _abortPointerGesture(): void {
+    this._pointerDownPos = null;
+    this._pointerDownEvent = null;
+    this._renderer?.hideCursorDot();
+    this._renderer?.hideProjectedPoint();
+    this._renderer?.clearPreview();
+  }
+
   private _worldRaycast(e: PointerEvent): { point: Vector3; normal: Vector3 | null } | null {
     if (!this._viewer) return null;
 
@@ -606,7 +627,7 @@ export class MeasurementPlugin implements RVViewerPlugin, MeasurementPluginAPI {
     try {
       const key = LS_PREFIX + this._modelHash;
       const data = JSON.stringify(this._measurements);
-      localStorage.setItem(key, data);
+      getLocalStorage()?.setItem(key, data);
     } catch (e) {
       // QuotaExceededError — gracefully ignore
       if (e instanceof DOMException && e.name === 'QuotaExceededError') {

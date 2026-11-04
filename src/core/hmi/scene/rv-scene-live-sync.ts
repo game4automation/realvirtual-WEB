@@ -29,10 +29,14 @@
  * place rather than growing a second notification style per feature.
  */
 
+// Persisted name — do not rename (plan-777 P1): tabs of an older build share this channel.
 const CHANNEL_NAME = 'rv-scene-writes';
 
 /** The id of the one `stale-draft` notice (plan-546). */
 export const STALE_DRAFT_NOTICE_ID = 'stale-draft';
+
+/** The id of the one `draft-restored` notice. */
+export const DRAFT_RESTORED_NOTICE_ID = 'draft-restored';
 
 export type SceneSyncNotice =
   | {
@@ -106,6 +110,22 @@ export type SceneSyncNotice =
       message: string;
     }
   | {
+      /**
+       * The open document was resumed from its autosave draft, and that draft
+       * holds changes the FILE does not have.
+       *
+       * Reported where those changes can never reach the file — a read-only
+       * (bundled) project: without it the draft came back silently on every
+       * open, looking like the file itself. Discard drops the draft and reloads
+       * the file; Keep just closes the notice.
+       */
+      kind: 'draft-restored';
+      documentId: string;
+      /** Document name, for the sentence. */
+      name: string;
+      message: string;
+    }
+  | {
       kind: 'orphaned-bindings';
       /** Model whose load produced the finding — reported once per load (F9). */
       modelId: string;
@@ -143,6 +163,7 @@ export function sceneSyncNoticeId(notice: SceneSyncNotice): string {
     // One id, not one per document: the notice belongs to the document that is
     // OPEN, and opening another one replaces or clears it (plan-546 AC 10).
     case 'stale-draft': return STALE_DRAFT_NOTICE_ID;
+    case 'draft-restored': return DRAFT_RESTORED_NOTICE_ID;
     case 'orphaned-bindings': return `orphaned-bindings:${notice.modelId}`;
   }
 }
@@ -425,6 +446,27 @@ export function clearStaleDraftNotice(documentId?: string): void {
   if (!current) return;
   if (documentId !== undefined && current.kind === 'stale-draft' && current.documentId !== documentId) return;
   clearSceneSyncNotice(STALE_DRAFT_NOTICE_ID);
+}
+
+/**
+ * Surface that the open document was resumed from a draft with local changes
+ * that are not in its file (a read-only project cannot take them).
+ */
+export function reportDraftRestored(documentId: string, name: string): void {
+  emit({
+    kind: 'draft-restored',
+    documentId,
+    name,
+    message: `"${name}" has local changes that are not in the file.`,
+  });
+}
+
+/** Withdraw the `draft-restored` notice — optionally only when it is about `documentId`. */
+export function clearDraftRestoredNotice(documentId?: string): void {
+  const current = latest.get(DRAFT_RESTORED_NOTICE_ID);
+  if (!current) return;
+  if (documentId !== undefined && current.kind === 'draft-restored' && current.documentId !== documentId) return;
+  clearSceneSyncNotice(DRAFT_RESTORED_NOTICE_ID);
 }
 
 /**

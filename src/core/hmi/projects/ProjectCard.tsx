@@ -20,17 +20,19 @@
  * `assets-library-groups` and the folder-contents grid fill.
  */
 
-import { useState } from 'react';
+import { useRef, useState, type ReactNode } from 'react';
 import { Box, Menu, MenuItem } from '@mui/material';
 import { useLongPress } from '../../../hooks/use-long-press';
 import { AssetCard, type AssetCardGlyph } from '../../library/AssetCard';
 import type { LibraryCatalogEntry } from '../../library/library-types';
-import { useOptionalViewer } from '../../../hooks/use-viewer';
-import {
-  useAssetThumbnail,
-  type ResolvedThumbnailSource,
-} from '../../thumbnails/use-asset-thumbnail';
-import type { ThumbnailKeyParts } from '../../thumbnails/thumbnail-key';
+import type { ProjectBackend } from '../../project/backends/project-backend';
+import { useThumbnailUrl } from '../../thumbnails/rv-thumbnail-url-store';
+
+/**
+ * Two pointer clicks on one card within this window are a double-click.
+ * 500 ms is the Windows default double-click time.
+ */
+export const DOUBLE_CLICK_MS = 500;
 
 /** One entry of a card's right-click menu. */
 export interface ProjectCardMenuAction {
@@ -57,33 +59,28 @@ export interface ProjectCardModel {
   /** Right-click menu. Omit for a card that has no verbs beyond selection. */
   menuActions?: ProjectCardMenuAction[];
   /**
-   * Preview identity + how to load the asset, for a card whose entry has no
-   * picture of its own (§2.7). Omit for a card that can never have one — a
-   * scene's thumbnail is a saved snapshot of a composed scene, not a render of
-   * a single GLB, so there is nothing here to generate.
+   * The SAVED preview of this document — the row's `thumbnail` pointer
+   * (plan-776), resolved through `thumbnailBackend`. Omit for a card with no
+   * document behind it or no saved picture: the card then shows its type
+   * placeholder. Nothing is ever rendered for a card.
    */
-  thumbnailKey?: ThumbnailKeyParts;
-  resolveThumbnail?: () => Promise<ResolvedThumbnailSource | null>;
-  /**
-   * The PERSISTED preview of this document, tried before anything is
-   * rendered (plan-744 F5). Omit for a card with no document behind it.
-   */
-  resolveThumbnailSidecar?: () => Promise<ResolvedThumbnailSource | null>;
+  thumbnailPointer?: string | null;
+  /** The backend the pointer is read through — the open project's. */
+  thumbnailBackend?: ProjectBackend | null;
   /**
    * Stated glyph tile instead of a picture — a CONNECT configuration or
    * knowledge card, or the `file:<ext>` tile of any other project file.
-   * Suppresses the thumbnail request: nothing to render.
+   * Takes precedence over any picture.
    */
   glyph?: AssetCardGlyph;
 }
 
 /**
- * One card, plus the preview request that belongs to it.
+ * One card, plus the saved-thumbnail read that belongs to it.
  *
- * A component rather than a branch inside a grid map: the pull is a hook, and
- * hooks cannot be called from a loop body. It also keeps the per-card
- * observer/effect scoped to the card, so a card leaving the grid takes its
- * pending request with it.
+ * A component rather than a branch inside a grid map: the read is a hook, and
+ * hooks cannot be called from a loop body. It also scopes the URL reference to
+ * the card, so a card leaving the grid releases it.
  */
 export interface ProjectCardProps {
   card: ProjectCardModel;
@@ -93,23 +90,23 @@ export interface ProjectCardProps {
    * wide touch tablet keeps three columns and still needs this.
    */
   touchInput?: boolean;
+  /** Label for the preview's top-left corner; Bundled sits bottom-left (see `AssetCard.cornerBadge`). */
+  cornerBadge?: ReactNode;
 }
 
-export function ProjectCard({ card, touchInput = false }: ProjectCardProps) {
-  const viewer = useOptionalViewer();
-  const { ref, url, empty } = useAssetThumbnail<HTMLDivElement>({
-    service: viewer?.thumbnails ?? null,
-    keyParts: card.thumbnailKey ?? null,
-    resolve: card.resolveThumbnail ?? null,
-    sidecar: card.resolveThumbnailSidecar ?? null,
-    // A glyph card has nothing to render — never queue a request for it.
-    enabled: !card.entry.thumbnailUrl && !card.glyph,
-  });
+export function ProjectCard({ card, touchInput = false, cornerBadge }: ProjectCardProps) {
+  // Read, never rendered (plan-776 F9): a glyph card or an entry that brings
+  // its own picture asks for nothing.
+  const wantsSidecar = !card.glyph && !card.entry.thumbnailUrl;
+  const url = useThumbnailUrl(
+    wantsSidecar ? card.thumbnailBackend : null,
+    wantsSidecar ? card.thumbnailPointer : null,
+  );
   // Anchored at the pointer, not the card: a context menu that jumps to the
   // card corner reads as detached from the click that raised it.
   const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null);
 
-  // The generated picture is merged in rather than assigned to the entry: the
+  // The resolved picture is merged in rather than assigned to the entry: the
   // entry is store state, and a card must not mutate it.
   const entry = url ? { ...card.entry, thumbnailUrl: url } : card.entry;
 
@@ -130,19 +127,59 @@ export function ProjectCard({ card, touchInput = false }: ProjectCardProps) {
     onLongPress: (x, y) => setCtxPos({ x, y }),
   });
 
+  /**
+   * Double-click, detected from the two clicks themselves (user report
+   * 2026-10-20: "double-click must open, reliably").
+   *
+   * The browser's own `dblclick` is NOT reliable here: the first click selects,
+   * the selection re-renders the card (thumbnail swap, tooltip, selected frame),
+   * and Chromium resets its click count when the node under the pointer is
+   * replaced between the two clicks — the second click then arrives as a fresh
+   * single click and nothing opens. A timestamp on the card survives any
+   * re-render, so two pointer clicks inside the window open, whatever the DOM
+   * did in between. Keyboard activation (`detail === 0`) never counts.
+   *
+   * The native `dblclick` stays wired as the fallback (an OS double-click time
+   * longer than ours), and is ignored when the click pair has just opened, so
+   * one gesture never opens twice.
+   */
+  const lastClickAt = useRef(0);
+  const openedAt = useRef(-Infinity);
+  const open = () => {
+    openedAt.current = performance.now();
+    card.onOpen?.();
+  };
+  const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (longPress.consumedLastGesture()) return;
+    const now = performance.now();
+    // AssetCard forwards Enter/Space as a KeyboardEvent, whose `detail` is 0.
+    const isPointer = (e.detail ?? 0) > 0;
+    if (isPointer && card.onOpen && now - lastClickAt.current <= DOUBLE_CLICK_MS) {
+      lastClickAt.current = 0;
+      open();
+      return;
+    }
+    lastClickAt.current = isPointer ? now : 0;
+    card.onSelect();
+  };
+  const handleDoubleClick = card.onOpen
+    ? () => { if (performance.now() - openedAt.current > DOUBLE_CLICK_MS) open(); }
+    : undefined;
+
   const body = (
     <AssetCard
-      ref={ref}
       entry={entry}
       variant="comfortable"
       tier={card.tier}
+      cornerBadge={cornerBadge}
       selected={card.selected}
-      empty={empty}
       glyph={card.glyph}
       // A touch long-press still emits a click after `pointerup`; without
       // this guard the card would select behind the menu it just opened.
-      onClick={() => { if (!longPress.consumedLastGesture()) card.onSelect(); }}
-      onDoubleClick={card.onOpen}
+      // The second click of a double-click opens (see `handleClick`); the
+      // native `dblclick` is only the de-duplicated fallback.
+      onClick={handleClick}
+      onDoubleClick={handleDoubleClick}
       onContextMenu={hasMenu
         ? (e) => {
             e.preventDefault();

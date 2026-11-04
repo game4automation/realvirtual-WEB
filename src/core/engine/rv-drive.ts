@@ -9,6 +9,9 @@ import { MM_TO_METERS } from './rv-constants';
 import { RV_DRIVE_HOME_KEY } from './rv-pre-bake-keys';
 import { parentScaleAlong } from './rv-drive-units';
 import { getDriveSpeedOverride } from './rv-speed-override';
+// Type-only: the contract imports this file for DEFAULT_ARRIVAL_TOLERANCE, so a
+// value import here would be a runtime cycle (plan-673 Phase 4).
+import type { RVDynamicAxis } from './rv-dynamic-axis';
 import {
   SMOOTH_OK,
   createMotionSnapshot,
@@ -33,6 +36,37 @@ export { DriveDirection } from './rv-coordinate-utils';
 export interface IDriveBehavior {
   /** Called every fixed timestep, before drive physics. Sets targetPosition/targetSpeed/startMove. */
   update(dt: number): void;
+
+  /**
+   * OPTIONAL — contribute the axis SETPOINT while an external authority owns the
+   * POSITION (plan-673 Phase 5).
+   *
+   * `update()` is called from the normal branch of `updateMotion()`, which a
+   * drive under `positionOverwrite` never reaches: the overwrite branch returns
+   * before the behavior loop, by design, because the position is somebody
+   * else's answer. For a KINEMATIC overwrite (recording playback, a multiuser
+   * follower) that is exactly right and must not change.
+   *
+   * For a DYNAMIC axis it leaves a hole. A gripper jaw in the realvirtual idiom
+   * is a `Drive_Gear` off a `Drive{Direction:'Virtual'}` master that a
+   * `Drive_Cylinder` moves; once the jaw is physics-driven, the gear is the only
+   * thing that knows where the jaw should BE, and it is the one thing that no
+   * longer runs. Phase 4b's MJCF therefore had the actuated lead jaw and the
+   * equality row, and nothing commanding either.
+   *
+   * This method is that one route, and it is the ONLY thing a behavior may do
+   * inside the overwrite branch: write the SETPOINT (`commandPosition()` /
+   * `commandAxisPosition()`). It must NOT write `currentPosition`,
+   * `targetPosition`, `isRunning` or call `applyToNode()` — a behavior that
+   * wrote the position would be the "last writer in the tick wins" race the
+   * axis contract exists to prevent.
+   *
+   * Called only when {@link RVDrive.dynamicAxis} is set, so a behavior that
+   * implements it stays inert in every non-physics scene — which is precisely
+   * where the obvious shortcut (routing `Drive_Gear.update()` through the
+   * setpoint) killed the kinematic gripper.
+   */
+  commandDynamicSetpoint?(dt: number): void;
 }
 
 // Reusable temp objects to avoid GC
@@ -41,6 +75,52 @@ const _deltaQuat = new Quaternion();
 const _axisScaled = new Vector3();
 /** Scratch for the motion direction in the PARENT frame (unit conversion). */
 const _unitDir = new Vector3();
+
+/**
+ * The Drive's transform formula as a pure function (plan-641 M6) — extracted
+ * from `RVDrive.applyToNode` so a pose can be computed WITHOUT touching any
+ * drive state (the pose adapter of `web_check_*`, `rv-pose-adapter.ts`).
+ *
+ * Rotary: `outQuaternion = baseQuaternion · Euler(axis · positionDeg, 'XYZ')`;
+ * `outPosition` untouched. Linear: `outPosition = basePosition +
+ * (baseQuaternion ⊗ axis) · localOffset`; `outQuaternion` untouched.
+ * `localOffset` is the node-local length of the linear position (mm → parent
+ * units, see `RVDrive.positionToLocalOffset`); `positionDeg` the angle in
+ * degrees. Both already include the drive's `Offset`.
+ */
+export function writeDriveLocalTransform(
+  isRotary: boolean,
+  axis: Vector3,
+  basePosition: Vector3,
+  baseQuaternion: Quaternion,
+  positionDeg: number,
+  localOffset: number,
+  outPosition: Vector3,
+  outQuaternion: Quaternion,
+): void {
+  if (isRotary) {
+    // Rotation: localRotation = baseQuat * Quaternion.Euler(axis * angle)
+    // Unity uses degrees, Three.js Euler uses radians
+    const rad = MathUtils.degToRad(positionDeg);
+    _axisScaled.copy(axis).multiplyScalar(rad);
+    _euler.set(_axisScaled.x, _axisScaled.y, _axisScaled.z, 'XYZ');
+    _deltaQuat.setFromEuler(_euler);
+    outQuaternion.copy(baseQuaternion).multiply(_deltaQuat);
+  } else {
+    // Linear: move along the object's OWN local axis (Space.Self / Unity
+    // "local axis of the game object") — rotate the axis by the node's home
+    // orientation so a locally-rotated drive travels along its own X/Y/Z, not
+    // the parent's. (baseQuaternion is identity for the common un-rotated
+    // node, so this is a no-op there.)
+    //   localPosition = basePos + (baseQuat ⊗ axis) * (pos / controllerScale)
+    // pos is in mm, converted to meters by dividing by controllerScale — and
+    // then into the PARENT's units, which are metres only while the frame is
+    // unscaled (a CAD subtree is in millimetres; see rv-drive-units).
+    outPosition.copy(basePosition);
+    _axisScaled.copy(axis).multiplyScalar(localOffset).applyQuaternion(baseQuaternion);
+    outPosition.add(_axisScaled);
+  }
+}
 
 /**
  * RVDrive - TypeScript port of realvirtual Drive.cs transform logic.
@@ -138,6 +218,13 @@ export function isDriveExternallyCommanded(drive: {
   }
   return false;
 }
+
+/**
+ * Arrival tolerance of a kinematic axis in drive units (mm / deg) — the value
+ * `isAtTarget` has always compared against. A dynamic axis replaces it; see
+ * {@link RVDrive.arrivalTolerance}.
+ */
+export const DEFAULT_ARRIVAL_TOLERANCE = 0.01;
 
 /** Move a signed scalar toward a target without overshooting. */
 function moveTowards(current: number, target: number, maxDelta: number): number {
@@ -271,6 +358,59 @@ export class RVDrive implements RVComponent {
   /** Previous position for computing speed in overwrite mode */
   private _prevOverwritePos = 0;
 
+  // ── Dynamic axis contract (plan-673 Phase 4) ──────────────────────────────
+  //
+  // A kinematic drive's position IS its setpoint: it integrates toward
+  // `targetPosition` and arrives, so the following error is structurally zero
+  // and the quantity does not exist. A DYNAMIC axis (a `DynamicAxis` component
+  // next to this drive, its setpoint on a force-limited actuator) has a real
+  // one, and on a machine that error is the overload signal.
+  //
+  // The four fields below are written by whoever owns the axis physically — the
+  // MuJoCo adapter through {@link reportDynamicSample} — and read by the HMI,
+  // the charts, the recording, MCP and the feedback signals. On a kinematic
+  // drive they stay at their initial values and cost nothing.
+
+  /**
+   * Last setpoint written through {@link commandPosition} in drive units
+   * (mm / deg), `NaN` while nothing has ever commanded the axis.
+   *
+   * Deliberately NOT `targetPosition`: `targetPosition` is the end of the
+   * drive's own motion profile and `isAtTarget` compares against it, while the
+   * commanded position is what an external controller asked for — on a dynamic
+   * axis the two differ by the following error, which is the whole point.
+   */
+  commandedPosition = Number.NaN;
+  /**
+   * `commandedPosition - currentPosition` in drive units (mm / deg) — the RAW
+   * following error of a dynamic axis, base share included.
+   *
+   * The overload model subtracts `DynamicAxis.BaseFollowingError` from this;
+   * see `rv-axis-diagnostics.ts`. 0 on a kinematic axis.
+   */
+  followingError = 0;
+  /** Actuator force / torque of a dynamic axis (N / Nm); 0 on a kinematic one. */
+  actualTorque = 0;
+  /** True while a dynamic axis sits at its actuator force limit. */
+  saturated = false;
+  /**
+   * Arrival tolerance of {@link isAtTarget} in drive units. The kinematic
+   * default is 0.01; a dynamic axis widens it (`DynamicAxis.ArrivalTolerance`,
+   * or base + window), because a P+D servo never reaches its setpoint exactly
+   * and a LogicStep waiting for 0.01 would wait forever.
+   */
+  arrivalTolerance = DEFAULT_ARRIVAL_TOLERANCE;
+  /**
+   * The `DynamicAxis` that declares this drive dynamic, or null — set by
+   * `bindDynamicAxis()` in `rv-axis-contract.ts`.
+   *
+   * A field rather than a lookup in that module, because the drive has to read
+   * its own role (the setpoint ramp below) and must not import the contract at
+   * runtime: the contract imports this file for {@link DEFAULT_ARRIVAL_TOLERANCE}.
+   * Typed through a type-only import, so nothing is pulled in at runtime.
+   */
+  dynamicAxis: RVDynamicAxis | null = null;
+
   // ── Motion contract (plan-554 F3c) — read-only for consumers ──────────────
   /**
    * Signed distance (mm) / angle (deg) the drive actually TRAVELLED in its last `update()`,
@@ -402,6 +542,15 @@ export class RVDrive implements RVComponent {
     setComponentInstance(node, this);
   }
 
+  captureOverwriteState(): { enabled: boolean; previousPosition: number } {
+    return { enabled: this.positionOverwrite, previousPosition: this._prevOverwritePos };
+  }
+
+  restoreOverwriteState(state: { enabled: boolean; previousPosition: number }): void {
+    this.positionOverwrite = state.enabled;
+    this._prevOverwritePos = state.previousPosition;
+  }
+
   /** Home (authored) local position captured at `initDrive` — the node's pose
    *  before any motion. Writes into `out` (or a new Vector3) and returns it. */
   getHomeLocalPosition(out: Vector3 = new Vector3()): Vector3 {
@@ -521,12 +670,92 @@ export class RVDrive implements RVComponent {
    * forever at a point the drive can never leave would strand every waiting
    * logic step. Non-smooth drives keep the requested target — nothing there can
    * produce a different endpoint.
+   *
+   * plan-673 Phase 4: the tolerance is {@link arrivalTolerance} instead of a
+   * hard-coded 0.01. A dynamic axis never reaches its setpoint exactly — the
+   * P+D servo keeps the declared base sag — so a LogicStep or an IK path
+   * polling for 0.01 would wait forever. That is listed in 2.4 as the most
+   * common practical stumbling block of the dynamic mode.
    */
   get isAtTarget(): boolean {
     const target = Number.isFinite(this._smoothEffectiveTarget)
       ? this._smoothEffectiveTarget
       : this.targetPosition;
-    return Math.abs(this.currentPosition - target) < 0.01;
+    return Math.abs(this.currentPosition - target) < this.arrivalTolerance;
+  }
+
+  /**
+   * Write the axis SETPOINT (drive units, mm / deg) — the cascade of the
+   * plan-673 axis contract, rule 2.
+   *
+   * On a dynamic axis this is what the planner, the PLC, the operator jog or a
+   * policy writes: the number lands on the actuator and the physics decides
+   * whether the axis gets there. The drive's own motion integration is already
+   * out of the way (`positionOverwrite`), so the position is NOT touched here —
+   * writing it would be exactly the "last writer in the tick wins" race 2.4
+   * describes.
+   *
+   * On a kinematic or planned axis it degenerates to the write the callers did
+   * before (`currentPosition = targetPosition = value`), so one call site
+   * serves all three roles. Prefer {@link commandAxisPosition} in
+   * `rv-axis-contract.ts`, which picks the branch from the axis role; this
+   * method is the dynamic half and never integrates.
+   */
+  commandPosition(value: number): void {
+    this.commandedPosition = value;
+    this.followingError = value - this.currentPosition;
+  }
+
+  /**
+   * Feedback of one physics step of a dynamic axis: the measured joint
+   * position, the actuator force and whether that force is at its limit.
+   *
+   * Called by the authority that owns the axis (the MuJoCo dynamic-drive
+   * adapter) BEFORE the drive loop of the same tick, in place of writing
+   * `currentPosition` directly — so the following error is computed against the
+   * setpoint that produced this very step and the three diagnostic quantities
+   * can never drift apart.
+   */
+  reportDynamicSample(actual: number, torque: number, saturated: boolean): void {
+    this.currentPosition = actual;
+    this.actualTorque = torque;
+    this.saturated = saturated;
+    this.followingError = Number.isFinite(this.commandedPosition)
+      ? this.commandedPosition - actual
+      : 0;
+  }
+
+  /**
+   * plan-673 Phase 4 — one step of the setpoint ramp of a DYNAMIC axis that was
+   * commanded through the ordinary `startMove()`.
+   *
+   * Why this exists: with `positionOverwrite` set, `updateMotion()` returns at
+   * the overwrite branch BEFORE the motion integration, so a `startMove()` from
+   * a `LogicStep_DriveTo`, a behavior or the jog UI arms a profile that never
+   * runs — the axis simply never moves, with no error anywhere. Routing the
+   * command through the setpoint instead keeps every one of those callers
+   * working: they move the axis by asking the actuator, which is what a real
+   * drive does.
+   *
+   * Velocity-limited only, exactly like the IK path's PTP ramp: shaping the
+   * acceleration of a command whose execution is governed by `forcerange` would
+   * be a second profile over a physical one. `isRunning` is cleared when the
+   * COMMAND arrives, so `isAtTarget` (with the axis's widened tolerance) decides
+   * when the AXIS has.
+   */
+  private stepDynamicSetpoint(dt: number): void {
+    if (!this.dynamicAxis || !this.isRunning || dt <= 0) return;
+    const dest = this.targetPosition;
+    const from = Number.isFinite(this.commandedPosition) ? this.commandedPosition : this.currentPosition;
+    if (from === dest) {
+      this.commandPosition(dest);
+      this.isRunning = false;
+      return;
+    }
+    const step = Math.max(this.targetSpeed, 0) * dt * Math.max(getDriveSpeedOverride(), 0);
+    const next = from < dest ? Math.min(dest, from + step) : Math.max(dest, from - step);
+    this.commandPosition(next);
+    if (next === dest) this.isRunning = false;
   }
 
   /** Authoritative current runtime values for UI display (live source of truth).
@@ -543,6 +772,12 @@ export class RVDrive implements RVComponent {
       MotionBlocked: this.motionBlocked,
       JogForward: this.jogForward,
       JogBackward: this.jogBackward,
+      // plan-673 Phase 4 — the three quantities a kinematic axis cannot show.
+      // Always present so a chart or a readout does not have to know the role;
+      // on a kinematic drive they are 0 / false by construction.
+      FollowingError: this.followingError,
+      ActualTorque: this.actualTorque,
+      Saturated: this.saturated,
     };
   }
 
@@ -715,6 +950,22 @@ export class RVDrive implements RVComponent {
       // position/speed instead of resuming a profile that describes a past the
       // drive never lived through (plan-281 §2.7 PositionOverwrite/Playback).
       this._smoothRebasePending = true;
+      // plan-673 Phase 4/5: the setpoint — and ONLY the setpoint — may be
+      // produced here, because the position is somebody else's answer.
+      //
+      // Guarded by `dynamicAxis` so a KINEMATIC overwrite (recording playback,
+      // a multiuser follower) keeps costing exactly what it cost before: one
+      // boolean test, no behavior loop. A dynamic axis pays the loop over its
+      // own one or two behaviors.
+      if (this.dynamicAxis) {
+        const behaviors = this.driveBehaviors;
+        for (let i = 0; i < behaviors.length; i++) behaviors[i].commandDynamicSetpoint?.(dt);
+        // The explicit ramp runs AFTER the behaviors, so a `startMove()` on this
+        // very axis outranks a passive follower. In practice they are mutually
+        // exclusive: `stepDynamicSetpoint` needs `isRunning`, and a gear slave
+        // never runs.
+        this.stepDynamicSetpoint(dt);
+      }
       this.applyToNode();
       this.dispatchAfterUpdate();
       return;
@@ -1304,6 +1555,14 @@ export class RVDrive implements RVComponent {
     this.positionOverwrite = false;
     this.liveControlled = false;
     this._prevOverwritePos = this.StartPosition;
+    // plan-673 Phase 4: a run starts without a command and without an error —
+    // a latched following error from the previous run would be reported as an
+    // overload on the first tick of the new one. `arrivalTolerance` is NOT
+    // reset: it is a property of the axis declaration, not of the run.
+    this.commandedPosition = Number.NaN;
+    this.followingError = 0;
+    this.actualTorque = 0;
+    this.saturated = false;
     // Restore the authored jog state so drives configured to jog continuously
     // resume after a sim reset (Unity keeps the JogForward inspector bit set).
     this.jogForward = this.JogForward;
@@ -1345,29 +1604,35 @@ export class RVDrive implements RVComponent {
     // drives, but `_istransportsurface` suppresses movement of the belt frame.
     if (this.Direction === DriveDirection.Virtual || this.isTransportSurface) return;
 
-    if (this.isRotary) {
-      // Rotation: localRotation = baseQuat * Quaternion.Euler(axis * angle)
-      // Unity uses degrees, Three.js Euler uses radians
-      const rad = MathUtils.degToRad(pos);
-      _axisScaled.copy(this.axis).multiplyScalar(rad);
-      _euler.set(_axisScaled.x, _axisScaled.y, _axisScaled.z, 'XYZ');
-      _deltaQuat.setFromEuler(_euler);
-      this.node.quaternion.copy(this.baseQuaternion).multiply(_deltaQuat);
-    } else {
-      // Linear: move along the object's OWN local axis (Space.Self / Unity
-      // "local axis of the game object") — rotate the axis by the node's home
-      // orientation so a locally-rotated drive travels along its own X/Y/Z, not
-      // the parent's. (baseQuaternion is identity for the common un-rotated
-      // node, so this is a no-op there.)
-      //   localPosition = basePos + (baseQuat ⊗ axis) * (pos / controllerScale)
-      // pos is in mm, converted to meters by dividing by controllerScale — and
-      // then into the PARENT's units, which are metres only while the frame is
-      // unscaled (a CAD subtree is in millimetres; see rv-drive-units).
-      const offset = this.positionToLocalOffset(pos);
-      this.node.position.copy(this.basePosition);
-      _axisScaled.copy(this.axis).multiplyScalar(offset).applyQuaternion(this.baseQuaternion);
-      this.node.position.add(_axisScaled);
-    }
+    writeDriveLocalTransform(
+      this.isRotary, this.axis, this.basePosition, this.baseQuaternion,
+      pos, this.isRotary ? 0 : this.positionToLocalOffset(pos),
+      this.node.position, this.node.quaternion,
+    );
+  }
+
+  /**
+   * The local transform this drive's node WOULD have at drive position
+   * `position` (mm or deg, `Offset` added like `applyToNode`) — written into
+   * `outPosition` / `outQuaternion`, which start as copies of the node's
+   * current local transform. Pure: no drive field, motion state or node is
+   * touched (plan-641 M6). Returns false — outputs untouched — for a drive
+   * that never moves its node (`Virtual`, TransportSurface).
+   *
+   * Reads the PARENT's world matrix for the linear unit conversion, so a
+   * caller posing nested axes refreshes the parent first.
+   */
+  computePoseTransform(position: number, outPosition: Vector3, outQuaternion: Quaternion): boolean {
+    outPosition.copy(this.node.position);
+    outQuaternion.copy(this.node.quaternion);
+    if (this.Direction === DriveDirection.Virtual || this.isTransportSurface) return false;
+    const pos = position + this.Offset;
+    writeDriveLocalTransform(
+      this.isRotary, this.axis, this.basePosition, this.baseQuaternion,
+      pos, this.isRotary ? 0 : this.positionToLocalOffset(pos),
+      outPosition, outQuaternion,
+    );
+    return true;
   }
 }
 

@@ -143,6 +143,13 @@ export class RVDriveDestinationMotor implements RVComponent {
       return;
     }
     this.drive = drive;
+    // A slot the reference resolution left as a non-string (a malformed or
+    // unresolved reference object) is unwired — the input wiring already treats
+    // it so; the feedback writes below would hand the object to `setByPath`.
+    if (typeof this.IsAtPosition !== 'string') this.IsAtPosition = null;
+    if (typeof this.IsAtSpeed !== 'string') this.IsAtSpeed = null;
+    if (typeof this.IsAtDestination !== 'string') this.IsAtDestination = null;
+    if (typeof this.IsDriving !== 'string') this.IsDriving = null;
 
     // ── Inputs (PLC → drive) ──
     // Wired in slot order, which is also REPLAY order (plan-427): Destination

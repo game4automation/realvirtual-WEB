@@ -164,6 +164,16 @@ describe('plan-723 §9.1 — planner library tabs from registry', () => {
     expect(buildLibraryTabs([projectSource(), exploding], []).map(t => t.sourceId))
       .toEqual(['proj-1', 'explodes']);
   });
+
+  it('gives a hidden (resolver-only) source no tab — plan-660, SimReady without CONNECT', () => {
+    const simready = (hidden: boolean) => registered('simready', fakeSource({
+      id: 'simready-central', kind: 'cloud', hidden,
+      listEntries: () => (hidden ? [] : [entry({ id: 'simready:a/b/APM2@' + 'c'.repeat(40) })]),
+    }));
+    expect(buildLibraryTabs([projectSource(), simready(true)], []).map(t => t.sourceId)).toEqual(['proj-1']);
+    expect(buildLibraryTabs([projectSource(), simready(false)], []).map(t => t.sourceId))
+      .toEqual(['proj-1', 'simready-central']);
+  });
 });
 
 // ─── Dedup (F6) ─────────────────────────────────────────────────────────

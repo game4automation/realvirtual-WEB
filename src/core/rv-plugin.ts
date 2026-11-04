@@ -109,6 +109,9 @@ export interface RVViewerPlugin {
   /** Per render frame, after renderer.render(). */
   onRender?(frameDt: number): void;
 
+  /** Called once per animation frame before the render decision. */
+  onBeforeFrame?(dtSeconds: number, nowMs: number): void;
+
   // ── Workspace mode hooks (plan-198) ──
 
   /**

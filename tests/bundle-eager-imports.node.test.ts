@@ -14,64 +14,17 @@
  * before the editor (measured 2026-09-26: they are not in the entry graph).
  */
 
-import { existsSync, readFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-
-const ROOT = resolve(__dirname, '..');
-const PRIVATE_SRC = resolve(ROOT, '../realvirtual-WebViewer-Private~/src');
-const HAS_PRIVATE = existsSync(PRIVATE_SRC);
-
-function resolveSpec(from: string, spec: string): string | null {
-  let base: string;
-  if (spec.startsWith('.')) base = resolve(dirname(from), spec);
-  else if (spec.startsWith('@rv-private/')) {
-    base = resolve(HAS_PRIVATE ? PRIVATE_SRC : resolve(ROOT, 'src/private-stubs'), spec.slice('@rv-private/'.length));
-  } else if (spec.startsWith('@rv/')) base = resolve(ROOT, 'src', spec.slice(4));
-  else return null; // a package
-  for (const c of [base, `${base}.ts`, `${base}.tsx`, resolve(base, 'index.ts'), resolve(base, 'index.tsx')]) {
-    if (existsSync(c) && /\.(ts|tsx)$/.test(c)) return c;
-  }
-  return null;
-}
-
-/** Static, value-level import/export-from specifiers of one file. */
-function staticSpecifiers(src: string): string[] {
-  const out: string[] = [];
-  const re = /^\s*(import|export)\s+(?!type\b)([^'";]*?\bfrom\s*)?['"]([^'"]+)['"]/gm;
-  for (let m; (m = re.exec(src)) !== null;) {
-    // `import { type A, type B } from` is still type-only when EVERY name is a type.
-    const clause = (m[2] ?? '').trim();
-    const onlyBraces = /^\{([^}]*)\}\s*from$/.exec(clause);
-    if (onlyBraces && onlyBraces[1].split(',').map((n) => n.trim()).filter(Boolean).every((n) => n.startsWith('type '))) {
-      continue;
-    }
-    out.push(m[3]);
-  }
-  return out;
-}
-
-function eagerGraph(entry: string): Set<string> {
-  const seen = new Set<string>();
-  const stack = [entry];
-  while (stack.length) {
-    const f = stack.pop()!;
-    if (seen.has(f)) continue;
-    seen.add(f);
-    let src: string;
-    try { src = readFileSync(f, 'utf8'); } catch { continue; }
-    for (const spec of staticSpecifiers(src)) {
-      const r = resolveSpec(f, spec);
-      if (r && !seen.has(r)) stack.push(r);
-    }
-  }
-  return seen;
-}
-
-const norm = (p: string): string => p.replace(/\\/g, '/');
+// The graph walker moved to tests/helpers/static-import-graph.ts with plan-773
+// Phase 5, when the robot program export needed the same walk. One copy, so
+// neither guard can drift away from what the other calls 'eager'.
+import { eagerGraph, eagerGraphPaths, lfBytes, norm, REPO_ROOT as ROOT } from './helpers/static-import-graph';
+import BUDGETS from './bundle-budgets.json';
 
 describe('bundle: command registry lazy discipline', () => {
-  const graph = [...eagerGraph(resolve(ROOT, 'src/main.ts'))].map(norm);
+  const graph = eagerGraphPaths(resolve(ROOT, 'src/main.ts'));
   const has = (suffix: string): boolean => graph.some((f) => f.endsWith(suffix));
 
   it('walks a real graph', () => {
@@ -89,5 +42,119 @@ describe('bundle: command registry lazy discipline', () => {
   it('the private command implementations are NOT (they stay behind import())', () => {
     expect(graph.filter((f) => f.includes('realvirtual-WebViewer-Private~') && f.endsWith('/asset-editor/editor-commands.ts')))
       .toEqual([]);
+  });
+});
+
+/**
+ * plan-779 — the EAGER-SOURCE RATCHET.
+ *
+ * ## Why this exists
+ *
+ * This file used to walk the whole eager graph and then assert four things about
+ * ONE feature: that it has more than 100 files, and that two named modules are /
+ * are not in it. It computed the number that would have caught every startup-path
+ * regression of the last three months and threw it away.
+ *
+ * On 25.10.2026 the dist entry was 314_528 B over its budget with NO single leak:
+ * four deliberately eager features, a grown schema and diffuse growth. Measured at
+ * the commits that introduced them, each of the four moved the sum below by
+ * +221_407, +363_333, +93_287 and +153_530 B — all of them visible WITHOUT a build,
+ * in seconds, at the moment they landed, by a number this file was already computing
+ * and discarding. (How well a single absolute threshold can tell such a cluster from
+ * an ordinary day on this trunk is a separate question, answered honestly under
+ * *Tolerance* below: not very.)
+ *
+ * ## What it measures, and what it does NOT
+ *
+ * The bytes of SOURCE statically reachable from `src/main.ts` — the same walk the
+ * suite above uses, so `eager` means one thing in this file. It is deliberately not
+ * a bundle measurement: no minification, no tree-shaking, no npm packages (a bare
+ * specifier is not an edge). It therefore does not predict the entry chunk's size
+ * and must never be confused with the `entry-chunk` pin. What it DOES track is the
+ * only thing a lazy-loading rule is about: how much code the startup path can reach
+ * without crossing an `import()`.
+ *
+ * ## WHEN THIS TEST GOES RED
+ *
+ * It is red because the startup path grew. There are exactly two honest answers,
+ * and raising the number quietly is neither:
+ *
+ *  1. **Make the new code lazy.** Put it behind `import()` (a feature stub, a
+ *     `lazy(() => import(...))` panel, a plugin body) so the boot path no longer
+ *     reaches it. The failure message names the ten biggest files in the graph and
+ *     the delta, which is usually enough to see what arrived.
+ *  2. **Turn the ratchet on purpose.** If the growth is wanted in the boot path,
+ *     re-pin `eager-source-graph` in `tests/bundle-budgets.json` — WITH the commit
+ *     it was measured at, a note saying what grew, and `onMergeTarget: true`.
+ *     `bundle-budget-provenance.node.test.ts` checks that record; a pin taken on a
+ *     feature branch is refused there, for the reason that file's $note explains.
+ *
+ * ## Tolerance — and what it can and cannot do
+ *
+ * 150_153 B above the 25.10.2026 measurement (0.95 %), the number and its reasoning
+ * in `tests/bundle-budgets.json`. It is ONE median day of trunk growth, not a noise
+ * band, and the difference matters:
+ *
+ * The eager graph was measured at every first-parent commit of main between
+ * 2026-10-13 and 2026-10-25 (14_068_445 -> 15_874_627 B). The twelve daily deltas are
+ * 226 / 1_972 / 41_010 / 53_891 / 56_002 / 99_517 / 144_547 / 197_847 / 210_009 /
+ * 214_180 / 312_794 / 474_187 B — median ~122 kB. The smallest of the four clusters
+ * this guard exists for is +93_287 B. So ordinary trunk movement and a cluster are
+ * the SAME SIZE on this metric, and no absolute threshold separates them: loose
+ * enough for a quiet week means blind to a cluster.
+ *
+ * The consequence is deliberate and should not be filed as a bug: this ratchet trips
+ * every few days of normal work. When it does, the startup path really has grown by
+ * more than a day's worth, which is the cheapest possible moment to ask lazy-or-eager.
+ * The variant that WOULD separate the two is a per-change guard — the eager sum of
+ * the worktree against the eager sum of the merge-base tree, which needs no build
+ * either. That is the recommended successor, not a bigger number here.
+ */
+describe('bundle: eager-source ratchet (plan-779)', () => {
+  const PIN = BUDGETS.pins['eager-source-graph'];
+
+  it('the eager source graph stays inside its ratchet', () => {
+    const files = [...eagerGraph(resolve(ROOT, 'src/main.ts'))].sort();
+    expect(files.length, 'the walk returned no graph — resolution broken, not a size result')
+      .toBeGreaterThan(100);
+
+    // LF-normalised bytes (CRLF counts as one byte), so the number is the same in a CRLF
+    // worktree (core.autocrlf=true) as in the canonical LF tree. Raw on-disk sizes made this
+    // test falsely red in worktrees (+2_234 B, measured 2026-11-04).
+    //
+    // Two independent measurements of the same quantity: the byte count of the file with
+    // CRLF dropped, and the size the decoded text occupies when LF-normalised and re-encoded.
+    // The oracle must not compute the way the subject does — a mistake in one path
+    // (counting UTF-16 code units, say, which is the bug the dist-entry budget had
+    // until 2026-08-08) shows up as a disagreement instead of as a wrong budget.
+    let onDisk = 0;
+    let reEncoded = 0;
+    for (const f of files) {
+      onDisk += lfBytes(f);
+      reEncoded += new TextEncoder().encode(readFileSync(f, 'utf8').replace(/\r\n/g, '\n')).length;
+    }
+    expect(
+      reEncoded,
+      'a file in the eager graph is not valid UTF-8 (its bytes and its re-encoded text differ) — '
+      + 'fix the file; this is not a size regression',
+    ).toBe(onDisk);
+
+    if (onDisk >= PIN.budgetBytes) {
+      const biggest = files
+        .map((f) => ({ f: norm(f).replace(/^.*?\/(realvirtual-WebViewer[^/]*\/)/, '$1'), b: lfBytes(f) }))
+        .sort((a, b) => b.b - a.b)
+        .slice(0, 10)
+        .map((x) => `  ${String(x.b).padStart(7)}  ${x.f}`)
+        .join('\n');
+      throw new Error(
+        `eager source graph: ${onDisk} B in ${files.length} files, budget ${PIN.budgetBytes} B `
+        + `(+${onDisk - PIN.budgetBytes} B over; pinned ${PIN.measuredBytes} B at ${PIN.measuredAt.commit}).\n`
+        + 'The startup path grew. Either make the new code lazy (put it behind import()), or turn the\n'
+        + 'ratchet on purpose: re-pin `eager-source-graph` in tests/bundle-budgets.json, measured on the\n'
+        + 'merge target (no build needed — this walk IS the measurement), with a note saying what grew\n'
+        + `and onMergeTarget: true. Ten biggest files in the eager graph:\n${biggest}`,
+      );
+    }
+    expect(onDisk).toBeLessThan(PIN.budgetBytes);
   });
 });

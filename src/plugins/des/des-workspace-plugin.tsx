@@ -25,6 +25,7 @@
  *     case (model loads after the workspace is already DES).
  */
 
+import { lazy, Suspense, useSyncExternalStore } from 'react';
 import { Box, Paper, Typography } from '@mui/material';
 import { AccountTree } from '@mui/icons-material';
 import type { RVViewer } from '../../core/rv-viewer';
@@ -33,11 +34,33 @@ import type { ModeId } from '../../core/rv-mode-manager';
 import type { UISlotEntry, UISlotProps } from '../../core/rv-ui-plugin';
 import type { LoadResult } from '../../core/engine/rv-scene-loader';
 import { DESControllerToolbar } from '../sim-controller/DESControllerToolbar';
-import { setEventQueueWindowOpen } from '../sim-controller/event-queue-window-store';
-import { ensureDesManagerNode } from '../../core/material-flow/des-manager-node';
-// The Event Queue window is a PRIVATE feature (filter/category/footer). Imported
-// via @rv-private — the public build resolves the no-op stub in src/private-stubs.
-import { EventQueueOverlay } from '@rv-private/plugins/des/hmi/event-queue-overlay';
+import {
+  isEventQueueWindowOpen, setEventQueueWindowOpen, subscribeEventQueueWindow,
+} from '../sim-controller/event-queue-window-store';
+import { LazyPanelBoundary } from '../../core/hmi/LazyPanelBoundary';
+
+// The Event Queue window (filter/category/footer) — part of the DES core since
+// plan-680, the same module in every build.
+// plan-652 Phase 3: imported on first open only. A static import pulled the DES
+// manager (`DESMode`) into the startup entry, although the window exists only in
+// DES mode after the user opens it.
+const EventQueueOverlayBody = lazy(() =>
+  import('./hmi/event-queue-overlay').then((m) => ({ default: m.EventQueueOverlay })));
+
+/** Mounts the Event Queue window once it was opened (stays mounted after). */
+function EventQueueOverlay(props: UISlotProps) {
+  const open = useSyncExternalStore(subscribeEventQueueWindow, isEventQueueWindowOpen);
+  if (!open && !openedOnce.has(props.viewer)) return null;
+  openedOnce.add(props.viewer);
+  return (
+    <LazyPanelBoundary label="Event Queue">
+      <Suspense fallback={null}>
+        <EventQueueOverlayBody {...props} />
+      </Suspense>
+    </LazyPanelBoundary>
+  );
+}
+const openedOnce = new WeakSet<object>();
 
 /**
  * Honest stub shown only when the private DES runner is absent (public build).
@@ -47,6 +70,8 @@ import { EventQueueOverlay } from '@rv-private/plugins/des/hmi/event-queue-overl
 function DESWorkspacePanel({ viewer }: UISlotProps) {
   const hasRunner = viewer.simulationKernel?.hasDesRunner() ?? false;
   if (hasRunner) return null;
+  // plan-652: declared on demand but not active yet → it is loading, not missing.
+  const loading = viewer.features?.isDeclared('des') === true && !viewer.features.isActive('des');
   return (
     <Paper
       elevation={4}
@@ -72,7 +97,7 @@ function DESWorkspacePanel({ viewer }: UISlotProps) {
           Discrete Event Simulation
         </Typography>
         <Typography sx={{ fontSize: 12, opacity: 0.75, lineHeight: 1.3 }}>
-          DES runner not available in this build.
+          {loading ? 'Loading DES simulation …' : 'DES runner not available in this build.'}
         </Typography>
       </Box>
     </Paper>
@@ -92,7 +117,7 @@ export class DESWorkspacePlugin implements RVViewerPlugin {
     // SimControllerToolbar (which is hidden in DES), so they swap cleanly.
     { slot: 'toolbar-button-leading', component: DESControllerToolbar, order: 10 },
     // Event Queue window (toggled from the DES toolbar) — gated to `mode:des`.
-    // Private window (filter/category/footer) via @rv-private; stub renders null.
+    // Window with filter/category/footer, imported on first open.
     { slot: 'overlay', component: EventQueueOverlay, order: 90 },
     // Overlay stub — only renders when the DES runner is unavailable.
     { slot: 'overlay', component: DESWorkspacePanel, order: 100 },
@@ -108,10 +133,12 @@ export class DESWorkspacePlugin implements RVViewerPlugin {
    */
   onModeActivate(_mode: ModeId, viewer: RVViewer): void {
     this._syncKernelToDes(viewer);
-    // Auto-singleton (like the Unity DESManager): ensure a 'Simulation' node with
-    // a DESManager component exists so the sim END / statistics-reset settings live
-    // in the scene (GLB-first) and round-trip through save / load. No-op if present.
-    ensureDesManagerNode(viewer);
+    // The sim END / statistics-reset settings live in the scene (GLB-first) on a
+    // singleton 'Simulation' node with a DESManager component. Entering the mode
+    // touches nothing — the document stays clean (plan-616 Teil 1, LOP #196);
+    // readers call `readDesManagerSettings` where they need the values. The
+    // toolbar creates the node with the user's first edit of a setting
+    // (`ensureDesManagerNode` right before its `setField`).
   }
 
   /** Leaving the DES workspace → restore the continuous (Realtime) executor
@@ -150,6 +177,13 @@ export class DESWorkspacePlugin implements RVViewerPlugin {
 
   private _syncKernelToDes(viewer: RVViewer): void {
     const kernel = viewer.simulationKernel;
-    if (kernel?.hasDesRunner()) kernel.setMode('des');
+    if (!kernel) return;
+    if (kernel.hasDesRunner()) { kernel.setMode('des'); return; }
+    // Fallback: a viewer whose DES feature has not handed the runner factory over
+    // yet (a test viewer without FeatureLoader activation). The on-demand DES
+    // feature normally set it before this mode was entered.
+    void viewer.loadDesRunnerFactory?.().then((ok) => {
+      if (ok && viewer.modes.activeMode === 'des') viewer.simulationKernel?.setMode('des');
+    });
   }
 }

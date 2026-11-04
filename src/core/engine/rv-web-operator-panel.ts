@@ -89,6 +89,7 @@ export class RVWebOperatorPanel implements RVComponent {
   }
 
   init(): void {
+    this._normalizeConfig();
     this.Dock = parseDock(this.Dock);
     this.disposed = false;
     announceChange();
@@ -96,8 +97,15 @@ export class RVWebOperatorPanel implements RVComponent {
 
   /** IMPLEMENTS RVComponent::reapplyConfig — an editor / MCP field edit. */
   reapplyConfig(): void {
+    this._normalizeConfig();
     this.Dock = parseDock(this.Dock);
     announceChange();
+  }
+
+  /** Legacy object extras must also be usable through the live string field. */
+  private _normalizeConfig(): void {
+    const source = this.configSource;
+    if (source !== null && typeof source === 'object') this.Config = JSON.stringify(source);
   }
 
   dispose(): void {
@@ -144,6 +152,12 @@ export interface WebOperatorPanelEntry {
   readonly component: RVWebOperatorPanel;
   /** Config problems (JSON, structure, unknown signals); empty = usable. */
   readonly errors: readonly string[];
+  /**
+   * True while the panel is STARTING UP rather than broken (plan-673): signals
+   * it names are missing and a lazy feature that may still register them has
+   * not settled. `errors` then holds the one "waiting for n signals" sentence.
+   */
+  readonly pending: boolean;
 }
 
 /** What the host needs from the viewer. */
@@ -155,6 +169,8 @@ interface Slot {
   component: RVWebOperatorPanel;
   signature: string;
   controller: OperatorPanelController;
+  /** Unsubscribe from the controller's snapshot channel (plan-673). */
+  off: () => void;
 }
 
 const signatureOf = (c: RVWebOperatorPanel): string => {
@@ -163,6 +179,9 @@ const signatureOf = (c: RVWebOperatorPanel): string => {
 };
 
 const problemId = (nodePath: string): string => `${WEB_OPERATOR_PANEL_PROBLEM}:${nodePath}`;
+
+const sameErrors = (a: readonly string[], b: readonly string[]): boolean =>
+  a.length === b.length && a.every((s, i) => s === b[i]);
 
 /**
  * Viewer-owned: one {@link OperatorPanelController} per `WebOperatorPanel` in
@@ -210,12 +229,14 @@ export class WebOperatorPanelHost {
       const signature = signatureOf(instance);
       const prev = this._slots.get(path);
       if (prev && prev.component === instance && prev.signature === signature) continue;
+      prev?.off();
       prev?.controller.stop();
-      this._slots.set(path, { component: instance, signature, controller: this._createController(instance, path) });
+      this._slots.set(path, this._createSlot(instance, signature, path));
       changed = true;
     }
     for (const [path, slot] of this._slots) {
       if (seen.has(path)) continue;
+      slot.off();
       slot.controller.stop();
       this._slots.delete(path);
       clearProblem(problemId(path));
@@ -240,18 +261,39 @@ export class WebOperatorPanelHost {
     this._listeners.clear();
   }
 
-  private _createController(c: RVWebOperatorPanel, path: string): OperatorPanelController {
+  private _createSlot(c: RVWebOperatorPanel, signature: string, path: string): Slot {
     const parsed = parseWebOperatorPanelConfig(c.configSource);
     const controller = new OperatorPanelController(parsed.raw, {
       errors: parsed.errors,
       id: `web-operator-panel:${path}`,
     });
+    // plan-673: a controller's verdict is no longer final at `start()`. It can
+    // move pending → ready (the signals arrived) or pending → invalid (the
+    // feature activations ended without them), and the ENTRY carries both
+    // `errors` and `pending` — so the window and the Problems panel have to be
+    // re-published when it does. Only a change of THAT pair re-publishes; the
+    // per-value snapshots a running panel emits are ignored here.
+    const off = controller.subscribe(() => this._onControllerChanged(path));
     controller.start(this.target);
-    return controller;
+    return { component: c, signature, controller, off };
+  }
+
+  /** Re-publish when a controller's (errors, pending) pair no longer matches its entry. */
+  private _onControllerChanged(path: string): void {
+    const slot = this._slots.get(path);
+    if (!slot) return;
+    const entry = this._entries.find((e) => e.nodePath === path);
+    if (!entry) return;
+    const snap = slot.controller.getSnapshot();
+    if (snap.pending === entry.pending && sameErrors(snap.errors, entry.errors)) return;
+    this._publish();
   }
 
   private _stopAll(): void {
-    for (const slot of this._slots.values()) slot.controller.stop();
+    for (const slot of this._slots.values()) {
+      slot.off();
+      slot.controller.stop();
+    }
     this._slots.clear();
   }
 
@@ -276,19 +318,27 @@ export class WebOperatorPanelHost {
       const dock = parseDock(component.Dock);
       const dockIndex = perDock.get(dock) ?? 0;
       perDock.set(dock, dockIndex + 1);
-      const errors = controller.getSnapshot().errors;
+      const snapshot = controller.getSnapshot();
+      const errors = snapshot.errors;
+      const pending = snapshot.pending;
       const title = component.Title || config?.title || 'Operator panel';
       entries.push({
         nodePath, panelId, title, dock, dockIndex,
         startCollapsed: component.StartCollapsed === true,
-        controller, component, errors,
+        controller, component, errors, pending,
       });
       if (errors.length > 0) {
+        // plan-673: a panel that is WAITING is not a panel that is wrong. It
+        // gets an `info` row, so the Problems panel keeps its warning count
+        // honest and nobody is sent looking for a defect that will clear
+        // itself; a real one keeps the `warning` it always had.
         reportProblem({
           id: problemId(nodePath),
-          severity: 'warning',
+          severity: pending ? 'info' : 'warning',
           code: WEB_OPERATOR_PANEL_PROBLEM,
-          title: `Operator panel "${title}" cannot be used`,
+          title: pending
+            ? `Operator panel "${title}" is starting up`
+            : `Operator panel "${title}" cannot be used`,
           detail: `${nodePath}: ${errors.slice(0, 6).join('; ')}${errors.length > 6 ? ` … and ${errors.length - 6} more` : ''}`,
           nodePath,
         });

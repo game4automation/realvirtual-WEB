@@ -16,6 +16,7 @@ import {
 } from '../src/core/engine/rv-component-registry';
 import type { RVDrive } from '../src/core/engine/rv-drive';
 import type { FeedbackSource } from '../src/core/engine/rv-binding-slot-resolver';
+import { slotFeedbackValue } from '../src/core/engine/rv-slot-io';
 
 interface DriveFeedbackFixture {
   drive: RVDrive;
@@ -59,10 +60,19 @@ function driveFeedback(
     scene,
     root: node,
   } as ComponentContext);
-  return {
-    drive: result.drive,
-    source: pending.component as unknown as FeedbackSource & Record<string, unknown>,
+  const component = pending.component as unknown as FeedbackSource & Record<string, unknown>;
+  if (typeof component.readFeedbackSlot === 'function') return { drive: result.drive, source: component };
+  // SlotIO component: its feedback is published after every drive update, so a
+  // read first runs the drive's after-update pass on the state the test set up.
+  const drive = result.drive;
+  const readFeedbackSlot = (slot: string): boolean | number => {
+    (drive as unknown as { dispatchAfterUpdate(): void }).dispatchAfterUpdate();
+    return slotFeedbackValue(component, slot)!;
   };
+  const source = new Proxy(component, {
+    get: (target, key, receiver) => (key === 'readFeedbackSlot' ? readFeedbackSlot : Reflect.get(target, key, receiver)),
+  });
+  return { drive, source };
 }
 
 describe('FeedbackSource slot value contract', () => {

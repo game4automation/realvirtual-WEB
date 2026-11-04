@@ -35,6 +35,7 @@
  */
 
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { basename, join } from 'node:path';
 
 import { walk } from './_rv-fs-utils.mjs';
@@ -67,6 +68,11 @@ export const SECRET_FILE_PATTERNS = Object.freeze([
   /^.*\.keystore$/i,
   /^credentials(\.json)?$/i,
   /^service-account.*\.json$/i,
+  // Confidential contract documents. They are versioned in the private repo's
+  // `.contracts/` folder and must never reach a delivery, a hosted deploy, a
+  // CDN upload or an export — not even when someone copies the folder into a
+  // project. Matched as a path segment, so everything beneath it is refused too.
+  /^\.contracts$/i,
 ]);
 
 //! True when a bare filename is a secret-bearing file.
@@ -164,11 +170,17 @@ const HIGH_ENTROPY_FRAGMENT = /[A-Za-z0-9+/=_-]{32,}/g;
 const HEX_DIGEST_LITERAL = /^[0-9a-fA-F]{32,}$/;
 const SUBRESOURCE_INTEGRITY_LITERAL = /^(sha256|sha384|sha512)-([A-Za-z0-9+/]+={0,2})$/;
 
-function extractStringLiterals(text) {
+//! The quote-pairing reader for files the TypeScript parser does not read.
+//! `wordApostrophe` (plan-679 Phase 1): an apostrophe BETWEEN two letters (`don't`, `it's`)
+//! opens nothing — prose in Markdown/HTML/YAML would otherwise pair two of them into one long
+//! "literal" over unrelated text. Off for the JS-family fallback, which stays byte-identical to
+//! the reader the guard had before the parser.
+function extractStringLiterals(text, { wordApostrophe = false } = {}) {
   const values = [];
   for (let index = 0; index < text.length; index++) {
     const quote = text[index];
     if (quote !== '"' && quote !== "'" && quote !== '`') continue;
+    if (wordApostrophe && quote === "'" && isLetter(text[index - 1]) && isLetter(text[index + 1])) continue;
     let value = '';
     for (index += 1; index < text.length; index++) {
       const char = text[index];
@@ -183,6 +195,130 @@ function extractStringLiterals(text) {
     }
   }
   return values;
+}
+
+function isLetter(char) {
+  return typeof char === 'string' && /\p{L}/u.test(char);
+}
+
+// ─── JS-family sources through the TypeScript parser (plan-679 Phase 1) ───
+//
+// The quote pairer above treats every `'` as the start of a literal, comments included: two
+// apostrophes in two comments of `runtime-stage-export.ts` became one "literal" spanning code,
+// and the entropy heuristic refused every 6.5.0 delivery (worked around in f482cba4). A home-made
+// lexer would have to re-learn regex-vs-division, JSX text and nested templates; the TypeScript
+// parser already knows all three, so the JS family is read through it.
+//
+// The parser is resolved from THIS module (`import.meta.url`), i.e. from the node_modules of the
+// checkout that runs the guard — never from the scanned tree, which before the build has none.
+
+//! Source extensions read through the TypeScript parser.
+export const PARSED_SOURCE_EXTENSIONS = new Set(['.js', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts', '.jsx']);
+
+let cachedTypeScript;
+
+//! Default loader: `typescript` from the executing checkout, or `null` when it is not installed.
+export function loadTypeScriptFromGuardModule() {
+  if (cachedTypeScript !== undefined) return cachedTypeScript;
+  try {
+    cachedTypeScript = createRequire(import.meta.url)('typescript');
+  } catch {
+    cachedTypeScript = null;
+  }
+  return cachedTypeScript;
+}
+
+function scriptKindFor(ts, extension) {
+  switch (extension) {
+    case '.tsx': return ts.ScriptKind.TSX;
+    case '.jsx': return ts.ScriptKind.JSX;
+    case '.js': case '.mjs': case '.cjs': return ts.ScriptKind.JS;
+    default: return ts.ScriptKind.TS;
+  }
+}
+
+/**
+ * Splits one JS-family source into what the scanner judges differently:
+ *  - `literals` — string, template and regex literals, JSX attribute values (all StringLiteral);
+ *  - `prose` — comments and JSX text.
+ *
+ * `createSourceFile` recovers from syntax errors and keeps every literal it read, so a broken
+ * file is still scanned; diagnostics are not consulted.
+ */
+export function splitSourceLiteralsAndProse(ts, text, extension) {
+  const file = ts.createSourceFile(`scan${extension}`, text, ts.ScriptTarget.Latest, false, scriptKindFor(ts, extension));
+  const literals = [];
+  const prose = [];
+  const seenComments = new Set();
+  const collectComments = (ranges) => {
+    for (const range of ranges ?? []) {
+      if (seenComments.has(range.pos)) continue;
+      seenComments.add(range.pos);
+      prose.push(text.slice(range.pos, range.end));
+    }
+  };
+  const isJsDoc = (node) => node.kind >= ts.SyntaxKind.FirstJSDocNode && node.kind <= ts.SyntaxKind.LastJSDocNode;
+  const visit = (node) => {
+    if (isJsDoc(node)) return;
+    switch (node.kind) {
+      case ts.SyntaxKind.StringLiteral:
+      case ts.SyntaxKind.NoSubstitutionTemplateLiteral:
+      case ts.SyntaxKind.TemplateHead:
+      case ts.SyntaxKind.TemplateMiddle:
+      case ts.SyntaxKind.TemplateTail:
+      case ts.SyntaxKind.RegularExpressionLiteral:
+        literals.push(node.text);
+        break;
+      case ts.SyntaxKind.JsxText:
+        prose.push(node.text);
+        break;
+      default:
+        break;
+    }
+    const children = node.getChildren(file);
+    if (children.length === 0) {
+      // A leaf token: every comment is leading or trailing trivia of some token.
+      collectComments(ts.getLeadingCommentRanges(text, node.pos));
+      collectComments(ts.getTrailingCommentRanges(text, node.end));
+      return;
+    }
+    for (const child of children) visit(child);
+  };
+  visit(file);
+  return { literals, prose };
+}
+
+/**
+ * What one file offers the scanner, split by how it is judged:
+ * `literals` get every rule (token formats, licence keys, entropy); `prose` (comments, JSX text)
+ * gets the token formats only — a token in a comment is a leak, but prose is not where the
+ * entropy heuristic belongs (it is what made the comment false positive).
+ *
+ * `parser: 'typescript' | 'fallback' | 'none'` says how a JS-family file was read.
+ * Options: `loadTypeScript` (test injection), `requireParser` (throw instead of falling back),
+ * `onFallback(message)` (called on every fallback read).
+ */
+export function secretScanParts(text, relativePath, extension, options = {}) {
+  if (extension === '.json') {
+    try {
+      return { literals: collectJsonStringValues(JSON.parse(text), relativePath), prose: [], parser: 'none' };
+    } catch { /* malformed JSON is scanned as ordinary text */ }
+  }
+  if (PARSED_SOURCE_EXTENSIONS.has(extension)) {
+    const ts = (options.loadTypeScript ?? loadTypeScriptFromGuardModule)();
+    if (ts) {
+      const { literals, prose } = splitSourceLiteralsAndProse(ts, text, extension);
+      return { literals, prose, parser: 'typescript' };
+    }
+    const message = 'secret scanner: the TypeScript parser (devDependency `typescript`) is not '
+      + `installed next to scripts/_rv-guards.mjs; ${relativePath} cannot be read comment-aware.`;
+    if (options.requireParser) throw new Error(`${message} Run npm ci in the delivering checkout.`);
+    options.onFallback?.(message);
+    return { literals: extractStringLiterals(text), prose: [], parser: 'fallback' };
+  }
+  const literals = extractStringLiterals(text, { wordApostrophe: true });
+  if (PLAIN_TEXT_SECRET_EXTENSIONS.has(extension)) literals.push(text);
+  return { literals, prose: [], parser: 'none' };
 }
 
 /**
@@ -235,16 +371,10 @@ export function collectJsonStringValues(value, relativePath, propertyPath = [], 
   return values;
 }
 
-//! The strings worth scanning in one file: JSON leaves, or source-code literals.
-export function secretScanValues(text, relativePath, extension) {
-  if (extension === '.json') {
-    try {
-      return collectJsonStringValues(JSON.parse(text), relativePath);
-    } catch { /* malformed JSON is scanned as ordinary text */ }
-  }
-  const values = extractStringLiterals(text);
-  if (PLAIN_TEXT_SECRET_EXTENSIONS.has(extension)) values.push(text);
-  return values;
+//! The literal strings worth scanning in one file: JSON leaves, or source-code literals.
+//! Kept for callers that only want the values; {@link secretScanParts} also returns the prose.
+export function secretScanValues(text, relativePath, extension, options = {}) {
+  return secretScanParts(text, relativePath, extension, options).literals;
 }
 
 function shannonEntropy(value) {
@@ -325,10 +455,21 @@ export function isTestFile(relativePath) {
  * into its own single tree walk (links, sizes, foreign names) rather than
  * walking the workspace twice.
  */
-export function secretContentViolation(relLower, extension, text) {
-  if (/-----BEGIN/.test(text)) return `PEM block found in ${relLower}.`;
+export function secretContentViolation(relLower, extension, text, options = {}) {
+  // `-{5}`, never five literal dashes: since plan-604 this file is itself delivered
+  // and scanned, and a literal pattern made the guard report its own source.
+  if (/-{5}BEGIN/.test(text)) return `PEM block found in ${relLower}.`;
   if (COMPACT_JWS_FORMAT.test(text)) return `Compact JWS found in ${relLower}.`;
-  for (const value of secretScanValues(text, relLower, extension)) {
+  const { literals, prose } = secretScanParts(text, relLower, extension, options);
+  for (const value of prose) {
+    if (KNOWN_SECRET_FORMAT.test(value)) {
+      return `Token-like secret found in a comment or JSX text: ${relLower}.`;
+    }
+    if (/RVC1-[A-Za-z0-9_-]{8,}/.test(value)) {
+      return `CONNECT licence key found in a comment or JSX text: ${relLower}.`;
+    }
+  }
+  for (const value of literals) {
     if (KNOWN_SECRET_FORMAT.test(value)) {
       return `Token-like secret found outside an allowed schema path: ${relLower}.`;
     }
@@ -482,8 +623,15 @@ export function looksLikeSecretValue(value) {
  * customer pull, an ad-hoc check). The delivery guard uses the two primitives
  * directly.
  */
-export function assertNoSecrets(root, { skipDirs = ['.git', 'node_modules', 'dist'] } = {}) {
+export function assertNoSecrets(root, { skipDirs = ['.git', 'node_modules', 'dist'], loadTypeScript, warn = console.warn } = {}) {
   const skip = new Set(skipDirs.map((name) => name.toLowerCase()));
+  // An incoming tree (customer pull) keeps working without the parser: it falls back to the
+  // pre-679 reader with ONE warning. The delivery guard does not — see assertWorkspaceGuards.
+  let warned = false;
+  const scanOptions = {
+    loadTypeScript,
+    onFallback: (message) => { if (!warned) { warned = true; warn(`${message} Falling back to the quote-pairing reader.`); } },
+  };
   walk(root, (absolute, rel, entry) => {
     if (entry.isDirectory()) return !skip.has(entry.name.toLowerCase());
     if (!entry.isFile()) return;
@@ -491,7 +639,7 @@ export function assertNoSecrets(root, { skipDirs = ['.git', 'node_modules', 'dis
     const lower = rel.toLowerCase();
     const ext = lower.slice(lower.lastIndexOf('.'));
     if (!SECRET_SCAN_EXTENSIONS.has(ext)) return;
-    const violation = secretContentViolation(lower, ext, readFileSync(absolute, 'utf8'));
+    const violation = secretContentViolation(lower, ext, readFileSync(absolute, 'utf8'), scanOptions);
     if (violation) throw new Error(violation);
   });
 }

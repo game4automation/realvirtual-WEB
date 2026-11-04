@@ -172,7 +172,7 @@ export function SignalUsageButton({ viewer, name }: { viewer: RVViewer | null | 
           onDoubleClick={(e: React.MouseEvent) => e.stopPropagation()}
           sx={{
             display: 'inline-flex', alignItems: 'center', gap: 0.25, flexShrink: 0,
-            height: 16, px: 0.5, ml: 0.25, border: '1px solid rgba(255,255,255,0.14)', borderRadius: '8px',
+            height: 16, px: 0.5, ml: 0.25, border: '1px solid rgba(255,255,255,0.14)', borderRadius: '2px',
             bgcolor: 'transparent', color: 'text.secondary', fontSize: 10, cursor: 'pointer',
             '&:hover': { color: LINK, borderColor: LINK },
           }}

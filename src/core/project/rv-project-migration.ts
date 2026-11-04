@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, removeLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+
 /**
  * rv-project-migration — giving the pre-project scenes a project, without
  * moving a single byte (§2.4).
@@ -309,7 +311,7 @@ export async function shouldOfferWorkFolderAsProject(): Promise<boolean> {
 /** The recorded decision. `pending` means "never answered". */
 export function readWorkFolderOffer(): WorkFolderOfferStatus {
   try {
-    const raw = localStorage.getItem(LS_KEY_WORKFOLDER_OFFER);
+    const raw = readLocalStorage(LS_KEY_WORKFOLDER_OFFER);
     if (!raw) return 'pending';
     const parsed: unknown = JSON.parse(raw);
     const status = (parsed as { status?: unknown } | null)?.status;
@@ -334,16 +336,12 @@ export function acceptWorkFolderOffer(): void {
 
 /** Test/support utility: forget the decision so the offer can appear again. */
 export function resetWorkFolderOffer(): void {
-  try {
-    localStorage.removeItem(LS_KEY_WORKFOLDER_OFFER);
-  } catch {
-    /* ignore */
-  }
+  removeLocalStorage(LS_KEY_WORKFOLDER_OFFER);
 }
 
 function writeWorkFolderOffer(status: Exclude<WorkFolderOfferStatus, 'pending'>): void {
   try {
-    localStorage.setItem(
+    writeLocalStorage(
       LS_KEY_WORKFOLDER_OFFER,
       JSON.stringify({ status, at: new Date().toISOString() }),
     );
@@ -364,11 +362,7 @@ function writeWorkFolderOffer(status: Exclude<WorkFolderOfferStatus, 'pending'>)
  */
 export function rollbackMigration(): void {
   for (const id of listSceneOwnerIds()) clearSceneOwner(id);
-  try {
-    localStorage.removeItem(LS_KEY_MIGRATION_STATE);
-  } catch {
-    /* ignore */
-  }
+  removeLocalStorage(LS_KEY_MIGRATION_STATE);
   resetWorkFolderOffer();
 }
 
@@ -376,7 +370,7 @@ export function rollbackMigration(): void {
 
 function readMigrationState(): MigrationState {
   try {
-    const raw = localStorage.getItem(LS_KEY_MIGRATION_STATE);
+    const raw = readLocalStorage(LS_KEY_MIGRATION_STATE);
     if (!raw) return {};
     const parsed: unknown = JSON.parse(raw);
     return parsed && typeof parsed === 'object' ? (parsed as MigrationState) : {};
@@ -387,7 +381,7 @@ function readMigrationState(): MigrationState {
 
 function writeMigrationState(state: MigrationState): void {
   try {
-    localStorage.setItem(LS_KEY_MIGRATION_STATE, JSON.stringify(state));
+    writeLocalStorage(LS_KEY_MIGRATION_STATE, JSON.stringify(state));
   } catch {
     /* quota — re-running the pass is harmless */
   }

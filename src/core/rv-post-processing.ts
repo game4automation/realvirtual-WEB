@@ -55,8 +55,9 @@ import type { Pass } from 'three/addons/postprocessing/Pass.js';
 
 import type { AOMode } from './hmi/visual-settings-store';
 import { NO_AO_LAYER } from './engine/rv-constants';
+import { overlayLayerMask } from './engine/rv-group-registry';
 import { getTslMaterials } from './engine/materials/material-factory';
-import type { TslPostPipeline, DesatBlitTsl } from './engine/materials/rv-post-processing-tsl';
+import type { TslPostPipeline, DesatBlitTsl, TslPassHandle } from './engine/materials/rv-post-processing-tsl';
 
 // ─── Host interface ───────────────────────────────────────────────────────
 
@@ -88,12 +89,33 @@ export interface PostProcessingHost {
    *  loop reads this flag — every state-changing setter on the manager
    *  calls into here so users see the change immediately. */
   markRenderDirty(): void;
+  /** Called with the TSL pipeline's pass nodes at the end of every graph
+   *  build — the viewer instruments them for its per-pass frame stats
+   *  (plan-763 Phase 4). Optional: lightweight hosts and tests omit it. */
+  onTslPassesBuilt?(passes: readonly TslPassHandle[]): void;
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────
 
 /** Internal buffers for GTAO/N8AO/Bloom run at half resolution for performance. */
 export const PP_SCALE = 0.5;
+
+/** GTAO sample count. 8 at the (DPR-aware) AO resolution looks practically
+ *  identical to three's default 16 at half the cost (GTX 1060, 1600×1000:
+ *  +3.6 ms vs +7.2 ms over AO off). */
+const GTAO_SAMPLES = 8;
+
+/**
+ * AO buffer scale for a given composer pixel ratio. The AO buffer must not drop
+ * below one sample per CSS pixel: at DPR 1 a 0.5 scale gives one AO sample per
+ * 2×2 screen pixels, and GTAO's non-depth-aware upscale turns that into grain
+ * and dotted edges. So AO runs at `max(scale, 1/pixelRatio)` — full resolution
+ * on DPR-1 screens, unchanged half resolution at DPR ≥ 2. Bloom keeps `scale`.
+ */
+function aoScaleFor(scale: number, pixelRatio: number): number {
+  const pr = Number.isFinite(pixelRatio) && pixelRatio > 0 ? pixelRatio : 1;
+  return Math.min(1, Math.max(scale, 1 / pr));
+}
 
 /**
  * Classic WebGL compatibility only. three r185 multiplies UnrealBloomPass'
@@ -130,6 +152,11 @@ export class PostProcessingManager {
 
   // ── State (source of truth) ──────────────────────────────────────────
   private _aoMode: AOMode = 'gtao';
+  /** AO blend intensity / radius as last set — kept here because the composer is
+   *  built lazily: a preset applied before the GTAO pass exists must still reach
+   *  it (otherwise the pass came up with hardcoded 1.0 / 0.15). */
+  private _aoIntensity = 1.0;
+  private _aoRadius = 0.15;
   /** True iff an n8ao-import attempt is currently in flight, to coalesce
    *  rapid toggle clicks while the network / module eval resolves. */
   private _n8aoLoading = false;
@@ -262,16 +289,33 @@ export class PostProcessingManager {
     }
     const pipeline = new tsl.TslPostPipeline(this.host.renderer as Renderer, {
       samples: this.host.antialiasActive ? 4 : 0,
+      // The overlay layers are composited INSIDE the pipeline (its
+      // OverlayPassNode). The viewer's post-render overlay pass must not run
+      // after it: under the WebGPURenderer that pass goes through three's
+      // frame-buffer target whose output blit replaces the finished frame.
+      overlayLayerMask: overlayLayerMask(),
+      // Per-pass frame stats (plan-763 Phase 4): the viewer wraps the pass
+      // nodes at the end of every build, so no frame lands in `other`.
+      instrument: (passes) => this.host.onTslPassesBuilt?.(passes),
     });
-    // Re-apply AO state remembered while no pipeline existed yet.
+    // Re-apply the state remembered while no pipeline existed yet (AO and,
+    // since plan-763, bloom — toon edges re-apply through the toon manager).
     pipeline.setAoEnabled(this._aoMode !== 'off');
+    pipeline.setBloom(this._bloomEnabled, this._bloomIntensity, this._bloomRadius, this._bloomThreshold);
     this._tslPost = pipeline;
     return pipeline;
   }
 
+  /** True while the TSL pipeline renders the ray traced G-buffer graph
+   *  (plan-762) — set by the viewer's ray traced controller through
+   *  `tslPost.setRaytraced()` only after the backend's setup succeeded, so
+   *  `useTslPost` switches to the MRT variant exactly then. */
+  get raytracedReady(): boolean { return this._tslPost?.raytracedReady ?? false; }
+
   /** Whether the TSL pipeline path is the right choice this frame — the
    *  `useComposer` counterpart for WebGPURenderer. The viewer's render loop
-   *  calls `renderTslPost()` (which REPLACES `renderer.render()`) when true. */
+   *  calls `renderTslPost()` (which REPLACES `renderer.render()`) when true.
+   *  The ray traced mode is part of `anyEffectActive` (plan-762 F6). */
   get useTslPost(): boolean {
     if (this.host.isWebGPU === false || !this._tslPost) return false;
     const xr = (this.host.renderer as unknown as WebGLRenderer).xr;
@@ -279,9 +323,13 @@ export class PostProcessingManager {
     return this._tslPost.anyEffectActive;
   }
 
-  /** Render one frame through the TSL pipeline (replaces renderer.render()). */
-  renderTslPost(scene: Scene, camera: PerspectiveCamera | OrthographicCamera): void {
-    this._tslPost?.render(scene, camera);
+  /** Render one frame through the TSL pipeline (replaces renderer.render()).
+   *  Returns true when the pipeline also composited the overlay layers — the
+   *  caller must then SKIP its own post-render overlay pass. */
+  renderTslPost(scene: Scene, camera: PerspectiveCamera | OrthographicCamera): boolean {
+    if (!this._tslPost) return false;
+    this._tslPost.render(scene, camera);
+    return this._tslPost.compositesOverlayLayers;
   }
 
   /** Lazily build the TSL isolate-desaturation blit (shared Rec601 node).
@@ -327,8 +375,8 @@ export class PostProcessingManager {
     const gtaoPass = new GTAOPass(this.host.scene, this.host.camera, hw, hh);
     gtaoPass.normalMaterial.clippingPlanes = this._clippingPlanes;
     gtaoPass.output = GTAOPass.OUTPUT.Default;
-    gtaoPass.blendIntensity = 1.0;
-    gtaoPass.updateGtaoMaterial({ radius: 0.15, scale: 1.0, thickness: 0.5 });
+    gtaoPass.blendIntensity = this._aoIntensity;
+    gtaoPass.updateGtaoMaterial({ radius: this._aoRadius, scale: 1.0, thickness: 0.5, samples: GTAO_SAMPLES });
     gtaoPass.enabled = this._aoMode === 'gtao';
     composer.addPass(gtaoPass);
 
@@ -370,8 +418,11 @@ export class PostProcessingManager {
     const ph = c._height * c._pixelRatio;
     const hw = Math.max(1, Math.floor(pw * this._bufferScale));
     const hh = Math.max(1, Math.floor(ph * this._bufferScale));
-    if (this._gtaoPass) this._gtaoPass.setSize(hw, hh);
-    if (this._n8aoPass) this._n8aoPass.setSize(hw, hh);
+    const aoScale = aoScaleFor(this._bufferScale, c._pixelRatio);
+    const aw = Math.max(1, Math.floor(pw * aoScale));
+    const ah = Math.max(1, Math.floor(ph * aoScale));
+    if (this._gtaoPass) this._gtaoPass.setSize(aw, ah);
+    if (this._n8aoPass) this._n8aoPass.setSize(aw, ah);
     if (this._bloomPass) this._bloomPass.setSize(hw, hh);
   }
 
@@ -524,7 +575,7 @@ export class PostProcessingManager {
    *  On WebGPU the value drives the TSL GTAO blend uniform instead. */
   get ssaoIntensity(): number {
     if (this.host.isWebGPU) return this._tslPost?.aoIntensity ?? 1.0;
-    return this._gtaoPass?.blendIntensity ?? 1.0;
+    return this._aoIntensity;
   }
   set ssaoIntensity(v: number) {
     if (this.host.isWebGPU) {
@@ -532,6 +583,7 @@ export class PostProcessingManager {
       this.host.markRenderDirty();
       return;
     }
+    this._aoIntensity = v;
     if (this._gtaoPass) this._gtaoPass.blendIntensity = v;
     const n8 = this._n8aoPass as (Pass & { configuration?: { intensity: number } }) | null;
     if (n8?.configuration) n8.configuration.intensity = Math.max(1, v * 3);
@@ -542,7 +594,7 @@ export class PostProcessingManager {
    *  On WebGPU the value drives the TSL GTAO radius uniform instead. */
   get ssaoRadius(): number {
     if (this.host.isWebGPU) return this._tslPost?.aoRadius ?? 0.15;
-    return this._gtaoPass?.gtaoMaterial?.uniforms?.radius?.value ?? 0.15;
+    return this._aoRadius;
   }
   set ssaoRadius(v: number) {
     if (this.host.isWebGPU) {
@@ -550,6 +602,7 @@ export class PostProcessingManager {
       this.host.markRenderDirty();
       return;
     }
+    this._aoRadius = v;
     if (this._gtaoPass) this._gtaoPass.updateGtaoMaterial({ radius: v });
     const n8 = this._n8aoPass as (Pass & { configuration?: { aoRadius: number } }) | null;
     if (n8?.configuration) n8.configuration.aoRadius = v * 30;
@@ -558,14 +611,20 @@ export class PostProcessingManager {
 
   // ─── Bloom state ─────────────────────────────────────────────────────
 
-  /** Whether bloom (glow on bright areas) is enabled. WebGL only.
-   *  Side-effects (composer lazily ensured, pass toggled, render dirty)
-   *  match the original RVViewer setter exactly. */
+  /** Whether bloom (glow on bright areas) is enabled. WebGL: UnrealBloomPass
+   *  on the composer; WebGPURenderer paths: three's TSL bloom node on the
+   *  pipeline (plan-763). Side-effects (composer lazily ensured, pass
+   *  toggled, render dirty) match the original RVViewer setter exactly. */
   get bloomEnabled(): boolean { return this._bloomEnabled; }
   set bloomEnabled(v: boolean) {
     if (v === this._bloomEnabled) return;
     this._bloomEnabled = v;
-    if (v && !this.host.isWebGPU) this.ensureComposer();
+    if (this.host.isWebGPU) {
+      this._applyTslBloom(v);
+      this.host.markRenderDirty();
+      return;
+    }
+    if (v) this.ensureComposer();
     if (this._bloomPass) this._bloomPass.enabled = v;
     this.host.markRenderDirty();
   }
@@ -575,6 +634,7 @@ export class PostProcessingManager {
   set bloomIntensity(v: number) {
     this._bloomIntensity = v;
     if (this._bloomPass) this._bloomPass.strength = toWebGLBloomStrength(v);
+    if (this.host.isWebGPU) this._applyTslBloom(false);
     this.host.markRenderDirty();
   }
 
@@ -583,6 +643,7 @@ export class PostProcessingManager {
   set bloomThreshold(v: number) {
     this._bloomThreshold = v;
     if (this._bloomPass) this._bloomPass.threshold = v;
+    if (this.host.isWebGPU) this._applyTslBloom(false);
     this.host.markRenderDirty();
   }
 
@@ -591,7 +652,17 @@ export class PostProcessingManager {
   set bloomRadius(v: number) {
     this._bloomRadius = v;
     if (this._bloomPass) this._bloomPass.radius = v;
+    if (this.host.isWebGPU) this._applyTslBloom(false);
     this.host.markRenderDirty();
+  }
+
+  /** Push the bloom state into the TSL pipeline. `create` builds the pipeline
+   *  when bloom turns on; parameter changes only reach an existing pipeline
+   *  (`ensureTslPost` re-applies the remembered state when it is built later).
+   *  The RAW intensity goes in — `toWebGLBloomStrength` is WebGL-only. */
+  private _applyTslBloom(create: boolean): void {
+    const pipeline = create ? this.ensureTslPost() : this._tslPost;
+    pipeline?.setBloom(this._bloomEnabled, this._bloomIntensity, this._bloomRadius, this._bloomThreshold);
   }
 
   // ─── Isolate overlay (group-isolate "wash") ──────────────────────────

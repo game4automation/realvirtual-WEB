@@ -54,6 +54,25 @@ export function registerAxisOwnershipParticipant(
 }
 
 /**
+ * Every drive a registered participant moves — i.e. every axis a PATH PLANNER
+ * commands (`IKPath`, `KinematicMechanism`, `MechanismPath`), claimed or not.
+ *
+ * plan-673 Phase 4 reads it for the axis-role audit: a `DynamicAxis` with
+ * `SetpointSource: 'policy'` claims, a claim pauses every participant, and a
+ * claim on an axis a planner commands would therefore switch off the very path
+ * that is supposed to keep running. Taking the set from here keeps the audit
+ * free of an import of the IK layer, and it covers every participant kind
+ * instead of just the one the auditor happened to think of.
+ */
+export function plannerCommandedAxes(): Set<RVDrive> {
+  const out = new Set<RVDrive>();
+  for (const participant of participants) {
+    for (const drive of participant.drives) out.add(drive);
+  }
+  return out;
+}
+
+/**
  * Atomically claim all axes. Validation completes before any drive is stopped,
  * so a competing second claimer cannot partially seize a robot.
  */

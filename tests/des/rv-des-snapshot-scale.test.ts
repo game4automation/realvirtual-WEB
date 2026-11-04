@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 
+import { muRecords } from './snapshot-test-utils';
 /**
  * plan-261 test §9.6 — large-model scale (F5): a synthetic warehouse with
  * hundreds of components and thousands of MUs snapshots WITHOUT a stringify
@@ -11,17 +12,13 @@
 
 import { describe, it, expect } from 'vitest';
 import { Object3D, Scene } from 'three';
-import { DESManager } from '@rv-private/plugins/des/rv-des-manager';
-import { DES } from '@rv-private/plugins/des/rv-des-api';
-import { DESStation } from '@rv-private/plugins/des/rv-des-station';
-import type { DESComponent } from '@rv-private/plugins/des/rv-des-component';
-import { createSnapshot, restoreSnapshot } from '@rv-private/plugins/des/rv-des-snapshot';
-import { createDESMU, resetDESMUCounter } from '@rv-private/plugins/des/rv-des-mu';
-import type { DESMU, DESMUSnapshot } from '@rv-private/plugins/des/rv-des-mu';
-import { registerAction, ACTION_INDEX } from '@rv-private/plugins/des/rv-des-named-actions';
+import { runnerFixture } from './runner-fixture';
+import { resetDESMUCounter } from '@rv/plugins/des/rv-des-mu';
+import type { DESMU } from '@rv/plugins/des/rv-des-mu';
+import { registerAction, ACTION_INDEX } from '@rv/plugins/des/rv-des-named-actions';
 
 // Guarded registration — a no-op action for the synthetic pending workload.
-if (!ACTION_INDEX.has('ScaleTest.Noop')) registerAction('ScaleTest.Noop', () => {});
+if (!ACTION_INDEX.has('ScaleTest.Noop')) registerAction('ScaleTest.Noop', () => {}, { owner: 'component', payload: 'none' });
 
 const COMPONENT_COUNT = 300;
 const MU_COUNT = 3000;
@@ -31,30 +28,28 @@ const MAX_SNAPSHOT_BYTES = 100 * 1024 * 1024;
 describe('DES snapshot — large model scale (9.6)', () => {
   it('300 components / 3000 MUs snapshot + restore without overflow', () => {
     resetDESMUCounter();
-    const scene = new Scene();
-    const manager = new DESManager(16384);
-    DES.setManager(manager);
-
-    const components: DESComponent[] = [];
-    for (let i = 0; i < COMPONENT_COUNT; i++) {
-      const node = new Object3D();
-      node.name = `Station-${i}`;
-      scene.add(node);
-      const st = new DESStation(node);
-      st.prop['zone'] = `Z${i % 12}`;
-      st.ProcessingTime = 0;          // immediate pass-through — no event scheduling
-      st.MaxCapacity = MU_COUNT;      // park many MUs per station
-      manager.registerComponent(st);
-      components.push(st);
-    }
+    const makeWorld = () => {
+      const scene = new Scene();
+      for (let i = 0; i < COMPONENT_COUNT; i++) {
+        const node = new Object3D(); node.name = `Storage-${i}`;
+        // Storage parks the synthetic workload without scheduling processing events.
+        node.userData.realvirtual = { Storage: { MaxCapacity: MU_COUNT, AutoRelease: false } };
+        scene.add(node);
+      }
+      const fixture = runnerFixture(scene);
+      expect(fixture.components).toHaveLength(COMPONENT_COUNT);
+      fixture.runner.start([], { root: scene });
+      fixture.components.forEach((c, i) => { c.prop['zone'] = `Z${i % 12}`; });
+      return fixture;
+    };
+    const { runner, manager, components } = makeWorld();
 
     const mus: DESMU[] = [];
     for (let i = 0; i < MU_COUNT; i++) {
-      const mu = createDESMU(0);
-      manager.registerMU(mu);
+      const mu = runner.createMU() as DESMU;
       mu.prop['sku'] = `SKU-${i % 500}`;
       mu.prop['weight'] = (i % 37) * 0.5;
-      // Park each MU on a station so component muIds serialize too.
+      // Park each MU in storage so component muIds serialize too.
       const comp = components[i % COMPONENT_COUNT];
       comp.acceptMU(mu);
       mus.push(mu);
@@ -68,7 +63,7 @@ describe('DES snapshot — large model scale (9.6)', () => {
     // Snapshot: must not throw, and one stringify stays snapshot-sized.
     let json = '';
     expect(() => {
-      const snap = createSnapshot(manager, components, mus, [], null);
+      const snap = runner.fullSnapshot();
       json = JSON.stringify(snap);
     }).not.toThrow();
     expect(json.length).toBeGreaterThan(0);
@@ -76,32 +71,14 @@ describe('DES snapshot — large model scale (9.6)', () => {
 
     // Round-trip into a FRESH world (re-created MUs incl. instanced ones).
     resetDESMUCounter();
-    const scene2 = new Scene();
-    const manager2 = new DESManager(16384);
-    DES.setManager(manager2);
-    const components2: DESComponent[] = [];
-    for (let i = 0; i < COMPONENT_COUNT; i++) {
-      const node = new Object3D();
-      node.name = `Station-${i}`;
-      scene2.add(node);
-      const st = new DESStation(node);
-      manager2.registerComponent(st);
-      components2.push(st);
-    }
-    const mus2: DESMU[] = [];
-    const muFactory = (muSnap: DESMUSnapshot): DESMU => {
-      const mu = createDESMU(muSnap.creationTime);
-      mu.customId = muSnap.customId;
-      manager2.registerMUAt(mu, muSnap.id);
-      mus2.push(mu);
-      return mu;
-    };
+    const { runner: runner2, manager: manager2, components: components2 } = makeWorld();
 
     const parsed = JSON.parse(json);
     expect(() => {
-      restoreSnapshot(parsed, manager2, components2, mus2, [], null, muFactory);
+      runner2.restoreFull(parsed);
     }).not.toThrow();
 
+    const mus2 = muRecords(runner2.fullSnapshot());
     expect(mus2.length).toBe(MU_COUNT);
     expect(manager2.pendingEventCount).toBe(2000);
     expect(manager2.currentTime).toBe(manager.currentTime);

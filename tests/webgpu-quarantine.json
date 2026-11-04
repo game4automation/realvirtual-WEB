@@ -1,0 +1,9 @@
+{
+  "$comment": [
+    "plan-602 F9/F10: the WebGPU quarantine — tests whose BODY may fail for the recorded cause (tests/helpers/quarantine.ts, quarantinedIt).",
+    "Curated, may only SHRINK: the ids must equal QUARANTINE_BASELINE in tests/webgpu-quarantine.node.test.ts. observedOn (mandatory) records the machine the failure was classified on; the hand-over is plan-763.",
+    "2026-10-17 (plan-763, GTX 1060 6GB Pascal, driver 560.94, Chromium 145 full build, Dawn D3D12): with a real WebGPU device all eight original entries pass or were fixed (capability probe: DoF measure robust to path-tracing noise; teardown-guard test waits for an earlier arm to expire) — the list is EMPTY. It stays as the mechanism; an entry may never be re-added.",
+    "That observation REQUIRES the full Chromium build: launchOptions.channel = GPU_BROWSER_CHANNEL ('chromium') in vitest.gpu.config.ts (commit b748d034). Playwright's default chrome-headless-shell lacks dxil.dll/dxcompiler.dll, so Dawn cannot create a device and three falls back to WebGL2. Reverting the channel turns these tests red again; the cause is then the browser binary, not the tests."
+  ],
+  "webgpuQuarantine": []
+}

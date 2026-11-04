@@ -1,0 +1,42 @@
+{
+  "version": "1.0",
+  "name": "Partner catalog (fixture)",
+  "entries": [
+    {
+      "id": "partner-belt-1m",
+      "name": "Belt 1m",
+      "category": "Conveyors",
+      "glbUrl": "Parts/Belt-1m.glb"
+    },
+    {
+      "id": "partner-belt-2m",
+      "name": "Belt 2m",
+      "category": "Conveyors",
+      "glbUrl": "Parts/Belt-2m.glb"
+    },
+    {
+      "id": "partner-curve-90",
+      "name": "Curve 90",
+      "category": "Conveyors",
+      "glbUrl": "Parts/Curve-90.glb"
+    },
+    {
+      "id": "partner-lift",
+      "name": "Lift",
+      "category": "Parts",
+      "glbUrl": "Parts/Lift.glb"
+    },
+    {
+      "id": "partner-pallet",
+      "name": "Pallet",
+      "category": "Parts",
+      "glbUrl": "Parts/Pallet.glb"
+    },
+    {
+      "id": "partner-sensor",
+      "name": "Sensor",
+      "category": "Parts",
+      "glbUrl": "Parts/Sensor.glb"
+    }
+  ]
+}

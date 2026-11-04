@@ -16,6 +16,7 @@ import type { RVDrive } from '../src/core/engine/rv-drive';
 import type { RVDriveSpeed } from '../src/core/engine/rv-drive-speed';
 import type { RVDriveFollowPosition } from '../src/core/engine/rv-drive-follow-position';
 import { resolveBindableSlots } from '../src/core/engine/rv-binding-slot-resolver';
+import { slotCommand, slotNeutralize } from '../src/core/engine/rv-slot-io';
 
 interface Fixture<T extends RVComponent> {
   node: Object3D;
@@ -53,15 +54,15 @@ describe('direct command contracts', () => {
       Acceleration: 30,
     });
 
-    f.component.commandSignalTargetSpeed(-240);
-    f.component.commandSignalAcceleration(60);
+    slotCommand(f.component, 'SignalTargetSpeed', -240);
+    slotCommand(f.component, 'SignalAcceleration', 60);
     f.drive.update(1 / 60);
     expect(f.drive.targetSpeed).toBe(240);
     expect(f.drive.jogBackward).toBe(true);
     expect(f.drive.Acceleration).toBe(60);
 
-    f.component.neutralizeSignalTargetSpeed();
-    f.component.neutralizeSignalAcceleration();
+    slotNeutralize(f.component, 'SignalTargetSpeed');
+    slotNeutralize(f.component, 'SignalAcceleration');
     f.drive.update(1 / 60);
     expect(f.drive.targetSpeed).toBe(120);
     expect(f.drive.jogForward).toBe(true);

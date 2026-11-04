@@ -12,6 +12,13 @@ import {
   type SignalWriter,
 } from './rv-signal-store';
 import { debug } from './rv-debug';
+import { slotDeclare, slotRead, slotUndeclare, slotWrite } from './rv-slot-io';
+
+/** PLCOutput slots of Drive_FestoFHPP (PLC → drive). */
+const COMMAND_SLOTS = ['Ccon', 'Cpos', 'RecordOrCdir', 'VelocityPercent', 'TargetPosition'] as const;
+type CommandSlot = typeof COMMAND_SLOTS[number];
+/** PLCInput slots of Drive_FestoFHPP (drive → PLC). */
+const FEEDBACK_SLOTS = ['Scon', 'Spos', 'RecordOrSdir', 'PositionActual'] as const;
 
 /** True when bit `n` of `word` is set. */
 function bit(word: number, n: number): boolean {
@@ -134,6 +141,9 @@ export class RVDriveFestoFHPP implements IDriveBehavior, RVComponent {
 
     // Register self as a drive behavior so drive.update() calls our update().
     drive.driveBehaviors.push(this);
+    // Unwired slots stay bindable in the viewer (SlotIO, rv-slot-io.ts).
+    for (const slot of COMMAND_SLOTS) slotDeclare(this, slot, 'poll');
+    for (const slot of FEEDBACK_SLOTS) slotDeclare(this, slot, 'feedback');
 
     debug('loader',
       `  Drive_FestoFHPP "${drive.name}": ccon="${this.Ccon}" cpos="${this.Cpos}" records=${this.records().length}`);
@@ -144,8 +154,9 @@ export class RVDriveFestoFHPP implements IDriveBehavior, RVComponent {
     return Array.isArray(this.Records) ? this.Records.map(toRecord) : [];
   }
 
-  private readInt(address: string | null): number {
-    return address ? Math.round(this.signalStore!.getFloatByPath(address)) : 0;
+  /** A command slot as integer: the wired signal, else the direct value, else `fallback`. */
+  private readInt(slot: CommandSlot, fallback = 0): number {
+    return Math.round(slotRead(this.signalStore!, this, slot, this[slot], fallback));
   }
 
   /** Called every fixed timestep from the drive's update(), before physics. */
@@ -154,8 +165,8 @@ export class RVDriveFestoFHPP implements IDriveBehavior, RVComponent {
     const store = this.signalStore;
     if (!drive || !store) return;
 
-    const ccon = this.readInt(this.Ccon);
-    const cpos = this.readInt(this.Cpos);
+    const ccon = this.readInt('Ccon');
+    const cpos = this.readInt('Cpos');
 
     const enable = bit(ccon, 0);
     const stop = bit(ccon, 1);         // active low named action: 0 = stop
@@ -249,15 +260,13 @@ export class RVDriveFestoFHPP implements IDriveBehavior, RVComponent {
     this.SposValue = spos;
 
     // ── Feedback (drive → PLC) — ALWAYS ──
-    const writer = this.signalWriter!;
-    if (this.Scon) writer.setByPath(this.Scon, scon);
-    if (this.Spos) writer.setByPath(this.Spos, spos);
-    if (this.RecordOrSdir) writer.setByPath(this.RecordOrSdir, this.readInt(this.RecordOrCdir)); // echo byte 2
-    if (this.PositionActual) {
-      writer.setByPath(this.PositionActual, this.PositionScale !== 0
-        ? Math.round((drive.currentPosition - this.PositionOffset) / this.PositionScale)
-        : 0);
-    }
+    const writer = this.signalWriter;
+    slotWrite(this, 'Scon', this.Scon, scon, writer);
+    slotWrite(this, 'Spos', this.Spos, spos, writer);
+    slotWrite(this, 'RecordOrSdir', this.RecordOrSdir, this.readInt('RecordOrCdir'), writer); // echo byte 2
+    slotWrite(this, 'PositionActual', this.PositionActual, this.PositionScale !== 0
+      ? Math.round((drive.currentPosition - this.PositionOffset) / this.PositionScale)
+      : 0, writer);
   }
 
   private startPositioningTask(drive: RVDrive, directMode: boolean, commands: boolean): void {
@@ -265,16 +274,16 @@ export class RVDriveFestoFHPP implements IDriveBehavior, RVComponent {
     let speed: number;
 
     if (directMode) {
-      const cdir = this.readInt(this.RecordOrCdir);
+      const cdir = this.readInt('RecordOrCdir');
       const relative = bit(cdir, 0); // CDIR.0 1 = relative
-      const tarpos = this.readInt(this.TargetPosition);
+      const tarpos = this.readInt('TargetPosition');
       targetMm = relative
         ? drive.currentPosition + tarpos * this.PositionScale
         : tarpos * this.PositionScale + this.PositionOffset;
-      const velPercent = this.VelocityPercent ? Math.max(0, Math.min(100, this.readInt(this.VelocityPercent))) : 100;
+      const velPercent = Math.max(0, Math.min(100, this.readInt('VelocityPercent', 100))); // 100 % while unbound
       speed = velPercent / 100 * this.BaseVelocity;
     } else {
-      const recNo = this.readInt(this.RecordOrCdir);
+      const recNo = this.readInt('RecordOrCdir');
       const records = this.records();
       if (recNo < 0 || recNo >= records.length) return; // unknown record — ignore the start
       const rec = records[recNo];
@@ -292,6 +301,7 @@ export class RVDriveFestoFHPP implements IDriveBehavior, RVComponent {
   }
 
   dispose(): void {
+    slotUndeclare(this);
     if (this.drive) {
       const index = this.drive.driveBehaviors.indexOf(this);
       if (index >= 0) this.drive.driveBehaviors.splice(index, 1);

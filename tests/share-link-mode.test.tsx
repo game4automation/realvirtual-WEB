@@ -58,6 +58,8 @@ function chooseMode(mode: 'viewer' | 'commissioning') {
 }
 
 async function submitAndReadLink(): Promise<string> {
+  // An upload stays locked until /limits answered (plan-2209); own URL is never locked.
+  await waitFor(() => expect((screen.getByTestId('share-submit') as HTMLButtonElement).disabled).toBe(false));
   fireEvent.click(screen.getByTestId('share-submit'));
   await waitFor(() => expect(screen.getByTestId('share-link')).toBeTruthy());
   return testId('share-link').value;
@@ -187,7 +189,7 @@ describe('shareLink_OptionsAreBuiltOnce', () => {
     // captured and the radio button does nothing — the defect this pins is
     // invisible in the UI and only shows in the produced link.
     expect(shareDialogSource).toContain('[linkBase, recipientMode]');
-    expect(shareDialogSource).toContain('[getBytes, meta, expiry, allowDownload, name, linkOptions]');
-    expect(shareDialogSource).toContain('[target, ownUrl, terms, persistDraft, doUpload, linkOptions]');
+    expect(shareDialogSource).toContain('[getBytes, meta, validExpiry, allowDownload, name, linkOptions, refreshLimits]');
+    expect(shareDialogSource).toContain('[target, ownUrl, terms, validExpiry, persistDraft, doUpload, linkOptions]');
   });
 });

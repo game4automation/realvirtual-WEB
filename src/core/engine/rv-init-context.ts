@@ -36,6 +36,7 @@ import type { ChainManager } from './rv-chain-manager';
 import type { RibbonManager } from './rv-ribbon-manager';
 import type { MachiningManager } from './rv-machining-manager';
 import type { CollisionRoleRegistrar } from './rv-collision-role';
+import type { DropDetectionRegistrar } from './rv-drop-detection';
 import type { ErrorStore } from './rv-error-store';
 import type { RVHighlightManager } from './rv-highlight-manager';
 import type { InstructionRuntimeStore } from './rv-instruction-runtime-store';
@@ -69,6 +70,13 @@ export interface InitSubsystems {
   machiningManager?: MachiningManager;
   /** Collision-role registry (plan-394). */
   collisionManager?: CollisionRoleRegistrar;
+  /**
+   * Optional viewer-owned drop-detection registry (plan-2022). The one
+   * `DropDetection` component of the scene registers its configuration here;
+   * every other component ignores it. Absent (or no component) = the detection
+   * is off and no existing model changes behaviour.
+   */
+  dropManager?: DropDetectionRegistrar;
   /** Viewer event bus — components that react to UI↔engine signals. */
   events?: EventEmitter<ViewerEvents>;
   /** Error registry (WebError). */
@@ -86,7 +94,7 @@ export interface InitSubsystems {
 /** The key list of {@link InitSubsystems} — what `subsystemsOf` picks out of a wider bag. */
 export const INIT_SUBSYSTEM_KEYS: ReadonlyArray<keyof InitSubsystems> = Object.freeze([
   'gizmoManager', 'lampManager', 'webLabelManager', 'outlineManager', 'energyChainManager', 'sceneButtonManager',
-  'chainManager', 'ribbonManager', 'machiningManager', 'collisionManager', 'events',
+  'chainManager', 'ribbonManager', 'machiningManager', 'collisionManager', 'dropManager', 'events',
   'errorStore', 'instructionStore', 'highlighter', 'reapply',
 ] as const);
 
@@ -143,6 +151,7 @@ export function buildInitContext(deps: InitContextDeps): InitContextBase {
     ribbonManager: deps.ribbonManager,
     machiningManager: deps.machiningManager,
     collisionManager: deps.collisionManager,
+    dropManager: deps.dropManager,
     events: deps.events,
     errorStore: deps.errorStore,
     instructionStore: deps.instructionStore,

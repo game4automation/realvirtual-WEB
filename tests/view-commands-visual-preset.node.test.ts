@@ -17,6 +17,12 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { ensureSessionOverlayCommandsRegistered } from '../src/core/hmi/session-overlay-commands';
+import { ensureComponentCommandsRegistered } from '../src/core/hmi/component-commands';
+import { ensureQueryCommandsRegistered } from '../src/core/hmi/query-commands';
+import { ensureDocumentCommandsRegistered } from '../src/core/hmi/document-commands';
+import { ensureSignalAutomapCommandsRegistered } from '../src/core/hmi/signal-automap-commands';
+import { ensureDesPlcCommandsRegistered } from '../src/core/hmi/des-plc-commands';
 import { CommandRegistry } from '../src/core/hmi/rv-command-registry';
 import {
   ensureViewCommandsRegistered, visualPresetKey, visualPresetInvalid,
@@ -92,6 +98,12 @@ describe('view.visualPreset', () => {
     registry = new CommandRegistry();
     setAppConfig({});
     ensureViewCommandsRegistered(registry);
+    ensureSessionOverlayCommandsRegistered(registry);
+    ensureComponentCommandsRegistered(registry);
+    ensureQueryCommandsRegistered(registry);
+    ensureDocumentCommandsRegistered(registry);
+    ensureSignalAutomapCommandsRegistered(registry);
+    ensureDesPlcCommandsRegistered(registry);
     await seedPublished([]);
   });
   afterEach(() => {
@@ -101,6 +113,12 @@ describe('view.visualPreset', () => {
 
   it('registers once (idempotent) with mcp mirror web_view_visual_preset and the wire argsSchema', () => {
     ensureViewCommandsRegistered(registry);
+    ensureSessionOverlayCommandsRegistered(registry);
+    ensureComponentCommandsRegistered(registry);
+    ensureQueryCommandsRegistered(registry);
+    ensureDocumentCommandsRegistered(registry);
+    ensureSignalAutomapCommandsRegistered(registry);
+    ensureDesPlcCommandsRegistered(registry);
     const d = registry.get(ID)!;
     expect(d).toBeDefined();
     expect(d.mcp?.tool).toBe('web_view_visual_preset');

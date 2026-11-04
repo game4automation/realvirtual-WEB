@@ -40,16 +40,16 @@ describe('feature matrix responsive sticky table', () => {
     const table = screen.getByRole('table', { name: 'Plugins by workspace mode' });
     const scroller = table.parentElement;
     if (!scroller) throw new Error('Missing table scroller');
-    for (const name of ['Plugin', 'Ein/Aus User-Intention', 'HMI', 'DES']) {
+    for (const name of ['Plugin', 'On/Off user intent', 'HMI', 'DES']) {
       assertVisibleWithin(screen.getByRole('columnheader', { name }), scroller);
     }
 
     await page.viewport(360, 720);
     assertVisibleWithin(screen.getByRole('columnheader', { name: 'Plugin' }), scroller);
-    assertVisibleWithin(screen.getByRole('columnheader', { name: 'Ein/Aus User-Intention' }), scroller);
+    assertVisibleWithin(screen.getByRole('columnheader', { name: 'On/Off user intent' }), scroller);
 
     const stickyPlugin = screen.getByRole('columnheader', { name: 'Plugin' });
-    const stickySwitch = screen.getByRole('columnheader', { name: 'Ein/Aus User-Intention' });
+    const stickySwitch = screen.getByRole('columnheader', { name: 'On/Off user intent' });
     const pluginLeft = stickyPlugin.getBoundingClientRect().left;
     const switchLeft = stickySwitch.getBoundingClientRect().left;
     scroller.scrollLeft = scroller.scrollWidth;
@@ -63,6 +63,6 @@ describe('feature matrix responsive sticky table', () => {
     rendered.rerender(<FeatureMatrixPanel viewer={harness.viewer} />);
     expect(screen.queryByRole('columnheader', { name: 'Tier Info' })).toBeNull();
     assertVisibleWithin(screen.getByRole('columnheader', { name: 'Plugin' }), scroller);
-    assertVisibleWithin(screen.getByRole('columnheader', { name: 'Ein/Aus User-Intention' }), scroller);
+    assertVisibleWithin(screen.getByRole('columnheader', { name: 'On/Off user intent' }), scroller);
   });
 });

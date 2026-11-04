@@ -1,40 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 
+
 /**
- * rv-project-manager.ts — active project / experiment resolution (plan-260).
- *
- * A PROJECT is the comparison boundary (F5/F11): every experiment/run inside
- * shares the same KPI structure and may be compared; cross-project comparison
- * does not exist. An EXPERIMENT is one concrete model state (identified by
- * `glbHash`, F6) inside a project — a changed layout creates a NEW experiment
- * under the SAME project.
- *
- * All experiment data lives behind the `SimDesControl` facade (JSON string
- * transport, plan-261 B3); this module only orchestrates: default project
- * bootstrap, glb fingerprinting, experiment find-or-create, active-scope
- * publication (`runScopeStore`, read by the private run-lifecycle controller)
- * and cascading project deletion.
- *
- * glbHash deviation from the plan wording (documented in plan-260's
- * Implementation-Complete section): instead of hashing the raw GLB bytes
- * (which are not retained after parsing), the fingerprint is a SHA-256 over
- * the STRUCTURE the statistics are keyed by — the sorted material-flow
- * component names/types/kinds plus the model key. That is exactly the
- * comparability criterion a project protects (same stations/KPIs) and it is
- * available at runtime without re-downloading the model.
+ * Active project and scene-column resolution. Projects bound comparisons; columns
+ * bind to Base or a variant ID. Effective Base changes invalidate results without changing the column.
  */
 
 import type { SimDesControl, SimulationKernel } from './simulation-kernel';
+import type { ModelInputHost } from '../../plugins/des/rv-des-model-input';
 import {
   listProjects, createProject, deleteProjectRecord, parseExperimentInfo,
   runScopeStore,
   type Project, type ExperimentInfo, type RunScope,
 } from './rv-run-history-store';
+import { currentRunLease, getSceneVariantProvenance, subscribeRunLease, getColumnMigrationContext } from '../hmi/rv-run-lease';
+import { reportProblem } from '../hmi/problems-store';
 import { getDesRunSettings, updateDesRunSettings } from '../hmi/des-run-settings-store';
 
 /** Minimal viewer surface (structural — no RVViewer import). */
-export interface ProjectManagerViewerLike {
+export interface ProjectManagerViewerLike extends Partial<ModelInputHost> {
   readonly currentModelUrl?: string | null;
   readonly simulationKernel: Pick<SimulationKernel, 'desControl'> | null;
 }
@@ -70,7 +55,7 @@ export async function sha256Hex(text: string): Promise<string> {
   return `fnv1a-${(h >>> 0).toString(16)}`;
 }
 
-/** Structure fingerprint of the loaded model — the experiment identity (F6). */
+/** Legacy structure fingerprint retained for the old matrix metadata. */
 export async function computeGlbFingerprint(viewer: ProjectManagerViewerLike): Promise<string> {
   const ctl = viewer.simulationKernel?.desControl() ?? null;
   const states = ctl?.componentStates?.() ?? [];
@@ -98,62 +83,34 @@ export async function ensureActiveProject(): Promise<Project> {
 /** Switch the active project (comparison context). Clears the run scope so it
  *  re-resolves against the new project on the next `ensureActiveScope`. */
 export function setActiveProject(projectId: string): void {
+  scopeGeneration++;
   updateDesRunSettings({ activeProjectId: projectId });
   runScopeStore.set(() => null);
 }
 
-/** All experiment manifests of `projectId` for the CURRENT model (the compare
- *  candidate list is strictly project-internal — F11). Untagged legacy
- *  experiments (no projectId) are NOT offered. */
-export async function listProjectExperiments(
-  viewer: ProjectManagerViewerLike,
-  projectId: string,
-): Promise<ExperimentInfo[]> {
-  const ctl = viewer.simulationKernel?.desControl() ?? null;
-  if (!ctl?.listExperiments || !ctl.readManifestJson) return [];
-  const model = modelKeyOf(viewer);
-  const index = await ctl.listExperiments(model);
-  const out: ExperimentInfo[] = [];
-  for (const e of index) {
-    const json = await ctl.readManifestJson(e.model, e.experiment);
-    const info = json ? parseExperimentInfo(json) : null;
-    if (info && info.projectId === projectId) out.push(info);
-  }
-  out.sort((a, b) => a.createdAt - b.createdAt);
-  return out;
+export type ExperimentScopeHook = (viewer: ProjectManagerViewerLike) => Promise<RunScope | null>;
+export type VariantSetChangedHook = (viewer: ProjectManagerViewerLike, restore?: boolean,
+  knownVariants?: readonly import('../variants/rv-variant-model').Variant[]) => Promise<void>;
+export let experimentScopeHook: ExperimentScopeHook | null = null;
+let variantSetChangedHook: VariantSetChangedHook | null = null;
+export function setExperimentScopeHook(hook: ExperimentScopeHook | null): void { experimentScopeHook = hook; }
+export function setOnVariantSetChanged(hook: VariantSetChangedHook | null): void { variantSetChangedHook = hook; }
+export function ensureActiveScope(viewer: ProjectManagerViewerLike): Promise<RunScope | null> {
+  return experimentScopeHook?.(viewer) ?? Promise.resolve(null);
 }
-
-/**
- * Resolve (or create) the experiment for the current model state under the
- * active project and publish it as the ACTIVE RUN SCOPE (F6). A changed model
- * structure (different `glbHash`) creates a new experiment in the SAME
- * project. Returns null without a DES control surface.
- */
-export async function ensureActiveScope(viewer: ProjectManagerViewerLike): Promise<RunScope | null> {
-  const ctl = viewer.simulationKernel?.desControl() ?? null;
-  if (!ctl?.patchExperimentMetaJson) return null;
-
-  const project = await ensureActiveProject();
-  const model = modelKeyOf(viewer);
-  const glbHash = await computeGlbFingerprint(viewer);
-
-  const experiments = await listProjectExperiments(viewer, project.projectId);
-  let expName = experiments.find((e) => e.glbHash === glbHash)?.experiment;
-  if (!expName) {
-    expName = nextExperimentName(experiments.map((e) => e.experiment));
-    await ctl.patchExperimentMetaJson(model, expName, JSON.stringify({
-      projectId: project.projectId,
-      glbHash,
-      baseSeed: ctl.masterSeed ?? 42,
-    }));
-  }
-  const scope: RunScope = { model, exp: expName, projectId: project.projectId };
-  runScopeStore.set(() => scope);
-  return scope;
+export function reconcileExperimentVariants(viewer: ProjectManagerViewerLike, restore = true,
+  knownVariants: readonly import('../variants/rv-variant-model').Variant[] = []): Promise<void> {
+  return variantSetChangedHook?.(viewer, restore, knownVariants) ?? Promise.resolve();
 }
+let scopeGeneration = 0;
+export function experimentScopeGeneration(): number { return scopeGeneration; }
 
 /** Explicitly select an experiment of the active project as the run scope. */
 export function setActiveExperiment(model: string, exp: string, projectId: string | null): void {
+  if (projectId !== null && projectId !== getDesRunSettings().activeProjectId) {
+    throw new Error('Cannot select an experiment belonging to another project');
+  }
+  scopeGeneration++;
   runScopeStore.set(() => ({ model, exp, projectId }));
 }
 
@@ -191,3 +148,5 @@ export async function deleteProjectCascade(
     runScopeStore.set(() => null);
   }
 }
+
+export const onVariantSetChanged = reconcileExperimentVariants;

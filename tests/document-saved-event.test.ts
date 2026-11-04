@@ -34,12 +34,10 @@ vi.mock('../src/core/editor/rv-asset-glb-export', async (original) => {
   };
 });
 
-vi.mock('../src/core/thumbnails/thumbnail-renderer', () => ({
-  ThumbnailRenderer: class {
-    render(): string | null { return null; }
-    dispose(): void {}
-  },
-}));
+// plan-776: the save reaches the renderer only through the thumbnail writer —
+// one shared stand-in for it (tests/helpers/mock-thumbnail-write.ts).
+vi.mock('../src/core/thumbnails/rv-thumbnail-write', async () =>
+  (await import('./helpers/mock-thumbnail-write')).mockThumbnailWriteModule());
 
 function makeBackend(id: string) {
   return {

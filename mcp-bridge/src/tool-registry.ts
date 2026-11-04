@@ -10,8 +10,20 @@ import type { ToolSchema } from './protocol.js';
  * `McpServer`), so we keep the list here and serve it from the ListTools handler.
  * `replace()` is called on every `discover`; `clear()` on browser disconnect.
  */
+/**
+ * Emergency switch (plan-641 Nachtrag 2026-10-21): `RV_MCP_LIST_ALIASES=1` lists the
+ * command-bound alias tools again. Default: hidden from `tools/list`, still callable.
+ */
+export function aliasesListedFromEnv(env: Record<string, string | undefined> = process.env): boolean {
+  const v = (env.RV_MCP_LIST_ALIASES ?? '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
 export class ToolRegistry {
   private readonly _tools = new Map<string, ToolSchema>();
+
+  /** @param listAliases true = also list tools the browser announced with `listed: false`. */
+  constructor(private readonly listAliases: boolean = aliasesListedFromEnv()) {}
 
   /** Replace the whole set with the announced tools (ignores entries without a name). */
   replace(tools: ToolSchema[]): void {
@@ -51,7 +63,9 @@ export class ToolRegistry {
    * transports advertise the same tools differently.
    */
   list(): ToolSchema[] {
-    return [...this._tools.values()].map(({ timeoutMs: _timeoutMs, ...rest }) => rest);
+    return [...this._tools.values()]
+      .filter((t) => t.tombstone !== true && (this.listAliases || t.listed !== false))
+      .map(({ timeoutMs: _timeoutMs, listed: _listed, tombstone: _tombstone, ...rest }) => rest);
   }
 
   get size(): number {

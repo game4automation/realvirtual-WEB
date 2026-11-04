@@ -43,6 +43,7 @@ import { createSignalWriter, type SignalWriter } from './rv-signal-store';
 import type { SceneButtonManager } from './rv-scene-button-manager';
 import type { RVSceneButtonMoveable } from './rv-scene-button-moveable';
 import { wireValueSignal } from './rv-signal-wiring';
+import { slotWrite } from './rv-slot-io';
 
 /** Who caused a state change — decides whether `liveControlled` may gate it. */
 export type SceneButtonClickSource = 'operator' | 'auto';
@@ -75,6 +76,8 @@ export class RVSceneButtonBase implements RVComponent {
   private _manager?: SceneButtonManager;
   private _writer?: SignalWriter;
   private _stateSignal: string | null = null;
+  /** Wrapper that declared `stateSignal` in SlotIO (null = none). */
+  private _slotOwner: object | null = null;
   private _unsubState?: () => void;
 
   private _active = false;
@@ -123,11 +126,15 @@ export class RVSceneButtonBase implements RVComponent {
   /**
    * Wire the PLC input signal this button writes. Called by the wrapper
    * component (Unity: `SceneButtonBase.SetInputSignal`). Passing null unwires.
+   * `slotOwner` is the wrapper that declared `stateSignal` in SlotIO: every
+   * written flank is published to its slot too, so an unwired button can be
+   * bound directly in the viewer.
    */
-  setStateSignal(address: string | null): void {
+  setStateSignal(address: string | null, slotOwner: object | null = null): void {
     this._unsubState?.();
     this._unsubState = undefined;
     this._stateSignal = address;
+    this._slotOwner = slotOwner;
     if (!address || !this._ctx) return;
 
     // plan-538 F4: an NC button writes its released value (true) at start, so
@@ -241,13 +248,15 @@ export class RVSceneButtonBase implements RVComponent {
 
   /** Write one flank of the operator pulse. Autonomous flanks respect the live gate. */
   private _writeState(value: boolean, source: SceneButtonClickSource): void {
-    if (!this._stateSignal || !this._writer) return;
+    if (!this._stateSignal && !this._slotOwner) return;
     // Defense in depth: `click()` already refuses an autonomous change while
     // live-controlled, but the release flank of a pulse started BEFORE the gate
     // was raised still passes through here.
     if (source === 'auto' && this.liveControlled) return;
     // plan-538 F4: a normally-closed button writes the inverse of "pressed".
-    this._writer.setByPath(this._stateSignal, this.invertSignal ? !value : value);
+    // Wired: into the store as before; declared: into the SlotIO slot as well.
+    slotWrite(this._slotOwner ?? this, 'stateSignal', this._stateSignal,
+      this.invertSignal ? !value : value, this._writer ?? null);
   }
 
   /** Confirmed state from the store (own write echo, force, remote, PLC). */
@@ -268,6 +277,7 @@ export class RVSceneButtonBase implements RVComponent {
   dispose(): void {
     this._unsubState?.();
     this._unsubState = undefined;
+    this._slotOwner = null;
     this._manager?.unregister(this);
     this._manager = undefined;
     this._writer = undefined;

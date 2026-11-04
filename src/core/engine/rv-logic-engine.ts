@@ -4,6 +4,7 @@
 import type { Object3D } from 'three';
 import { createSignalWriter, type SignalStore, type SignalWriter } from './rv-signal-store';
 import { NodeRegistry, type ComponentRef } from './rv-node-registry';
+import { isComponentReference } from './rv-node-path-rewrite.mjs';
 import { isActiveForState, parseActiveOnly, type ActiveOnly } from './rv-active-only';
 import type { RVDrive } from './rv-drive';
 import {
@@ -43,6 +44,7 @@ import { RVIKPathStep } from './rv-ik-path-step';
 import { getLogicStepBuilder } from './rv-logic-step-registry';
 import { validateExtras, logicRootRuleWarnings, type LogicRootRuleInput } from './rv-extras-validator';
 import { debug } from './rv-debug';
+import { MAINTENANCE_PROCEDURE_TYPE } from './rv-maintenance-components';
 
 // ─── Step State Info (for UI polling) ────────────────────────────
 
@@ -113,7 +115,8 @@ class LogicRootRuntime implements LogicRootContext {
  * RVLogicEngine - Reconstructs LogicStep hierarchies from GLB node trees
  * and runs them in the simulation loop.
  *
- * Each top-level SerialContainer (with autoLoop) runs independently.
+ * Each top-level SerialContainer (with autoLoop) runs independently; nested SerialContainers
+ * run once per start and report Finished to their parent container (as in Unity).
  * Engine is updated via fixedUpdate() from the simulation loop.
  *
  * plan-538 — per-root `Active` lifecycle. Every top-level root carries its own
@@ -163,6 +166,13 @@ export class RVLogicEngine {
   /** True once start() ran — roots added later (placed assets) start immediately. */
   private started = false;
 
+  /**
+   * plan-522: registry paths of the LogicStep nodes inside a maintenance
+   * procedure that `addSubtree()` skipped → their node (for subtree-scoped
+   * removal). `reapplyStepFields` is a no-op for them.
+   */
+  private readonly skippedMaintenancePaths = new Map<string, Object3D>();
+
   /** Build LogicStep tree from GLB scene graph */
   static build(
     sceneRoot: Object3D,
@@ -190,10 +200,12 @@ export class RVLogicEngine {
 
   /**
    * Build the LogicSteps found in a subtree and merge them as new roots.
-   * Used by build() for the whole model and by the Layout Planner for placed
-   * library assets (processExtras handles components but not logic). Roots
-   * added after start() ran are started immediately so a dropped asset's
-   * sequences run without a sim restart.
+   * Used through `mergePlacedLogic()` for the main model (once its scene is
+   * complete, plan-769 Phase 6) and for every placed asset (processExtras
+   * handles components but not logic). A runtime placement BELOW the subtree
+   * root is skipped — it merges its own steps. Roots added after start() ran
+   * are started immediately so a dropped asset's sequences run without a sim
+   * restart.
    *
    * @returns number of root containers added.
    */
@@ -205,18 +217,40 @@ export class RVLogicEngine {
     // Find all nodes that have LogicStep components
     const stepNodes: { node: Object3D; rv: Record<string, unknown>; stepType: string }[] = [];
 
-    subtreeRoot.traverse((node: Object3D) => {
+    // plan-522 F2: a maintenance procedure (node with
+    // `LogicStep_MaintenanceProcedure`) and its whole subtree are data for the
+    // maintenance guide, never logic — its step nodes carry DriveTo /
+    // SetSignalBool that must not run at load. Filtered BEFORE the root
+    // selection (plan-538 contract): no root, no stepByPath entry, no root-rule
+    // warning, no owned output. Also when the subtree itself lies under one.
+    for (let p = subtreeRoot.parent; p; p = p.parent) {
+      if (isMaintenanceProcedureNode(p)) return 0;
+    }
+    const collect = (node: Object3D): void => {
+      // plan-769 Phase 6: a runtime placement below the subtree root brings its
+      // own logic — merged at its integration, or held by the trust gate
+      // (plan-757 F6). The main model's merge runs AFTER its placements
+      // materialised and must neither build their steps a second time nor
+      // start the steps of a gated asset.
+      if (node !== subtreeRoot && isPlacementContentRoot(node)) return;
       const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
-      if (!rv) return;
-
-      // Find any LogicStep_* key
-      for (const key of Object.keys(rv)) {
-        if (key.startsWith('LogicStep_')) {
-          stepNodes.push({ node, rv, stepType: key });
-          break; // One LogicStep per node rule
+      if (rv) {
+        if (rv[MAINTENANCE_PROCEDURE_TYPE] != null) {
+          this.rememberSkipped(node, registry);
+          return;
+        }
+        // Find any LogicStep_* key
+        for (const key of Object.keys(rv)) {
+          if (key.startsWith('LogicStep_')) {
+            stepNodes.push({ node, rv, stepType: key });
+            break; // One LogicStep per node rule
+          }
         }
       }
-    });
+      const children = node.children;
+      for (let i = 0; i < children.length; i++) collect(children[i]);
+    };
+    collect(subtreeRoot);
 
     if (stepNodes.length === 0) return 0;
 
@@ -263,6 +297,7 @@ export class RVLogicEngine {
     for (const tl of topLevelNodes) {
       const step = buildStep(tl.node, tl.stepType, tl.rv, nodeStepMap, registry, signalStore, subtreeRoot);
       if (!step) continue;
+      disableNestedAutoLoop(step);
       this.roots.push(step);
       this.rootNodeByStep.set(step, tl.node);
       populateStepByPath(step, tl.node);
@@ -291,6 +326,11 @@ export class RVLogicEngine {
     for (const [step, node] of this.rootNodeByStep) {
       for (let p: Object3D | null = node; p; p = p.parent) {
         if (p === subtreeRoot) { removedRoots.add(step); break; }
+      }
+    }
+    for (const [path, node] of this.skippedMaintenancePaths) {
+      for (let p: Object3D | null = node; p; p = p.parent) {
+        if (p === subtreeRoot) { this.skippedMaintenancePaths.delete(path); break; }
       }
     }
     if (removedRoots.size === 0) return 0;
@@ -333,6 +373,18 @@ export class RVLogicEngine {
    * roots only for an engine that was running before the reset, so a reset
    * never starts logic a gate (signature, plan-757 F6) still holds.
    */
+  snapshotBlockerReason(): string | null {
+    if (!this.started) return null;
+    const roots = this.roots.filter(root => this.runtimeOf(root).active
+      && (root.state === StepState.Active || root.state === StepState.Waiting));
+    return roots.length ? `LogicStep ${roots.map(root => root.name).join(', ')}` : null;
+  }
+
+  /** Root containers that run (or will run on start) for the current connection state — the LogicSteps the DES batch guard names. */
+  batchPresence(): string[] {
+    return this.roots.filter(root => { const rt = this.runtimeOf(root); return rt.active || wantsActive(rt, this.connected); }).map(root => root.name);
+  }
+
   get isStarted(): boolean { return this.started; }
 
   /** The connection state the roots are evaluated against (plan-538). */
@@ -556,6 +608,20 @@ export class RVLogicEngine {
     return true;
   }
 
+  /** Record the LogicStep nodes of a skipped maintenance procedure (plan-522). */
+  private rememberSkipped(procedureNode: Object3D, registry: NodeRegistry): void {
+    procedureNode.traverse((node) => {
+      const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
+      if (!rv) return;
+      for (const key in rv) {
+        if (!key.startsWith('LogicStep_')) continue;
+        const path = registry.getPathForNode(node);
+        if (path) this.skippedMaintenancePaths.set(path, node);
+        return;
+      }
+    });
+  }
+
   /** Recompute the root-rule warnings (plan-538 F1f/F1g) and log new ones. */
   private refreshWarnings(): void {
     const inputs: LogicRootRuleInput[] = [];
@@ -590,6 +656,9 @@ export class RVLogicEngine {
    * @returns true when a running step took the new values.
    */
   reapplyStepFields(path: string, stepType: string, data: Record<string, unknown>): boolean {
+    // plan-522: a step node of a maintenance procedure is never a running step —
+    // editing it in the Inspector must not build or touch one.
+    if (this.skippedMaintenancePaths.has(path)) return false;
     const step = this.stepByPath.get(path);
     if (!step) return false;
     if (stepType === 'LogicStep_Delay' && step instanceof RVDelay) {
@@ -652,6 +721,23 @@ export class RVLogicEngine {
   }
 }
 
+/** True when the node is the root of a maintenance procedure (plan-522). */
+function isMaintenanceProcedureNode(node: Object3D): boolean {
+  const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
+  return !!rv && rv[MAINTENANCE_PROCEDURE_TYPE] != null;
+}
+
+/**
+ * True for the root of a runtime placement — a planner record (`_layoutId`) or
+ * a nested placement (`_layoutNestedOf`); the markers of
+ * `rv-placement-instancer.ts` (`isPlacementRoot`), read inline so the engine
+ * does not import the instancer.
+ */
+function isPlacementContentRoot(node: Object3D): boolean {
+  const ud = node.userData as Record<string, unknown> | undefined;
+  return typeof ud?._layoutId === 'string' || typeof ud?._layoutNestedOf === 'string';
+}
+
 /** Visit a step and (for containers) all its descendants, depth-first. */
 function walkSteps(step: RVLogicStep, visit: (step: RVLogicStep) => void): void {
   visit(step);
@@ -678,6 +764,24 @@ export function isExternallyControlled(store: SignalStore, name: string): boolea
   if (store.isForced(name)) return true;
   const authority = describeChannelAuthority(name as SignalChannelId);
   return authority !== null && (authority.authority === 'bound' || authority.authority === 'forced');
+}
+
+/**
+ * Only a root chain runs cyclically (Unity: LogicStep.NextStep / SerialContainer.OnFinished — a
+ * container with a parent container reports its end to that parent instead of restarting).
+ * Clears `autoLoop` on every SerialContainer below `root`, whether its ancestor is a Serial or a
+ * Parallel container; the root itself keeps its flag. plan-2016 S2.
+ */
+export function disableNestedAutoLoop(root: RVLogicStep): void {
+  const walk = (s: RVLogicStep, nested: boolean): void => {
+    if (s instanceof RVSerialContainer) {
+      if (nested) s.autoLoop = false;
+      for (const c of s.children) walk(c, true);
+    } else if (s instanceof RVParallelContainer) {
+      for (const c of s.children) walk(c, true);
+    }
+  };
+  walk(root, false);
 }
 
 /**
@@ -709,7 +813,8 @@ function buildStep(
       break;
     }
     case 'LogicStep_SerialContainer': {
-      const container = new RVSerialContainer([], true); // autoLoop for top-level
+      // autoLoop is the root default; disableNestedAutoLoop() clears it on every nested Serial.
+      const container = new RVSerialContainer([], true);
       const children = buildChildren(node, nodeStepMap, registry, signalStore, scope, container);
       container.children = children;
       step = container;
@@ -730,7 +835,7 @@ function buildStep(
 
     case 'LogicStep_SetSignalBool': {
       const ref = data?.['Signal'] as ComponentRef | undefined;
-      const resolved = registry.resolve(ref, scope);
+      const resolved = registry.resolve(ref, scope, node);
       const setToTrue = (data?.['SetToTrue'] as boolean) ?? true;
       step = new RVSetSignalBool(resolved.signalAddress ?? null, setToTrue, signalStore);
       break;
@@ -738,7 +843,7 @@ function buildStep(
 
     case 'LogicStep_WaitForSignalBool': {
       const ref = data?.['Signal'] as ComponentRef | undefined;
-      const resolved = registry.resolve(ref, scope);
+      const resolved = registry.resolve(ref, scope, node);
       const waitForTrue = (data?.['WaitForTrue'] as boolean) ?? true;
       // plan-538 F5: optional edge mode, default Level (today's behaviour).
       step = new RVWaitForSignalBool(resolved.signalAddress ?? null, waitForTrue, signalStore, parseSignalEdge(data?.['Edge']));
@@ -747,7 +852,7 @@ function buildStep(
 
     case 'LogicStep_WaitForSensor': {
       const ref = data?.['Sensor'] as ComponentRef | undefined;
-      const resolved = registry.resolve(ref, scope);
+      const resolved = registry.resolve(ref, scope, node);
       const waitForOccupied = (data?.['WaitForOccupied'] as boolean) ?? true;
       step = new RVWaitForSensor(resolved.sensor ?? null, waitForOccupied, data?.['WaitForStopped'] === true);
       break;
@@ -757,7 +862,7 @@ function buildStep(
       // plan-521 — Zone reference through the generic component branch of the
       // ONE resolver (asset-relative, three steps).
       const ref = data?.['Zone'] as ComponentRef | undefined;
-      const resolved = registry.resolve(ref, scope);
+      const resolved = registry.resolve(ref, scope, node);
       const zone = resolved.component instanceof RVZone ? resolved.component : null;
       if (!zone) {
         console.warn(`[LogicStep] WaitForZone "${node.name}": Zone reference ${ref?.path ? `"${ref.path}" not found` : 'missing'}`);
@@ -775,27 +880,34 @@ function buildStep(
       } else {
         debug('logic', `DriveTo "${node.name}": ref type="${ref.type}" path="${ref.path}" componentType="${ref.componentType}"`);
       }
-      const resolved = registry.resolve(ref, scope);
+      const resolved = registry.resolve(ref, scope, node);
       const destination = (data?.['Destination'] as number) ?? 0;
       const relative = (data?.['Relative'] as boolean) ?? false;
-      step = new RVDriveTo(resolved.drive ?? null, destination, relative);
+      // plan-2016 S3 — Unity `DestinationFromPLCOutput` (PLCOutputFloat). The
+      // signal is read here, at build time: signals are registered by the
+      // loader before the logic is built, so this is the Unity `Awake` moment.
+      const destRef = data?.['DestinationFromPLCOutput'] as ComponentRef | undefined;
+      const destSignal = destRef ? (registry.resolve(destRef, scope, node).signalAddress ?? null) : null;
+      step = new RVDriveTo(resolved.drive ?? null, destination, relative, destSignal, signalStore);
       break;
     }
 
     case 'LogicStep_SetDriveSpeed': {
       const ref = data?.['drive'] as ComponentRef | undefined;
-      const resolved = registry.resolve(ref, scope);
+      const resolved = registry.resolve(ref, scope, node);
       const speed = (data?.['Speed'] as number) ?? 100;
       step = new RVSetDriveSpeed(resolved.drive ?? null, speed);
       break;
     }
 
     case 'LogicStep_Enable': {
-      // Enable targets a GameObject — resolve by path via registry
-      const targetPath = (data?.['Target'] as string) ?? '';
+      // Enable targets a GameObject. plan-769: a declared path field (PATH_FIELDS) —
+      // a path (Unity export) or, in a web-saved file, `{ address }` / `{ unresolvedPath }`;
+      // read through the file's verdict, never a guess.
+      const rawTarget = data?.['Target'] as string | { address?: string; unresolvedPath?: string } | undefined;
       let target: { visible: boolean } | null = null;
-      if (targetPath) {
-        target = registry.getNode(targetPath);
+      if (rawTarget) {
+        target = registry.storedNode(node, rawTarget as Parameters<typeof registry.storedNode>[1]);
       }
       const enable = (data?.['Enable'] as boolean) ?? true;
       step = new RVEnable(target, enable);
@@ -810,7 +922,7 @@ function buildStep(
 
     case 'LogicStep_StartDriveTo': {
       const ref = data?.['drive'] as ComponentRef | undefined;
-      const resolved = registry.resolve(ref, scope);
+      const resolved = registry.resolve(ref, scope, node);
       const destination = (data?.['Destination'] as number) ?? 0;
       const relative = (data?.['Relative'] as boolean) ?? false;
       step = new RVStartDriveTo(resolved.drive ?? null, destination, relative);
@@ -819,7 +931,7 @@ function buildStep(
 
     case 'LogicStep_StartDriveSpeed': {
       const ref = data?.['drive'] as ComponentRef | undefined;
-      const resolved = registry.resolve(ref, scope);
+      const resolved = registry.resolve(ref, scope, node);
       const speed = (data?.['Speed'] as number) ?? 100;
       step = new RVSetDriveSpeed(resolved.drive ?? null, speed);
       break;
@@ -828,7 +940,7 @@ function buildStep(
     case 'LogicStep_WaitForDrivesAtTarget': {
       const driveRefs = (data?.['Drives'] as ComponentRef[]) ?? [];
       const drives = driveRefs
-        .map(ref => registry.resolve(ref, scope).drive)
+        .map(ref => registry.resolve(ref, scope, node).drive)
         .filter((d): d is NonNullable<typeof d> => d != null);
       step = new RVWaitForDrivesAtTarget(drives);
       break;
@@ -836,7 +948,7 @@ function buildStep(
 
     case 'LogicStep_SetSignalFloat': {
       const ref = data?.['Signal'] as ComponentRef | undefined;
-      const resolved = registry.resolve(ref, scope);
+      const resolved = registry.resolve(ref, scope, node);
       const value = (data?.['Value'] as number) ?? 0;
       step = new RVSetSignalFloat(resolved.signalAddress ?? null, value, signalStore);
       break;
@@ -844,7 +956,7 @@ function buildStep(
 
     case 'LogicStep_WaitForSignalFloat': {
       const ref = data?.['Signal'] as ComponentRef | undefined;
-      const resolved = registry.resolve(ref, scope);
+      const resolved = registry.resolve(ref, scope, node);
       const comparison = (data?.['Comparison'] as string) ?? 'Equals';
       const value = (data?.['Value'] as number) ?? 0;
       const tolerance = (data?.['Tolerance'] as number) ?? 0.0001;
@@ -854,7 +966,7 @@ function buildStep(
 
     case 'LogicStep_GripPick': {
       const ref = data?.['Grip'] as ComponentRef | undefined;
-      const grip = ref?.path ? registry.getByPath<RVGrip>('Grip', ref.path) : null;
+      const grip = isComponentReference(ref) ? registry.storedComponent<RVGrip>(node, ref, 'Grip') : null;
       const blocking = (data?.['Blocking'] as boolean) ?? false;
       step = new RVGripPick(grip, blocking);
       break;
@@ -862,7 +974,7 @@ function buildStep(
 
     case 'LogicStep_GripPlace': {
       const ref = data?.['Grip'] as ComponentRef | undefined;
-      const grip = ref?.path ? registry.getByPath<RVGrip>('Grip', ref.path) : null;
+      const grip = isComponentReference(ref) ? registry.storedComponent<RVGrip>(node, ref, 'Grip') : null;
       const blocking = (data?.['Blocking'] as boolean) ?? false;
       step = new RVGripPlace(grip, blocking);
       break;
@@ -870,14 +982,14 @@ function buildStep(
 
     case 'LogicStep_IKPath': {
       const ref = data?.['IKPath'] as ComponentRef | undefined;
-      const ikPath = ref?.path ? registry.getByPath<RVIKPath>('IKPath', ref.path) : null;
+      const ikPath = isComponentReference(ref) ? registry.storedComponent<RVIKPath>(node, ref, 'IKPath') : null;
       step = new RVIKPathStep(ikPath);
       break;
     }
 
     case 'LogicStep_JumpOnSignal': {
       const ref = data?.['Signal'] as ComponentRef | undefined;
-      const resolved = registry.resolve(ref, scope);
+      const resolved = registry.resolve(ref, scope, node);
       const jumpOn = (data?.['JumpOn'] as boolean) ?? true;
       const jumpToStep = (data?.['JumpToStep'] as string) ?? '';
       step = new RVJumpOnSignal(resolved.signalAddress ?? null, jumpOn, jumpToStep, signalStore, parentContainer ?? null);

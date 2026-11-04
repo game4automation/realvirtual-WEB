@@ -9,7 +9,7 @@
  * Phase 1c: the in-place bake) each left the docs describing machinery that was
  * no longer in the tree. Nobody notices, because prose does not fail to
  * compile: `doc-webviewer.md` still listed `rv-chunk-visibility.ts` in its file
- * tree, and `doc-render-picking.md` still explained masked source meshes as a
+ * tree, and `contract-bake-picking.md` still explained masked source meshes as a
  * live mechanism. A reader — or an agent — then plans against a world that does
  * not exist.
  *
@@ -39,8 +39,16 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-/** The private design note lives in a sibling repo that is not always checked out. */
-const privateDoc = resolve(repoRoot, '..', 'realvirtual-WebViewer-Private~', 'doc-render-picking.md');
+/**
+ * The private contracts and their internals doc live in a sibling repo that is not
+ * always checked out. The contracts hold the rules; the internals doc the detail.
+ */
+const privateRoot = resolve(repoRoot, '..', 'realvirtual-WebViewer-Private~');
+const privateDocs = [
+  resolve(privateRoot, '.contracts', 'contract-bake-picking.md'),
+  resolve(privateRoot, '.contracts', 'contract-node-identity.md'),
+  resolve(privateRoot, 'doc-bake-picking-internals.md'),
+];
 
 /**
  * Concepts plan-753/754 deleted. Each entry is the name as a doc would write
@@ -115,6 +123,20 @@ const DELETED_IDENTIFIERS = [
   "driveHomePose: 'defer'",
   "driveHomePose: 'bracket'",
   'bake-no-bake-fallbacks',
+  // plan-766 — the editor highlight is fill-only and the editor draws through
+  // arenas. The sentences that described the old editor picture may stay only
+  // as history.
+  'fill plus edges in the editor',
+  'fill + edges on real meshes',
+  // plan-769 (NodeId-only references): part moves in placements, their forced-split
+  // bake and the plan-757 nested-override refusal are gone.
+  'trsByNodeId',
+  'forceSplitNodeIds',
+  'referenceTransforms',
+  'transformsApplied',
+  'parseTrsOverride',
+  'applyTrsOverride',
+  'nested-reference',
 ];
 
 /** The settings tab that carried the loader-bake switch until commit A. */
@@ -146,7 +168,7 @@ function architectureDocs(): string[] {
   const docs = readdirSync(repoRoot)
     .filter((f) => f.startsWith('doc-') && f.endsWith('.md'))
     .map((f) => join(repoRoot, f));
-  if (existsSync(privateDoc)) docs.push(privateDoc);
+  for (const doc of privateDocs) if (existsSync(doc)) docs.push(doc);
   return docs;
 }
 

@@ -17,6 +17,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { fromStoredMapping } from '../src/core/engine/rv-signal-mapping-address';
 import { Object3D, Scene } from 'three';
 import { objectToGlb } from '../src/core/import/rv-import-object';
 import { loadGLB, type LoadResult } from '../src/core/engine/rv-scene-loader';
@@ -259,8 +260,14 @@ async function runChain(
     const lamp2 = lampNodeOf(load2);
 
     // (a) the mapping is IN the draft GLB
-    expect(signalLinksOf(lamp2), 'SignalLinks.Mappings missing from the draft GLB')
-      .toEqual(applied);
+    // plan-769 F15: the draft stores the component by ADDRESS (`componentAddress`);
+    // read back it is exactly the mapping that was applied.
+    const stored = signalLinksOf(lamp2) as SignalMapping[] | undefined;
+    expect(stored?.every((m) => typeof m.componentAddress === 'string' && m.componentPath === undefined)).toBe(true);
+    expect(stored?.map((m) => {
+      const { componentAddress: _a, ...rest } = fromStoredMapping(m, lamp2, load2.registry, null);
+      return rest;
+    }), 'SignalLinks.Mappings missing from the draft GLB').toEqual(applied);
 
     // (b) the replay turns it back into a live binding
     const restored = replayNodeMappings(viewer2, load2);

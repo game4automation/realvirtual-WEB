@@ -1,0 +1,217 @@
+{
+  "plan": 659,
+  "phase": 3,
+  "part": "bake-survival",
+  "measured": "2026-10-23",
+  "asExportedToday": {
+    "sourceNodes": 23,
+    "survivors": 1,
+    "removed": 22,
+    "distinctSourceNames": 23,
+    "survivingJoints": [],
+    "jointReasons": {
+      "yaw2roll": "removed/unclaimed",
+      "hip_l": "removed/unclaimed",
+      "upper_leg_left": "removed/unclaimed",
+      "leg": "removed/unclaimed",
+      "ankle_left": "removed/unclaimed",
+      "neck": "removed/unclaimed",
+      "neck_pitch": "removed/unclaimed",
+      "yaw_roll_motion": "removed/unclaimed",
+      "jaw_soft": "removed/unclaimed",
+      "bearing_roll": "removed/unclaimed",
+      "hip_l_2": "removed/unclaimed",
+      "upper_leg_right": "removed/unclaimed",
+      "leg_2": "removed/unclaimed",
+      "ankle_right": "removed/unclaimed"
+    },
+    "templateNames": [
+      "rv_duck",
+      "tex:cd67a2e3-9408-4b50-b10c-5eca525e32b3"
+    ],
+    "chunkMeshes": 1,
+    "chunkCount": 1
+  },
+  "withDrivesOnJoints": {
+    "sourceNodes": 23,
+    "survivors": 16,
+    "removed": 7,
+    "distinctSourceNames": 23,
+    "survivingJoints": [
+      "yaw2roll",
+      "hip_l",
+      "upper_leg_left",
+      "leg",
+      "ankle_left",
+      "neck",
+      "neck_pitch",
+      "yaw_roll_motion",
+      "jaw_soft",
+      "bearing_roll",
+      "hip_l_2",
+      "upper_leg_right",
+      "leg_2",
+      "ankle_right"
+    ],
+    "jointReasons": {
+      "yaw2roll": "component/chunk",
+      "hip_l": "component/chunk",
+      "upper_leg_left": "component/chunk",
+      "leg": "component/chunk",
+      "ankle_left": "component/chunk",
+      "neck": "component/chunk",
+      "neck_pitch": "component/chunk",
+      "yaw_roll_motion": "component/chunk",
+      "jaw_soft": "component/chunk",
+      "bearing_roll": "component/chunk",
+      "hip_l_2": "component/chunk",
+      "upper_leg_right": "component/chunk",
+      "leg_2": "component/chunk",
+      "ankle_right": "component/chunk"
+    },
+    "templateNames": [
+      "rv_duck",
+      "trunk_base",
+      "yaw2roll",
+      "hip_l",
+      "upper_leg_left",
+      "leg",
+      "ankle_left",
+      "neck",
+      "neck_pitch",
+      "yaw_roll_motion",
+      "jaw_soft",
+      "bearing_roll",
+      "hip_l_2",
+      "upper_leg_right",
+      "leg_2",
+      "ankle_right",
+      "mover:trunk_base/yaw2roll/hip_l/upper_leg_left/leg/ankle_left/neck/neck_pitch/yaw_roll_motion/jaw_soft/bearing_roll/hip_l_2/upper_leg_right/leg_2/ankle_right|tex:cd67a2e3-9408-4b50-b10c-5eca525e32b3",
+      "mover:trunk_base/yaw2roll/hip_l/upper_leg_left/leg/ankle_left/neck/neck_pitch/yaw_roll_motion/jaw_soft/bearing_roll/hip_l_2/upper_leg_right/leg_2|tex:cd67a2e3-9408-4b50-b10c-5eca525e32b3",
+      "mover:trunk_base/yaw2roll/hip_l/upper_leg_left/leg/ankle_left/neck/neck_pitch/yaw_roll_motion/jaw_soft/bearing_roll/hip_l_2/upper_leg_right|tex:cd67a2e3-9408-4b50-b10c-5eca525e32b3",
+      "mover:trunk_base/yaw2roll/hip_l/upper_leg_left/leg/ankle_left/neck/neck_pitch/yaw_roll_motion/jaw_soft/bearing_roll/hip_l_2|tex:cd67a2e3-9408-4b50-b10c-5eca525e32b3",
+      "mover:trunk_base/yaw2roll/hip_l/upper_leg_left/leg/ankle_left/neck/neck_pitch/yaw_roll_motion/jaw_soft/bearing_roll|tex:cd67a2e3-9408-4b50-b10c-5eca525e32b3",
+      "mover:trunk_base/yaw2roll/hip_l/upper_leg_left/leg/ankle_left/neck/neck_pitch/yaw_roll_motion/jaw_soft|tex:cd67a2e3-9408-4b50-b10c-5eca525e32b3",
+      "mover:trunk_base/yaw2roll/hip_l/upper_leg_left/leg/ankle_left/neck/neck_pitch/yaw_roll_motion|tex:cd67a2e3-9408-4b50-b10c-5eca525e32b3",
+      "mover:trunk_base/yaw2roll/hip_l/upper_leg_left/leg/ankle_left/neck/neck_pitch|tex:cd67a2e3-9408-4b50-b10c-5eca525e32b3",
+      "mover:trunk_base/yaw2roll/hip_l/upper_leg_left/leg/ankle_left/neck|tex:cd67a2e3-9408-4b50-b10c-5eca525e32b3",
+      "mover:trunk_base/yaw2roll/hip_l/upper_leg_left/leg/ankle_left|tex:cd67a2e3-9408-4b50-b10c-5eca525e32b3",
+      "mover:trunk_base/yaw2roll/hip_l/upper_leg_left/leg|tex:cd67a2e3-9408-4b50-b10c-5eca525e32b3",
+      "mover:trunk_base/yaw2roll/hip_l/upper_leg_left|tex:cd67a2e3-9408-4b50-b10c-5eca525e32b3",
+      "mover:trunk_base/yaw2roll/hip_l|tex:cd67a2e3-9408-4b50-b10c-5eca525e32b3",
+      "mover:trunk_base/yaw2roll|tex:cd67a2e3-9408-4b50-b10c-5eca525e32b3",
+      "tex:cd67a2e3-9408-4b50-b10c-5eca525e32b3"
+    ],
+    "chunkMeshes": 15,
+    "chunkCount": 15,
+    "fates": {
+      "yaw2roll": {
+        "survives": true,
+        "reason": "component",
+        "role": "chunk",
+        "ownChunkMeshes": 1
+      },
+      "hip_l": {
+        "survives": true,
+        "reason": "component",
+        "role": "chunk",
+        "ownChunkMeshes": 1
+      },
+      "upper_leg_left": {
+        "survives": true,
+        "reason": "component",
+        "role": "chunk",
+        "ownChunkMeshes": 1
+      },
+      "leg": {
+        "survives": true,
+        "reason": "component",
+        "role": "chunk",
+        "ownChunkMeshes": 1
+      },
+      "ankle_left": {
+        "survives": true,
+        "reason": "component",
+        "role": "chunk",
+        "ownChunkMeshes": 1
+      },
+      "neck": {
+        "survives": true,
+        "reason": "component",
+        "role": "chunk",
+        "ownChunkMeshes": 1
+      },
+      "neck_pitch": {
+        "survives": true,
+        "reason": "component",
+        "role": "chunk",
+        "ownChunkMeshes": 1
+      },
+      "yaw_roll_motion": {
+        "survives": true,
+        "reason": "component",
+        "role": "chunk",
+        "ownChunkMeshes": 1
+      },
+      "jaw_soft": {
+        "survives": true,
+        "reason": "component",
+        "role": "chunk",
+        "ownChunkMeshes": 1
+      },
+      "bearing_roll": {
+        "survives": true,
+        "reason": "component",
+        "role": "chunk",
+        "ownChunkMeshes": 1
+      },
+      "hip_l_2": {
+        "survives": true,
+        "reason": "component",
+        "role": "chunk",
+        "ownChunkMeshes": 1
+      },
+      "upper_leg_right": {
+        "survives": true,
+        "reason": "component",
+        "role": "chunk",
+        "ownChunkMeshes": 1
+      },
+      "leg_2": {
+        "survives": true,
+        "reason": "component",
+        "role": "chunk",
+        "ownChunkMeshes": 1
+      },
+      "ankle_right": {
+        "survives": true,
+        "reason": "component",
+        "role": "chunk",
+        "ownChunkMeshes": 1
+      }
+    }
+  },
+  "baseAndSensorsWithDrivesOnJoints": {
+    "trunk_base": {
+      "survives": true,
+      "reason": "ancestor",
+      "role": "unclaimed",
+      "ownChunkMeshes": 0
+    },
+    "sensorsRemoved": [
+      "imu",
+      "left_foot",
+      "head_camera",
+      "tof",
+      "head_imu",
+      "mouth_tip",
+      "right_foot"
+    ]
+  },
+  "baseWithVirtualDrive": {
+    "survives": true,
+    "reason": "component",
+    "role": "chunk",
+    "ownChunkMeshes": 1
+  }
+}

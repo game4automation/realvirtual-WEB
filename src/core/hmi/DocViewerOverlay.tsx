@@ -234,7 +234,7 @@ export function DocViewerOverlay({ url, title, initialPage, onClose }: DocViewer
         sx={{
           width: '90vw',
           height: '90vh',
-          borderRadius: 2,
+          borderRadius: 1,
           overflow: 'hidden',
           display: 'flex',
           flexDirection: 'column',

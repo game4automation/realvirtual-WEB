@@ -52,6 +52,7 @@ import {
 } from '../project/rv-project-documents';
 import type { DocumentClassification } from '../project/rv-document-classification';
 import type { RvDocumentEntry, RvProject } from '../project/rv-project-types';
+import { copyThumbnailSidecar, deleteThumbnailSidecar } from './resolve-document-thumbnail';
 
 /** Root folder of a project's own assets. */
 export const LIBRARY_FOLDER = 'library';
@@ -367,6 +368,24 @@ async function transferDocument(
     else delete entry.classification;
     if (mode.keepId) delete entry.copiedFrom;
     else entry.copiedFrom = doc.id;
+    // The picture follows as BYTES under the target id, into the target's own
+    // `.thumbnails/` (plan-776 F5). The source's pointer is never carried over
+    // the `...doc` spread: it names a file of the SOURCE. A copy that fails
+    // leaves the row without one — a placeholder, never a dangling pointer.
+    const thumbnail = await copyThumbnailSidecar(
+      {
+        read: async (p) => {
+          const blob = await readBytesAt(source, p).catch(() => null);
+          return blob ? new Uint8Array(await blob.arrayBuffer()) : null;
+        },
+      },
+      { write: async (p, b) => { await target.writeDocument(p, b, { expectedRevision: 'any' }); } },
+      doc.thumbnail,
+      doc.id,
+      entry.id,
+    );
+    if (thumbnail) entry.thumbnail = thumbnail;
+    else delete entry.thumbnail;
     // Stats and revisions describe the source's file, not this one. Left in
     // place they would make the target's scan pre-filter clear on a document it
     // has never looked at.
@@ -444,6 +463,9 @@ async function retireSourceDocument(
   await source.deleteDocument(doc.path);
 
   await source.updateManifestEntry(documents => documents.filter(d => d.path !== doc.path));
+  // The source's picture goes with its row (plan-776 F5); only its own
+  // sidecar, never anything a hand-edited pointer names (F3).
+  await deleteThumbnailSidecar(source, doc.thumbnail, doc.id);
 }
 
 /**

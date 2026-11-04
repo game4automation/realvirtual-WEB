@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
+// Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 
 /**
  * rv-extras-validator.ts — Dev-mode GLB extras parity validator.
@@ -41,6 +41,7 @@ const CONSUMED: Record<string, string[]> = {
   Grip: [],       // all fields in RVGrip.schema
   GripTarget: [], // all fields in RVGripTarget.schema
   ConnectSignal: [], // all fields in RVConnectSignal.schema
+  SignalConnector: [], // all fields in RVSignalConnector.schema (plan-2227)
   Lamp: ['OnColor'], // Unity Color is read raw; scalar fields are schema-derived
   Zone: [],       // plan-521 — all fields in RVZone.schema
 
@@ -57,6 +58,12 @@ const CONSUMED: Record<string, string[]> = {
   Drive_Simple: [],       // all fields in RVDriveSimple.schema
   Drive_Cylinder: [],     // all fields in RVDriveCylinder.schema
   Drive_ErraticPosition: [], // all fields in RVErraticDriver.schema
+
+  // Robotics — read RAW off the node extras (rv-robot-ik.ts / rv-ik-target.ts),
+  // because they are references or Unity-shaped values the schema does not carry.
+  // A rig written by `ik.robot.rig` or `scripts/author-robot-ik.mjs` has exactly these.
+  RobotIK: ['Axis', 'TCP', 'a1', 'a2', 'b', 'c1', 'c2', 'c3', 'c4', 'ToolOffset'],
+  IKTarget: ['AxisPos'],
 
   // LayoutObject — layout planner marker component. `Visible` is editable
   // from the Inspector and mirrors node.visible (handled in
@@ -82,9 +89,10 @@ const CONSUMED: Record<string, string[]> = {
 
   // Path — WebViewer-native path substrate (plan-268). The structured fields
   // (segments/successors/align + the type/id discriminators) and the Phase-2
-  // zone attributes (zone/zoneCapacity, control-point model) are consumed by
-  // parsePathExtras() in rv-path.ts, not by the scalar factory schema.
-  Path: ['type', 'id', 'segments', 'successors', 'align', 'zone', 'zoneCapacity'],
+  // zone attributes (zone/zoneCapacity, control-point model) and the plan-633
+  // successor-check opt-out (connectCheck) are consumed by parsePathExtras() in
+  // rv-path.ts, not by the scalar factory schema.
+  Path: ['type', 'id', 'segments', 'successors', 'align', 'zone', 'zoneCapacity', 'connectCheck'],
 
   // AASLink — Asset Administration Shell link (parsed by aas-link-plugin)
   AASLink: ['AASId', 'Description', 'ServerUrl'],
@@ -94,17 +102,26 @@ const CONSUMED: Record<string, string[]> = {
   // fields become the `self.prop` bag (v1 shim) and may warn here until the
   // plan-139 property layer lands.
   WebComponent: ['Active', 'ApiVersion', 'Language', 'DesSafe', 'TypeId', 'Code'],
+  // plan-650: parsed by parseParametricComponent (rv-parametric-component.ts). The inspector
+  // shows ONLY the parameter mask on `Values` (custom renderer); the rest is hidden there.
+  ParametricComponent: ['Values', 'ApiVersion', 'Params', 'Code', 'CodeHash', 'PartsRoot', 'GeneratedRoot',
+    'BakedInputHash', 'DesignResource'],
 
   // WebPhysicsZone — StaticColliders is a rawFields string array (node paths)
   // captured in the factory beforeSchema hook (rv-physics-zone.ts), not a
   // schema field (the schema mapper has no string-array type).
   WebPhysicsZone: ['StaticColliders'],
+  // WebPhysicsZone2D (plan-661) — Guides is a rawFields ComponentReference array
+  // read by RVPhysicsZone2D.readReferences.
+  WebPhysicsZone2D: ['Guides'],
 
   // MU — LoadSeatDepth (plan-577) on carriers; the schema registered in rv-mu.ts adds it too
   MU: ['LoadSeatDepth'],
 
-  // BoxCollider — used by createAABBFromExtras()
-  BoxCollider: ['center', 'size'],
+  // Legacy BoxCollider: bounds plus trigger exclusion in readMUColliderTemplate().
+  // colliders[] uses its own parser (getColliderExtrasFrom), which reads isTrigger
+  // separately and does not pass its entries through validateExtras().
+  BoxCollider: ['center', 'size', 'isTrigger'],
 
   // Signal types — connection-relevant fields editable, Status read-only (object).
   // `Generated` (plan-589) is the PROVENANCE flag written by `addSignal()` and
@@ -147,7 +164,7 @@ const CONSUMED: Record<string, string[]> = {
   LogicStep_WaitForSignalBool: ['Signal', 'WaitForTrue', 'Edge', 'Active'],  // Edge: plan-538 F5
   LogicStep_Delay: ['Duration', 'Active'],
   LogicStep_DriveToPosition: ['drive', 'Destination', 'Relative', 'Direction', 'Active'],
-  LogicStep_DriveTo: ['drive', 'Destination', 'Relative', 'Direction', 'Active'],
+  LogicStep_DriveTo: ['drive', 'Destination', 'DestinationFromPLCOutput', 'Relative', 'Direction', 'Active'],  // DestinationFromPLCOutput: plan-2016 S3
   LogicStep_SetDriveSpeed: ['drive', 'Speed', 'Active'],
   LogicStep_Enable: ['Target', 'Enable', 'Active'],
   LogicStep_Pause: ['Active'],  // debugging breakpoint, no other fields consumed
@@ -252,6 +269,13 @@ const GLOBAL_IGNORED: string[] = ['_fullTypeName', '_version', '_enabled'];
 const LOGIC_STEP_STATUS: string[] = ['State', 'StepActive', 'IsWaiting'];
 
 const IGNORED: Record<string, string[]> = {
+  // IKTarget — `AxisCorrection` (Unity `IKTarget.cs`) was removed from the web on
+  // 2026-11-02: the web replay never applied it, and the program export no longer
+  // adds it. Unity exports still carry it; it is accepted silently and hidden in the
+  // inspector (HIDDEN_FIELDS_PER_TYPE). A non-zero value makes the export warn once
+  // (rv-ik-path-to-program.ts → warnIgnoredAxisCorrection).
+  IKTarget: ['AxisCorrection'],
+
   // plan-417 — 3D scene buttons. `Name`/`Active` are realvirtual component
   // metadata; `renderer`/`colliders` are Unity component references the viewer
   // resolves by traversal instead; `currentOffset` is Unity runtime state and
@@ -313,8 +337,6 @@ const IGNORED: Record<string, string[]> = {
     // Display/visualization (not in WebViewer)
     'DisplayStatus', 'MaterialOccupied', 'MaterialNotOccupied',
     'ShowSensorLinerenderer', 'RayCastDisplayWidth',
-    // Raycast details (not consumed)
-    'AdditionalRayCastLayers',
     // SensorOccupied, SensorNotOccupied — now in schema (componentRef)
     // Filtering
     'LimitSensorToTag',
@@ -331,7 +353,7 @@ const IGNORED: Record<string, string[]> = {
 
   Source: [
     // Features not in WebViewer
-    'Destination', 'Enabled', 'FreezeSourcePosition',
+    'Enabled', 'FreezeSourcePosition',
     'DontVisualize', 'HideOnStop',
     'Mass', 'SetCenterOfMass', 'CenterOfMass',
     'GenerateOnLayer', 'OnCreateDestroyComponents',
@@ -384,6 +406,17 @@ const IGNORED: Record<string, string[]> = {
     'StopWhenDrivingToMin', 'StopWhenDrivingToMax',
     '_out', '_in', '_isOut', '_isIn', '_movingOut', '_movingIn', '_isMax', '_isMin',
     'Name', 'Active', '_fullTypeName', '_version', '_enabled'],
+  // plan-2016 Phase 3 — TransportGuided: Unity editor/physics plumbing. `drive` and
+  // `boxcollider` are the Unity-side caches of the Drive on the same node and the
+  // generated collider (the web finds the Drive itself and derives the box from
+  // the parameters). GuideCircle / GuideLine are the helper components Unity adds
+  // next to TransportGuided (their Radius/Angle/Length duplicate TransportGuided's);
+  // GuidedMU is the Unity non-physics MU marker — the web transport is kinematic,
+  // so it has no behaviour here (plan-2016 decision log, F3).
+  TransportGuided: ['UseStandardLayer', 'ShowGizmos', 'drive', 'boxcollider', 'Name', 'Active'],
+  GuideCircle: ['*'],
+  GuideLine: ['*'],
+  GuidedMU: ['*'],
   Drive_Gear: ['*'],      // Not yet consumed, pass-through
   Drive_Simple: ['Speed', 'Accelaration', 'IsAtPosition', 'IsAtSpeed', 'IsDriving',
     'ScaleSpeed', 'CurrentPositionScale', 'CurrentPositionOffset', 'ScaleFeedbackPosition', 'Name', 'Active'],
@@ -439,10 +472,12 @@ const IGNORED: Record<string, string[]> = {
 
   // ConnectSignal — internal state, Name/Active metadata
   ConnectSignal: ['Name', 'Active'],
+  // SignalConnector (plan-2227) — Unity component metadata
+  SignalConnector: ['Name', 'Active'],
 
   // Grip — fields not consumed in WebViewer
   Grip: [
-    'AdvancedMode', 'DirectlyGrip', 'PickAlignWithObject', 'AlignRotation',
+    'AdvancedMode',
     'PickBasedOnSensor', 'PickBasedOnCylinder', 'PickOnCylinderMax',
     'RaycastDistance', 'NoPhysicsWhenPlaced', 'PlaceAlignWithObject',
     'PlaceLoadOnMU', 'PlaceLoadOnMUSensor', 'ConnectToJoint',

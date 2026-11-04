@@ -55,6 +55,9 @@
  * Storage-free and React-free: every input is a value.
  */
 
+import { findStartDocument } from './rv-project-documents';
+import type { RvDocumentEntry, RvProjectStart } from './rv-project-types';
+
 /**
  * What the picked folder turned out to be.
  *
@@ -423,20 +426,43 @@ export function resolveServedProjectUrl(
 export type HostedBootVerdict =
   | { kind: 'not-hosted' }
   | { kind: 'error'; reason: 'no-manifest' | 'no-documents'; detail: string }
-  | { kind: 'dashboard' };
+  | { kind: 'dashboard'; warning?: string; deepLink?: boolean }
+  | { kind: 'document'; docId: string; docName: string; mode: string | null; deepLink?: boolean };
 
 /**
- * The hosted boot rule (D14): the root is ALWAYS the dashboard of the served
- * project; a document opens only through its own `?doc=` (handled before this
- * runs — a routed boot never reaches it). `settings.defaultModel` is not
- * consulted. The kiosk (`mode.lock`) path is untouched: it keeps
- * {@link diagnoseKioskBoot} and its start-document contract.
+ * The hosted boot rule (D14): the root is the dashboard of the served project;
+ * a document opens through its own `?doc=` (handled before this runs — a
+ * routed boot never reaches it). `settings.defaultModel` is not consulted. The
+ * kiosk (`mode.lock`) path is untouched: it keeps {@link diagnoseKioskBoot} and
+ * its start-document contract.
+ *
+ * The one opt-in exception (plan-640): a REAL hosted deploy (`hostedDeploy`,
+ * written by the deploy's own `settings.json`) whose `project.json` names
+ * `settings.start` opens that document instead — in `start.mode` when given.
+ * A start document that names no document of the manifest keeps the
+ * dashboard and carries a `warning` for the Problems panel.
+ *
+ * plan-2018: a DEEP LINK — the project came from the `?projectUrl=` query
+ * (`servedFromQuery`) and the deploy carries no `hostedDeploy` marker (a dev
+ * viewer, an agent window, an unlocked customer loader) — is a statement about
+ * the project, so it opens its start document: `settings.start.document`, else
+ * `settings.defaultModel`, else the dashboard. D14 stays for the marked deploy.
  */
 export function resolveHostedBoot(probe: {
   servedProjectUrl: string | null;
   modeLocked: boolean;
   hasDeployedManifest: boolean;
   documentCount: number;
+  /** `settings.json` → `hostedDeploy === true` (plan-640). */
+  hostedDeploy?: boolean;
+  /** `project.json` → `settings.start`, already read by `readProjectStart`. */
+  start?: RvProjectStart | null;
+  /** The manifest's documents, to resolve `start.document` (id or path). */
+  documents?: readonly RvDocumentEntry[];
+  /** plan-2018: the served project URL came from the `?projectUrl=` query. */
+  servedFromQuery?: boolean;
+  /** plan-2018: `project.json` → `settings.defaultModel` (path, id or file name). */
+  defaultModel?: string | null;
 }): HostedBootVerdict {
   if (!probe.servedProjectUrl || probe.modeLocked) return { kind: 'not-hosted' };
   const verdict = diagnoseKioskBoot({
@@ -450,7 +476,64 @@ export function resolveHostedBoot(probe: {
   if (!verdict.ok && (verdict.reason === 'no-manifest' || verdict.reason === 'no-documents')) {
     return { kind: 'error', reason: verdict.reason, detail: verdict.detail };
   }
-  return { kind: 'dashboard' };
+  const start = probe.start;
+  if (probe.servedFromQuery === true && probe.hostedDeploy !== true) {
+    const docs = probe.documents ?? [];
+    const named = start?.document ?? null;
+    const model = (probe.defaultModel ?? '').trim();
+    const doc = (named ? findStartDocument(docs, named) : null)
+      ?? (model !== '' ? findStartDocument(docs, model) : null);
+    if (doc) {
+      const mode = typeof start?.mode === 'string' && start.mode.trim() !== '' ? start.mode.trim() : null;
+      return { kind: 'document', docId: doc.id, docName: doc.name || doc.id, mode, deepLink: true };
+    }
+    if (!named && model === '') return { kind: 'dashboard', deepLink: true };
+    return {
+      kind: 'dashboard',
+      deepLink: true,
+      warning: `Start document "${named ?? model}" names no document of the served project — showing the dashboard instead.`,
+    };
+  }
+  if (probe.hostedDeploy !== true || !start) return { kind: 'dashboard' };
+  const doc = findStartDocument(probe.documents ?? [], start.document);
+  if (!doc) {
+    return {
+      kind: 'dashboard',
+      warning: `settings.start.document "${start.document}" names no document of the served project — showing the dashboard instead.`,
+    };
+  }
+  const mode = typeof start.mode === 'string' && start.mode.trim() !== '' ? start.mode.trim() : null;
+  return { kind: 'document', docId: doc.id, docName: doc.name || doc.id, mode };
+}
+
+/**
+ * plan-2018: the deep-link boot as ONE pure decision. A deep link is a
+ * `?projectUrl=` boot without kiosk lock and without the `hostedDeploy` marker.
+ * `suppressImplicitRoutes` is true for EVERY verdict of such a boot (document,
+ * dashboard, error): the implicit planner empty start and the saved-scene
+ * restore must not beat the prescribed start document or dashboard. Explicit
+ * routes (`?doc=`, `?scene=`, `?glb=`) are routed before and never reach it.
+ */
+export function resolveDeepLinkBoot(probe: Parameters<typeof resolveHostedBoot>[0]): {
+  isDeepLink: boolean;
+  suppressImplicitRoutes: boolean;
+  verdict: HostedBootVerdict;
+} {
+  const isDeepLink = !!probe.servedProjectUrl && probe.servedFromQuery === true
+    && !probe.modeLocked && probe.hostedDeploy !== true;
+  const verdict = resolveHostedBoot(probe);
+  return { isDeepLink, suppressImplicitRoutes: isDeepLink && verdict.kind !== 'not-hosted', verdict };
+}
+
+/** plan-2018: what the deep-link start does once the heavy-CAD guard answered. */
+export function deepLinkStartAction(
+  verdict: HostedBootVerdict,
+  guardApproved: boolean,
+): 'open-document' | 'dashboard' | 'dashboard-with-warning' | 'error' | 'none' {
+  if (verdict.kind === 'document') return guardApproved ? 'open-document' : 'dashboard';
+  if (verdict.kind === 'dashboard') return verdict.warning ? 'dashboard-with-warning' : 'dashboard';
+  if (verdict.kind === 'error') return 'error';
+  return 'none';
 }
 
 /** Parse a stored snapshot defensively; a broken one is simply "nothing remembered". */

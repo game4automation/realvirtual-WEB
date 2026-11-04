@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>realvirtual WEB — MuJoCo duck (plan-659 spike)</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --rv-pink: #d02a66;
+        --bg: #14171c;
+        --panel: rgba(22, 26, 32, 0.86);
+        --line: rgba(255, 255, 255, 0.1);
+        --text: #e9edf2;
+        --muted: #9aa4b2;
+      }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); }
+      body {
+        font: 13px/1.45 ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+        color: var(--text);
+      }
+      #view { position: fixed; inset: 0; display: block; }
+      .panel {
+        position: fixed;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        backdrop-filter: blur(8px);
+        padding: 12px 14px;
+      }
+      #hud { top: 14px; left: 14px; min-width: 230px; }
+      #hud h1 {
+        margin: 0 0 8px;
+        font-size: 12px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--muted);
+        font-weight: 600;
+      }
+      #hud dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin: 0; }
+      #hud dt { color: var(--muted); }
+      #hud dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+      #controls {
+        bottom: 14px; left: 50%; transform: translateX(-50%);
+        display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+        justify-content: center; max-width: calc(100vw - 28px);
+      }
+      button {
+        font: inherit; color: var(--text);
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid var(--line); border-radius: 7px;
+        padding: 6px 13px; cursor: pointer;
+      }
+      button:hover { background: rgba(255, 255, 255, 0.12); }
+      button.primary { background: var(--rv-pink); border-color: var(--rv-pink); }
+      button.primary:hover { filter: brightness(1.12); }
+      button[disabled] { opacity: 0.45; cursor: default; }
+      label.slider { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+      label.slider output { color: var(--text); font-variant-numeric: tabular-nums; min-width: 68px; }
+      input[type="range"] { width: 150px; accent-color: var(--rv-pink); }
+      #hint { position: fixed; bottom: 14px; left: 14px; color: var(--muted); max-width: 240px; }
+      #status {
+        position: fixed; top: 14px; right: 14px; max-width: 330px;
+        color: var(--muted);
+      }
+      #status b { color: var(--text); }
+      #status.error { color: #ff8da1; }
+      .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
+      .dot.run { background: #4ade80; }
+      .dot.fall { background: #fbbf24; }
+      .dot.err { background: #ff6b81; }
+    </style>
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+
+    <div id="hud" class="panel">
+      <h1>MuJoCo &middot; duck</h1>
+      <dl>
+        <dt>state</dt><dd id="m-state">booting</dd>
+        <dt>policy</dt><dd id="m-policy">&ndash;</dd>
+        <dt>sim time</dt><dd id="m-sim">0.0 s</dd>
+        <dt>distance</dt><dd id="m-dist">0.000 m</dd>
+        <dt>base height</dt><dd id="m-height">&ndash;</dd>
+        <dt>real-time</dt><dd id="m-rtf">&ndash;</dd>
+        <dt>policy p95</dt><dd id="m-lat">&ndash;</dd>
+        <dt>frame cost</dt><dd id="m-frame">&ndash;</dd>
+        <dt>dropped sim</dt><dd id="m-drop">0 ms</dd>
+        <dt>contacts</dt><dd id="m-con">0</dd>
+        <dt>fps</dt><dd id="m-fps">&ndash;</dd>
+      </dl>
+    </div>
+
+    <div id="status" class="panel"><span class="dot" id="s-dot"></span><span id="s-text">loading scene&hellip;</span></div>
+
+    <div id="controls" class="panel">
+      <button id="btn-activate" class="primary">Load &amp; run</button>
+      <button id="btn-run" disabled>Stop</button>
+      <button id="btn-reset" disabled>Reset</button>
+      <button id="btn-push" disabled>Push</button>
+      <label class="slider">vx <input id="vx" type="range" min="-0.4" max="0.6" step="0.01" value="0.25" /><output id="vx-out">0.25 m/s</output></label>
+      <label class="slider">yaw <input id="yaw" type="range" min="-1" max="1" step="0.02" value="0" /><output id="yaw-out">0.00 rad/s</output></label>
+    </div>
+
+    <div id="hint">W/S forward &middot; A/D turn &middot; Q/E sideways &middot; Space push &middot; R reset</div>
+
+    <script type="module" src="./rv-duck-demo.ts"></script>
+  </body>
+</html>

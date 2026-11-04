@@ -111,7 +111,7 @@ test('drag moves the placement and reload follows the measured contract', async 
   const phases: Record<string, number> = {};
   const errors = collectErrors(page);
   await blockAnalytics(page);
-  await page.goto(`?doc=${encodeURIComponent(EXPECTED_DEMOS.planner)}`, { waitUntil: 'domcontentloaded' });
+  await page.goto(`?doc=${encodeURIComponent(EXPECTED_DEMOS.planner)}&welcome=0`, { waitUntil: 'domcontentloaded' });
   await openPlanner(page);
   phases.openMs = Date.now() - t0;
 

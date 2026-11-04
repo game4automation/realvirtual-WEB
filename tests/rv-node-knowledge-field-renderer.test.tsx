@@ -24,6 +24,7 @@
  * pins the schema side of that bargain.
  */
 
+import { executeDelegateValue } from './helpers/execute-value';
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import { render, screen, cleanup, waitFor, fireEvent } from '@testing-library/react';
 import { Object3D } from 'three';
@@ -536,7 +537,7 @@ describe('9.4 staying current', () => {
     const { rerender } = renderNote(fx);
     await screen.findByText('first');
 
-    await fx.tools.webKnowledgeSet('Cell/Axis1', '# second');
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: '# second' });
     const fresh = readNodeKnowledge(fx.node)!.Note;
     rerender(
       <Renderer value={fresh} fieldName="Note" componentType={NODE_KNOWLEDGE_TYPE}
@@ -557,15 +558,15 @@ describe('9.4 staying current', () => {
     const { rerender } = render(show('# before'));
     await screen.findByText('before');
 
-    await fx.tools.webKnowledgeSet('Cell/Axis1', '# after');
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: '# after' });
     rerender(show(readNodeKnowledge(fx.node)!.Note));
     await screen.findByText('after');
 
-    await fx.tools.webKnowledgeSet('Cell/Axis1', '# before');       // undo
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: '# before' });       // undo
     rerender(show(readNodeKnowledge(fx.node)!.Note));
     await screen.findByText('before');
 
-    await fx.tools.webKnowledgeSet('Cell/Axis1', '# after');        // redo
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: '# after' });        // redo
     rerender(show(readNodeKnowledge(fx.node)!.Note));
     await screen.findByText('after');
   });
@@ -584,7 +585,7 @@ describe('9.4 staying current', () => {
     const { rerender } = render(show());
     expect(screen.getByTestId('rv-knowledge-provenance').textContent).toContain('observed');
 
-    await fx.tools.webKnowledgeSet('Cell/Axis1', '# same text', 'user', 'unverified');
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: '# same text', author: 'user', confidence: 'unverified' });
     rerender(show());
 
     const header = screen.getByTestId('rv-knowledge-provenance');
@@ -598,7 +599,7 @@ describe('9.4 staying current', () => {
     const { rerender } = renderNote(fx);
     await screen.findByText('temporary');
 
-    await fx.tools.webKnowledgeSet('Cell/Axis1', '');
+    await executeDelegateValue(fx.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: '' });
     expect(readNodeKnowledge(fx.node)).toBeNull();
     rerender(
       <Renderer value="" fieldName="Note" componentType={NODE_KNOWLEDGE_TYPE}
@@ -617,7 +618,7 @@ describe('9.4 staying current', () => {
     // A FIRST note on a bare node: all five fields change, so all five are
     // written. Five separate ops, no transaction around them.
     const fresh = makeFixture();
-    await fresh.tools.webKnowledgeSet('Cell/Axis1', 'a new note');
+    await executeDelegateValue(fresh.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'a new note' });
     expect(ops.filter((o) => o.kind === 'setField').map((o) => o.field))
       .toEqual([...NODE_KNOWLEDGE_FIELDS]);
     expect(ops.some((o) => o.kind.startsWith('transaction:'))).toBe(false);
@@ -626,7 +627,7 @@ describe('9.4 staying current', () => {
     // is already there, so the undo depth of a knowledge set is not even a fixed
     // number — it depends on what changed.
     ops.length = 0;
-    await fresh.tools.webKnowledgeSet('Cell/Axis1', 'a second note');
+    await executeDelegateValue(fresh.tools, 'knowledge.set', { path: 'Cell/Axis1', markdown: 'a second note' });
     const rewritten = ops.filter((o) => o.kind === 'setField').map((o) => o.field);
     expect(rewritten).toContain('Note');
     expect(rewritten.length).toBeLessThan(NODE_KNOWLEDGE_FIELDS.length);

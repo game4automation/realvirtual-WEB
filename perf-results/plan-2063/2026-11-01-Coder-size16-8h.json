@@ -1,0 +1,454 @@
+{
+  "schemaVersion": 1,
+  "createdAt": "2026-11-01T02:00:29.730Z",
+  "smoke": false,
+  "status": "ok",
+  "machine": {
+    "hostname": "Coder",
+    "os": "Windows_NT 10.0.26200 x64",
+    "cpuModel": "AMD Ryzen 9 9950X 16-Core Processor            ",
+    "cpuCount": 32,
+    "totalMemoryBytes": 65939009536,
+    "nodeVersion": "v26.13.0",
+    "webViewerCommit": "75c4a183d5ff7502b239d4337d2ccfd8e9d24cd9",
+    "privateCommit": null
+  },
+  "scenarios": [
+    {
+      "scenario": "yard:16",
+      "kind": "fastforward",
+      "size": 16,
+      "requestedSimSeconds": 28800,
+      "repeats": 3,
+      "metrics": {
+        "wallMs": {
+          "median": 1730.3999999985099,
+          "min": 1704.5999999996275,
+          "max": 1731.800000000745,
+          "samples": 3
+        },
+        "simSeconds": {
+          "median": 28800,
+          "min": 28800,
+          "max": 28800,
+          "samples": 3
+        },
+        "lastEventTimeSeconds": {
+          "median": 28800,
+          "min": 28800,
+          "max": 28800,
+          "samples": 3
+        },
+        "totalEventsProcessed": {
+          "median": 290864,
+          "min": 290864,
+          "max": 290864,
+          "samples": 3
+        },
+        "eventsPerSecond": {
+          "median": 168090.61488687614,
+          "min": 167954.72918343623,
+          "max": 170634.75302127394,
+          "samples": 3
+        },
+        "simHoursPerWallHour": {
+          "median": 16643.550624147483,
+          "min": 16630.09585401756,
+          "max": 16895.459345304644,
+          "samples": 3
+        },
+        "componentCount": {
+          "median": 208,
+          "min": 208,
+          "max": 208,
+          "samples": 3
+        },
+        "muCount": {
+          "median": 83,
+          "min": 83,
+          "max": 83,
+          "samples": 3
+        },
+        "liveMuCount": {
+          "median": 67,
+          "min": 67,
+          "max": 67,
+          "samples": 3
+        },
+        "vehicles": {
+          "median": 24,
+          "min": 24,
+          "max": 24,
+          "samples": 3
+        },
+        "stations": {
+          "median": 96,
+          "min": 96,
+          "max": 96,
+          "samples": 3
+        },
+        "heapPeakBytes": {
+          "median": 276019130,
+          "min": 275142886,
+          "max": 279794002,
+          "samples": 3
+        },
+        "heapSamples": {
+          "median": 103,
+          "min": 101,
+          "max": 103,
+          "samples": 3
+        },
+        "heapAfterGcBytes": {
+          "median": 79952348,
+          "min": 79926896,
+          "max": 79958908,
+          "samples": 3
+        }
+      },
+      "restore": {
+        "supported": false,
+        "reason": "agv-snapshot-restore-unsupported (plan-558)"
+      },
+      "snapshot": {
+        "supported": false,
+        "reason": "agv-snapshot-unsupported (plan-558)"
+      },
+      "runs": [
+        {
+          "scenario": "yard:16",
+          "kind": "fastforward",
+          "size": 16,
+          "requestedSimSeconds": 28800,
+          "metrics": {
+            "wallMs": 1730.3999999985099,
+            "simSeconds": 28800,
+            "lastEventTimeSeconds": 28800,
+            "totalEventsProcessed": 290864,
+            "eventsPerSecond": 168090.61488687614,
+            "simHoursPerWallHour": 16643.550624147483,
+            "componentCount": 208,
+            "muCount": 83,
+            "liveMuCount": 67,
+            "vehicles": 24,
+            "stations": 96,
+            "heapPeakBytes": 275142886,
+            "heapSamples": 103,
+            "heapAfterGcBytes": 79958908
+          },
+          "restore": {
+            "supported": false,
+            "reason": "agv-snapshot-restore-unsupported (plan-558)"
+          },
+          "snapshot": {
+            "supported": false,
+            "reason": "agv-snapshot-unsupported (plan-558)"
+          },
+          "sources": {
+            "heapPeakBytes": "performance.memory.usedJSHeapSize; sampled before run and after every tick (sampled peak, not allocation high-water mark)",
+            "heapAfterGcBytes": "CDP HeapProfiler.collectGarbage + Runtime.getHeapUsage",
+            "componentCount": "DESManager.componentCount",
+            "muCount": "DESManager.muCount (allocated MU slots)",
+            "liveMuCount": "DESManager.liveMuCount",
+            "vehicles": "PalletYardRoot.PalletYard.vehicles resolved in loaded scene (successful bind)",
+            "stations": "PalletYardRoot.PalletYard.stations (pick, drop, buffer, charger; excludes wait points)"
+          }
+        },
+        {
+          "scenario": "yard:16",
+          "kind": "fastforward",
+          "size": 16,
+          "requestedSimSeconds": 28800,
+          "metrics": {
+            "wallMs": 1704.5999999996275,
+            "simSeconds": 28800,
+            "lastEventTimeSeconds": 28800,
+            "totalEventsProcessed": 290864,
+            "eventsPerSecond": 170634.75302127394,
+            "simHoursPerWallHour": 16895.459345304644,
+            "componentCount": 208,
+            "muCount": 83,
+            "liveMuCount": 67,
+            "vehicles": 24,
+            "stations": 96,
+            "heapPeakBytes": 279794002,
+            "heapSamples": 101,
+            "heapAfterGcBytes": 79952348
+          },
+          "restore": {
+            "supported": false,
+            "reason": "agv-snapshot-restore-unsupported (plan-558)"
+          },
+          "snapshot": {
+            "supported": false,
+            "reason": "agv-snapshot-unsupported (plan-558)"
+          },
+          "sources": {
+            "heapPeakBytes": "performance.memory.usedJSHeapSize; sampled before run and after every tick (sampled peak, not allocation high-water mark)",
+            "heapAfterGcBytes": "CDP HeapProfiler.collectGarbage + Runtime.getHeapUsage",
+            "componentCount": "DESManager.componentCount",
+            "muCount": "DESManager.muCount (allocated MU slots)",
+            "liveMuCount": "DESManager.liveMuCount",
+            "vehicles": "PalletYardRoot.PalletYard.vehicles resolved in loaded scene (successful bind)",
+            "stations": "PalletYardRoot.PalletYard.stations (pick, drop, buffer, charger; excludes wait points)"
+          }
+        },
+        {
+          "scenario": "yard:16",
+          "kind": "fastforward",
+          "size": 16,
+          "requestedSimSeconds": 28800,
+          "metrics": {
+            "wallMs": 1731.800000000745,
+            "simSeconds": 28800,
+            "lastEventTimeSeconds": 28800,
+            "totalEventsProcessed": 290864,
+            "eventsPerSecond": 167954.72918343623,
+            "simHoursPerWallHour": 16630.09585401756,
+            "componentCount": 208,
+            "muCount": 83,
+            "liveMuCount": 67,
+            "vehicles": 24,
+            "stations": 96,
+            "heapPeakBytes": 276019130,
+            "heapSamples": 103,
+            "heapAfterGcBytes": 79926896
+          },
+          "restore": {
+            "supported": false,
+            "reason": "agv-snapshot-restore-unsupported (plan-558)"
+          },
+          "snapshot": {
+            "supported": false,
+            "reason": "agv-snapshot-unsupported (plan-558)"
+          },
+          "sources": {
+            "heapPeakBytes": "performance.memory.usedJSHeapSize; sampled before run and after every tick (sampled peak, not allocation high-water mark)",
+            "heapAfterGcBytes": "CDP HeapProfiler.collectGarbage + Runtime.getHeapUsage",
+            "componentCount": "DESManager.componentCount",
+            "muCount": "DESManager.muCount (allocated MU slots)",
+            "liveMuCount": "DESManager.liveMuCount",
+            "vehicles": "PalletYardRoot.PalletYard.vehicles resolved in loaded scene (successful bind)",
+            "stations": "PalletYardRoot.PalletYard.stations (pick, drop, buffer, charger; excludes wait points)"
+          }
+        }
+      ]
+    },
+    {
+      "scenario": "warehouse-synthetic",
+      "kind": "snapshot-only",
+      "size": 0,
+      "requestedSimSeconds": 0,
+      "repeats": 3,
+      "metrics": {
+        "wallMs": {
+          "median": 0,
+          "min": 0,
+          "max": 0,
+          "samples": 3
+        },
+        "simSeconds": {
+          "median": 0,
+          "min": 0,
+          "max": 0,
+          "samples": 3
+        },
+        "lastEventTimeSeconds": {
+          "median": 0,
+          "min": 0,
+          "max": 0,
+          "samples": 3
+        },
+        "totalEventsProcessed": {
+          "median": 0,
+          "min": 0,
+          "max": 0,
+          "samples": 3
+        },
+        "eventsPerSecond": {
+          "median": 0,
+          "min": 0,
+          "max": 0,
+          "samples": 3
+        },
+        "simHoursPerWallHour": {
+          "median": 0,
+          "min": 0,
+          "max": 0,
+          "samples": 3
+        },
+        "componentCount": {
+          "median": 300,
+          "min": 300,
+          "max": 300,
+          "samples": 3
+        },
+        "muCount": {
+          "median": 3000,
+          "min": 3000,
+          "max": 3000,
+          "samples": 3
+        },
+        "liveMuCount": {
+          "median": 3000,
+          "min": 3000,
+          "max": 3000,
+          "samples": 3
+        },
+        "vehicles": {
+          "median": 0,
+          "min": 0,
+          "max": 0,
+          "samples": 3
+        },
+        "stations": {
+          "median": 300,
+          "min": 300,
+          "max": 300,
+          "samples": 3
+        },
+        "heapPeakBytes": {
+          "median": 106755006,
+          "min": 106706650,
+          "max": 106807054,
+          "samples": 3
+        },
+        "heapSamples": {
+          "median": 1,
+          "min": 1,
+          "max": 1,
+          "samples": 3
+        },
+        "snapshotMs": {
+          "median": 7.700000001117587,
+          "min": 7.5,
+          "max": 7.900000000372529,
+          "samples": 3
+        },
+        "snapshotBytes": {
+          "median": 2077366,
+          "min": 2077366,
+          "max": 2077366,
+          "samples": 3
+        },
+        "restoreMs": {
+          "median": 18.5,
+          "min": 18.40000000037253,
+          "max": 19,
+          "samples": 3
+        },
+        "heapAfterGcBytes": {
+          "median": 58866660,
+          "min": 58863932,
+          "max": 58866936,
+          "samples": 3
+        }
+      },
+      "runs": [
+        {
+          "scenario": "warehouse-synthetic",
+          "kind": "snapshot-only",
+          "size": 0,
+          "requestedSimSeconds": 0,
+          "metrics": {
+            "wallMs": 0,
+            "simSeconds": 0,
+            "lastEventTimeSeconds": 0,
+            "totalEventsProcessed": 0,
+            "eventsPerSecond": 0,
+            "simHoursPerWallHour": 0,
+            "componentCount": 300,
+            "muCount": 3000,
+            "liveMuCount": 3000,
+            "vehicles": 0,
+            "stations": 300,
+            "heapPeakBytes": 106807054,
+            "heapSamples": 1,
+            "snapshotMs": 7.700000001117587,
+            "snapshotBytes": 2077366,
+            "restoreMs": 19,
+            "heapAfterGcBytes": 58866660
+          },
+          "sources": {
+            "heapPeakBytes": "performance.memory.usedJSHeapSize; sampled before run and after every tick (sampled peak, not allocation high-water mark)",
+            "heapAfterGcBytes": "CDP HeapProfiler.collectGarbage + Runtime.getHeapUsage",
+            "componentCount": "DESManager.componentCount",
+            "muCount": "DESManager.muCount (allocated MU slots)",
+            "liveMuCount": "DESManager.liveMuCount",
+            "vehicles": "synthetic warehouse: no vehicles",
+            "stations": "synthetic Storage components"
+          }
+        },
+        {
+          "scenario": "warehouse-synthetic",
+          "kind": "snapshot-only",
+          "size": 0,
+          "requestedSimSeconds": 0,
+          "metrics": {
+            "wallMs": 0,
+            "simSeconds": 0,
+            "lastEventTimeSeconds": 0,
+            "totalEventsProcessed": 0,
+            "eventsPerSecond": 0,
+            "simHoursPerWallHour": 0,
+            "componentCount": 300,
+            "muCount": 3000,
+            "liveMuCount": 3000,
+            "vehicles": 0,
+            "stations": 300,
+            "heapPeakBytes": 106706650,
+            "heapSamples": 1,
+            "snapshotMs": 7.5,
+            "snapshotBytes": 2077366,
+            "restoreMs": 18.5,
+            "heapAfterGcBytes": 58863932
+          },
+          "sources": {
+            "heapPeakBytes": "performance.memory.usedJSHeapSize; sampled before run and after every tick (sampled peak, not allocation high-water mark)",
+            "heapAfterGcBytes": "CDP HeapProfiler.collectGarbage + Runtime.getHeapUsage",
+            "componentCount": "DESManager.componentCount",
+            "muCount": "DESManager.muCount (allocated MU slots)",
+            "liveMuCount": "DESManager.liveMuCount",
+            "vehicles": "synthetic warehouse: no vehicles",
+            "stations": "synthetic Storage components"
+          }
+        },
+        {
+          "scenario": "warehouse-synthetic",
+          "kind": "snapshot-only",
+          "size": 0,
+          "requestedSimSeconds": 0,
+          "metrics": {
+            "wallMs": 0,
+            "simSeconds": 0,
+            "lastEventTimeSeconds": 0,
+            "totalEventsProcessed": 0,
+            "eventsPerSecond": 0,
+            "simHoursPerWallHour": 0,
+            "componentCount": 300,
+            "muCount": 3000,
+            "liveMuCount": 3000,
+            "vehicles": 0,
+            "stations": 300,
+            "heapPeakBytes": 106755006,
+            "heapSamples": 1,
+            "snapshotMs": 7.900000000372529,
+            "snapshotBytes": 2077366,
+            "restoreMs": 18.40000000037253,
+            "heapAfterGcBytes": 58866936
+          },
+          "sources": {
+            "heapPeakBytes": "performance.memory.usedJSHeapSize; sampled before run and after every tick (sampled peak, not allocation high-water mark)",
+            "heapAfterGcBytes": "CDP HeapProfiler.collectGarbage + Runtime.getHeapUsage",
+            "componentCount": "DESManager.componentCount",
+            "muCount": "DESManager.muCount (allocated MU slots)",
+            "liveMuCount": "DESManager.liveMuCount",
+            "vehicles": "synthetic warehouse: no vehicles",
+            "stations": "synthetic Storage components"
+          }
+        }
+      ]
+    }
+  ],
+  "failures": []
+}

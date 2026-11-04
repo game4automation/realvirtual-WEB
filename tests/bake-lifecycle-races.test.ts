@@ -187,7 +187,7 @@ describe('AssetOverrides on a baked instance (plan-753 Phase 3, §9.11 d)', () =
   }
   const idLoader = (): GLTFLoader => ({ loadAsync: async (): Promise<{ scene: Group }> => ({ scene: makeIdAsset() }) } as unknown as GLTFLoader);
 
-  it('byNodeId patches a logic node; a patch on a merged CAD leaf is reported as override-orphaned', async () => {
+  it('byAddress patches a logic node; a patch on a merged CAD leaf is reported as override-orphaned', async () => {
     const { getProblems, resetProblemsForTests } = await import('../src/core/hmi/problems-store');
     resetProblemsForTests();
     const cache = new ModelCache(idLoader(), { uber: () => uber, pickPort: () => createPickBuildPort({ createWorker: () => null }) });
@@ -197,14 +197,14 @@ describe('AssetOverrides on a baked instance (plan-753 Phase 3, §9.11 d)', () =
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       const inst = reg.instantiate(baked, new Group(), {
-        overrides: { byNodeId: { [DRIVE_ID]: { Drive: { Speed: 42 } }, [LEAF_ID]: { Drive: { Speed: 1 } } } },
+        overrides: { byAddress: { [`#${DRIVE_ID}`]: { Drive: { Speed: 42 } }, [`#${LEAF_ID}`]: { Drive: { Speed: 1 } } } },
       });
       const drive = inst.logicNodes.find((n) => n.name === 'Drive-A')!;
       expect((drive.userData.realvirtual as { Drive: { Speed?: number } }).Drive.Speed).toBe(42);
       // plan-757 F9: the orphan is ONE `override-orphaned` problem naming the leaf — not a console line.
       const orphans = getProblems().filter((p) => p.code === 'override-orphaned');
       expect(orphans).toHaveLength(1);
-      expect(orphans[0].id).toBe(`override-orphaned::nodeId:${LEAF_ID}`);
+      expect(orphans[0].id).toBe(`override-orphaned::address:#${LEAF_ID}`);
       expect(orphans[0].detail).toContain(LEAF_ID);
       expect(orphans[0].detail).toContain('Drive');
       expect(warn).not.toHaveBeenCalled();
@@ -217,34 +217,22 @@ describe('AssetOverrides on a baked instance (plan-753 Phase 3, §9.11 d)', () =
     }
   });
 
-  it('trsByNodeId forces a chunk split and applies the saved TRS to the split node', async () => {
+  it('plan-769 F14: an old trsByNodeId neither splits the bake nor moves the part — the count comes back', async () => {
     const cache = new ModelCache(idLoader(), { uber: () => uber, pickPort: () => createPickBuildPort({ createWorker: () => null }) });
     const key = BLOB_URL + '#trs';
     const plain = await cache.getOrLoadBaked(key);
     expect(plain.chunks.map((c) => c.key).sort()).toEqual(['mover:Drive-A', 'static']);
 
-    const split = await cache.getOrLoadBaked(key, undefined, { forceSplitNodeIds: [PART_ID] });
-    expect(split).not.toBe(plain);
-    expect(split.chunks.map((c) => c.key).sort()).toEqual(['mover:Drive-A', 'mover:Part', 'static']);
-    // Same request → same cached split bake; the plain one is still served too.
-    expect(await cache.getOrLoadBaked(key, undefined, { forceSplitNodeIds: [PART_ID] })).toBe(split);
-    expect(await cache.getOrLoadBaked(key)).toBe(plain);
-
     const { BakeRegistry } = await import('../src/core/engine/rv-bake-registry');
+    const { readAssetOverridesRecord } = await import('../src/core/engine/rv-asset-reference');
     const reg = new BakeRegistry();
-    const inst = reg.instantiate(split, new Group(), {
-      overrides: { byNodeId: {}, trsByNodeId: { [PART_ID]: { position: [5, 6, 7] } } },
-    });
-    const part = inst.logicNodes.find((n) => n.name === 'Part')!;
-    expect(part.position.toArray()).toEqual([5, 6, 7]);
-    expect((part as { isMesh?: boolean }).isMesh).toBeFalsy();
-    const partChunk = inst.chunks.find((m) => m.name === 'mover:Part')!;
-    expect(partChunk.parent).toBe(part);
-    // Both bakes retire together with the base key.
-    inst.root; reg.release(inst);
+    const inst = reg.instantiate(plain, new Group());
+    const result = reg.applyOverrides(inst, readAssetOverridesRecord({ trsByNodeId: { [PART_ID]: { position: [5, 6, 7] } } })!);
+    expect(result.droppedTransforms).toBe(1);
+    expect(result.applied).toBe(0);
+    expect(inst.chunks.map((m) => m.name).sort()).toEqual(['mover:Drive-A', 'static']);
+    reg.release(inst);
     cache.invalidate(key);
     expect(plain.retired).toBe(true);
-    expect(split.retired).toBe(true);
-    expect(split.disposed).toBe(true);
   });
 });

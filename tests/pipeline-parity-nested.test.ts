@@ -188,3 +188,96 @@ describe('nested parity fixtures — table', () => {
     expect(NESTED_PARITY_FIXTURES.map((f) => f.id)).toEqual(['n1', 'n2', 'n3']);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// plan-774 Phase 2 — the EDITOR load variant (authoring flags)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// The asset editor opens the same outer bytes as an AUTHORING document
+// (`preserveHierarchy` + `preserveAuthoringHierarchy`). Since plan-774 F2 it
+// defers its references exactly like the runtime main load, so the NESTED
+// placement must be the same instance on both paths: same baked asset key,
+// same chunk set, same surviving nodes, same pivot frame. The one ALLOW-LISTED
+// difference is the open document's OWN content: unbaked in the editor
+// (authorable, no chunk outside the reference), baked on the runtime path.
+
+/** What a nested placement looks like, independent of the viewer it lives in. */
+interface NestedPlacementSignature {
+  assetUrlIsInner: boolean;
+  chunkNames: string[];
+  nodes: string[];
+  childPositions: Record<string, number[]>;
+}
+
+function nestedSignature(viewer: ParityHost['viewer'], root: import('three').Object3D, refName: string, innerUrl: string): NestedPlacementSignature {
+  const ref = root.getObjectByName(refName);
+  expect(ref, `${refName} exists`).toBeDefined();
+  const instance = viewer.bakeRegistry.instanceOf(ref!);
+  expect(instance, `${refName} is a placement instance`).not.toBeNull();
+  const nodes: string[] = [];
+  const walk = (node: import('three').Object3D, path: string): void => {
+    for (const child of node.children) {
+      if (child.userData._rvGizmo || child.userData._highlightOverlay) continue;
+      const p = `${path}/${child.name}`;
+      nodes.push(`${p}:${child.type}`);
+      walk(child, p);
+    }
+  };
+  walk(ref!, '');
+  const childPositions: Record<string, number[]> = {};
+  for (const child of ref!.children) childPositions[child.name] = child.position.toArray().map((n) => Math.round(n * 1e6) / 1e6);
+  return {
+    assetUrlIsInner: instance!.baked.url === innerUrl || instance!.baked.assetId === innerUrl,
+    chunkNames: instance!.chunks.map((m) => m.name).sort(),
+    nodes: nodes.sort(),
+    childPositions,
+  };
+}
+
+/** Chunk meshes OUTSIDE every reference node of `root` — the own content's bake. */
+function ownChunkCount(root: import('three').Object3D): number {
+  let n = 0;
+  const walk = (node: import('three').Object3D): void => {
+    if (node !== root && node.userData?.realvirtual?.AssetReference && node.userData.realvirtual.AssetReference.embedded !== true) return;
+    if (node.userData?._rvBakeChunk === true) n++;
+    for (const c of node.children) walk(c);
+  };
+  walk(root);
+  return n;
+}
+
+describe('plan-774 editor load variant — the nested placement equals the runtime one; own content unbaked (allow-listed)', () => {
+  for (const id of ['n1', 'n2', 'n3'] as const) {
+    it(`(${id}) editor load and runtime main load materialise the same nested instance`, async () => {
+      const host = await createParityHost();
+      const fixture = nestedParityFixture(id);
+      const innerBytes = await fixtureBytes(fixture.buildInner());
+      const innerUrl = URL.createObjectURL(new Blob([innerBytes], { type: 'model/gltf-binary' }));
+      try {
+        const outerBytes = await fixtureBytes(fixture.buildOuter(innerUrl));
+        const { viewer } = host;
+
+        const runtime = await viewer.loadModel(`parity-774-runtime-${id}.glb`, { data: outerBytes.slice(0) });
+        await viewer.whenSceneReady();
+        const runtimeSig = nestedSignature(viewer, runtime.root, fixture.referenceName, innerUrl);
+        const runtimeOwnChunks = ownChunkCount(runtime.root);
+
+        const editor = await viewer.loadModel(`parity-774-editor-${id}.glb`, {
+          data: outerBytes.slice(0), preserveHierarchy: true, preserveAuthoringHierarchy: true,
+        });
+        await viewer.whenSceneReady();
+        const editorSig = nestedSignature(viewer, editor.root, fixture.referenceName, innerUrl);
+
+        expect(editorSig).toEqual(runtimeSig);
+        expect(editorSig.chunkNames.length).toBeGreaterThan(0);
+        // The allow-listed difference: own content baked at runtime, unbaked in the editor.
+        expect(runtimeOwnChunks).toBeGreaterThan(0);
+        expect(ownChunkCount(editor.root)).toBe(0);
+        expect(editor.root.getObjectByName('Frame'), 'own CAD part stays addressable in the editor').toBeDefined();
+      } finally {
+        URL.revokeObjectURL(innerUrl);
+        host.dispose();
+      }
+    }, 60_000);
+  }
+});

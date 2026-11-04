@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { useState, useRef, useEffect } from 'react';
+import { writeLocalStorage } from '../../rv-safe-storage';
+
+import { useState, useRef, useEffect, useSyncExternalStore } from 'react';
 import {
   Typography, Box, Button, ToggleButton, ToggleButtonGroup, Select, MenuItem, Switch,
   Dialog, DialogTitle, DialogContent, DialogActions, TextField, Tooltip,
@@ -23,12 +25,16 @@ import {
 import { markEnvironmentUserModified } from '../environment-presets';
 import { reloadHintSuppressedByTouch } from '../reload-hint-store';
 import { showInfoOverlay } from '../info-overlay-store';
-import { RENDER_MODES, getRenderMode, type RenderMode } from '../../rv-render-modes';
+import {
+  NO_RENDER_MODE_CONTEXT, availableRenderModes, getRenderMode, type RenderMode,
+} from '../../rv-render-modes';
 import { commandRegistry } from '../rv-command-registry';
 import {
   ensureViewCommandsRegistered, VIEW_RENDER_MODE_COMMAND, VIEW_VISUAL_PRESET_COMMAND,
 } from '../view-commands';
 import { SettingsSection, FieldRow, SliderRow } from './settings-helpers';
+import { renderModeLockReason } from '../render-mode-controller';
+import { subscribeMaintenanceRenderLock } from '../../maintenance-runtime-registry';
 
 /** Outer wrapper: remounts the body (via `key`) after a preset is applied so all
  *  sliders/dropdowns re-read the freshly-applied visual settings. */
@@ -104,6 +110,10 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
   const sourceMarkersVisible = useSourceMarkersVisible();
   const toolbarShowLabels = useToolbarShowLabels();
   const settingsLocked = isSettingsLocked();
+  // plan-522: the ONE lock rule of `view.renderMode` — shown as the reason
+  // (e.g. "Not available during a maintenance guide"), re-read when a guide
+  // takes or releases the lock.
+  const renderModeLock = useSyncExternalStore(subscribeMaintenanceRenderLock, renderModeLockReason);
   const [driveAxisGizmoOn, setDriveAxisGizmoOn] = useState<boolean>(settingsRef.current.showDriveAxisGizmo);
   const [agentEyeOn, setAgentEyeOn] = useState<boolean>(settingsRef.current.showAgentEye);
 
@@ -443,16 +453,17 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
 
       {/* Render Mode + appearance basics */}
       <SettingsSection id="visual-rendermode" title="Render Mode">
-        <FieldRow label="Mode" hint={getRenderMode(mode).description}>
+        <FieldRow label="Mode" hint={renderModeLock ?? getRenderMode(mode).description}>
           <Select
             size="small"
             fullWidth
             value={mode}
             onChange={(e) => { void updateMode(e.target.value as RenderMode); }}
-            disabled={settingsLocked}
+            disabled={settingsLocked || renderModeLock !== null}
             data-testid="visual-render-mode-select"
           >
-            {RENDER_MODES.map((m) => (
+            {/* plan-762 F2: only the modes the registry's backend gate offers here. */}
+            {availableRenderModes(viewer.renderModeContext ?? NO_RENDER_MODE_CONTEXT).map((m) => (
               <MenuItem key={m.id} value={m.id}>{m.label}</MenuItem>
             ))}
           </Select>
@@ -595,8 +606,8 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
         </SettingsSection>
       )}
 
-      {/* Post-Processing (ambient occlusion + bloom) — WebGL only */}
-      {(caps.ambientOcclusion || caps.bloom) && !viewer.isWebGPU && (
+      {/* Post-Processing (ambient occlusion + bloom) — both renderers since plan-763 */}
+      {(caps.ambientOcclusion || caps.bloom) && (
         <SettingsSection id="visual-postfx" title="Post-Processing">
           {/* Ambient Occlusion (Off / GTAO / N8AO) */}
           {caps.ambientOcclusion && (
@@ -672,26 +683,21 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
         </SettingsSection>
       )}
 
-      {/* Toon — edge / outline (caps.toon only; WebGL only) */}
+      {/* Toon — edge / outline (caps.toon only; both renderers since plan-763,
+          the 2× gbuffer supersample stays a WebGL-only knob) */}
       {caps.toon && (
         <SettingsSection id="visual-toon-edge" title="Edge">
-          {!viewer.isWebGPU ? (
-            <>
-              <SliderRow label="Amount" min={0} max={1} step={0.05} value={toonOutlineAmount} onChange={updateToonOutlineAmount} />
-              <SliderRow label="Thickness" min={0} max={5} step={0.5} value={toonOutlineThick} onChange={updateToonOutlineThick} />
-              <SliderRow label="Threshold" min={0} max={1} step={0.02} value={toonOutlineThreshold} onChange={updateToonOutlineThreshold} />
-              <SliderRow label="Distance (m)" min={0} max={100} step={1} value={toonOutlineDist} onChange={updateToonOutlineDist} />
-              <FieldRow label="Color" hint="Color of the silhouette + crease lines.">
-                <input type="color" value={toonOutlineCol} onChange={(e) => updateToonOutlineCol(e.target.value)} style={colorInputStyle} />
-              </FieldRow>
-              <FieldRow label="Supersample x2" hint="Render the edge depth buffer at 2× for higher-quality, smoother edges (heavier on the GPU).">
-                <Switch size="small" checked={toonOutlineSS} onChange={updateToonOutlineSS} />
-              </FieldRow>
-            </>
-          ) : (
-            <Typography variant="caption" sx={{ color: '#999', fontSize: 11 }}>
-              Edge outlines require WebGL (not available on WebGPU).
-            </Typography>
+          <SliderRow label="Amount" min={0} max={1} step={0.05} value={toonOutlineAmount} onChange={updateToonOutlineAmount} />
+          <SliderRow label="Thickness" min={0} max={5} step={0.5} value={toonOutlineThick} onChange={updateToonOutlineThick} />
+          <SliderRow label="Threshold" min={0} max={1} step={0.02} value={toonOutlineThreshold} onChange={updateToonOutlineThreshold} />
+          <SliderRow label="Distance (m)" min={0} max={100} step={1} value={toonOutlineDist} onChange={updateToonOutlineDist} />
+          <FieldRow label="Color" hint="Color of the silhouette + crease lines.">
+            <input type="color" value={toonOutlineCol} onChange={(e) => updateToonOutlineCol(e.target.value)} style={colorInputStyle} />
+          </FieldRow>
+          {!viewer.isWebGPU && (
+            <FieldRow label="Supersample x2" hint="Render the edge depth buffer at 2× for higher-quality, smoother edges (heavier on the GPU).">
+              <Switch size="small" checked={toonOutlineSS} onChange={updateToonOutlineSS} />
+            </FieldRow>
           )}
         </SettingsSection>
       )}
@@ -799,7 +805,7 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
             size="small"
             fullWidth
             value={viewer.rendererKind}
-            onChange={(e) => { localStorage.setItem('rv-webviewer-renderer', e.target.value); window.location.reload(); }}
+            onChange={(e) => { writeLocalStorage('rv-webviewer-renderer', e.target.value); window.location.reload(); }}
           >
             <MenuItem value="webgl" sx={{ fontSize: 13 }}>WebGL</MenuItem>
             <MenuItem value="webgpu" disabled={!navigator.gpu} sx={{ fontSize: 13 }}>

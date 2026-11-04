@@ -3,9 +3,11 @@
 
 /**
  * Viewer-ready helper for specs that must also work against a PRODUCTION build
- * (plan-503). `window.__rvViewer` exists only under `import.meta.env.DEV`
- * (src/main.ts), `window.viewer` is set unconditionally (src/main.ts:662), so
- * everything here reads `window.viewer` — read-only.
+ * (plan-503). `window.viewer` is THE viewer handle and is set in every build, so
+ * everything here reads `window.viewer` — read-only. (`window.__rvViewer` used
+ * to exist only under `import.meta.env.DEV`, which is why this helper was
+ * written; since 2026-10-25 it is a plain alias of `window.viewer` published in
+ * every build, and `window.viewer` stays the name to use.)
  *
  * Order matters on a deployed site (F13): when `settings.json` names a Google
  * Analytics id, `requireAnalyticsConsent()` (src/core/hmi/consent-gate.tsx)
@@ -162,13 +164,23 @@ export function collectNotFound(page: Page): string[] {
  * - `aasx/index.json` anywhere: the project's AASX index is optional (plan-596,
  *   src/core/aas/rv-aas-source.ts). A project without AASX files has none, and
  *   the merged source reads its 404 as "no project packages".
+ * - `/health` at the ORIGIN root of the page (not the deploy root): the MCP
+ *   bridge asks its own origin once per page load whether CONNECT serves the
+ *   page (plan-541 SOL #10, page-load since plan-668 Phase 1 —
+ *   src/plugins/mcp-bridge-plugin.ts `_probeSameOrigin`, pinned by
+ *   tests/mcp-bridge-ai-gate.test.ts "one same-origin probe"). Same-origin, so
+ *   no Local Network Access prompt; a CDN 404 is the designed "hosted" answer.
+ *   A `/health` on ANY other origin (e.g. localhost:5100) stays a defect.
  *
  * Everything else — a GLB, a manifest, a chunk, a texture — is a defect.
  */
 export function isAllowedNotFound(url: string, baseUrl: string): boolean {
-  const path = new URL(url).pathname;
-  const basePath = new URL(baseUrl).pathname.replace(/\/?$/, '/');
+  const parsed = new URL(url);
+  const path = parsed.pathname;
+  const base = new URL(baseUrl);
+  const basePath = base.pathname.replace(/\/?$/, '/');
   if (path === `${basePath}project.json` || path === `${basePath}models.json`) return true;
+  if (parsed.origin === base.origin && path === '/health') return true;
   return /\.kin\.json$/i.test(path) || /\/aasx\/index\.json$/i.test(path);
 }
 

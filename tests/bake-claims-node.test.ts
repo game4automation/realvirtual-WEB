@@ -47,9 +47,11 @@ const FORMER_IMPLICIT_EXPORT_MARKERS = [
 ] as const;
 
 describe('claimsNode — frozen set (plan-755 D7)', () => {
-  it('the types with claimsNode === false are exactly the former export markers + Group', () => {
+  it('the types with claimsNode === false are exactly the former export markers + Group + BlockageBudget', () => {
     const actual = getTypesWhere((c) => !c.claimsNode).sort();
-    expect(actual).toEqual([...FORMER_IMPLICIT_EXPORT_MARKERS, 'Group'].sort());
+    // BlockageBudget (plan-2038 § 2.7): a pure declaration like Group — it must never create a
+    // chunk boundary; it sits on nodes another component already claims (conveyors, stations).
+    expect(actual).toEqual([...FORMER_IMPLICIT_EXPORT_MARKERS, 'Group', 'BlockageBudget'].sort());
   });
 
   it('the former implicit rule still describes the markers, and none of them has behaviour', () => {

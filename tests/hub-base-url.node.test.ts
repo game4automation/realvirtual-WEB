@@ -113,7 +113,7 @@ describe.skipIf(!HAS_PRIVATE)('hub base URL — one constant (F6)', () => {
     expect(existsSync(join(PRIVATE_ROOT, 'delivery'))).toBe(false);
 
     // Only customers with a git delivery have a hub remote; a hosted-link customer (plan-759,
-    // e.g. gernbauer) is skipped exactly like T15b does.
+    // no git delivery) is skipped exactly like T15b does.
     const deliverable = new Set(listCustomers(PRIVATE_ROOT).filter(c => !undeliverableReason(c)).map(c => c.customer));
     const slugs = listCustomerSlugs(PRIVATE_ROOT).filter(s => deliverable.has(s));
     expect(slugs.length).toBeGreaterThan(0);

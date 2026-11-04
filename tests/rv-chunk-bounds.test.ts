@@ -17,17 +17,97 @@
  * nothing changes at all (every non-baking context).
  */
 
-import { describe, it, expect, afterEach } from 'vitest';
-import { Box3, Group, Scene, Vector3 } from 'three';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import { Box3, Group, Matrix4, Scene, Vector3 } from 'three';
 import type { Object3D } from 'three';
 import '../src/core/engine/rv-scene-loader'; // installs the capability table
 import { RVUberMaterial } from '../src/core/engine/rv-uber-material';
 import { BakeRegistry } from '../src/core/engine/rv-bake-registry';
 import type { BakedAsset } from '../src/core/engine/rv-bake-chunk';
-import { computeSubtreeAABB, setChunkBoundsSource } from '../src/core/engine/rv-traverse-utils';
+import { computeSubtreeAABB, computeSubtreeBoxInFrame, setChunkBoundsSource } from '../src/core/engine/rv-traverse-utils';
 import { bakeTree, group, uberMesh, withComponent } from './fixtures/bake-fixture';
 
 const uber = new RVUberMaterial(false);
+
+describe('computeSubtreeBoxInFrame (plan-2014)', () => {
+  afterEach(() => { setChunkBoundsSource(null); vi.restoreAllMocks(); });
+
+  it('keeps a rotated mover tight in its own frame, including merged children and a held real mesh', async () => {
+    const registry = new BakeRegistry();
+    const baked = await bakeTree(makeAsset(), { uber, destructive: true });
+    registry.instantiateTemplate(baked);
+    setChunkBoundsSource(registry);
+    const drive = baked.template.getObjectByName('Drive-A')!;
+    drive.rotation.y = Math.PI / 4;
+    drive.position.set(4, 2, -1);
+    const held = uberMesh(uber, 'held-MU', [2, 0, 0]);
+    drive.add(held);
+    drive.updateWorldMatrix(true, true);
+    const inverse = new Matrix4().copy(drive.matrixWorld).invert();
+    const target = new Box3();
+    expect(computeSubtreeBoxInFrame(drive, inverse, target)).toBe(true);
+    expectBoxClose(target, unitBoxAt([0, 0, 5], 0).union(unitBoxAt([2, 0, 0], 0)));
+    const inflated = new Box3().setFromObject(drive).applyMatrix4(inverse);
+    expect(inflated.max.x - inflated.min.x).toBeGreaterThan(target.max.x - target.min.x);
+    held.position.x = 3;
+    computeSubtreeBoxInFrame(drive, inverse, target);
+    expect(target.max.x).toBeCloseTo(3.5);
+  });
+
+  it('uses only a merged subtree range, not the enclosing chunk geometry', async () => {
+    const registry = new BakeRegistry();
+    const baked = await bakeTree(makeAsset(), { uber, destructive: true });
+    registry.instantiateTemplate(baked);
+    setChunkBoundsSource(registry);
+    const sensor = baked.template.getObjectByName('Sensor-1')!;
+    const target = new Box3();
+    expect(computeSubtreeBoxInFrame(sensor, new Matrix4(), target)).toBe(true);
+    expectBoxClose(target, unitBoxAt([0, 0, -3], 0));
+  });
+
+  it('visits a grabbed separate placement and transforms each chunk exactly once', async () => {
+    const registry = new BakeRegistry();
+    const holderAsset = await bakeTree(makeAsset(), { uber, destructive: true });
+    const holder = registry.instantiateTemplate(holderAsset);
+    const muRoot = group('separate-MU');
+    muRoot.add(uberMesh(uber, 'MU-part'));
+    const muAsset = await bakeTree(muRoot, { uber, destructive: true });
+    const mu = registry.instantiateTemplate(muAsset);
+    const scene = new Scene();
+    scene.add(holder.root, mu.root);
+    mu.root.position.set(3, 0, 0);
+    scene.updateMatrixWorld(true);
+    const drive = holder.root.getObjectByName('Drive-A')!;
+    drive.attach(mu.root);
+    setChunkBoundsSource(registry);
+    const visit = vi.spyOn(registry, 'visitChunkGeometry');
+    const expand = vi.spyOn(Box3.prototype, 'expandByPoint');
+    const target = new Box3();
+    expect(computeSubtreeBoxInFrame(drive, new Matrix4(), target)).toBe(true);
+    expectBoxClose(target, unitBoxAt([0, 0, 5], 0).union(unitBoxAt([3, 0, 0], 0)));
+    expect(visit.mock.calls.map(call => call[0])).toEqual([drive, mu.root]);
+    // One holder chunk and one MU chunk, eight transformed corners each.
+    expect(expand).toHaveBeenCalledTimes(16);
+  });
+
+  it('reuses scratch across calls and does not allocate missing geometry boxes', () => {
+    const node = group('unbaked');
+    const mesh = uberMesh(uber, 'box');
+    mesh.geometry.boundingBox = null;
+    node.add(mesh);
+    const target = new Box3(), inverse = new Matrix4();
+    const compute = vi.spyOn(mesh.geometry, 'computeBoundingBox');
+    for (let i = 0; i < 600; i++) {
+      expect(computeSubtreeBoxInFrame(node, inverse, target)).toBe(true);
+    }
+    expect(compute).not.toHaveBeenCalled();
+    expect(mesh.geometry.boundingBox).toBeNull();
+    expectBoxClose(target, unitBoxAt([0, 0, 0], 0));
+    node.remove(mesh);
+    expect(computeSubtreeBoxInFrame(node, inverse, target)).toBe(false);
+    expect(target.isEmpty()).toBe(true);
+  });
+});
 
 /**
  * Machine

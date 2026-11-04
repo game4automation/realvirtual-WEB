@@ -31,7 +31,6 @@ import type { GroupInfo } from '../engine/rv-group-registry';
 import type { AutoFilterGroup } from '../engine/rv-auto-filter-registry';
 import { useOverlayVisibilityState } from '../../hooks/use-overlay-visible';
 import { setOverlayVisible, showAllOverlays } from '../overlay-visibility-store';
-
 /**
  * Apply the persisted group / auto-filter visibility to a freshly loaded
  * model, and reconcile the panel's kinematic auto-exclusion.
@@ -48,18 +47,18 @@ export function applyPersistedGroupVisibility(viewer: RVViewer, result?: Pick<Lo
 
     // Auto-exclude the kinematic groups a DRIVE moves (structure) — a
     // drive-less `Kinematic` is a rigid group the operator toggles
-    // (Festo `Cover`, 2026-09-24) and stays listed.
+    // (pick-and-place cell `Cover`, 2026-09-24) and stays listed.
     const kinNames = result?.drivenKinematicGroupNames ?? result?.kinematicGroupNames ?? [];
     // Release what THIS panel excluded earlier and this model no longer
     // drives (a Kinematic that lost its drive, or a group that became a
-    // plain group — the Festo `Cover`). A name the user excluded by hand
+    // plain group — the pick-and-place cell `Cover`). A name the user excluded by hand
     // is not in `autoExcludedKinematic` and stays excluded.
     const modelGroups = new Set(groups.getAll().map(g => g.name));
     const stillDriven = new Set(kinNames);
     // A profile from before this record existed (2026-09-24) holds only
     // the old rule's auto-exclusions for this model's groups — treat them
     // as auto-added ONCE so the first load releases what is no longer
-    // driven (the Festo `Cover`). From then on the record is authoritative.
+    // driven (the pick-and-place cell `Cover`). From then on the record is authoritative.
     const auto = saved.autoExcludedKinematic
       ?? (saved.excludedFromOverlay ?? []).filter(n => modelGroups.has(n));
     const released = auto.filter(n => modelGroups.has(n) && !stillDriven.has(n));
@@ -154,7 +153,9 @@ export function GroupsListContent({
   const [, setTick] = useState(0);
   // Overlay-visibility categories (plan-250) — only those with a live producer.
   const overlayState = useOverlayVisibilityState();
-  const overlayCats = showOverlaysSection ? overlayState.present : [];
+  const overlayCats = showOverlaysSection
+    ? overlayState.present.filter(c => c.id !== 'trace-blocked' && c.id !== 'trace-utilization')
+    : [];
 
   /** Toggle an overlay category and force a redraw so on-demand overlays
    *  (highlights, gizmos) update immediately in render-on-demand mode. */
@@ -166,7 +167,7 @@ export function GroupsListContent({
   // The exclusion filter lives in localStorage; re-read it whenever the store
   // is written (Settings → Groups, an MCP tool, the model-loaded reconciliation)
   // — a memo keyed on the group array alone showed a stale list until the
-  // panel happened to rebuild (Festo `Cover`, 2026-09-24).
+  // panel happened to rebuild (pick-and-place cell `Cover`, 2026-09-24).
   const [settingsTick, setSettingsTick] = useState(0);
   useEffect(() => subscribeGroupVisibilitySettings(() => setSettingsTick(t => t + 1)), []);
 

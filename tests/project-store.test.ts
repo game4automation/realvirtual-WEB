@@ -28,6 +28,7 @@ import {
 } from './helpers/dead-draft-slots';
 import { FakeDir, asDirHandle } from './helpers/fake-fs-handles';
 import { ProjectStore, resetProjectStore } from '../src/core/project/project-store';
+import { BundledBackend } from '../src/core/project/backends/bundled-backend';
 import {
   clearSceneMutationListeners,
   emitSceneMutation,
@@ -767,5 +768,41 @@ describe('snapshot.documents follows scenes created after the project opened', (
     emitSceneMutation({ type: 'delete', id: 'scn_gone' });
     await store.flush();
     expect(store.getSnapshot().documents.map(d => d.name)).toEqual([]);
+  });
+});
+
+// ─── plan-777 §9.3b: the snapshot carries documents only ────────────────
+
+describe('plan-777 rule 2 — no models / scenes views at runtime', () => {
+  const notFound = () => new BundledBackend({
+    fetchImpl: (async () => ({ ok: false, status: 404, json: async () => null })) as unknown as typeof fetch,
+  });
+
+  it('a fresh store snapshot has `documents` and neither `models` nor `scenes`', () => {
+    const keys = Object.keys(new ProjectStore().getSnapshot());
+    expect(keys).toContain('documents');
+    expect(keys).not.toContain('models');
+    expect(keys).not.toContain('scenes');
+  });
+
+  it('…and so does the snapshot of an opened project', async () => {
+    const s = scene('scn_a', 'A');
+    const root = makeFolder({ scenes: [entryFor(s)], models: [{ path: 'models/Line.glb', label: 'Line' }] } as never, [s]);
+    expect(await store.openProjectFolder(asDirHandle(root))).toBe(true);
+    const snap = store.getSnapshot();
+    expect(Object.keys(snap)).not.toContain('models');
+    expect(Object.keys(snap)).not.toContain('scenes');
+    // The model the legacy `models[]` declared is a document like every other.
+    expect(snap.documents.map(d => d.path)).toEqual(expect.arrayContaining(['models/Line.glb']));
+  });
+
+  it('resolveActiveProject() returns `documents` and neither `models` nor `scenes`', async () => {
+    const resolved = await store.resolveActiveProject({
+      workspaceDefault: false, bundledBackend: notFound(), rootBackend: notFound(),
+    });
+    expect(Object.keys(resolved)).toContain('documents');
+    expect(Object.keys(resolved)).not.toContain('models');
+    expect(Object.keys(resolved)).not.toContain('scenes');
+    expect(Array.isArray(resolved.documents)).toBe(true);
   });
 });

@@ -3,7 +3,7 @@
 
 /**
  * debug-endpoint-serialize.test.ts — crash-safe console-argument
- * serialization of the DebugEndpointPlugin error buffer.
+ * serialization of the diagnostics console buffer behind /__api/debug/errors.
  *
  * Regression for the live crash: the console.error monkey-patch ran
  * `JSON.stringify` over a Three.js BufferGeometry argument; its
@@ -16,7 +16,11 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { BufferAttribute, BufferGeometry } from 'three';
-import { DebugEndpointPlugin, serializeConsoleArg } from '../src/plugins/debug-endpoint-plugin';
+import {
+  getDiagnosticsEntries, installDiagnosticsCollector,
+} from '../src/core/diagnostics/rv-diagnostics-collector';
+// Through the plugin's own re-export, so the surface the endpoint offers stays pinned.
+import { serializeConsoleArg } from '../src/plugins/debug-endpoint-plugin';
 
 describe('serializeConsoleArg — never throws', () => {
   it('object whose toJSON throws (simulated detached buffer) → String fallback, no throw', () => {
@@ -92,25 +96,27 @@ describe('serializeConsoleArg — never throws', () => {
   });
 });
 
-describe('DebugEndpointPlugin console hook — buffers a short form, never crashes', () => {
-  type PluginInternals = {
-    _setupErrorCapture(): void;
-    _restoreConsole(): void;
-    _errors: Array<{ level: string; message: string }>;
-  };
-
-  const plugins: PluginInternals[] = [];
+/**
+ * The console hook no longer lives in the plugin. `installDiagnosticsCollector()`
+ * wraps `console.error` / `console.warn` once, globally, and buffers the entries
+ * under `cat: 'console'`; the plugin only READS them back through
+ * `getDiagnosticsEntries()` for its `/__api/debug/errors` endpoint, and
+ * re-exports `serializeConsoleArg` for this very regression. The old
+ * `_setupErrorCapture` / `_restoreConsole` pair went with that move, so the
+ * regression is pinned where the hook actually is. The install is once-only and
+ * has no uninstall, so the console originals are restored by hand here.
+ */
+describe('diagnostics console hook — buffers a short form, never crashes', () => {
+  const originalError = console.error;
+  const originalWarn = console.warn;
 
   afterEach(() => {
-    for (const p of plugins) p._restoreConsole();
-    plugins.length = 0;
+    console.error = originalError;
+    console.warn = originalWarn;
   });
 
   it('console.error with a throwing-toJSON object does not throw and buffers a short form', () => {
-    const plugin = new DebugEndpointPlugin() as unknown as PluginInternals;
-    plugins.push(plugin);
-    plugin._errors = [];
-    plugin._setupErrorCapture();
+    installDiagnosticsCollector();
 
     const geo = new BufferGeometry();
     geo.name = 'Detached';
@@ -118,12 +124,15 @@ describe('DebugEndpointPlugin console hook — buffers a short form, never crash
       throw new TypeError('detached ArrayBuffer');
     };
 
+    const before = getDiagnosticsEntries().length;
     expect(() => console.error('THREE.GLTFLoader: mesh failed', geo)).not.toThrow();
 
-    expect(plugin._errors).toHaveLength(1);
-    expect(plugin._errors[0].level).toBe('error');
-    expect(plugin._errors[0].message).toContain('THREE.GLTFLoader: mesh failed');
-    expect(plugin._errors[0].message).toContain('[BufferGeometry name=Detached');
-    expect(plugin._errors[0].message.length).toBeLessThanOrEqual(8000);
+    const added = getDiagnosticsEntries().slice(before);
+    const consoleEntries = added.filter(e => e.cat === 'console');
+    expect(consoleEntries).toHaveLength(1);
+    expect(consoleEntries[0].lvl).toBe('error');
+    expect(consoleEntries[0].msg).toContain('THREE.GLTFLoader: mesh failed');
+    expect(consoleEntries[0].msg).toContain('[BufferGeometry name=Detached');
+    expect(consoleEntries[0].msg.length).toBeLessThanOrEqual(8000);
   });
 });

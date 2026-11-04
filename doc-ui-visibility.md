@@ -33,7 +33,7 @@ That single omission is the whole rule. `core` buys participation and nothing el
 
 ### The registered modes
 
-Six workspace modes are registered in `main.ts`, in this order. A mode's UI context id is
+Five workspace modes are registered in `main.ts`; the sixth, `editor`, is registered by the asset-editor feature adapter (private builds only — a community build has no Editor mode). All six, in `order`. A mode's UI context id is
 `mode:<id>` (`modeContext(id)`), which is what `modes` compiles into:
 
 | `ModeId` | Label | `order` | Runtime |
@@ -184,6 +184,25 @@ startup.
 > `useUIVisible` (chrome elements) — for a plugin's slot entry, change the plugin's `modes` or
 > hand-write a `hiddenIn` on the entry instead.
 
+### Checking a delivery's view on the dev server (plan-615)
+
+Overrides are applied **once, at boot** — and they cannot be taken back at runtime: the store has
+no "unregister", and the code default of an overridden id was never registered (see above). That
+is why the dev toolbar's **View** switch (`doc-web-debugging.md` § 4g) does not toggle overrides
+live; it **reloads** the page with a different config:
+
+- **Delivered** — the loaded config with its view keys applied (`mode.lock`, `lockSettings`,
+  `lockedTabs`, `ui.initialContexts`, `ui.visibilityOverrides`); when the loaded config has none,
+  the HMI-only profile `{ mode: { lock: "hmi" }, lockSettings: true }`.
+- **Dev** — the loaded config with those keys removed: every mode, every panel.
+
+The choice lives in sessionStorage (`rv-view-profile`) or, for one boot, in `?view=`; without
+either the boot applies the loaded config unchanged. `src/core/rv-view-profile.ts` holds the rule;
+`main.ts` applies it before `setAppConfig()` and before the mode lock, dev server only. The dev
+entry is the activity bar's last entry in both views, so it is also the way back from the delivered
+view. Only when no activity bar is mounted (e.g. the delivered config hides it) does a small handle
+at the bottom-left edge (`data-testid="dev-handle"`) take its place.
+
 ### The one non-obvious rule: `shownOnlyInAny` is replaced, not merged
 
 `register()` writes the compiled mode rule with a spread (`rv-ui-registry.ts`):
@@ -278,12 +297,102 @@ and the UI-context axis.
 
 ---
 
+## 6.5 Authoring tools: the `planner` context is "authoring is live"
+
+The layout planner runs in TWO workspace modes, `planner` and `des` (`AUTHORING_MODES`,
+`layout-planner/authoring-modes.ts`), because DES is where material-flow layouts are built. Its
+`setActive` sets the legacy UI context `'planner'` in **both** — so that context means
+*"layout authoring is live"*, **not** *"Planner mode is selected"* (that is `mode:planner`). A
+toolbar entry with the bare rule `{ shownOnlyIn: ['planner'] }` therefore shows in DES too, which
+reads like a bug and is not one.
+
+Authoring tools say what they mean with the named rule:
+
+```typescript
+import { AUTHORING_TOOL_RULE, AUTHORING_LIVE_CONTEXT } from '../layout-planner/authoring-modes';
+
+{ slot: 'button-group', component: SnapFlyout, group: 'model',
+  visibilityRule: { ...AUTHORING_TOOL_RULE } }   // authoring live AND mode planner|des
+```
+
+`AUTHORING_TOOL_RULE` = `shownOnlyIn: [AUTHORING_LIVE_CONTEXT]` + `shownOnlyInAny: ['mode:planner', 'mode:des']`.
+The context string is not renamed (snap-point's mode handling, the magnetic arming and the chain
+preview read it).
+
+**Signal linking in DES (plan-2010).** The two signal toolbar buttons (link-mode toggle, bindings
+overview) use `SIGNAL_LINK_TOOLBAR_CONTEXTS` — the link-mode list **without** `des`
+(`signal-link-gate.ts`). Linking itself stays available in DES (inspector slot rows,
+drag-linking, the "Link signal…" context entry follow `SIGNAL_LINK_MODES`). Because the switch is
+not on screen there, a link mode that was left on **rests** in DES: `SignalBindPlugin` follows
+`mode-changed` and calls `setSignalLinkModeSuspended(true)`, so `active` is false (no badges,
+normal object tooltips) while the stored switch (`explicit`, localStorage) is untouched; it
+applies again as soon as the mode changes. A running inspector drag-link still counts.
+
+---
+
+## 6.6 CONNECT panel: lazy chunk, eager boot effects (plan-2035)
+
+`ConnectPanel` (the CONNECT left window) is a lazy chunk. `App.tsx` renders the small eager
+`ConnectPanelHost` at all three places (full shell, CONNECT embed shell, recording shell); the
+panel body loads on first need and then stays mounted (`hasLoaded || wanted`, the plan-344 pattern),
+so dialogs and expanded interfaces survive close/reopen.
+
+- **Wanted** = the panel is open, or an Edit request is pending (`snap.editInterfaceId`). The panel
+  consumes the request exactly once when it mounts.
+- **Preload** (chunk fetch only, nothing rendered): hover/focus of the CONNECT toolbar button
+  (`ConnectToolbarButton`) and once the gateway is `connected`.
+- **Closed-panel behaviour is unchanged.** What used to run inside the always-mounted panel now
+  lives in `useConnectPanelBootEffects` (host, eager): `ensureInterfaceTypes()` and the bridge-cache
+  load on `connected` (single owner; the panel only reads the cache). The status poll stays with
+  `ConnectStatusPoll` in `connect-plugin.tsx`.
+- **Failure**: `LazyPanelBoundary` (`visible={open}`) shows loading/error only while the panel is
+  open; reopening after a failed import retries with a fresh `lazy()` instance (`attempt` + boundary `key`).
+- **Recording**: `connect-panel-readiness.ts` (`pending` → `committed` / `failed`). `captureHmiSettle`
+  waits for the panel's first commit (10 s timeout, import failure and abort reject with the cause);
+  `enterRecordingHmi` marks it pending synchronously when it opens `connect`.
+- **Shared pieces** (`ConnectDownloadLinks`, `interfaceEndpointLabel`, `interfaceTypeLabel`) live in
+  `connect-panel-shared.tsx`, which must never import `ConnectPanel.tsx`; `ConnectPanel.tsx` re-exports them.
+
+
+### Path-network controller (plan-2036)
+
+`path-network-interaction.ts` (the planner's pointer/keyboard controller for path networks) is a lazy
+chunk too. `PathNetworkUiPlugin.init()` starts `import('./path-network-interaction')` at boot and creates
+`PathNetworkInteraction` when it lands; `interaction` is `null` until then. `whenInteractionReady()`
+resolves with the controller (or `null` after dispose / import failure) and `subscribeInteraction(cb)`
+feeds `useSyncExternalStore` in `PathNetworkToolbar` and `SnapPointPickerPopup`. After loading,
+`syncLibrary()` runs again so the path-block catalog and the marquee provider also appear when an
+authoring mode was entered before the import finished. `onRender` / `onModelCleared` are no-ops until
+loaded. Constants the toolbar needs (`PATH_BLOCK_DRAG_TYPE`) live in `path-network-shared.ts`.
+Tests replace the loader through `setPathNetworkInteractionLoaderForTests`.
+
+### Layout planner chunk (plan-2037)
+
+`plugins/layout-planner` is no longer in the demo entry: `init()` in `main.ts` starts
+`import('./plugins/layout-planner')` right after `initFragmentSecret()` (still the first statement) and
+awaits it just before `RVViewer.create`. Consent, password gate and published presets run while the
+chunk downloads; nothing is lazy-on-demand, the boot still waits for it. The plugin chain is unchanged:
+`.use(new LayoutPlannerPlugin(), 'core')` keeps its position. The rejection is handled immediately (no
+unhandled rejection while a dialog is open); if the await fails, `init()` shows `showLoadingError`, wires
+both splash buttons to `location.reload()` and returns without a viewer. `LayoutLibraryPanelHost` lives in
+that chunk, so its lazy `LayoutLibraryPanel` import is emitted there. Guards:
+`tests/bundle-splitting.test.ts` (plan-2037 block, T3) and `tests/planner-chunk-boot.node.test.ts`.
+
 ## 7. Checklist before you change any of this
 
 - Changing a plugin's `modes` or `core`? Check both axes — participation *and* the compiled slot
   rule. They are not the same switch.
 - Adding a slot entry to a plugin that declares `modes`? Do not set `shownOnlyInAny` yourself.
+- Adding a toolbar tool for layout authoring? Use `AUTHORING_TOOL_RULE`, not the bare `shownOnlyIn: ['planner']` (§6.5), and give it a `group`.
 - Gating a chrome element? Use `useUIVisible(id, rule)` with a stable `id`, so a deployment can
   override it.
 - Changing `register()`'s compile step? `tests/rv-mode-visibility.test.ts` is the specification —
   if those tests still pass after a semantic change, the change was not covered.
+
+### HMI overlay switch
+
+Press **H** or use the eye button to toggle the entire HMI overlay. The choice is
+stored in `localStorage['rv-hmi-visible']`. Open a link with `?hmi=0` to start
+with the overlay hidden, or `?hmi=1` to force it visible. This URL override takes
+precedence over the stored choice without writing to localStorage. Unknown values
+are ignored. H continues to toggle visibility and persist the choice as usual.

@@ -32,6 +32,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { nodeRegistryDouble } from './fixtures/node-registry-double';
 
 vi.mock('../src/core/engine/rv-local-filesystem', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/core/engine/rv-local-filesystem')>();
@@ -199,7 +200,7 @@ function makeSceneStore(): SceneStore {
     currentModelUrl: null,
     // The bake is mocked but its GUARD is real: `_bakeCurrent` returns null
     // without a registry, and a save that cannot bake writes nothing.
-    registry: { getGltfNodeNames: () => [], getGltfNodeIndex: () => -1 },
+    registry: nodeRegistryDouble(),
     currentModelRoot: null,
     lastLoadResult: null,
     loadScene: vi.fn(async (s: RvScene) => { v.currentScene = s; }),

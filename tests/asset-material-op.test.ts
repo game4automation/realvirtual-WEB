@@ -2,11 +2,12 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { describe, it, expect } from 'vitest';
-import { Group, Mesh, BoxGeometry, MeshStandardMaterial } from 'three';
+import { Group, Mesh, BoxGeometry, MeshStandardMaterial, Scene } from 'three';
 import {
   collectPaintableMeshes, materialToValue, materialForValue, materialValueKey,
-  indexMeshPathsByMaterialValue,
+  indexMeshPathsByMaterialValue, planMaterialAssignment, materialPrevOfPlan,
 } from '../src/core/editor/rv-asset-material';
+import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { classifyAssetOpRaycastImpact } from '../src/core/editor/rv-asset-ops';
 import { canCoalesceRvOps, mergeRvOps, describeRvOp } from '../src/core/ops/rv-unified-ops';
 import type { SetMaterialOp, MaterialValue } from '../src/core/editor/rv-asset-ops';
@@ -64,7 +65,7 @@ describe('material values', () => {
 });
 
 describe('collectPaintableMeshes', () => {
-  it('collects descendants but skips helpers and multi-material meshes', () => {
+  it('collects descendants, multi-material meshes and `_`-named CAD parts; skips flagged helpers', () => {
     const root = new Group();
     root.name = 'Asset';
     root.add(mesh('a', new MeshStandardMaterial()));
@@ -72,12 +73,55 @@ describe('collectPaintableMeshes', () => {
     child.name = 'sub';
     child.add(mesh('b', new MeshStandardMaterial()));
     root.add(child);
-    root.add(mesh('_overlay', new MeshStandardMaterial()));
+    // A legitimate CAD name with a leading underscore is a part, not a helper.
+    root.add(mesh('_CADpart', new MeshStandardMaterial()));
     const multi = new Mesh(new BoxGeometry(), [new MeshStandardMaterial(), new MeshStandardMaterial()]);
     multi.name = 'multi';
     root.add(multi);
+    // Helpers: explicit metadata, or the reserved `__` runtime prefix.
+    const gizmo = mesh('gizmo', new MeshStandardMaterial());
+    gizmo.userData._rvGizmo = true;
+    root.add(gizmo);
+    root.add(mesh('__rvOverlay', new MeshStandardMaterial()));
     const names = collectPaintableMeshes(root).map(m => m.name).sort();
-    expect(names).toEqual(['a', 'b']);
+    expect(names).toEqual(['_CADpart', 'a', 'b', 'multi']);
+  });
+});
+
+describe('planMaterialAssignment', () => {
+  function registryOver(root: Group): NodeRegistry {
+    // Paths start below the scene root (`NodeRegistry.computeNodePath`).
+    new Scene().add(root);
+    const reg = new NodeRegistry();
+    root.traverse((n) => reg.registerNode(NodeRegistry.computeNodePath(n), n));
+    return reg;
+  }
+
+  it('reports unresolved and mesh-less paths with a reason, and the paintable meshes deduped', () => {
+    const root = new Group();
+    root.name = 'Asset';
+    const part = mesh('Part', new MeshStandardMaterial());
+    root.add(part);
+    const empty = new Group();
+    empty.name = 'Empty';
+    root.add(empty);
+    const plan = planMaterialAssignment(registryOver(root), ['Asset', 'Asset/Part', 'Asset/Empty', 'Asset/Nope']);
+    expect(plan.targets.map((t) => t.mesh)).toEqual([part]);
+    expect(plan.nodePaths).toEqual(['Asset', 'Asset/Part']);
+    expect(plan.skipped).toEqual([
+      { path: 'Asset/Empty', reason: 'no-mesh' },
+      { path: 'Asset/Nope', reason: 'unresolved' },
+    ]);
+  });
+
+  it('includes a material-array mesh with a null value in prev (exact undo goes through the stash)', () => {
+    const root = new Group();
+    root.name = 'Asset';
+    const multi = new Mesh(new BoxGeometry(), [new MeshStandardMaterial(), new MeshStandardMaterial()]);
+    multi.name = 'Multi';
+    root.add(multi);
+    const plan = planMaterialAssignment(registryOver(root), ['Asset/Multi']);
+    expect(materialPrevOfPlan(plan)).toEqual([{ meshPath: 'Asset/Multi', material: null }]);
   });
 });
 

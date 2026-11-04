@@ -4,7 +4,7 @@
 /**
  * scene-document-view — the SCENE writer of the view seam (plan-709 §2.1.1).
  *
- * Three of the four modes (planner, HMI, DES) work on a scene document, and a
+ * Three of the four modes (planner, HMI, DES) work on the planner's document, and a
  * scene has no `RvDocumentStack` at all. This is what publishes their half of
  * {@link ActiveDocumentView}: one chip, `stackDirty === dirty`, and the verbs
  * the (never-mounted) `SceneActiveCard` used to offer — which is how
@@ -21,6 +21,7 @@
  * never blinks empty in between (§2.1.1, R2-S).
  */
 
+import { activeHistoryStep } from '../rv-edit-target';
 import type { RVViewer } from '../../rv-viewer';
 import type { ProjectBackend } from '../../project/backends/project-backend';
 import { getProjectStore } from '../../project/project-store';
@@ -34,6 +35,12 @@ import {
   type NamePrompt,
 } from '../../editor/active-document-view';
 import { decideSaveVerb, saveDocument, type SaveVerb } from '../../editor/rv-save-document';
+import {
+  exportProviderRegistry,
+  type DocumentExportContext,
+  type ExportProviderRegistry,
+} from '../../export/rv-export-provider';
+import type { ActiveDocumentFileExport } from '../../editor/active-document-view';
 import type { SceneSnapshot, SceneStore } from './scene-store';
 
 /** The mode whose writer owns the seam instead of this one. */
@@ -60,12 +67,12 @@ export const SCENE_SOURCE_MODE = 'scene';
  * lineages, and a scene simply describes itself to it. The refusals therefore
  * cannot drift apart any more — they have one source.
  */
-function sceneSaveDecision(
+function plannerSaveDecision(
   snap: SceneSnapshot | null,
   backend: ProjectBackend | null,
 ): { verb: SaveVerb; reason?: string } {
   return decideSaveVerb(
-    { lineage: 'scene', open: !!snap?.draft, transient: snap?.transient === true },
+    { lineage: 'planner', open: !!snap?.draft, transient: snap?.transient === true },
     backend,
   );
 }
@@ -80,16 +87,18 @@ function sceneSaveDecision(
  * and it is also why the card can never disagree with the exit guard, since
  * `dirty` here IS `snap.dirty`, the value `trySwitch` reads.
  */
-export function sceneDocumentView(
+export function plannerDocumentView(
   store: SceneStore,
   snap: SceneSnapshot | null,
   backend: ProjectBackend | null,
   sourceMode: string = SCENE_SOURCE_MODE,
+  /** The running viewer, for the replace sequence of an apply (plan-764). Optional: tests hand in none. */
+  viewer?: unknown,
 ): ActiveDocumentView | null {
   const draft = snap?.draft;
   if (!snap || !draft) return null;
 
-  const decision = sceneSaveDecision(snap, backend);
+  const decision = plannerSaveDecision(snap, backend);
   const savedId = snap.saved?.id ?? null;
 
   const menu: ActiveDocumentVerb[] = [
@@ -173,15 +182,116 @@ export function sceneDocumentView(
     redoLabel: snap.redoLabel,
     actions: {
       save: (prompt?: NamePrompt) => saveFromDocumentCard(store, prompt),
-      undo: () => store.undo(),
-      redo: () => store.redo(),
+      undo: async () => { await (activeHistoryStep('undo') ?? store.undo()); },
+      redo: async () => { await (activeHistoryStep('redo') ?? store.redo()); },
       menu,
       exportGlb: {
         estimate: () => store.estimateFlatExport(),
         run: (opts) => store.exportSceneGlb(opts),
         fileName: `${draft.name.replace(/[\\/:*?"<>|]+/g, '_') || 'scene'}.glb`,
       },
+      ...sceneFileExports(store, draft.name, exportProviderRegistry, viewer),
     },
+  };
+}
+
+// ─── Non-GLB exports (plan-764) ─────────────────────────────────────────
+
+/**
+ * The export context of the planner's open document (plan-764 §2.3).
+ *
+ * `documentGlb` is the NON-embedding export — the authored document bytes
+ * (base + op log through `bakeIntoGlb`). Never the embed path: that one
+ * serialises the baked live tree and loses up to half of the authored extras
+ * (spike S5). `replaceDocument` is the plan-527 replace sequence
+ * (`rv-document-replace.ts`) with the bytes entry: the same lock, draft and
+ * dirty checks, revision precondition, full parse, camera-keeping reload and
+ * restore that an outside push gets — loaded lazily, only when an apply commits.
+ *
+ * Every getter reads the store when CALLED, not when the context is built, so
+ * a context held by a long export or an MCP call never reports stale facts.
+ */
+export function plannerDocumentExportContext(
+  store: SceneStore,
+  documentName: string,
+  projectId: () => string = () => getProjectStore().getProject()?.id ?? '',
+  viewer?: unknown,
+): DocumentExportContext {
+  // `documentExportFacts` is read defensively: the parity tests hand in stub stores.
+  const facts = () => store.documentExportFacts?.()
+    ?? { documentId: null, documentPath: null, revision: null, hasUsdPrimPaths: false };
+  const ctx: DocumentExportContext = {
+    get projectId() { return projectId(); },
+    get documentId() { return facts().documentId ?? ''; },
+    documentName,
+    documentRevision: () => facts().revision,
+    documentGlb: () => store.exportSceneGlb({ embedReferences: false }),
+    hasUsdPrimPaths: () => facts().hasUsdPrimPaths,
+    replaceDocument: async (bytes, expectedRevision, target) => {
+      const { replaceDocument, createViewerReplaceDeps } = await import('../../../plugins/mcp-bridge/rv-document-replace');
+      return replaceDocument(
+        {
+          operationId: newReplaceOperationId(),
+          projectId: target?.projectId ?? ctx.projectId,
+          documentId: target?.documentId ?? ctx.documentId,
+          bytes,
+          expectedRevision,
+        },
+        () => createViewerReplaceDeps(viewer, IN_PAGE_REPLACE_SESSION, { sceneStore: () => store }),
+        { sessionId: IN_PAGE_REPLACE_SESSION },
+      );
+    },
+  };
+  return ctx;
+}
+
+/** The "bridge session" an in-page replace (an apply from the card or MCP) is registered under. */
+export const IN_PAGE_REPLACE_SESSION = 'in-page';
+
+let _replaceSeq = 0;
+
+/** A fresh idempotency key per replace — an apply never re-uses one. */
+function newReplaceOperationId(): string {
+  const uuid = (globalThis.crypto as { randomUUID?: () => string } | undefined)?.randomUUID?.();
+  return `apply-${uuid ?? `${Date.now().toString(36)}-${++_replaceSeq}`}`;
+}
+
+/**
+ * Bind every registered export provider to the scene's context. Absent (not
+ * an empty array) when nothing is registered, so a public build's view has
+ * exactly the shape it had before plan-764.
+ */
+export function sceneFileExports(
+  store: SceneStore,
+  documentName: string,
+  registry: ExportProviderRegistry = exportProviderRegistry,
+  viewer?: unknown,
+): { exports?: ActiveDocumentFileExport[] } {
+  const providers = registry.list();
+  if (providers.length === 0) return {};
+  const ctx = plannerDocumentExportContext(store, documentName, undefined, viewer);
+  return {
+    exports: providers.map((provider) => {
+      const apply = provider.apply;
+      return {
+        id: provider.id,
+        label: provider.label,
+        modes: () => provider.modes(ctx),
+        run: (modeId: string) => provider.run(ctx, modeId),
+        ...(apply
+          ? {
+            apply: {
+              label: apply.label,
+              preview: (file: { name: string; bytes: Uint8Array }) => apply.preview(ctx, file),
+              commit: (
+                previewToken: string,
+                confirm: { acceptExtrasLoss?: boolean; confirmExtrasLost?: boolean },
+              ) => apply.commit(ctx, previewToken, confirm),
+            },
+          }
+          : {}),
+      };
+    }),
   };
 }
 
@@ -189,7 +299,7 @@ export function sceneDocumentView(
  * Save what the card has open — through the ONE save path (plan-710 F5).
  *
  * Called `saveScene()` until plan-720. The name outlived the split it described:
- * there is one document type, so this is not "the scene save" beside some other
+ * there is one document type, so this is not "the planner save" beside some other
  * save, it is the CARD's thin adapter onto `saveDocument()`. It cannot simply be
  * called `saveDocument` — that is the imported core function it delegates to.
  *
@@ -273,7 +383,7 @@ export function describeSaveIntoModel(
  * back to this writer — without that subscription the card would stay on the
  * editor's last view until the next scene edit.
  */
-export function installSceneDocumentView(viewer: RVViewer, store: SceneStore): () => void {
+export function installPlannerDocumentView(viewer: RVViewer, store: SceneStore): () => void {
   /** What this writer last put on the seam — the only thing it may clear. */
   let published: string | null = null;
 
@@ -296,7 +406,7 @@ export function installSceneDocumentView(viewer: RVViewer, store: SceneStore): (
     }
     const sourceMode = modes?.activeMode ?? SCENE_SOURCE_MODE;
     const backend = getProjectStore().getBackend();
-    const view = sceneDocumentView(store, store.getSnapshot(), backend, sourceMode);
+    const view = plannerDocumentView(store, store.getSnapshot(), backend, sourceMode, viewer);
     if (view) {
       setActiveDocumentView(view);
       published = sourceMode;
@@ -307,11 +417,15 @@ export function installSceneDocumentView(viewer: RVViewer, store: SceneStore): (
 
   const unsubStore = store.subscribe(publish);
   const unsubModes = subscribeModes?.(publish);
+  // A private export provider registers after boot (plan-764): republish so
+  // the card's menu learns about it without waiting for the next scene edit.
+  const unsubExports = exportProviderRegistry.onChange(publish);
   publish();
 
   return () => {
     unsubStore();
     unsubModes?.();
+    unsubExports();
     if (published) { clearActiveDocumentViewFor(published); published = null; }
   };
 }

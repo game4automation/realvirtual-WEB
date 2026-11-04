@@ -16,6 +16,7 @@ import {
   Select,
   MenuItem,
   Checkbox,
+  Slider,
 } from '@mui/material';
 import { DragNumberField } from './DragNumberField';
 import { InspectorRow } from './rv-inspector-row';
@@ -45,6 +46,13 @@ export interface FieldEditorProps {
    *  over the name-keyed `ENUM_FIELDS` fallback, which only knows a handful of
    *  legacy fields (Direction, Active, CollisionRole ...). */
   options?: string[];
+  /** Inclusive bounds and drag step of a number field, from the schema
+   *  (`minimum` / `maximum` / `step`, plan-673). Passed on to the number editor,
+   *  which clamps a typed value on commit and a drag continuously — so a bound
+   *  the writer would have to enforce is enforced at the input instead. */
+  min?: number;
+  max?: number;
+  step?: number;
 }
 
 // ── NumberEditor ──────────────────────────────────────────────────────────
@@ -62,6 +70,13 @@ export interface NumberEditorProps {
   min?: number;
   /** Inclusive upper bound (see `min`). */
   max?: number;
+  /** Drag step per pixel (default 1); also derives the fraction digits (plan-650). */
+  step?: number;
+  /**
+   * false = commit only at the END of an edit (blur, Enter, end of a drag) — for values whose
+   * commit is expensive (plan-650: a parametric family regenerates once per commit). Default true.
+   */
+  liveCommit?: boolean;
   disabled?: boolean;
   ariaLabel?: string;
 }
@@ -84,8 +99,11 @@ export function formatRangeHint(min?: number, max?: number): string {
   return '';
 }
 
-export function NumberEditor({ value, onChange, unit, min, max, disabled, ariaLabel }: NumberEditorProps) {
+export function NumberEditor({ value, onChange, unit, min, max, step, liveCommit = true, disabled, ariaLabel }: NumberEditorProps) {
   const [draft, setDraft] = useState(String(value));
+  const dirtyRef = useRef(false);
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
   const hint = formatRangeHint(min, max);
   // The value a clamping commit just sent: its re-synced draft must not fire a
   // second live commit before the parent's value catches up.
@@ -93,9 +111,18 @@ export function NumberEditor({ value, onChange, unit, min, max, disabled, ariaLa
 
   // Re-sync draft when the external value changes from outside (gizmo drag,
   // reset, live signal, polling tick). We compare numerically against the
-  // parsed draft so the user's in-progress typing is not clobbered.
+  // parsed draft so the user's in-progress typing is not clobbered. Only
+  // user-edited drafts are protected while focused; untouched fields stay live.
   useEffect(() => {
-    const parsed = parseDecimal(draft);
+    // The latest draft, not the render's closure: an acknowledgement can arrive
+    // after the next keystroke and must not clear that keystroke's dirty flag.
+    const latest = draftRef.current;
+    const parsed = parseDecimal(latest);
+    // A matching complete draft is acknowledged by the parent, so later
+    // external updates must remain visible even while the field has focus.
+    const acknowledged = isCompleteDecimal(latest) && parsed === value;
+    if (dirtyRef.current && !acknowledged) return;
+    dirtyRef.current = false;
     if (parsed === null || parsed !== value) {
       setDraft(String(value));
     }
@@ -108,7 +135,7 @@ export function NumberEditor({ value, onChange, unit, min, max, disabled, ariaLa
   // parity. Trailing-dot / lone-minus drafts are skipped so typing "1.5"
   // doesn't briefly snap to 1.
   useEffect(() => {
-    if (disabled) return;
+    if (disabled || !liveCommit || !dirtyRef.current) return;
     if (!isCompleteDecimal(draft)) return;
     const parsed = parseDecimal(draft);
     if (parsed === null) return;
@@ -125,6 +152,14 @@ export function NumberEditor({ value, onChange, unit, min, max, disabled, ariaLa
   }, [draft]);
 
   const commit = useCallback(() => {
+    if (!dirtyRef.current) {
+      // An acknowledged live edit already cleared the dirty flag; blur still
+      // normalises the typed spelling ("-9,5" -> "-9.5").
+      const settled = parseDecimal(draft);
+      if (settled !== null && settled === value) setDraft(String(value));
+      return;
+    }
+    dirtyRef.current = false;
     const parsed = parseDecimal(draft);
     if (parsed === null) {
       setDraft(String(value));
@@ -133,29 +168,30 @@ export function NumberEditor({ value, onChange, unit, min, max, disabled, ariaLa
     const clamped = clampToRange(parsed, min, max);
     if (clamped !== parsed) {
       clampedRef.current = clamped;
-      setDraft(String(clamped));
     }
+    setDraft(String(clamped));
     if (clamped !== value) onChange(clamped);
-    else if (clamped === parsed) setDraft(String(value));
   }, [draft, value, onChange, min, max]);
 
   const field = (
+    <Box sx={{ width: '100%' }}>
     <DragNumberField
       compact
       value={draft}
-      onValueChange={setDraft}
+      onValueChange={(next) => { dirtyRef.current = true; draftRef.current = next; setDraft(next); }}
       onCommit={commit}
-      onDragChange={(n) => { const c = clampToRange(n, min, max); if (c !== value) onChange(c); }}
+      onDragChange={liveCommit ? (n) => { const c = clampToRange(n, min, max); if (c !== value) onChange(c); } : undefined}
       min={min !== undefined && Number.isFinite(min) ? min : -Number.MAX_SAFE_INTEGER}
       max={max !== undefined && Number.isFinite(max) ? max : Number.MAX_SAFE_INTEGER}
-      step={1}
-      fractionDigits={3}
+      step={step !== undefined && step > 0 ? step : 1}
+      fractionDigits={step !== undefined && step > 0 && step >= 1 ? 0 : 3}
       unit={unit}
       disabled={disabled}
       ariaLabel={ariaLabel}
       error={isInvalidDecimalDraft(draft)}
       sx={{ width: '100%' }}
     />
+    </Box>
   );
   if (!hint) return field;
   return (
@@ -331,6 +367,105 @@ function DragLabel({
 }
 
 // ── ColorEditor ──────────────────────────────────────────────────────────
+
+/** Hex string editor with one undoable commit per picker choice or text edit. */
+export function HexColorEditor({ value, onChange, disabled, ariaLabel }: {
+  value: string;
+  onChange: (hex: string) => void;
+  disabled?: boolean;
+  ariaLabel?: string;
+}) {
+  const [draft, setDraft] = useState(value.toUpperCase());
+  const ref = useRef<HTMLInputElement | null>(null);
+  const dirty = useRef(false);
+  const latest = useRef({ value, onChange, disabled });
+  latest.current = { value, onChange, disabled };
+  useEffect(() => { setDraft(value.toUpperCase()); dirty.current = false; }, [value]);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const commit = () => {
+      const next = el.value.toUpperCase();
+      setDraft(next);
+      dirty.current = false;
+      if (!latest.current.disabled && next !== latest.current.value.toUpperCase()) latest.current.onChange(next);
+    };
+    el.addEventListener('change', commit);
+    return () => el.removeEventListener('change', commit);
+  }, []);
+  const commitText = () => {
+    if (disabled || !dirty.current) return;
+    dirty.current = false;
+    if (/^#[0-9a-f]{6}$/i.test(draft)) {
+      if (draft !== value.toUpperCase()) onChange(draft);
+    } else setDraft(value.toUpperCase());
+  };
+  return (
+    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, width: '100%', minWidth: 0 }}>
+      <Box component="input" type="color" ref={ref} disabled={disabled}
+        aria-label={ariaLabel ?? 'Colour'}
+        value={/^#[0-9a-f]{6}$/i.test(draft) ? draft : value}
+        onInput={(e: React.FormEvent<HTMLInputElement>) => setDraft(e.currentTarget.value.toUpperCase())}
+        sx={{ width: 28, height: 18, flexShrink: 0, p: 0, border: `1px solid ${DIVIDER}`, borderRadius: 0.5,
+          bgcolor: 'transparent', cursor: disabled ? 'default' : 'pointer',
+          '&::-webkit-color-swatch-wrapper': { p: 0.125 },
+          '&::-webkit-color-swatch': { border: 'none', borderRadius: 0.5 } }} />
+      <TextField size="small" value={draft} disabled={disabled}
+        onChange={(e) => { dirty.current = true; setDraft(e.target.value.toUpperCase()); }}
+        onBlur={commitText} onKeyDown={(e) => { if (e.key === 'Enter') commitText(); }}
+        slotProps={{ input: { sx: { fontSize: FS.label, fontFamily: 'monospace', height: 18 } },
+          htmlInput: { 'aria-label': `${ariaLabel ?? 'Colour'} hex` } }}
+        sx={{ flex: 1, minWidth: 0, '& .MuiOutlinedInput-root': inspectorInputSx }} />
+    </Box>
+  );
+}
+
+/** Compact slider and decimal input; dragging only updates the local draft. */
+export function CompactSliderEditor({ value, min, max, step, onChange, disabled, ariaLabel }: {
+  value: number;
+  min?: number;
+  max?: number;
+  step?: number;
+  onChange: (value: number) => void;
+  disabled?: boolean;
+  ariaLabel?: string;
+}) {
+  const [draft, setDraft] = useState(String(value));
+  const dirty = useRef(false);
+  useEffect(() => { setDraft(String(value)); dirty.current = false; }, [value]);
+  const commitNumber = () => {
+    if (disabled || !dirty.current) return;
+    dirty.current = false;
+    const next = parseDecimal(draft);
+    if (next === null) setDraft(String(value));
+    else {
+      setDraft(String(next));
+      if (next !== value) onChange(next);
+    }
+  };
+  return (
+    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, width: '100%', minWidth: 0 }}>
+      <Slider size="small" value={parseDecimal(draft) ?? value} min={min} max={max} step={step}
+        disabled={disabled} aria-label={ariaLabel}
+        onChange={(_, next) => setDraft(String(next))}
+        onChangeCommitted={(_, next) => {
+          if (!disabled && typeof next === 'number') {
+            setDraft(String(next));
+            dirty.current = false;
+            if (next !== value) onChange(next);
+          }
+        }}
+        sx={{ flex: 1, minWidth: 0, mx: 0.5,
+          '& .MuiSlider-thumb': { width: 10, height: 10 },
+          '& .MuiSlider-track': { height: 2 },
+          '& .MuiSlider-rail': { height: 2, opacity: 0.2 } }} />
+      <DragNumberField compact value={draft} disabled={disabled} ariaLabel={`${ariaLabel ?? 'Slider'} value`}
+        min={min ?? 0} max={max ?? 100} step={step ?? 1}
+        onValueChange={(next) => { dirty.current = true; setDraft(next); }} onCommit={commitNumber}
+        sx={{ width: 52, flexShrink: 0 }} />
+    </Box>
+  );
+}
 
 /**
  * A Unity Color `{r,g,b,a}` as a swatch with the browser's colour picker and
@@ -563,12 +698,12 @@ export function ObjectEditor({ value, onChange }: {
 
 // ── FieldEditor (dispatcher) ─────────────────────────────────────────────
 
-export function FieldEditor({ value, onChange, fieldType, fieldName, editable, unit, options }: FieldEditorProps) {
+export function FieldEditor({ value, onChange, fieldType, fieldName, editable, unit, options, min, max, step }: FieldEditorProps) {
   switch (fieldType) {
     case 'boolean':
       return <BooleanEditor value={value as boolean} onChange={(v) => onChange(v)} />;
     case 'number':
-      return <NumberEditor value={value as number} onChange={(v) => onChange(v)} unit={unit} />;
+      return <NumberEditor value={value as number} onChange={(v) => onChange(v)} unit={unit} min={min} max={max} step={step} />;
     case 'enum': {
       const current = String(value);
       const choices = options ?? ENUM_FIELDS[fieldName] ?? DIRECTION_OPTIONS;

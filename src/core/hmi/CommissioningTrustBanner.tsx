@@ -90,7 +90,7 @@ export function CommissioningTrustBanner({ onReload }: CommissioningTrustBannerP
           py: 1.25,
           bgcolor: 'rgba(18, 42, 52, 0.97)',
           border: '1px solid rgba(79,195,247,0.55)',
-          borderRadius: 2,
+          borderRadius: 1,
           boxShadow: '0 4px 16px rgba(0,0,0,0.4)',
           backdropFilter: 'blur(calc(8px * var(--rv-ui-blur-scale, 1)))',
         }}>
@@ -153,7 +153,7 @@ export function CommissioningTrustBanner({ onReload }: CommissioningTrustBannerP
         py: 1.25,
         bgcolor: provenance.trusted ? 'rgba(18, 42, 52, 0.97)' : 'rgba(68, 48, 15, 0.97)',
         border: `1px solid ${provenance.trusted ? 'rgba(79,195,247,0.55)' : ISA_AMBER}`,
-        borderRadius: 2,
+        borderRadius: 1,
         boxShadow: '0 4px 16px rgba(0,0,0,0.4)',
         backdropFilter: 'blur(calc(8px * var(--rv-ui-blur-scale, 1)))',
       }}>

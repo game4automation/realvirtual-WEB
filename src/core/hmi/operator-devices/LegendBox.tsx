@@ -19,25 +19,31 @@ import { FS, INK_HIGH } from '../shared-sx';
 /** Legend line height in px (11 px type × 1.25). */
 export const LEGEND_LINE = 14;
 
-export function LegendBox({ children, lines = 1, marker, tone }: {
+/** Legend line height on a plate packed `compact` (10 px type × 1.2). */
+export const LEGEND_LINE_COMPACT = 12;
+
+export function LegendBox({ children, lines = 1, marker, tone, compact }: {
   children: ReactNode;
   lines?: number;
   marker?: string;
   tone?: string;
+  /** One line less tall and a size smaller, for a `compact` plate (plan-659). */
+  compact?: boolean;
 }) {
+  const line = compact ? LEGEND_LINE_COMPACT : LEGEND_LINE;
   return (
     <Box
       component="span"
       data-part="legend"
       sx={{
         width: '100%',
-        height: lines * LEGEND_LINE,
+        height: lines * line,
         display: 'flex',
         alignItems: 'flex-start',
         justifyContent: 'center',
-        fontSize: FS.label,
+        fontSize: compact ? FS.micro : FS.label,
         fontWeight: 500,
-        lineHeight: `${LEGEND_LINE}px`,
+        lineHeight: `${line}px`,
         letterSpacing: '0.02em',
         textTransform: 'uppercase',
         textAlign: 'center',
@@ -57,7 +63,7 @@ export function LegendBox({ children, lines = 1, marker, tone }: {
             component="span"
             aria-hidden
             data-part="lamp-anchor"
-            sx={{ display: 'inline-block', position: 'relative', width: 0, height: LEGEND_LINE, verticalAlign: 'top' }}
+            sx={{ display: 'inline-block', position: 'relative', width: 0, height: line, verticalAlign: 'top' }}
           >
             <svg
               data-part="lamp-dot"

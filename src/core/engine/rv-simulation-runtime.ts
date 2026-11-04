@@ -55,6 +55,11 @@ export interface RuntimeHost {
   getLoop(): SimulationLoop;
   /** Lazy kernel accessor (null before a model is loaded). */
   getKernel(): SimulationKernel | null;
+  /**
+   * plan-652 Phase 3: makes the discrete runner available (activates the on-demand
+   * DES feature). Optional — a host without it has the runner registered up front.
+   */
+  ensureDiscrete?(): Promise<void>;
   /** Emit a viewer event (typed on the RVViewer side). */
   emit(event: 'runtime-attach-changed', data: { attached: boolean }): void;
 }
@@ -158,7 +163,53 @@ export class SimulationRuntime {
       console.warn(`[SimulationRuntime] setMode('${mode}') ignored — no kernel (no model loaded).`);
       return;
     }
+    const gen = ++this._runtimeModeGen;
+    // plan-652 Phase 3 safety net: `discrete` without a runner yet → activate the
+    // DES feature and switch afterwards, unless a newer request came in meanwhile.
+    if (mode === 'discrete' && !kernel.hasDesRunner() && this.host.ensureDiscrete) {
+      console.debug("[SimulationRuntime] setMode('discrete') waits for the DES feature");
+      this.host.ensureDiscrete().then(
+        () => this._commitMode(mode, gen),
+        (error: unknown) => console.warn('[SimulationRuntime] DES feature failed to load:', error),
+      );
+      return;
+    }
+    this._commitMode(mode, gen);
+  }
+
+  /**
+   * Like {@link setMode}, but resolves after the switch (plan-652 Phase 3): a
+   * `discrete` request first activates the on-demand DES feature. For callers that
+   * read {@link mode} right after (MCP, API). Resolves `false` when the switch was
+   * ignored (no kernel), superseded by a newer request, or the feature failed.
+   */
+  async setModeAsync(mode: RuntimeMode): Promise<boolean> {
+    const kernel = this.host.getKernel();
+    if (!kernel) {
+      console.warn(`[SimulationRuntime] setModeAsync('${mode}') ignored — no kernel (no model loaded).`);
+      return false;
+    }
+    const gen = ++this._runtimeModeGen;
+    if (mode === 'discrete' && !kernel.hasDesRunner() && this.host.ensureDiscrete) {
+      try {
+        await this.host.ensureDiscrete();
+      } catch (error) {
+        console.warn('[SimulationRuntime] DES feature failed to load:', error);
+        return false;
+      }
+    }
+    return this._commitMode(mode, gen);
+  }
+
+  /** Generation of accepted mode requests — a late switch commits only while current. */
+  private _runtimeModeGen = 0;
+
+  private _commitMode(mode: RuntimeMode, gen: number): boolean {
+    if (gen !== this._runtimeModeGen) return false;
+    const kernel = this.host.getKernel();
+    if (!kernel) return false;
     kernel.setMode(mode === 'discrete' ? 'des' : 'continuous');
+    return true;
   }
 
   /** DES sub-mode control surface (step / fast-forward / stats), null outside discrete mode. */

@@ -39,6 +39,8 @@ export interface FieldRendererProps {
   viewer: RVViewer | null;
   /** Signal store for live signal values. */
   signalStore: SignalStore | null;
+  /** Commit through the inspector's normal field-write/undo path. */
+  onEdit?: (value: unknown) => void;
 }
 
 /** Registration entry for a custom field renderer. */

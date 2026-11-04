@@ -1,0 +1,87 @@
+{
+  "provenance": {
+    "spec": "plan-2060 section 2.3",
+    "implementation": "Independent Python: NFC UTF-8, length framing, FNV-1a64, SplitMix64 finalizer",
+    "command": "python vectors/seedkey64.py"
+  },
+  "vectors": [
+    {
+      "masterSeed": 0,
+      "id": "",
+      "purpose": "",
+      "expected": "4238381450697096594"
+    },
+    {
+      "masterSeed": 42,
+      "id": "Line/StationA",
+      "purpose": "default",
+      "expected": "8598944655140279752"
+    },
+    {
+      "masterSeed": 42,
+      "id": "Line/StationA",
+      "purpose": "downtime:mtbf",
+      "expected": "10276208855607273230"
+    },
+    {
+      "masterSeed": 43,
+      "id": "Line/StationA",
+      "purpose": "default",
+      "expected": "16409369259685700576"
+    },
+    {
+      "masterSeed": -1,
+      "id": "A",
+      "purpose": "x",
+      "expected": "10703131265582750771"
+    },
+    {
+      "masterSeed": 9007199254740991,
+      "id": "A",
+      "purpose": "x",
+      "expected": "17997516000853041671"
+    },
+    {
+      "masterSeed": 7,
+      "id": "ab",
+      "purpose": "c",
+      "expected": "2126782128118210043"
+    },
+    {
+      "masterSeed": 7,
+      "id": "a",
+      "purpose": "bc",
+      "expected": "13027016172840379936"
+    },
+    {
+      "masterSeed": 42,
+      "id": "Linie/\u00c4",
+      "purpose": "default",
+      "expected": "7108889666948471551"
+    },
+    {
+      "masterSeed": 42,
+      "id": "Linie/A\u0308",
+      "purpose": "default",
+      "expected": "7108889666948471551"
+    },
+    {
+      "masterSeed": 42,
+      "id": "A",
+      "purpose": "",
+      "expected": "17284484168961006852"
+    },
+    {
+      "masterSeed": -1.9,
+      "id": "A",
+      "purpose": "x",
+      "expected": "10703131265582750771"
+    },
+    {
+      "masterSeed": 42.9,
+      "id": "A",
+      "purpose": "x",
+      "expected": "2110926365504368835"
+    }
+  ]
+}

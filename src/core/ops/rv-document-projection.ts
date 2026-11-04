@@ -51,9 +51,10 @@
  * dropped, so those inverses are only correct through a re-projection too.
  */
 
-import type { RvDocument } from './rv-document';
+import { DEFAULT_REPLAY_WAIT_BUDGET_MS, type RvDocument } from './rv-document';
 import type { RvOp } from './rv-unified-ops';
 import { resolveOpTarget, type RvDocumentMode } from './rv-unified-executors';
+import { planPlacedReplay, type RvPlacedSkipReason } from './rv-placed-replay';
 
 /**
  * Does `op` materialise in `projection` when applied through the executor?
@@ -85,6 +86,108 @@ export function needsRecomposeToUndo(op: RvOp, projection: RvDocumentMode): bool
   return !isProjectedInto(op, projection);
 }
 
+/** One op a replay did not apply (plan-774 F8): its kind and, where it has one, its target path. */
+export interface RvReplaySkip {
+  kind: string;
+  nodePath?: string;
+  /**
+   * The op's target lies inside PLACED content (`nodePath` is that target):
+   * reported as Problems `replay-op-skipped` through the executor. Absent for
+   * an own-content op that threw (log line only) and for the tail a superseded
+   * gate wait cut off (the document is gone).
+   */
+  placed?: true;
+  /**
+   * With `placed`: why it did not land (review fix E4, `rv-placed-replay.ts`) —
+   * `baked-away` (placement materialised, node merged away) or `not-loaded`
+   * (placement not materialised); absent for an op that threw.
+   */
+  reason?: RvPlacedSkipReason;
+}
+
+/** What a replay did (plan-774 F8). Skips under a reference become `replay-op-skipped` (Phase 4). */
+export interface RvReplayResult {
+  applied: number;
+  skipped: RvReplaySkip[];
+  /**
+   * Review round 2 (R4): a `gate` wait ended SUPERSEDED mid-replay — another
+   * document took the viewer, the rest of the log was not applied. The caller
+   * must not answer "done": the tree it replayed onto is not the one on screen.
+   */
+  superseded?: true;
+  /**
+   * Review round 2 (R5): the `gate` wait ran out of its budget — the remaining
+   * ops on placed content were left unapplied (reported "still loading", kept
+   * in the restored history), the own-content ones applied.
+   */
+  timedOut?: true;
+}
+
+/** Options of {@link replayOntoTreeLocked}. */
+export interface RvReplayOntoTreeOptions {
+  /**
+   * How long a `gate` wait may hold the document lock (review round 2, R5).
+   * Default {@link DEFAULT_REPLAY_WAIT_BUDGET_MS} — the authoring join's budget.
+   */
+  waitBudgetMs?: number;
+}
+
+/**
+ * plan-774 F3: the gate a replay asks before each op — "does this op need
+ * placed content that is still materialising?" (`rv-authoring-load.ts`
+ * `authoringReplayGate`). Structural here so core ops stay free of the editor.
+ * The FIRST op that needs the wait waits once; `wait()` resolving false (the
+ * document was superseded) ends the replay — the rest is reported skipped and
+ * the result is marked `superseded`. The wait is bounded (review round 2, R5):
+ * once the budget is spent, ops still waiting stay unapplied ("still loading").
+ */
+export interface RvReplayGate {
+  needsWait(op: RvOp): boolean;
+  wait(): Promise<boolean>;
+}
+
+/**
+ * What a `reload` may hand back to the replay that follows it: the authoring
+ * join's gate (plan-774 F3) when the placements were not ready in time.
+ */
+export interface RvReloadOutcome {
+  replayGate?: RvReplayGate;
+}
+
+/** Hand the skips under a reference to the executor (Problems `replay-op-skipped`). */
+export function reportPlacedSkips(doc: RvDocument, skipped: readonly RvReplaySkip[], what: string): void {
+  const placed = skipped.filter((s): s is RvReplaySkip & { nodePath: string } => s.placed === true && typeof s.nodePath === 'string');
+  if (placed.length === 0) return;
+  try {
+    doc.executor.reportReplaySkips?.(placed.map((s) => ({ kind: s.kind, nodePath: s.nodePath, reason: s.reason ?? 'baked-away' })), what);
+  } catch (e) {
+    console.warn('[rv-document-projection] reporting skipped replay ops failed:', e);
+  }
+}
+
+/** `gate.wait()` raced against `budgetMs`: true = settled, false = superseded, `'timeout'` = budget spent. */
+async function waitBounded(gate: RvReplayGate, budgetMs: number): Promise<boolean | 'timeout'> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race<boolean | 'timeout'>([
+      gate.wait().catch(() => false),
+      new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), Math.max(0, budgetMs)); }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function skipOf(op: RvOp): RvReplaySkip {
+  const nodePath = (op as { nodePath?: unknown }).nodePath;
+  return typeof nodePath === 'string' ? { kind: op.kind, nodePath } : { kind: op.kind };
+}
+
+/** True for a "a newer load took the viewer" rejection — the loader's abort or the authoring join's supersede. */
+export function isSupersededReload(e: unknown): boolean {
+  return e instanceof Error && (e.name === 'LoadAbortedError' || e.name === 'AuthoringLoadSupersededError');
+}
+
 /**
  * Apply `ops` to the live tree WITHOUT recording them.
  *
@@ -94,22 +197,80 @@ export function needsRecomposeToUndo(op: RvOp, projection: RvDocumentMode): bool
  * one). A single failing op is logged and skipped: the tree came from bytes and
  * may legitimately have moved on, and losing one op is recoverable where losing
  * the whole replay is not.
+ *
+ * plan-774 F8: returns `{ applied, skipped }` — skipped = the ops whose target
+ * inside placed content is missing (not applied at all, see
+ * `RvExecutor.replayTargetInPlacedContent`), the ops that threw, plus the rest
+ * of the log when a `gate` wait ended with the document superseded. The skips
+ * under a reference are handed to `executor.reportReplaySkips` → Problems
+ * `replay-op-skipped` (path + op kind); the others keep the log line.
  */
 export async function replayOntoTreeLocked(
   doc: RvDocument,
   ops: readonly RvOp[],
   what: string,
-): Promise<void> {
-  for (const op of ops) {
-    try {
-      await doc.executor.applyForward(op);
-    } catch (e) {
-      console.warn(
-        `[rv-document-projection] op '${op.kind}' did not replay onto the reloaded '${what}' — skipped:`,
-        e,
-      );
+  gate?: RvReplayGate,
+  opts: RvReplayOntoTreeOptions = {},
+): Promise<RvReplayResult> {
+  const result: RvReplayResult = { applied: 0, skipped: [] };
+  // plan-766 §2.4.4: bracket the replay (editor arenas build once at the end).
+  doc.executor.beginReplay?.();
+  try {
+    let waited = false;
+    for (let i = 0; i < ops.length; i++) {
+      const op = ops[i];
+      if (gate && !waited && gate.needsWait(op)) {
+        waited = true;
+        // Review round 2 (R5): the wait runs INSIDE the document lock, so it is
+        // bounded like the draft tail's (E3) — never an endless `runExclusive`.
+        const outcome = await waitBounded(gate, opts.waitBudgetMs ?? DEFAULT_REPLAY_WAIT_BUDGET_MS);
+        if (outcome === false) {
+          // R4: superseded — the rest is not applied and the caller must not
+          // report the recompose as done.
+          result.superseded = true;
+          for (let j = i; j < ops.length; j++) result.skipped.push(skipOf(ops[j]));
+          break;
+        }
+        if (outcome === 'timeout') result.timedOut = true;
+      }
+      // R5: after the budget ran out, an op whose placed content is STILL
+      // materialising is kept unapplied (the caller restores the history, so it
+      // stays in the log and the draft) and reported "still loading" — the
+      // draft tail's timeout semantics (E3). Own-content ops land as usual.
+      if (result.timedOut && gate!.needsWait(op)) {
+        const nodePath = doc.executor.replayTargetInPlacedContent?.(op)?.nodePath ?? skipOf(op).nodePath;
+        result.skipped.push(nodePath !== undefined
+          ? { kind: op.kind, nodePath, placed: true, reason: 'still-loading' }
+          : { kind: op.kind, placed: true, reason: 'still-loading' });
+        continue;
+      }
+      // plan-774 F8: a target inside placed content that is not there — the
+      // op would no-op silently (a field write on a missing node) — is skipped.
+      // Review fixes E4/E5 (`planPlacedReplay`, shared with the draft replay):
+      // baked away vs not loaded, and a composite loses only its missing
+      // placed children. The history is restored by the caller either way.
+      const plan = planPlacedReplay(doc.executor, op);
+      for (const s of plan.skips) result.skipped.push({ kind: s.kind, nodePath: s.nodePath, placed: true, reason: s.reason });
+      if (!plan.apply) continue;
+      try {
+        await doc.executor.applyForward(plan.apply);
+        result.applied++;
+      } catch (e) {
+        result.skipped.push(plan.placedPath ? { kind: op.kind, nodePath: plan.placedPath, placed: true } : skipOf(op));
+        console.warn(
+          `[rv-document-projection] op '${op.kind}' did not replay onto the reloaded '${what}' — skipped:`,
+          e,
+        );
+      }
     }
+  } finally {
+    doc.executor.endReplay?.();
   }
+  if (result.skipped.length > 0) {
+    console.warn(`[rv-document-projection] replay onto '${what}': ${result.applied} applied, ${result.skipped.length} skipped`);
+    reportPlacedSkips(doc, result.skipped, what);
+  }
+  return result;
 }
 
 export interface RvRecomposeRequest {
@@ -124,8 +285,14 @@ export interface RvRecomposeRequest {
    * Rebuild the live tree. Runs INSIDE the lock (plan-711 R2-Arch-F3): two
    * fast mode switches must serialise, and the old shape — reload outside,
    * replay inside — left exactly that window open.
+   *
+   * plan-774 F3: an authoring reload joins its placements before it returns
+   * and may hand back the join's replay gate ({@link RvReloadOutcome}). A
+   * reload that was SUPERSEDED (another document took the viewer — it rejects
+   * with a `LoadAbortedError`) ends the recompose silently: no replay, the
+   * history restored as it was.
    */
-  reload: () => Promise<void>;
+  reload: () => Promise<void | RvReloadOutcome>;
   /**
    * What the replay applies onto the rebuilt tree.
    *
@@ -142,6 +309,11 @@ export interface RvRecomposeRequest {
   replay?: 'projected' | 'all' | 'none';
   /** For the skipped-op warning. */
   label?: string;
+  /**
+   * Bound of the replay's gate wait inside the lock (review round 2, R5);
+   * default {@link DEFAULT_REPLAY_WAIT_BUDGET_MS}.
+   */
+  waitBudgetMs?: number;
 }
 
 /**
@@ -159,24 +331,48 @@ export interface RvRecomposeRequest {
  *     history onto a log that is about to be restored from the freeze;
  *  5. restore, byte-identical, so `dirty` is exactly what it was.
  */
-export async function recomposeProjection(req: RvRecomposeRequest): Promise<void> {
+/** What a recompose did: the replay's result, or nothing because its reload was superseded (plan-774 F3). */
+export type RvRecomposeOutcome =
+  | { status: 'ok'; replay: RvReplayResult }
+  | { status: 'superseded' };
+
+export async function recomposeProjection(req: RvRecomposeRequest): Promise<RvRecomposeOutcome> {
   const { doc, reload } = req;
-  await doc.runExclusive(async () => {
+  return doc.runExclusive(async (): Promise<RvRecomposeOutcome> => {
     const history = doc.captureHistory();
     if (req.projection) doc.setProjection(req.projection);
-    await reload();
+    let reloaded: void | RvReloadOutcome;
+    try {
+      reloaded = await reload();
+    } catch (e) {
+      if (!isSupersededReload(e)) throw e;
+      // plan-774 F3: another document took the viewer during the reload — no
+      // replay onto its tree; this document's log stays exactly as it was.
+      doc.restoreHistory(history);
+      return { status: 'superseded' };
+    }
     const ops = req.replay === 'none'
       ? []
       : req.replay === 'all'
         ? history.ops
         : projectedOps(history.ops, doc.mode);
-    await replayOntoTreeLocked(doc, ops, req.label ?? doc.name);
+    const replay = await replayOntoTreeLocked(
+      doc, ops, req.label ?? doc.name, reloaded?.replayGate, { waitBudgetMs: req.waitBudgetMs },
+    );
     doc.restoreHistory(history);
+    // Review round 2 (R4): the replay's gate wait ended superseded — another
+    // document took the viewer mid-replay. Not done; the log stays as it was.
+    if (replay.superseded) return { status: 'superseded' };
+    // plan-774 review fix E3: a recovered tail that was still waiting for its
+    // placed content (kept when a descend superseded its wait) is re-attempted
+    // on the fresh tree — Back is exactly that moment.
+    if (req.replay !== 'none') await doc.replayPendingLocked(reloaded?.replayGate, req.waitBudgetMs);
+    return { status: 'ok', replay };
   });
 }
 
 /** Why an undo-by-recompose could not run right now. */
-export type RvUndoRecomposeRefusal = 'busy' | 'in-transaction' | 'nothing-to-undo';
+export type RvUndoRecomposeRefusal = 'busy' | 'in-transaction' | 'nothing-to-undo' | 'superseded';
 
 export type RvUndoRecomposeOutcome =
   | { ok: true }
@@ -201,8 +397,10 @@ export type RvUndoRecomposeOutcome =
  */
 export async function undoViaRecompose(req: {
   doc: RvDocument;
-  reload: () => Promise<void>;
+  reload: () => Promise<void | RvReloadOutcome>;
   label?: string;
+  /** Bound of the replay's gate wait (review round 2, R5). */
+  waitBudgetMs?: number;
 }): Promise<RvUndoRecomposeOutcome> {
   const { doc } = req;
   if (doc.inTransaction) {
@@ -218,7 +416,7 @@ export async function undoViaRecompose(req: {
   if (!doc.canUndo()) {
     return { ok: false, reason: 'nothing-to-undo', message: 'There is nothing to undo.' };
   }
-  await doc.runExclusive(async () => {
+  const superseded = await doc.runExclusive(async (): Promise<boolean> => {
     const history = doc.captureHistory();
     const undone = history.ops[history.ops.length - 1];
     // The log WITHOUT the undone op, with it on the redo branch — exactly the
@@ -229,9 +427,31 @@ export async function undoViaRecompose(req: {
       ops: history.ops.slice(0, -1),
       redoOps: [...history.redoOps, undone],
     };
-    await req.reload();
-    await replayOntoTreeLocked(doc, projectedOps(next.ops, doc.mode), req.label ?? doc.name);
+    let reloaded: void | RvReloadOutcome;
+    try {
+      reloaded = await req.reload();
+    } catch (e) {
+      if (!isSupersededReload(e)) throw e;
+      // plan-774 F3: superseded during the reload — the undo did not happen.
+      doc.restoreHistory(history);
+      return true;
+    }
+    const replay = await replayOntoTreeLocked(
+      doc, projectedOps(next.ops, doc.mode), req.label ?? doc.name, reloaded?.replayGate, { waitBudgetMs: req.waitBudgetMs },
+    );
+    if (replay.superseded) {
+      // Review round 2 (R4): superseded mid-replay — the undo did not happen;
+      // the undone op stays in the log (it does NOT move to redo).
+      doc.restoreHistory(history);
+      return true;
+    }
     doc.restoreHistory(next, { announce: true });
+    // plan-774 review fix E3: the fresh tree is also a chance for a kept tail.
+    await doc.replayPendingLocked(reloaded?.replayGate, req.waitBudgetMs);
+    return false;
   });
+  if (superseded) {
+    return { ok: false, reason: 'superseded', message: 'Another document was opened while the undo was rebuilding the view.' };
+  }
   return { ok: true };
 }

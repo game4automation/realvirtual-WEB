@@ -1,0 +1,10 @@
+{
+  "//": "plan-673 spike typecheck: npx tsc -p spikes/673/tsconfig.json --noEmit (from the W root). The project tsconfig deliberately does NOT include spikes/, so this is the only thing that checks these files.",
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "types": ["node", "vitest/globals", "vite/client"],
+    "resolveJsonModule": true
+  },
+  "include": ["."],
+  "exclude": []
+}

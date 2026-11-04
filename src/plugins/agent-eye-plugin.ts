@@ -215,7 +215,7 @@ export class AgentEyePlugin implements RVViewerPlugin {
     // double-click) and no controls event announces that, so without it the
     // cone would stay hidden and `attached` would lie.
     this._source = new AgentEyeFollowSource(eye, () => this._onFollowStopped());
-    v.startCameraFollow(this._source);
+    v.startCameraFollow(this._source, 'agent-eye');
     eye.attached = true;
     return { attached: true };
   }
@@ -225,11 +225,12 @@ export class AgentEyePlugin implements RVViewerPlugin {
     const v = this._viewer;
     const eye = this._eye;
     if (!eye) return;
+    const source = this._source;
     // Clear our own flags FIRST: stopCameraFollow calls back into
     // `_onFollowStopped`, which must find nothing left to do.
     this._source = null;
     eye.attached = false;
-    if (v && v.cameraFollowMode !== 'off') v.stopCameraFollow(false);
+    if (v && source && v.cameraFollowSource === source) v.stopCameraFollow(false);
   }
 
   /** The follow ended somewhere else — catch up rather than fight it. */

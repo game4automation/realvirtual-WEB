@@ -12,6 +12,7 @@
  * of each, by tool, from the state alone.
  */
 
+import { movedToolOf } from '../src/plugins/mcp-bridge/rv-mcp-moved-tools';
 import { describe, it, expect, vi } from 'vitest';
 import {
   McpDescribeTool,
@@ -150,7 +151,7 @@ describe('web_describe — the next rule table', () => {
       doc: { base: { kind: 'document' }, opCount: 0 },
       nodeCount: 1,
     });
-    expect(r.next).toContain('web_editor_import_glb');
+    expect(r.next).toContain('web_execute("editor.importGlb", …)');
     expect(r.next).toMatch(/EMPTY/i);
   });
 
@@ -167,7 +168,7 @@ describe('web_describe — the next rule table', () => {
       mode: 'editor', hasModel: true, selectionCount: 0,
       doc: { name: 'x', baseKind: 'document', dirty: true, busy: false, opCount: 0, nodeCount: 1, canUndo: false },
     });
-    expect(empty.next).toContain('web_editor_import_glb');
+    expect(empty.next).toContain('web_execute("editor.importGlb", …)');
   });
 
   it('dirty document → verify before save', async () => {
@@ -189,7 +190,9 @@ describe('web_describe — blocked families', () => {
     const r = await describeWith({ mode: 'hmi' });
     const layout = r.blocked.find((b) => b.family === 'web_layout_*');
     const editor = r.blocked.find((b) => b.family === 'web_editor_*');
-    expect(layout?.reason).toContain('web_mode_set');
+    // The retained describe tool keeps its hint; the old name now directs callers to the command.
+    expect(layout?.reason).toContain('web_execute("workspace.setMode", {mode:"planner"})');
+    expect(movedToolOf('web_mode_set')).toMatchObject({ movedTo: ['workspace.setMode'], door: 'web_execute' });
     expect(editor?.reason).toContain('web_editor_open');
   });
 

@@ -13,7 +13,7 @@
  * driving a mirrored slave leaf) and gripper fingers.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { Object3D, Scene, MathUtils } from 'three';
 import { RVDrive, DriveDirection } from '../src/core/engine/rv-drive';
 import { RVDriveGear } from '../src/core/engine/rv-drive-gear';
@@ -28,7 +28,17 @@ interface GearFixture {
   gear: RVDriveGear;
 }
 
-function makeGearFixture(opts: { factor?: number; offset?: number; slaveReverse?: boolean } = {}): GearFixture {
+interface GearFixtureOptions {
+  factor?: number;
+  offset?: number;
+  slaveReverse?: boolean;
+  /** Replaces the resolved master (default: the master RVDrive) — what resolveComponentRefs() left in MasterDrive. */
+  masterRef?: unknown;
+  /** Replaces the raw MasterDrive extras the fallback reads (default: a tagged reference to the master). */
+  rawRef?: unknown;
+}
+
+function makeGearFixture(opts: GearFixtureOptions = {}): GearFixture {
   const store = new SignalStore();
   const registry = new NodeRegistry();
   const scene = new Scene();
@@ -63,10 +73,12 @@ function makeGearFixture(opts: { factor?: number; offset?: number; slaveReverse?
   // Wire the gear as resolveComponentRefs() would: MasterDrive already resolved
   // to the master RVDrive instance.
   const gear = new RVDriveGear(slaveNode);
-  gear.MasterDrive = master;
+  gear.MasterDrive = ('masterRef' in opts ? opts.masterRef : master) as RVDrive;
   gear.GearFactor = opts.factor ?? 1;
   gear.Offset = opts.offset ?? 0;
-  slave.BehaviorExtras['Drive_Gear'] = { MasterDrive: { type: 'ComponentReference', path: masterPath } };
+  slave.BehaviorExtras['Drive_Gear'] = {
+    MasterDrive: 'rawRef' in opts ? opts.rawRef : { type: 'ComponentReference', path: masterPath },
+  } as Record<string, unknown>;
 
   const ctx: ComponentContext = {
     registry,
@@ -141,5 +153,46 @@ describe('RVDriveGear master→slave coupling', () => {
     slave.update(1 / 60);
     // With positionOverwrite the gear must NOT overwrite the replayed position.
     expect(slave.currentPosition).toBe(12.5);
+  });
+});
+
+// plan-612 CP1d-b b1-2: an UNRESOLVED master (an untagged `{ path, componentType }`
+// the loader never resolves — AGVStacker.glb before b1-0) used to be taken as the
+// master drive: the slave then read `undefined.currentPosition` → NaN, silently.
+describe('RVDriveGear invalid master (plan-612 b1-2)', () => {
+  const untagged = { path: 'Root/Nowhere', componentType: 'Drive' };
+
+  it('an unresolved reference object is no master: warning, behavior inactive, no NaN', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { master, slave } = makeGearFixture({ masterRef: untagged, rawRef: untagged });
+      expect(slave.driveBehaviors).toHaveLength(0);
+      expect(warn.mock.calls.some((c) => /MasterDrive could not be resolved/.test(String(c[0])))).toBe(true);
+      master.currentPosition = 40;
+      slave.update(1 / 60);
+      expect(Number.isNaN(slave.currentPosition)).toBe(false);
+      expect(slave.currentPosition).toBe(0);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('a non-drive object is no master either (e.g. a plain object with a currentPosition)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { slave } = makeGearFixture({ masterRef: { currentPosition: 1, currentSpeed: 0 }, rawRef: null });
+      expect(slave.driveBehaviors).toHaveLength(0);
+      expect(warn).toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('an unresolved object master still falls back to the raw tagged path', () => {
+    const { master, slave } = makeGearFixture({ masterRef: untagged });
+    expect(slave.driveBehaviors).toHaveLength(1);
+    master.currentPosition = 30;
+    slave.update(1 / 60);
+    expect(slave.currentPosition).toBeCloseTo(30, 6);
   });
 });

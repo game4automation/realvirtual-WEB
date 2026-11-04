@@ -83,7 +83,7 @@ function makeSceneFacade(sceneId: string, opts?: { dirty?: boolean }) {
   const calls: string[] = [];
   return {
     calls,
-    lineage: 'scene' as const,
+    lineage: 'planner' as const,
     getSnapshot: () => ({
       draft: { name: 'Line 1' },
       saved: { id: sceneId },
@@ -199,7 +199,7 @@ describe('Editor-Save am gebundenen Dokument routet auf SceneStore.save()', () =
 
   it('the verb says SAVE and carries no relPath, whichever lineage asks', () => {
     const decision = decideSaveVerb(
-      { lineage: 'asset', base: sceneDocumentBase('scene_1', 'Line 1'), name: 'Line 1' },
+      { lineage: 'editor', base: sceneDocumentBase('scene_1', 'Line 1'), name: 'Line 1' },
       backend as never,
     );
     expect(decision.verb).toBe('save');

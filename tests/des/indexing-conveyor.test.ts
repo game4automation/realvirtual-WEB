@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { testAddressRegistry } from '../helpers/test-address-registry';
+
+import { componentState } from './snapshot-test-utils';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { Object3D, Vector3 } from 'three';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
-import { MaterialFlowAdapter } from '@rv-private/plugins/des/material-flow-adapter';
-import { IndexingConveyor } from '@rv-private/plugins/des/material-flow/IndexingConveyor';
-import { _resetDesHookCache } from '@rv-private/plugins/des/des-hook-adapter';
-import { resetDESMUCounter, type DESMU } from '@rv-private/plugins/des/rv-des-mu';
+import { DESRunner } from '@rv/plugins/des/des-runner';
+import { MaterialFlowAdapter } from '@rv/plugins/des/material-flow-adapter';
+import { IndexingConveyor } from '@rv/plugins/des/material-flow/IndexingConveyor';
+import { _resetDesHookCache } from '@rv/plugins/des/des-hook-adapter';
+import { resetDESMUCounter, type DESMU } from '@rv/plugins/des/rv-des-mu';
 import {
   createSelf,
   type MaterialFlowSelf,
@@ -68,7 +71,7 @@ function testHost(): BindContextHost {
     on: (event, callback) => events.on(event, callback as never),
     contextMenu: new ContextMenuStore(),
     drives: [] as never,
-    registry: null,
+    registry: null, desAddresses: testAddressRegistry(),
     getPlugin: () => undefined,
   };
 }
@@ -105,7 +108,7 @@ function bind(
     })(),
   });
   Object.assign(self.prop, config);
-  adapter = runner.addInstance(def, self, node);
+  adapter = runner.addInstance(def, self, node, undefined, { desId: node.name + '@' + def.type });
   return { def, self, adapter, node };
 }
 
@@ -255,7 +258,7 @@ describe('IndexingConveyor', () => {
     state.conveyor.adapter.setFailure(true);
     expect(state.runner.getTweenRegistry().activeCount).toBe(0);
     const snapshot = JSON.parse(state.runner.snapshotJson());
-    const frozen = snapshot.components.Indexing.frozen as Array<{ remaining: number; tweens: unknown[] }>;
+    const frozen = componentState(snapshot, 'Indexing').frozen as Array<{ remaining: number; tweens: unknown[] }>;
     expect(frozen).toHaveLength(1);
     expect(frozen[0].remaining).toBeCloseTo(0.6);
     expect(frozen[0].tweens).toHaveLength(2);

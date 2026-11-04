@@ -2,6 +2,8 @@ node_modules/
 dist/
 dist-private/
 dist-embed/
+# plan-646: generated/features.json (npm run features:generate), built from the catalog + private manifest
+generated/
 # Per-tier build outputs for the three-tier build proof (tests/mechanism-tier.node.test.ts)
 dist-public/
 dist-customer/
@@ -18,6 +20,10 @@ dist-internal/
 test-results/
 # plan-503: post-deploy demo smoke output of a local release deploy (<repo>/.smoke/<time>/)
 .smoke/
+# plan-2004: tutorial recordings, events, motion controls, and contact-sheet stills
+.tutorial-out/
+# npm run arch: architecture graph + viewer — describes the private sibling too, never commit
+.arch/
 *.local
 *.tsbuildinfo
 .mcp.json
@@ -82,6 +88,9 @@ public/models/D5347024_1-matrices.glb
 
 # Stray tool logs at the repo root (e.g. vite.omniverse-debug.*.log).
 /*.log
+# Spike run logs and editor/tool backup copies are run output, never source.
+spikes/**/*.log
+*.bak
 
 # Vitest browser failure screenshots - auto-generated on every red test run,
 # never read back by anything (no toMatchScreenshot in the repo). Untracked
@@ -103,3 +112,6 @@ e2e/__baseline__/**/*.diff.png
 # plan-753 §9.15: hmi-highlight-parity baselines are headless-rasteriser specific and
 # compared within ONE run pair (RV_PARITY_MODE=baseline, then bake) on one machine.
 e2e/__baseline__/hmi-highlight-parity/
+
+# Suite run records (plan-2102)
+.test-runs/

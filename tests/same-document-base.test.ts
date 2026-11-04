@@ -350,7 +350,7 @@ describe('a slot-addressed document — the four stille-default sites answer for
   it('decideSaveVerb answers with the SCENE verb and no relPath (Triage R2-F-A)', () => {
     const backend = { id: 'b1', kind: 'folder', writable: true } as never;
     const decision = decideSaveVerb(
-      { lineage: 'asset', base: slotDocument, name: 'Plant' }, backend,
+      { lineage: 'editor', base: slotDocument, name: 'Plant' }, backend,
     );
     expect(decision.verb).toBe('save');
     // A slot-addressed document addresses its bytes by ID. A `relPath` here
@@ -366,11 +366,11 @@ describe('a slot-addressed document — the four stille-default sites answer for
     // exact verb. `library/` appears once, and neither answer sets `copies`.
     const backend = { id: 'b1', kind: 'folder', writable: true } as never;
     expect(decideSaveVerb(
-      { lineage: 'asset', base: projectDocumentBase('models/Cell.glb', 'Cell'), name: 'Cell' },
+      { lineage: 'editor', base: projectDocumentBase('models/Cell.glb', 'Cell'), name: 'Cell' },
       backend,
     )).toEqual({ verb: 'save', relPath: 'models/Cell.glb' });
     expect(decideSaveVerb(
-      { lineage: 'asset', base: libraryDocumentBase('Custom/Belt.glb'), name: 'Belt' },
+      { lineage: 'editor', base: libraryDocumentBase('Custom/Belt.glb'), name: 'Belt' },
       backend,
     )).toEqual({ verb: 'save', relPath: 'library/Custom/Belt.glb' });
   });
@@ -378,21 +378,21 @@ describe('a slot-addressed document — the four stille-default sites answer for
   it('a SOURCE still copies — the copy semantics are untouched by the collapse', () => {
     const backend = { id: 'b1', kind: 'folder', writable: true } as never;
     for (const base of [bases.builtinModel, bases.providerAsset] as AssetBase[]) {
-      const decision = decideSaveVerb({ lineage: 'asset', base, name: 'Cell' }, backend);
+      const decision = decideSaveVerb({ lineage: 'editor', base, name: 'Cell' }, backend);
       expect(decision.verb, base.kind).toBe('save-into-project');
       expect((decision as { copies?: boolean }).copies, base.kind).toBe(true);
     }
     // …and a document never does.
     expect((decideSaveVerb(
-      { lineage: 'asset', base: bases.document, name: 'Cell' }, backend,
+      { lineage: 'editor', base: bases.document, name: 'Cell' }, backend,
     ) as { copies?: boolean }).copies).toBeUndefined();
   });
 
   it('the shared refusals still win over the new case', () => {
-    expect(decideSaveVerb({ lineage: 'asset', base: slotDocument, name: 'Plant' }, null))
+    expect(decideSaveVerb({ lineage: 'editor', base: slotDocument, name: 'Plant' }, null))
       .toMatchObject({ verb: 'blocked' });
     const readOnly = { id: 'b1', kind: 'folder', writable: false } as never;
-    expect(decideSaveVerb({ lineage: 'asset', base: slotDocument, name: 'Plant' }, readOnly))
+    expect(decideSaveVerb({ lineage: 'editor', base: slotDocument, name: 'Plant' }, readOnly))
       .toMatchObject({ verb: 'blocked' });
   });
 });

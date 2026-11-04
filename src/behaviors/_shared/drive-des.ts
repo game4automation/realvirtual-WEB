@@ -19,6 +19,7 @@
  * the material-flow scheduler + TweenSpec, which the engine layer must not import.
  */
 
+import type { Object3D } from 'three';
 import type { DesHookName, MU } from '../../core/material-flow/material-flow-self';
 
 /** A visual a position-move tween translates (its `setPosition` moves the MU). */
@@ -28,6 +29,7 @@ export interface PositionMoveTarget {
 
 /** The real drive the DES move tween writes to each frame (engine RVDrive shape). */
 export interface DriveTweenTarget {
+  readonly node?: Object3D;
   positionOverwrite: boolean;
   currentPosition: number;
   applyToNode(): void;
@@ -85,6 +87,7 @@ export function scheduleDriveMove(
         tween: {
           kind: 'drive' as const,
           drive: {
+            node: drv.node,
             setPosition(v: number): void {
               drv.positionOverwrite = true;
               drv.currentPosition = v;

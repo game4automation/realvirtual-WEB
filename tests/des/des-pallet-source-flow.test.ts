@@ -21,15 +21,15 @@
  *  3. those visible pallets flow Source -> Conveyor -> Sink, every consumed MU
  *     carries a non-null visual, and the sink consumes them (load back to 0).
  *
- * Runs only in the private build (imports `@rv-private/plugins/des/*`).
+ * Imports `@rv/plugins/des/*` — DES is core code since plan-680.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Object3D, Mesh, BoxGeometry, MeshStandardMaterial } from 'three';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
-import { _resetDesHookCache } from '@rv-private/plugins/des/des-hook-adapter';
-import { resetDESMUCounter } from '@rv-private/plugins/des/rv-des-mu';
-import type { MaterialFlowAdapter } from '@rv-private/plugins/des/material-flow-adapter';
+import { DESRunner } from '@rv/plugins/des/des-runner';
+import { _resetDesHookCache } from '@rv/plugins/des/des-hook-adapter';
+import { resetDESMUCounter } from '@rv/plugins/des/rv-des-mu';
+import type { MaterialFlowAdapter } from '@rv/plugins/des/material-flow-adapter';
 import { RVSource } from '../../src/core/engine/rv-source';
 import { RVMovingUnit } from '../../src/core/engine/rv-mu';
 import { ConveyorFlow } from '../../src/behaviors/Conveyor';
@@ -202,10 +202,17 @@ describe('DES pallet source — visible europallets spawn, flow and are consumed
 
     // ── Sink: capture every consumed MU (kind:'sink' so the adapter sink-consume
     //    fix applies — infinite capacity + release-on-consume). ──
+    //    plan-2212: a consumed MU retires at the end of its consuming event and
+    //    its visual is disposed then, so the visual is captured AT consume time.
     const consumed: MU[] = [];
+    const consumedVisuals: unknown[] = [];
     const sinkDef = defineMaterialFlow<MaterialFlowSelf>({
       type: 'TestPalletSink', kind: 'sink', schema: {}, continuous: {},
-      des: { onAccept(_s, mu) { consumed.push(mu); return true; } },
+      des: { onAccept(_s, mu) {
+        consumed.push(mu);
+        consumedVisuals.push((mu as unknown as { visual?: unknown }).visual);
+        return true;
+      } },
     });
     const sinkCtx = bareCtx('PalletSink', values);
     const sinkSelf = createSelf(sinkCtx.ctx, sinkDef as MaterialFlowDefinition, {
@@ -227,8 +234,8 @@ describe('DES pallet source — visible europallets spawn, flow and are consumed
     expect(consumed.length).toBeGreaterThanOrEqual(5);
     // EVERY consumed MU carried a real visual pallet — a virtual des-source would
     // leave these undefined (the invisible-MU bug).
-    for (const mu of consumed) {
-      expect((mu as unknown as { visual?: unknown }).visual).toBeInstanceOf(RVMovingUnit);
+    for (const visual of consumedVisuals) {
+      expect(visual).toBeInstanceOf(RVMovingUnit);
     }
     // The sink freed its slot after each consume (adapter sink-consume fix).
     expect(adapters[2].totalProcessed).toBeGreaterThanOrEqual(5);

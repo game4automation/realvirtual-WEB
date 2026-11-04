@@ -10,7 +10,8 @@
  * `lightingMode` alias).
  *
  * The pill is a UI single axis over TWO state fields: the persisted
- * `renderMode` (`simple | default | toon`) and the transient editor flag
+ * `renderMode` (`simple | default | toon | raytraced` — the last only behind
+ * the registry's backend gate, plan-762) and the transient editor flag
  * `wireframe`. {@link deriveRenderModeValue} is the one rule that folds them:
  * `wireframeActive ? 'wireframe' : renderMode`. `wireframeActive` (the APPLIED
  * state, editor mode only), not `wireframe` (the latent toggle): leaving the
@@ -22,9 +23,13 @@
  */
 
 import type { RVViewer } from '../rv-viewer';
-import type { RenderMode } from '../rv-render-modes';
+import { NO_RENDER_MODE_CONTEXT, resolveRenderMode, type RenderMode } from '../rv-render-modes';
 import { isTabLocked } from '../rv-app-config';
 import { loadVisualSettings, saveVisualSettings } from './visual-settings-store';
+import {
+  maintenanceRenderLockReason,
+  subscribeMaintenanceRenderLock,
+} from '../maintenance-runtime-registry';
 
 /** What the pill shows: a shading mode, or `'wireframe'` while that view is applied. */
 export type RenderModeValue = RenderMode | 'wireframe';
@@ -49,6 +54,9 @@ export function subscribeRenderModeValue(viewer: RVViewer, cb: () => void): () =
     viewer.on('render-mode-changed', cb),
     viewer.on('wireframe-changed', cb),
     viewer.on('mode-changed', cb),
+    // plan-522: the lock is not part of the derived value, but views that
+    // show the lock (pill, Visual tab) must re-read it when a guide starts/ends.
+    subscribeMaintenanceRenderLock(cb),
   ];
   return () => { for (const off of offs) off(); };
 }
@@ -58,9 +66,15 @@ export function subscribeRenderModeValue(viewer: RVViewer, cb: () => void): () =
  *
  * `isTabLocked('visual')` covers BOTH `lockSettings` and `lockedTabs: ['visual']`;
  * `isSettingsLocked()` alone would miss the second.
+ *
+ * plan-522: while a maintenance guide with a runtime runs, the mode is locked
+ * too (the runtime swaps materials, as the toon mode does). The deployment lock
+ * wins — it is the permanent one. The Visual tab, the toolbar pill and MCP all
+ * go through `view.renderMode`, whose `enabled()` asks this function.
  */
 export function renderModeLockReason(): string | null {
-  return isTabLocked('visual') ? RENDER_MODE_LOCKED : null;
+  if (isTabLocked('visual')) return RENDER_MODE_LOCKED;
+  return maintenanceRenderLockReason();
 }
 
 /**
@@ -82,11 +96,15 @@ export function renderModeLockReason(): string | null {
  *  4. `viewer.renderMode = mode` (VisualSettingsManager, toon swap, the event).
  *  5. `lightIntensity` last, as before.
  */
-export function setRenderMode(viewer: RVViewer, mode: RenderMode): void {
+export function setRenderMode(viewer: RVViewer, requested: RenderMode): void {
+  // plan-762 F2: protection against a direct call — a gated mode the viewer
+  // cannot offer (raytraced without real WebGPU / without a backend) resolves
+  // to the default mode, exactly as the registry's gate says.
+  const mode = resolveRenderMode(requested, viewer.renderModeContext ?? NO_RENDER_MODE_CONTEXT);
   if (viewer.renderMode === mode && !viewer.wireframeActive) return;
   if (viewer.wireframeActive) viewer.wireframe = false;
   const settings = loadVisualSettings();
-  // Always populated: parseModeSettings fills all three modes from MODE_DEFAULTS.
+  // Always populated: parseModeSettings fills every mode of RENDER_MODE_IDS from MODE_DEFAULTS.
   const ms = settings.modeSettings[mode];
   viewer.toneMapping = ms.toneMapping;
   viewer.toneMappingExposure = ms.toneMappingExposure;

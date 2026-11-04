@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readSessionStorage, writeSessionStorage } from '../rv-safe-storage';
+
 /**
  * rv-agent-eye.ts — the MCP agent's own camera body (plan-740 Phase 1).
  *
@@ -114,7 +116,7 @@ export function isValidPose(v: unknown): v is AgentPose {
 /** Read a persisted pose; never throws (Safari private mode raises here). */
 function readPose(key: string): AgentPose | null {
   try {
-    const raw = sessionStorage.getItem(AGENT_EYE_STORAGE_PREFIX + key);
+    const raw = readSessionStorage(AGENT_EYE_STORAGE_PREFIX + key);
     if (!raw) return null;
     const parsed: unknown = JSON.parse(raw);
     return isValidPose(parsed) ? parsed : null;
@@ -126,7 +128,7 @@ function readPose(key: string): AgentPose | null {
 /** Write a pose; a failing write is silently dropped (D-A3, quota/SecurityError). */
 function writePose(key: string, pose: AgentPose): void {
   try {
-    sessionStorage.setItem(AGENT_EYE_STORAGE_PREFIX + key, JSON.stringify(pose));
+    writeSessionStorage(AGENT_EYE_STORAGE_PREFIX + key, JSON.stringify(pose));
   } catch { /* storage unavailable — the body simply does not survive F5 */ }
 }
 

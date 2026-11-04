@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { readLocalStorage, writeLocalStorage } from '../../rv-safe-storage';
+
 /**
  * browser-backend — the writable project that needs no filesystem (§2.5).
  *
@@ -106,7 +108,6 @@ import {
   sceneGlbRelPathFor,
   type RvDocumentEntry,
   type RvProject,
-  type RvProjectSceneEntry,
 } from '../rv-project-types';
 import {
   assertWritable,
@@ -438,7 +439,7 @@ export class BrowserBackend implements ProjectBackend {
    *     document across both stores. That is {@link _storedSceneId} — backend
    *     authority, the same rule the read path uses.
    *  2. **Otherwise `ref.meta` decides**, because a caller that hands over a
-   *     scene row is a caller performing a scene save. This is *caller intent
+   *     scene row is a caller performing a planner save. This is *caller intent
    *     at the call site*, not a persisted category: nothing stores it, nothing
    *     can disagree with it later, and only this one backend consults it. It
    *     exists because a brand-new scene has no pointer yet, and routing its
@@ -475,7 +476,7 @@ export class BrowserBackend implements ProjectBackend {
     const expected = preconditionOf(opts.expectedRevision);
     return this._writes.run(async () => {
       // A caller that hands over a scene row hands over its id with it. An
-      // empty one is not "write this as a blob then" — it is a scene save that
+      // empty one is not "write this as a blob then" — it is a planner save that
       // has lost track of what it is saving, and the body would land under a
       // path key that `readSceneGlb(id)` can never find. Refused in the words
       // the folder backend has always used.
@@ -530,7 +531,7 @@ export class BrowserBackend implements ProjectBackend {
    *     `<id>.scene.glb`) — the browser backend keys its bodies by scene id, so
    *     addressing one by its id is how most callers reach it.
    */
-  private _assertPathBelongsToScene(relPath: string, meta: RvProjectSceneEntry): void {
+  private _assertPathBelongsToScene(relPath: string, meta: RvDocumentEntry): void {
     const id = meta.id;
     const rows = readDocuments(this._readStoredManifest()) ?? [];
 
@@ -721,7 +722,7 @@ function isDigestLike(value: string): boolean {
 
 function readJson<T>(key: string): T | null {
   try {
-    const raw = localStorage.getItem(key);
+    const raw = readLocalStorage(key);
     if (!raw) return null;
     const parsed: unknown = JSON.parse(raw);
     return parsed && typeof parsed === 'object' ? (parsed as T) : null;
@@ -732,7 +733,7 @@ function readJson<T>(key: string): T | null {
 
 function writeJson(key: string, value: unknown): void {
   try {
-    localStorage.setItem(key, JSON.stringify(value));
+    writeLocalStorage(key, JSON.stringify(value));
   } catch {
     /* quota / private mode — surfaced by the scene-storage error channel */
   }

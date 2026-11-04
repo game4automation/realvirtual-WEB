@@ -1,0 +1,124 @@
+{
+  "meta": {
+    "plan": 659,
+    "phase": 0,
+    "generated_by": "spikes/659/make-g1-fixtures.py",
+    "sources": {
+      "policy": {
+        "repo": "github.com/unitreerobotics/unitree_rl_gym",
+        "revision": "276801e46c5d433564f24658bac64f254b7d2d4b",
+        "path": "deploy/pre_train/g1/motion.pt",
+        "format": "TorchScript"
+      },
+      "mjcf": {
+        "repo": "github.com/unitreerobotics/unitree_rl_gym",
+        "revision": "276801e46c5d433564f24658bac64f254b7d2d4b",
+        "path": "resources/robots/g1_description/{scene,g1_12dof}.xml"
+      },
+      "reference_loop": {
+        "repo": "github.com/unitreerobotics/unitree_rl_gym",
+        "revision": "276801e46c5d433564f24658bac64f254b7d2d4b",
+        "path": "deploy/deploy_mujoco/deploy_mujoco.py"
+      }
+    },
+    "runtime_versions": {
+      "python": "3.13.9",
+      "mujoco": "3.11.0",
+      "onnxruntime": "1.23.2",
+      "numpy": "2.5.4",
+      "torch": "n/a (export failed)",
+      "platform": "Windows-11-10.0.26200-SP0"
+    },
+    "onnx_export": {
+      "status": "failed",
+      "error": "RuntimeError: Tried to trace <__torch__.torch.nn.modules.rnn.LSTM object at 000001F362865020> but it is not part of the active trace. Modules that are called during a trace must be registered as submodules of the thing being traced.",
+      "note": "stateful TorchScript LSTM; see plan-659 Phase 0 report"
+    },
+    "contract": {
+      "obs_size": 47,
+      "action_size": 12,
+      "observation_layout": [
+        "base_ang_vel[3] * 0.25 (qvel[3:6], NOT a gyro sensor)",
+        "gravity_orientation[3] (closed form from qpos[3:7])",
+        "command[3] * [2.0, 2.0, 0.25]",
+        "joint_pos[12] = (qpos[7:] - default_angles) * 1.0",
+        "joint_vel[12] = qvel[6:] * 0.05",
+        "last_action[12]",
+        "[sin(2*pi*phase), cos(2*pi*phase)] with phase = (counter*dt) % 0.8 / 0.8"
+      ],
+      "no_observation_clipping": true,
+      "action_scale": 0.25,
+      "control": "tau = (target_q - q)*kp + (0 - dq)*kd, written to ctrl EVERY physics step",
+      "actuator_type": "motor (torque), gain 1, no forcerange",
+      "target_dof_pos": "action * 0.25 + default_angles",
+      "timestep": 0.002,
+      "decimation": 10,
+      "policy_rate_hz": 50.0,
+      "kps": [
+        100.0,
+        100.0,
+        100.0,
+        150.0,
+        40.0,
+        40.0,
+        100.0,
+        100.0,
+        100.0,
+        150.0,
+        40.0,
+        40.0
+      ],
+      "kds": [
+        2.0,
+        2.0,
+        2.0,
+        4.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        4.0,
+        2.0,
+        2.0
+      ],
+      "default_angles": [
+        -0.10000000149011612,
+        0.0,
+        0.0,
+        0.30000001192092896,
+        -0.20000000298023224,
+        0.0,
+        -0.10000000149011612,
+        0.0,
+        0.0,
+        0.30000001192092896,
+        -0.20000000298023224,
+        0.0
+      ],
+      "joint_names": [
+        "left_hip_pitch_joint",
+        "left_hip_roll_joint",
+        "left_hip_yaw_joint",
+        "left_knee_joint",
+        "left_ankle_pitch_joint",
+        "left_ankle_roll_joint",
+        "right_hip_pitch_joint",
+        "right_hip_roll_joint",
+        "right_hip_yaw_joint",
+        "right_knee_joint",
+        "right_ankle_pitch_joint",
+        "right_ankle_roll_joint"
+      ],
+      "matching_mjcf": "g1_12dof.xml (12 DoF); the Menagerie unitree_g1 model is 29 DoF with position actuators and does NOT match this policy"
+    },
+    "determinism": {
+      "two_identical_runs_bit_equal": null
+    },
+    "runs": {
+      "walk_vx0.5_10s": null,
+      "walk_vx0.5_60s": null
+    }
+  },
+  "fixtures": []
+}

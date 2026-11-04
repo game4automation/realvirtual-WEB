@@ -64,14 +64,7 @@ describe('LayoutStore ↔ LibraryStore adapter', () => {
 
     layout.addCatalogDirect('bundled://test', CATALOG);
     expect(library.catalogUrls).toEqual(['bundled://test']);
-
-    layout.setEntryThumbnail('belt', 'data:image/png;base64,AAA');
-    expect(library.catalogs.get('bundled://test')?.entries[0].thumbnailUrl)
-      .toBe('data:image/png;base64,AAA');
-
-    layout.setThumbnailPending('belt', true);
-    expect(library.thumbnailPending.has('belt')).toBe(true);
-    expect(layout.getSnapshot().thumbnailPending.has('belt')).toBe(true);
+    // plan-776: no thumbnail mutators any more — the picture is the catalog's.
 
     layout.removeCatalog('bundled://test');
     expect(library.catalogUrls).toEqual([]);

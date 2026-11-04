@@ -1,0 +1,22 @@
+{
+  // plan-672 Phase 0 — typecheck for the spike folder.
+  //
+  // `tsconfig.full.json` includes `src` and `tests`, not `spikes`, so the
+  // project gate does not see this code — deliberately: a spike must not be
+  // able to break the repo's typecheck. It still has to typecheck itself, or
+  // the measurements rest on code nobody checked. This config therefore EXTENDS
+  // the full one (so the compiler options, lib and globals are identical) and
+  // only adds this folder. Run:
+  //
+  //   npx tsc -p spikes/672/tsconfig.json --noEmit
+  "extends": "../../tsconfig.full.json",
+  "include": [
+    "../../src",
+    "../../tests",
+    "../../../realvirtual-WebViewer-Private~/src",
+    "."
+  ],
+  "compilerOptions": {
+    "noEmit": true
+  }
+}

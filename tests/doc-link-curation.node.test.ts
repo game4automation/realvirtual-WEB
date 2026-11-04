@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 /**
  * Unit tests for `curateCoreMarkdownLinks` (plan-739 Phase 1, section 9.1).
  *

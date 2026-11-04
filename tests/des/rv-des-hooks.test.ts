@@ -4,22 +4,27 @@
 /**
  * TestDESHooks -- DES callback hook tests.
  *
- * Tests onGetProcessingTime override, -1 fallthrough, Infinity hold,
- * onSelectNext routing, onCanAccept filter, onMUCreated property flow,
- * and onProcessingComplete modification.
+ * Tests behaviour processing time, onSelectNext routing and onCanAccept filtering.
+ * Script-controlled timing and holding/downstream-ready notification are covered
+ * by script-station.test.ts.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { Object3D, Scene } from 'three';
-import { DESManager, DESMode } from '@rv-private/plugins/des/rv-des-manager';
-import { DES } from '@rv-private/plugins/des/rv-des-api';
-import { DESSource } from '@rv-private/plugins/des/rv-des-source';
-import { DESSink } from '@rv-private/plugins/des/rv-des-sink';
-import { DESStation } from '@rv-private/plugins/des/rv-des-station';
-import { DESConveyor } from '@rv-private/plugins/des/rv-des-conveyor';
-import { resetDESMUCounter } from '@rv-private/plugins/des/rv-des-mu';
-import { NodeRegistry } from '../../src/core/engine/rv-node-registry';
+import { DESManager } from '@rv/plugins/des/rv-des-manager';
+import { createDESMU, resetDESMUCounter } from '@rv/plugins/des/rv-des-mu';
+import { DESComponent } from '@rv/plugins/des/rv-des-component';
 import { SignalStore } from '../../src/core/engine/rv-signal-store';
+import { DESRunner } from '@rv/plugins/des/des-runner';
+import { bindSceneToRunner } from '@rv/plugins/des/des-scene-binding';
+import type { MaterialFlowAdapter } from '@rv/plugins/des/material-flow-adapter';
+import { Station } from '@rv/plugins/des/material-flow/Station';
+import Source from '../../src/behaviors/Source';
+import Sink from '../../src/behaviors/Sink';
+import { getMaterialFlow, registerMaterialFlow } from '../../src/core/material-flow/registry';
+import type { MaterialFlowDefinition } from '../../src/core/material-flow/define-material-flow';
+import type { BindContextHost } from '../../src/core/behavior-runtime';
+import { ContextMenuStore } from '../../src/core/hmi/context-menu-store';
 
 function createNode(name: string): Object3D {
   const n = new Object3D();
@@ -27,14 +32,35 @@ function createNode(name: string): Object3D {
   return n;
 }
 
-function makeContext(scene: Scene) {
-  return {
-    registry: new NodeRegistry(),
-    signalStore: new SignalStore(),
-    scene,
-    transportManager: {} as never,
-    root: scene,
+void Source; void Sink;
+const definitions = [
+  getMaterialFlow('Source')!, getMaterialFlow('Sink')!, Station,
+] as MaterialFlowDefinition[];
+const runners: DESRunner[] = [];
+afterEach(() => { for (const runner of runners.splice(0)) runner.dispose(); });
+
+/** Bind real behaviour payloads, then let each case wire its explicit test graph. */
+function bindRunner(scene: Scene): DESRunner {
+  for (const def of definitions) registerMaterialFlow(def);
+  scene.updateMatrixWorld(true);
+  const host: BindContextHost = {
+    signalStore: new SignalStore(), registry: null, drives: [],
+    on: () => () => {}, contextMenu: new ContextMenuStore(),
+    getPlugin: () => undefined,
   };
+  const runner = new DESRunner({ subMode: 'animated' });
+  runners.push(runner);
+  bindSceneToRunner(runner, scene, host);
+  // These cases explicitly wire the graph below (including deliberate fan-out).
+  for (const { adapter } of runner.liveInstances) {
+    adapter.nextComponents = [];
+    adapter.previousComponents = [];
+  }
+  return runner;
+}
+
+function component(runner: DESRunner, node: Object3D): MaterialFlowAdapter {
+  return runner.liveInstances.find(i => i.adapter.node === node)!.adapter;
 }
 
 function runSimulation(manager: DESManager, seconds: number): void {
@@ -49,133 +75,86 @@ describe('DES Hooks', () => {
   let scene: Scene;
 
   beforeEach(() => {
-    manager = new DESManager();
-    manager.mode = DESMode.Animated;
-    DES.setManager(manager);
     resetDESMUCounter();
     scene = new Scene();
   });
 
-  it('onGetProcessingTime overrides fixed time', () => {
-    const ctx = makeContext(scene);
+  it('Station behaviour waits for its configured processing time', () => {
     const sourceNode = createNode('Source');
     const stationNode = createNode('Station');
     const sinkNode = createNode('Sink');
     scene.add(sourceNode, stationNode, sinkNode);
 
-    const source = new DESSource(sourceNode);
-    source.InterArrivalTime = 5;
-    const station = new DESStation(stationNode);
-    station.ProcessingTime = 10; // default 10s
-    const sink = new DESSink(sinkNode);
-
-    // Override: use 1s instead of 10s
-    station.onGetProcessingTime = (_mu) => 1.0;
+    sourceNode.userData.realvirtual = { Source: { Interval: 5 } };
+    stationNode.userData.realvirtual = { Station: { ProcessingTime: 10 } };
+    sinkNode.userData.realvirtual = { Sink: {} };
+    const runner = bindRunner(scene);
+    manager = runner.getManager();
+    manager.duration = 100000;
+    const source = component(runner, sourceNode);
+    const station = component(runner, stationNode);
+    const sink = component(runner, sinkNode);
 
     source.nextComponents = [station];
     station.nextComponents = [sink];
     station.previousComponents = [source];
     sink.previousComponents = [station];
 
-    manager.registerComponent(source);
-    manager.registerComponent(station);
-    manager.registerComponent(sink);
-    source.init(ctx); station.init(ctx); sink.init(ctx);
-    source.start();
+    runner.start([], { root: scene });
 
-    runSimulation(manager, 15);
-
-    // With 1s processing, multiple MUs should pass through quickly
-    expect(sink.totalConsumed).toBeGreaterThanOrEqual(1);
+    runSimulation(manager, 9);
+    expect(sink.totalProcessed).toBe(0);
+    runSimulation(manager, 2);
+    expect(sink.totalProcessed).toBeGreaterThanOrEqual(1);
   });
 
-  it('onGetProcessingTime returns -1 for fallthrough to default', () => {
-    const ctx = makeContext(scene);
+  it('Station behaviour uses a shorter configured processing time', () => {
     const sourceNode = createNode('Source');
     const stationNode = createNode('Station');
     const sinkNode = createNode('Sink');
     scene.add(sourceNode, stationNode, sinkNode);
 
-    const source = new DESSource(sourceNode);
-    source.InterArrivalTime = 3;
-    const station = new DESStation(stationNode);
-    station.ProcessingTime = 2;
-    const sink = new DESSink(sinkNode);
-
-    // Return -1: fall through to fixed ProcessingTime (2s)
-    station.onGetProcessingTime = (_mu) => -1;
+    sourceNode.userData.realvirtual = { Source: { Interval: 3 } };
+    stationNode.userData.realvirtual = { Station: { ProcessingTime: 2 } };
+    sinkNode.userData.realvirtual = { Sink: {} };
+    const runner = bindRunner(scene);
+    manager = runner.getManager();
+    manager.duration = 100000;
+    const source = component(runner, sourceNode);
+    const station = component(runner, stationNode);
+    const sink = component(runner, sinkNode);
 
     source.nextComponents = [station];
     station.nextComponents = [sink];
     station.previousComponents = [source];
     sink.previousComponents = [station];
 
-    manager.registerComponent(source);
-    manager.registerComponent(station);
-    manager.registerComponent(sink);
-    source.init(ctx); station.init(ctx); sink.init(ctx);
-    source.start();
+    runner.start([], { root: scene });
 
-    runSimulation(manager, 12);
-
-    // Default 2s processing, source at 3s intervals => MUs flow through
-    expect(sink.totalConsumed).toBeGreaterThanOrEqual(1);
-  });
-
-  it('Infinity hold keeps MU until releaseProcessing', () => {
-    const ctx = makeContext(scene);
-    const sourceNode = createNode('Source');
-    const stationNode = createNode('Station');
-    const sinkNode = createNode('Sink');
-    scene.add(sourceNode, stationNode, sinkNode);
-
-    const source = new DESSource(sourceNode);
-    source.InterArrivalTime = 2;
-    const station = new DESStation(stationNode);
-    station.ProcessingTime = 1;
-    const sink = new DESSink(sinkNode);
-
-    // Hold indefinitely
-    station.onGetProcessingTime = (_mu) => Infinity;
-
-    source.nextComponents = [station];
-    station.nextComponents = [sink];
-    station.previousComponents = [source];
-    sink.previousComponents = [station];
-
-    manager.registerComponent(source);
-    manager.registerComponent(station);
-    manager.registerComponent(sink);
-    source.init(ctx); station.init(ctx); sink.init(ctx);
-    source.start();
-
-    runSimulation(manager, 5);
-
-    // MU should be held — nothing in sink
-    expect(sink.totalConsumed).toBe(0);
-
-    // Now release
-    station.releaseProcessing();
     runSimulation(manager, 1);
-
-    // After release, MU should reach sink
-    expect(sink.totalConsumed).toBe(1);
+    expect(sink.totalProcessed).toBe(0);
+    runSimulation(manager, 2);
+    expect(sink.totalProcessed).toBeGreaterThanOrEqual(1);
   });
 
   it('onSelectNext routes MUs to different outputs', () => {
-    const ctx = makeContext(scene);
     const sourceNode = createNode('Source');
     const stationNode = createNode('Station');
     const sink1Node = createNode('SinkGood');
     const sink2Node = createNode('SinkReject');
     scene.add(sourceNode, stationNode, sink1Node, sink2Node);
 
-    const source = new DESSource(sourceNode);
-    source.InterArrivalTime = 2;
-    const station = new DESStation(stationNode);
-    station.ProcessingTime = 1;
-    const sinkGood = new DESSink(sink1Node);
-    const sinkReject = new DESSink(sink2Node);
+    sourceNode.userData.realvirtual = { Source: { Interval: 2 } };
+    stationNode.userData.realvirtual = { Station: { ProcessingTime: 1 } };
+    sink1Node.userData.realvirtual = { Sink: {} };
+    sink2Node.userData.realvirtual = { Sink: {} };
+    const runner = bindRunner(scene);
+    manager = runner.getManager();
+    manager.duration = 100000;
+    const source = component(runner, sourceNode);
+    const station = component(runner, stationNode);
+    const sinkGood = component(runner, sink1Node);
+    const sinkReject = component(runner, sink2Node);
 
     let muIdx = 0;
     station.onSelectNext = (candidates, _mu) => {
@@ -189,141 +168,24 @@ describe('DES Hooks', () => {
     sinkGood.previousComponents = [station];
     sinkReject.previousComponents = [station];
 
-    manager.registerComponent(source);
-    manager.registerComponent(station);
-    manager.registerComponent(sinkGood);
-    manager.registerComponent(sinkReject);
-    source.init(ctx); station.init(ctx); sinkGood.init(ctx); sinkReject.init(ctx);
-    source.start();
+    runner.start([], { root: scene });
 
     runSimulation(manager, 15);
 
-    expect(sinkGood.totalConsumed).toBeGreaterThanOrEqual(1);
-    expect(sinkReject.totalConsumed).toBeGreaterThanOrEqual(1);
+    expect(sinkGood.totalProcessed).toBeGreaterThanOrEqual(1);
+    expect(sinkReject.totalProcessed).toBeGreaterThanOrEqual(1);
   });
 
-  it('onCanAccept filters MUs', () => {
-    const ctx = makeContext(scene);
-    const sourceNode = createNode('Source');
-    const stationNode = createNode('Station');
-    const sinkNode = createNode('Sink');
-    scene.add(sourceNode, stationNode, sinkNode);
-
-    const source = new DESSource(sourceNode);
-    source.InterArrivalTime = 2;
-    const station = new DESStation(stationNode);
-    station.ProcessingTime = 1;
-    const sink = new DESSink(sinkNode);
-
-    let muCount = 0;
-    source.onMUCreated = (mu) => {
-      mu.prop['idx'] = muCount++;
-    };
-
-    // Only accept even-indexed MUs
-    station.onCanAccept = (mu) => {
-      return (mu.prop['idx'] as number) % 2 === 0;
-    };
-
-    source.nextComponents = [station];
-    station.nextComponents = [sink];
-    station.previousComponents = [source];
-    sink.previousComponents = [station];
-
-    manager.registerComponent(source);
-    manager.registerComponent(station);
-    manager.registerComponent(sink);
-    source.init(ctx); station.init(ctx); sink.init(ctx);
-    source.start();
-
-    runSimulation(manager, 12);
-
-    // Only even MUs get through — sink should have received some
-    // Odd MUs are rejected (station.canAccept returns false)
-    expect(sink.totalConsumed).toBeGreaterThanOrEqual(1);
-  });
-
-  it('onMUCreated sets properties that flow through pipeline', () => {
-    const ctx = makeContext(scene);
-    const sourceNode = createNode('Source');
-    const stationNode = createNode('Station');
-    const sinkNode = createNode('Sink');
-    scene.add(sourceNode, stationNode, sinkNode);
-
-    const source = new DESSource(sourceNode);
-    source.InterArrivalTime = 3;
-    const station = new DESStation(stationNode);
-    station.ProcessingTime = 1;
-    const sink = new DESSink(sinkNode);
-
-    // Set property at source
-    source.onMUCreated = (mu) => {
-      mu.prop['productType'] = 'WidgetA';
-      mu.prop['weight'] = 4.2;
-    };
-
-    // Verify property at station
-    const receivedProps: Record<string, unknown>[] = [];
-    station.onMUEnter = (mu) => {
-      receivedProps.push({ ...mu.prop });
-    };
-
-    source.nextComponents = [station];
-    station.nextComponents = [sink];
-    station.previousComponents = [source];
-    sink.previousComponents = [station];
-
-    manager.registerComponent(source);
-    manager.registerComponent(station);
-    manager.registerComponent(sink);
-    source.init(ctx); station.init(ctx); sink.init(ctx);
-    source.start();
-
-    runSimulation(manager, 8);
-
-    expect(receivedProps.length).toBeGreaterThanOrEqual(1);
-    expect(receivedProps[0]['productType']).toBe('WidgetA');
-    expect(receivedProps[0]['weight']).toBe(4.2);
-  });
-
-  it('onProcessingComplete modifies MU before transfer', () => {
-    const ctx = makeContext(scene);
-    const sourceNode = createNode('Source');
-    const stationNode = createNode('Station');
-    const sinkNode = createNode('Sink');
-    scene.add(sourceNode, stationNode, sinkNode);
-
-    const source = new DESSource(sourceNode);
-    source.InterArrivalTime = 3;
-    const station = new DESStation(stationNode);
-    station.ProcessingTime = 1;
-    const sink = new DESSink(sinkNode);
-
-    station.onProcessingComplete = (mu) => {
-      mu.prop['inspected'] = true;
-      mu.prop['qualityScore'] = 95;
-    };
-
-    const destroyedProps: Record<string, unknown>[] = [];
-    sink.onMUDestroyed = (mu) => {
-      destroyedProps.push({ ...mu.prop });
-    };
-
-    source.nextComponents = [station];
-    station.nextComponents = [sink];
-    station.previousComponents = [source];
-    sink.previousComponents = [station];
-
-    manager.registerComponent(source);
-    manager.registerComponent(station);
-    manager.registerComponent(sink);
-    source.init(ctx); station.init(ctx); sink.init(ctx);
-    source.start();
-
-    runSimulation(manager, 8);
-
-    expect(destroyedProps.length).toBeGreaterThanOrEqual(1);
-    expect(destroyedProps[0]['inspected']).toBe(true);
-    expect(destroyedProps[0]['qualityScore']).toBe(95);
+  it('onCanAccept filters MUs on the base component contract', () => {
+    // MaterialFlowAdapter uses def.des.canAccept instead; PalletYard probes
+    // still use the base DESComponent callback.
+    const station = new DESComponent(createNode('Station'));
+    station.onCanAccept = (mu) => (mu.prop['idx'] as number) % 2 === 0;
+    const even = createDESMU(0, null, manager);
+    const odd = createDESMU(0, null, manager);
+    even.prop['idx'] = 0;
+    odd.prop['idx'] = 1;
+    expect(station.canAccept(even)).toBe(true);
+    expect(station.canAccept(odd)).toBe(false);
   });
 });

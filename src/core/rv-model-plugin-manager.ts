@@ -192,7 +192,7 @@ export async function discoverDeclaredScriptRefs(
     // thing — a `models: []` declaration — and that only ever appears in a
     // collecting `index.ts`. With the glob opened this loop would otherwise
     // FETCH the source text of every helper file of the project on every
-    // project open (nine of them for Toray), for an answer none of them can
+    // project open (nine of them for a CAD-import showcase model), for an answer none of them can
     // give. Not an execution cost, but a real one, and the `index.` filter in
     // `_findByModelName` does not cover it: that one walks a different glob.
     if (!isAggregatorModulePath(path)) continue;
@@ -371,7 +371,7 @@ export function normalizeScriptRef(ref: string): string {
  * build-relative and spelled differently for each of the four roots
  * (`/src/plugins/models/…`, `../../../realvirtual-WebViewer-Private~/projects/…`).
  * The only thing the two share is the tail, so the match is a **segment-aligned
- * suffix**: `plugins/index.ts` matches `…/Toray/plugins/index.ts` but never
+ * suffix**: `plugins/index.ts` matches `…/Showcase/plugins/index.ts` but never
  * `…/other-plugins/index.ts`.
  *
  * Case-sensitive, like every other match in this module (K3). A reference that

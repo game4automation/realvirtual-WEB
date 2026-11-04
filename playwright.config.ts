@@ -3,11 +3,13 @@
 
 import { defineConfig, devices } from 'playwright/test';
 
-// Override with RV_E2E_PORT when 5177 is taken — e.g. a vitest browser runner
-// from a parallel worktree session on the same machine grabs 5177, and
-// `reuseExistingServer` would then "reuse" a server that serves
-// vitest-instrumented modules (boot dies on `__vitest_browser_runner__`).
-const E2E_PORT = Number(process.env.RV_E2E_PORT ?? 5177);
+// Default 5187, NOT 5177 (plan-606 F7): 5177 is the vitest browser runner's API
+// port (vite.config.ts `browser.api.port`), and `reuseExistingServer` would then
+// "reuse" a server that serves vitest-instrumented modules (boot dies on
+// `__vitest_browser_runner__`). The machine-wide test lock additionally keeps a
+// vitest browser run and an e2e run from overlapping; a reused server is still not
+// identity-checked. Override with RV_E2E_PORT.
+const E2E_PORT = Number(process.env.RV_E2E_PORT ?? 5187);
 
 // plan-503: the live demo smoke. The `prod-demo` project exists ONLY when a live
 // target is named (the runner scripts/rv-demo-smoke.mjs sets it), so a local
@@ -16,6 +18,12 @@ const E2E_PORT = Number(process.env.RV_E2E_PORT ?? 5177);
 // e2e/prod-demo-calibration/ is a LOCAL spec against the dev server and stays in
 // `chromium`. Contract pinned by tests/playwright-config-prod-demo.node.test.ts.
 const SMOKE_BASE_URL = process.env.RV_SMOKE_BASE_URL;
+
+// plan-766: specs that measure or compare real GPU output (render CPU, draw
+// calls, pixel parity) run in the installed Google Chrome (`channel: 'chrome'`),
+// not in the bundled Chromium / chrome-headless-shell. Each such spec lives in
+// exactly ONE project — `chromium` ignores them.
+const CHROME_ONLY_SPECS = /(editor-arena-parity|editor-arena-perf|editor-batched-display)\.spec\.ts/;
 
 export default defineConfig({
   testDir: './e2e',
@@ -41,7 +49,12 @@ export default defineConfig({
     {
       name: 'chromium',
       use: { ...devices['Desktop Chrome'] },
-      testIgnore: [/embed-smoke\.spec\.ts/, /prod-demo\//],
+      testIgnore: [/embed-smoke\.spec\.ts/, /prod-demo\//, CHROME_ONLY_SPECS],
+    },
+    {
+      name: 'chrome',
+      testMatch: CHROME_ONLY_SPECS,
+      use: { ...devices['Desktop Chrome'], channel: 'chrome' },
     },
     {
       name: 'embed-chromium',
@@ -75,11 +88,13 @@ export default defineConfig({
       reuseExistingServer: true,
       timeout: 30_000,
     },
-    {
+    // RV_E2E_NO_EMBED=1 leaves the embed preview out (viewer-only specs on a checkout
+    // without dist-embed); the default starts it exactly as before.
+    ...(process.env.RV_E2E_NO_EMBED === '1' ? [] : [{
       command: 'npm run preview:embed',
       port: 4178,
       reuseExistingServer: true,
       timeout: 30_000,
-    },
+    }]),
   ],
 });

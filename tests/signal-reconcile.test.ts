@@ -292,19 +292,33 @@ describe('reconcile performance', () => {
     expect(median).toBeLessThan(50);
   });
 
-  it('stays linear when every one of the 5 interfaces carries all 20 000 signals', () => {
+  it('stays linear when every one of the 5 interfaces carries all 20 000 signals (median of 5, warm-up discarded)', () => {
     const model = bigModel();
     const interfaces = [0, 1, 2, 3, 4].map((n) => ifaceOver(`all${n}`, model, 0, 20_000));
 
-    const started = performance.now();
-    let rows = 0;
-    for (const iface of interfaces) rows += reconcileSignals(model, iface, REQUIRED).entries.length;
-    const elapsed = performance.now() - started;
+    const pass = (): number => {
+      let n = 0;
+      for (const iface of interfaces) n += reconcileSignals(model, iface, REQUIRED).entries.length;
+      return n;
+    };
+    // Warm-up, not measured: a single cold pass measures JIT warm-up and allocation of the first
+    // 100 000 rows, which is what made this bound flaky. Median of 5 warm passes instead.
+    const rows = pass();
 
-    // 100 000 rows — five times the §1 case. The bound is deliberately loose (the cost here is
-    // allocating the rows themselves); what it catches is a nested scan, which would need minutes.
+    const samples: number[] = [];
+    for (let run = 0; run < 5; run++) {
+      const t0 = performance.now();
+      expect(pass()).toBe(rows);
+      samples.push(performance.now() - t0);
+    }
+    samples.sort((a, b) => a - b);
+    const median = samples[2];
+
+    // 100 000 rows - five times the section 1 case. The bound is deliberately loose (the cost here
+    // is allocating the rows themselves); what it catches is a nested scan, which would need minutes.
     expect(rows).toBeGreaterThan(100_000);
-    console.info(`[plan-589] reconcile 100 000 rows took ${elapsed.toFixed(1)} ms`);
-    expect(elapsed).toBeLessThan(400);
+    console.info(`[plan-589] reconcile 100 000 rows: ${median.toFixed(1)} ms `
+      + `(median of 5; samples ${samples.map((x) => x.toFixed(1)).join(', ')})`);
+    expect(median).toBeLessThan(400);
   });
 });
