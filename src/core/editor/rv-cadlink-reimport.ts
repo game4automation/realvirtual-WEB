@@ -34,6 +34,7 @@ import { dedupeSiblingNames } from './rv-asset-executors';
 import { deepCloneJSON } from '../ops/rv-op-utils';
 import { identityIdOf } from '../engine/rv-decode-identity';
 import type { NodeIdMap } from '../engine/rv-subtree-instantiate';
+import { whenDocumentSettled } from '../hmi/rv-bind-queue';
 
 export interface ReimportUnmatched {
   /** Relative name-path under the old CAD root. */
@@ -201,6 +202,7 @@ export async function reimportCad(
     );
   }
 
+  await whenDocumentSettled(doc);
   const oldRoot = viewer.registry?.getNode(cadRootPath);
   if (!oldRoot) throw new Error(`CAD root not found: ${cadRootPath}`);
 

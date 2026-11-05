@@ -94,6 +94,8 @@ export class UsdLiveLinkPlugin implements RVViewerPlugin {
   /** Sync switched on without a token: waits for {@link commitToken}. */
   private tokenPending = false;
   private offReset: (() => void) | null = null;
+  private offStructure: (() => void) | null = null;
+  private whenSceneReady: (() => Promise<void>) | undefined;
   private readonly opts: UsdLiveLinkPluginOptions;
 
   constructor(opts: UsdLiveLinkPluginOptions = {}) {
@@ -105,6 +107,9 @@ export class UsdLiveLinkPlugin implements RVViewerPlugin {
 
   init(viewer: RVViewer): void {
     this.offReset = viewer.on('simulation-reset', () => this.session?.onSimulationReset());
+    this.offStructure = viewer.on('editor-structure-changed', () => this.session?.onStructureHint());
+    // Plugins rule 3: every mount waits for the complete scene (plan-2239).
+    this.whenSceneReady = typeof viewer.whenSceneReady === 'function' ? () => viewer.whenSceneReady() : undefined;
   }
 
   onModelLoaded(result: LoadResult): void {
@@ -133,6 +138,8 @@ export class UsdLiveLinkPlugin implements RVViewerPlugin {
     this.setSyncEnabled(false);
     this.offReset?.();
     this.offReset = null;
+    this.offStructure?.();
+    this.offStructure = null;
   }
 
   // ── Public API (UI) ──
@@ -228,8 +235,10 @@ export class UsdLiveLinkPlugin implements RVViewerPlugin {
 
   private createSession(m: UsdLiveLinkSessionModule): UsdLiveLinkSession {
     if (this.session) return this.session;
-    const { exportStage, compress, createClient, now } = this.opts;
-    const session = new m.UsdLiveLinkSession(this.store, { exportStage, compress, createClient, now });
+    const { exportStage, compress, createClient, now, structureTiming } = this.opts;
+    const session = new m.UsdLiveLinkSession(this.store, {
+      exportStage, compress, createClient, now, structureTiming, whenSceneReady: this.opts.whenSceneReady ?? this.whenSceneReady,
+    });
     if (this.model) session.onModelLoaded(this.model);
     this.session = session;
     return session;

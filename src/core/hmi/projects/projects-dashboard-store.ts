@@ -75,6 +75,8 @@ export type ProjectsSelection =
   | { kind: 'none' }
   | { kind: 'project'; projectId: string }
   | { kind: 'document'; documentId: string }
+  /** Two or more documents (Ctrl / Shift click) — rules in `document-multi-select.ts`. */
+  | { kind: 'documents'; documentIds: string[] }
   | { kind: 'documentPath'; path: string }
   | { kind: 'folder'; rootId: string; relPath: string }
   | { kind: 'file'; rootId: string; relPath: string }

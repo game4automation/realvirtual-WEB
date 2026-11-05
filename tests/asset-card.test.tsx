@@ -17,7 +17,7 @@ import { render, screen, cleanup, fireEvent } from '@testing-library/react';
 import { AssetCard, fileGlyphOf, isCadExtension } from '../src/core/library/AssetCard';
 import type { LibraryCatalogEntry } from '../src/core/library/library-types';
 import { DocumentModeChip } from '../src/core/hmi/projects/DocumentModeChip';
-import { LABEL_CHIP_ON_PREVIEW_BG } from '../src/core/hmi/shared-sx';
+import { LABEL_CHIP_ON_PREVIEW_SX } from '../src/core/hmi/shared-sx';
 
 afterEach(() => cleanup());
 
@@ -100,7 +100,7 @@ describe('AssetCard tier badge', () => {
         entry={entry()}
         tier="bundled"
         cornerBadge={(
-          <DocumentModeChip mode="des" modeLabel={() => 'DES'} testId="mode" sx={{ bgcolor: LABEL_CHIP_ON_PREVIEW_BG }} />
+          <DocumentModeChip mode="des" modeLabel={() => 'DES'} testId="mode" sx={LABEL_CHIP_ON_PREVIEW_SX} />
         )}
       />,
     );

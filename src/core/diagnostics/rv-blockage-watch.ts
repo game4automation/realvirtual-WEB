@@ -41,10 +41,10 @@ export class BlockageWatch {
     if (report.findings.length) ctx.ledger.lastFindings = structuredClone(report.findings);
     this.publishReport(report);
   }
-  private publishReport(report: BlockageSnapshot): void {
+  private publishReport(report: BlockageSnapshot, signals = true): void {
     const ctx = this.context();
     if (!ctx) return;
-    ctx.budgets.publishFindings(report.findings.flatMap(f => f.cycles
+    if (signals) ctx.budgets.publishFindings(report.findings.flatMap(f => f.cycles
       ? f.cycles.flatMap(c => c.filter((_, i) => i % 2 === 0)) : [f.waiterId]), ctx.now);
     const active = new Set<string>();
     for (const f of report.findings) {
@@ -114,8 +114,7 @@ export class BlockageWatch {
     this.on = state.on; this.since = state.since; this.lastReport = state.lastReport;
     ctx.ledger.restoreState(state.ledger);
     clearBlockageProblems();
-    if (this.on && this.lastReport) this.publishReport(this.lastReport);
-    else ctx.budgets.publishFindings([], ctx.now);
+    if (this.on && this.lastReport) this.publishReport(this.lastReport, false);
   }
 
   reset(keepOn = false): void {

@@ -45,8 +45,8 @@ import {
   isStageHelper,
   patchModelUsda,
   sanitizePrimName,
-} from '../src/plugins/usd-live-link/runtime-stage-export';
-import { buildTemplateTable } from '../src/plugins/usd-live-link/usd-live-link-session';
+} from '../src/core/usd/runtime-stage-export';
+import { buildTemplateTable } from '../src/core/usd/collect-stage-input';
 
 const DEMO = '/demo-realvirtual/DemoRealvirtualWeb.glb';
 const DT = 1 / 60;

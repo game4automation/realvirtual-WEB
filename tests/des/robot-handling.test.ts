@@ -104,6 +104,8 @@ function bind(
     onTransfer: (mu) => runner.makeTransfer(adapter)(mu),
     spawnMU: (templateId) => runner.createMU(templateId),
     onStatState: (state) => adapter.setState(state),
+    // Same forwarder as the production DES bind (des-scene-binding.ts).
+    onStatOutput: (n) => adapter.recordOutput(n),
     local: (() => {
       const make = def.state ?? def.local;
       return make ? make() : undefined;
@@ -191,6 +193,8 @@ describe('RobotHandling', () => {
     expect(target.adapter.currentLoad).toBe(2);
     expect(blister.childMUs).toHaveLength(0);
     expect(runner.getManager().activeReservationCount).toBe(0);
+    // One committed batch of 2 = 2 outputs, counted once (not 2n).
+    expect(robot.adapter.totalProcessed).toBe(2);
 
     _resetDesHookCache();
     const e2eRunner = new DESRunner();
@@ -373,6 +377,7 @@ describe('RobotHandling', () => {
     failureRunner.tick(3);
     expect(failureRobot.adapter.heldMUs).toContain(retained);
     expect(failureTarget.adapter.currentLoad).toBe(0);
+    expect(failureRobot.adapter.totalProcessed).toBe(0);
 
     _resetDesHookCache();
     const resetRunner = new DESRunner();

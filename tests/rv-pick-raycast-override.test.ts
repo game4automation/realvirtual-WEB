@@ -15,13 +15,14 @@
  *    satisfied by construction (one hit per mesh at most);
  *  - `faceIndex` indexes the PERMUTED `geometry.index` — the three vertices read
  *    through it contain the hit point (§2.4a.11);
- *  - `Mesh.prototype.raycast` is NOT touched (R6), and a collision `boundsTree`
- *    on a chunk geometry changes no pick result (§2.4a.10);
+ *  - `Mesh.prototype.raycast` is NOT touched (R6), and a collision tick on a
+ *    chunk builds no tree and changes no pick result (§2.4a.10, plan-781);
  *  - keep meshes answer through the override too, with the AUTHORED index order.
  */
 import { describe, it, expect, beforeAll } from 'vitest';
 import { Mesh, Raycaster, Scene, Vector3, type BufferAttribute, type Intersection, type Object3D } from 'three';
-import { MeshBVH, acceleratedRaycast } from 'three-mesh-bvh';
+import { acceleratedRaycast } from 'three-mesh-bvh';
+import { RVCollisionManager } from '../src/core/engine/rv-collision-manager';
 import '../src/core/engine/rv-scene-loader';
 import { registerCapabilities, registerComponentSchema } from '../src/core/engine/rv-component-registry';
 import { RVUberMaterial } from '../src/core/engine/rv-uber-material';
@@ -69,10 +70,11 @@ describe('.raycast instance override (plan-756 F4)', () => {
   let chunkMesh: Mesh;
   let keepMesh: Mesh;
   let placed: Awaited<ReturnType<typeof bakeAndPlace>>;
+  let bakeRegistry: BakeRegistry;
 
   beforeAll(async () => {
     scene = new Scene();
-    const bakeRegistry = new BakeRegistry();
+    bakeRegistry = new BakeRegistry();
     placed = await bakeAndPlace(makeAsset(), bakeRegistry, { uber });
     scene.add(placed.template);
     scene.updateMatrixWorld(true);
@@ -179,25 +181,30 @@ describe('.raycast instance override (plan-756 F4)', () => {
     expect([...(keepMesh.geometry.getIndex()!.array as Uint32Array)]).toEqual([...before]);
   });
 
-  it('a collision boundsTree on a chunk geometry changes no pick result (§2.4a.10)', () => {
+  it('a collision tick on the chunk builds no tree and changes no pick result (plan-781, §2.4a.10)', () => {
     const raycaster = new Raycaster(new Vector3(0, 0, 10), new Vector3(0, 0, -1));
     const before: Intersection<Object3D>[] = [];
     chunkMesh.raycast(raycaster, before);
     const indexBefore = (chunkMesh.geometry.getIndex()!.array as Uint32Array).slice();
 
-    // What `RVCollisionManager._ensureBoundsTree` does for a chunk geometry: an
-    // INDIRECT tree, which leaves the index alone.
-    const geometry = chunkMesh.geometry as unknown as { boundsTree?: unknown };
-    geometry.boundsTree = new MeshBVH(chunkMesh.geometry, { indirect: true });
-    try {
-      expect([...(chunkMesh.geometry.getIndex()!.array as Uint32Array)]).toEqual([...indexBefore]);
-      const after: Intersection<Object3D>[] = [];
-      chunkMesh.raycast(raycaster, after);
-      expect(after).toHaveLength(before.length);
-      expect(after[0].faceIndex).toBe(before[0].faceIndex);
-      expect(after[0].distance).toBeCloseTo(before[0].distance, 10);
-    } finally {
-      delete geometry.boundsTree;
-    }
+    // Collision READS the pick structure (rule 15 as ruled 2026-11-05): a body
+    // over a chunk segment range, a full tick with motion — and no tree, no
+    // index rewrite on the shared geometry.
+    const manager = new RVCollisionManager();
+    manager.setGeometrySource(bakeRegistry);
+    manager.register(placed.node('Part'), 'Machine');
+    manager.register(placed.node('Far'), 'Robot');
+    manager.update(1 / 60);
+    placed.node('Far').position.z += 0.5;
+    manager.update(1 / 60);
+    expect(manager.bodies.every((b) => b.parts.length > 0)).toBe(true);
+    expect((chunkMesh.geometry as unknown as { boundsTree?: unknown }).boundsTree).toBeUndefined();
+    expect([...(chunkMesh.geometry.getIndex()!.array as Uint32Array)]).toEqual([...indexBefore]);
+    const after: Intersection<Object3D>[] = [];
+    chunkMesh.raycast(raycaster, after);
+    expect(after).toHaveLength(before.length);
+    expect(after[0].faceIndex).toBe(before[0].faceIndex);
+    expect(after[0].distance).toBeCloseTo(before[0].distance, 10);
+    manager.dispose();
   });
 });

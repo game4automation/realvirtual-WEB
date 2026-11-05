@@ -675,8 +675,8 @@ describe('plan-774 F6 — descend holds the window; a saved child is re-baked on
     // Open the parent: two placed assets, two bakes.
     await reloadAuthoring(booted, 'machine.glb', parentBytes, { keepBaked: false });
     const cache = v.placements.modelCache;
-    const cellKey = v.placements.keyOf({ catalogId: `project:${CELL_PATH}` });
-    const otherKey = v.placements.keyOf({ catalogId: `project:${OTHER_PATH}` });
+    const cellKey = v.placements.keyOf({ catalogId: `project:${CELL_PATH}` }, null);
+    const otherKey = v.placements.keyOf({ catalogId: `project:${OTHER_PATH}` }, null);
     const cell0 = cache.peekBaked(cellKey)!;
     const other0 = cache.peekBaked(otherKey)!;
     expect(cell0, 'cell placed').toBeDefined();

@@ -20,6 +20,7 @@ import { WebLabelManager } from '../src/core/engine/rv-web-label-manager';
 import { WEB_LABEL_TYPE } from '../src/core/engine/rv-web-label';
 import { exportAssetGlb } from '../src/core/editor/rv-asset-glb-export';
 import { isSensorRuntimeVizName } from '../src/core/engine/rv-sensor-viz-names';
+import { stripPersistedSensorViz } from '../src/core/engine/rv-prepare-and-bake';
 import { gltfLoader } from '../src/core/engine/rv-glb-parse';
 import { parseGlbChunks } from '../src/core/persistence/rv-glb-chunks';
 
@@ -174,12 +175,15 @@ describe('demo station credit plate (Phase 5)', () => {
     plate.geometry.computeBoundingBox();
     expect(plate.geometry.boundingBox!.max.x - plate.geometry.boundingBox!.min.x).toBeCloseTo(0.30, 6);
 
+    // A load migrates the legacy viz (loadGLB runs the strip on every path); the
+    // export itself prunes by marker only.
+    stripPersistedSensorViz(scene);
     const saved = await exportAssetGlb(scene, 'LaserWeldingAssemblyStation');
     const j1 = json(saved);
     expect((j1.nodes ?? []).map((n) => n.name)).not.toContain('__rvWebLabelPlate');
     // The shipped file still carries sensor ray tubes saved before the export
-    // pruned `_sensorRay` (`Sensor_Lift01_sensorRay_1_1…`). A save drops them
-    // now, so they are not part of the expected geometry.
+    // pruned `_sensorRay` (`Sensor_Lift01_sensorRay_1_1…`). The load migration
+    // drops them, so they are not part of the expected geometry.
     const nodes0 = j0.nodes ?? [];
     const used = new Set(nodes0.filter((n) => n.mesh !== undefined && !isSensorRuntimeVizName(n.name ?? '')).map((n) => n.mesh));
     const vizOnly = new Set(nodes0.filter((n) => n.mesh !== undefined && isSensorRuntimeVizName(n.name ?? '') && !used.has(n.mesh)).map((n) => n.mesh));

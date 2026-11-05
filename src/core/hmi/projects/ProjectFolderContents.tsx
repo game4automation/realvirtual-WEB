@@ -37,7 +37,7 @@ import {
 import { PROJECTS_CARD_SIZE_KEY } from '../rv-storage-keys';
 import { DocumentInfoTooltip } from './DocumentInfoTooltip';
 import { DocumentModeChip } from './DocumentModeChip';
-import { LABEL_CHIP_ON_PREVIEW_BG } from '../shared-sx';
+import { LABEL_CHIP_ON_PREVIEW_SX } from '../shared-sx';
 import type { DocumentInfo } from '../../project/rv-document-info';
 import type { DocumentClassification } from '../../project/rv-document-classification';
 
@@ -420,7 +420,7 @@ export function ProjectFolderContents({
                       mode={card.openMode}
                       modeLabel={modeLabel}
                       testId={`card-mode-${card.key}`}
-                      sx={{ bgcolor: LABEL_CHIP_ON_PREVIEW_BG }}
+                      sx={LABEL_CHIP_ON_PREVIEW_SX}
                     />
                   ) : undefined}
                 />
@@ -432,7 +432,7 @@ export function ProjectFolderContents({
                     sx={{
                       mt: 0.5, width: 'fit-content', maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis',
                       pointerEvents: 'none',
-                      bgcolor: LABEL_CHIP_ON_PREVIEW_BG,
+                      ...LABEL_CHIP_ON_PREVIEW_SX,
                     }}
                   />
                 )}

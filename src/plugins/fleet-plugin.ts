@@ -290,9 +290,13 @@ export class FleetPlugin implements RVViewerPlugin {
       }
       if (viewer.waitRegistry) {
         const runtime = this.runtime;
+        // The wrappers carry what the sources declare (plan-2241): endpoint domain and vocabulary.
+        // Reservation owners are vehicle ids; per-edge flags (`ownerMUs`) ride on the edges themselves.
         this.waitSourcesOff.push(
-          viewer.waitRegistry.addSource({ id: `${this.id}:fleet`, edges: now => runtime.waitWatch.edges(now) }),
-          viewer.waitRegistry.addSource({ id: `${this.id}:reservations`, edges: now => runtime.dispatcher.reservations.edges(now) }),
+          viewer.waitRegistry.addSource({ id: `${this.id}:fleet`, vehicles: runtime.waitWatch.vehicles,
+            kinds: () => runtime.waitWatch.kinds(), edges: now => runtime.waitWatch.edges(now) }),
+          viewer.waitRegistry.addSource({ id: `${this.id}:reservations`, vehicles: true,
+            edges: now => runtime.dispatcher.reservations.edges(now) }),
         );
       }
       this.runner = runner;

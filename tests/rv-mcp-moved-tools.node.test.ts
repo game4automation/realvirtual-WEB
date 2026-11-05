@@ -89,7 +89,7 @@ describe('plan-2007 moved tools', () => {
     expect(movedToolOf('web_missing', [synthetic])).toBeUndefined();
     expect(JSON.parse(movedToolAnswer(synthetic))).toEqual({
       error: 'MOVED', message: 'web_old moved to command test.inspect, test.list — use web_query',
-      movedTo: ['test.inspect', 'test.list'], use: 'web_query', example: synthetic.example, removedAfter: '6.7.0',
+      movedTo: ['test.inspect', 'test.list'], use: 'web_query', example: synthetic.example, removedAfter: '6.8.0',
     });
   });
 

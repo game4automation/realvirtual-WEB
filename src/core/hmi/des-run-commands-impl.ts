@@ -5,7 +5,7 @@ import { runLeaseBlocker } from './rv-run-lease';
 import { CommandError, type CommandContext, type CommandEnabled, type CommandImpl } from './rv-command-registry';
 import { boolArg, parseDesTimeArg, stringList } from './command-arg-validation';
 import { USER_PAUSE_REASON } from '../engine/rv-constants';
-import { applyDesMasterSeed, ensureDesManagerNode, persistDesEndTime, persistDesStatReset } from '../material-flow/des-manager-node';
+import { applyDesClockSettings, applyDesMasterSeed } from '../material-flow/des-manager-node';
 import { getDesRunSettings, updateDesRunSettings, type SeedMode } from './des-run-settings-store';
 import { getDesStatsHiddenKinds, setDesStatsHiddenKinds, setDesStatsWindowOpen } from '../../plugins/sim-controller/des-stats-window-store';
 
@@ -50,19 +50,17 @@ export const desFastForward: CommandImpl<{ on?: boolean; untilSimTime?: string }
 
 export const desSetEnd: CommandImpl<{ end?: string; statReset?: string }> = {
   enabled: (ctx) => runLeaseBlocker() ?? desEnabled(ctx),
-  run: (ctx, args) => {
+  run: async (ctx, args) => {
     const end = args?.end === undefined ? undefined : parseDesTimeArg('end', args.end, { allowInf: true });
     const statReset = args?.statReset === undefined ? undefined : parseDesTimeArg('statReset', args.statReset);
     const ctl = control(ctx);
     if (end !== undefined && !ctl.setEndTime) throw new CommandError('DES end time is not available');
     if (statReset !== undefined && !ctl.setStatResetTime) throw new CommandError('DES statistics reset is not available');
-    if (end !== undefined) {
-      ctl.setEndTime!(end);
-      persistDesEndTime(ensureDesManagerNode(ctx.viewer), end);
-    }
-    if (statReset !== undefined) {
-      ctl.setStatResetTime!(statReset);
-      persistDesStatReset(ensureDesManagerNode(ctx.viewer), statReset);
+    // Base settings on the scene's DESManager, written as ONE unit (one transaction, read back),
+    // applied live only after: a failure changes nothing.
+    if (end !== undefined || statReset !== undefined) {
+      const r = await applyDesClockSettings(ctx.viewer, ctl, { end, statReset });
+      if (!r.ok) throw new CommandError(r.reason, { code: r.code });
     }
     return { endTime: ctl.endTime, statResetTime: ctl.statResetTime };
   },

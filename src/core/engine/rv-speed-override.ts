@@ -17,11 +17,12 @@
  */
 
 let _factor = 1;
+let neutralDepth = 0;
 const listeners = new Set<() => void>();
 
 /** Current master speed factor (1 = normal). */
 export function getDriveSpeedOverride(): number {
-  return _factor;
+  return neutralDepth > 0 ? 1 : _factor;
 }
 
 /** Set the master speed factor. Clamped to [0, 100]. */
@@ -39,7 +40,21 @@ export function setDriveSpeedOverride(factor: number): number {
  * current simulation speed. Hot path: one multiplication, no allocation.
  */
 export function scaleSimDt(dt: number): number {
-  return dt * _factor;
+  return neutralDepth > 0 ? dt : dt * _factor;
+}
+
+export function isSpeedOverrideNeutral(): boolean { return neutralDepth > 0; }
+
+/** Synchronous DES scope; nested calls and exceptions preserve the outer scope. */
+export function withSpeedOverrideNeutral<T>(fn: () => T): T {
+  neutralDepth++;
+  try {
+    const result = fn();
+    if (result != null && typeof (result as { then?: unknown }).then === 'function') {
+      throw new TypeError('withSpeedOverrideNeutral requires a synchronous callback');
+    }
+    return result;
+  } finally { neutralDepth--; }
 }
 
 /** Subscribe to override changes (for reactive UI). Returns an unsubscribe fn. */

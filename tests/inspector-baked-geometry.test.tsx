@@ -181,11 +181,18 @@ describe('the desktop inspector mounts for a path-less selection (plan-505 F7)',
   // a chunk mesh has no path, and gating on `selectedNodePath` alone made the
   // "Baked geometry" section unreachable on desktop.
   it('gates <PropertyInspector> on the selected node, not only on its path', () => {
+    // The gate is a primitive selector slice (`inspectorWanted`) so a selection
+    // change does not re-render the whole shell; it must still accept a
+    // path-less node, and the mount must still use it.
+    const selector = topBarSource.slice(
+      topBarSource.indexOf('const inspectorWanted'),
+      topBarSource.indexOf(');', topBarSource.indexOf('const inspectorWanted')),
+    );
+    expect(selector).toMatch(/s\.showInspector && \(s\.selectedNodePath !== null \|\| s\.selectedNode !== null\)/);
     const gate = topBarSource.slice(
-      topBarSource.indexOf('pluginState.showInspector'),
+      topBarSource.indexOf('!settingsOpen && inspectorWanted'),
       topBarSource.indexOf('<PropertyInspector'),
     );
-    expect(gate).toContain('pluginState.selectedNode)');
-    expect(gate).toMatch(/pluginState\.selectedNodePath \|\| pluginState\.selectedNode\b/);
+    expect(gate).toContain('inspectorWanted');
   });
 });

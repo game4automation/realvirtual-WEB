@@ -204,6 +204,16 @@ describe('bridges as id / pair ops', () => {
     ]);
     expect(getConnectBridges().mappings).toEqual([{ enabled: true, sourceSignal: 'A', destSignal: 'C' }]);
   });
+
+  it('plan-2227: a mapping carries its conversion options; an option change upserts the same pair', async () => {
+    const bit = { enabled: true, sourceSignal: 'RobotReady', destSignal: 'Rob_Status', coercion: 'Strict' as const, mode: 'BitToWord' as const, bit: 3, width: 'Byte' as const };
+    await connect({ mappings: [bit, { enabled: true, sourceSignal: 'A', destSignal: 'B' }] });
+    await putMappings([{ ...bit, bit: 4, invert: true }, { enabled: true, sourceSignal: 'A', destSignal: 'B' }]);
+    expect(gw.opsCalls().at(-1)!.ops).toEqual([
+      { op: 'mapping.upsert', mapping: { ...bit, bit: 4, invert: true } },
+    ]);
+    expect(getConnectBridges().mappings?.[0]).toEqual({ ...bit, bit: 4, invert: true });
+  });
 });
 
 describe('discovery contract (plan-2025 F8)', () => {

@@ -24,6 +24,24 @@ export function formatDesDuration(totalSeconds: number): string {
 }
 
 /**
+ * Seconds as the strict `DD:HH:MM:SS(.ffffff)` argument of the des.* commands. The WHOLE duration is
+ * rounded to microseconds first, so a fraction carries into seconds, minutes, hours and days
+ * (0.9999999 → 00:00:00:01). Infinite → `inf`, 0 → `00:00:00:00`. A positive value below 1 µs and a
+ * negative value give null: they must never be encoded as 0, which means "indefinite" for an end.
+ */
+export function formatDesTimeArg(seconds: number): string | null {
+  if (seconds === Infinity) return 'inf';
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  const micros = Math.round(seconds * 1e6);
+  if (seconds > 0 && micros === 0) return null;
+  const whole = Math.floor(micros / 1e6);
+  const frac = micros - whole * 1e6;
+  const p = (n: number): string => String(n).padStart(2, '0');
+  const sec = p(whole % 60) + (frac > 0 ? `.${String(frac).padStart(6, '0').replace(/0+$/, '')}` : '');
+  return `${p(Math.floor(whole / 86400))}:${p(Math.floor((whole % 86400) / 3600))}:${p(Math.floor((whole % 3600) / 60))}:${sec}`;
+}
+
+/**
  * Parse a DD:HH:MM:SS duration into seconds. Accepts 1–4 colon-separated fields
  * (SS, MM:SS, HH:MM:SS, DD:HH:MM:SS) so partial entry is forgiving. Returns null
  * for an empty or non-numeric value (the caller then leaves the value unchanged).

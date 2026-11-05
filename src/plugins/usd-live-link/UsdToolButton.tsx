@@ -53,7 +53,7 @@ export function UsdToolButton({ viewer }: UISlotProps) {
 
   return (
     <>
-      <Tooltip title={`USD — export, import, sync to Isaac Sim${live ? ' (live)' : ''}`} placement="right">
+      <Tooltip title={`USD — export, import, record animation, sync to Isaac Sim${live ? ' (live)' : ''}`} placement="right">
         <IconButton
           size="medium"
           color={open ? 'primary' : 'inherit'}

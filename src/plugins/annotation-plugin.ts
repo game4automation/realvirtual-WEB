@@ -10,9 +10,11 @@ import { getLocalStorage, readLocalStorage } from '../core/rv-safe-storage';
  * Annotations persist in localStorage for single-user sessions and sync
  * across multiuser sessions via the relay server.
  *
- * The plugin manages its own Raycaster for world-hit placement (not using
- * RaycastManager which only returns RV-annotated nodes). Selection of
- * annotation pins uses a separate raycast against layer 6 (ANNOTATION).
+ * World-hit placement goes through the shared pick pipeline
+ * (`RaycastManager.raycastSurface`), so hidden nodes, transparent chunks and
+ * occlusion behave as for hover and selection. Selection of annotation pins
+ * uses a separate raycast against the plugin's own pin sprites on layer 6
+ * (ANNOTATION) — overlay helpers, not render content.
  *
  * Phase 1: Single-user annotation CRUD + rendering + localStorage
  * Phase 2: Multiuser sync (annotation_add/update/remove messages)
@@ -20,7 +22,6 @@ import { getLocalStorage, readLocalStorage } from '../core/rv-safe-storage';
  */
 
 import { Raycaster, Vector2, Vector3 } from 'three';
-import type { Object3D } from 'three';
 import type { RVViewerPlugin } from '../core/rv-plugin';
 import type { RVViewer } from '../core/rv-viewer';
 import type { LoadResult } from '../core/engine/rv-scene-loader';
@@ -28,6 +29,7 @@ import type { UISlotEntry } from '../core/rv-ui-plugin';
 import type { Annotation, AnnotationPluginAPI } from '../core/types/plugin-types';
 import { AnnotationRenderer, ANNOTATION_LAYER } from './rv-annotation-renderer';
 import { pointerToNDC } from '../core/engine/rv-pointer-utils';
+import type { SurfaceHit } from '../core/engine/rv-raycast-manager';
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -88,7 +90,9 @@ export class AnnotationPlugin implements RVViewerPlugin, AnnotationPluginAPI {
 
   // ── Three.js ──
   private _renderer: AnnotationRenderer | null = null;
-  private _worldRaycaster = new Raycaster();
+  private readonly _surf: SurfaceHit = { point: new Vector3(), distance: 0, blocked: false, path: null, normal: new Vector3() };
+  private readonly _worldHit: { point: Vector3; normal: Vector3 | null; nodePath: string | null } =
+    { point: this._surf.point, normal: null, nodePath: null };
   private _annotationRaycaster = new Raycaster();
   private _pointer = new Vector2();
   private _viewer: RVViewer | null = null;
@@ -445,14 +449,9 @@ export class AnnotationPlugin implements RVViewerPlugin, AnnotationPluginAPI {
           ? [hit.normal.x, hit.normal.y, hit.normal.z]
           : [0, 1, 0];
 
-        // Check if hit mesh belongs to an RV node
-        let nodePath: string | undefined;
-        if (this._viewer?.registry) {
-          const node = this._findRVNode(hit.object);
-          if (node) {
-            nodePath = this._viewer.registry.getPathForNode(node) ?? undefined;
-          }
-        }
+        // The pick pipeline resolved the node the pin belongs to (null on an
+        // opaque housing without a pick owner).
+        const nodePath = hit.nodePath ?? undefined;
 
         this.addAnnotation(pos, normal, 'New annotation', DEFAULT_COLOR, nodePath);
       }
@@ -471,28 +470,16 @@ export class AnnotationPlugin implements RVViewerPlugin, AnnotationPluginAPI {
     // Placeholder for ghost pin preview (future enhancement)
   }
 
-  private _worldRaycast(e: PointerEvent): { point: Vector3; normal: Vector3 | null; object: Object3D } | null {
-    if (!this._viewer) return null;
-
-    const canvas = this._viewer.renderer.domElement;
-    pointerToNDC(e.clientX, e.clientY, canvas, this._pointer);
-
-    this._worldRaycaster.setFromCamera(this._pointer, this._viewer.camera);
-    // Cast against all visible meshes on layer 0
-    this._worldRaycaster.layers.set(0);
-    const intersects = this._worldRaycaster.intersectObjects(this._viewer.scene.children, true);
-
-    for (const hit of intersects) {
-      if (!hit.object.visible) continue;
-      // Skip the annotation group itself
-      if (this._isAnnotationObject(hit.object)) continue;
-      return {
-        point: hit.point,
-        normal: hit.face?.normal?.clone().transformDirection(hit.object.matrixWorld) ?? null,
-        object: hit.object,
-      };
-    }
-    return null;
+  /**
+   * The surface under the pointer via the one pick pipeline (rules 15/17),
+   * without the mode's allow filter. Returns the reused `_worldHit`.
+   */
+  private _worldRaycast(e: { clientX: number; clientY: number }): { point: Vector3; normal: Vector3 | null; nodePath: string | null } | null {
+    const rm = this._viewer?.raycastManager;
+    if (!rm || !rm.raycastSurface(e.clientX, e.clientY, this._surf, true)) return null;
+    this._worldHit.normal = this._surf.normal!.lengthSq() > 0 ? this._surf.normal! : null;
+    this._worldHit.nodePath = this._surf.path;
+    return this._worldHit;
   }
 
   private _annotationRaycast(e: PointerEvent): string | null {
@@ -510,24 +497,6 @@ export class AnnotationPlugin implements RVViewerPlugin, AnnotationPluginAPI {
     for (const hit of intersects) {
       const id = this._renderer.getAnnotationIdFromObject(hit.object);
       if (id) return id;
-    }
-    return null;
-  }
-
-  private _isAnnotationObject(obj: Object3D): boolean {
-    let current: Object3D | null = obj;
-    while (current) {
-      if (current === this._renderer?.group) return true;
-      current = current.parent;
-    }
-    return false;
-  }
-
-  private _findRVNode(obj: Object3D): Object3D | null {
-    let current: Object3D | null = obj;
-    while (current) {
-      if (current.userData?.['rv_type']) return current;
-      current = current.parent;
     }
     return null;
   }

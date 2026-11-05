@@ -36,4 +36,27 @@ export function ensureWallCommandsRegistered(registry: CommandRegistry = command
     };
     registry.register(descriptor);
   }
+  if (!registry.get(WALL_FILL_COMMAND)) {
+    // plan-2233 F6: open descriptor, commercial implementation (tier-boundary 6); the
+    // community stub has no impl, so the command answers `unavailable`.
+    registry.register({
+      id: WALL_FILL_COMMAND, label: 'Fill from body', undoLabel: 'Fill from body', readOnly: false,
+      macro: true, scope: 'none', available: true, unavailableReason: WALL_FILL_UNAVAILABLE,
+      argsSchema: {
+        node: 'string', pose: 'string', frame: 'string', select: 'string', grab: 'string',
+        nav: 'string', joyX: 'string', joyY: 'string', clearMissing: 'boolean',
+      },
+      impl: () => (import('@rv-private/display-wall/wall-fill-commands') as Promise<WallFillModule>)
+        .then(m => m.impls?.[WALL_FILL_COMMAND] ?? null),
+    } as CommandDescriptor<never, unknown>);
+  }
+}
+
+/** `wall.fillFromBody` — binds the tracking slots of a WallViewport/WallFlystick in one undo step. */
+export const WALL_FILL_COMMAND = 'wall.fillFromBody';
+export const WALL_FILL_UNAVAILABLE = 'Display wall tracking is part of realvirtual Professional';
+
+/** Shape of the (private or stub) implementation module. */
+export interface WallFillModule {
+  readonly impls: Readonly<Record<string, CommandImpl<never, unknown> | undefined>>;
 }

@@ -35,7 +35,9 @@
  *   RV_TEST_LOCK_DIR                  IGNORED since plan-606 (the old file lock's directory)
  *
  * CLI:
- *   node scripts/test-lock.mjs status    who holds the lock (exit 0 free, 1 held, 2 unknown holder)
+ *   node scripts/test-lock.mjs status    who holds the lock (exit 0 free, 1 held, 2 unknown holder);
+ *                                        also lists runs `WAITING for memory` (plan-2247, no port
+ *                                        held, exit code unchanged — see scripts/test-memory.mjs)
  *   node scripts/test-lock.mjs break [--port N] [--dry-run] [--min-age-minutes 30] [--idle-seconds 60]
  *                                        ends a HUNG test holder — only an idle test process older
  *                                        than the minimum age, with its test ancestors (Windows;
@@ -46,6 +48,7 @@ import http from 'node:http';
 import net from 'node:net';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { formatWaiting, listWaiting } from './test-memory.mjs';
 
 export const LOCK_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 47177;
@@ -461,6 +464,9 @@ async function statusCli() {
       exitCode = 2;
     }
   }
+  // plan-2247: runs waiting for free memory hold no port, so they are read from the wait
+  // directory. They never change the exit code (0 free, 1 held, 2 unknown).
+  for (const entry of listWaiting()) process.stdout.write(`${formatWaiting(entry)}\n`);
   return exitCode;
 }
 

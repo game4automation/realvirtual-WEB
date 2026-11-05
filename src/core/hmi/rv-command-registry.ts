@@ -60,7 +60,7 @@ export type CommandEnabled = true | { readonly reason: string; readonly details?
 export type CommandScope = 'editor' | 'none';
 
 /** Types a command argument may have (parity gate: branch transformations are checked against these). */
-export type CommandArgType = 'string' | 'number' | 'boolean' | 'string[]' | 'number[]';
+export type CommandArgType = 'string' | 'number' | 'boolean' | 'string[]' | 'number[]' | 'object[]';
 
 export interface CommandContext {
   /** Cooperative cancellation supplied by the caller. */
@@ -195,10 +195,10 @@ export interface ExecutedEvent {
 /**
  * A failure that happens INSIDE `run()` after `enabled()` said yes (a
  * verification that did not land, a refused op). Thrown by implementations;
- * `execute` turns it into `{ok:false, kind:'threw', reason, details}`.
+ * `execute` turns it into `{ok:false, kind:'threw' (or its kind), reason, details}`.
  */
 export class CommandError extends Error {
-  constructor(message: string, readonly details?: Readonly<Record<string, unknown>>) {
+  constructor(message: string, readonly details?: Readonly<Record<string, unknown>>, readonly kind?: ExecuteFailureKind) {
     super(message);
     this.name = 'CommandError';
   }
@@ -233,6 +233,8 @@ export class CommandRegistry {
   private readonly _impls = new Map<string, AnyImpl | null>();
   private readonly _loading = new Map<string, Promise<AnyImpl | null>>();
   private readonly _executed = new Set<(e: ExecutedEvent) => void>();
+  /** plan-2237: called with the id when a dispatch begins (recording seam). */
+  dispatchHook?: ((id: string) => void) | null;
   private readonly _listeners = new Set<() => void>();
   private _gen = 0;
   private _version = 0;
@@ -314,6 +316,7 @@ export class CommandRegistry {
   }
 
   async execute<R = unknown>(id: string, args: unknown, opts: ExecuteOptions): Promise<ExecuteResult<R>> {
+    try { this.dispatchHook?.(id); } catch { /**/ }
     const desc = this.get(id);
     const buttonKey = opts.buttonKey ?? this.buttonKeyOf(id, args);
     const done = (result: ExecuteResult): ExecuteResult<R> => {
@@ -365,7 +368,7 @@ export class CommandRegistry {
     } catch (e) {
       const details = e instanceof CommandError ? e.details : undefined;
       return done({
-        ok: false, kind: 'threw', reason: e instanceof Error ? e.message : String(e),
+        ok: false, kind: (e instanceof CommandError && e.kind) || 'threw', reason: e instanceof Error ? e.message : String(e),
         ...(details ? { details } : {}),
       });
     }

@@ -25,6 +25,7 @@ import { unwrapGltfRoot } from './rv-gltf-unwrap';
 import { debug } from './rv-debug';
 import { parseGlbCollectingResources } from './rv-binary-resources';
 import { RV_ORIG_NAME_KEY } from './rv-authored-keys';
+import { stripPersistedSensorViz } from './rv-sensor-viz-names';
 import { getDecodeIdentity, linkDecodeIdentity, type FileIdentity } from './rv-decode-identity';
 
 // ─── Singleton loader ────────────────────────────────────────────────────
@@ -297,6 +298,7 @@ export async function parseGlbSubtreeWithMeta(
   const gltf = await parseGlbCollectingResources(bytes, documentId, gltfLoader);
   const parser = (gltf as unknown as { parser?: GltfParserLike }).parser;
   const renamedNodes = detectRenamedNodes(parser);
+  stripPersistedSensorViz(gltf.scene as Group); // legacy sensor viz, as loadGLB does
   const gltfNodeIndices = collectGltfNodeIndices(parser);
   const gltfNodeNames = collectGltfNodeNames(parser);
   const identity = getDecodeIdentity(gltf.scene as Group);

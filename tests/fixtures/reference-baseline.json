@@ -1384,8 +1384,8 @@
    "entries": []
   },
   "public:public/library/PalletHandling/CartonBox.glb": {
-   "bytes": 15598364,
-   "jsonSha1": "7cd801a64ba72d01",
+   "bytes": 244524,
+   "jsonSha1": "c40b1b2475cb0011",
    "nodes": 2,
    "reachable": 2,
    "seed": {
@@ -1753,8 +1753,8 @@
    "entries": []
   },
   "public:public/library/PalletHandling/EuropalletLoaded.glb": {
-   "bytes": 17361652,
-   "jsonSha1": "3ab9dd8e5e58a848",
+   "bytes": 2007816,
+   "jsonSha1": "2fd1d6bcfa7beba0",
    "nodes": 11,
    "reachable": 11,
    "seed": {

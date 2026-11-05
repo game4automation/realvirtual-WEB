@@ -21,6 +21,14 @@ export function libraryNodeOf(projectId: string): LibraryProjectNode | null {
   return getLibraryProjectLoader()?.getNode(projectId) ?? null;
 }
 
+/** The backend holding the files (thumbnails …) of a library project's entry; null = not a ready library entry. */
+export function libraryBackendOf(entry: { libraryOrigin?: { providerId: string; sourceId: string } }): ProjectBackend | null {
+  const origin = entry.libraryOrigin;
+  if (origin?.providerId !== 'library-projects') return null;
+  const state = libraryNodeOf(origin.sourceId)?.state;
+  return state?.kind === 'ready' ? state.backend ?? null : null;
+}
+
 export function libraryLabelOf(projectId: string, node: LibraryProjectNode | null = libraryNodeOf(projectId)): string {
   return node?.label || projectId;
 }

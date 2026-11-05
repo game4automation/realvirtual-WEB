@@ -195,7 +195,7 @@ describe('plan-450 §9.3 — rename is inserted after the last primary action', 
     // `actions` hid the whole block, which would have hidden the new verb.
     render(<ProjectsDetailPane title="Belt.glb" onRename={() => {}} />);
     expect(actionLabels()).toEqual(['Rename']);
-    expect(screen.getByText('Actions')).toBeTruthy();
+    expect(screen.getByRole('group', { name: 'Actions' })).toBeTruthy();
   });
 
   it('never mutates the caller\'s array', () => {
@@ -236,7 +236,7 @@ describe('plan-450 §9.1 — the pane offers Rename on exactly one condition', (
 
   it('offers no Actions section at all when there is nothing to offer', () => {
     render(<ProjectsDetailPane title="Sample.glb" />);
-    expect(screen.queryByText('Actions')).toBeNull();
+    expect(screen.queryByRole('group', { name: 'Actions' })).toBeNull();
   });
 });
 

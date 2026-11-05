@@ -302,6 +302,8 @@ describe.skipIf(!HAS_PRIVATE)('real catalog against the real manifest (drift, pl
     // Out of beta since 2026-11-03 (Thomas): the planner and guided maintenance are stable.
     expect(rows['layout-planner']).toMatchObject({ edition: 'community', status: 'stable' });
     expect(rows['guided-maintenance']).toMatchObject({ edition: 'commercial', status: 'stable' });
+    // plan-767: the ray-traced render mode is commercial beta (2026-11-04).
+    expect(rows['raytraced-render']).toMatchObject({ edition: 'commercial', status: 'beta' });
     expect(rows['internal-tools']).toBeUndefined();
   });
 

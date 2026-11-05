@@ -222,6 +222,12 @@ export class RVZone implements RVComponent {
   active = false;
   /** Detect result (false while inactive or without the Detect effect). */
   occupied = false;
+  private readonly occupiedListeners = new Set<(occupied: boolean, zone: RVZone) => void>();
+
+  addOccupiedListener(fn: (occupied: boolean, zone: RVZone) => void): () => void {
+    this.occupiedListeners.add(fn);
+    return () => { this.occupiedListeners.delete(fn); };
+  }
   /** MUs this zone holds (reused array — never reassigned). */
   readonly held: RVMovingUnit[] = [];
 
@@ -686,6 +692,7 @@ export class RVZone implements RVComponent {
     if (occ === this.occupied) return;
     this.occupied = occ;
     slotWrite(this, 'SignalOccupied', this.SignalOccupied, occ, this._writer);
+    for (const fn of this.occupiedListeners) fn(occ, this);
   }
 
   // ─── Lifecycle ──────────────────────────────────────────────────────

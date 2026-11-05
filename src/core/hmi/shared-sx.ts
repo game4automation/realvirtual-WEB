@@ -9,6 +9,7 @@
  */
 
 import type { SxProps, Theme } from '@mui/material';
+import { uiBlur } from './rv-ui-blur';
 
 /**
  * Shared corner radius for all small inline chips (type badges, filter chips,
@@ -36,8 +37,8 @@ export const LABEL_CHIP_SX = {
   whiteSpace: 'nowrap',
 } as const;
 
-/** Backdrop of a label chip painted over a card preview, so it reads on any thumbnail. */
-export const LABEL_CHIP_ON_PREVIEW_BG = 'rgba(0,0,0,0.55)';
+/** Backdrop of a label chip painted over a card preview — light; the blur in {@link LABEL_CHIP_ON_PREVIEW_SX} keeps it readable. */
+export const LABEL_CHIP_ON_PREVIEW_BG = 'rgba(0,0,0,0.3)';
 
 // ─── Design values (plan-510) ───────────────────────────────────────────
 //
@@ -65,6 +66,17 @@ export const INK_LOW = 'rgba(255,255,255,0.5)';
  * (theme.ts), so a Paper takes this as `${PANEL_SURFACE} !important`.
  */
 export const PANEL_SURFACE = 'rgba(15,15,15,0.92)';
+/**
+ * A label chip painted over a card preview (the open mode, Bundled, the detail
+ * pane's mode selector): a light, blurred backdrop and a faint edge, so it reads
+ * on any thumbnail without weighing on it. Spread AFTER {@link LABEL_CHIP_SX}.
+ */
+export const LABEL_CHIP_ON_PREVIEW_SX = {
+  bgcolor: LABEL_CHIP_ON_PREVIEW_BG,
+  borderColor: 'rgba(255,255,255,0.08)',
+  backdropFilter: uiBlur(6),
+  color: INK_MID,
+} as const;
 /** Hairline separators between inspector blocks. */
 export const DIVIDER = 'rgba(255,255,255,0.06)';
 /** Row hover tint. */

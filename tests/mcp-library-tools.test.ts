@@ -35,7 +35,13 @@ import { CommandRegistry } from '../src/core/hmi/rv-command-registry';
 import { EMPTY_TARGET, ensureLibraryCommandsRegistered } from '../src/core/library/library-commands';
 import { ensurePlannerCommandsRegistered } from '../src/plugins/layout-planner/planner-commands';
 import { registerLibrarySourceProvider, type LibrarySource } from '../src/core/library/library-source-registry';
-import { PROJECT_LIBRARY_PROVIDER_ID } from '../src/core/library/project-library-provider';
+import {
+  PROJECT_LIBRARY_PROVIDER_ID,
+  installProjectLibraryProvider,
+  uninstallProjectLibraryProvider,
+  type ProjectStoreLike,
+} from '../src/core/library/project-library-provider';
+import type { RvDocumentEntry } from '../src/core/project/rv-project-types';
 import type { LibraryCatalogEntry } from '../src/core/library/library-types';
 import { McpSceneTools } from '../src/plugins/mcp-bridge/rv-mcp-scene-tools';
 import { clearCache as clearSnapIndex } from '../src/plugins/snap-point/library-snap-index';
@@ -253,7 +259,8 @@ describe('plan-655 F3/F4 — one parts list, snap-attach for project parts', () 
     const all = await queryCommand(viewer, 'library.catalogList') as Array<Record<string, unknown>>;
     expect(all).toEqual(expect.arrayContaining([
       expect.objectContaining({ catalogId: 'pallethandling-cartonbox', source: 'catalog', library: '/lib/catalog.json' }),
-      expect.objectContaining({ catalogId: PART.id, source: 'project', documentId: 'doc-curve-1', path: PART.localPath }),
+      // plan-780 R5 (contract documents-projects 4): a project document is listed by its DOCUMENT id.
+      expect.objectContaining({ catalogId: 'doc-curve-1', source: 'project', documentId: 'doc-curve-1', path: PART.localPath }),
     ]));
     const onlyProject = await queryCommand(viewer, 'library.catalogList', { source: 'project' }) as Array<Record<string, unknown>>;
     expect(onlyProject.map((e) => e.source)).toEqual(['project']);
@@ -280,4 +287,86 @@ describe('plan-655 F3/F4 — one parts list, snap-attach for project parts', () 
       expect((r as { value: { catalogId: string } }).value.catalogId).toBe(PART.id);
     });
   }
+});
+
+// ─── plan-780 R5: layout.place on the REAL project library provider ─────
+
+/** Store + backend double (pattern: project-library-rename-index.test.ts): one project document. */
+function projectWorld(): ProjectStoreLike {
+  const project = {
+    id: 'p1', name: 'Demo', version: 1,
+    documents: [{ id: 'doc-rm8320', path: 'library/Interroll/RM8320.glb', name: 'RM8320' }],
+  } as unknown as RvProject;
+  const backend = {
+    kind: 'browser', writable: true,
+    listDocuments: async (): Promise<RvDocumentEntry[]> =>
+      (project.documents ?? []).map((d) => ({ ...d })) as RvDocumentEntry[],
+    readDocumentUrl: async (path: string) =>
+      (path === 'library/Interroll/RM8320.glb' ? { url: `blob:${path}`, release: () => {} } : null),
+  };
+  return {
+    subscribe: () => () => {},
+    getBackend: () => backend as never,
+    getProject: () => project,
+  };
+}
+
+function placeViewer(placed: LibraryCatalogEntry[]): RVViewer {
+  const planner = {
+    store: { getSnapshot: () => ({ catalogs: new Map() }) },
+    getPlacedRootById: () => null,
+    placeComponent: async (entry: LibraryCatalogEntry) => { placed.push(entry); return `placed-${placed.length}`; },
+    moveById: async () => {},
+  };
+  return {
+    modes: { activeMode: 'planner' },
+    getPlugin: (id: string) => (id === 'layout-planner' ? planner : undefined),
+    selectionManager: { getSnapshot: () => ({ selectedPaths: [] }) },
+  } as unknown as RVViewer;
+}
+
+describe('plan-780 R5 — layout.place on a real ProjectLibraryProvider world', () => {
+  afterEach(() => uninstallProjectLibraryProvider());
+
+  async function setup(): Promise<{ reg: CommandRegistry; viewer: RVViewer; placed: LibraryCatalogEntry[] }> {
+    installProjectLibraryProvider(projectWorld());
+    await new Promise((r) => setTimeout(r, 0));
+    const placed: LibraryCatalogEntry[] = [];
+    const reg = new CommandRegistry();
+    ensurePlannerCommandsRegistered(reg);
+    return { reg, viewer: placeViewer(placed), placed };
+  }
+
+  it('the document id hits the document — no deprecation hint', async () => {
+    const { reg, viewer, placed } = await setup();
+    const r = await reg.execute('layout.place', { catalogId: 'doc-rm8320' }, { origin: 'mcp', viewer });
+    expect(r.ok, JSON.stringify(r)).toBe(true);
+    expect(placed).toHaveLength(1);
+    expect(placed[0].documentId ?? placed[0].id).toBe('doc-rm8320');
+    expect(placed[0].localPath).toBe('library/Interroll/RM8320.glb');
+    const value = (r as { value: Record<string, unknown> }).value;
+    expect(value.catalogId).toBe('doc-rm8320');
+    expect(value.deprecation).toBeUndefined();
+  });
+
+  it('`project:<path>` is a lookup shim — same document, the result names the id and carries the deprecation hint', async () => {
+    const { reg, viewer, placed } = await setup();
+    const r = await reg.execute('layout.place', { catalogId: 'project:library/Interroll/RM8320.glb' }, { origin: 'mcp', viewer });
+    expect(r.ok, JSON.stringify(r)).toBe(true);
+    expect(placed).toHaveLength(1);
+    expect(placed[0].documentId ?? placed[0].id).toBe('doc-rm8320');
+    const value = (r as { value: Record<string, unknown> }).value;
+    expect(value.catalogId).toBe('doc-rm8320');
+    expect(String(value.deprecation)).toMatch(/deprecated.*doc-rm8320/);
+  });
+
+  it('a miss (unknown id, unknown path) is an error and places nothing', async () => {
+    const { reg, viewer, placed } = await setup();
+    for (const catalogId of ['doc-nope', 'project:library/Nope.glb']) {
+      const r = await reg.execute('layout.place', { catalogId }, { origin: 'mcp', viewer });
+      expect(r.ok, JSON.stringify(r)).toBe(false);
+      expect(JSON.stringify(r)).toContain(catalogId);
+    }
+    expect(placed).toHaveLength(0);
+  });
 });

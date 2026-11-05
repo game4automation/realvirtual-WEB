@@ -422,7 +422,7 @@ requestAnimationFrame / renderer.setAnimationLoop tick
        │     energyChainManager.update(dt)   (after the drive stage, so the
        │                                      follower pose of this frame is set)
        │     pipeFlowManager.update(dt)
-       │     collisionManager.update(dt)     ← deliberately LAST: drives,
+       │     collisionManager?.update(dt)    ← deliberately LAST: drives,
        │                                      kinematics, transport and the
        │                                      energy-chain rig of THIS tick are
        │                                      all applied. A hit highlights and

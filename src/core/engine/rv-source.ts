@@ -1244,11 +1244,11 @@ export class RVSource implements RVComponent {
   }
 
   /**
-   * Size `[x, y, z]` (m) a spawned MU of this source will measure
-   * (`measureMuVisualBugSize` of the clone, i.e. its `_bugSize`) — computed from
+   * Canonical size `[x, y, z]` (m) for this source's MUs — computed from
    * the template WITHOUT spawning (plan-638): `Created`, `spawnCount` and
    * `lastSpawnedMU` stay untouched. `null` without template, spawn parent or
-   * measurable geometry. Used only by the DES pose hand-over pre-check.
+   * measurable geometry. DES captures it once per bind for pose pre-checks and
+   * the bug-size preset of both visual and headless MUs.
    */
   templateSize(): [number, number, number] | null {
     if (!this.muTemplate || !this.spawnParent) return null;

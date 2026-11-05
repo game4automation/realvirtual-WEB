@@ -12,7 +12,11 @@
  * they stay reported after the geometry separates. They leave the set only
  * through `ignoreType` (suppresses that role pair for the current run),
  * `reset()` (PLC `ResetCollisions` edge), or `clear()` (model change, which
- * also wipes the ignore set). There is no `armed` state and no modal.
+ * also wipes the ignore set). There is no modal.
+ *
+ * plan-781: the scene is BAKED (`collision-fixture.ts`), and a pair that
+ * already overlaps at its first evaluation is a quiet start baseline — so every
+ * case below lets one tick pass with the bodies apart before it collides them.
  */
 
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
@@ -26,23 +30,28 @@ import {
 
 const DT = 1 / 60;
 
-function setup(gap = 5) {
-  const s = twoBodyScene(gap);
+async function setup(gap = 5) {
+  const s = await twoBodyScene(gap);
   const highlight = new FakeHighlightHost();
   const manager = new RVCollisionManager();
+  manager.setGeometrySource(s.bakeRegistry);
   manager.setHighlightHost(highlight);
   manager.register(s.robot, 'Robot');
   manager.register(s.machine, 'Machine');
+  // One tick apart: the pair is armed (not a start overlap).
+  manager.update(DT);
   return { ...s, manager, highlight };
 }
 
-/** Push the machine into the robot and refresh the world matrices. */
-function collide(s: ReturnType<typeof setup>): void {
-  s.machine.position.x = 0.5;
+type Setup = Awaited<ReturnType<typeof setup>>;
+
+/** Push the machine into the robot (offset in y/z: a real penetration, no flush faces). */
+function collide(s: Setup): void {
+  s.machine.position.set(0.5, 0.2, 0.1);
   s.scene.updateMatrixWorld(true);
 }
 
-function separate(s: ReturnType<typeof setup>): void {
+function separate(s: Setup): void {
   s.machine.position.x = 20;
   s.scene.updateMatrixWorld(true);
 }
@@ -51,16 +60,37 @@ beforeEach(() => __resetCollisionAlertStore());
 afterEach(() => vi.restoreAllMocks());
 
 describe('RVCollisionManager', () => {
-  it('reports nothing while the bodies are apart', () => {
-    const s = setup();
+  it("a Sensor's runtime ray / box under a body is no collision geometry", async () => {
+    // The ray tube reaches 2..3 into the machine at 2.5..3.5; the robot box itself
+    // (-0.5..0.5) is apart. The same mesh under another name does collide.
+    for (const [name, expected] of [['Gripper_sensorRay', 0], ['Gripper_sensorViz', 0], ['Probe', 1]] as const) {
+      __resetCollisionAlertStore();
+      const s = await twoBodyScene(3);
+      const probe = boxMesh({ name, pos: [1.5, 0, 0], size: [1, 0.5, 0.5] });
+      s.robot.add(probe);
+      s.scene.updateMatrixWorld(true);
+      const manager = new RVCollisionManager();
+      manager.setGeometrySource(s.bakeRegistry);
+      manager.setHighlightHost(new FakeHighlightHost());
+      manager.register(s.robot, 'Robot');
+      manager.register(s.machine, 'Machine');
+      manager.update(DT);
+      probe.position.x = 2.5;                 // a real mesh under the body: a keep part
+      manager.update(DT);
+      expect(manager.activePairs, name).toHaveLength(expected);
+    }
+  });
+
+  it('reports nothing while the bodies are apart', async () => {
+    const s = await setup();
     expect(s.manager.update(DT)).toBe(false);
     expect(s.manager.activePairs).toHaveLength(0);
     expect(getCollisionAlertSnapshot().pairs).toHaveLength(0);
     expect(s.highlight.current).toBeNull();
   });
 
-  it('reports a new collision within the very same tick (NFR same-tick)', () => {
-    const s = setup();
+  it('reports a new collision within the very same tick (NFR same-tick)', async () => {
+    const s = await setup();
     s.manager.update(DT);                       // tick N-1: clean
     collide(s);
     const changed = s.manager.update(DT);       // tick N: exactly one tick
@@ -69,8 +99,8 @@ describe('RVCollisionManager', () => {
     expect(s.highlight.current).toEqual(expect.arrayContaining([s.robot, s.machine]));
   });
 
-  it('publishes once and keeps the outline while the pair is latched', () => {
-    const s = setup();
+  it('publishes once and keeps the outline while the pair is latched', async () => {
+    const s = await setup();
     collide(s);
     s.manager.update(DT);
     const v1 = getCollisionAlertSnapshot().version;
@@ -82,8 +112,8 @@ describe('RVCollisionManager', () => {
     expect(s.highlight.current).not.toBeNull();
   });
 
-  it('keeps a latched pair — card and outline — after the overlap ends', () => {
-    const s = setup();
+  it('keeps a latched pair — card and outline — after the overlap ends', async () => {
+    const s = await setup();
     collide(s);
     s.manager.update(DT);
     separate(s);
@@ -93,8 +123,8 @@ describe('RVCollisionManager', () => {
     expect(s.highlight.current).not.toBeNull();
   });
 
-  it('carries key, roles and a since timestamp in the published view', () => {
-    const s = setup();
+  it('carries key, roles and a since timestamp in the published view', async () => {
+    const s = await setup();
     collide(s);
     s.manager.update(DT);
     const [p] = getCollisionAlertSnapshot().pairs;
@@ -104,8 +134,8 @@ describe('RVCollisionManager', () => {
     expect(p.since).toBeGreaterThan(0);
   });
 
-  it('re-detects after reset while the overlap persists', () => {
-    const s = setup();
+  it('re-detects after reset while the overlap persists', async () => {
+    const s = await setup();
     collide(s);
     s.manager.update(DT);
     expect(s.manager.activePairs).toHaveLength(1);
@@ -120,8 +150,8 @@ describe('RVCollisionManager', () => {
     expect(getCollisionAlertSnapshot().pairs).toHaveLength(1);
   });
 
-  it('acknowledge (card OK) drops one pair; still-intersecting pairs return next tick', () => {
-    const s = setup();
+  it('acknowledge (card OK) drops one pair; still-intersecting pairs return next tick', async () => {
+    const s = await setup();
     collide(s);
     s.manager.update(DT);
     const [p] = s.manager.activePairs;
@@ -148,8 +178,8 @@ describe('RVCollisionManager', () => {
     expect(s.manager.activePairs).toHaveLength(0);
   });
 
-  it('ignoreType drops matching latched pairs and suppresses re-detection', () => {
-    const s = setup();
+  it('ignoreType drops matching latched pairs and suppresses re-detection', async () => {
+    const s = await setup();
     collide(s);
     s.manager.update(DT);
     expect(s.manager.activePairs).toHaveLength(1);
@@ -169,8 +199,8 @@ describe('RVCollisionManager', () => {
     expect(s.manager.update(DT)).toBe(false);
   });
 
-  it('ignoreType survives reset() but not clear() (current-run scope)', () => {
-    const s = setup();
+  it('ignoreType survives reset() but not clear() (current-run scope)', async () => {
+    const s = await setup();
     collide(s);
     s.manager.update(DT);
     s.manager.ignoreType('Robot', 'Machine');
@@ -182,8 +212,9 @@ describe('RVCollisionManager', () => {
     expect(s.manager.ignoredTypes.size).toBe(0);
   });
 
-  it('grows the list when a second pair starts intersecting (F8)', () => {
-    const s = setup();
+  it('grows the list when a second pair starts intersecting (F8)', async () => {
+    const s = await setup();
+    // Two more bodies made of real (unbaked) meshes — keep parts.
     const tool = new Object3D();
     tool.name = 'Tool';
     tool.position.set(0, 10, 0);
@@ -191,11 +222,12 @@ describe('RVCollisionManager', () => {
     const part = new Object3D();
     part.name = 'Part';
     part.position.set(20, 10, 0);
-    part.add(boxMesh({ name: 'PartMesh' }));
+    part.add(boxMesh({ name: 'PartMesh', size: [1, 0.6, 0.6] }));
     s.scene.add(tool, part);
     s.manager.register(tool, 'Tool');
     s.manager.register(part, 'Workpiece');
     s.scene.updateMatrixWorld(true);
+    s.manager.update(DT);                         // new pairs armed apart
 
     collide(s);
     s.manager.update(DT);
@@ -209,16 +241,16 @@ describe('RVCollisionManager', () => {
     expect(getCollisionAlertSnapshot().version).toBeGreaterThan(openVersion);
   });
 
-  it('never pairs a body with itself or with an equal role', () => {
-    const s = setup();
+  it('never pairs a body with itself or with an equal role', async () => {
+    const s = await setup();
     s.manager.register(s.machine, 'Robot');   // both Robot now
     collide(s);
     expect(s.manager.update(DT)).toBe(false);
     expect(getCollisionAlertSnapshot().pairs).toHaveLength(0);
   });
 
-  it('re-applies the outline on demand (mode change, F15)', () => {
-    const s = setup();
+  it('re-applies the outline on demand (mode change, F15)', async () => {
+    const s = await setup();
     collide(s);
     s.manager.update(DT);
     const before = s.highlight.calls.length;
@@ -227,8 +259,8 @@ describe('RVCollisionManager', () => {
     expect(s.highlight.current).toEqual(expect.arrayContaining([s.robot, s.machine]));
   });
 
-  it('clears registry, outline and published cards on model change (F12)', () => {
-    const s = setup();
+  it('clears registry, outline and published cards on model change (F12)', async () => {
+    const s = await setup();
     collide(s);
     s.manager.update(DT);
     expect(getCollisionAlertSnapshot().pairs).toHaveLength(1);

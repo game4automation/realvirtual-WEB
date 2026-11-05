@@ -869,11 +869,13 @@ dev server shows every block in every state.
 Components are not ticked by the engine. A component that has to do something
 every frame is driven by a small **viewer-owned manager**, and registers itself
 with it. The live examples are `LampManager` (blink phase), `EnergyChainManager`
-(bone poses) and `RVCollisionManager` (`rv-collision-manager.ts`, plan-394 —
-per-tick AABB + `bvhcast` check between bodies of different `CollisionRole`s;
-it owns the `'collision'` aux-emphasis set and the `CollisionActive` /
+(bone poses) and `RVCollisionManager` (`rv-collision-manager.ts`, plan-394 /
+plan-781 — per-tick check between bodies of different `CollisionRole`s, only
+for pairs whose bodies moved: world boxes, then an exact triangle walk over the
+chunks' pick structure (`rv-collision-narrowphase.ts`), with no structure of its
+own; it owns the `'collision'` aux-emphasis set and the `CollisionActive` /
 `CollisionCount` / `ResetCollisions` signals, and observes spawned MUs through
-`RVTransportManager.muLifecycleHook`):
+`RVTransportManager.muLifecycleHook`; since plan-781 F21 it is the on-demand feature `collision`, so components register with the viewer's eager slot `rv-collision-slot.ts`):
 
 1. Write `rv-<name>-manager.ts` with `register` / `unregister` /
    `update(dt): boolean` / `clear()`. `update` returns whether anything visible
@@ -1034,6 +1036,35 @@ const off = viewer.simulationKernel?.onDesLifecycle((e) => {
 Time-driven plugin work uses `desControl().scheduleCallback(t, fn)` /
 `cancelCallback(h)` — real DES queue events, not persisted in snapshots, dropped on
 every lifecycle event. Event matrix and delivery rules: `doc-lifecycle.md` § 6.5.
+
+### A fleet plant in a few lines: `definePlantPlugin` (plan-559)
+
+A project that runs forklift-style AGVs on the fleet core (orders, dispatch, job execution, charging, status lamps) does not write a plugin lifecycle. It declares the plant and the core owns the rest: `FleetPlugin` binds the run per kernel (DES or continuous), resets it and disposes it.
+
+```typescript
+import { definePlantPlugin, plantPluginExports } from '@rv/core/fleet/define-plant-plugin';
+import { RETRIEVAL_RULES } from '@rv/core/fleet/core/strategies';
+import { DEFAULT_LAMP_MAP } from '@rv/core/fleet/exec/lamp-map';
+
+const definition = definePlantPlugin({
+  apiVersion: 1,
+  id: 'my-plant',                                  // plugin id, removed by this id
+  config: {
+    takts: [{ station: 'A1', intervalSec: 45, startSec: 0 }],  // production takt per pick station
+  },
+  retrieval: RETRIEVAL_RULES['legacy-fifo'],       // where a pallet is taken from
+  lampMap: DEFAULT_LAMP_MAP,                       // vehicle status to lamp nodes
+});
+export default definition;
+export const { registerModelPlugins, unregisterModelPlugins } = plantPluginExports(definition /*, sceneBinder */);
+```
+
+- `definePlantPlugin` is a typed identity: it checks the shape and registers nothing itself. `apiVersion` is `1`; `id` is required.
+- Optional fields: `config` (`takts`, `pauses` for repeating shipping pauses, `lamps` for lamp names), `retrieval` (the retrieval rule), `lampMap` (status to lamp mapping) and `parameters` (the planning window the model declares: `declare`, `adoptDocument`, `onLive`, `onStructuralReset`, `dispose`).
+- `plantPluginExports(definition, binder?)` returns the `registerModelPlugins` / `unregisterModelPlugins` pair that a `scriptRef` project script exports. The optional `FleetSceneBinder` is the project's scene lookup (station nodes, hand-over poses).
+- Vehicle selection and charging strategy are settings of the `Fleet` component (`VehicleSelection`, `Charging`); a project replaces the core strategies through this definition.
+
+The PalletYard example (`src/plugins/models/PalletYard/index.ts`) is the reference: its plugin entry is one `definePlantPlugin` call plus the scene binder.
 
 ### DES statistics: own states and KPI rows (plan-644)
 
@@ -2254,7 +2285,12 @@ dependent setup in `onModelLoaded` / `onModeActivate`, never in `init()`.
 Most private features register at startup. Two do not: the **asset editor** (`asset-editor`) and
 **DES** (`des`) are *declared* at startup and *loaded* the first time they are used, so a plain HMI
 start neither downloads nor parses them (generated demo build: Editor + DES ≈ 0.9 MB less in the boot
-set). The mechanism is generic; any feature can become on demand.
+set). The mechanism is generic; any feature can become on demand. Core (AGPL) features use it too,
+declared by every `RVViewer` (`withCoreFeatures` in `rv-viewer.ts`) instead of the manifest:
+**SignalConnector** (`signal-connector`, plan-2227) and **collision detection** (`collision`,
+plan-781 F21 — `component:CollisionRole` and `command:collision.watch`; a Source whose
+`CollisionRoleForMUs` is not `None` counts as a `CollisionRole` through a prescan *field trigger*,
+`registerFieldTypeTrigger` in `rv-component-types.ts`).
 
 **Activation is manifest data.** A registration in `tier-manifest.json` carries `activation` — a list
 of triggers. Missing means `["startup"]` (eager, as before); an unknown prefix or an empty list is a
@@ -2317,7 +2353,11 @@ have no activation trigger or component factory. The cost
 of the scan is the `rv:feature.prescan` performance measure. A type that still arrives late (an
 authoring "add component", a path the scan does not see) is caught by a safety net: a warning, a
 Problems entry `feature-late-component:<type>`, the feature activates and the component is built
-afterwards.
+afterwards. That net exists for a component whose *factory* lives in the feature body. A feature
+whose component stays eager and only talks to a viewer-owned manager (collision: the `CollisionRole`
+marker) needs no net of that kind — the component is built at once and registers with an eager
+**slot** (`rv-collision-slot.ts`) that buffers until the feature installs its manager, asks for the
+feature on the first entry that participates, and then replays and forwards.
 
 **What the user sees.** A user-triggered activation (`mode:` / `command:`) that takes longer than
 **300 ms** shows the info overlay *"Loading Editor …"* / *"Loading DES simulation …"*, kept for at least
@@ -2979,7 +3019,44 @@ The page seam `window.__rvRecording` is installed only with `?recording=1`. It e
 `pick('moving-vehicle', among, sampleSec?)` (default 0.3 s, vehicle component nodes only).
 `pickBegin` / `pickEnd` support sampling across recorder-driven frames. For command completion,
 `armCommandWatch()` subscribes to `onExecuted`, `takeCommandWatch()` drains the captured events,
-and `stopCommandWatch()` unsubscribes; stop the watch in cleanup.
+and `stopCommandWatch()` unsubscribes; stop the watch in cleanup. A failed event carries `kind` and
+`reason` (plan-2237), so a click-dispatched command keeps its structured cause (e.g.
+`commercial-feature`). `armTimeWatch(ids)` / `takeTimeWatch()` (plan-2237) watch the given command
+ids for a whole take, whoever dispatches them — `{ id, phase: 'dispatch' | 'done', ok? }` from the
+registry's `dispatchHook` (called with the id at the start of `execute`, before any check; one hook,
+only the recording seam sets it) and `onExecuted`. `commandState(id, args?)` returns the registry's
+verdict without executing — `{ known: false }` or `{ known: true, enabled, reason }` (`preload` +
+`enabled()`); the recorder asks it before a click-dispatched command looks for its button.
+
+The tutorial recorder reads the simulation clock every frame through the read-only command
+**`sim.clock.get`** (plan-2237, descriptor in `sim-commands.ts`, body lazy in `sim-clock-get.ts`; the same query an agent reaches with
+`web_query("sim.clock.get", {})`, contract-commands-mcp rule 5) — not through a seam accessor;
+`desClock()` stays as it is. It returns `{ mode: 'continuous' | 'des', paused, simTime,
+fixedStepCount, factor, factorSource, des? }`. `factor` is the effective speed taken from the
+STATE: the master speed override in [0, 100] (continuous), or per DES sub-mode `animated` 1,
+`hybrid` max(1, multiplier), `step` 0 (hold), `fastforward` null (jumps). `des` carries
+`subMode`, `multiplier`, `renderClock` (the DES tempo clock — `simTime` is the event time), `simTime`,
+`endTime` (null = infinite), `clampedAt` (`'budget'` | `'end'` | null — the clamp the runner's
+`_advanceTimed` applied in its last fixed step) and `clampCounts` (`{ budget, end }`, monotonic, so a
+reader that samples once per video frame sees a clamp in any of that frame's steps). The DES runner
+exposes the clamp report through the optional `SimDesControl.clampReport` (`{ at, budget, end }`:
+the clamp of the last timed advance, null when it ran free — the render clock pulled back to the
+event clock (`budget`) or held at the end time (`end`) — and monotonic counts per kind, so a reader
+sampling once per video frame sees a clamp in any of its fixed steps); it is read-only and changes
+no behaviour.
+
+The flag itself lives in `src/core/recording-mode.ts` (plan-2240): `isRecordingMode(search?)` and
+`isWelcomeAutoOpenSuppressed(search?)`, both read the page URL on every call (the flag never changes
+during a page's life, so no hook or store is needed). The same `?recording=1` is the viewer's
+**recording mode**, a display rule, not a plugin switch (contract-plugins rule 6): no toolbar
+tooltips, no self-opening Problems panel, no self-opening startup dialog, manual opening intact. A
+new UI element that opens ITSELF (a tooltip that is not domain data, a dialog shown at startup)
+asks `isRecordingMode()` at the point where it decides to open, or registers through
+`mayShowStartupModal`, which already answers `false` for auto-only dialogs in recording mode. The
+module is eager and import-free — keep it that way (it is part of the startup graph).
+
+Not the same as `RECORDING_CONTEXT` (`rv-recording-hmi.ts`, plan-556): that is the UI context of
+the in-app video recording HMI, active while the user records. The two are deliberately separate.
 
 ### MCP tool bindings
 
@@ -3102,6 +3179,42 @@ throw `pose-dependency-unsupported`, `ctx.editorTree` throws `pose-requires-runt
 | `useDrives()` | drive list + hover state | All loaded drives |
 | `useSignal(name)` | signal value | Signal store subscription (by name) |
 | `useTooltipState()` | `TooltipState` | Current active tooltip (useSyncExternalStore) |
+| `useEditorState(selector)` | selected slice | Hierarchy/inspector state (`panelOpen`, `selectedNodePath`, …) — re-renders only when the slice changes |
+| `useEditorPluginInstance()` | `RvExtrasEditorPlugin \| undefined` | The hierarchy/inspector plugin itself, for calling its methods — no subscription |
+| `useEditorPlugin()` | `{ plugin, state }` | Full editor state — re-renders on **every** selection change; inspector and hierarchy panels only |
+
+### Subscribe to slices, not to whole snapshots
+
+A store snapshot that carries the selection changes on every click. A component that
+subscribes to the whole snapshot re-renders on every click, and so does everything below it.
+In the HMI shell this was expensive: until 2026-11-05, TopBar, ActivityBar and the width
+hooks under ButtonPanel and BottomBar (`useLeftWindowWidth` → `useViewportInsets`) used
+`useEditorPlugin()`, and the planner library used the whole layout-store snapshot. Every
+click-to-select and every planner drop re-rendered about 800 components — 65–70 ms of React
+work per selection in the dev build. Reading primitive slices brought a selection change
+between two objects down to about 8 ms, and a repeated planner drop from 112–155 ms to
+29–39 ms of main-thread time.
+
+Rules:
+
+- Shell components (bars, toolbars, anything mounted all the time) read **primitive slices**:
+  `useEditorState((s) => s.panelOpen)`, or `useSyncExternalStore(store.subscribe, () =>
+  store.getSnapshot().placed.length)`.
+- A selector must return a primitive or an existing reference. `useSyncExternalStore`
+  compares with `Object.is`; a selector that builds a new object on every call re-renders
+  forever. Several values → several hooks, or derive one primitive (`hasSelection`).
+- Need the plugin only to call it? `useEditorPluginInstance()`, not `useEditorPlugin()`.
+- `tests/shell-selection-rerender-guard.test.ts` fails when a shell file calls
+  `useEditorPlugin()` again or the planner library subscribes to the whole layout snapshot.
+- A `React.memo` list row only helps when every prop keeps its identity: no inline
+  `style={{…}}` literals (the hierarchy uses `rowStyle(start, height)`), callbacks that read
+  changing state through a ref, memos keyed on the fields they read (`state.overlay`, not
+  `state`). Until 2026-11-05 the hierarchy re-rendered every visible row on each selection
+  for exactly these reasons.
+- Helper objects (gizmos, guides, hover overlays) are added to the scene all the time. A
+  panel that listens to `childadded`/`childremoved` must ignore the ones it never shows —
+  the hierarchy does that with `structureChangeMatters` (hierarchy-rows.ts); before, every
+  planner drag re-rendered the whole tree 2–3 times.
 
 ### Writing Custom Hooks
 

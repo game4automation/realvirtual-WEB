@@ -393,7 +393,7 @@ function makeLiveScene(programs: Array<{ name: string; code: string }> = []) {
 }
 
 function resolver(list: Array<Pick<PlcProgramInfo, 'path' | 'name' | 'selected'>>): PlcProgramResolver {
-  const infos = list.map((p, i) => ({ ...p, order: i, state: 'running' as const, scanTimeMs: 0, lastError: null }));
+  const infos = list.map((p, i) => ({ ...p, order: i, desBlocking: 0, state: 'running' as const, scanTimeMs: 0, lastError: null }));
   return {
     programs: () => infos,
     pathOf: (n) => infos.find((p) => p.path === n || p.name.toLowerCase() === n.toLowerCase())?.path ?? null,

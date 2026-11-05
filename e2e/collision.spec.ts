@@ -11,14 +11,20 @@
  * inspector dropdown: the round-trip of the dropdown value itself is covered
  * exactly (and much faster) by the schema test `tests/rv-collision-extras.test.ts`.
  *
- * READINESS, the thing this spec got wrong once (measured on a cold dev
- * server): `viewer.collisionManager` is assigned in the RVViewer CONSTRUCTOR,
- * so waiting for it proves only that the viewer object exists — at that moment
- * `currentModel` was still false and the scene held 2 meshes. The model landed
- * ~12 s later, and the per-mesh `boundsTree`s another ~8 s after that, because
- * the BVH pass is fire-and-forget after load (`_startAsyncBvhBuild` →
- * `'raycast-ready'`, plan-240). Never gate on a timeout here — gate on the
- * precondition this test actually needs: a mesh that carries a real BVH.
+ * READINESS: since plan-781 F21 collision is the on-demand feature `collision`
+ * — `viewer.collisionManager` is null until a model with a role loads it or a
+ * caller ensures it, so the gate ensures the feature (the `collision.watch`
+ * trigger) once the model is loaded. Collision needs no BVH any more — its
+ * bodies read the pick structure the bake builds before the scene is shown —
+ * so the rest of the gate is "the model is loaded and baked" (a chunk mesh is
+ * in the scene), never a timeout.
+ *
+ * plan-781 semantics: touching is not a collision (two coincident clones are
+ * coplanar = touching), and a pair overlapping at its first evaluation is a
+ * quiet start baseline — so the test bodies are armed apart for one tick and
+ * then pushed INTO each other. A second case drives a probe into a STATIC role
+ * node of the baked demo model: the verified bug of plan-781 (a static role had
+ * no mesh after the bake and never collided).
  */
 
 import { test, expect } from 'playwright/test';
@@ -33,60 +39,106 @@ import type { Page } from 'playwright/test';
  * non-fatal: on a machine where the notice does not appear this is a no-op.
  */
 async function dismissStartupNotices(page: Page): Promise<void> {
-  for (const testId of ['auto-quality-ok', 'welcome-start-demo']) {
-    const btn = page.getByTestId(testId);
+  // The startup coordinator QUEUES its notices: the demo welcome/about overlay
+  // ("Accept & continue" on a fresh profile, "Got it" afterwards) comes first,
+  // and the auto-quality notice only opens once it is closed. A single pass in a
+  // fixed order therefore left the auto-quality backdrop over the page and the
+  // Ignore click below timed out — so loop until a round finds nothing.
+  // `welcome-dismiss` only: "Start Demo" would start the kiosk tour, which
+  // drives the scene the test is asserting on.
+  // `isVisible()` does not wait, so the next queued notice is awaited explicitly.
+  const notice = page.locator('[data-testid="welcome-dismiss"], [data-testid="auto-quality-ok"]').first();
+  for (let round = 0; round < 4; round++) {
     try {
-      if (await btn.isVisible({ timeout: 1_000 })) {
-        await btn.click({ timeout: 5_000 });
-        await btn.waitFor({ state: 'detached', timeout: 5_000 });
-      }
+      await notice.waitFor({ state: 'visible', timeout: 2_000 });
     } catch {
-      /* not shown on this machine — nothing to dismiss */
+      return;                                   // nothing (more) queued on this machine
     }
-  }
-  // The demo welcome/about overlay ("Accept & continue" on a fresh profile,
-  // "Got it" afterwards) — its backdrop spans the viewport and swallows clicks
-  // aimed at the messages panel.
-  try {
-    const welcomeDismiss = page.getByTestId('welcome-dismiss');
-    if (await welcomeDismiss.isVisible({ timeout: 1_000 })) {
-      await welcomeDismiss.click({ timeout: 5_000 });
-      await welcomeDismiss.waitFor({ state: 'detached', timeout: 5_000 });
+    try {
+      const btn = notice;
+      const id = await btn.getAttribute('data-testid');
+      await btn.click({ timeout: 5_000 });
+      if (id) await page.getByTestId(id).waitFor({ state: 'detached', timeout: 5_000 });
+    } catch {
+      /* closed by itself in between — look again */
     }
-  } catch {
-    /* not shown — nothing to dismiss */
   }
 }
 
-/**
- * Poll until the model is loaded AND the async BVH pass produced a tree on a
- * PLAIN model mesh. The merged `__raycastBVH_*` helpers get their (indirect)
- * trees first — gating on "any boundsTree" once passed while the per-mesh
- * trees were still pending, and the sample search below (which rightly skips
- * pipeline helpers) came up empty.
- */
-async function waitForBvhReadyModel(page: Page): Promise<void> {
+/** Poll until the model is loaded and baked (a chunk mesh is in the scene). */
+async function waitForBakedModel(page: Page): Promise<void> {
   await page.waitForFunction(
     () => {
       const v = (window as unknown as { viewer?: Record<string, never> }).viewer as
-        | { collisionManager?: unknown; currentModel?: unknown; scene?: { traverse(cb: (n: unknown) => void): void } }
+        | { currentModel?: unknown; scene?: { traverse(cb: (n: unknown) => void): void } }
         | undefined;
-      if (!v?.collisionManager || !v.currentModel || !v.scene) return false;
+      if (!v?.currentModel || !v.scene) return false;
       let found = false;
       v.scene.traverse((n: unknown) => {
-        const m = n as {
-          isMesh?: boolean;
-          geometry?: { boundsTree?: unknown };
-          userData?: { _rvRaycastBVH?: boolean; _highlightOverlay?: boolean };
-        };
-        if (!found && m.isMesh && m.geometry?.boundsTree
-          && !m.userData?._rvRaycastBVH && !m.userData?._highlightOverlay) found = true;
+        const m = n as { isMesh?: boolean; userData?: { _rvBakeChunk?: boolean } };
+        if (!found && m.isMesh && m.userData?._rvBakeChunk === true) found = true;
       });
       return found;
     },
     undefined,
     { timeout: 180_000 },
   );
+  // plan-781 F21: the manager exists once the on-demand feature is active.
+  await page.evaluate(async () => {
+    const v = (window as unknown as { viewer: { features: { ensure(id: string, t: string): Promise<void> } } }).viewer;
+    await v.features.ensure('collision', 'command:collision.watch');
+  });
+}
+
+/**
+ * Test cubes made with the viewer's OWN three classes (taken from a model mesh,
+ * so no second three instance) — plain meshes in the scene, i.e. keep parts of
+ * their bodies. Installed as `window.__rvMakeCube(name, size)`, plus
+ * `window.__rvBox3()` for an empty Box3 of the same instance.
+ */
+async function installCubeFactory(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const viewer = (window as unknown as { viewer?: any }).viewer;
+    // The sample's geometry class is instantiated below, so it MUST be a plain
+    // BufferGeometry: the first mesh in the demo scene is a PlaneGeometry, whose
+    // constructor builds its own 6-entry index — the "cube" then drew (and
+    // collided as) one quad at z = -h, and the pair never overlapped. The index
+    // is also dropped defensively, so a subclass can never shape the cube.
+    let sample: any = null;
+    let fallback: any = null;
+    viewer.scene.traverse((n: any) => {
+      if (!n.isMesh || !n.geometry?.getAttribute?.('position')) return;
+      if (!fallback) fallback = n;
+      if (!sample && n.geometry.type === 'BufferGeometry') sample = n;
+    });
+    sample = sample ?? fallback;
+    const Geometry = sample.geometry.constructor;
+    const Attribute = sample.geometry.getAttribute('position').constructor;
+    const Mesh = sample.constructor;
+    if (!sample.geometry.boundingBox) sample.geometry.computeBoundingBox();
+    const Box3 = sample.geometry.boundingBox.constructor;
+    (window as any).__rvBox3 = () => new Box3();
+    (window as any).__rvMakeCube = (name: string, size: number) => {
+      const h = size / 2;
+      const c = [[-h, -h, -h], [h, -h, -h], [h, h, -h], [-h, h, -h], [-h, -h, h], [h, -h, h], [h, h, h], [-h, h, h]];
+      const faces = [[0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7], [0, 1, 5], [0, 5, 4], [3, 6, 2], [3, 7, 6], [0, 4, 7], [0, 7, 3], [1, 2, 6], [1, 6, 5]];
+      const pos = new Float32Array(36 * 3);
+      faces.forEach((f, i) => f.forEach((v, k) => pos.set(c[v], (i * 3 + k) * 3)));
+      const geo = new Geometry();
+      geo.setIndex(null);
+      for (const attrName of Object.keys(geo.attributes)) geo.deleteAttribute(attrName);
+      geo.clearGroups();
+      geo.setDrawRange(0, Infinity);
+      geo.setAttribute('position', new Attribute(pos, 3));
+      if (geo.index !== null || geo.getAttribute('position').count !== 36) {
+        throw new Error('test cube is not 12 non-indexed triangles');
+      }
+      const m = new Mesh(geo, sample.material);
+      m.name = name;
+      m.matrixAutoUpdate = true;
+      return m;
+    };
+  });
 }
 
 test('collision cards latch in the messages panel, survive a mode change and clear on ignore-type', async ({ page }) => {
@@ -95,60 +147,21 @@ test('collision cards latch in the messages panel, survive a mode change and cle
 
   await page.goto('/', { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('canvas', { timeout: 60_000 });
-  await waitForBvhReadyModel(page);
+  await waitForBakedModel(page);
   await dismissStartupNotices(page);
+  await installCubeFactory(page);
 
-  // Build two overlapping bodies of different roles directly in the live scene.
+  // Build two bodies of different roles directly in the live scene.
   const built = await page.evaluate(() => {
     const viewer = (window as unknown as { viewer?: any }).viewer;
     if (!viewer) return { ok: false, why: 'no viewer' };
 
-    // Clone an existing BVH-carrying mesh — that keeps us on the viewer's own
-    // three instance and gives both test bodies a real boundsTree, so the
-    // triangle narrowphase (not just the box test) is exercised. NOT a
-    // pipeline helper (`_rvRaycastBVH` / `_highlightOverlay`): the clone would
-    // inherit the marker and the manager rightly refuses such meshes.
-    let sample: any = null;
-    viewer.scene.traverse((n: any) => {
-      if (!sample && n.isMesh && n.geometry?.boundsTree
-        && !n.userData?._rvRaycastBVH && !n.userData?._highlightOverlay) sample = n;
-    });
-    if (!sample) return { ok: false, why: 'no plain mesh with boundsTree' };
-
-    // The batched render pipeline leaves its SOURCE meshes in the scene with
-    // `layers.mask = 0`. A clone would inherit that and F6 would correctly
-    // treat it as invisible — empty body box, no collision. Normalise the
-    // clones so they are effectively visible. `freezeStaticMatrices` turns OFF
-    // `matrixAutoUpdate` on static model meshes, and a clone inherits that:
-    // writing `.position` then does nothing at all, because
-    // `updateMatrixWorld()` reuses the baked local matrix. Re-enable it or
-    // these bodies can never be moved.
-    const prepare = (m: any, name: string) => {
-      m.name = name;
-      m.visible = true;
-      m.layers.set(0);
-      m.traverse((c: any) => {
-        c.visible = true;
-        c.layers.set(0);
-        c.matrixAutoUpdate = true;
-        // Defensive: never let a cloned helper marker exclude the body.
-        if (c.userData) {
-          delete c.userData._rvRaycastBVH;
-          delete c.userData._highlightOverlay;
-        }
-      });
-      m.matrixAutoUpdate = true;
-      m.position.set(0, 50, 0);   // identical transform => guaranteed overlap
-      m.rotation.set(0, 0, 0);
-      m.scale.set(1, 1, 1);
-      m.updateMatrixWorld(true);
-      return m;
-    };
-
-    const a = prepare(sample.clone(), 'RVTestBodyA');
-    const b = prepare(sample.clone(), 'RVTestBodyB');
+    const make = (window as any).__rvMakeCube;
+    const a = make('RVTestBodyA', 1);
+    const b = make('RVTestBodyB', 1);
+    a.position.set(0, 50, 0);
+    b.position.set(10, 50, 0);                  // apart: the pair is armed first
     viewer.scene.add(a, b);
-    viewer.scene.updateMatrixWorld(true);
 
     // The demo model ships AUTHORED CollisionRoles since 2026-08-07 (robot,
     // gripper, CNC door, Workpiece MUs) and its cycle produces real contacts.
@@ -170,6 +183,9 @@ test('collision cards latch in the messages panel, survive a mode change and cle
   // so `hasPulsingOutlines` is a precise probe for it.
   const reported = await page.evaluate(() => {
     const viewer = (window as unknown as { viewer: any }).viewer;
+    viewer.collisionManager.update(1 / 60);     // armed apart
+    const b = viewer.scene.getObjectByName('RVTestBodyB');
+    b.position.set(0.4, 50.2, 0.1);             // a real penetration (not a coplanar touch)
     viewer.collisionManager.update(1 / 60);
     return {
       pairs: viewer.collisionManager.activePairs.length,
@@ -226,13 +242,7 @@ test('collision cards latch in the messages panel, survive a mode change and cle
     const viewer = (window as unknown as { viewer: any }).viewer;
     const mgr = viewer.collisionManager;
     const b = viewer.scene.getObjectByName('RVTestBodyB');
-    const bodyB = mgr.bodies.find((x: any) => x.root.name === 'RVTestBodyB');
-    const span = bodyB.worldBox.max.y - bodyB.worldBox.min.y;
-    b.matrixAutoUpdate = true;   // see `prepare()` — frozen static matrices
-    b.position.y += span * 10 + 100;
-    b.updateMatrixWorld(true);
-    viewer.scene.updateMatrixWorld(true);
-
+    b.position.y += 10;
     mgr.update(1 / 60);
     return { pairs: mgr.activePairs.length };
   });
@@ -254,9 +264,7 @@ test('collision cards latch in the messages panel, survive a mode change and cle
     // Bring the bodies back into overlap and tick — the ignored type must NOT
     // re-report.
     const b = viewer.scene.getObjectByName('RVTestBodyB');
-    b.position.set(0, 50, 0);
-    b.updateMatrixWorld(true);
-    viewer.scene.updateMatrixWorld(true);
+    b.position.set(0.4, 50.2, 0.1);
     mgr.update(1 / 60);
     return {
       pairs: mgr.activePairs.length,
@@ -266,4 +274,59 @@ test('collision cards latch in the messages panel, survive a mode change and cle
   expect(afterIgnore.pairs).toBe(0);
   expect(afterIgnore.pulsing).toBe(false);
   await expect(panel).toHaveCount(0);
+});
+
+test('a STATIC role node of the baked model collides (plan-781 verified bug)', async ({ page }) => {
+  test.setTimeout(360_000);
+  await page.goto('/', { waitUntil: 'domcontentloaded' });
+  await page.waitForSelector('canvas', { timeout: 60_000 });
+  await waitForBakedModel(page);
+  await dismissStartupNotices(page);
+  await installCubeFactory(page);
+
+  const result = await page.evaluate(() => {
+    const viewer = (window as unknown as { viewer?: any }).viewer;
+    const reg = viewer.bakeRegistry;
+    const newBox = (window as any).__rvBox3;
+    // A node with chunk geometry but NO mesh under it: merged by the bake.
+    let target: any = null;
+    let bounds: any = null;
+    viewer.scene.traverse((n: any) => {
+      if (target || n.isMesh || n.userData?._rvBakeChunk || reg.instanceOf(n)) return;
+      let hasMesh = false;
+      n.traverse((c: any) => { if (c !== n && c.isMesh) hasMesh = true; });
+      if (hasMesh) return;
+      const box = newBox();
+      if (!reg.chunkBoundsOf(n, box)) return;
+      const sx = box.max.x - box.min.x, sy = box.max.y - box.min.y, sz = box.max.z - box.min.z;
+      if (!(sx > 0.05 && sy > 0.05 && sz > 0.05 && sx < 20 && sy < 20 && sz < 20)) return;
+      target = n;
+      bounds = box;
+    });
+    if (!target) return { ok: false, why: 'no static merged node with chunk geometry', parts: 0, hit: false };
+    const probe = (window as any).__rvMakeCube('RVTestProbe', 0.07);
+    const cx = (bounds.min.x + bounds.max.x) / 2;
+    const cz = (bounds.min.z + bounds.max.z) / 2;
+    probe.position.set(cx, bounds.max.y + 5, cz);     // far above: armed apart
+    viewer.scene.add(probe);
+    if (viewer.transportManager) viewer.transportManager.muLifecycleHook = null;
+    const mgr = viewer.collisionManager;
+    mgr.clear();
+    mgr.register(target, 'Environment');
+    mgr.register(probe, 'Robot');
+    mgr.update(1 / 60);
+    const body = mgr.bodies.find((x: any) => x.root === target);
+    const parts = body?.parts.length ?? 0;
+    // Sweep the probe down through the node's geometry until it collides.
+    let hit = false;
+    for (let y = bounds.max.y + 0.05; y > bounds.min.y - 0.05 && !hit; y -= 0.01) {
+      probe.position.y = y;
+      mgr.update(1 / 60);
+      hit = mgr.activePairs.length > 0;
+    }
+    return { ok: true, why: '', parts, hit, name: target.name };
+  });
+  expect(result.why).toBe('');
+  expect(result.parts).toBeGreaterThan(0);
+  expect(result.hit).toBe(true);
 });

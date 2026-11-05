@@ -58,6 +58,7 @@ import type { OrderManagerPluginAPI } from '../core/types/plugin-types';
 import { useCustomBranding } from '../core/hmi/branding-store';
 import { extractOrderData } from './order-manager-plugin';
 import { NavButton } from '../core/hmi/NavButton';
+import { modeContext } from '../core/rv-mode-manager';
 import type { UISlotEntry, UISlotProps } from '../core/rv-ui-plugin';
 import { openPdfViewer, disposePdfViewer, type PdfLink } from '../core/hmi/pdf-viewer-store';
 
@@ -229,7 +230,12 @@ export class AasLinkPlugin implements RVViewerPlugin {
   readonly core = true;
 
   readonly slots: UISlotEntry[] = [
-    { slot: 'button-group', component: AasButton, order: 45 },
+    // Thomas 2026-11-04: the documents button belongs to the operating views, not to the
+    // authoring ones (editor, planner, DES). AAS parts stay hoverable everywhere.
+    {
+      slot: 'button-group', component: AasButton, order: 45,
+      visibilityRule: { hiddenIn: [modeContext('editor'), modeContext('planner'), modeContext('des')] },
+    },
   ];
 
   private viewer: RVViewer | null = null;
@@ -1103,6 +1109,7 @@ export function AasDetailPanel() {
       open={state.open}
       onClose={closeAasDetail}
       title={`AAS ${headerText}`}
+      panelId="aas-link"
       titleColor="#26a69a"
       subtitle={state.aasId}
       defaultWidth={460}

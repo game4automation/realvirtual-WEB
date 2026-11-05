@@ -100,6 +100,7 @@ export function PartsChart({ open, onClose }: PartsChartProps) {
       open={open}
       onClose={onClose}
       title="Parts per Hour"
+      panelId="demo-parts"
       titleColor="#4fc3f7"
       subtitle="Last 24h"
       defaultWidth={700}

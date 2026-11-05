@@ -2,41 +2,42 @@
 // Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * carrier-signal-name-anchor — a node binding survives its carrier being moved
- * (plan-425 F2, test 9.2, "case A").
+ * carrier-signal-name-anchor — a moved carrier is NOT re-homed by its signal name
+ * (plan-2234, contract-node-identity R4/R10; replaces plan-425 F2 "case A").
  *
- * The review's first blocker was about the LAYER this repair lives on, and the
- * fixtures here exist to keep it there. A `setField` op is addressed by path. If
- * the path is dead, the op is never materialised onto any node — so the restore
- * traverse, which walks the loaded model's nodes, cannot read the anchor stored
- * INSIDE that op. It only ever sees ops that already worked.
- *
- * Which is why the fixtures below are overlays and ops, not nodes: the anchor
- * has to be legible from the op side or it is not legible at all.
- *
- * The second-round finding was about the WRITE. Persisting the mappings at the
- * new path while leaving the old op in place makes the repair last exactly one
- * session — the next load rediscovers the same dead carrier and reports the same
- * orphan. So the migration is a PAIR, and the test checks for the absence of the
- * old path, not merely the presence of the new one.
+ * The anchor (`carrierSignalName`) is still written and still legible from the op
+ * side (that read stays tested below — plan-2236 builds its adopt offer on it).
+ * What changed: loading no longer MOVES the carrier's ops to whichever node carries
+ * that name today. Moving them was an automatic, persisted name fallback. The
+ * carrier stays an orphan, its ops stay as they are, the `orphaned-bindings`
+ * notice names it — also when a same-named signal hangs on another node.
  */
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { Object3D } from 'three';
 import {
   findOrphanedBindingCarriers,
   findOrphanedBindingPaths,
-  planCarrierMigrations,
 } from '../src/plugins/signal-bind/orphaned-bindings';
 import { SignalStore } from '../src/core/engine/rv-signal-store';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
-import {
-  registerSignal,
-  isDuplicateSignalName,
-  resetDuplicateSignalNames,
-} from '../src/core/engine/rv-signal-construction';
+import { registerSignal, resetDuplicateSignalNames } from '../src/core/engine/rv-signal-construction';
 import { materialise } from '../src/core/hmi/scene/rv-scene-edits';
 import type { RvOp } from '../src/core/ops/rv-unified-ops';
+import { setSceneStore } from '../src/core/hmi/scene/scene-store-ref';
+import { clearSceneSyncNotices, onSceneSyncNotice, type SceneSyncNotice } from '../src/core/hmi/scene/rv-scene-live-sync';
+import { SignalBindPlugin } from '../src/plugins/signal-bind/SignalBindPlugin';
+
+import { setActiveEditTarget } from '../src/core/hmi/rv-edit-target';
+
+/** A recording edit target — any write the load would make lands here. */
+const editTarget = {
+  available: true,
+  setField: vi.fn(),
+  unsetField: vi.fn(),
+  setFieldAsync: vi.fn(),
+  withTransaction: vi.fn(async (_label: string, fn: () => Promise<void> | void) => { await fn(); }),
+};
 
 const OLD_PATH = 'Cell/OldGroup/Motor_Run';
 const NEW_PATH = 'Cell/Machine/Signals/Motor_Run';
@@ -65,27 +66,27 @@ function registryWith(paths: readonly string[]) {
   return { getNode: (path: string) => (set.has(path) ? {} : undefined) };
 }
 
-/** A store where `SIGNAL` lives at `path` (and optionally at a second one). */
+/** A store + registry where `SIGNAL` lives at `path` — the same-named signal elsewhere. */
 function storeWith(paths: readonly string[]) {
   const store = new SignalStore();
   const registry = new NodeRegistry();
   for (const path of paths) {
     const node = new Object3D();
     node.name = SIGNAL;
+    registry.registerNode(path, node);
     registerSignal(node, 'PLCOutputBool', { Name: SIGNAL, Status: { Value: false } },
       path, store, registry);
   }
-  return store;
+  return { store, registry };
 }
 
-function resolverFor(store: SignalStore) {
-  return {
-    getPath: (name: string) => store.getPath(name),
-    isDuplicate: (name: string) => isDuplicateSignalName(store, name),
-  };
-}
-
-afterEach(() => resetDuplicateSignalNames(new SignalStore()));
+afterEach(() => {
+  resetDuplicateSignalNames(new SignalStore());
+  setSceneStore(null as never);
+  clearSceneSyncNotices();
+  setActiveEditTarget(null);
+  vi.clearAllMocks();
+});
 
 describe('reading the anchor out of the op payload', () => {
   it('finds the carrier AND keeps its mappings — the anchor is in the payload', () => {
@@ -108,110 +109,34 @@ describe('reading the anchor out of the op payload', () => {
   });
 });
 
-describe('planCarrierMigrations', () => {
-  it('migrates a dead carrier onto the path the signal name now resolves to', () => {
-    const overlay = materialise([setFieldOp(OLD_PATH, [MAPPING])]).overlay;
-    const registry = registryWith([NEW_PATH]);
-    const store = storeWith([NEW_PATH]);
-    const { migrations, stillOrphaned } = planCarrierMigrations(
-      findOrphanedBindingCarriers(overlay, registry), resolverFor(store), registry);
-
-    expect(stillOrphaned).toEqual([]);
-    expect(migrations).toHaveLength(1);
-    expect(migrations[0].from).toBe(OLD_PATH);
-    expect(migrations[0].to).toBe(NEW_PATH);
-    expect(migrations[0].mappings[0].signal).toBe('PLC.Start');
-  });
-
-  it('refuses the anchor when the name became ambiguous in the new model', () => {
-    // Two live nodes now answer to `Motor.Run`. Since plan-418 that is exactly
-    // the condition under which a name identifies NOTHING — so the mapping goes
-    // back to being an ordinary orphan rather than landing on a coin flip.
-    const overlay = materialise([setFieldOp(OLD_PATH, [MAPPING])]).overlay;
-    const registry = registryWith([NEW_PATH, 'Cell/Other/Motor_Run']);
-    const store = storeWith([NEW_PATH, 'Cell/Other/Motor_Run']);
-    const { migrations, stillOrphaned } = planCarrierMigrations(
-      findOrphanedBindingCarriers(overlay, registry), resolverFor(store), registry);
-
-    expect(migrations).toEqual([]);
-    expect(stillOrphaned).toEqual([OLD_PATH]);
-  });
-
-  it('leaves a legacy mapping without an anchor exactly as it was', () => {
-    const legacy = { ...MAPPING, carrierSignalName: undefined };
-    delete (legacy as { carrierSignalName?: string }).carrierSignalName;
-    const overlay = materialise([setFieldOp(OLD_PATH, [legacy])]).overlay;
-    const registry = registryWith([NEW_PATH]);
-    const { migrations, stillOrphaned } = planCarrierMigrations(
-      findOrphanedBindingCarriers(overlay, registry), resolverFor(storeWith([NEW_PATH])), registry);
-
-    expect(migrations).toEqual([]);
-    expect(stillOrphaned).toEqual([OLD_PATH]);
-  });
-
-  it('refuses to migrate onto a path that already carries its own mappings', () => {
-    // Overwriting there would turn a repair into data loss — the destination's
-    // own links would be replaced by the dead carrier's.
-    const overlay = materialise([
-      setFieldOp(OLD_PATH, [MAPPING]),
-      setFieldOp(NEW_PATH, [{ ...MAPPING, signal: 'PLC.Other' }]),
-    ]).overlay;
-    const registry = registryWith([NEW_PATH]);
-    const { migrations, stillOrphaned } = planCarrierMigrations(
-      findOrphanedBindingCarriers(overlay, registry),
-      resolverFor(storeWith([NEW_PATH])),
-      registry,
-      new Set(Object.keys(overlay.nodes)),
-    );
-
-    expect(migrations).toEqual([]);
-    expect(stillOrphaned).toEqual([OLD_PATH]);
-  });
-
-  it('never sends two dead carriers to the same destination', () => {
-    const second = 'Cell/OlderGroup/Motor_Run';
-    const overlay = materialise([
-      setFieldOp(OLD_PATH, [MAPPING]),
-      setFieldOp(second, [{ ...MAPPING, signal: 'PLC.Second' }]),
-    ]).overlay;
-    const registry = registryWith([NEW_PATH]);
-    const { migrations, stillOrphaned } = planCarrierMigrations(
-      findOrphanedBindingCarriers(overlay, registry), resolverFor(storeWith([NEW_PATH])), registry);
-
-    expect(migrations).toHaveLength(1);
-    expect(stillOrphaned).toHaveLength(1);
-  });
-});
-
-describe('the migration op pair', () => {
-  it('leaves NO trace of the old path in the materialised overlay', () => {
-    // Round-2 finding: setField alone would leave the old op standing and the
-    // orphan would return on the next load. The pair is what makes it stick.
+describe('loading never re-homes a carrier by its signal name (plan-2234)', () => {
+  it('a missing carrier with a same-named signal elsewhere: no move, no write, the notice names it', async () => {
     const ops: RvOp[] = [setFieldOp(OLD_PATH, [MAPPING])];
-    expect(Object.keys(materialise(ops).overlay.nodes)).toContain(OLD_PATH);
-
-    ops.push(setFieldOp(NEW_PATH, [MAPPING]));
-    ops.push({
-      id: 'unset', ts: 2, schemaV: 1,
-      kind: 'unsetField', nodePath: OLD_PATH, componentType: 'SignalLinks',
-      fieldName: 'Mappings', prev: [MAPPING],
-    } as RvOp);
-
-    const after = materialise(ops).overlay;
-    expect(Object.keys(after.nodes)).not.toContain(OLD_PATH);
-    expect(Object.keys(after.nodes)).toContain(NEW_PATH);
-  });
-
-  it('produces no second orphan report after the migration', () => {
-    const ops: RvOp[] = [
-      setFieldOp(NEW_PATH, [MAPPING]),
-      {
-        id: 'unset', ts: 2, schemaV: 1,
-        kind: 'unsetField', nodePath: OLD_PATH, componentType: 'SignalLinks',
-        fieldName: 'Mappings', prev: [MAPPING],
-      } as RvOp,
-    ];
-    const registry = registryWith([NEW_PATH]);
-    expect(findOrphanedBindingCarriers(materialise(ops).overlay, registry)).toEqual([]);
+    const before = JSON.stringify(ops);
+    setSceneStore({ getSnapshot: () => ({ draft: { edits: { ops } } }) } as never);
+    const { store, registry } = storeWith([NEW_PATH]);
+    expect(store.getPath(SIGNAL)).toBe(NEW_PATH); // the name now answers on another node
+    const viewer = {
+      registry, signalStore: store, signalBindingManager: null,
+      currentModelUrl: 'cell.glb', whenSceneReady: async () => {},
+    };
+    setActiveEditTarget(editTarget as never);
+    const seen: SceneSyncNotice[] = [];
+    const off = onSceneSyncNotice((n) => seen.push(n));
+    try {
+      const plugin = new SignalBindPlugin();
+      await (plugin as unknown as { _reportOrphanedBindings(v: unknown, r: unknown): Promise<void> })
+        ._reportOrphanedBindings(viewer, { root: new Object3D() });
+    } finally {
+      off();
+    }
+    expect(editTarget.setField).not.toHaveBeenCalled();
+    expect(editTarget.unsetField).not.toHaveBeenCalled();
+    expect(editTarget.withTransaction).not.toHaveBeenCalled();
+    expect(JSON.stringify(ops)).toBe(before);
+    expect(seen).toHaveLength(1);
+    const notice = seen[0];
+    if (notice.kind !== 'orphaned-bindings') throw new Error(`wrong kind ${notice.kind}`);
+    expect(notice.paths).toEqual([OLD_PATH]);
   });
 });

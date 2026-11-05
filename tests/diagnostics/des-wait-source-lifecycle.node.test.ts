@@ -43,13 +43,16 @@ function check(f: ReturnType<typeof fixture>) {
   expect(adapters).toHaveLength(1);
   const a = adapters[0];
   expect(f.waitRegistry.sources()).toEqual(['des']);
-  expect(f.progressLedger.adapterSources()).toEqual(['des']);
+  expect(f.progressLedger.adapterSources()).toEqual([]);   // plan-2241: pushed, not sampled
   expect(f.progressLedger.sample(0).coverage.bySource).toEqual({ des: 1 });
   a.currentLoad = 1;
   expect(f.progressLedger.sample(0).coverage.armed).toBe(1);
   const before = f.progressLedger.entry(a.progressUnitId)!.count;
   a.recordOutput(); a.resetStatistics(); a.recordOutput();
   expect(f.progressLedger.entry(a.progressUnitId)!.count).toBe(before + 2);
+  // plan-2241 Phase 1: a source holding its start MU (no downstream here) is armed by `pending`;
+  // drop it so the load alone decides, as the subscription check intends.
+  (f.runner.liveInstances[0].self.local as unknown as { pending: unknown }).pending = null;
   a.currentLoad = 0;
   expect(f.progressLedger.sample(0).coverage.inactive).toBe(1);
   return a;

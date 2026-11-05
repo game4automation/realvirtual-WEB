@@ -80,18 +80,24 @@ import { parametricRequestsOf } from './rv-parametric-component';
 import { resolveReferenceUrl, weakestSignatureState } from './rv-glb-compose';
 import { gltfLoader as sharedGltfLoader } from './rv-glb-parse';
 import {
-  PROJECT_PLACEMENT_PREFIX,
-  findRegistryOrigin,
+  isProjectDocumentId,
   rebaseLocalLibraryUrl,
 } from '../library/rv-placement-source';
 import {
   findQualifiedOrigin,
   isQualifiedRef,
+  isStrictDocumentRef,
+  LIBRARY_PROJECTS_PROVIDER_ID,
   qualifiedSourceState,
-  findWhenQualifiedSourceSettled,
-  qualifyInLibrary,
+  resolveDocumentRef,
+  resolveDocumentRefSettled,
+  scopeOfQualifiedRef,
+  type DocumentScope,
+  type RefResolution,
+  type ResolvedRef,
 } from '../library/library-origin';
-import { subscribeLibrarySources } from '../library/library-source-registry';
+import { listLibrarySources, subscribeLibrarySources } from '../library/library-source-registry';
+import { RESOLVED_KEY_PREFIX } from '../library/rv-asset-hash-registry';
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -113,7 +119,7 @@ export interface PlacementRef {
    * + `sourceId` = a STRICT reference into one library project: resolved in
    * that source only, checked BEFORE any url / path, never through the host's
    * fallback. Any other pair (a pre-778 `global` + catalog URL) is a legacy
-   * hint for {@link findRegistryOrigin}.
+   * hint for the legacy search (`findLegacyOrigin`, via `resolveDocumentRef`).
    */
   providerId?: string;
   sourceId?: string;
@@ -131,6 +137,57 @@ function qualifierFieldsOf(reference: { providerId?: string; sourceId?: string }
 /** The bake / chain key of a QUALIFIED reference — stable whether or not its source is ready. */
 function qualifiedKeyOf(ref: PlacementRef): string {
   return resolvedCacheKey(ref.providerId as string, ref.sourceId as string, ref.catalogId);
+}
+
+/** Key of a strict reference in `scope`, stable while its library is pending (plan-780). */
+function strictKeyOf(ref: PlacementRef, scope: DocumentScope): string {
+  if (isQualifiedRef(ref)) return qualifiedKeyOf(ref);
+  return scope ? resolvedCacheKey(scope.providerId, scope.sourceId, ref.catalogId) : assetKeyOf(ref);
+}
+
+/** plan-780 R1: a strict hit's qualified form (no url); null for a legacy hit, kept as written. */
+function effectiveRefOf(hit: ResolvedRef): PlacementRef | null {
+  if (!hit.qualified) return null;
+  return { catalogId: hit.assetId, glbUrl: '', providerId: hit.registered.providerId, sourceId: hit.registered.source.id };
+}
+
+/** Key `resolved:<provider>:<source>:<id>` + transport of a hit. */
+function sourceOfHit(hit: ResolvedRef): PlacementSource {
+  const source = hit.registered.source;
+  const id = hit.assetId;
+  return {
+    key: resolvedCacheKey(hit.registered.providerId, source.id, id),
+    resolve: () => source.resolveAsset(id, 'place'),
+  };
+}
+
+/** plan-780 2.1: scope of content baked under `assetKey`, read off the key; undefined = url-keyed. */
+export function scopeOfAssetKey(assetKey: string): DocumentScope | undefined {
+  if (!assetKey.startsWith(RESOLVED_KEY_PREFIX)) return undefined;
+  const rest = assetKey.slice(RESOLVED_KEY_PREFIX.length);
+  const providerEnd = rest.indexOf(':');
+  if (providerEnd < 0) return null;
+  const providerId = rest.slice(0, providerEnd);
+  if (providerId !== LIBRARY_PROJECTS_PROVIDER_ID) return null;
+  const sourceEnd = rest.indexOf(':', providerEnd + 1);
+  const sourceId = sourceEnd < 0 ? '' : rest.slice(providerEnd + 1, sourceEnd);
+  return sourceId ? { providerId, sourceId } : null;
+}
+
+/** {@link scopeOfAssetKey}; a url-keyed asset keeps `inherited`. */
+function contentScopeOf(assetKey: string, inherited: DocumentScope): DocumentScope {
+  const s = scopeOfAssetKey(assetKey);
+  return s === undefined ? inherited : s;
+}
+
+/** Problems-row reason of a strict reference without a source. */
+function unresolvedReason(ref: PlacementRef, r: RefResolution): string {
+  if ('missing' in r) return r.reason;
+  if ('pending' in r) {
+    const where = r.source ? `library "${r.source.sourceId}"` : 'the libraries';
+    return `"${ref.catalogId}" waits for ${where} to finish loading — it is placed when it is ready.`;
+  }
+  return `"${ref.catalogId}" could not be placed.`;
 }
 
 /** The cache key + transport of a {@link PlacementRef}. */
@@ -177,6 +234,8 @@ export interface MaterializeSpec {
    * `_layoutObject` + `_layoutNestedOf`, never a planner record's `_layoutId`.
    */
   nestedOf?: string;
+  /** plan-780 2.1: scope of this placement's nested references; absent = {@link scopeOfAssetKey}. */
+  scope?: DocumentScope;
 }
 
 /** One deferred placement root of a loaded layout document. */
@@ -221,6 +280,11 @@ export interface DeferredPlacementEntry {
   paramDepth?: number;
   /** plan-650 Phase 5b: id of the outermost placement - the key of the aggregated child budget. */
   paramRoot?: string;
+  /**
+   * plan-780 R2: project of the document this reference is written in, captured at
+   * queue time (contract documents-projects 4). Absent / null = the open project.
+   */
+  scope?: DocumentScope;
 }
 
 /** Why a nested reference was NOT queued as a placement (per node). */
@@ -499,8 +563,11 @@ export function recordRootOf(node: Object3D): Object3D | null {
 
 // ─── Deferred discovery ─────────────────────────────────────────────────
 
-/** The deferred placement roots under `root`, in document order (marks untouched). */
-export function collectDeferredPlacements(root: Object3D): DeferredPlacementEntry[] {
+/**
+ * The deferred placement roots under `root`, in document order (marks untouched).
+ * `scope` (plan-780 R2) is captured on every entry.
+ */
+export function collectDeferredPlacements(root: Object3D, scope: DocumentScope = null): DeferredPlacementEntry[] {
   const out: DeferredPlacementEntry[] = [];
   const walk = (node: Object3D): void => {
     const mark = getDeferredPlacement(node);
@@ -533,6 +600,7 @@ export function collectDeferredPlacements(root: Object3D): DeferredPlacementEntr
           // placement is floor-centre pivoted, a hand-authored CAD sub-assembly
           // keeps its child transforms — what `compose()` applies when it grafts.
           pivot: getPlacementMeta(node) !== null,
+          scope,
         });
       }
       return; // never descend into a placement
@@ -564,10 +632,10 @@ export interface NestedScanContext {
   parentUrl: string;
   /** The parent asset's own signature state — folded into the nested chain state (F7). */
   parentState: SignatureState;
-  /** ONE key derivation for the cycle guard (F13): `PlacementInstancer.sourceOf(ref).key`. */
+  /** ONE key derivation for the cycle guard (F13), {@link scope} bound in. */
   keyOf: (ref: PlacementRef) => string;
-  /** plan-778: the library the parent asset comes from — its unqualified nested references are that library's. */
-  parentLibrary?: { providerId: string; sourceId: string };
+  /** plan-780 2.1: scope of the parent's content; nested unqualified refs resolve there (D2). */
+  scope?: DocumentScope;
   /**
    * The reference nodes of the instance, when the caller already knows them
    * (F14: the instancer memoises the template's reference nodes per asset and
@@ -642,13 +710,12 @@ export function collectNestedReferences(
     }
     // plan-778 F4: a qualified nested reference ignores any stored path.
     const catalogId = reference.assetId || getPlacementMeta(node)?.catalogId || '';
-    // plan-778: inside a library document, `project:<path>` / a bare id is THAT library's.
-    const inLibrary = !isQualifiedRef(reference) && ctx.parentLibrary ? qualifyInLibrary(catalogId, ctx.parentLibrary) : null;
-    const qualified = isQualifiedRef(reference) || !!inLibrary;
-    const glbUrl = !qualified && reference.path ? resolveReferenceUrl(ctx.parentUrl, reference.path) : '';
-    const ref: PlacementRef = inLibrary
-      ? { ...inLibrary, glbUrl: '' }
-      : { catalogId, glbUrl, ...qualifierFieldsOf(reference) };
+    // plan-780: kept as written; the parent's scope travels with it, the ONE resolver decides.
+    const scope = ctx.scope ?? null;
+    const asWritten: PlacementRef = { catalogId, glbUrl: '', ...qualifierFieldsOf(reference) };
+    const strict = isStrictDocumentRef(asWritten, scope);
+    const glbUrl = !strict && reference.path ? resolveReferenceUrl(ctx.parentUrl, reference.path) : '';
+    const ref: PlacementRef = { ...asWritten, glbUrl };
     const key = ctx.keyOf(ref);
     const base = { node, label: node.name, ref, assetKey: key, chain, depth };
     // plan-650 Phase 5b: a reference whose overrides carry family values is a
@@ -672,6 +739,7 @@ export function collectNestedReferences(
         nestedOf: parent.id,
         paramDepth,
         paramRoot: parent.paramRoot ?? parent.id,
+        scope,
       });
     }
   }
@@ -843,21 +911,15 @@ export class PlacementInstancer {
    * share ONE bake in the document's cache — and the nesting chain's cycle
    * guard spells its keys the same way (F13).
    */
-  sourceOf(ref: PlacementRef): PlacementSource | null {
+  sourceOf(ref: PlacementRef, scope: DocumentScope): PlacementSource | null {
     const catalogId = ref.catalogId ?? '';
-    // plan-778 F4: the qualifier is checked FIRST — before the url branch
-    // below, which used to return early on any url. A qualified reference has
-    // a source only while its ONE library answers; nothing else stands in.
-    if (isQualifiedRef(ref)) {
-      const found = findQualifiedOrigin({ assetId: catalogId, providerId: ref.providerId, sourceId: ref.sourceId });
-      if (!found) return null;
-      const source = found.registered.source;
-      const entryId = found.entry.id;
-      const key = qualifiedKeyOf(ref);
-      this._libraryOfKey.set(key, { providerId: ref.providerId!, sourceId: ref.sourceId! });
-      return { key, resolve: () => source.resolveAsset(entryId, 'place') };
+    // plan-778 F4 / plan-780 R1: a strict reference is checked before the url
+    // branch; only its ONE library answers, nothing else stands in.
+    if (isStrictDocumentRef(ref, scope)) {
+      const r = resolveDocumentRef(ref, scope);
+      return 'hit' in r ? sourceOfHit(r.hit) : null;
     }
-    const isProject = catalogId.startsWith(PROJECT_PLACEMENT_PREFIX);
+    const isProject = isProjectDocumentId(catalogId);
     if (!isProject) {
       const raw = (ref.url || ref.glbUrl || '').trim();
       // An UNANCHORED relative path (no scheme, no leading `/`) is what
@@ -870,21 +932,18 @@ export class PlacementInstancer {
       const unanchored = !!key && !/^[a-z][a-z0-9+.-]*:/i.test(key) && !key.startsWith('/');
       if (key && !(unanchored && catalogId && this._deps.resolveReference)) return { key };
     }
-    const origin = findRegistryOrigin(catalogId, ref);
-    if (!origin) return null;
-    return {
-      key: resolvedCacheKey(origin.providerId, origin.source.id, catalogId),
-      resolve: () => origin.source.resolveAsset(catalogId, 'place'),
-    };
+    // The ONE resolver (plan-780 R1/R3).
+    const r = resolveDocumentRef(ref, scope);
+    return 'hit' in r ? sourceOfHit(r.hit) : null;
   }
 
   /**
    * The chain key of a reference: its source key, else its bare identity (F13).
-   * A qualified reference keys by (library, document) even while its library is
+   * A strict reference keys by (library, document) even while its library is
    * not ready — two libraries' equal document ids are two assets (plan-778).
    */
-  keyOf(ref: PlacementRef): string {
-    return this.sourceOf(ref)?.key ?? (isQualifiedRef(ref) ? qualifiedKeyOf(ref) : assetKeyOf(ref));
+  keyOf(ref: PlacementRef, scope: DocumentScope): string {
+    return this.sourceOf(ref, scope)?.key ?? (isStrictDocumentRef(ref, scope) ? strictKeyOf(ref, scope) : assetKeyOf(ref));
   }
 
   /**
@@ -912,13 +971,17 @@ export class PlacementInstancer {
    */
   resolveBaked(
     ref: PlacementRef,
-    opts?: { signal?: AbortSignal; overrides?: AssetOverrides | null },
+    opts?: { signal?: AbortSignal; overrides?: AssetOverrides | null; scope?: DocumentScope },
   ): Promise<BakedAsset> {
-    if (isQualifiedRef(ref)) return this._resolveQualifiedBaked(ref, opts);
-    const source = this.sourceOf(ref) ?? this._fallbackSource(ref);
+    const scope = opts?.scope ?? null;
+    if (isStrictDocumentRef(ref, scope)) return this._resolveStrictBaked(ref, scope, opts);
+    const source = this.sourceOf(ref, scope) ?? this._fallbackSource(ref, scope);
     if (!source) {
+      // A strict verdict (ambiguous legacy path) is reported with its reason.
+      const r = ref.catalogId ? resolveDocumentRef(ref, scope) : null;
+      if (r && 'missing' in r && r.strict) return Promise.reject(new Error(r.reason));
       return Promise.reject(new Error(
-        ref.catalogId?.startsWith(PROJECT_PLACEMENT_PREFIX)
+        isProjectDocumentId(ref.catalogId ?? '')
           ? `Project asset "${ref.catalogId}" is not in the active project.`
           : `Entry "${ref.catalogId}" has no glbUrl and no registry origin.`,
       ));
@@ -931,22 +994,18 @@ export class PlacementInstancer {
   }
 
   /**
-   * plan-778 F4: the baked asset of a QUALIFIED reference. Waits for its ONE
-   * library while that is pending (never for any other source), then resolves
-   * there or rejects — never the host fallback, the open project's manifest or
-   * a path. A rejection is not cached (the cache only keeps settled bakes), so
-   * a later attempt after the library became ready bakes normally (F8).
+   * plan-778 F4 / plan-780 R1: the baked asset of a STRICT reference. Waits for
+   * its ONE library, then resolves there or rejects — never a fallback. A
+   * rejection is not cached, so a later attempt bakes normally (F8).
    */
-  private async _resolveQualifiedBaked(
+  private async _resolveStrictBaked(
     ref: PlacementRef,
+    scope: DocumentScope,
     opts?: { signal?: AbortSignal; overrides?: AssetOverrides | null },
   ): Promise<BakedAsset> {
-    const source = await findWhenQualifiedSourceSettled(ref, () => this.sourceOf(ref));
-    if (!source) {
-      throw new Error(qualifiedSourceState(ref) === 'ready'
-        ? `Document "${ref.catalogId}" is not in library "${ref.sourceId}".`
-        : `Library "${ref.sourceId}" is not available — "${ref.catalogId}" cannot be placed.`);
-    }
+    const r = await resolveDocumentRefSettled(ref, scope);
+    if (!('hit' in r)) throw new Error(unresolvedReason(ref, r));
+    const source = sourceOfHit(r.hit);
     const parametric = parametricRequestsOf(opts?.overrides);
     return this.modelCache.getOrLoadBaked(source.key, source.resolve, {
       signal: opts?.signal,
@@ -958,13 +1017,18 @@ export class PlacementInstancer {
    * The host's resolver as a source (plan-757 Phase 2b, `deps.resolveReference`)
    * for a reference {@link sourceOf} cannot place: keyed by the reference's
    * bare identity (the same key {@link keyOf} gives it), transport = whatever
-   * the host resolves. `null` without a host resolver or an identity.
+   * the host resolves. `null` without a host resolver or an identity, and for a
+   * strict or ambiguous reference (plan-780 D2, contract node-identity 4).
    */
-  private _fallbackSource(ref: PlacementRef): PlacementSource | null {
-    if (isQualifiedRef(ref)) return null;   // plan-778 F4: strict — no host fallback
+  private _fallbackSource(ref: PlacementRef, scope: DocumentScope): PlacementSource | null {
+    if (isStrictDocumentRef(ref, scope)) return null;
     const resolve = this._deps.resolveReference;
     const key = assetKeyOf(ref);
     if (!resolve || !key) return null;
+    if (ref.catalogId) {
+      const r = resolveDocumentRef(ref, scope);
+      if ('missing' in r && r.strict) return null;
+    }
     return {
       key,
       resolve: async () => {
@@ -976,16 +1040,17 @@ export class PlacementInstancer {
   }
 
   /** The cached baked asset of a reference, if it is warm and alive (no load). */
-  peekBaked(ref: PlacementRef): BakedAsset | undefined {
-    const source = this.sourceOf(ref);
+  peekBaked(ref: PlacementRef, scope: DocumentScope = null): BakedAsset | undefined {
+    const source = this.sourceOf(ref, scope);
     const baked = source ? this.modelCache.peekBaked(source.key) : undefined;
     return baked && !baked.disposed ? baked : undefined;
   }
 
   /** Warm the caches for a reference — fire-and-forget, never rejects. */
-  prefetch(ref: PlacementRef, opts?: { bake?: boolean }): void {
-    const source = this.sourceOf(ref);
+  prefetch(ref: PlacementRef, opts?: { bake?: boolean; scope?: DocumentScope }): void {
+    const source = this.sourceOf(ref, opts?.scope ?? null);
     if (!source) return;
+
     if (source.resolve) this.modelCache.prefetchResolved(source.key, source.resolve, opts);
     else this.modelCache.prefetch(source.key, opts);
   }
@@ -997,8 +1062,8 @@ export class PlacementInstancer {
    * clone of the pruned template, so it carries every triangle of the asset but
    * not its source CAD hierarchy. Whoever needs that asks {@link decodeFreshModel}.
    */
-  loadModel(ref: PlacementRef, opts?: { signal?: AbortSignal }): Promise<Group> {
-    const source = this.sourceOf(ref);
+  loadModel(ref: PlacementRef, opts?: { signal?: AbortSignal; scope?: DocumentScope }): Promise<Group> {
+    const source = this.sourceOf(ref, opts?.scope ?? null);
     if (!source) return Promise.reject(new Error(`Entry "${ref.catalogId}" has no glbUrl and no registry origin.`));
     return source.resolve
       ? this.modelCache.getOrLoadResolved(source.key, source.resolve, opts)
@@ -1013,35 +1078,41 @@ export class PlacementInstancer {
    * every time by design — its callers either edit the tree or consume it, so
    * handing two of them the same object would be a bug, not a saving.
    */
-  decodeFreshModel(ref: PlacementRef, opts?: { signal?: AbortSignal }): Promise<Group> {
-    const source = this.sourceOf(ref);
+  decodeFreshModel(ref: PlacementRef, opts?: { signal?: AbortSignal; scope?: DocumentScope }): Promise<Group> {
+    const source = this.sourceOf(ref, opts?.scope ?? null);
     if (!source) return Promise.reject(new Error(`Entry "${ref.catalogId}" has no glbUrl and no registry origin.`));
     return this.modelCache.decodeFresh(source.key, source.resolve, opts);
   }
 
   /** Drop the decoded master + bakes of a reference (editor-save invalidation). */
-  invalidate(ref: PlacementRef): void {
-    const source = this.sourceOf(ref);
+  invalidate(ref: PlacementRef, scope: DocumentScope = null): void {
+    const source = this.sourceOf(ref, scope);
     if (source) this.modelCache.invalidate(source.key);
   }
 
   /**
    * plan-774 F6 — a DOCUMENT was written (`document-saved`): retire every
    * cache entry baked from it, so the next placement of it (a Back after a
-   * descend-save above all) bakes the new bytes. Keys come from the ONE
-   * derivation ({@link keyOf}): the document as a project placement
-   * (`project:<path>`) and by its manifest id; plus every entry the cache holds
-   * whose key or source url ends in the document's path (a reference that named
-   * the file by a relative path is keyed by its url). Over-matching costs a
-   * re-bake, never a wrong picture. Returns the keys invalidated.
+   * descend-save above all) bakes the new bytes. Keyed by document id (plan-780
+   * R3) in `doc.scope` (absent: every loaded library holding it), plus entries
+   * whose key or url ends in the path. Over-matching costs a re-bake, never a
+   * wrong picture. Returns the keys invalidated.
    */
-  invalidateDocument(doc: { documentId?: string | null; relPath?: string | null }): string[] {
+  invalidateDocument(doc: { documentId?: string | null; relPath?: string | null; scope?: DocumentScope }): string[] {
     const path = (doc.relPath ?? '').replace(/\\/g, '/').replace(/^\/+/, '');
     const keys = new Set<string>();
-    for (const catalogId of [path ? `${PROJECT_PLACEMENT_PREFIX}${path}` : '', doc.documentId ?? '']) {
-      if (!catalogId) continue;
-      const key = this.keyOf({ catalogId, glbUrl: '' });
+    const documentId = doc.documentId ?? '';
+    if (documentId) {
+      const key = this.keyOf({ catalogId: documentId, glbUrl: '' }, doc.scope ?? null);
       if (key) keys.add(key);
+      if (doc.scope === undefined) {
+        for (const { providerId, source } of listLibrarySources()) {
+          if (providerId !== LIBRARY_PROJECTS_PROVIDER_ID || !source.loaded) continue;
+          let held = false;
+          try { held = source.getEntry(documentId) !== null; } catch { held = false; }
+          if (held) keys.add(resolvedCacheKey(providerId, source.id, documentId));
+        }
+      }
     }
     if (path && this._cache) {
       for (const e of this._cache.knownEntries()) {
@@ -1165,10 +1236,17 @@ export class PlacementInstancer {
     for (const e of entries) {
       if (!getDeferredPlacement(e.node) || this._materializing.has(e.id)) continue;
       clearDeferredPlacement(e.node);
+      // plan-780 R1/R2: the entry's own scope decides; a pending strict ref resolves in `_materializeOne`.
+      const scope = e.scope ?? null;
+      if (isStrictDocumentRef(e.ref, scope)) {
+        const r = resolveDocumentRef(e.ref, scope);
+        const effective = 'hit' in r ? effectiveRefOf(r.hit) : null;
+        if (effective) e.ref = effective;
+      }
       // plan-612 #149: still a placement root for the signal scope while its
       // asset bakes (`rv-instance-scope` reads it; the stamp removes it).
       e.node.userData[PLACEMENT_PENDING_KEY] = true;
-      const key = isQualifiedRef(e.ref) ? qualifiedKeyOf(e.ref) : (e.ref.catalogId || e.ref.glbUrl || e.id);
+      const key = isStrictDocumentRef(e.ref, scope) ? strictKeyOf(e.ref, scope) : (e.ref.catalogId || e.ref.glbUrl || e.id);
       const group = groups.get(key);
       if (group) group.push(e); else groups.set(key, [e]);
       queued++;
@@ -1302,13 +1380,22 @@ export class PlacementInstancer {
     const overrides = getAssetOverrides(entry.node) ?? hooks?.overridesOf?.(entry) ?? null;
     const missing = hooks?.missing ?? this._deps.missingDefault;
 
+    const scope = entry.scope ?? null;
     let baked: BakedAsset;
     try {
-      const isProject = entry.ref.catalogId.startsWith(PROJECT_PLACEMENT_PREFIX);
-      // plan-778 F4: a qualified reference never takes the host's url fallback.
-      const url = !isProject && !isQualifiedRef(entry.ref) && hooks?.resolveUrl ? await hooks.resolveUrl(entry) : undefined;
+      // plan-780 R1: wait for the deciding library (pending is never a verdict).
+      if (isStrictDocumentRef(entry.ref, scope) && !isQualifiedRef(entry.ref)) {
+        const r = await resolveDocumentRefSettled(entry.ref, scope);
+        if (generation !== this._generation) return;
+        const effective = 'hit' in r ? effectiveRefOf(r.hit) : null;
+        if (!effective) throw new Error(unresolvedReason(entry.ref, r));
+        entry.ref = effective;
+      }
+      const isProject = isProjectDocumentId(entry.ref.catalogId);
+      // plan-778 F4: a strict reference never takes the host's url fallback.
+      const url = !isProject && !isStrictDocumentRef(entry.ref, scope) && hooks?.resolveUrl ? await hooks.resolveUrl(entry) : undefined;
       if (generation !== this._generation) return;
-      baked = await this.resolveBaked(url ? { ...entry.ref, url } : entry.ref, { overrides });
+      baked = await this.resolveBaked(url ? { ...entry.ref, url } : entry.ref, { overrides, scope });
     } catch (err) {
       if (generation !== this._generation) return;
       this._flushRouted(entry.occurrence, 'placement-missing');
@@ -1354,6 +1441,8 @@ export class PlacementInstancer {
       chain: entry.chain, depth: entry.depth, chainState: entry.chainState,
       occurrence: entry.occurrence, nestedOf: entry.nestedOf,
       paramDepth: entry.paramDepth, paramRoot: entry.paramRoot,
+      // plan-780 2.1: nested refs resolve in the source the content came from.
+      scope: scopeOfQualifiedRef(entry.ref) ?? contentScopeOf(baked.assetId, scope),
     }, hooks);
     this._materialized++;
     // F11: a throwing host registration neither loses the instance nor its
@@ -1474,9 +1563,6 @@ export class PlacementInstancer {
     return n;
   }
 
-  /** plan-778: asset key → the library it comes from — the scope of its nested references. */
-  private readonly _libraryOfKey = new Map<string, { providerId: string; sourceId: string }>();
-
   /** F14: the template's reference nodes of `baked`, memoised per asset. */
   private _templateReferenceNodesOf(baked: BakedAsset): readonly Object3D[] {
     let refs = this._templateRefs.get(baked);
@@ -1516,13 +1602,15 @@ export class PlacementInstancer {
     };
     // A re-materialised OUTERMOST placement starts its child budget afresh.
     if (spec.nestedOf === undefined) this._paramTree.delete(spec.id);
+    // plan-780 2.1: scope of this content; a live drop / copy reads it off the bake key.
+    const scope: DocumentScope = spec.scope !== undefined ? spec.scope : contentScopeOf(baked.assetId, null);
     const { entries, refused } = collectNestedReferences(parent, {
       parentKey: baked.assetId,
       parentUrl: baked.url,
       parentState: baked.signatureState,
-      keyOf: (ref) => this.keyOf(ref),
+      keyOf: (ref) => this.keyOf(ref, scope),
       nodes,
-      parentLibrary: this._libraryOfKey.get(baked.assetId),
+      scope,
     });
     // plan-650 Phase 5b: the aggregated child budget of the placement tree.
     const budgeted: DeferredPlacementEntry[] = [];
@@ -1531,7 +1619,7 @@ export class PlacementInstancer {
         const tally = this._paramTreeOf(e.paramRoot);
         if (tally.placements >= this.maxParametricTreePlacements) {
           refused.push({ reason: 'parametric-budget', node: e.node, label: e.label, ref: e.ref,
-            assetKey: this.keyOf(e.ref), chain: e.chain ?? [], depth: e.depth ?? 0 });
+            assetKey: this.keyOf(e.ref, e.scope ?? null), chain: e.chain ?? [], depth: e.depth ?? 0 });
           continue;
         }
         tally.placements++;
@@ -1588,7 +1676,7 @@ export class PlacementInstancer {
     if (tally.vertices + baked.vertices > this.maxParametricTreeVertices) {
       try {
         this._deps.onNestedRefused?.({ reason: 'parametric-budget', node: entry.node, label: entry.label, ref: entry.ref,
-          assetKey: this.keyOf(entry.ref), chain: entry.chain ?? [], depth: entry.depth ?? 0 });
+          assetKey: this.keyOf(entry.ref, entry.scope ?? null), chain: entry.chain ?? [], depth: entry.depth ?? 0 });
       } catch (err) {
         console.warn(`[PlacementInstancer] onNestedRefused failed: ${err}`);
       }
@@ -1613,18 +1701,22 @@ export class PlacementInstancer {
    */
   private _recordUnresolved(entry: DeferredPlacementEntry, hooks: DeferredPlacementHooks | undefined): void {
     if (!entry.ref.catalogId) return;
-    this._unresolved.set(entry.id, { entry, hooks, generation: this._generation, source: this._registrySourceOf(entry.ref) });
+    this._unresolved.set(entry.id, { entry, hooks, generation: this._generation, source: this._registrySourceOf(entry) });
     if (!this._unsubSources) {
       this._unsubSources = subscribeLibrarySources(() => this._reresolveUnresolved());
     }
   }
 
-  /** The registry answer as a key (null = none), never source identity — providers rebuild sources per notify (review C5). */
-  private _registrySourceOf(ref: PlacementRef): string | null {
-    const r = isQualifiedRef(ref)
-      ? findQualifiedOrigin({ assetId: ref.catalogId, providerId: ref.providerId, sourceId: ref.sourceId })?.registered
-      : findRegistryOrigin(ref.catalogId, ref);
-    return r ? `${r.providerId}|${r.source.id}|${r.source.loaded}|${r.source.error ?? ''}` : null;
+  /**
+   * The registry answer for an entry as a key (null = none), never source
+   * identity — providers rebuild sources per notify (review C5). Scope-aware
+   * (plan-780 R1), so a pending library brings the placement back on settle.
+   */
+  private _registrySourceOf(entry: DeferredPlacementEntry): string | null {
+    const r = resolveDocumentRef(entry.ref, entry.scope ?? null);
+    if (!('hit' in r)) return null;
+    const { providerId, source } = r.hit.registered;
+    return `${providerId}|${source.id}|${source.loaded}|${source.error ?? ''}`;
   }
 
   /**
@@ -1641,7 +1733,7 @@ export class PlacementInstancer {
     const byHooks = new Map<DeferredPlacementHooks | undefined, DeferredPlacementEntry[]>();
     for (const [id, u] of [...this._unresolved]) {
       if (u.generation !== this._generation) { this._unresolved.delete(id); continue; }
-      const now = this._registrySourceOf(u.entry.ref);
+      const now = this._registrySourceOf(u.entry);
       if (!now || now === u.source) continue;
       const node = u.entry.node;
       const isLive = u.hooks?.isLive ?? this._deps.isLive;

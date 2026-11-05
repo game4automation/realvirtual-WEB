@@ -55,6 +55,8 @@ function makeEnv(opts?: {
   loadImpl?: (call: LoadCall) => Promise<void>;
   /** plan-774 F3: what `whenSceneReady()` does (default: resolve at once). */
   readyImpl?: () => Promise<void>;
+  /** plan-780: the project of the open document (`viewer.currentModelScope`). */
+  scope?: { providerId: string; sourceId: string } | null;
 }) {
   const scene = new Scene();
   const model = new Group();
@@ -89,6 +91,7 @@ function makeEnv(opts?: {
     signalStore: null,
     transportManager: null,
     get currentModelRoot() { return currentRoot; },
+    get currentModelScope() { return opts?.scope ?? null; },
     markRenderDirty() {},
     markShadowsDirty() {},
     rebuildGroupedBvh() {},
@@ -280,6 +283,30 @@ describe('InPlaceTestSession — start', () => {
     await session.stop();
     expect(doc.isAutosaveSuspended).toBe(false);
     doc.dispose();
+  });
+});
+
+describe('InPlaceTestSession — plan-780 R2: the run and the restore keep the document project', () => {
+  it('a library document is tested AND restored in its library (its parts keep resolving there)', async () => {
+    const scope = { providerId: 'library-projects', sourceId: 'prj_b' };
+    const env = makeEnv({ scope });
+    const doc = scratchAssetDocument(env.viewer);
+    const { session } = makeSession(env, doc);
+    await session.start();
+    await session.stop();
+    expect(env.loads).toHaveLength(2);
+    expect((env.loads[0].options as { library?: unknown } | undefined)?.library).toEqual(scope);
+    expect((env.loads[1].options as { library?: unknown } | undefined)?.library).toEqual(scope);
+  });
+
+  it('a document of the open project passes no library', async () => {
+    const env = makeEnv();
+    const doc = scratchAssetDocument(env.viewer);
+    const { session } = makeSession(env, doc);
+    await session.start();
+    await session.stop();
+    expect((env.loads[0].options as { library?: unknown } | undefined)?.library).toBeUndefined();
+    expect((env.loads[1].options as { library?: unknown } | undefined)?.library).toBeUndefined();
   });
 });
 

@@ -7,9 +7,11 @@
  * on user decision 2026-08-07).
  *
  * The manager publishes the CURRENT pair list on every change — grow AND
- * shrink. There is no `open` flag and no acknowledgement round-trip anymore:
- * a collision card lives exactly as long as the geometry actually intersects,
- * the same lifecycle as the `ErrorStore` entries next to it. The store
+ * shrink. There is no `open` flag and no modal round-trip anymore. A card
+ * LATCHES: it stays after the geometry separates, until its OK (acknowledge),
+ * "ignore type", a `ResetCollisions` edge or a model change removes it (user
+ * decisions 2026-08-07). Start overlaps and still-still overlaps never become a
+ * card at all — they are listed in the Problems panel (plan-781). The store
  * publishes an **immutable snapshot with a version counter** —
  * `useSyncExternalStore` compares snapshots by identity, so every change must
  * arrive as a new object.

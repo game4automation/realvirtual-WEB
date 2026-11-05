@@ -87,7 +87,9 @@ export function toCatalogEntry(doc: RvDocumentEntry, opts: ToCatalogEntryOptions
     : [];
   const keyBy = opts.keyBy ?? 'path';
   const entry: LibraryCatalogEntry = {
-    id: keyBy === 'document' && documentId ? documentId : `project:${path}`,
+    // Contract documents-projects 4: a document is addressed by its id; the path form
+    // is only the key of a row without one (and stays readable for old files).
+    id: documentId ?? `project:${path}`,
     name: label || authored || stem.replace(/[_-]/g, ' '),
     category: 'custom',
     glbUrl: '',
@@ -174,7 +176,7 @@ export function indexProjectEntries(
   const byId = new Map<string, LibraryCatalogEntry>();
   const byAlias = new Map<string, LibraryCatalogEntry>();
   if ((opts.keyBy ?? 'path') === 'path') {
-    for (const e of entries) if (e.documentId) byId.set(e.documentId, e);
+    for (const e of entries) if (e.localPath) byId.set(`project:${e.localPath}`, e);   // legacy references
     for (const e of entries) byId.set(e.id, e);
   } else {
     for (const e of entries) byId.set(e.id, e);

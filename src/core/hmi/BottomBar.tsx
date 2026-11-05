@@ -40,6 +40,7 @@ import { SearchAiDialog } from './SearchAiDialog';
 import { groupSearchResults, flattenGroupedResults } from './search-result-grouping';
 import { isUnclaimedSearchShortcut } from './search-shortcut';
 import { useRegisteredSearchActions } from './search-action-registry';
+import { isRecordingMode } from '../recording-mode';
 
 const DEBOUNCE_MS = 250;
 const ASK_AI_TOOLTIP = 'Ask the machine documentation (AI)';
@@ -706,7 +707,7 @@ export function BottomBar() {
                       )}
                       {/* Focus button (touch alternative to Enter) */}
                       {filter && filteredNodes.length > 0 && (
-                        <IconButton size="small" onClick={handleFocus} sx={{ p: 0.25 }} title="Focus camera (Enter)">
+                        <IconButton size="small" onClick={handleFocus} sx={{ p: 0.25 }} title={isRecordingMode() ? undefined : 'Focus camera (Enter)'} aria-label="Focus camera (Enter)">
                           <CenterFocusStrong sx={{ fontSize: 16, color: 'primary.main' }} />
                         </IconButton>
                       )}

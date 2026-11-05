@@ -28,6 +28,7 @@ export function agvZoneScenario(mode: Mode, opts: { disableStep4?: boolean } = {
     const fleet = getDefaultAgvFleet();
     wiring = new ProgressWiring({ fleet, transport: new RVTransportManager(),
       clock: { now: () => world!.now() }, running: () => true, authority: () => world!.mb });
+    world.bindDiagnostics?.(wiring.ledger, wiring.waitRegistry);
     getDefaultPathDockRegistry().register('S1', { onVehicleArrive: (_id, release) => release() });
     fleet.get('A')!.assign({ destination: 'R1' }); fleet.get('B')!.assign({ destination: 'R1' });
     const trySwitch = (tries: number): void => {

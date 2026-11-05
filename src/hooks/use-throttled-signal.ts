@@ -62,8 +62,13 @@ export function useThrottledSignalValue(
     };
 
     const unsubscribe = store.subscribe(name, onChange);
+    const offRestore = store.onValuesRestored?.(() => {
+      const v = store.get(name);
+      if (v !== undefined) onChange(v);
+    });
     return () => {
       unsubscribe();
+      offRestore?.();
       clearDirty(flush);
     };
   }, [store, name]);

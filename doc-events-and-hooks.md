@@ -111,7 +111,8 @@ plan-680, imported on demand when the workspace enters DES or a model carries DE
 Use `model-loaded` for geometry/HMI state. Executable model logic must wait for
 `model-logic-activated`, which respects the signature gate; `signature-state-changed`
 reports changes to that gate. `raycast-ready` means the asynchronous three-mesh-bvh
-trees (collision, transport, instance pick) are ready — a baked model's own pick
+trees (transport, instance pick) are ready — collision reads the bake's pick
+structure and does not wait for it (plan-781); a baked model's own pick
 structure exists before the scene is shown — not that the first interaction must
 wait. `document-saved` invalidates cached
 bytes after a successful write, independent of the document's folder — every save
@@ -246,7 +247,7 @@ context. It receives a fixed set of collaborators, split into always-present and
 | | `componentEventDispatcher` — hover/click/select routing |
 | | `events` — `EventEmitter<ViewerEvents>` |
 | | `energyChainManager` — energy-chain rigs (plan-362) |
-| | `collisionManager` — `CollisionRole` registrar (plan-394) |
+| | `collisionManager` — `CollisionRole` registrar (plan-394); since plan-781 F21 the viewer's registrar slot, which buffers until the on-demand `collision` feature installs the manager |
 | | `expectSceneReady` — `true` when `onSceneReady()` will still run on this load path |
 
 Note that `events` and `componentEventDispatcher` are **optional**, so a component that wants to

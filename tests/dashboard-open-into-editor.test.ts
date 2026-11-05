@@ -22,7 +22,7 @@
  *     identity as a pending open, exactly like the catalog's "Edit asset".
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 const calls: string[] = [];
 
@@ -43,9 +43,13 @@ vi.mock('../src/core/editor/active-asset-store', async (original) => {
 });
 
 import {
+  dashboardAssetOpenBase,
   openDocumentAsWorkingScene,
 } from '../src/core/hmi/projects/ProjectsDashboardHost';
 import type { TieredDocumentEntry } from '../src/core/project/rv-project-tiers';
+import { LibraryProjectLoader, setLibraryProjectLoader } from '../src/core/library/library-project-loader';
+import { libraryDocumentBaseOf } from '../src/core/library/library-document-edit';
+import { LIBRARY_PROJECTS_PROVIDER_ID } from '../src/core/library/library-origin';
 
 const DOCS = [
   { id: 'doc_ddd', name: 'ddd', path: 'ddd.glb', section: 'library' },
@@ -131,5 +135,48 @@ describe('openDocumentAsWorkingScene — editor not active', () => {
       // `documentId` alone, and the funnel's own write carries the path.
       'identity:{"kind":"document","documentId":"doc_ddd","path":"","name":"ddd"}',
     ]);
+  });
+});
+
+// ─── plan-780 2.3: a library entry opens as `libraryDocument` (scoped to B) ──
+
+describe('dashboardAssetOpenBase — the base an asset entry opens with (plan-780 2.3)', () => {
+  const LIB = { providerId: LIBRARY_PROJECTS_PROVIDER_ID, sourceId: 'prj_b', assetId: 'doc_pump' };
+
+  function readyLibrary(documents: Array<{ id: string; path: string; name?: string }>): void {
+    const loader = new LibraryProjectLoader({
+      factory: { folder: () => null as never, browser: () => null, remote: () => null as never },
+      builtinBaseUrl: () => null,
+    });
+    (loader as unknown as { _nodes: Map<string, unknown> })._nodes.set('prj_b', {
+      projectId: 'prj_b', label: 'SharedConveyors', direct: true, placeable: true, neededBy: [], depth: 1,
+      state: { kind: 'ready', via: 'folder', backend: null, project: null, documents },
+    });
+    setLibraryProjectLoader(loader);
+  }
+
+  afterEach(() => setLibraryProjectLoader(null));
+
+  it('a library entry → `libraryDocument` base naming B (never the open project\'s row)', () => {
+    readyLibrary([{ id: 'doc_pump', path: 'models/pump.glb', name: 'Pump' }]);
+    expect(dashboardAssetOpenBase(LIB, 'Pump', null, libraryDocumentBaseOf)).toEqual({
+      kind: 'libraryDocument', libraryProjectId: 'prj_b', documentId: 'doc_pump',
+      path: 'models/pump.glb', name: 'Pump', libraryLabel: 'SharedConveyors',
+    });
+  });
+
+  it('a library entry B no longer lists falls back to the provider asset (no guessed row)', () => {
+    readyLibrary([]);
+    expect(dashboardAssetOpenBase(LIB, 'Pump', null, libraryDocumentBaseOf)).toEqual({
+      kind: 'providerAsset', providerId: LIBRARY_PROJECTS_PROVIDER_ID, sourceId: 'prj_b', assetId: 'doc_pump', label: 'Pump',
+    });
+  });
+
+  it('the project\'s own row opens as a `document`; another provider\'s entry as `providerAsset`', () => {
+    expect(dashboardAssetOpenBase({ providerId: 'project', sourceId: 'prj_a', assetId: 'doc_a' }, 'A',
+      { id: 'doc_a', name: 'Alpha', path: 'models/a.glb' }, libraryDocumentBaseOf))
+      .toEqual({ kind: 'document', documentId: 'doc_a', path: 'models/a.glb', name: 'Alpha' });
+    expect(dashboardAssetOpenBase({ providerId: 'global', sourceId: 'cat', assetId: 'x' }, 'X', null, libraryDocumentBaseOf))
+      .toEqual({ kind: 'providerAsset', providerId: 'global', sourceId: 'cat', assetId: 'x', label: 'X' });
   });
 });

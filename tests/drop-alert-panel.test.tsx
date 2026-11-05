@@ -127,7 +127,7 @@ describe('DropAlertPanel (plan-2022)', () => {
     expect(screen.getAllByTestId('drop-card').length).toBe(1);
   });
 
-  it('OK removes exactly this card, and it returns while the part is still free', async () => {
+  it('OK removes exactly this card and deletes its part (Thomas 2026-11-04)', async () => {
     const w = makeWorld();
     const a = part('Box_A', 'Source_A');
     const b = part('Box_B', 'Source_B');
@@ -137,10 +137,12 @@ describe('DropAlertPanel (plan-2022)', () => {
 
     await userEvent.click(screen.getAllByTestId('drop-ok')[0]);
     await waitFor(() => expect(screen.getAllByTestId('drop-card').length).toBe(1));
+    const removed = [a, b].filter((m) => m.markedForRemoval);
+    expect(removed.length).toBe(1);
 
-    // Still unsupported → the detector reports it again on the next tick.
+    // The acknowledged part is on its way out of the scene: it is never reported again.
     w.run(0.2, [a, b]);
-    await waitFor(() => expect(screen.getAllByTestId('drop-card').length).toBe(2));
+    await waitFor(() => expect(screen.getAllByTestId('drop-card').length).toBe(1));
   });
 
   it('Ignore <Source> mutes every part of that source for the rest of the run', async () => {

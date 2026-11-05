@@ -25,6 +25,7 @@ import type { NodeRegistry } from './engine/rv-node-registry';
 import type { RVDrive } from './engine/rv-drive';
 import type { RVTransportSurface } from './engine/rv-transport-surface';
 import type { ModeId } from './rv-mode-manager';
+import type { SimEventFacade } from './sim-event-facade';
 
 // TickStage wird in Phase 0 bereits in rv-tick-stages.ts definiert — Re-Export hier
 // damit Plugin-Autoren `import { TickStage } from '@rv/core/rv-plugin-context'` nutzen können.
@@ -109,6 +110,7 @@ export interface SimLoopFacade {
   readonly driveCount: number;
 }
 
+import type { StageRecordCapabilities } from './usd/stage-record-types';
 // ─── Hauptinterface: PluginContext ────────────────────────────────────────
 
 /**
@@ -126,12 +128,18 @@ export type PluginSignalFacade =
   Pick<SignalStore, 'get' | 'subscribe'>
   & Pick<SignalWriter, 'set' | 'setMany'>;
 
-export interface PluginContext {
+/**
+ * plan-2229: the optional `StageRecordCapabilities` (`stage`, `simTime`,
+ * `simCapture`, `loadGeneration`, `whenSceneReady`) are installed by the USD
+ * feature (`installStageRecordCapabilities`); undefined until it loaded.
+ */
+export interface PluginContext extends StageRecordCapabilities {
+  readonly simEvents: SimEventFacade | null;
   /** Live-Getter: Subset von SignalStore. Null vor loadModel(). */
   readonly signals: PluginSignalFacade | null;
 
   /** Live-Getter: Subset von NodeRegistry. Null vor loadModel(). */
-  readonly nodes: Pick<NodeRegistry, 'getNode' | 'getPathForNode' | 'forEachNode'> | null;
+  readonly nodes: Pick<NodeRegistry, 'getNode' | 'getPathForNode' | 'forEachNode' | 'getAddressForNode'> | null;
 
   /** Typisierter Event-Emitter. RVViewer extends EventEmitter<ViewerEvents>, also kein Cast nötig. */
   readonly events: EventEmitter<ViewerEvents>;
@@ -179,6 +187,10 @@ import type { RVViewer } from './rv-viewer';
  * `events` getter returns the viewer directly with the correct type.
  */
 export class PluginContextImpl implements PluginContext {
+  get simEvents(): SimEventFacade | null {
+    const kernel = this._viewer.simulationKernel;
+    return kernel?.mode === 'des' ? kernel.activeExecutor.simEvents ?? null : null;
+  }
   readonly scene: SceneFacade;
   readonly camera: CameraFacade;
   readonly controls: ControlsFacade;
@@ -234,7 +246,7 @@ export class PluginContextImpl implements PluginContext {
     return new PluginContextImpl(this._viewer, pluginId, pluginSignalWriterKind(pluginId));
   }
 
-  get nodes(): Pick<NodeRegistry, 'getNode' | 'getPathForNode' | 'forEachNode'> | null {
+  get nodes(): Pick<NodeRegistry, 'getNode' | 'getPathForNode' | 'forEachNode' | 'getAddressForNode'> | null {
     return this._viewer.registry;
   }
 

@@ -816,6 +816,7 @@ export class OperatorPanelController implements OperatorPanelSource {
     const sync = () => this._sync();
     for (const name of this._signals) this._cleanups.push(store.subscribe(name, sync));
     for (const name of this._analog) this._cleanups.push(store.subscribe(name, sync));
+    this._cleanups.push(store.onValuesRestored(sync));
     const mode = viewer.connectionMode;
     if (mode) this._cleanups.push(mode.subscribe(sync));
     this._sync();

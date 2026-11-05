@@ -5,6 +5,9 @@ import { agvZoneScenario } from '../helpers/agv-zone-scenario';
 import { runBlockageChecker } from '../../src/core/diagnostics/rv-blockage-checker';
 import { enumerateCycles } from '../../src/core/diagnostics/rv-blockage-probes';
 
+/** plan-2241: a DES vehicle is the ledger unit `des:<path>`; its fleet-id edges resolve onto it. */
+const unit = (mode: string, id: string): string => mode === 'continuous' ? id : `des:${id}`;
+
 it.each(['continuous', 'fastforward'] as const)('finds the real stale-hold deadlock (%s)', mode => {
   const sc = agvZoneScenario(mode, { disableStep4: true });
   try {
@@ -16,7 +19,8 @@ it.each(['continuous', 'fastforward'] as const)('finds the real stale-hold deadl
       return runBlockageChecker(ctx);
     });
     expect(report.findings).toHaveLength(1);
-    expect(report.findings[0]).toMatchObject({ cls: 'deadlock', chain: ['A', 'M1', 'B', 'M2', 'A'], budgetSource: 'default' });
+    expect(report.findings[0]).toMatchObject({ cls: 'deadlock', budgetSource: 'default',
+      chain: [unit(mode, 'A'), 'M1', unit(mode, 'B'), 'M2', unit(mode, 'A')] });
     expect(report.coverage.missing).toEqual([]);
     console.info('follow/zone coverage', mode, report.coverage);
   } finally { sc.dispose(); }
@@ -33,11 +37,11 @@ it.each(['continuous', 'fastforward'] as const)('stale-hold release: no deadlock
     console.info('follow coverage', mode, coverage);
     expect(coverage.missing).toEqual([]);
     sc.inspect(ctx => expect(ctx.registry.collect(ctx.now)).toContainEqual(expect.objectContaining({
-      waiterId: 'A', resourceId: 'leader:B', ownerIds: ['B'], kind: 'follow', analysed: true,
+      waiterId: unit(mode, 'A'), resourceId: 'leader:B', ownerIds: [unit(mode, 'B')], kind: 'follow', analysed: true,
     })));
     expect(findings.filter(f => f.cls === 'deadlock')).toEqual([]);
     expect(findings).toHaveLength(1);
-    expect(findings[0]).toMatchObject({ cls: 'stall', chain: ['A', 'leader:B', 'B'] });
+    expect(findings[0]).toMatchObject({ cls: 'stall', chain: [unit(mode, 'A'), 'leader:B', unit(mode, 'B')] });
     expect(findings[0].checks.map(c => c.name)).toContain('wait-edge');
   } finally { sc.dispose(); }
 }, 180000);

@@ -33,11 +33,11 @@ import { nodeRegistryDouble } from './fixtures/node-registry-double';
 // irrelevant to every case in this file, and baking for real would need a live
 // Three.js scene — which is exactly what the fake viewer exists to avoid.
 vi.mock('../src/core/hmi/scene/rv-scene-glb-bake', () => ({
-  bakeIntoGlb: async () => ({
+  bakeIntoGlb: vi.fn(async () => ({
     glb: new Uint8Array([0x67, 0x6c, 0x54, 0x46, 1, 2, 3, 4]),
     warnings: [],
     writtenReferences: [],
-  }),
+  })),
   makeRegistryBakeResolver: () => ({}),
   bakeRequiresFullPath: () => false,
 }));
@@ -171,6 +171,37 @@ describe('SceneStore', () => {
     fixtureModels = null;
     project?.restore();
     resetProjectStore();
+  });
+
+  describe('JSON-only export preflight', () => {
+    it('reads the base JSON without baking or exporting a document', async () => {
+      await store.openBuiltin('/models/Demo.glb', 'Demo');
+      const exportGlb = vi.spyOn(store, 'exportSceneGlb').mockRejectedValue(new Error('Preflight must not export.'));
+      const { bakeIntoGlb } = await import('../src/core/hmi/scene/rv-scene-glb-bake');
+      vi.mocked(bakeIntoGlb).mockClear();
+      try {
+        expect(await store.documentExportJson()).toMatchObject({ scene: 0, scenes: [{ nodes: [] }] });
+        expect(exportGlb).not.toHaveBeenCalled();
+        expect(bakeIntoGlb).not.toHaveBeenCalled();
+      } finally {
+        exportGlb.mockRestore();
+      }
+    });
+
+    it('refuses a stale base count after edits without falling back to an export', async () => {
+      await store.openBuiltin('/models/Demo.glb', 'Demo');
+      await store.applyOp({
+        id: 'preflight-edit', ts: Date.now(), schemaV: 1, kind: 'setField',
+        nodePath: 'Conv1', componentType: 'Drive', fieldName: 'TargetSpeed', value: 200, prev: 100,
+      });
+      const exportGlb = vi.spyOn(store, 'exportSceneGlb').mockRejectedValue(new Error('Preflight must not export.'));
+      try {
+        await expect(store.documentExportJson()).rejects.toThrow('Placement count is unavailable');
+        expect(exportGlb).not.toHaveBeenCalled();
+      } finally {
+        exportGlb.mockRestore();
+      }
+    });
   });
 
   // ─── Catalogue ────────────────────────────────────────────────────────

@@ -13,6 +13,8 @@ import type { RVZone } from './rv-zone';
 import { debug } from './rv-debug';
 import { scaleSimDt } from './rv-speed-override';
 import { isSignalLiveControlled } from './rv-slot-authority';
+import type { RVLogicEngine } from './rv-logic-engine';
+import { reportProblem } from '../hmi/problems-store';
 
 // ─── Step State ──────────────────────────────────────────────────
 
@@ -33,11 +35,29 @@ export enum StepState {
  * drive an active root took over since.
  */
 export interface LogicRootContext {
+  readonly engine?: RVLogicEngine;
+  readonly root?: RVLogicStep;
   /** Record that `drive` was just commanded by a step of this root. */
   noteDriveCommand(drive: RVDrive): void;
   /** True when the LAST command on `drive` came from a step of this root. */
   isLastCommander(drive: RVDrive): boolean;
 }
+
+function readSignal(step: RVLogicStep, store: SignalStore, path: string): boolean | number | undefined {
+  return step.rootContext?.engine?.eventImage?.get(store.nameForPath(path) ?? path) ?? store.getByPath(path);
+}
+function readFloat(step: RVLogicStep, store: SignalStore, path: string): number {
+  const v = readSignal(step, store, path);
+  return typeof v === 'number' ? v : 0;
+}
+
+const evT = (s: RVLogicStep): number | null => {
+  const e = s.rootContext?.engine;
+  return e ? e.eventTime ?? e.desHooks?.now() ?? null : null;
+};
+const clock = (s: RVLogicStep): number => evT(s) ?? performance.now() / 1000;
+
+export const LOGIC_MAX_INSTANT_TRANSITIONS = 10_000;
 
 /** Optional edge mode of `LogicStep_WaitForSignalBool` (plan-538 F5). */
 export type SignalEdge = 'Level' | 'Rising' | 'Falling';
@@ -160,7 +180,7 @@ export class RVSerialContainer extends RVLogicStep {
   start(): void {
     this.state = StepState.Active;
     this.currentIndex = 0;
-    this.cycleStartTime = performance.now() / 1000;
+    this.cycleStartTime = clock(this);
     if (this.children.length === 0) {
       console.warn(`[LogicStep] SerialContainer "${this.name}" has 0 children — finishing immediately`);
       this.finish();
@@ -173,11 +193,12 @@ export class RVSerialContainer extends RVLogicStep {
     if (this.state !== StepState.Active) return;
     if (this.currentIndex >= this.children.length) return;
 
-    const child = this.children[this.currentIndex];
+    const child = this.children[Math.max(0, this.currentIndex)];
 
     // Update active or waiting child
     if (child.state === StepState.Active || child.state === StepState.Waiting) {
       child.fixedUpdate(dt);
+      if (this.rootContext?.root?.state === StepState.Finished) return;
     }
 
     // Check if child finished -> advance
@@ -188,7 +209,20 @@ export class RVSerialContainer extends RVLogicStep {
       // starting it: a JumpOnSignal moves currentIndex to target-1 inside start(), and re-reading
       // children[currentIndex] afterwards stalled a forward jump on a never-started step and read
       // children[-1] on a jump to the first step.
+      let transitions = 0;
       while (this.currentIndex < this.children.length) {
+        if (++transitions > LOGIC_MAX_INSTANT_TRANSITIONS) {
+          this.finish();
+          this.reason = undefined;
+          const root = this.rootContext?.root ?? this;
+          const t = evT(this);
+          this.rootContext?.engine?.haltRoot(root, 'logic-instant-loop');
+          reportProblem({ id: `logic-instant-loop:${this.hierarchyPath}`, code: 'logic-instant-loop',
+            severity: 'error', title: 'Logic instant transition limit exceeded',
+            detail: `${root.name}: ${this.hierarchyPath}`, nodePath: this.hierarchyPath,
+            at: t === null ? undefined : t * 1000 });
+          return;
+        }
         const next = this.children[this.currentIndex];
         this.startChild(this.currentIndex);
         if (next.state === StepState.Finished) {
@@ -199,7 +233,7 @@ export class RVSerialContainer extends RVLogicStep {
       }
 
       // All children done — record cycle time
-      const cycleTime = performance.now() / 1000 - this.cycleStartTime;
+      const cycleTime = clock(this) - this.cycleStartTime;
       this.cycleTimes.push(cycleTime);
       this.completedCycles++;
       debug('logic', `[${this.name}] cycle #${this.completedCycles} complete (${cycleTime.toFixed(3)}s)`);
@@ -207,7 +241,7 @@ export class RVSerialContainer extends RVLogicStep {
         // Reset all children and restart
         for (const c of this.children) c.reset();
         this.currentIndex = 0;
-        this.cycleStartTime = performance.now() / 1000;
+        this.cycleStartTime = clock(this);
         this.startChild(0);
       } else {
         this.finish();
@@ -276,6 +310,7 @@ export class RVParallelContainer extends RVLogicStep {
     for (const child of this.children) {
       if (child.state === StepState.Active || child.state === StepState.Waiting) {
         child.fixedUpdate(dt);
+        if (this.rootContext?.root?.state === StepState.Finished) return;
         // Re-check state after fixedUpdate (step may have called finish())
         if ((child.state as StepState) === StepState.Finished) {
           this.finishedCount++;
@@ -301,6 +336,7 @@ export class RVParallelContainer extends RVLogicStep {
 export class RVDelay extends RVLogicStep {
   duration: number;
   elapsed = 0;
+  startT = 0;
 
   constructor(duration: number) {
     super();
@@ -316,6 +352,7 @@ export class RVDelay extends RVLogicStep {
   start(): void {
     this.state = StepState.Active;
     this.elapsed = 0;
+    this.startT = evT(this) ?? 0;
     if (this.duration <= 0) {
       this.finish();
     }
@@ -323,8 +360,9 @@ export class RVDelay extends RVLogicStep {
 
   fixedUpdate(dt: number): void {
     if (this.state !== StepState.Active) return;
-    this.elapsed += scaleSimDt(dt);
-    if (this.elapsed >= this.duration) {
+    const t = evT(this);
+    this.elapsed = t === null ? this.elapsed + scaleSimDt(dt) : t - this.startT;
+    if (t === null ? this.elapsed >= this.duration : t - this.startT >= this.duration) {
       this.finish();
     }
   }
@@ -440,7 +478,7 @@ export class RVWaitForSignalBool extends RVLogicStep {
       return;
     }
     // Check immediately
-    if (this.signalStore.getBoolByPath(this.signalAddress) === this.waitForTrue) {
+    if ((readSignal(this, this.signalStore, this.signalAddress) === true) === this.waitForTrue) {
       this.finish();
     }
   }
@@ -456,7 +494,7 @@ export class RVWaitForSignalBool extends RVLogicStep {
       }
       return;
     }
-    if (this.signalStore.getBoolByPath(this.signalAddress) === this.waitForTrue) {
+    if ((readSignal(this, this.signalStore, this.signalAddress) === true) === this.waitForTrue) {
       debug('logic', `WaitForSignalBool "${this.name}": ${this.signalAddress} matched (${this.waitForTrue})`);
       this.finish();
     }
@@ -616,7 +654,7 @@ export class RVDriveTo extends RVLogicStep {
   /** Unity FixedUpdate parity: follow the destination signal while `valueBySignal`. */
   private syncDestinationFromSignal(): void {
     if (!this.valueBySignal) return;
-    this.destination = this.signalStore!.getFloatByPath(this.destinationSignal!);
+    this.destination = readFloat(this, this.signalStore!, this.destinationSignal!);
   }
 
   get progress(): number {
@@ -951,7 +989,7 @@ export class RVWaitForSignalFloat extends RVLogicStep {
 
   private checkCondition(): boolean {
     if (!this.signalAddress) return false;
-    const current = this.signalStore.getFloatByPath(this.signalAddress);
+    const current = readFloat(this, this.signalStore, this.signalAddress);
     switch (this.comparison) {
       case 'GreaterThan':    return current > this.value;
       case 'LessThan':       return current < this.value;
@@ -1078,7 +1116,7 @@ export class RVJumpOnSignal extends RVLogicStep {
       this.state = StepState.Finished;
       return;
     }
-    const value = this.signalStore.getBoolByPath(this.signalAddress);
+    const value = readSignal(this, this.signalStore, this.signalAddress) === true;
     if (value === this.jumpOn && this.parentContainer && this.jumpToStep) {
       const idx = this.parentContainer.children.findIndex(c => c.name === this.jumpToStep);
       if (idx >= 0) {

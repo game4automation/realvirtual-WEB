@@ -212,7 +212,9 @@ import { AxisDiagnosticsManager } from './engine/rv-axis-diagnostics';
 import { clearMjcfProblems } from './engine/rv-mjcf-problems';
 import { WebLabelManager } from './engine/rv-web-label-manager';
 import { SceneButtonManager } from './engine/rv-scene-button-manager';
-import { RVCollisionManager } from './engine/rv-collision-manager';
+// plan-781 F21: the manager is the on-demand `collision` feature — type only here.
+import type { RVCollisionManager } from './engine/rv-collision-manager';
+import { CollisionRegistrarSlot } from './engine/rv-collision-slot';
 import { RVDropManager } from './engine/rv-drop-manager';
 import {
   SignalReapplyRegistry,
@@ -268,6 +270,8 @@ import { registerFilterSubscriber, loadSearchSettings, isTypeEnabled } from './h
 import { getPickableTypes, getTypesWhere, getRegisteredCapabilities, getCapabilities } from './engine/rv-component-registry';
 import { BakeRegistry, pickMemoryStats, type PickMemoryStats } from './engine/rv-bake-registry';
 import { collectDeferredPlacements, type PlacementInstancer } from './engine/rv-placement-instancer';
+import type { DocumentScope } from './library/library-origin';
+import { referenceForWrite } from './library/library-reference-write';
 import { createViewerPlacementInstancer, mergePlacedLogic, disposePlacedRoot } from './engine/rv-placement-integrate';
 import { getDefaultPathNetwork } from './engine/rv-path-network';
 import { markDeferredPlacement, canonicalizeAssetOverridesIn } from './engine/rv-asset-reference';
@@ -342,6 +346,7 @@ import {
 } from './engine/rv-component-types';
 import { FeatureLoader, featureChunkBytes, ensureFeatureIfDeclared } from './rv-feature-loader';
 import { defineSignalConnectorFeature } from '../features/signal-connector.register';
+import { defineCollisionFeature, COLLISION_FEATURE } from '../features/collision.register';
 import { memoizeAsync, type MemoizedAsync } from './rv-memoize-async';
 import {
   applyKinematicsSpec,
@@ -622,7 +627,7 @@ export const WEBGPU_ADAPTER_OPTIONS: GPURequestAdapterOptions & { featureLevel: 
 };
 
 export interface WebGPURendererBootOptions<R> {
-  /** Request the adapter limits (internal build AND the real WebGPU backend). */
+  /** Request the adapter limits (private-tree build AND the real WebGPU backend). */
   internal: boolean;
   /** `navigator.gpu` (injected for tests). */
   gpu: Pick<GPU, 'requestAdapter'> | undefined;
@@ -633,7 +638,7 @@ export interface WebGPURendererBootOptions<R> {
 }
 
 /**
- * Construct and `init()` a WebGPURenderer. In an internal build the four
+ * Construct and `init()` a WebGPURenderer. In a private-tree build the four
  * {@link WEBGPU_REQUIRED_LIMIT_NAMES} are read from an adapter requested with
  * {@link WEBGPU_ADAPTER_OPTIONS} and passed as `requiredLimits`; when that
  * `init()` fails the renderer is disposed and ONE retry without limits follows
@@ -681,7 +686,16 @@ export async function initWebGPURendererWithLimits<R>(opts: WebGPURendererBootOp
 function withCoreFeatures(features: FeatureLoader): FeatureLoader {
   // plan-2227: the SignalConnector (component, kernel, network) loads with the first model that has one.
   defineSignalConnectorFeature(features);
+  // plan-781 F21: collision detection loads with the first model that has a role (or a
+  // Source handing one to its MUs), or with `collision.watch`.
+  defineCollisionFeature(features);
   return features;
+}
+
+/** One `loadModel` run: its generation (-1 = failed before `clearModel`) and the URL + scope restored on failure (plan-780 R2). */
+interface LoadTicket {
+  generation: number;
+  previous?: { url: string | null; scope: DocumentScope };
 }
 
 export class RVViewer extends EventEmitter<ViewerEvents> {
@@ -882,6 +896,8 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   /** Viewer-owned registry for the 3D scene-button family (plan-417): press /
    *  turn animation, momentary release timers and the component lifecycle. */
   readonly sceneButtonManager: SceneButtonManager;
+  /** Prevents the DES executor from repeating the viewer's owner resets. */
+  inViewerReset = false;
   /** Viewer-owned registry for EnergyChain rigs and their per-frame bone update. */
   readonly energyChainManager: EnergyChainManager;
   /** Viewer-owned registry for Chain components and their per-tick element poses
@@ -900,10 +916,19 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
    *  model switch destroys the worker-side grids and the chunk geometries,
    *  `dispose()` terminates the worker. */
   readonly machiningManager: MachiningManager;
-  /** Viewer-owned collision registry + per-tick check (plan-394). Survives model
-   *  loads; `clear()` on every model switch drops registry, highlight, signals
-   *  and an open modal. */
-  readonly collisionManager: RVCollisionManager;
+  /** Viewer-owned collision registry + per-tick check (plan-394). `null` until the
+   *  on-demand feature `collision` is active (plan-781 F21: a model with a
+   *  `CollisionRole`, a Source handing roles to its MUs, or `collision.watch`).
+   *  Survives model loads; `clear()` on every model switch drops registry,
+   *  highlight, signals and the published cards. */
+  get collisionManager(): RVCollisionManager | null { return this._collisionManager; }
+  private _collisionManager: RVCollisionManager | null = null;
+  /** What components and the MU spawn hook register with — buffers until the
+   *  feature installs the manager, then forwards (plan-781 F21). */
+  private readonly _collisionSlot = new CollisionRegistrarSlot(() => {
+    ensureFeatureIfDeclared(this, COLLISION_FEATURE, 'component:CollisionRole')
+      .catch(() => { /* the loader reported it (Problems entry with Retry) */ });
+  });
   /** Viewer-owned unsupported-part detection (plan-2022). Survives model loads;
    *  `clear()` on every model switch drops the registry, the outline, the
    *  signals and every published card. Detection uses schema defaults without an
@@ -1253,6 +1278,8 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
    * writes a `boundsTree` onto a disposed/stale geometry.
    */
   private _loadGeneration = 0;
+  /** Moves on with every model load and clear: a caller that pinned a value sees a newer load (read-only). */
+  get loadGeneration(): number { return this._loadGeneration; }
   /**
    * The `_loadGeneration` whose `placements-materialized` (not aborted) has
    * fired — "this load's scene is complete" for a LATE logic attach
@@ -1387,6 +1414,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       get lampManager() { return viewer.lampManager; },
       get axisDiagnostics() { return viewer.axisDiagnostics; },
       get sceneButtonManager() { return viewer.sceneButtonManager; },
+      get signalReapply() { return viewer.signalReapply; },
       get energyChainManager() { return viewer.energyChainManager; },
       get chainManager() { return viewer.chainManager; },
       get ribbonManager() { return viewer.ribbonManager; },
@@ -1448,6 +1476,8 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   }));
   /** URL of the currently loaded model (for reloadModel). */
   private _currentModelUrl: string | null = null;
+  /** plan-780 R2: the current model's project, set and rolled back with {@link _currentModelUrl}; null = open project. */
+  private _currentModelScope: DocumentScope = null;
   /** Where the current model's bytes came from (see {@link currentModelSource}). */
   private _currentModelSource: ModelLoadSource | null = null;
   /** Original model URL set by main.ts before loadModel (survives blob URL override). */
@@ -2536,7 +2566,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       chainManager: this.chainManager,
       ribbonManager: this.ribbonManager,
       machiningManager: this.machiningManager,
-      collisionManager: this.collisionManager,
+      collisionManager: this._collisionSlot,
       dropManager: this.dropManager,
       errorStore: this.errorStore,
       instructionStore: this.instructionStore, outlineManager: this.outlineManager,
@@ -3258,7 +3288,6 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
 
     this._simTime = 0; // Plan 201 (E2): restart the sim clock
     this.blockageWatch.reset(true);
-    this._progressWiring?.reset();
 
     // Drives back to their authored start pose (position/speed/jog/running).
     // Conveyor (transport-surface) drives keep their belt jog so belts resume
@@ -3288,7 +3317,15 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // Plan 194 P1 (K3): also reset the kernel's active executor so the DES
     // runner clears its own state. No-op for the continuous runner beyond the
     // transportManager.reset() above (same target).
-    this._kernel?.activeExecutor.reset();
+    if (this._kernel?.mode === 'des') {
+      this.playback?.stop();
+      for (const path of this.ikPaths) path.reset();
+      for (const replay of this.replayRecordings) replay.reset();
+      this.sceneButtonManager.resetAll();
+    }
+    this.inViewerReset = true;
+    try { this._kernel?.activeExecutor.reset(); }
+    finally { this.inViewerReset = false; }
     // plan-516 F4: the resets above put every pre-placed MU (and its loads) back
     // on its authored pose and parent WITHOUT activating it — they serve model
     // unload and mode switches too. The simulation reset is the one caller that
@@ -3299,6 +3336,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // plan-538 F6 (2): sensor / zone feedback from the plant state before the
     // logic restarts (cylinders re-initialise in their simulation-start handler).
     refreshPlantFeedback(this.transportManager);
+    this._progressWiring?.reset(); // seeds on the reset clock
 
     // ── Phase 2: RESETSTAT ──────────────────────────────────────────────────
     this.statisticsManager.resetAll(); // Plan 201: reset accumulators (registrations persist)
@@ -3399,6 +3437,32 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     if (this._desRunnerFactory === factory) return;
     this._desRunnerFactory = factory;
     this._kernel?.registerDesRunnerFactory(factory);
+  }
+
+  /**
+   * Installs the collision manager (plan-781 F21). Called by the on-demand
+   * `collision` feature's body; replays what the registrar slot buffered and wires
+   * the model that is already loaded (late activation). Idempotent.
+   */
+  installCollisionManager(manager: RVCollisionManager): void {
+    if (this._collisionManager) return;
+    this._collisionManager = manager;
+    this._collisionSlot.install(manager);
+    if (this.signalStore) this._wireCollisionModel(this.signalStore, this.transportManager);
+  }
+
+  /** (Re)wires the collision manager to one model — its signals, events and MU grid. */
+  private _wireCollisionModel(signalStore: SignalStore, transportManager: RVTransportManager | null): void {
+    const manager = this._collisionManager;
+    if (!manager) return;
+    manager.attachSignals(signalStore);
+    // plan-781: the events the bodies follow — `simulation-reset` retakes the
+    // start baseline, a visibility change re-splits hidden owners, placements
+    // (and the registry's release) change which chunks exist. Dropped again by
+    // `collisionManager.clear()` on the next model change.
+    manager.attachEvents((event, cb) => this.on(event, cb));
+    manager.invalidate();
+    manager.setMUQuery(transportManager);
   }
 
   /**
@@ -3790,14 +3854,15 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       const rv: Record<string, unknown> = {
         ...(spec.extras ? JSON.parse(JSON.stringify(spec.extras)) as Record<string, unknown> : {}),
         NodeId: spec.nodeId,
-        AssetReference: { assetId: spec.assetRef.assetId, path: spec.assetRef.path },
+        // plan-780 R4: the ONE writer rule (a project document by id, no path).
+        AssetReference: referenceForWrite({ catalogId: spec.assetRef.assetId, glbUrl: spec.assetRef.path }, this._currentModelScope),
       };
       canonicalizeAssetOverridesIn(rv);
       node.userData.realvirtual = rv;
       parent.add(node);
       node.updateMatrixWorld(true);
       markDeferredPlacement(node, spec.nodeId, spec.assetRef.path);
-      this.placements.materializeDeferred(collectDeferredPlacements(node));
+      this.placements.materializeDeferred(collectDeferredPlacements(node, this._currentModelScope));
       return this.placements.whenMaterialized().then(() => node);
     },
     removePlacement: (root: Object3D): void => {
@@ -4243,7 +4308,11 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // (ids registered before its init, components built) is announced; references
     // waiting for it resolve now. The orphan verdict falls once no placement is
     // pending any more (`placements-materialized` with pending 0).
-    this.on('layout-content-added', () => { this.registry?.flushPendingRefs(); });
+    this.on('layout-content-added', () => {
+      this.registry?.flushPendingRefs();
+      // Restored content can bring back an addressed signal source.
+      this.signalBindingManager?.recheckSources();
+    });
     this.on('placements-materialized', (info) => {
       if (this.placements.progress.pending === 0) this.registry?.settlePendingRefs();
       // plan-769 Phase 6: a non-aborted settle belongs to the current load.
@@ -4363,17 +4432,9 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this.on('layout-drag-tick', () => this.ribbonEditorPreview.notifyDefinitionChanged());
     this.on('editor-structure-changed', () => this.ribbonEditorPreview.notifyDefinitionChanged(true));
     this.machiningManager = new MachiningManager();
-    // plan-394: collided bodies get the OutlinePass STATUS outline — the same
-    // pulsing severity silhouette the error-message system uses (user decision
-    // 2026-08-07), persistent while the pair is latched and independent of the
-    // user's selection. Color = the warning-severity orange of the collision
-    // cards (SEVERITY_COLORS.warning).
-    this.collisionManager = new RVCollisionManager();
-    this.collisionManager.setHighlightHost({
-      showCollision: (roots) => showStatusOutline(this, roots, 0xffa726,
-        { ownerKey: 'collision', pulsePeriod: 0.6 }),
-      hideCollision: () => hideStatusOutline(this, 'collision'),
-    });
+    // plan-394 / plan-781 F21: the collision manager (status outline, geometry
+    // source, machining bridge) is created by the on-demand `collision` feature
+    // (`features/collision.body.ts`) through `installCollisionManager`.
     // plan-2022: an unsupported part gets the SAME warning-orange status
     // silhouette as a collision — it is the same statement to the user ("look
     // here, something is wrong") and the card says which. Same style means the
@@ -4384,11 +4445,6 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
         { ownerKey: 'drop', pulsePeriod: 0.6 }),
       hideDrops: () => hideStatusOutline(this, 'drop'),
     });
-    // plan-409: machining reports which cutter is legitimately inside which
-    // workpiece, so that pair goes quiet while the spindle runs — and only that
-    // pair. Wired here, in the constructor, because both managers live for the
-    // whole viewer; a model change clears the associations, not the wiring.
-    this.machiningManager.setCollisionBridge(this.collisionManager);
     // plan-427: publish the re-apply registry for the ComponentContext
     // producers that are called positionally from outside the viewer
     // (`processExtras` — Layout Planner, asset editor). Same module-slot
@@ -4702,7 +4758,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       // A mode switch rebuilds the visuals — re-push the collision status
       // outline so an active collision keeps its emphasis across the switch
       // (plan-394 F15).
-      this.collisionManager.reapplyHighlight();
+      this._collisionManager?.reapplyHighlight();
       this.dropManager.reapplyHighlight();
     });
 
@@ -5128,11 +5184,10 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       const { WebGPURenderer } = await import('three/webgpu');
       const forceWebGL = kind === 'webgpu-gl';
       try {
-        // plan-762 F14: internal builds ask the real device for the adapter's
-        // storage limits (the ray traced buffers exceed the 128 MiB default);
-        // community / customer builds take the define-dead branch unchanged.
+        // plan-762 F14 / plan-767: private-tree builds request the adapter's storage
+        // limits (ray traced buffers exceed 128 MiB); community: define-dead branch.
         renderer = await initWebGPURendererWithLimits({
-          internal: kind === 'webgpu' && __RV_INTERNAL__,
+          internal: kind === 'webgpu' && __RV_HAS_PRIVATE__,
           gpu: typeof navigator !== 'undefined' ? navigator.gpu : undefined,
           create: (extra) => new WebGPURenderer({
             antialias: options?.antialias ?? false,
@@ -5285,7 +5340,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       chainManager: this.chainManager,
       ribbonManager: this.ribbonManager,
       machiningManager: this.machiningManager,
-      collisionManager: this.collisionManager,
+      collisionManager: this._collisionSlot,
       dropManager: this.dropManager,
       events: this,
       errorStore: this.errorStore,
@@ -5572,6 +5627,8 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     keepBaked?: boolean;
     /** plan-774 F6 — INTERNAL, with `keepBaked`: a descend; see `PlacementInstancer.clearDocument`. */
     holdKept?: boolean;
+    /** plan-778 / plan-780 R2: the document is library B's; its references resolve in B ({@link currentModelScope}). */
+    library?: { providerId: string; sourceId: string };
     /**
      * plan-769 Phase 7 (D23) — moves / removals of placements THIS file holds,
      * by placement id (`materialise().baselinePlacementTransforms` /
@@ -5588,10 +5645,15 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   private async _loadModelTrusted(url: string, options?: Parameters<RVViewer['loadModel']>[1]): Promise<LoadResult> {
     // The generation THIS load runs under, written by `_loadModelInner` right
     // after its `clearModel` (-1 = it failed before getting that far).
-    const ticket = { generation: -1 };
+    const ticket: LoadTicket = { generation: -1 };
     try {
       return await withLoadTrust(this._trustSlot, options?.trust, () => this._loadModelInner(url, options, ticket));
     } catch (e) {
+      // plan-780 R2: a failed load restores URL + scope together (a superseded one leaves them to the newer load).
+      if (!(e instanceof LoadAbortedError) && ticket.generation === this._loadGeneration && ticket.previous) {
+        this._currentModelUrl = ticket.previous.url;
+        this._currentModelScope = ticket.previous.scope;
+      }
       // plan-774 review fix E7: a load that FAILS (bad bytes, a bake error) never
       // seals, so the kept window its `clearModel` opened would keep the
       // previous document's bakes in memory until some later load settled. It
@@ -5617,8 +5679,9 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     editedScene?: boolean;
     keepBaked?: boolean;
     holdKept?: boolean;
+    library?: { providerId: string; sourceId: string };
     baselinePlacements?: BaselinePlacementEdits;
-  }, ticket?: { generation: number }): Promise<LoadResult> {
+  }, ticket?: LoadTicket): Promise<LoadResult> {
     // No trust carried over from the previous load — whatever happens below,
     // the source facts are this load's or none (rv-script-trust.ts).
     this._currentModelSource = null;
@@ -5657,7 +5720,10 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // differ exactly when a scene resumes from a stored body — see the option's
     // docs. Only `loadGLB` below gets the raw `url`.
     const identity = options?.identityUrl ?? url;
+    // plan-780 R2: URL and scope are set at ONE point; no `library` option = the open project.
+    if (ticket) ticket.previous = { url: this._currentModelUrl, scope: this._currentModelScope };
     this._currentModelUrl = identity;
+    this._currentModelScope = options?.library ? { providerId: options.library.providerId, sourceId: options.library.sourceId } : null;
     // Where the bytes really came from — read by the WebComponent trust rule
     // (rv-script-trust.ts). Only a provenance token the fetch boundary recorded
     // on EXACTLY the parsed buffer counts; a caller cannot name a source. The
@@ -5679,7 +5745,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // chain — a placed asset that references the document it sits in is a
     // cycle, not an infinite descent. Spelled in the instancer's ONE key
     // derivation, so it matches a nested reference's key whatever its form.
-    this.placements.setDocumentKey(this.placements.keyOf({ catalogId: '', glbUrl: identity }));
+    this.placements.setDocumentKey(this.placements.keyOf({ catalogId: '', glbUrl: identity }, null));
     this._signatureModelName = resolveModelName(options?.modelName ?? identity);
 
     // --- Pre-load phase: load model plugins BEFORE GLB so they can register capabilities ---
@@ -5724,6 +5790,8 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this._mainDocumentLoadUrl = url;
     const result = await loadGLB(url, this.scene, {
       isWebGPU: this.isWebGPU,
+      // plan-780 R1: composition resolves this document's references in its own project.
+      documentScope: this._currentModelScope,
       // ONE uber material per session, owned here (plan-752 S2): the loader
       // and the layout planner's ModelCache must bake onto the same reference
       // or a dropped asset and a reloaded one land in different arenas.
@@ -5899,10 +5967,12 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this.signalStore.signalWriteGate = this._signalWriteGate;
     // plan-394: (re)wire the collision manager to THIS model — its signals and
     // its MU spawn/remove stream. Reporting goes through the live card store;
-    // there is no modal round-trip anymore.
-    this.collisionManager.attachSignals(this.signalStore);
-    this.collisionManager.invalidate();
-    if (result.transportManager) result.transportManager.muLifecycleHook = this.collisionManager;
+    // there is no modal round-trip anymore. plan-781 F21: the MU stream always
+    // goes through the slot (it buffers role-carrying MUs and activates the
+    // feature); the rest only when the feature is active — a later activation
+    // wires the model in `installCollisionManager`.
+    if (result.transportManager) result.transportManager.muLifecycleHook = this._collisionSlot;
+    this._wireCollisionModel(this.signalStore, result.transportManager ?? null);
     // plan-2022: (re)wire the drop detection to THIS model. The transport
     // manager is both the tick host and the source of the two facts the stage
     // needs — the vertical reach a surface may bridge, and the GripTargets.
@@ -6198,7 +6268,8 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // Deferred placements nobody claimed in `onModelLoaded` (no planner):
     // the core materialises them — one bake per asset, smaller assets first.
     // Fire-and-forget; `placements.whenMaterialized()` is the join point.
-    this.placements.materializeDeferred(collectDeferredPlacements(result.root));
+    // plan-780 R2: every entry captures THIS document's scope at queue time.
+    this.placements.materializeDeferred(collectDeferredPlacements(result.root, this._currentModelScope));
 
     // Re-evaluate _physicsPluginActive — plugins may have changed handlesTransport in onModelLoaded
     this._recomputePhysicsPluginActive();
@@ -6295,12 +6366,8 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
         if (!completed || this._loadGeneration !== generation) return;
 
         this._pickMetrics.setBvhPending(0);
-        // The collision bodies were built while the trees were still pending —
-        // every mesh looked tree-less, so every body latched `aabbOnly` and a
-        // workpiece INSIDE a machine reported a permanent AABB collision
-        // (2026-09-02, /demo: Turbine in the CNC). Rebuild against the finished
-        // trees; the rebuild is lazy and costs one tick.
-        this.collisionManager.invalidate();
+        // plan-781: collision no longer waits for these trees — its bodies read
+        // the pick structure the bake already built, so nothing is invalidated here.
         this._renderDirty = true;
         this.emit('raycast-ready', undefined);
       } catch (e) {
@@ -6670,8 +6737,9 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     if (this._toon.isActive) this._toon.onModelClearing(modelRootsToClear);
 
     // plan-394 F12: drop the collision registry, highlight, signals and any
-    // published cards BEFORE the geometry teardown.
-    this.collisionManager.clear();
+    // published cards BEFORE the geometry teardown (and what the slot buffered).
+    this._collisionManager?.clear();
+    this._collisionSlot.clear();
     // plan-2022: same timing and the same reason for the drop detection.
     this.dropManager.clear();
     // plan-427: drop every re-apply slot BEFORE the components behind them are
@@ -6826,6 +6894,14 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   /** URL of the currently loaded model (null if no model loaded). */
   get currentModelUrl(): string | null {
     return this._currentModelUrl;
+  }
+
+  /**
+   * plan-780 R2: the current model's project (library B, or null = open project);
+   * its unqualified references resolve there (contract documents-projects 4).
+   */
+  get currentModelScope(): DocumentScope {
+    return this._currentModelScope;
   }
 
   /** Source facts of the current (or loading) model — input of the script trust rule.
@@ -7123,6 +7199,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   async loadEmptyScene(): Promise<void> {
     this.clearModel();
     this._currentModelUrl = null;
+    this._currentModelScope = null;
     this._currentModelSource = null;
     this._currentScene = null;
     // Reset the checker floor to the standard authoring playground. clearModel
@@ -7160,7 +7237,9 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   async reloadModel(): Promise<LoadResult | null> {
     if (!this._currentModelUrl) return null;
     const url = this._currentModelUrl;
-    return this.loadModel(url);
+    // plan-780 R2: the reload keeps the document's scope.
+    const scope = this._currentModelScope;
+    return this.loadModel(url, scope ? { library: { ...scope } } : undefined);
   }
 
   /** Clean up all resources. */
@@ -7203,7 +7282,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // Final overlay-visibility teardown (plan-250): drop the GizmoManager's
     // store subscription (per-model dispose deliberately keeps it alive).
     this.gizmoManager.destroy();
-    this.collisionManager.dispose();
+    this._collisionManager?.dispose();
     this.dropManager.dispose();
     // plan-427: release the module slot so a disposed viewer's registry can
     // never be handed to a later `processExtras` call. clearModel() above

@@ -74,67 +74,13 @@ export function findOrphanedBindingCarriers(
   return orphans;
 }
 
-/** What the name anchor needs to answer: where does this signal live now? */
-export interface CarrierNameResolver {
-  /** Node path currently registered for `name`, or undefined. */
-  getPath(name: string): string | undefined;
-  /** True when `name` is claimed by more than one live node (fail-closed). */
-  isDuplicate(name: string): boolean;
-}
-
-/** A carrier that can be moved to a path the current model actually has. */
-export interface CarrierMigration {
-  /** The dead stored path the op sits on today. */
-  from: string;
-  /** Where the anchor says it belongs now. */
-  to: string;
-  /** The payload to re-persist, unchanged. */
-  mappings: SignalMapping[];
-}
-
-/**
- * Split orphaned carriers into "the name anchor knows where this went" and
- * "still lost" (plan-425 F2).
- *
- * A migration is offered only when the anchor is unambiguous on BOTH sides: the
- * mappings agree on one `carrierSignalName`, that name resolves, and it is not
- * shared with a second live node. Anything less stays an orphan and is reported
- * the way it always was — the anchor is here to remove a class of false alarm,
- * not to start guessing where guessing was previously refused.
- *
- * A migration onto a path that is ALREADY a carrier is refused too: re-persisting
- * there would overwrite whatever that node's own mappings are — turning a
- * repair into data loss. Pass those paths as `occupied`.
+/*
+ * plan-2234 (2026-11-04): carriers are no longer moved by their stored
+ * `carrierSignalName` — that was an automatic, persisted name fallback
+ * (contract-node-identity R4/R10). An orphaned carrier stays an orphan, its ops
+ * stay untouched, and the `orphaned-bindings` notice reports it. An adopt offer
+ * a person confirms follows with plan-2236.
  */
-export function planCarrierMigrations(
-  carriers: readonly OrphanedCarrier[],
-  resolver: CarrierNameResolver,
-  registry: NodeResolver,
-  occupied: ReadonlySet<string> = new Set(),
-): { migrations: CarrierMigration[]; stillOrphaned: string[] } {
-  const migrations: CarrierMigration[] = [];
-  const stillOrphaned: string[] = [];
-  const claimed = new Set<string>();
-  for (const carrier of carriers) {
-    const names = new Set(carrier.mappings
-      .map((m) => m.carrierSignalName)
-      .filter((n): n is string => typeof n === 'string' && n.length > 0));
-    const name = names.size === 1 ? [...names][0] : undefined;
-    const to = name && !resolver.isDuplicate(name) ? resolver.getPath(name) : undefined;
-    // `to === from` cannot happen (from did not resolve), but a path that two
-    // dead carriers both point at would have the second silently clobber the
-    // first — so a destination is taken at most once per scan.
-    if (!to || to === carrier.nodePath || claimed.has(to) || occupied.has(to)
-      || !registry.getNode(to)) {
-      stillOrphaned.push(carrier.nodePath);
-      continue;
-    }
-    claimed.add(to);
-    migrations.push({ from: carrier.nodePath, to, mappings: carrier.mappings });
-  }
-  return { migrations, stillOrphaned };
-}
-
 /**
  * Carrier paths in `overlay` that hold `SignalLinks.Mappings` and do not
  * resolve, in overlay order and without duplicates.

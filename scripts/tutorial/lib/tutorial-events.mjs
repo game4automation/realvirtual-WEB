@@ -56,7 +56,9 @@ export const MOTION_DOWNSCALE = 'scale=8:8:flags=area';
 /** The one diagnosis name for every violation of the six trace conditions (i)-(vi). */
 export const TRACE_DIAGNOSIS = 'trace-not-contiguous';
 
-const SEGMENT_KINDS = Object.freeze(['action', 'command', 'wait', 'hold', 'marker']);
+// plan-2237 F8: 'timelapse' — the wall-clock section of a command action; it sits between the
+// action's two 'command' segments (same stepId, same command), never overlapping them.
+const SEGMENT_KINDS = Object.freeze(['action', 'command', 'wait', 'hold', 'marker', 'timelapse']);
 
 /**
  * Relative tolerance for the frame quantisation.
@@ -250,6 +252,72 @@ export function motionVerdict(diffs, stillThreshold = STILL_THRESHOLD, minMovedF
 }
 
 /**
+ * plan-2240: the effective Gate C policy of ONE step, resolved once.
+ *
+ * Explicit step value > CLI `--motion-check` > `require`. CLI `off` is not a policy here: it is the
+ * canvas-less fixture path, which skips Gate C as a whole before any step is looked at.
+ *
+ * @param {'require'|'warn'|'off'|undefined} stepMotion
+ * @param {'require'|'warn'|'off'|undefined} cliMotionCheck
+ * @returns {{ policy: 'require'|'warn'|'off', source: 'step'|'cli'|'default' }}
+ */
+export function resolveMotionPolicy(stepMotion, cliMotionCheck) {
+  if (stepMotion !== undefined) return { policy: stepMotion, source: 'step' };
+  if (cliMotionCheck === 'warn') return { policy: 'warn', source: 'cli' };
+  return { policy: 'require', source: 'default' };
+}
+
+/**
+ * plan-2240: Gate C PER STEP.
+ *
+ * `diffs[i]` is the mad between video frames `i` and `i + 1` (`measureMotion`). A step owns the
+ * frames `[start; end)`, so its pairs are `diffs[start .. end - 2]`: only pairs INSIDE the step
+ * count, a moving neighbour never lends a standing step its motion and the step boundary pair
+ * belongs to no step.
+ *
+ * Per step: `off` → `skipped`; no pair at all (a one-frame step) → `require` fails with reason
+ * `too-short`, `warn` warns, `off` ignores; otherwise `motionVerdict` decides and a failed `warn`
+ * step becomes `warn` (reported, not fatal). The take fails when ANY `require` step fails.
+ *
+ * @param {number[]} diffs
+ * @param {Array<{ id: string, start: number, end: number }>} steps
+ * @param {Record<string, { policy: 'require'|'warn'|'off', source: string }>} policies by step id
+ */
+export function stepMotionVerdicts(diffs, steps, policies, stillThreshold = STILL_THRESHOLD, minMovedFraction = MIN_MOVED_FRACTION) {
+  if (!Array.isArray(diffs)) throw new TypeError('stepMotionVerdicts: diffs must be an array');
+  const perStep = [];
+  for (const step of steps) {
+    const resolved = policies[step.id] ?? { policy: 'require', source: 'default' };
+    const pairs = diffs.slice(Math.max(0, step.start), Math.max(0, Math.min(diffs.length, step.end - 1)));
+    const entry = { stepId: step.id, policy: resolved.policy, source: resolved.source, start: step.start, end: step.end, pairs: pairs.length };
+    if (resolved.policy === 'off') {
+      perStep.push({ ...entry, verdict: 'skipped' });
+      continue;
+    }
+    if (pairs.length === 0) {
+      perStep.push({ ...entry, verdict: resolved.policy === 'require' ? 'fail' : 'warn', reason: 'too-short' });
+      continue;
+    }
+    const motion = motionVerdict(pairs, stillThreshold, minMovedFraction);
+    const measured = {
+      ...entry, movedFrames: motion.movedFrames, movedFraction: motion.movedFraction,
+      longestStillFrames: motion.longestStillFrames,
+    };
+    if (motion.verdict === 'ok') perStep.push({ ...measured, verdict: 'ok' });
+    else perStep.push({ ...measured, verdict: resolved.policy === 'require' ? 'fail' : 'warn', reason: 'motion-below-threshold' });
+  }
+  const failed = perStep.filter((entry) => entry.verdict === 'fail');
+  const warned = perStep.filter((entry) => entry.verdict === 'warn');
+  return {
+    perStep,
+    verdict: failed.length === 0 ? 'ok' : 'fail',
+    ...(failed.length === 0 ? {} : { diagnosis: 'motion-below-threshold' }),
+    failed: failed.map((entry) => entry.stepId),
+    warned: warned.map((entry) => entry.stepId),
+  };
+}
+
+/**
  * The decoder control frame is its own check with the SAME metric and the SAME constant: the
  * region thumbnail must differ from an all-black frame by `mad >= stillThreshold`.
  *
@@ -311,6 +379,19 @@ export function motionShapeVerdict(motion) {
       }
     }
     if (motion.reason !== undefined) problems.push("a measured variant carries no 'reason'");
+    // plan-2240: the additive per-step record. Optional (older events.json have none); when
+    // present every entry names its step, policy and verdict.
+    if (motion.perStep !== undefined) {
+      if (!Array.isArray(motion.perStep)) problems.push('perStep must be an array');
+      else {
+        for (const [index, entry] of motion.perStep.entries()) {
+          if (typeof entry?.stepId !== 'string') problems.push(`perStep[${index}] has no stepId`);
+          if (!['require', 'warn', 'off'].includes(entry?.policy)) problems.push(`perStep[${index}] has an unknown policy ${String(entry?.policy)}`);
+          if (!['ok', 'fail', 'warn', 'skipped'].includes(entry?.verdict)) problems.push(`perStep[${index}] has an unknown verdict ${String(entry?.verdict)}`);
+          if (!Number.isInteger(entry?.pairs)) problems.push(`perStep[${index}] pairs must be an integer`);
+        }
+      }
+    }
   } else if (motion.verdict === 'skipped-no-viewer') {
     for (const field of MOTION_MEASURED_FIELDS) {
       if (field in motion) problems.push(`skip variant must omit the measured field entirely: ${field}`);
@@ -406,6 +487,9 @@ export function traceCoverageVerdict(segments, pointer, frames, steps) {
     if (!SEGMENT_KINDS.includes(sg.kind)) fail(`(v) segment ${i} has unknown kind ${String(sg.kind)}`);
     if (sg.kind === 'command' && (typeof sg.id !== 'string' || sg.id.length === 0)) {
       fail(`(v) segment ${i}: kind 'command' needs a non-empty id`);
+    }
+    if (sg.kind === 'timelapse' && (typeof sg.cmd !== 'string' || sg.cmd.length === 0)) {
+      fail(`(v) segment ${i}: kind 'timelapse' needs a non-empty cmd`);
     }
     const isMarker = sg.kind === 'marker';
     // `stepId` is a REQUIRED field of the shape `string | null`, so a MISSING key is not the same
@@ -521,7 +605,14 @@ export function frameBudget(script, fps) {
           }
           const waitFrames = framesOf(action.waitSec ?? 0.3, fps);
           stepMin += 1 + Math.max(1, waitFrames);
-          stepMax += 1 + Math.max(1, waitFrames, framesOf(action.maxWaitSec ?? 30, fps));
+          if (action.timelapse) {
+            // plan-2237 Phase 2: during the time-lapse the command waits on the WALL clock and at
+            // most `ceil(maxWallSec · timelapse.fps)` OUTPUT frames are grabbed (dropped slots are
+            // no frames); `waitSec` runs after `wallEnd` in video frames.
+            stepMax += 1 + Math.ceil(action.timelapse.maxWallSec * action.timelapse.fps - EPS) + Math.max(1, waitFrames);
+          } else {
+            stepMax += 1 + Math.max(1, waitFrames, framesOf(action.maxWaitSec ?? 30, fps));
+          }
           break;
         }
         case 'pick': {

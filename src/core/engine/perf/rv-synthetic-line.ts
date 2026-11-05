@@ -45,6 +45,7 @@ import { RVSink } from '../rv-sink';
 import { RVSource } from '../rv-source';
 import { RVTransportSurface } from '../rv-transport-surface';
 import type { RVTransportManager } from '../rv-transport-manager';
+import { addSensorTo, removeSensorsFrom } from '../rv-sensor-registration';
 import type { ComponentContext } from '../rv-component-registry';
 import { NodeRegistry } from '../rv-node-registry';
 import type { SignalStore, SignalWriter } from '../rv-signal-store';
@@ -591,7 +592,7 @@ export function buildSyntheticLine(
         sensor.UseRaycast = false;
         sensor.invertSignal = false;
         sensors.push(sensor);
-        tm.sensors.push(sensor);
+        addSensorTo(tm, sensor);
 
         if (cfg.signalBinding !== 'none') {
           const sensorName = `${SYNTHETIC_LINE_PREFIX}PLC${plc}/Sensor${idx}`;
@@ -795,7 +796,7 @@ export function buildSyntheticLine(
     const sourceSet = new Set<RVSource>(sources);
     const sinkSet = new Set<RVSink>(sinks);
     tm.surfaces = tm.surfaces.filter((s) => !surfaceSet.has(s));
-    tm.sensors = tm.sensors.filter((s) => !sensorSet.has(s));
+    removeSensorsFrom(tm, (s) => sensorSet.has(s));
     tm.sources = tm.sources.filter((s) => !sourceSet.has(s));
     tm.sinks = tm.sinks.filter((s) => !sinkSet.has(s));
 

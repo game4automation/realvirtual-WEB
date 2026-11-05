@@ -383,7 +383,7 @@ const SPECS: readonly Spec[] = [
 ];
 
 /** Every runtime command id (preload, tests). */
-export const SIM_COMMAND_IDS: readonly string[] = [...SPECS.map((s) => s.id), 'sim.setConnectionMode', 'sim.connectionMode'];
+export const SIM_COMMAND_IDS: readonly string[] = [...SPECS.map((s) => s.id), 'sim.setConnectionMode', 'sim.connectionMode', 'sim.clock.get'];
 
 /** Build the runtime descriptors (testable seam: no registry side effect). */
 export function createSimCommandDescriptors(): CommandDescriptor<never, unknown>[] {
@@ -419,7 +419,8 @@ export function createSimCommandDescriptors(): CommandDescriptor<never, unknown>
     unavailableReason: 'Not available', argsSchema: s.argsSchema,
     eagerImpl: s.readOnly ? s.impl : guardedSimImpl(s.impl),
     impl: () => Promise.resolve(s.readOnly ? s.impl : guardedSimImpl(s.impl)),
-  }))];
+  })), { id: 'sim.clock.get', label: 'Simulation clock', readOnly: true, scope: 'none', available: true, // plan-2237
+    unavailableReason: '', argsSchema: {}, impl: () => import('./sim-clock-get').then((m) => m.simClockGetImpl) }];
 }
 
 const registered = new WeakSet<CommandRegistry>();

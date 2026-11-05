@@ -40,6 +40,8 @@
  * Throw-free entry `assemble()`; the geometry functions throw `AssemblyError`.
  */
 
+import { referenceForWrite } from '../library/library-reference-write';
+import type { DocumentScope } from '../library/library-origin';
 import { RV_ASSET_OVERRIDES_KEY, RV_ASSET_REFERENCE_KEY, overrideAddressOf } from './rv-asset-reference';
 import { setNodeId } from './rv-node-id';
 import type { ParametricUse } from './rv-parametric-component';
@@ -504,6 +506,8 @@ export interface AssemblyOptions {
   parts?: readonly ParametricPart[];
   /** Declared child families (`ParametricComponent.Uses`, plan-650 Phase 5b). */
   uses?: readonly ParametricUse[];
+  /** plan-780 R4: project of the family document (null = open project). */
+  scope?: DocumentScope;
   /** NodeId prefix of the child reference nodes (`<prefix>:_Children:<i>`); default `'family'`. */
   childIdPrefix?: string;
   /** Undefined uses the direct-assembly default; null means no family identity. */
@@ -778,8 +782,10 @@ export function assemble(partsRoot: Object3D, plan: BuildPlan, opts: AssemblyOpt
         const node = new Group();
         node.name = String(i);
         place(node, c.positionMm, c.rotationDeg);
-        const ref: Record<string, unknown> = { assetId: use.Family };
-        if (use.Path) ref.path = use.Path;
+        // plan-780 R4: the ONE writer rule; only a non-document child keeps its path fallback.
+        const ref: Record<string, unknown> = {
+          ...referenceForWrite({ catalogId: use.Family, glbUrl: use.Path, providerId: use.ProviderId, sourceId: use.SourceId }, opts.scope ?? null),
+        };
         node.userData.realvirtual = {
           [RV_ASSET_REFERENCE_KEY]: ref,
           // plan-769 F14: the writer form is `byAddress` (`#<id>`), never `byNodeId`.

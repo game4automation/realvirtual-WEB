@@ -124,6 +124,42 @@ names the realvirtual catalogue URL resolves in `prj_realvirtual_library`. This 
 the one exception to the containment rule: a library reference may leave the
 project only by identity, never by path.
 
+**A document knows its project — its scope (plan-780).** An unqualified reference
+belongs to the project of the file it is written in. Every stored reference is
+resolved through ONE function, `resolveDocumentRef(ref, scope)`
+(`src/core/library/library-origin.ts`), which answers *hit*, *pending* or
+*missing*, in this order: a qualified reference strictly in its library; the
+legacy forms (`project:<path>` through the scope's path index — exactly one row,
+else kept as written with a Problems row; `global` + catalogue URL; an old
+realvirtual catalogue id → `prj_realvirtual_library`); an unqualified id inside a
+document of library B strictly in B — *missing* only once B has settled; an
+unqualified id in the open project's document → the open project, then the
+legacy search. A source that is still loading is never read and never a verdict.
+
+The scope is data, not viewer state: `viewer.currentModelScope` is set together
+with `currentModelUrl` (and rolled back together when a load fails); every
+queued placement captures it; a placed asset's nested references take the
+library its content came from; `reloadModel`, the editor reprojection and the
+test session keep it. Every open path (dashboard, descend, hierarchy, origin
+inspector) goes through `openDocumentScoped`
+(`src/core/project/rv-referenced-asset-open.ts`): inside a library document a
+part opens as THAT library's document, never as a same-named one of the open
+project. A legacy `project:<path>` that resolved once is remembered by its
+document id for the session, so a rename keeps the placement and the next save
+writes the id.
+
+**Writers write ids only** (`src/core/library/library-reference-write.ts`): a
+document of the same project `{ assetId }` (no self-qualifier), of another
+project `{ assetId, providerId, sourceId }`, never a `path` beside a document
+id. An old library reference is upgraded to the qualified id on save when its
+source is ready; otherwise it is written exactly as it was and a Problems row
+"Reference not upgraded" names it. **Copy into project** rewrites the copy's
+unqualified references to the source library's qualifier (only inside the copy,
+before anything is written) and copies the thumbnail sidecar; a library-to-library
+transfer that would need that rewrite is refused unless the target lists the
+source as a library. **Edit in library** regenerates the thumbnail into the
+library on save.
+
 **Locations, in order** (`src/core/library/library-project-loader.ts`, backends in
 `library-project-backends.ts`). The first that holds a `project.json` with the same
 id wins; a location that holds another project is an error naming both.

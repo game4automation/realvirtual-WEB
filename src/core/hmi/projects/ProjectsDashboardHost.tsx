@@ -27,6 +27,7 @@ import {
   MoreHoriz, MoreVert, NoteAddOutlined, Refresh, Search, SettingsEthernet,
 } from '@mui/icons-material';
 import type { LibraryCatalogEntry } from '../../library/library-types';
+import type { AssetBase } from '../../editor/rv-asset-document';
 import { fileGlyphOf } from '../../library/AssetCard';
 import { debug } from '../../engine/rv-debug'; // TEMP open-perf instrumentation
 import {
@@ -96,9 +97,14 @@ import {
 } from './open-recent-entry';
 import { allowedModesOf, documentModeKey, effectiveOpenMode, handoffParkMode, isModeAllowedForRow, type DocumentModeRecord } from '../../project/rv-document-mode';
 import {
-  loadDocumentModes, readDocumentMode, subscribeDocumentModes,
+  loadDocumentModes, readDocumentMode, setDocumentMode, subscribeDocumentModes,
 } from '../../project/rv-document-mode-store';
 import { forgetProjectTraces } from './forget-project-traces';
+import { DocumentInfoEditor } from './DocumentInfoEditor';
+import { DocumentModeChip } from './DocumentModeChip';
+import { DocumentModeMenuChip } from './DocumentModeMenuChip';
+import { LABEL_CHIP_ON_PREVIEW_SX } from '../shared-sx';
+import { nextDocumentSelection, selectedDocumentIds, type SelectModifiers } from './document-multi-select';
 import {
   forgetModelIndexEntry, loadModelIndex, subscribeModelIndex,
 } from '../../project/rv-model-index-store';
@@ -154,6 +160,7 @@ import { AddLibraryDialog, type AddLibraryProjectsOptions } from '../../library/
 import { readProjectLibraries } from '../../library/project-libraries';
 import { countOpenLibraryPlacements, ensureLibraryCommandsRegistered } from '../../library/library-commands';
 import { LIBRARY_PROJECTS_PROVIDER_ID, REALVIRTUAL_LIBRARY_PROJECT_ID } from '../../library/library-origin';
+import { libraryBackendOf } from '../../library/library-save-target';
 import { getLibraryProjectLoader } from '../../library/library-project-loader';
 import { isLibraryProjectSource } from '../../library/library-projects-provider';
 import { libraryStateBadge, runLibraryRepair } from '../../library/library-project-ui';
@@ -219,7 +226,7 @@ import { setDragChip } from './drag-chip';
 import { reportDocumentIdCollisions } from '../problems-store';
 import { selectionPointsIntoGroup, type SelectedAssetRef } from './assets-library-groups';
 import type { ProjectCardMenuAction } from './ProjectCard';
-import { ProjectsDetailPane, type DetailAction, type DetailField } from './ProjectsDetailPane';
+import { PREVIEW_MODE_CHIP_BOX, ProjectsDetailPane, type DetailAction, type DetailField } from './ProjectsDetailPane';
 import { ProjectsDetailSheet } from './ProjectsDetailSheet';
 import {
   collapseCrumbs, isCollapsedCrumbs, mobileLibraryTiles,
@@ -257,8 +264,6 @@ import { ProjectSearchResults } from './ProjectSearchResults';
 import { projectsScreenActive, useDashboardSearchShortcut } from './dashboard-search-shortcut';
 import { DocumentFilterBar } from './DocumentFilterBar';
 import { DocumentHeroSection } from './DocumentHeroSection';
-import { ClassificationEditor } from './ClassificationEditor';
-import { DocumentInfoEditor } from './DocumentInfoEditor';
 // plan-716 §2.7 / F8 — the dashboard's readers of THE one list. They live in
 // their own module because this file cannot be rendered by a test.
 import {
@@ -266,6 +271,7 @@ import {
   documentCardPicture,
   documentPickOptions,
   documentRoleBadge,
+  documentSubtitle,
   documentsUsingRef,
   documentTypeBadge,
   formatDocumentSize,
@@ -288,6 +294,7 @@ import type { DocumentClassification } from '../../project/rv-document-classific
 import type { DocumentInfo } from '../../project/rv-document-info';
 import type { TieredDocumentEntry } from '../../project/rv-project-tiers';
 import { sceneUrlToDocumentUrl } from '../../project/rv-doc-alias';
+import { isRecordingMode } from '../../recording-mode';
 
 /** Display name for a manifest asset that carries no explicit `label`. */
 function baseNameOf(path: string): string {
@@ -495,6 +502,26 @@ export function handoffExitTarget(modes: {
 }): string {
   // The one spelling lives beside the chain's guard rule (plan-513).
   return handoffParkMode(modes);
+}
+
+/**
+ * plan-780 2.3 — the base an asset entry opens with: the project's own row, else
+ * a library document scoped to B (`libraryDocument`), else the provider asset.
+ */
+export function dashboardAssetOpenBase(
+  ref: SelectedAssetRef,
+  label: string,
+  ownDoc: { id: string; name?: string; path: string } | null | undefined,
+  libraryBaseOf: ((projectId: string, documentId: string) => AssetBase | null) | null,
+): AssetBase {
+  if (ownDoc) return documentBase(ownDoc.id, ownDoc.name || label, ownDoc.path);
+  const library = ref.providerId === LIBRARY_PROJECTS_PROVIDER_ID ? libraryBaseOf?.(ref.sourceId, ref.assetId) : null;
+  return library ?? { kind: 'providerAsset', providerId: ref.providerId, sourceId: ref.sourceId, assetId: ref.assetId, label };
+}
+
+/** plan-780 R6: the detail pane's picture — `||`, a project entry carries `thumbnailUrl: ''`. */
+export function detailPaneThumbnail(entryUrl: string | null | undefined, pointerUrl: string | null | undefined): string | null {
+  return entryUrl || pointerUrl || null;
 }
 
 /** What the handoff needs of the scene store. */
@@ -805,7 +832,7 @@ export function ProjectsDashboardHost() {
       suppress: cfg.projects?.suppress,
       force: cfg.projects?.force,
       restoreFailed: failure !== null,
-    })) {
+    }) && !isRecordingMode()) {
       openProjectsDashboard();
     }
   }, [modeLocked, store]);
@@ -1407,15 +1434,17 @@ export function ProjectsDashboardHost() {
     const ownDoc = localPath
       ? documentByPath.get(localPath) ?? documentByPath.get(`${LIBRARY_FOLDER}/${localPath}`)
       : null;
-    setPendingAssetOpen(ownDoc ? documentBase(ownDoc.id, ownDoc.name || label, ownDoc.path) : {
-      kind: 'providerAsset',
-      providerId: ref.providerId,
-      sourceId: ref.sourceId,
-      assetId: ref.assetId,
-      label,
-    });
-    void viewer.modes.requestMode('editor');
-    closeProjectsDashboard();
+    const open = (libraryBaseOf: Parameters<typeof dashboardAssetOpenBase>[3]): void => {
+      setPendingAssetOpen(dashboardAssetOpenBase(ref, label, ownDoc, libraryBaseOf));
+      void viewer.modes.requestMode('editor');
+      closeProjectsDashboard();
+    };
+    // plan-780 2.3: a library document opens as `libraryDocument`, scoped to B.
+    if (!ownDoc && ref.providerId === LIBRARY_PROJECTS_PROVIDER_ID) {
+      void import('../../library/library-document-edit').then(({ libraryDocumentBaseOf }) => open(libraryDocumentBaseOf));
+      return;
+    }
+    open(null);
   }, [viewer, documentByPath]);
 
   /**
@@ -2228,6 +2257,33 @@ export function ProjectsDashboardHost() {
     });
   }, [sceneStore, runVerb, store]);
 
+  /** Delete several documents behind ONE confirm (multi-select). */
+  const deleteDocumentRows = useCallback((docs: readonly { id: string; name: string }[]) => {
+    if (!sceneStore || docs.length === 0) return;
+    setConfirmReq({
+      title: 'Delete documents',
+      message: `Delete ${docs.length} documents? This cannot be undone.`,
+      confirmLabel: `Delete ${docs.length}`,
+      onConfirm: () => {
+        void runVerb('Delete documents', async () => {
+          // One after the other: each delete rewrites the manifest.
+          for (const d of docs) await sceneStore.delete(d.id);
+          setProjectsSelection({ kind: 'none' });
+          await refreshListings();
+        });
+      },
+    });
+  }, [sceneStore, runVerb, store]);
+
+  /** Duplicate several documents, one listing refresh at the end (multi-select). */
+  const duplicateDocumentRows = useCallback((ids: readonly string[]) => {
+    if (!sceneStore || ids.length === 0) return;
+    void runVerb('Duplicate documents', async () => {
+      for (const id of ids) await sceneStore.duplicate(id);
+      await refreshListings();
+    });
+  }, [sceneStore, runVerb, store]);
+
   const duplicateDocumentRow = useCallback((id: string) => {
     if (!sceneStore) return;
     void runVerb('Duplicate scene', async () => {
@@ -2735,9 +2791,33 @@ export function ProjectsDashboardHost() {
     return null;
   }, [dash.selection, tree.refs]);
 
-  /** Turn a tree row into the selection that describes it. */
-  const handleTreeSelect = useCallback((node: ProjectTreeNode) => {
+  /**
+   * Multi-select state the click handler needs without re-creating itself:
+   * the document of the last plain / Ctrl click (Shift ranges start there) and
+   * the document ids in the order the grid shows them.
+   */
+  const selectionAnchorRef = useRef<string | null>(null);
+  const visibleDocumentIdsRef = useRef<string[]>([]);
+
+  /**
+   * Turn a tree row or card into the selection that describes it. With
+   * Ctrl/Cmd or Shift on a document, the rules of `document-multi-select`
+   * decide (multi-select is documents-only; a modifier on anything else is a
+   * plain click).
+   */
+  const handleTreeSelect = useCallback((node: ProjectTreeNode, mods?: SelectModifiers) => {
     const ref = tree.refs.get(node.path!);
+    if (mods && (mods.toggle || mods.range) && ref && ref.kind === 'document') {
+      const doc = documentByPath.get(ref.path);
+      if (doc) {
+        const next = nextDocumentSelection(
+          getProjectsDashboardSnapshot().selection, selectionAnchorRef.current,
+          doc.id, mods, visibleDocumentIdsRef.current);
+        selectionAnchorRef.current = next.anchorId;
+        setProjectsSelection(next.selection);
+        return;
+      }
+    }
     if (!ref) {
       setProjectsSelection({ kind: 'folder', rootId: node.rootId, relPath: node.relPath });
       return;
@@ -2759,6 +2839,7 @@ export function ProjectsDashboardHost() {
     // document selection with the document verbs, wherever the file sits.
     const doc = documentByPath.get(ref.path);
     if (doc) {
+      selectionAnchorRef.current = doc.id;
       setProjectsSelection({ kind: 'document', documentId: doc.id });
     } else {
       setProjectsSelection({ kind: 'documentPath', path: ref.path });
@@ -3017,6 +3098,12 @@ export function ProjectsDashboardHost() {
   const [filtersOpen, setFiltersOpen] = useState(false);
   const hasActiveFilters = dash.chip !== null || dash.tag !== null;
 
+  /** The ids of a multi-selection (empty otherwise) — the cards it lights up. */
+  const multiSelectedIds = useMemo(
+    () => new Set(dash.selection.kind === 'documents' ? selectedDocumentIds(dash.selection) : []),
+    [dash.selection],
+  );
+
   const folderCards = useMemo<FolderCardModel[]>(
     () => folderRows
       .filter(row => matchesDocumentFilter(row, documentFilter))
@@ -3077,7 +3164,7 @@ export function ProjectsDashboardHost() {
           key: path,
           entry,
           thumbnailPointer,
-          thumbnailBackend: thumbnailPointer ? store.getBackend() : null,
+          thumbnailBackend: thumbnailPointer ? (entry.libraryOrigin ? libraryBackendOf(entry) : store.getBackend()) : null,
           ...(isConnectConfig ? { glyph: 'connect' as const } : {}),
           ...(isKnowledgeFile ? { glyph: 'knowledge' as const } : {}),
           // Every other plain file of the folder — PDF, slides, video, … —
@@ -3095,8 +3182,8 @@ export function ProjectsDashboardHost() {
           // `isBundled` half beside it described a built-in-demo ROW, and there
           // are no such rows any more.
           tier: doc?.tier === 'bundled' ? 'bundled' : 'user',
-          selected: selectedTreePath === path,
-          onSelect: () => handleTreeSelect(node),
+          selected: selectedTreePath === path || (!!doc && multiSelectedIds.has(doc.id)),
+          onSelect: (mods?: SelectModifiers) => handleTreeSelect(node, mods),
           onOpen: () => handleTreeActivate(node),
           menuActions,
           // plan-506 F6: the hover tooltip reads the manifest row's cache —
@@ -3145,8 +3232,16 @@ export function ProjectsDashboardHost() {
       }),
     [folderRows, documentFilter, sources, selectedTreePath, project.project?.id,
       store, handleTreeSelect, handleTreeActivate, treeRoots,
-      openModeOf, project.project, project.backendKind],
+      openModeOf, project.project, project.backendKind, multiSelectedIds],
   );
+
+  // The grid's document order, for Shift ranges.
+  useEffect(() => {
+    visibleDocumentIdsRef.current = folderRows
+      .filter(row => matchesDocumentFilter(row, documentFilter))
+      .map(row => row.doc?.id)
+      .filter((id): id is string => typeof id === 'string');
+  }, [folderRows, documentFilter]);
 
   /**
    * Navigation tiles for the subfolders, shown AHEAD of the asset cards. A
@@ -3774,80 +3869,74 @@ export function ProjectsDashboardHost() {
     }
   }, [documentByPath, tree.refs]);
 
-  // ── Classification (§2.5) ─────────────────────────────────────────────
+  // ── Open mode of the selected document ────────────────────────────────
   /**
-   * Write a document's classification into its GLB, then into the cache.
-   *
-   * Goes through `runVerb` like every other write in this file, so a refused
-   * write (read-only project, a body somebody else changed since it was read)
-   * surfaces in the snackbar instead of vanishing. `busy` is what turns the
-   * editor inert while the bytes are in flight.
+   * The mode chip on the detail pane's preview: which mode a click on the
+   * document opens it in, and — where there is a choice — the control that
+   * changes it. It writes the document's stored LAST mode — the record
+   * `effectiveOpenMode` consults first — so a later switch to another mode
+   * while the document is open simply overwrites the choice made here.
+   * A demo never restores a last mode and a document with one allowed mode has
+   * nothing to choose: both show the plain chip the grid card shows.
    */
-  const changeClassification = useCallback((
-    doc: TieredDocumentEntry,
-    next: DocumentClassification | null,
-  ) => {
-    void runVerb('Classify document', () => store.setDocumentClassification(doc.id, next));
-  }, [runVerb, store]);
-
-  /**
-   * The classification block of the selected document, or null.
-   *
-   * Editable only for a document this project owns: a bundled example travels
-   * with the deploy, so its classification is a fact about somebody else's
-   * file. The read-only editor still SHOWS it — that is information worth
-   * having, and §3.6 prefers showing to greying out.
-   */
-  const classificationFor = useCallback((row: DocumentRow | undefined) => {
-    if (!row) return null;
+  const documentModeFor = useCallback((row: DocumentRow | undefined) => {
+    const doc = row?.doc;
+    const backend = project.backendKind;
+    const proj = project.project;
+    if (!doc || !backend || !proj) return null;
+    const allowed = allowedModesOf(doc);
+    const isDemo = proj.kind === 'demo';
+    const current = openModeOf(backend, proj.id, doc.id, doc.mode, isDemo, allowed);
+    const choices = viewer.modes.available().filter(m =>
+      isModeAllowedForRow(allowed, m.id, (id) => viewer.modes.descriptor(id)?.runtime));
+    if (isDemo || choices.length < 2) {
+      return (
+        <DocumentModeChip
+          mode={current}
+          modeLabel={recentModeLabel}
+          testId="projects-detail-mode"
+          sx={{ ...PREVIEW_MODE_CHIP_BOX, ...LABEL_CHIP_ON_PREVIEW_SX }}
+        />
+      );
+    }
     return (
-      <ClassificationEditor
-        classification={row.classification}
-        knownTags={documentTags}
-        busy={busy}
-        onChange={row.doc && row.doc.tier !== 'bundled' && project.writable
-          ? (next) => changeClassification(row.doc!, next)
-          : undefined}
+      <DocumentModeMenuChip
+        value={current}
+        options={choices.map(m => ({ id: m.id, label: m.label ?? m.id }))}
+        onChange={(next) => { void setDocumentMode(backend, proj.id, doc.id, next); }}
       />
     );
-  }, [documentTags, busy, project.writable, changeClassification]);
+  }, [project.backendKind, project.project, viewer, openModeOf, recentModeLabel]);
 
   // ── Document description (plan-506 §2.7) ──────────────────────────────
   /**
-   * The description block of the selected document, stacked under the
-   * classification in the same `extra` slot.
+   * The description field at the bottom of the pane: one text field, first
+   * line = the summary the card tooltip shows in bold, the rest = body.
    *
-   * Same visibility rule as {@link classificationFor}: editable only for a
-   * document this project owns in a writable project. The commit goes to the
-   * store DIRECTLY, not through `runVerb` — `runVerb` drops a second call while
-   * one runs and reports no outcome, and a blur-committed text field produces
-   * exactly such overlapping calls (R1-1). The write is bound to the project
-   * that is open NOW (`expectProjectId`), so a draft flushed after the user
-   * switched projects is refused instead of landing in the new one (R2-5).
+   * Editable only for a document this project owns in a writable project. The
+   * commit goes to the store DIRECTLY, not through `runVerb` — `runVerb` drops
+   * a second call while one runs, and a blur-committed field produces exactly
+   * such overlapping calls (R1-1). The write is bound to the project open NOW
+   * (`expectProjectId`), so a draft flushed after a project switch is refused
+   * instead of landing in the new one (R2-5).
    */
-  const projectId = project.project?.id ?? null;
+  const descriptionProjectId = project.project?.id ?? null;
   const documentInfoFor = useCallback((row: DocumentRow | undefined) => {
     const doc = row?.doc;
-    if (!doc || !projectId) return null;
+    if (!doc || !descriptionProjectId) return null;
     const editable = doc.tier !== 'bundled' && project.writable;
     return (
       <DocumentInfoEditor
-        projectId={projectId}
+        projectId={descriptionProjectId}
         documentId={doc.id}
         info={doc.documentInfo ?? null}
         busy={busy}
         onCommit={editable
-          ? (next: DocumentInfo | null) => store.setDocumentInfo(doc.id, next, { expectProjectId: projectId })
+          ? (next: DocumentInfo | null) => store.setDocumentInfo(doc.id, next, { expectProjectId: descriptionProjectId })
           : undefined}
       />
     );
-  }, [projectId, busy, project.writable, store]);
-
-  /** Classification and description, stacked — the one `extra` slot of the pane. */
-  const documentExtraFor = useCallback((row: DocumentRow | undefined) => {
-    if (!row) return null;
-    return <>{classificationFor(row)}{documentInfoFor(row)}</>;
-  }, [classificationFor, documentInfoFor]);
+  }, [descriptionProjectId, busy, project.writable, store]);
 
   // ── Markdown preview + editor (plan-445 F7) ───────────────────────────
   /**
@@ -3923,9 +4012,54 @@ export function ProjectsDashboardHost() {
       : null,
   );
 
+  // plan-778: a selected library document's saved preview, read through ITS project.
+  const selectedAssetEntry = dash.selection.kind === 'asset'
+    ? (() => {
+      const sel = dash.selection;
+      return sources.find(s => s.providerId === sel.providerId && s.source.id === sel.sourceId)?.source.getEntry(sel.assetId) ?? null;
+    })()
+    : null;
+  const selectedAssetPointer = selectedAssetEntry && !selectedAssetEntry.thumbnailUrl ? selectedAssetEntry.thumbnailPointer ?? null : null;
+  const selectedAssetThumbnail = useThumbnailUrl(
+    selectedAssetPointer && selectedAssetEntry ? libraryBackendOf(selectedAssetEntry) : null,
+    selectedAssetPointer,
+  );
+
   // ── Detail pane for the current selection (§3.6) ──────────────────────
   const detail = useMemo(() => {
     const sel = dash.selection;
+
+    if (sel.kind === 'documents') {
+      // Several documents: a placeholder stack, and the verbs that apply to
+      // all of them. Delete covers only the documents this project owns — a
+      // bundled sample is never deletable — and its label says how many.
+      const docs = sel.documentIds
+        .map(id => documentById(project.documents, id))
+        .filter((d): d is TieredDocumentEntry => !!d);
+      if (docs.length === 0) return { title: null };
+      const deletable = docs.filter(d => d.tier !== 'bundled');
+      const actions: DetailAction[] = [
+        {
+          key: 'dup',
+          label: `Duplicate ${docs.length}`,
+          primary: true,
+          onClick: () => duplicateDocumentRows(docs.map(d => d.id)),
+        },
+      ];
+      if (deletable.length > 0) {
+        actions.push({
+          key: 'delete',
+          label: deletable.length === docs.length ? `Delete ${docs.length}` : `Delete ${deletable.length} of ${docs.length}`,
+          destructive: true,
+          onClick: () => deleteDocumentRows(deletable.map(d => ({ id: d.id, name: d.name }))),
+        });
+      }
+      return {
+        title: `${docs.length} documents`,
+        stack: { names: docs.map(d => d.name) },
+        actions,
+      };
+    }
 
     if (sel.kind === 'document') {
       // THE one list (plan-716 F8). `scenes` was the `scenes/`-section
@@ -3936,12 +4070,10 @@ export function ProjectsDashboardHost() {
       if (!doc) return { title: null };
       const bundled = doc.tier === 'bundled';
       const fields: DetailField[] = [];
-      if (doc.modifiedAt) fields.push({ label: 'Modified', value: doc.modifiedAt });
       // The GLB's size on disk, from the same stat pass that versions the
       // thumbnails. Absent (not "0 B") when the backend cannot size a body.
+      // Size, age and type are chips on the preview card, not rows.
       const size = formatDocumentSize(docStats.get(doc.path)?.size);
-      if (size) fields.push({ label: 'Size', value: size });
-      if (project.project?.name) fields.push({ label: 'Project', value: project.project.name });
       // The document's CONNECT binding (`documents[].connectRef`, plan-718 §3).
       // Shown whenever set — and marked when the file it names is not in the
       // config listing, because a dead reference is exactly what this row
@@ -3988,17 +4120,18 @@ export function ProjectsDashboardHost() {
       const row = documentRows.find(r => r.key === 'document:' + doc.id);
       return {
         title: doc.name,
-        // The subtitle says only what nothing else shows: writability. The
-        // word "Document" said nothing the row's presence did not already say
-        // — what the file IS is the type badge, where it LIVES is the place
-        // badge, and the root earns no place chip at all.
-        ...(bundled ? { subtitle: 'Read-only' } : {}),
+        // The subtitle is where the document lives and, for a sample, that it
+        // is read-only. What it IS (type), when it changed and how big it is
+        // sit on the preview card as chips, beside the open-mode control.
+        subtitle: documentSubtitle(doc, bundled),
         badge: bundled ? 'Sample' : null,
-        badges: [documentTypeBadge(doc), documentRoleBadge(doc)],
         thumbnailUrl: selectedDocumentThumbnail,
+        previewPlaceholder: true,
+        previewInfo: { type: documentTypeBadge(doc), modified: doc.modifiedAt ?? null, size },
+        previewModeControl: documentModeFor(row),
         fields,
         actions,
-        extra: documentExtraFor(row),
+        footer: documentInfoFor(row),
         // The title edits in place — the same commit the Rename action makes.
         ...(bundled || !sceneStore ? {} : {
           onRename: (name: string) => { renameDocumentRow(doc.id, name); },
@@ -4022,10 +4155,13 @@ export function ProjectsDashboardHost() {
       const readOnly = doc?.tier === 'bundled';
       return {
         title: label,
-        // Same rule as the branch above: the subtitle carries only what no
-        // badge shows.
-        ...(readOnly ? { subtitle: 'Read-only' } : {}),
-        badges: !doc ? [] : [documentTypeBadge(doc), documentRoleBadge(doc)],
+        // Same layout as the branch above: place in the subtitle, facts on the card.
+        subtitle: doc ? documentSubtitle(doc, readOnly) : (readOnly ? 'Read-only' : null),
+        previewPlaceholder: true,
+        previewInfo: doc
+          ? { type: documentTypeBadge(doc), modified: doc.modifiedAt ?? null, size: formatDocumentSize(docStats.get(doc.path)?.size) }
+          : null,
+        previewModeControl: documentModeFor(row),
         fields: [
           { label: 'Source', value: sel.path },
           // Same reference rows as the id-selected branch — one fact, both routes.
@@ -4040,7 +4176,7 @@ export function ProjectsDashboardHost() {
           },
           ...(readOnly ? [] : transferActionsFor(doc)),
         ] as DetailAction[],
-        extra: documentExtraFor(row),
+        footer: documentInfoFor(row),
         // Inline title rename runs the SAME gate and write path as F2 on the
         // tree row — one rule, however the rename is reached. The selection
         // follows to the new path on success, so the pane keeps describing
@@ -4074,7 +4210,8 @@ export function ProjectsDashboardHost() {
       return {
         title: entry.name,
         subtitle: src?.source.label ?? null,
-        thumbnailUrl: entry.thumbnailUrl ?? null,
+        thumbnailUrl: detailPaneThumbnail(entry.thumbnailUrl, selectedAssetThumbnail),
+        previewPlaceholder: true,
         fields,
         actions: buildAssetActions(
           { providerId: sel.providerId, sourceId: sel.sourceId, assetId: sel.assetId },
@@ -4179,9 +4316,10 @@ export function ProjectsDashboardHost() {
     // the dashboard header and its verbs in the header menu; a pane that
     // repeated them here would make "no selection" look like a selection.
     return { title: null };
-  }, [dash.selection, project, sources, store, runVerb, connectConfigs, knowledgeFiles,
+  }, [dash.selection, project, sources, store, runVerb, selectedAssetThumbnail, connectConfigs, knowledgeFiles,
       openDocumentRow, duplicateDocumentRow, deleteDocumentRow, buildAssetActions, openModel,
-      project.documents, documentRows, documentExtraFor,
+      project.documents, documentRows, documentModeFor, documentInfoFor,
+      duplicateDocumentRows, deleteDocumentRows,
       transferActionsFor, documentByPath, sourceOfRoot, treeRoots, catalogRoots,
       handleRefreshLibrary, handleRemoveLibrary,
       sceneStore, selectedTreePath, runTreeEdit, renameLibraryAsset, renameDocumentRow,

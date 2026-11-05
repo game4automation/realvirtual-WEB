@@ -286,6 +286,22 @@ separate `partAtSensor` discharge trigger (and the part counter) and does **not*
 - **published occupancy** (surface) = what the upstream neighbour reads as back-pressure.
 - **local sensor trigger** = what gates discharge in the ZPA rule.
 
+## Component types at a glance
+
+Each file in `src/behaviors/` registers one component `type`. The BehaviorManager binds it to every placed asset whose name matches `models[]`.
+
+| Type | `kind` | What it does |
+|---|---|---|
+| `Source` | source | Generates MUs (parts) from its spawn schedule (interval, distance or signal); inert, the continuous spawn driver is the engine component `RVSource` |
+| `Sink` | sink | Consumes arriving MUs and counts them for the throughput statistics; inert |
+| `Conveyor` | conveyor | Transports an MU along its belt; the DES transit time is belt length divided by the belt drive's `TargetSpeed` |
+| `OverheadConveyor` | conveyor | Rigid circulating chain; it has no DES events and does not advance in a DES run |
+| `Turntable` | router | Stops an MU in the centre, rotates to the free output and passes it on |
+| `ChainTransfer` | router | A right-angle chain transfer modelled as a Turntable whose alignment is a lift instead of a rotation |
+| `Agv` | conveyor | A path-guided vehicle with tasks, zone reservations and battery, driven by the fleet core (`doc-path-fleet-control.md`) |
+
+The fleet components (`Fleet`, `TransferStation`, `Charger`, `WaitPoint`, `ForkliftProfile`, `BatteryProfile`) are metadata schemas in `src/core/fleet/scene/fleet-components.ts`. They configure the fleet core and have no `logic` / `des` blocks of their own. `PickPlaceStationExample.ts` is a project-style example, not a library component.
+
 ## Shared building blocks
 
 | Module (in `_shared/`) | Provides |

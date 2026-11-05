@@ -22,7 +22,10 @@ import {
   markerVerdict,
   motionShapeVerdict,
   motionVerdict,
+  resolveMotionPolicy,
+  SEGMENT_KINDS,
   segmentKindOf,
+  stepMotionVerdicts,
   syncVerdict,
   traceCoverageVerdict,
 } from '../scripts/tutorial/lib/tutorial-events.mjs';
@@ -594,5 +597,143 @@ describe('stampsContiguous — the Gate A stamp reader', () => {
     expect(stampsContiguous(stamps)).toEqual({
       contiguous: false, firstBreak: 9, reason: 'stamp 38 at frame 8 is followed by 0 at frame 9, expected 39',
     });
+  });
+});
+
+describe('Gate C per step (plan-2240)', () => {
+  const MOVE = 2;
+  const STILL = 0;
+  // Frames: step a [0;10) moves, step b [10;20) stands, step c [20;30) moves.
+  const steps = [{ id: 'a', start: 0, end: 10 }, { id: 'b', start: 10, end: 20 }, { id: 'c', start: 20, end: 30 }];
+  const diffs = Array.from({ length: 29 }, (_, i) => (i < 9 || i >= 20 ? MOVE : STILL));
+  const req = { policy: 'require', source: 'default' } as const;
+
+  it('Test_ResolveMotionPolicy_StepBeatsCliBeatsRequire', () => {
+    expect(resolveMotionPolicy('off', 'warn')).toEqual({ policy: 'off', source: 'step' });
+    expect(resolveMotionPolicy('require', 'warn')).toEqual({ policy: 'require', source: 'step' });
+    expect(resolveMotionPolicy(undefined, 'warn')).toEqual({ policy: 'warn', source: 'cli' });
+    expect(resolveMotionPolicy(undefined, 'require')).toEqual({ policy: 'require', source: 'default' });
+    expect(resolveMotionPolicy(undefined, undefined)).toEqual({ policy: 'require', source: 'default' });
+  });
+
+  it('Test_StepMotion_StandingRequireStep_BetweenMovingSteps_Fails', () => {
+    // The whole take would pass (20 of 29 pairs move) — the standing step must not hide in it.
+    expect(motionVerdict(diffs, STILL_THRESHOLD, MIN_MOVED_FRACTION).verdict).toBe('ok');
+    const result = stepMotionVerdicts(diffs, steps, { a: req, b: req, c: req });
+    expect(result.verdict).toBe('fail');
+    expect(result.diagnosis).toBe('motion-below-threshold');
+    expect(result.failed).toEqual(['b']);
+    expect(result.perStep.map((entry) => entry.verdict)).toEqual(['ok', 'fail', 'ok']);
+    expect(result.perStep[1]).toMatchObject({ stepId: 'b', pairs: 9, movedFrames: 0, movedFraction: 0, reason: 'motion-below-threshold' });
+  });
+
+  it('Test_StepMotion_PairsOnlyInsideTheStep', () => {
+    // A single moving pair across the a|b boundary (diffs[9] = frames 9→10) belongs to no step.
+    const boundary = Array.from({ length: 29 }, (_, i) => (i === 9 ? MOVE : STILL));
+    const result = stepMotionVerdicts(boundary, steps, { a: req, b: req, c: req });
+    expect(result.perStep.map((entry) => entry.movedFrames)).toEqual([0, 0, 0]);
+    expect(result.perStep.map((entry) => entry.pairs)).toEqual([9, 9, 9]);
+  });
+
+  it('Test_StepMotion_WarnStep_WarnsWithoutFailing', () => {
+    const result = stepMotionVerdicts(diffs, steps, { a: req, b: { policy: 'warn', source: 'step' }, c: req });
+    expect(result.verdict).toBe('ok');
+    expect(result.warned).toEqual(['b']);
+    expect(result.perStep[1]).toMatchObject({ verdict: 'warn', reason: 'motion-below-threshold', policy: 'warn' });
+  });
+
+  it('Test_StepMotion_OffStep_Skipped', () => {
+    const result = stepMotionVerdicts(diffs, steps, { a: req, b: { policy: 'off', source: 'step' }, c: req });
+    expect(result.verdict).toBe('ok');
+    expect(result.perStep[1]).toMatchObject({ verdict: 'skipped', pairs: 9 });
+    expect('movedFraction' in result.perStep[1]).toBe(false);
+  });
+
+  it('Test_StepMotion_OneFrameStep_TooShort', () => {
+    const short = [{ id: 'a', start: 0, end: 10 }, { id: 'one', start: 10, end: 11 }];
+    const moving = Array.from({ length: 10 }, () => MOVE);
+    expect(stepMotionVerdicts(moving, short, { a: req, one: req })).toMatchObject({ verdict: 'fail', failed: ['one'] });
+    expect(stepMotionVerdicts(moving, short, { a: req, one: req }).perStep[1]).toMatchObject({ pairs: 0, verdict: 'fail', reason: 'too-short' });
+    expect(stepMotionVerdicts(moving, short, { a: req, one: { policy: 'warn', source: 'cli' } }))
+      .toMatchObject({ verdict: 'ok', warned: ['one'] });
+    expect(stepMotionVerdicts(moving, short, { a: req, one: { policy: 'off', source: 'step' } }).perStep[1])
+      .toMatchObject({ verdict: 'skipped' });
+  });
+
+  it('Test_MotionShape_PerStep_IsAdditiveAndChecked', () => {
+    const base = {
+      region: { x: 0, y: 0, w: 8, h: 8 }, metric: 'mad8x8gray', scale: '8bit-gray-0-255', downscale: 'scale=8:8:flags=area',
+      stillThreshold: 0.5, minMovedFraction: 0.1, verdict: 'ok', frames: 30, movedFrames: 20, movedFraction: 0.7,
+      longestStillFrames: 9, controlFrame: 'motion-control.jpg', controlMad: 10,
+    };
+    expect(motionShapeVerdict(base).verdict).toBe('ok');
+    const perStep = stepMotionVerdicts(diffs, steps, { a: req, b: req, c: req }).perStep;
+    expect(motionShapeVerdict({ ...base, perStep }).verdict).toBe('ok');
+    expect(motionShapeVerdict({ ...base, perStep: [{ stepId: 'a', policy: 'sometimes', verdict: 'ok', pairs: 1 }] }).verdict).toBe('fail');
+  });
+});
+
+describe('time-lapse and sim-progress fields (plan-2237)', () => {
+  const budgetFor = (actions: Record<string, unknown>[]) => frameBudget({ minStepSec: 0.01, steps: [{ holdSec: 0.01, tailSec: 0, actions }] }, FPS);
+  /** A command action with a time-lapse: head command, timelapse, tail command — one stepId. */
+  function timelapseTrace(): { segments: Segment[]; steps: StepRecord[] } {
+    return {
+      segments: [
+        { kind: 'marker', start: 0, end: 9, stepId: null },
+        { kind: 'command', id: 'experiment.run', start: 9, end: 10, stepId: 'batch', actionIndex: 0 },
+        { kind: 'timelapse', cmd: 'experiment.run', start: 10, end: 33, stepId: 'batch', actionIndex: 0,
+          wallFps: 4, wallMs: Array.from({ length: 23 }, (_, i) => i * 250), droppedSlots: 6 },
+        { kind: 'command', id: 'experiment.run', start: 33, end: 43, stepId: 'batch', actionIndex: 0 },
+        { kind: 'marker', start: 43, end: 52, stepId: null },
+      ],
+      steps: [{ id: 'batch', start: 9, end: 43 }],
+    };
+  }
+
+  it('Test_TraceCoverage_TimelapseBetweenTwoCommandSegments_Accepted', () => {
+    const trace = timelapseTrace();
+    expect(traceCoverageVerdict(trace.segments, [], 52, trace.steps)).toMatchObject({ verdict: 'ok', stepBoundsOk: true, problems: [] });
+  });
+
+  it('Test_TraceCoverage_TimelapseOverlappingTheAction_Fails', () => {
+    // The rejected shape (Gate A, review round 2): one action segment over the whole action AND the time-lapse.
+    const trace = timelapseTrace();
+    trace.segments[1] = { ...trace.segments[1], end: 43 };
+    expect(traceCoverageVerdict(trace.segments, [], 52, trace.steps).verdict).toBe('fail');
+  });
+
+  it('Test_TraceCoverage_TimelapseWithoutCmd_ConditionVFails', () => {
+    const trace = timelapseTrace();
+    delete trace.segments[2].cmd;
+    expect(traceCoverageVerdict(trace.segments, [], 52, trace.steps).problems.join(' ')).toMatch(/kind 'timelapse' needs a non-empty cmd/);
+  });
+
+  it('Test_FrameBudget_Timelapse_CountsOutputFramesNotVideoFrames', () => {
+    const plain = { type: 'command', id: 'experiment.run', via: 'direct', waitSec: 0, maxWaitSec: 30 };
+    const withTimelapse = { ...plain, timelapse: { fps: 4, maxWallSec: 20 } };
+    const base = budgetFor([plain]);
+    const lapse = budgetFor([withTimelapse]);
+    // max: dispatch + ceil(20 s · 4 fps) = 80 output frames + the waitSec floor — not 30 s · 30 fps.
+    expect(lapse.max - lapse.min).toBe(80);
+    expect(base.max).toBeGreaterThan(lapse.max);
+    expect(lapse.min).toBe(base.min); // an immediate completion records no time-lapse frame
+    expect(budgetFor([{ ...plain, timelapse: { fps: 2.5, maxWallSec: 3 } }]).max - lapse.min).toBe(8); // ceil(7.5)
+  });
+
+  it('Test_Events_SimJumpsAndSimProgress_AreAdditiveFields', () => {
+    // The published shape (run.mjs): additive top-level fields, existing ones untouched.
+    const trace = timelapseTrace();
+    const events = {
+      $schema: 'rv-tutorial-events/1', segments: trace.segments, steps: trace.steps,
+      simJumps: [{ frame: 61, cmd: 'des.checkpoint.load', fromSim: 10800, toSim: 3600 }],
+      simProgress: { verdict: 'ok', segments: [
+        { index: 0, startFrame: 1, endFrame: 9, kind: 'run', factor: 1, clock: 'simTime', i1: 0, i2: 0, verdict: 'pass' },
+        { index: 1, startFrame: 10, endFrame: 33, kind: 'timelapse', factor: null, clock: 'renderClock', i1: 0, i2: 0, verdict: 'skipped', cmd: 'experiment.run' },
+      ] },
+    };
+    expect(SEGMENT_KINDS).toEqual(['action', 'command', 'wait', 'hold', 'marker', 'timelapse']);
+    expect(traceCoverageVerdict(events.segments, [], 52, events.steps).verdict).toBe('ok');
+    expect(events.simJumps[0].toSim).toBeLessThan(events.simJumps[0].fromSim);
+    expect(segmentKindOf('command')).toBe('command');
   });
 });

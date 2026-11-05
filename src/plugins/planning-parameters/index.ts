@@ -119,6 +119,8 @@ const PLANNING_PROBLEM_CODES = [
   'planning-scenario-block-invalid',
   'planning-apply-failed',
   'planning-apply-rollback-failed',
+  'planning-committed-recovered',
+  'planning-committed-recovery-failed',
   PROBLEM_SELECTION_INVALID,
   PROBLEM_SELECTION_UNSUPPORTED,
   // plan-2005 Phase 7: a batch could not put the planning values back — about THIS document.

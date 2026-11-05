@@ -2,18 +2,31 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * DocumentInfoEditor — the summary and the Markdown description of one
- * document, in the detail pane under the classification (plan-506 F5).
+ * DocumentInfoEditor — the description of one document, at the bottom of the
+ * detail pane (plan-506 F5).
  *
- * ## Commit on blur, not per keystroke and not behind a Save button
+ * ## One field
+ *
+ * The block keeps two strings (`summary`, `description`), the editor shows
+ * ONE text field: its first line is the summary — the bold line of the card
+ * tooltip — and everything below it is the Markdown body. A first line longer
+ * than the summary limit is not cut: the whole text then goes to the body.
+ *
+ * ## Rendered by default, edited behind the pencil
+ *
+ * The pane always shows the description as rendered Markdown. The pencil opens
+ * the text field with Save / Cancel (Ctrl/Cmd+Enter saves, Escape cancels).
+ * Leaving the document with unsaved text still flushes it (below), so a
+ * selection change never throws typing away; only Cancel does.
+ *
+ * ## Why not per keystroke
  *
  * The classification editor writes on every change because a change there is
  * one click. Text is hundreds of keystrokes, and each write is a compare-and-
  * swap patch of the GLB — writing per keystroke (or per debounce tick) would
  * turn typing into a stream of file rewrites that race each other. A Save
- * button would make this the only field in the dashboard that can be left
- * half-entered. So: blur commits, Enter in the one-line summary commits, and
- * leaving the document (selection change, pane unmount) flushes.
+ * button alone would let a selection change drop half-entered text. So: Save commits, and leaving the document
+ * (selection change, pane unmount) flushes.
  *
  * ## The draft is not this component's state
  *
@@ -41,10 +54,10 @@
  */
 
 import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
-import { Box, Button, TextField, ToggleButton, ToggleButtonGroup, Typography } from '@mui/material';
+import { Box, Button, IconButton, TextField, Tooltip, Typography } from '@mui/material';
+import { EditOutlined } from '@mui/icons-material';
 import { SectionHeader } from '../shared-components';
 import { LazyMarkdown } from '../rv-markdown-lazy';
-import { formatRelativeAge } from '../rv-node-knowledge-field-renderer';
 import {
   isEmptyDocumentInfo,
   MAX_DESCRIPTION_CHARS,
@@ -53,6 +66,7 @@ import {
 } from '../../project/rv-document-info';
 import {
   commitDocumentInfoDraft,
+  discardDocumentInfoDraft,
   documentInfoDraftKey,
   flushDocumentInfoDraft,
   getDocumentInfoDraft,
@@ -124,18 +138,33 @@ export function DocumentInfoMarkdown({ text }: { text: string }) {
   );
 }
 
-/** "updated 2 hours ago · Thomas", or null when the block carries no stamp. */
-function StampLine({ info }: { info?: DocumentInfo | null }) {
-  const age = info?.updatedAt ? formatRelativeAge(info.updatedAt) : null;
-  if (!age && !info?.updatedBy) return null;
+/** The block's two strings as the one field shows them. */
+export function documentInfoText(info: { summary?: string; description?: string } | null | undefined): string {
+  return [info?.summary ?? '', info?.description ?? ''].filter(Boolean).join('\n');
+}
+
+/**
+ * The one field split back into the block's two strings: first line = summary,
+ * the rest = body. A first line over {@link MAX_SUMMARY_CHARS} makes the whole
+ * text the body rather than losing anything.
+ */
+export function splitDocumentInfoText(text: string): { summary: string; description: string } {
+  const i = text.indexOf('\n');
+  const first = (i < 0 ? text : text.slice(0, i)).trim();
+  if (first.length > MAX_SUMMARY_CHARS) return { summary: '', description: text.trim() };
+  const rest = i < 0 ? '' : text.slice(i + 1).replace(/^(\s*\n)+/, '').trimEnd();
+  return { summary: first, description: rest };
+}
+
+/** Summary (bold) and body (Markdown) — what the pane shows outside editing. */
+function DocumentInfoView({ info }: { info?: { summary?: string; description?: string } | null }) {
   return (
-    <Typography
-      data-testid="document-info-stamp"
-      title={info?.updatedAt}
-      sx={{ fontSize: 10, color: INK_LOW, mt: 0.5 }}
-    >
-      {['updated', age, info?.updatedBy ? `· ${info.updatedBy}` : null].filter(Boolean).join(' ')}
-    </Typography>
+    <>
+      {info?.summary && (
+        <Typography sx={{ fontSize: 12, fontWeight: 600, color: INK_HIGH, mt: 0.5 }}>{info.summary}</Typography>
+      )}
+      {info?.description && <DocumentInfoMarkdown text={info.description} />}
+    </>
   );
 }
 
@@ -147,9 +176,12 @@ export function DocumentInfoEditor({
     subscribeDocumentInfoDrafts,
     () => getDocumentInfoDraft(key),
   );
-  const summary = draft?.summary ?? info?.summary ?? '';
-  const description = draft?.description ?? info?.description ?? '';
-  const [mode, setMode] = useState<'edit' | 'preview'>(description ? 'preview' : 'edit');
+  // An unsaved draft (a failed save, or text left behind) reopens the field.
+  const [editing, setEditing] = useState<boolean>(() => !!draft);
+  // The raw field text while the user types (it keeps blank lines the split
+  // drops); null = show what the draft or the file says.
+  const [typed, setTyped] = useState<string | null>(null);
+  const text = typed ?? documentInfoText(draft ?? info);
 
   // Leaving a document flushes its draft through the write stored WITH it — the
   // callback captured for that document, never the one of whatever is shown
@@ -161,108 +193,115 @@ export function DocumentInfoEditor({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key, !!onCommit]);
 
-  // A new document starts in Preview when it has something to preview.
+  // A new document starts from its own text, never from the last one's.
   useEffect(() => {
-    setMode((info?.description ?? '') ? 'preview' : 'edit');
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    setTyped(null);
+    setEditing(!!getDocumentInfoDraft(key));
   }, [key]);
 
-  const edit = useCallback((next: { summary: string; description: string }) => {
+  const edit = useCallback((next: string) => {
     if (!onCommit) return;
-    setDocumentInfoDraft(key, next, info ?? null, onCommit);
+    setTyped(next);
+    setDocumentInfoDraft(key, splitDocumentInfoText(next), info ?? null, onCommit);
   }, [key, info, onCommit]);
 
-  const commit = useCallback(() => {
+  const save = useCallback(async () => {
     if (!onCommit) return;
-    void commitDocumentInfoDraft(key, onCommit);
+    const result = await commitDocumentInfoDraft(key, onCommit);
+    // A failure keeps the field open with its error and Retry.
+    if (result.ok) { setTyped(null); setEditing(false); }
   }, [key, onCommit]);
+
+  const cancel = useCallback(() => {
+    discardDocumentInfoDraft(key);
+    setTyped(null);
+    setEditing(false);
+  }, [key]);
 
   if (!onCommit) {
     if (isEmptyDocumentInfo(info)) return null;
     return (
       <Box sx={{ mt: 1.25 }} data-testid="document-info-readonly">
         <SectionHeader>Description</SectionHeader>
-        {info?.summary && (
-          <Typography sx={{ fontSize: 12, fontWeight: 600, color: INK_HIGH, mt: 0.5 }}>{info.summary}</Typography>
-        )}
-        {info?.description && <DocumentInfoMarkdown text={info.description} />}
-        <StampLine info={info} />
+        <DocumentInfoView info={info} />
       </Box>
     );
   }
 
   const error = draft?.error ?? null;
+  const saving = !!draft?.saving;
   return (
     <Box sx={{ mt: 1.25 }} data-testid="document-info-editor">
       <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <SectionHeader>Description</SectionHeader>
-        <ToggleButtonGroup
-          size="small"
-          exclusive
-          value={mode}
-          onChange={(_e, v) => { if (v) setMode(v); }}
-          aria-label="Description view"
-          sx={{ '& .MuiToggleButton-root': { py: 0, px: 0.75, fontSize: 10, textTransform: 'none' } }}
-        >
-          <ToggleButton value="preview">Preview</ToggleButton>
-          <ToggleButton value="edit">Edit</ToggleButton>
-        </ToggleButtonGroup>
+        {!editing && (
+          <Tooltip title="Edit description">
+            <span>
+              <IconButton
+                size="small"
+                aria-label="Edit description"
+                disabled={busy}
+                onClick={() => setEditing(true)}
+                sx={{ p: 0.25, color: INK_LOW, '&:hover': { color: INK_HIGH } }}
+              >
+                <EditOutlined sx={{ fontSize: 14 }} />
+              </IconButton>
+            </span>
+          </Tooltip>
+        )}
       </Box>
-      <TextField
-        fullWidth
-        size="small"
-        placeholder="One-line summary"
-        value={summary}
-        disabled={busy}
-        onChange={e => edit({ summary: e.target.value, description })}
-        onBlur={commit}
-        onKeyDown={e => {
-          if (e.key === 'Enter') { e.preventDefault(); commit(); }
-        }}
-        slotProps={{
-          htmlInput: { 'aria-label': 'Document summary', maxLength: MAX_SUMMARY_CHARS },
-          input: { sx: { fontSize: 12 } },
-        }}
-        sx={{ mt: 0.5 }}
-      />
-      {mode === 'edit' ? (
-        <TextField
-          fullWidth
-          multiline
-          minRows={3}
-          maxRows={14}
-          size="small"
-          placeholder="Description (Markdown)"
-          value={description}
-          disabled={busy}
-          onChange={e => edit({ summary, description: e.target.value })}
-          onBlur={commit}
-          slotProps={{
-            htmlInput: { 'aria-label': 'Document description', maxLength: MAX_DESCRIPTION_CHARS },
-            input: { sx: { fontSize: 11.5, fontFamily: 'inherit' } },
-          }}
-          sx={{ mt: 0.75 }}
-        />
+      {editing ? (
+        <>
+          <TextField
+            fullWidth
+            multiline
+            autoFocus
+            minRows={3}
+            maxRows={14}
+            size="small"
+            placeholder={'Short summary on the first line\nDetails below (Markdown)'}
+            value={text}
+            disabled={busy || saving}
+            onChange={e => edit(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); void save(); }
+              if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cancel(); }
+            }}
+            slotProps={{
+              htmlInput: {
+                'aria-label': 'Document description',
+                maxLength: MAX_SUMMARY_CHARS + 1 + MAX_DESCRIPTION_CHARS,
+              },
+              input: { sx: { fontSize: 11.5, fontFamily: 'inherit' } },
+            }}
+            sx={{ mt: 0.5 }}
+          />
+          {error && (
+            <Typography data-testid="document-info-error" role="alert" sx={{ fontSize: 10.5, color: ERROR, mt: 0.5 }}>
+              Not saved: {error}
+            </Typography>
+          )}
+          <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 0.5, mt: 0.5 }}>
+            <Button size="small" onClick={cancel} disabled={saving} sx={{ fontSize: 11, textTransform: 'none', minWidth: 0 }}>
+              Cancel
+            </Button>
+            <Button
+              size="small"
+              variant="contained"
+              onClick={() => { void save(); }}
+              disabled={busy || saving}
+              sx={{ fontSize: 11, textTransform: 'none', minWidth: 0 }}
+            >
+              {saving ? 'Saving…' : error ? 'Retry' : 'Save'}
+            </Button>
+          </Box>
+        </>
       ) : (
-        <Box data-testid="document-info-preview" sx={{ mt: 0.5, minHeight: 20 }}>
-          {description
-            ? <DocumentInfoMarkdown text={description} />
-            : <Typography sx={{ fontSize: 11, color: INK_LOW }}>No description yet.</Typography>}
-        </Box>
-      )}
-      {error ? (
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mt: 0.5 }} role="alert">
-          <Typography data-testid="document-info-error" sx={{ fontSize: 10.5, color: ERROR, flex: 1 }}>
-            Not saved: {error}
-          </Typography>
-          <Button size="small" onClick={commit} disabled={draft?.saving} sx={{ fontSize: 10, minWidth: 0, py: 0 }}>
-            Retry
-          </Button>
-        </Box>
-      ) : draft?.saving ? (
-        <Typography sx={{ fontSize: 10, color: INK_LOW, mt: 0.5 }}>Saving…</Typography>
-      ) : (
-        <StampLine info={info} />
+        <>
+          {isEmptyDocumentInfo(info)
+            ? <Typography sx={{ fontSize: 11, color: INK_LOW, mt: 0.5 }}>No description yet.</Typography>
+            : <DocumentInfoView info={info} />}
+        </>
       )}
     </Box>
   );

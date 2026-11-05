@@ -97,6 +97,7 @@ function makeScene(): Fixture {
   docHidden.visible = false;
   docHidden.userData.realvirtual = { Hidden: true };       // hidden in the DOCUMENT
   const bvh = box('__raycastBVH_helper', 4, BLUE);
+  bvh.userData._rvRaycastBVH = true;                       // helpers are recognised by MARKER
   const mu = box('MU_1', 6, BLUE);
   mu.userData._muSelectable = true;
   const gizmo = box('gizmo', 7, BLUE);

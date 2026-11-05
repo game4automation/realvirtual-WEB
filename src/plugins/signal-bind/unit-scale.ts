@@ -21,7 +21,8 @@
  *    the Problems entries and the bind decision all derive from it, from the
  *    CURRENT state (never from stored provenance).
  *  - {@link bindWithUnitScale} / {@link resetScaleToAuto} — the write path: one
- *    document transaction per action, serialised per document, in the order
+ *    document transaction per action, serialised per document (the queue lives in
+ *    core/hmi/rv-bind-queue since plan-2233), in the order
  *    "deactivate the slot → set the factor → activate the slot", so the factor
  *    only ever changes while the slot is unbound (forward, undo and redo alike),
  *    verified from the resulting state before it commits.
@@ -47,6 +48,7 @@ import {
 } from '../../core/engine/rv-units';
 import { NodeRegistry } from '../../core/engine/rv-node-registry';
 import { getActiveEditTarget, type EditTarget } from '../../core/hmi/rv-edit-target';
+import { enqueueBind, inBindQueue } from '../../core/hmi/rv-bind-queue';
 import { isFieldOverridden } from '../../core/hmi/rv-field-override';
 import { omitUndefined } from '../../core/hmi/rv-omit-undefined';
 import {
@@ -382,16 +384,6 @@ export interface UnitBindResult {
   error?: string;
 }
 
-/** Per-document promise chain (SOL R2 #6): `RvDocument` transactions share one depth counter. */
-const bindQueues = new WeakMap<object, Promise<unknown>>();
-
-function enqueue<T>(key: object, job: () => Promise<T>): Promise<T> {
-  const prior = bindQueues.get(key) ?? Promise.resolve();
-  const run = prior.catch(() => undefined).then(job);
-  bindQueues.set(key, run.catch(() => undefined));
-  return run;
-}
-
 // Pending targets — slot rows show them busy while a bind runs.
 const pendingTargets = new Map<string, number>();
 const pendingListeners = new Set<() => void>();
@@ -530,6 +522,8 @@ export interface BindWithUnitScaleOptions {
   editTarget?: EditTarget;
   /** Undo label (default "Bind <slot>"). */
   label?: string;
+  /** Hold of the queue the caller holds (rv-bind-queue). */
+  queueHold?: object;
 }
 
 /**
@@ -550,8 +544,8 @@ export function bindWithUnitScale(
   const et = opts.editTarget ?? getActiveEditTarget();
   const targetId = signalBindTargetId(target);
   setPending(targetId, 1);
-  return enqueue(et.documentKey ?? et, () => runBind(viewer, target, persistence, row, source, et, opts.label))
-    .finally(() => setPending(targetId, -1));
+  const job = () => runBind(viewer, target, persistence, row, source, et, opts.label);
+  return inBindQueue(et, opts.queueHold, job).finally(() => setPending(targetId, -1));
 }
 
 async function runBind(
@@ -665,7 +659,7 @@ export function resetScaleToAuto(
   const et = opts.editTarget ?? getActiveEditTarget();
   const targetId = signalBindTargetId(target);
   setPending(targetId, 1);
-  return enqueue(et.documentKey ?? et, async () => {
+  return enqueueBind(et, async () => {
     const mgr = viewer.signalBindingManager;
     if (!mgr || target.kind !== 'node' || !et.available) return null;
     const before = persistence.read();

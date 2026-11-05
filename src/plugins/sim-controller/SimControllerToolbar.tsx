@@ -22,6 +22,7 @@ import { commandRegistry } from '../../core/hmi/rv-command-registry';
 import { formatSimClock } from './format-sim-time';
 import { useKernelSnapshot } from '../../hooks/use-kernel-snapshot';
 import { shouldWarnDesSpeed, dismissDesSpeedWarningForSession, switchToDesMode } from './sim-speed-des-warning';
+import { isRecordingMode } from '../../core/recording-mode';
 
 /** Text of the DES speed warning (plan decision 2026-10-25, Thomas: variant B). */
 export const DES_SPEED_WARNING_TEXT =
@@ -122,7 +123,8 @@ export function SimClockSegment({ viewer }: UISlotProps) {
     <Box
       sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.5, px: 0.75, height: '100%', whiteSpace: 'nowrap' }}
       data-testid="sim-clock"
-      title="Elapsed simulation time"
+      title={isRecordingMode() ? undefined : 'Elapsed simulation time'}
+      aria-label="Elapsed simulation time"
     >
       <Schedule sx={{ fontSize: 18, color: 'text.secondary' }} />
       <Box component="span" sx={{ fontFamily: 'ui-monospace, monospace', fontSize: 11, fontWeight: 600, color: '#4fc3f7', letterSpacing: 0.3 }}>

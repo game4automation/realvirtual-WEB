@@ -65,6 +65,8 @@ function makeCtx(
       subscribeByPath: (_p: string, cb: (v: boolean) => void) => { cb(true); return () => {}; },
       getByPath: () => true,
       nameForPath: (p: string) => p,
+      // SignalStore contract: display wiring (`wireDisplaySignal`) also listens for silent restores.
+      onValuesRestored: () => () => {},
       getSignalMeta: () => (signalComment !== undefined ? { comment: signalComment } : undefined),
     } as never,
     instructionStore: store,

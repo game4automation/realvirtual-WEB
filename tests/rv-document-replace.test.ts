@@ -64,6 +64,7 @@ vi.mock('../src/core/hmi/scene/rv-scene-executors', () => ({
   writeUserDataField: vi.fn(),
   deleteUserDataField: vi.fn(),
   reapplySchemaForComponent: vi.fn(),
+  syncSignalLinksRuntime: vi.fn(),
 }));
 
 import { SceneStore } from '../src/core/hmi/scene/scene-store';

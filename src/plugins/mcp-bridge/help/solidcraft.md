@@ -165,8 +165,9 @@ Build (Z up, curve centre at the origin, arc from +X to +Y):
    two ends. Materials from `web_query("editor.materialPresets", {})`.
 2. Save it as a document anywhere in the project, e.g. `library/Interroll/RM8320-Kurve.glb`
    (`web_editor_save`). It is a placeable PROJECT part right away: `web_query("library.catalogList", {"source":"project"})`
-   lists it as `project:library/Interroll/RM8320-Kurve.glb` (plus its `documentId`). Renaming or moving
-   it with `document.rename` / `document.move` through `web_execute` keeps it placeable.
+   lists it with its `documentId` as `catalogId` — the id `layout.place` takes. Renaming or moving
+   it with `document.rename` / `document.move` through `web_execute` keeps it placeable (the id does
+   not change).
 3. Planner: `layout.place` the first curve, then `layout.snapAttach(targetId, catalogId)` on its free
    output snap — the project part is accepted like a catalog part. Four 90° curves close a ring; an MU
    is handed from curve to curve at the seams (the selection gizmo shows each curve's sector and its

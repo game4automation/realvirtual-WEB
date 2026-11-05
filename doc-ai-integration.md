@@ -23,7 +23,7 @@ Long commands with `timeoutMs > 120000` (120 s), including `editor.importCad` an
 `web_macro_status` or request cancellation with `web_macro_cancel`; imports are
 not cancellable and return `kind:"not-cancellable"` while continuing to completion.
 For one release, an old tool name returns
-`{"error":"MOVED", movedTo, use, example, removedAfter:"6.7.0"}` with its replacement;
+`{"error":"MOVED", movedTo, use, example, removedAfter:"6.8.0"}` with its replacement;
 it is absent from `tools/list`.
 
 CONNECT classifies `web_execute` and `web_batch` by the strictest named command in

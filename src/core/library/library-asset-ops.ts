@@ -53,6 +53,7 @@ import {
 import type { DocumentClassification } from '../project/rv-document-classification';
 import type { RvDocumentEntry, RvProject } from '../project/rv-project-types';
 import { copyThumbnailSidecar, deleteThumbnailSidecar } from './resolve-document-thumbnail';
+import { requalifyCopiedReferences } from './library-reference-requalify';
 
 /** Root folder of a project's own assets. */
 export const LIBRARY_FOLDER = 'library';
@@ -321,6 +322,29 @@ async function transferDocument(
   }
   if (!bytes) return { kind: 'error', message: `"${doc.name}" could not be read.` };
 
+  // plan-780 A3: unqualified refs get the source's qualifier; refused unless the
+  // source is a library of the target. Computed before any write.
+  let payload: Uint8Array = new Uint8Array(await bytes.arrayBuffer());
+  const [fromInfo, toInfo] = await Promise.all([
+    source.readProjectInfo?.().catch(() => null) ?? null,
+    target.readProjectInfo?.().catch(() => null) ?? null,
+  ]);
+  if (fromInfo && toInfo && fromInfo.projectId !== toInfo.projectId) {
+    let requalified: { bytes: Uint8Array; rewritten: number };
+    try {
+      requalified = requalifyCopiedReferences(payload, fromInfo.projectId);
+    } catch (e) {
+      return { kind: 'error', message: errText(e) };
+    }
+    if (requalified.rewritten > 0 && !toInfo.libraryIds.includes(fromInfo.projectId)) {
+      return {
+        kind: 'error',
+        message: `"${doc.name}" uses parts of "${source.label}", which "${target.label}" does not list as a library — add it as a library first.`,
+      };
+    }
+    payload = requalified.bytes;
+  }
+
   let targetPath: string | null;
   try {
     targetPath = await probeFreeName(target, folder, file);
@@ -335,8 +359,7 @@ async function transferDocument(
     // `targetPath` is the first free name the probe above found, so this is a
     // create — and saying so is what refuses the write if a concurrent copy got
     // there between the probe and here.
-    await target.writeDocument(
-      targetPath, new Uint8Array(await bytes.arrayBuffer()), { expectedRevision: 'create' });
+    await target.writeDocument(targetPath, payload, { expectedRevision: 'create' });
   } catch (e) {
     return { kind: 'error', message: errText(e) };
   }
@@ -347,7 +370,7 @@ async function transferDocument(
   try {
     const arrived = await readBytesAt(target, targetPath);
     if (!arrived) throw new Error(`The copy of "${doc.name}" could not be read back.`);
-    if (arrived.size !== bytes.size) {
+    if (arrived.size !== payload.byteLength) {
       throw new Error(`The copy of "${doc.name}" is incomplete.`);
     }
     classification = await classificationOfGlbBlob(arrived);
@@ -361,7 +384,7 @@ async function transferDocument(
       // A probed name has to reach the display string too, or two rows read
       // "Belt" and only the file names tell them apart.
       name: arrivedName === sourceName ? doc.name : arrivedName,
-      sizeBytes: bytes.size,
+      sizeBytes: payload.byteLength,
       modifiedAt: new Date().toISOString(),
     };
     if (classification) entry.classification = classification;

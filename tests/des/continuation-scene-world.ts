@@ -21,6 +21,10 @@ export type Scene = typeof SCENES[number];
 export interface SceneOptions {
   failures?: Array<{ desIdMatch: RegExp | string; at: number; until: number }>;
   hidden?: boolean;
+  /** Called on the fresh viewer before the model loads (e.g. install a plugin). */
+  setup?(v: import('../../src/core/rv-viewer').RVViewer): void;
+  /** Awaited after the scene is wired and before DES mode starts (e.g. programs deployed). */
+  ready?(v: import('../../src/core/rv-viewer').RVViewer): Promise<void>;
 }
 
 const bytes = new Map<Scene, Promise<ArrayBuffer>>();
@@ -60,6 +64,7 @@ export async function sceneWorld(scene: Scene, opts: SceneOptions = {}) {
   };
   try {
     registerAllBehaviors(v.behaviors);
+    opts.setup?.(v as unknown as import('../../src/core/rv-viewer').RVViewer);
     v.use(new SnapPointPlugin());
     const yard = scene === 'PalletYard' ? new PalletYardPlugin() : null;
     if (yard) v.use(yard);
@@ -67,6 +72,7 @@ export async function sceneWorld(scene: Scene, opts: SceneOptions = {}) {
     await v.whenSceneReady();
     await v.getPlugin<WebComponentPlugin>('web-component')?.whenWired();
     v.scene.updateMatrixWorld(true);
+    await opts.ready?.(v as unknown as import('../../src/core/rv-viewer').RVViewer);
     v.simulationKernel!.setMode('des');
     await Promise.resolve();
     await whenDocumentHashesSettled();

@@ -10,12 +10,12 @@ import { getLocalStorage, readLocalStorage } from '../core/rv-safe-storage';
  * workflow. Measurements persist in localStorage per model and are managed
  * via a LeftPanel UI (MeasurementPanel).
  *
- * Follows the AnnotationPlugin pattern: own Raycaster (Layer 0), CanvasTexture
+ * Follows the AnnotationPlugin pattern: surface pick through the shared pick
+ * pipeline (`RaycastManager.raycastSurface`), CanvasTexture
  * sprite labels, useSyncExternalStore snapshot/subscribe, localStorage persistence.
  */
 
-import { Raycaster, Vector2, Vector3 } from 'three';
-import type { Object3D } from 'three';
+import { Vector3 } from 'three';
 import type { RVViewerPlugin } from '../core/rv-plugin';
 import type { RVViewer } from '../core/rv-viewer';
 import type { LoadResult } from '../core/engine/rv-scene-loader';
@@ -23,7 +23,7 @@ import type { UISlotEntry } from '../core/rv-ui-plugin';
 import type { Measurement, MeasurementPluginAPI } from '../core/types/plugin-types';
 import { MeasurementRenderer, formatDistance as _formatDistance } from './rv-measurement-renderer';
 import { MEASUREMENT_LAYER } from '../core/engine/rv-constants';
-import { pointerToNDC } from '../core/engine/rv-pointer-utils';
+import type { SurfaceHit } from '../core/engine/rv-raycast-manager';
 import { createStore } from '../core/hmi/create-store';
 import { modeContext } from '../core/rv-mode-manager';
 
@@ -142,8 +142,8 @@ export class MeasurementPlugin implements RVViewerPlugin, MeasurementPluginAPI {
 
   // ── Three.js ──
   private _renderer: MeasurementRenderer | null = null;
-  private _worldRaycaster = new Raycaster();
-  private _pointer = new Vector2();
+  private readonly _surf: SurfaceHit = { point: new Vector3(), distance: 0, blocked: false, path: null, normal: new Vector3() };
+  private readonly _worldHit: { point: Vector3; normal: Vector3 | null } = { point: this._surf.point, normal: null };
   private _viewer: RVViewer | null = null;
   private _modelHash = '';
 
@@ -160,10 +160,6 @@ export class MeasurementPlugin implements RVViewerPlugin, MeasurementPluginAPI {
   private _onPointerUp: ((e: PointerEvent) => void) | null = null;
   private _onPointerMove: ((e: PointerEvent) => void) | null = null;
   private _onKeyDown: ((e: KeyboardEvent) => void) | null = null;
-
-  constructor() {
-    this._worldRaycaster.firstHitOnly = true;
-  }
 
   // ── Public getters / setters ──
 
@@ -571,45 +567,16 @@ export class MeasurementPlugin implements RVViewerPlugin, MeasurementPluginAPI {
     this._renderer?.clearPreview();
   }
 
-  private _worldRaycast(e: PointerEvent): { point: Vector3; normal: Vector3 | null } | null {
-    if (!this._viewer) return null;
-
-    const canvas = this._viewer.renderer.domElement;
-    pointerToNDC(e.clientX, e.clientY, canvas, this._pointer);
-
-    this._worldRaycaster.setFromCamera(this._pointer, this._viewer.camera);
-    this._worldRaycaster.layers.set(0);
-    const intersects = this._worldRaycaster.intersectObjects(this._viewer.scene.children, true);
-
-    // First mesh hit (skipping our own measurement overlays + merged static
-    // proxies that wouldn't survive a click anyway).
-    //
-    // Gaussian Splats are intentionally NOT pickable for measurement:
-    // splats are alpha-blended volumetric primitives without a well-defined
-    // surface, so any sphere/ellipsoid approximation has cm-level depth
-    // jitter. We render them as visual backdrop, but measurements happen
-    // against real triangulated geometry only. If a splat sits in front of
-    // a mesh the user wanted to measure, they need to crop or hide the
-    // splat first. Re-enable splat picking only via a GPU depth-pre-pass
-    // (cumulative-alpha 0.5) — see castRayAtSplatMesh JSDoc.
-    for (const hit of intersects) {
-      if (!hit.object.visible) continue;
-      if (this._isMeasurementObject(hit.object)) continue;
-      return {
-        point: hit.point,
-        normal: hit.face?.normal?.clone().transformDirection(hit.object.matrixWorld) ?? null,
-      };
-    }
-    return null;
-  }
-
-  private _isMeasurementObject(obj: Object3D): boolean {
-    let current: Object3D | null = obj;
-    while (current) {
-      if (current === this._renderer?.group) return true;
-      current = current.parent;
-    }
-    return false;
+  /**
+   * The surface under the pointer via the one pick pipeline (rules 15/17),
+   * without the mode's allow filter. Splats are no pick geometry. Returns the
+   * reused `_worldHit` — callers copy what they keep.
+   */
+  private _worldRaycast(e: { clientX: number; clientY: number }): { point: Vector3; normal: Vector3 | null } | null {
+    const rm = this._viewer?.raycastManager;
+    if (!rm || !rm.raycastSurface(e.clientX, e.clientY, this._surf, true)) return null;
+    this._worldHit.normal = this._surf.normal!.lengthSq() > 0 ? this._surf.normal! : null;
+    return this._worldHit;
   }
 
   // ── Persistence ──────────────────────────────────────────────────────

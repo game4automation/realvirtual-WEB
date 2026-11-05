@@ -460,8 +460,8 @@ export class MachiningManager {
     }
     // plan-409 F4: the authored mesh is back, so the collision body must stop
     // using the stock box. `teardownRender()` above already answers `null` from
-    // `getStockBoundsLocal()`; this rebuilds the body so the restored meshes
-    // (and their BVHs) are checked with full triangle precision again.
+    // `getStockBoundsLocal()`; this rebuilds the body so the restored authored
+    // meshes are checked with their exact triangles again (plan-781).
     this._collision?.invalidate();
     machiningRegistry.warnUnavailableOnce(`"${entry.volume.node.name}": ${reason}`);
     return hadRender;

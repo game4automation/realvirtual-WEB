@@ -46,6 +46,7 @@ import {
 import { BakeRegistry } from '../core/engine/rv-bake-registry';
 import { buildInitContext, type InitContextBase, type InitSubsystems } from '../core/engine/rv-init-context';
 import { collectDeferredPlacements, type PlacementInstancer } from '../core/engine/rv-placement-instancer';
+import type { DocumentScope } from '../core/library/library-origin';
 import { createViewerPlacementInstancer, mergePlacedLogic, type PlacementHost } from '../core/engine/rv-placement-integrate';
 import { lazyCoreComponentFeatures } from '../core/engine/rv-lazy-core-components';
 import { createUberMaterial, type RVUberMaterial } from '../core/engine/rv-uber-material';
@@ -440,9 +441,13 @@ export class RVEmbedViewer {
     };
   }
 
-  /** Load or replace a GLB through the production component pipeline. */
-  async loadModel(url: string, data?: ArrayBuffer): Promise<LoadResult> {
+  /**
+   * Load or replace a GLB through the production component pipeline.
+   * `opts.library` (plan-780 R2): the document is library B's; absent = open project.
+   */
+  async loadModel(url: string, data?: ArrayBuffer, opts?: { library?: { providerId: string; sourceId: string } }): Promise<LoadResult> {
     this.assertUsable();
+    const scope: DocumentScope = opts?.library ? { providerId: opts.library.providerId, sourceId: opts.library.sourceId } : null;
     const generation = ++this.loadGeneration;
     this.clearModel();
     resetEmbedEngineRegistries();
@@ -497,8 +502,8 @@ export class RVEmbedViewer {
     // per load) and AWAITED — `loadModel` resolves with the scene complete, the
     // embed's scene-ready contract in one line. A superseding load aborts the
     // queue through `clearModel` → `placements.clearDocument()`.
-    this.placements.setDocumentKey(this.placements.keyOf({ catalogId: '', glbUrl: url }));
-    this.placements.materializeDeferred(collectDeferredPlacements(result.root));
+    this.placements.setDocumentKey(this.placements.keyOf({ catalogId: '', glbUrl: url }, null));
+    this.placements.materializeDeferred(collectDeferredPlacements(result.root, scope));
     this.placements.sealLoad();
     await this.placements.whenMaterialized();
     if (this.disposed || this.lifecycleSignal.aborted || generation !== this.loadGeneration) {

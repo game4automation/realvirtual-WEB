@@ -14,14 +14,14 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react';
 import { budgeted } from './helpers/wait-budget';
-import { DocumentInfoEditor } from '../src/core/hmi/projects/DocumentInfoEditor';
+import { DocumentInfoEditor, documentInfoText, splitDocumentInfoText } from '../src/core/hmi/projects/DocumentInfoEditor';
 import {
   documentInfoDraftKey,
   getDocumentInfoDraft,
   resetDocumentInfoDraftsForTests,
   settleDocumentInfoDrafts,
 } from '../src/core/hmi/projects/document-info-draft-store';
-import type { DocumentInfo } from '../src/core/project/rv-document-info';
+import { MAX_SUMMARY_CHARS, type DocumentInfo } from '../src/core/project/rv-document-info';
 import { FakeDir, asDirHandle } from './helpers/fake-fs-handles';
 import { glbWithSceneExtras, seedBlob } from './helpers/glb-scene-extras';
 import { FolderBackend } from '../src/core/project/backends/folder-backend';
@@ -30,8 +30,17 @@ import { sceneExtrasOfGlbBlob } from '../src/core/project/rv-project-documents';
 
 const INFO: DocumentInfo = { v: 1, summary: 'Press', description: 'Body' };
 
+/** The description field — opened with the pencil when it is not open yet. */
 function summaryInput(): HTMLInputElement {
-  return screen.getByLabelText('Document summary') as HTMLInputElement;
+  const open = screen.queryByLabelText('Document description');
+  if (open) return open as HTMLInputElement;
+  fireEvent.click(screen.getByRole('button', { name: 'Edit description' }));
+  return screen.getByLabelText('Document description') as HTMLInputElement;
+}
+
+/** Press Save (or Retry, its label after a failure). */
+function save(): void {
+  fireEvent.click(screen.getByRole('button', { name: /^(Save|Retry)$/ }));
 }
 
 function deferred<T = void>() {
@@ -47,42 +56,73 @@ afterEach(async () => {
   resetDocumentInfoDraftsForTests();
 });
 
-describe('plan-506 §9.6 — commit on blur', () => {
-  it('typing never commits; a blur with a diff commits once; a blur without one does not', async () => {
+describe('rendered by default, edited behind the pencil', () => {
+  it('shows rendered Markdown and no field until the pencil is clicked', async () => {
+    render(<DocumentInfoEditor projectId="p" documentId="a" info={INFO} onCommit={async () => {}} />);
+    expect(screen.queryByLabelText('Document description')).toBeNull();
+    expect(screen.getByTestId('document-info-editor')).toHaveTextContent('Press');
+    expect(await screen.findByText('Body')).toBeTruthy();
+    expect(summaryInput().value).toBe('Press\nBody');
+  });
+
+  it('an empty description says so and still offers the pencil', () => {
+    render(<DocumentInfoEditor projectId="p" documentId="a" info={null} onCommit={async () => {}} />);
+    expect(screen.getByText('No description yet.')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Edit description' })).toBeTruthy();
+  });
+
+  it('typing never commits; Save with a diff commits once and closes the field', async () => {
     const onCommit = vi.fn(async () => {});
     render(<DocumentInfoEditor projectId="p" documentId="a" info={INFO} onCommit={onCommit} />);
 
+    fireEvent.change(summaryInput(), { target: { value: 'Pres\nBody' } });
+    fireEvent.change(summaryInput(), { target: { value: 'Press 400 t\nBody' } });
     fireEvent.blur(summaryInput());
-    fireEvent.change(summaryInput(), { target: { value: 'Pres' } });
-    fireEvent.change(summaryInput(), { target: { value: 'Press 400 t' } });
+    await settleDocumentInfoDrafts();
     expect(onCommit).not.toHaveBeenCalled();
 
-    fireEvent.blur(summaryInput());
+    await act(async () => { save(); });
     await settleDocumentInfoDrafts();
     expect(onCommit).toHaveBeenCalledTimes(1);
     expect(onCommit).toHaveBeenCalledWith({ v: 1, summary: 'Press 400 t', description: 'Body' });
-
-    // Typed back to what the file says: no diff, no write.
-    fireEvent.change(summaryInput(), { target: { value: 'X' } });
-    fireEvent.change(summaryInput(), { target: { value: 'Press' } });
-    fireEvent.blur(summaryInput());
-    await settleDocumentInfoDrafts();
-    expect(onCommit).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(screen.queryByLabelText('Document description')).toBeNull());
   });
 
-  it('Enter in the summary commits', async () => {
+  it('Save without a diff writes nothing', async () => {
+    const onCommit = vi.fn(async () => {});
+    render(<DocumentInfoEditor projectId="p" documentId="a" info={INFO} onCommit={onCommit} />);
+    fireEvent.change(summaryInput(), { target: { value: 'X' } });
+    fireEvent.change(summaryInput(), { target: { value: 'Press\nBody' } });
+    await act(async () => { save(); });
+    await settleDocumentInfoDrafts();
+    expect(onCommit).not.toHaveBeenCalled();
+  });
+
+  it('Ctrl+Enter saves', async () => {
     const onCommit = vi.fn(async () => {});
     render(<DocumentInfoEditor projectId="p" documentId="a" info={null} onCommit={onCommit} />);
     fireEvent.change(summaryInput(), { target: { value: 'New' } });
-    fireEvent.keyDown(summaryInput(), { key: 'Enter' });
+    await act(async () => { fireEvent.keyDown(summaryInput(), { key: 'Enter', ctrlKey: true }); });
     await settleDocumentInfoDrafts();
     expect(onCommit).toHaveBeenCalledWith({ v: 1, summary: 'New' });
+  });
+
+  it('Cancel drops the typed text and writes nothing, also on unmount', async () => {
+    const onCommit = vi.fn(async () => {});
+    const view = render(<DocumentInfoEditor projectId="p" documentId="a" info={INFO} onCommit={onCommit} />);
+    fireEvent.change(summaryInput(), { target: { value: 'Thrown away' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByLabelText('Document description')).toBeNull();
+    expect(getDocumentInfoDraft(documentInfoDraftKey('p', 'a'))).toBeUndefined();
+    view.unmount();
+    await settleDocumentInfoDrafts();
+    expect(onCommit).not.toHaveBeenCalled();
   });
 
   it('flushes an open draft on unmount — exactly once', async () => {
     const onCommit = vi.fn(async () => {});
     const view = render(<DocumentInfoEditor projectId="p" documentId="a" info={INFO} onCommit={onCommit} />);
-    fireEvent.change(summaryInput(), { target: { value: 'Unsaved' } });
+    fireEvent.change(summaryInput(), { target: { value: 'Unsaved\nBody' } });
     view.unmount();
     await settleDocumentInfoDrafts();
     expect(onCommit).toHaveBeenCalledTimes(1);
@@ -102,7 +142,7 @@ describe('plan-506 §9.6 — commit on blur', () => {
     expect(summaryInput().value).toBe('');
   });
 
-  it('a second blur while a write runs is queued behind it, not dropped', async () => {
+  it('a second save while a write runs is queued behind it, not dropped', async () => {
     const order: string[] = [];
     const first = deferred();
     const onCommit = vi.fn(async (next: DocumentInfo | null) => {
@@ -112,33 +152,43 @@ describe('plan-506 §9.6 — commit on blur', () => {
     });
     render(<DocumentInfoEditor projectId="p" documentId="a" info={null} onCommit={onCommit} />);
     fireEvent.change(summaryInput(), { target: { value: 'one' } });
-    fireEvent.blur(summaryInput());
+    await act(async () => { fireEvent.keyDown(summaryInput(), { key: 'Enter', ctrlKey: true }); });
     fireEvent.change(summaryInput(), { target: { value: 'two' } });
-    fireEvent.blur(summaryInput());
+    await act(async () => { fireEvent.keyDown(summaryInput(), { key: 'Enter', ctrlKey: true }); });
     await Promise.resolve();
     expect(order).toEqual(['start:one']);
-    first.resolve();
+    await act(async () => { first.resolve(); });
     await settleDocumentInfoDrafts();
     expect(order).toEqual(['start:one', 'end:one', 'start:two', 'end:two']);
     expect(onCommit).toHaveBeenCalledTimes(2);
   });
 
-  it('a failed write keeps the draft, shows the error and retries on request', async () => {
+  it('a failed save keeps the field open with the error and retries on request', async () => {
     let fail = true;
     const onCommit = vi.fn(async () => { if (fail) throw new Error('disk refused'); });
     render(<DocumentInfoEditor projectId="p" documentId="a" info={INFO} onCommit={onCommit} />);
     fireEvent.change(summaryInput(), { target: { value: 'Keep me' } });
-    fireEvent.blur(summaryInput());
+    await act(async () => { save(); });
     await settleDocumentInfoDrafts();
 
     expect(await screen.findByTestId('document-info-error')).toHaveTextContent(/disk refused/);
     expect(summaryInput().value).toBe('Keep me');
 
     fail = false;
-    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry' })); });
     await settleDocumentInfoDrafts();
     expect(onCommit).toHaveBeenCalledTimes(2);
     await waitFor(() => expect(screen.queryByTestId('document-info-error')).toBeNull());
+  });
+});
+
+describe('one field: first line = summary, rest = body', () => {
+  it('splits on the first line and keeps an over-long first line whole as body', () => {
+    expect(splitDocumentInfoText('Press\n\nLine 1\nLine 2\n')).toEqual({ summary: 'Press', description: 'Line 1\nLine 2' });
+    expect(splitDocumentInfoText('Only')).toEqual({ summary: 'Only', description: '' });
+    const long = 'x'.repeat(MAX_SUMMARY_CHARS + 1);
+    expect(splitDocumentInfoText(long + '\nmore')).toEqual({ summary: '', description: long + '\nmore' });
+    expect(documentInfoText(INFO)).toBe('Press\nBody');
   });
 });
 
@@ -146,7 +196,7 @@ describe('plan-506 §9.6 — read-only and preview', () => {
   it('without onCommit renders text and no input', async () => {
     render(<DocumentInfoEditor projectId="p" documentId="a" info={INFO} />);
     expect(screen.getByTestId('document-info-readonly')).toHaveTextContent('Press');
-    expect(screen.queryByLabelText('Document summary')).toBeNull();
+    expect(screen.queryByLabelText('Document description')).toBeNull();
     expect(await screen.findByText('Body')).toBeTruthy();
   });
 
@@ -159,7 +209,7 @@ describe('plan-506 §9.6 — read-only and preview', () => {
     const info: DocumentInfo = {
       v: 1, description: 'See ![plant photo](https://tracker.example/pixel.png) and [the manual](https://example.com/m)',
     };
-    const { container } = render(<DocumentInfoEditor projectId="p" documentId="a" info={info} onCommit={async () => {}} />);
+    const { container } = render(<DocumentInfoEditor projectId="p" documentId="a" info={info} />);
     // Budgeted findBy: async preview rendering has no test-controlled completion signal.
     const link = await screen.findByText('the manual', undefined, budgeted());
     expect(link.tagName).toBe('A');

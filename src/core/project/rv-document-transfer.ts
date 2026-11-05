@@ -112,6 +112,8 @@ export interface DocumentTransferSide {
   updateManifestEntry(
     apply: (documents: RvDocumentEntry[]) => RvDocumentEntry[],
   ): Promise<boolean>;
+  /** plan-780 A3: this side's project id + `libraries[]`; null/absent = transferred as before. */
+  readProjectInfo?(): Promise<{ projectId: string; libraryIds: string[] } | null>;
 }
 
 export interface DocumentTransferSession {
@@ -140,6 +142,14 @@ function sideOf(endpoint: DocumentTransferEndpoint): DocumentTransferSide {
     listDocuments: async () => {
       const manifest = await backend.readManifest().catch(() => null);
       return readDocuments(manifest) ?? [];
+    },
+    readProjectInfo: async () => {
+      const manifest = await backend.readManifest().catch(() => null);
+      if (!manifest?.id) return null;
+      const libraryIds = (manifest.libraries ?? [])
+        .map((r) => (r && typeof r === 'object' ? (r as { projectId?: unknown }).projectId : null))
+        .filter((id): id is string => typeof id === 'string' && id !== '');
+      return { projectId: manifest.id, libraryIds };
     },
     updateManifestEntry: async (apply) => {
       if (!dir) return false;

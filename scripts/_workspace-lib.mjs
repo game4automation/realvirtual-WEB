@@ -2158,7 +2158,7 @@ function generateReadme(delivery, projectKey, model, features, projectPlugins = 
     `If a new CONNECT version misbehaves, pin an earlier one instead of waiting for a fix:\n\n` +
     `1. Open \`connect.lock.json\` in the workspace root and set \`version\`, \`url\` and \`sha256\` to the earlier release. Ask [professional@realvirtual.io](mailto:professional@realvirtual.io) for the values if you do not have them.\n` +
     `2. Delete \`tools/connect/\` so the old binary is fetched again.\n` +
-    `3. Run the preparation once: \`powershell -NoProfile -ExecutionPolicy Bypass -File .\\setup.ps1\` (Linux: \`./setup.sh\`).\n\n` +
+    `3. Fetch the pinned version: \`node tools/get-connect.mjs .\` (without \`--latest\`). Do not run \`setup.ps1\` / \`setup.sh\` for this step: the preparation always fetches the latest published version and would overwrite the pin.\n\n` +
     `Start the workspace as usual afterwards. A CONNECT that predates the built-in launcher cannot start the development server itself; the start script notices that and starts it separately, so the Viewer works either way.\n\n` +
     `### If the start hangs while installing the dependencies\n\n` +
     `The dependency installation writes about 73000 files and normally fetches around 700 packages from the public npm registry. Behind a company proxy, a TLS-inspecting gateway, or an on-access virus scanner this is the step that can stall for a very long time without any error message.\n\n` +

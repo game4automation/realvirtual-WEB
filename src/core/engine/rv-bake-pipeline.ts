@@ -105,6 +105,7 @@ import { isGeometryUberBaked } from './rv-uber-material';
 import { isRuntimeRigMesh } from './rv-traverse-utils';
 import { getPlacementMeta } from './rv-asset-reference';
 import { installPickRaycast } from './rv-pick-backend';
+import { materialBlocks } from './rv-pick-utils';
 import { beginBakeTiming } from './rv-bake-timings';
 import {
   getSharedPickBuildPort,
@@ -507,9 +508,10 @@ export async function bake(root: Object3D, opts: BakeOptions): Promise<BakedAsse
       this.disposed = true;
       for (const c of this.chunks) {
         chunkMetaOf.delete(c.geometry);
-        // A collision body may have put an INDIRECT three-mesh-bvh tree on a
-        // chunk geometry (plan §2.4a.10); the bake never builds one, but the
-        // CPU-side tree must still go before the GPU buffers.
+        // Nothing in the engine puts a three-mesh-bvh tree on a chunk geometry
+        // (the bake never builds one, collision reads the pick structure since
+        // plan-781); a tree some outside caller left there must still go before
+        // the GPU buffers.
         const g = c.geometry;
         if (g.boundsTree) {
           if (typeof g.disposeBoundsTree === 'function') g.disposeBoundsTree();
@@ -1679,15 +1681,6 @@ function buildNodeTable(ordinals: BakeOrdinals, chunks: readonly BakedChunk[]): 
 }
 
 /**
- * Does an opaque chunk OCCLUDE a node pick (plan-756 Q5)?
- *
- * The one place the rule lives: a chunk blocks unless its material is
- * see-through — `transparent`, an `alphaTest` cut-out ("glass") or an `opacity`
- * below 1. Everything else counts as opaque, so a segment without a pick owner
- * stops the ray there instead of letting a hidden part behind a housing light
- * up; a guard behind real safety glass stays selectable.
- */
-/**
  * Is `node` a GENUINE pick owner (plan-756 Q5)?
  *
  * `StageItem.pickNode` is "nearest pickable ancestor-or-self, else the chunk
@@ -1705,14 +1698,6 @@ function buildNodeTable(ordinals: BakeOrdinals, chunks: readonly BakedChunk[]): 
 function isPickOwner(node: Object3D, root: Object3D): boolean {
   if (node === root) return false;
   return pickModeOf(node) !== 'none' || getPlacementMeta(node) !== null;
-}
-
-function materialBlocks(material: Material): boolean {
-  const m = material as Material & { opacity?: number; alphaTest?: number };
-  if (m.transparent === true) return false;
-  if ((m.alphaTest ?? 0) > 0) return false;
-  if ((m.opacity ?? 1) < 1) return false;
-  return true;
 }
 
 // ─── Staging ────────────────────────────────────────────────────────

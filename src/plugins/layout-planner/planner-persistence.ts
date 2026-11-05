@@ -27,6 +27,7 @@ import type { LayoutPlannerCloudStore } from './cloud-types';
 import {
   PROJECT_PLACEMENT_PREFIX,
   findRegistryOrigin,
+  isProjectDocumentId,
   rebaseLocalLibraryUrl,
 } from '../../core/library/rv-placement-source';
 import { findQualifiedOriginSettled, isQualifiedRef } from '../../core/library/library-origin';
@@ -35,7 +36,7 @@ import { findQualifiedOriginSettled, isQualifiedRef } from '../../core/library/l
 // to the core (`core/library/rv-placement-source`, 2026-09-17): the viewer's
 // placement instancer derives the ONE bake key from them, with or without the
 // planner. Re-exported for every existing import.
-export { PROJECT_PLACEMENT_PREFIX, findRegistryOrigin };
+export { PROJECT_PLACEMENT_PREFIX, findRegistryOrigin, isProjectDocumentId };
 
 /** Find a catalog entry by its stable id across all loaded catalogs. */
 export function findCatalogEntryById(
@@ -128,7 +129,7 @@ export async function resolvePlacementUrl(
   if (isQualifiedRef(comp)) return probeQualifiedPlacement(comp);
   // Project documents come first: they carry `glbUrl: ''` and are re-resolved
   // through the library registry, never through a saved URL (plan-723 F5).
-  if (comp.catalogId.startsWith(PROJECT_PLACEMENT_PREFIX)) {
+  if (isProjectDocumentId(comp.catalogId)) {
     return probeProjectPlacement(comp);
   }
 
@@ -230,7 +231,7 @@ export async function refreshCloudGlbUrl(
   // `glbUrl` is empty (or a dead handle), the identity is the `catalogId`, and
   // the geometry is loaded under the stable cache key. Return the marker so the
   // legacy autosave loop keeps going; `_buildPlacementFromRecord` ignores it.
-  if (comp.catalogId.startsWith(PROJECT_PLACEMENT_PREFIX)) {
+  if (isProjectDocumentId(comp.catalogId)) {
     return probeProjectPlacement(comp);
   }
 

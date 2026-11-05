@@ -60,13 +60,13 @@ export function createSceneScriptAccess(registry: NodeRegistry, root: Object3D):
         if (!v || ![v.x, v.y, v.z].every(n => typeof n === 'number' && Number.isFinite(n))) throw new Error('Expected a finite vector');
         const target = instance[field] as { x: number; y: number; z: number };
         Object.assign(target, { x: v.x, y: v.y, z: v.z });
-        if (typeof instance.reapplyConfig === 'function') instance.reapplyConfig();
+        if (typeof instance.reapplyConfig === 'function') instance.reapplyConfig(field);
         return;
       } else if (typeof value !== desc.type || (typeof value === 'number' && !Number.isFinite(value))) {
         throw new Error(`Expected ${desc.type}`);
       }
       instance[field] = value;
-      if (typeof instance.reapplyConfig === 'function') instance.reapplyConfig();
+      if (typeof instance.reapplyConfig === 'function') instance.reapplyConfig(field);
     },
   };
 }

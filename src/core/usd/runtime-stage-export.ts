@@ -32,7 +32,9 @@
  * canvas once per texture, everything else is left out of a CLONE of the
  * material (see `exportMaterialFor`); the counts land in the snapshot.
  *
- * Two text patches of `model.usda` follow the export:
+ * Text patches of `model.usda` follow the export:
+ * - Shared post-pass: sibling names and registry customData, with no customData
+ *   anywhere in MU template subtrees (USD references would inherit addresses).
  * - Uber / vertex-colour materials: `diffuseColor` is connected to a
  *   `UsdPrimvarReader_float3` reading `displayColor` (spike 0a), otherwise the
  *   white base colour of the uber material wins.
@@ -56,7 +58,11 @@ import {
   Texture,
   type Material,
 } from 'three';
-import { getSourceTemplateMaterial } from '../../core/engine/rv-source';
+import { getSourceTemplateMaterial } from '../engine/rv-source';
+import { PLACEHOLDER_PREFIX, SiblingNameAllocator } from './usd-prim-names';
+import { primIdentityAddress, primIdentityForNode, type PrimAddressRegistry, type PrimIdentity } from './usd-prim-identity';
+import type { PrimPostData } from './usd-stage-post';
+import { captureStructure, isStageHelper, type StructureBaseline } from './structure-baseline';
 
 /** What the export needs from the running model. */
 export interface RuntimeStageInput {
@@ -68,11 +74,21 @@ export interface RuntimeStageInput {
   exclude: ReadonlySet<Object3D>;
   /** Pre-placed MUs that stay in the snapshot. */
   preplaced: ReadonlyArray<{ muId: number; node: Object3D }>;
+  /** Registry of the live scene; absent means unresolved, never infer from userData. */
+  registry?: PrimAddressRegistry;
 }
 
 /** The synchronous half: export tree + node table. */
 export interface RuntimeStageTree {
   scene: Scene;
+  /** Sibling mode: placeholder index -> final name. Absent in legacy/global mode. */
+  finalNames?: string[];
+  /** Registry identities captured synchronously with the node table. */
+  identities: Array<PrimIdentity | undefined>;
+  addresses: Array<string | null>;
+  templateAddresses: Array<string | null>;
+  /** Mount metadata only; template subtrees deliberately have no customData. */
+  prims: Map<number, PrimPostData>;
   /** Live nodes, index = node index. */
   nodes: Object3D[];
   /** Prim path inside the file (`/Root/Scenes/Scene/...`), index = node index. */
@@ -89,10 +105,15 @@ export interface RuntimeStageTree {
   texturesConverted: number;
   /** Textures left out because they cannot be exported (compressed, no image data). */
   texturesSkipped: number;
+  /**
+   * Structure of the exported live nodes, captured in the same synchronous pass
+   * as the tree (plan-2239 Phase 3). Present only with `structure: true`.
+   */
+  structure?: StructureBaseline;
 }
 
 /** The finished snapshot handed to the mount. */
-export interface RuntimeStageSnapshot extends Omit<RuntimeStageTree, 'scene' | 'vertexColorMaterialIds'> {
+export interface RuntimeStageSnapshot extends Omit<RuntimeStageTree, 'scene' | 'vertexColorMaterialIds' | 'prims'> {
   /** The `.usdz` bytes (uncompressed). */
   usdz: Uint8Array;
   /** Exporter warnings swallowed during `parseAsync` (counted, not printed). */
@@ -102,20 +123,8 @@ export interface RuntimeStageSnapshot extends Omit<RuntimeStageTree, 'scene' | '
 /** Root of every prim path in the exported file. */
 export const STAGE_SCENE_PATH = '/Root/Scenes/Scene';
 
-const HELPER_FLAGS = [
-  '_isSourceGhost', '_isGhostOverlay', '_isSourcePreview', '_isSourceMarker',
-  '_highlightOverlay', '_rvGizmo', '_rvGizmoOverlay', '_rvWebLabel', '_rvLabelSprite',
-  '_rvLabelPlate', '_agentEyeOverlay', '_tankFillViz', '_pipeFlowViz', '_puHighlightViz',
-  '_isSplat', '_muPool', '_rvGroundPlane', '_rvGroundReflector',
-] as const;
-
-/** True for runtime helpers that never belong in the sync stage. */
-export function isStageHelper(node: Object3D): boolean {
-  const ud = node.userData;
-  if (ud) for (const f of HELPER_FLAGS) if (ud[f]) return true;
-  const t = node as unknown as Record<string, boolean | undefined>;
-  return !!(t.isInstancedMesh || t.isLine || t.isPoints || t.isSprite || t.isLight || t.isCamera);
-}
+/** Runtime helpers never belong in the sync stage (shared with the structure baseline). */
+export { isStageHelper };
 
 /**
  * Local matrix of `node` as the renderer will see it, without touching the
@@ -138,7 +147,7 @@ export function readLocalMatrix(node: Object3D, out: Matrix4): Matrix4 {
   return out;
 }
 
-/** Name a prim may carry (exporter rule: `[A-Za-z0-9_]`, no leading digit). */
+/** Legacy global sanitizer for callers that explicitly build a global tree. */
 export function sanitizePrimName(name: string): string {
   let n = name.replace(/[^A-Za-z0-9_]/g, '');
   if (/^[0-9]/.test(n)) n = '_' + n;
@@ -386,20 +395,41 @@ export function exportMaterialFor(material: Material, ctx: ExportTextureContext)
   return out;
 }
 
+export interface RuntimeStageTreeOptions {
+  /** Default global for existing tree callers; the live mount opts into sibling. */
+  primNames?: 'global' | 'sibling';
+  /** One cache across the model and MU snapshots: sanitized resources stay shared. */
+  textureContext?: ExportTextureContext;
+  /**
+   * Also capture the {@link StructureBaseline} of the exported nodes (live link,
+   * plan-2239 Phase 3). Same filter as the visit: excluded, helper and invisible
+   * non-template children are not structural; pre-placed MUs are exported but
+   * never counted (gripping re-parents them).
+   */
+  structure?: boolean;
+}
+
 /**
- * Build the export tree in one synchronous pass. Names are unique stage-wide
- * (the name set of the exporter is global), so the exporter keeps them verbatim
- * and the paths computed here are the paths in `model.usda`.
+ * Build a detached export tree in traversal order. Global mode retains the
+ * historical names. Sibling mode carries placeholders until the post-pass;
+ * primPaths already describe the final names, indexed by the same node table.
  */
-export function buildRuntimeStageTree(input: RuntimeStageInput): RuntimeStageTree {
+export function buildRuntimeStageTree(input: RuntimeStageInput, options: RuntimeStageTreeOptions = {}): RuntimeStageTree {
   const scene = new Scene();
   const nodes: Object3D[] = [];
   const primPaths: string[] = [];
   const indexOf = new Map<Object3D, number>();
   const usedNames = new Set<string>();
+  const siblingNames = options.primNames === 'sibling' ? new SiblingNameAllocator() : null;
+  const finalNames: string[] = [];
   const vertexColorMaterialIds = new Set<number>();
   const templateSet = new Set(input.templates);
-  const textureCtx = createExportTextureContext();
+  const preplacedSet = new Set(input.preplaced.map((p) => p.node));
+  const identities: Array<PrimIdentity | undefined> = [];
+  const addresses: Array<string | null> = [];
+  const prims = new Map<number, PrimPostData>();
+  const textureCtx = options.textureContext ?? createExportTextureContext();
+  const convertedBefore = textureCtx.converted, skippedBefore = textureCtx.skipped;
 
   const uniqueName = (raw: string): string => {
     const base = sanitizePrimName(raw);
@@ -409,7 +439,7 @@ export function buildRuntimeStageTree(input: RuntimeStageInput): RuntimeStageTre
     return name;
   };
 
-  const visit = (node: Object3D, parentClone: Object3D, parentPath: string, isRoot: boolean): void => {
+  const visit = (node: Object3D, parentClone: Object3D, parentPath: string, isRoot: boolean, inTemplate: boolean): void => {
     if (input.exclude.has(node) || isStageHelper(node)) return;
     if (!node.visible && !templateSet.has(node)) return;
 
@@ -430,7 +460,9 @@ export function buildRuntimeStageTree(input: RuntimeStageInput): RuntimeStageTre
     } else {
       clone = new Object3D();
     }
-    clone.name = uniqueName(node.name);
+    const finalName = siblingNames ? siblingNames.allocate(parentClone, node.name) : uniqueName(node.name);
+    clone.name = siblingNames ? `${PLACEHOLDER_PREFIX}${nodes.length}` : finalName;
+    if (siblingNames) finalNames.push(finalName);
     clone.visible = true;
     clone.matrixAutoUpdate = false;
     if (isRoot) {
@@ -441,14 +473,24 @@ export function buildRuntimeStageTree(input: RuntimeStageInput): RuntimeStageTre
     }
     parentClone.add(clone);
 
-    const path = `${parentPath}/${clone.name}`;
+    const path = `${parentPath}/${finalName}`;
+    inTemplate ||= templateSet.has(node);
+    const identity = input.registry ? primIdentityForNode(node, input.registry,
+      preplacedSet.has(node) ? { mu: { preplaced: true } } : {}) : undefined;
+    identities.push(identity);
+    addresses.push(primIdentityAddress(identity));
+    if (!inTemplate && identity) prims.set(nodes.length, { customData: identity });
     indexOf.set(node, nodes.length);
     nodes.push(node);
     primPaths.push(path);
-    for (const child of node.children) visit(child, clone, path, false);
+    for (const child of node.children) visit(child, clone, path, false, inTemplate);
   };
 
-  visit(input.root, scene, STAGE_SCENE_PATH, true);
+  visit(input.root, scene, STAGE_SCENE_PATH, true, false);
+  // Same synchronous pass: nothing can change the live scene in between.
+  const structure = options.structure
+    ? captureStructure(nodes, { exclude: input.exclude, templates: templateSet, isMu: (o) => preplacedSet.has(o) })
+    : undefined;
   scene.updateMatrixWorld(true);
 
   const templates = input.templates.map((t) => {
@@ -462,8 +504,15 @@ export function buildRuntimeStageTree(input: RuntimeStageInput): RuntimeStageTre
   }
   return {
     scene, nodes, primPaths, indexOf, templates, preplaced, vertexColorMaterialIds,
-    texturesConverted: textureCtx.converted,
-    texturesSkipped: textureCtx.skipped,
+    identities, addresses, prims,
+    templateAddresses: input.templates.map((t) => {
+      const i = indexOf.get(t);
+      return i === undefined ? null : addresses[i];
+    }),
+    ...(siblingNames ? { finalNames } : {}),
+    ...(structure ? { structure } : {}),
+    texturesConverted: textureCtx.converted - convertedBefore,
+    texturesSkipped: textureCtx.skipped - skippedBefore,
   };
 }
 
@@ -560,11 +609,14 @@ export async function exportRuntimeStage(
   input: RuntimeStageInput,
   options: RuntimeStageExportOptions = {},
 ): Promise<RuntimeStageSnapshot> {
-  const tree = buildRuntimeStageTree(input);
+  const tree = buildRuntimeStageTree(input, { primNames: 'sibling', structure: true });
   options.onTreeBuilt?.(tree);
-  const [{ USDZExporter }, fflate] = await Promise.all([
+  const [{ USDZExporter }, fflate, { postProcessModelUsda }, { withSplitOversizedMeshes }, packageLimit] = await Promise.all([
     import('three/examples/jsm/exporters/USDZExporter.js'),
     import('three/examples/jsm/libs/fflate.module.js'),
+    import('./usd-stage-post'),
+    import('./usd-export-geometry-split'),
+    import('./usd-package-limit'),
   ]);
   const exporter = new USDZExporter();
   let exporterWarnings = 0;
@@ -574,34 +626,55 @@ export async function exportRuntimeStage(
     origWarn(...args);
   };
   let raw: Uint8Array;
+  let partNames: ReadonlyMap<string, string> = new Map();
   try {
-    raw = new Uint8Array(await exporter.parseAsync(tree.scene, {
-      onlyVisible: true,
-      includeAnchoringProperties: false,
-      quickLookCompatible: false,
-    }));
+    // plan-2246: oversized chunk geometries are split for exactly this call
+    // (after every table is built), the tree is restored afterwards.
+    raw = await withSplitOversizedMeshes(tree.scene, { finalNames: tree.finalNames!, primPaths: tree.primPaths }, async (split) => {
+      partNames = split.partNames;
+      packageLimit.assertStageUsdzPackageFits(tree.scene, {
+        post: { finalNames: tree.finalNames!, prims: tree.prims, partNames },
+      });
+      return new Uint8Array(await exporter.parseAsync(tree.scene, {
+        onlyVisible: true,
+        includeAnchoringProperties: false,
+        quickLookCompatible: false,
+      }));
+    });
   } finally {
     console.warn = origWarn;
   }
   const files = fflate.unzipSync(raw);
   const usda = fflate.strFromU8(files['model.usda']);
-  files['model.usda'] = fflate.strToU8(patchModelUsda(usda, tree.vertexColorMaterialIds));
+  const patched = patchModelUsda(usda, tree.vertexColorMaterialIds);
+  files['model.usda'] = fflate.strToU8(postProcessModelUsda(patched, {
+    finalNames: tree.finalNames!, prims: tree.prims, ...(partNames.size ? { partNames } : {}),
+  }).text);
+  // Complete payload sizes, before the final archive allocation.
+  packageLimit.assertUsdzFilesFit(files);
   const usdz = repackUsdz(fflate, files);
+  packageLimit.assertUsdzPackageSize(usdz.byteLength);
   return {
     usdz,
     nodes: tree.nodes,
     primPaths: tree.primPaths,
     indexOf: tree.indexOf,
     templates: tree.templates,
+    identities: tree.identities,
+    addresses: tree.addresses,
+    templateAddresses: tree.templateAddresses,
     preplaced: tree.preplaced,
     exporterWarnings,
     texturesConverted: tree.texturesConverted,
     texturesSkipped: tree.texturesSkipped,
+    ...(tree.structure ? { structure: tree.structure } : {}),
   };
 }
 
 /** gzip via `CompressionStream` when the browser has it, else identity. */
 export async function compressForMount(bytes: Uint8Array): Promise<{ bytes: Uint8Array; encoding: 'gzip' | 'identity' }> {
+  const { assertUsdzPackageSize } = await import('./usd-package-limit');
+  assertUsdzPackageSize(bytes.byteLength);
   if (typeof CompressionStream === 'undefined') return { bytes, encoding: 'identity' };
   const stream = new Blob([bytes as unknown as BlobPart]).stream().pipeThrough(new CompressionStream('gzip'));
   const out = new Uint8Array(await new Response(stream).arrayBuffer());

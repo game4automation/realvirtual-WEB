@@ -82,6 +82,8 @@ import {
   subscribeSaveDialogs,
 } from '../src/core/hmi/scene/save-dialog-store';
 
+const idleTail = Promise.resolve();
+
 /**
  * Answer name prompts with `answer`, and RECORD every one — so a test can
  * assert that no prompt appeared at all, not merely survive one.
@@ -125,6 +127,7 @@ function context(name: string, base: AssetBase, opts?: { bound?: boolean }) {
     markSaved: async (b: AssetBase, n?: string) => { saved.push({ base: b, name: n }); },
     get isBound() { return opts?.bound === true; },
     document: {
+      whenIdle: () => idleTail,
       opCount: 0,
       runExclusive: <T,>(work: () => Promise<T>) => work(),
       markSaved: () => {},

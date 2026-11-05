@@ -199,6 +199,19 @@ describe('DropDetection — state stage (plan-2022)', () => {
       expect(w.reported()).toEqual([`mu:${mu.id}`]);
     });
 
+    it('OK on the card removes the reported part and clears the card (Thomas 2026-11-04)', () => {
+      const w = makeWorld();
+      const mu = part(1.0);
+      w.run(0.6, [mu]);
+      expect(w.reported()).toEqual([`mu:${mu.id}`]);
+      w.mgr.acknowledge(`mu:${mu.id}`);
+      expect(mu.markedForRemoval).toBe(true);
+      expect(w.reported()).toEqual([]);
+      // Marked for removal: never reported again while the transport tick disposes it.
+      w.run(0.6, [mu]);
+      expect(w.reported()).toEqual([]);
+    });
+
     it('E7: a part that was never carried is NOT reported (a static hose, a pre-placed pallet)', () => {
       const w = makeWorld();
       const mu = part(1.0);

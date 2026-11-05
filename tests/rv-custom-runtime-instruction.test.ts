@@ -37,6 +37,10 @@ function makeSignalMock(initial: boolean | undefined = undefined, comment?: stri
     nameForPath(path: string) {
       return path;
     },
+    /** SignalStore contract: display wiring (`wireDisplaySignal`) also listens for silent restores. */
+    onValuesRestored(_cb: () => void) {
+      return () => {};
+    },
     getSignalMeta(_name: string) {
       return comment !== undefined ? { comment } : undefined;
     },

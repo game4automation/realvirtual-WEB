@@ -6,6 +6,96 @@ Maintained by `/release-web`; the contract is described in `Documentation/web/RE
 
 ## Unreleased
 
+## 6.7.0 — 2026-11-05
+
+**New**
+- Record the running simulation as an animated USD file (.usdz) from the USD menu, live or
+  for a set duration in deterministic mode, at 24, 30 or 60 fps with Blender compatible visibility
+  (Commercial).
+- PLC editor: DES-suitability check — lines that never settle in event-driven DES are marked (DES:), affected programs show "not DES-ready", and experiment batches refuse them.
+- Ray-traced render mode (Commercial, Beta): with the WebGPU backend, the render-mode menu offers
+  **Ray traced** for interactive lighting with bounced light, reflections, transparency and soft
+  shadows that refines while the view is still.
+- Projects dashboard: select several documents at once; cards show the document's open mode, and the
+  detail pane shows a preview card.
+- DES experiments (Commercial): blocked runs are marked in the experiment matrix, with the blockage
+  findings of each run.
+
+**Improved**
+- The USD menu in the left activity bar groups USD files (export, import, apply realvirtual data),
+  animation recording and Isaac Sim live sync, with a short description for each entry. Export modes
+  explain what they write and why a mode is unavailable; the export dialog counts placements without geometry.
+- Animated USD export and Isaac Sim live sync handle baked parts with millions of vertices
+  by writing oversized parts in smaller pieces.
+- A library document edited with Edit in library loads its parts from that library everywhere:
+  reloads, test runs, descending into a part and the hierarchy's open link no longer pick up a
+  document of the open project that shares its name. A part of a library that is still loading
+  shows as loading and appears once the library is ready.
+- Old placements that name a project document by its path keep working after the document is
+  renamed, and are saved by the document's id from now on. Files saved now need realvirtual WEB
+  6.6 or newer to open their library parts; older viewers show them as missing.
+- Copy into project keeps the copy's parts and its thumbnail; saving in Edit in library refreshes
+  the library card's thumbnail.
+- Orphaned signal bindings are no longer moved to another node by name; rebind them manually.
+- DES: LogicSteps run on simulation events instead of the render frame (a delay ends exactly at its
+  time, waits react to the signal change), so a model with LogicSteps runs the same in every DES
+  speed mode, can run experiment batches and can be saved and restored as a snapshot. Sequences that
+  cannot run on events (a repeating sequence without any waiting step) are listed in Problems.
+- DES: grippers and zones are part of the snapshot, and a blocking GripPick/GripPlace step no longer
+  prevents saving one. A gripper or zone that holds a part still refuses the snapshot with its
+  address. A pick, place or source-generate signal that pulses within one DES time step is listed
+  in Problems (`des-zero-time-pulse`): grippers and classic sources do not run in DES mode yet.
+- DES: the virtual PLC runs event-driven — a program scans when a signal it reads changes, when one of
+  its timers (TON/TOF/TP) runs out or right after its own change, instead of once per render frame. A
+  model with ST programs runs the same in every DES speed mode and can run experiment batches; only
+  programs that are not DES-ready are refused. A program that never settles is stopped with an error
+  and listed in Problems (`des-settle-overflow`).
+- DES: a model with ST programs can be saved and restored as a snapshot. Program variables, function
+  block states and running timers are part of it, so the run continues exactly as without the cut.
+  While a program is still being deployed, saving and loading wait for it or are refused
+  (`des-snapshot-plc-pending`).
+- Collision detection works on the same structure as picking and loads only when a model uses it;
+  collision and unsupported-part messages show in every mode, and OK on an unsupported-part message
+  removes the part.
+- The documents button and the AAS mode appear only in the operating views.
+
+**Fixed**
+- DES experiments: a live run on the older random-number version kept no checkpoints when the project
+  saved its experiment metadata first; the checkpoints are now stored again.
+- Animated USD export and Isaac Sim live sync stop with a clear message showing the estimated
+  size and browser limit when the file would be too large.
+- DES: RobotHandling counted each output twice; throughput and KPIs of models with RobotHandling were
+  doubled. Experiment results recorded before this fix are not comparable.
+- A signal binding whose stored target no longer exists stays empty and is listed in Problems
+  instead of silently binding to a signal with the same name.
+- FMU models: a drive or LogicStep linked to an FMU signal (for example the ball height of the
+  FMU demo) moves again; the link was reported as "Reference not found" and stayed empty.
+- DES: after an experiment batch the next run starts with your own end time and warm-up again,
+  not with those of the last experiment run, also after a reset.
+- DES: end time, warm-up and seed set right after loading or resetting a scene (`des.setEnd`,
+  `des.seed.set`, clock window) wait for the load instead of being refused.
+- DES experiments (Commercial): changing the end time or warm-up of the live simulation no longer
+  marks experiment results as "stale: base changed"; existing results stay valid.
+- DES experiments (Commercial): an open live run (for example one with autosave checkpoints) no
+  longer shows its column as "stale: failed".
+- Resetting the simulation now also resets the internal run state of drive behaviors (for example
+  destination, start and speed commands of Drive_DestinationMotor, Drive_Speed and
+  Drive_ContinousDestination), so a reset no longer keeps a previous target or command.
+- A logic sequence that jumps or loops without any waiting step no longer freezes the viewer; it is
+  stopped after 10,000 instant steps and reported in Problems (`logic-instant-loop`).
+- DES: setting the end time, warm-up or seed during a run (`des.setEnd`, clock window) no longer
+  stops checkpoint autosave and snapshots with "model changed since run start".
+- DES checkpoints (Commercial): a Fast Forward over several autosave intervals keeps a checkpoint
+  at every interval (up to **keep**) instead of only the first one, and the checkpoints are listed
+  under the live run, also when an earlier run used the same seed.
+- Saving or exporting right after unbinding a signal no longer writes the old binding into the file.
+- Measuring, annotations and dragging in the planner pick the same part that hover highlights.
+- STEP import: the minimal and ultra-low quality presets keep large circles round.
+
+**Internal**
+- DES experiment results recorded since 5fff25b2 in scenes where `des.setEnd` created a
+  run-configuration holder show as "base changed" once; re-run them.
+
 ## 6.6.0 — 2026-11-04
 
 **New**

@@ -19,9 +19,8 @@
  *     belt end, and consecutive belts hand off continuously (shared snap plane);
  *   - a turntable discharges with the part's leading edge at the output snap.
  *
- * The offset = half the MU's world bounding-box extent along `forward`, cached on the
- * MU (geometry is constant). Because `forward` is the actual heading (and the part is
- * oriented along it), the world-AABB extent along it is the part's real length there.
+ * The offset = half the MU's canonical template extent along local +Z, cached on
+ * the MU. Continuous MUs without a preset measure their own local-frame bounds.
  */
 
 import { Box3, Matrix4, Quaternion, Vector3 } from 'three';
@@ -34,15 +33,13 @@ const _cloneScale = new Vector3();
 const _box = new Box3();
 const _size = new Vector3();
 const _meshBox = new Box3();
-const _invTemplate = new Matrix4();
 const _space = new Matrix4();
 const _scaleOnly = new Matrix4();
-const _meshToSpace = new Matrix4();
 const _origin = new Vector3();
 const _identityQuat = new Quaternion();
 
-/** The MU's mutable travel state: a ground-plane unit `forward` + a cached world-
- *  bounds size (computed once; geometry is constant). */
+/** The MU's mutable travel state: a ground-plane unit `forward` + a cached
+ *  template or local-frame bounds size (computed once; geometry is constant). */
 interface MuTravel {
   visual?: { node?: Object3D; isInstanced?: boolean };
   forward?: [number, number, number];
@@ -83,16 +80,12 @@ export function muForward(mu: MU): [number, number] {
 }
 
 /**
- * Measure an MU visual's bounds size in the part's OWN frame (un-rotating the
- * node, so a rotated world AABB can't inflate it) — the raw value `muBugOffset`
- * caches per MU. Exported for the plan-262 Phase 3 headless path: the DES
- * binding measures the size ONCE per source template and pre-sets it on every
- * spawned MU (visual AND headless), so both deliver IDENTICAL bug offsets.
+ * Measure a visual with its own heading reset, retaining parent rotation/scale.
+ * Kept for clone-size comparisons; travel offsets use canonical template sizes
+ * or the local-chain fallback in `muBugOffset`, never this world measurement.
  * Returns `null` when the node carries no measurable geometry.
  */
 export function measureMuVisualBugSize(node: Object3D): [number, number, number] | null {
-  // Size in the part's OWN frame: un-rotate the node, measure the axis-aligned
-  // bounds, restore. Independent of the current world heading.
   const q = node.quaternion.clone();
   node.quaternion.identity();
   node.updateWorldMatrix(true, true);
@@ -111,39 +104,40 @@ function isStrippedFromClone(ud: Record<string, unknown> | undefined): boolean {
 }
 
 /**
- * The size `measureMuVisualBugSize` would return for a clone of `template`
- * spawned under `spawnParent` — measured WITHOUT spawning (plan-638, spike
- * result). The clone hangs under `spawnParent`, carries `spawnCloneScale` (the
- * template's world scale relative to the spawn parent, plan-655 F10) and is measured with its quaternion reset, so the measurement space is
- * `P · S(template.scale) · rel` (P = world matrix of the spawn parent, rel =
- * mesh relative to the template). Ghost / overlay / preview subtrees are
- * skipped (the clone strips them). Each mesh contributes its transformed
- * `geometry.boundingBox`, the same non-precise rule as `Box3.expandByObject`.
- * Read-only: nothing is cloned, added or counted. `null` without geometry.
+ * Canonical clone size WITHOUT spawning. Keep `spawnCloneScale` (plan-655 F10)
+ * and the spawn parent's rotation/scale, including axis swaps of a Z-up root.
+ * Exclude parent translation and derive mesh-to-template transforms solely
+ * from descendant LOCAL matrices, avoiding world-matrix cancellation and load
+ * state in the bounds. Ghost / overlay / preview subtrees are stripped from
+ * clones and excluded here. `null` without measurable geometry.
  */
 export function templateSizeOf(template: Object3D, spawnParent: Object3D): [number, number, number] | null {
-  template.updateWorldMatrix(true, true);
-  spawnParent.updateWorldMatrix(true, false);
-  _invTemplate.copy(template.matrixWorld).invert();
   // plan-655 F10: the clone's scale is the template's WORLD scale relative to
   // the spawn parent — the same `spawnCloneScale` rule `RVSource.spawn` uses.
   _scaleOnly.compose(_origin, _identityQuat, spawnCloneScale(template, spawnParent, _cloneScale));
-  _space.multiplyMatrices(spawnParent.matrixWorld, _scaleOnly);
+  _space.copy(spawnParent.matrixWorld).setPosition(0, 0, 0).multiply(_scaleOnly);
+  return localBoundsSize(template, _space, true);
+}
+
+/** Accumulate bounds down the local hierarchy; never invert a world matrix. */
+function localBoundsSize(root: Object3D, rootToSpace: Matrix4, stripCloneSubtrees: boolean): [number, number, number] | null {
   _box.makeEmpty();
-  const walk = (o: Object3D): void => {
-    if (o !== template && isStrippedFromClone(o.userData)) return;
+  const walk = (o: Object3D, toSpace: Matrix4): void => {
+    if (o !== root && stripCloneSubtrees && isStrippedFromClone(o.userData)) return;
     const g = (o as Mesh).geometry;
     if (g) {
       if (!g.boundingBox) g.computeBoundingBox();
       if (g.boundingBox) {
-        _meshToSpace.multiplyMatrices(_invTemplate, o.matrixWorld).premultiply(_space);
-        _meshBox.copy(g.boundingBox).applyMatrix4(_meshToSpace);
+        _meshBox.copy(g.boundingBox).applyMatrix4(toSpace);
         _box.union(_meshBox);
       }
     }
-    for (const c of o.children) walk(c);
+    for (const c of o.children) {
+      if (c.matrixAutoUpdate) c.updateMatrix();
+      walk(c, new Matrix4().multiplyMatrices(toSpace, c.matrix));
+    }
   };
-  walk(template);
+  walk(root, rootToSpace);
   if (_box.isEmpty()) return null;
   _box.getSize(_size);
   return [_size.x, _size.y, _size.z];
@@ -192,7 +186,13 @@ export function muBugOffset(mu: MU): number {
   if (!s) {
     const node = m.visual?.node;
     if (!node) return 0;
-    const measured = measureMuVisualBugSize(node);
+    // Continuous fallback: retain the full scale chain to convert to metres,
+    // without the node's heading/position or parent translation/rotation.
+    // DES MUs with measurable templates already carry a preset.
+    _cloneScale.copy(node.scale);
+    for (let parent = node.parent; parent; parent = parent.parent) _cloneScale.multiply(parent.scale);
+    _space.compose(_origin, _identityQuat, _cloneScale);
+    const measured = localBoundsSize(node, _space, false);
     if (!measured) return 0;
     s = measured;
     m._bugSize = s;

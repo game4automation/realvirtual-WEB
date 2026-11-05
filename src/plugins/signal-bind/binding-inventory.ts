@@ -187,7 +187,12 @@ export function mergeAppliedMappings(
     const candidate = applied[next];
     if (candidate
       && candidate.slot === mapping.slot
-      && candidate.signal === mapping.signal
+      // Stored identities must agree: an address-bound source matches by its address
+      // (the name is a cache a rename moves on), a component by its address
+      // (doc-node-paths.md § 5.4).
+      && (candidate.sourceAddress ?? '') === (mapping.sourceAddress ?? '')
+      && (!!mapping.sourceAddress || candidate.signal === mapping.signal)
+      && (!mapping.componentAddress || candidate.componentAddress === mapping.componentAddress)
       && (mapping.componentPath === undefined
         || candidate.componentPath === mapping.componentPath)) {
       out.push({ ...candidate });

@@ -15,7 +15,7 @@ import { RVMovingUnit, MUInstancePool } from '../src/core/engine/rv-mu';
 import { RVSource } from '../src/core/engine/rv-source';
 import { decodeMessage, type DecodedMessage } from '../src/plugins/usd-live-link/livesync-protocol';
 import { RateGate, SyncTracker, collectTrackedIndices, type TrackedMu } from '../src/plugins/usd-live-link/sync-tracker';
-import { buildTemplateTable, templateIndexOfMu } from '../src/plugins/usd-live-link/usd-live-link-session';
+import { buildTemplateTable, templateIndexOfMu } from '../src/core/usd/collect-stage-input';
 
 const HALF = new Vector3(0.1, 0.1, 0.1);
 

@@ -151,6 +151,11 @@ export interface TransportTickHook {
   reset?(): void;
 }
 
+/** Listener of {@link RVTransportManager.onSensorsChanged}: the sensors just added / removed. */
+export type SensorsChangedListener = (added: readonly RVSensor[], removed: readonly RVSensor[]) => void;
+
+const NO_SENSORS: readonly RVSensor[] = Object.freeze([]) as readonly RVSensor[];
+
 /**
  * RVTransportManager - Central coordinator for transport simulation.
  *
@@ -210,7 +215,15 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
   }
 
   surfaces: RVTransportSurface[] = [];
+  /**
+   * The overlap sensors the tick evaluates. READ freely; WRITE only through
+   * {@link addSensor} / {@link removeSensors} / {@link clearSensors} — those are
+   * the one notification point for {@link onSensorsChanged} (sensor monitor,
+   * component-event consumers). A direct push / filter is invisible to them.
+   */
   sensors: RVSensor[] = [];
+  /** Listeners of {@link onSensorsChanged}. */
+  private readonly _sensorsChangedListeners = new Set<SensorsChangedListener>();
   /**
    * Ray-based sensors — `Rangefinder` / `LaserScanner` (plan-664 Phase 2).
    *
@@ -2333,6 +2346,69 @@ export class RVTransportManager implements IAccumulationQuery, MULoadHost, ZoneH
    * rebuild on the next tick and invalidates the dead-end adjacency cache.
    * Cheap and idempotent — safe to call defensively after any layout mutation.
    */
+  /**
+   * Subscribe to sensor registration changes (every write of {@link sensors}
+   * that goes through {@link addSensor} / {@link removeSensors} /
+   * {@link clearSensors}). Fires synchronously, AFTER the list is updated.
+   * Returns the unsubscribe function.
+   */
+  onSensorsChanged(cb: SensorsChangedListener): () => void {
+    this._sensorsChangedListeners.add(cb);
+    return () => { this._sensorsChangedListeners.delete(cb); };
+  }
+
+  /** Register a sensor for the tick (RVSensor.init, synthetic lines) and announce it. */
+  addSensor(sensor: RVSensor): void {
+    this.sensors.push(sensor);
+    if (this._sensorsChangedListeners.size > 0) this._emitSensorsChanged([sensor], NO_SENSORS);
+  }
+
+  /**
+   * Drop every sensor matching `predicate` and announce them. The list is
+   * REASSIGNED (not spliced) like the former direct filters, so identity-keyed
+   * caches (`_rayCollidersSensors`) invalidate as before. Returns the removed
+   * sensors (empty when nothing matched — the list is then left untouched).
+   */
+  removeSensors(predicate: (sensor: RVSensor) => boolean): RVSensor[] {
+    const removed: RVSensor[] = [];
+    const kept: RVSensor[] = [];
+    for (const s of this.sensors) (predicate(s) ? removed : kept).push(s);
+    if (removed.length === 0) return removed;
+    this.sensors = kept;
+    if (this._sensorsChangedListeners.size > 0) this._emitSensorsChanged(NO_SENSORS, removed);
+    return removed;
+  }
+
+  /**
+   * Drop ONE sensor (its own dispose) and announce it. A no-op — no allocation,
+   * no notification — when it is not registered (any more): a teardown path
+   * that already removed it is not announced twice. Returns whether it was there.
+   */
+  removeSensor(sensor: RVSensor): boolean {
+    const index = this.sensors.indexOf(sensor);
+    if (index < 0) return false;
+    // Reassigned like removeSensors (identity-keyed caches).
+    const kept = this.sensors.slice();
+    kept.splice(index, 1);
+    this.sensors = kept;
+    if (this._sensorsChangedListeners.size > 0) this._emitSensorsChanged(NO_SENSORS, [sensor]);
+    return true;
+  }
+
+  /** Empty the sensor list IN PLACE (perf strip) and announce the removed sensors. */
+  clearSensors(): void {
+    if (this.sensors.length === 0) return;
+    const removed = this._sensorsChangedListeners.size > 0 ? this.sensors.slice() : NO_SENSORS;
+    this.sensors.length = 0;
+    if (removed.length > 0) this._emitSensorsChanged(NO_SENSORS, removed);
+  }
+
+  private _emitSensorsChanged(added: readonly RVSensor[], removed: readonly RVSensor[]): void {
+    for (const cb of this._sensorsChangedListeners) {
+      try { cb(added, removed); } catch (e) { console.warn('[transport] sensors-changed listener failed:', e); }
+    }
+  }
+
   notifyTopologyChanged(): void {
     this._surfaceGridDirty = true;
     // plan-2016 Codex review: colliders may have been added or removed — the

@@ -644,6 +644,19 @@ falling back to the raw path; the signal may not be driven.
 The wording is deliberately non-committal: the raw path *may* still resolve downstream. Treat
 the warning as "look here first", not as proof of a defect.
 
+This pass-through applies only to a path **typed** in (plugin API, no referrer and no scope). A
+**stored** signal reference — one its file carries, read through the file's migration or by
+address — that names no node stays unbound: `resolve()` returns nothing, the field is `null`
+(queued while its placement is still loading) and the reference audit reports it. Its raw path is
+never handed to the SignalStore, whose space / suffix matching would bind it to whichever signal
+path happens to end the same way (contract-node-identity R4).
+
+The same rule holds for a signal link's internal source (`SignalMapping.sourceAddress`): the
+address decides, the stored `signal` name is only a display cache. An address that names no
+signal leaves the slot unlinked and reports `signal-binding-unresolved` in Problems — a signal
+that merely carries the old name elsewhere is not used, neither on load nor after a delete and
+re-create at runtime, and a save keeps the address instead of re-deriving it from the name.
+
 ### 5.5 Resolved earlier, kept here as history
 
 These were live defects until plan-381 (Phase 3) and are fixed; the notes remain because

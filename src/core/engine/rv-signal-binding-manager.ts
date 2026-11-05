@@ -63,6 +63,25 @@ import {
 } from './rv-slot-authority';
 import { signalSourceKey } from './rv-signal-provider';
 import { fromStoredMapping } from './rv-signal-mapping-address';
+import { ROOT_OCCURRENCE } from './rv-node-id';
+import { clearProblem, reportProblem } from '../hmi/problems-store';
+
+/** Problems code: a signal link whose stored address names nothing (doc-node-paths.md § 5.4). */
+export const SIGNAL_BINDING_UNRESOLVED_CODE = 'signal-binding-unresolved';
+
+/** What {@link SignalBindingManager} remembers of an element's last apply. */
+interface RequestedMappings {
+  node: Object3D;
+  mappings: SignalMapping[];
+  /** Per mapping: `_sourceStateOf` at apply time. */
+  sources: Array<string | null>;
+  /** Per mapping: the object handed to `bind()`, or null. */
+  live: Array<SignalMapping | null>;
+  /** Per mapping: why it is not bound, or null. */
+  unresolvedAt: Array<UnresolvedMapping | null>;
+  /** Source addresses with a queued pending wait. */
+  waiting: Set<string>;
+}
 
 /** plan-769 F19: the slot path of a mapping whose `componentAddress` names no node — matches no slot. */
 const UNRESOLVED_ADDRESS_PREFIX = '\u0000unresolved-address:';
@@ -220,10 +239,22 @@ export class SignalBindingManager {
    */
   private readonly _bindingsChangedListeners = new Set<BindingsChangedListener>();
 
+  /** Per element: the last applied list — the baseline of `_onCatalogChanged`. */
+  private readonly _requested = new Map<string, RequestedMappings>();
+  /** Per element: its Problems entry ids. */
+  private readonly _problemIds = new Map<string, string[]>();
+  /** Source addresses whose pending wait was dropped — missing from now on. */
+  private readonly _droppedSources = new Set<string>();
+  private readonly _unsubCatalog: () => void;
+  /** `onSignalAdded` watch, held only while some addressed source is missing or pending. */
+  private _unsubAdded: (() => void) | null = null;
+  private _addedScheduled = false;
+
   constructor(store: SignalStore, registry: NodeRegistry) {
     this._store = store;
     this._writer = createSignalWriter(store, SIGNAL_BINDING_RELAY_WRITER_ID, 'component');
     this._registry = registry;
+    this._unsubCatalog = store.onCatalogChanged(() => this._onCatalogChanged());
   }
 
   // ─── Element registration ────────────────────────────────────────────
@@ -489,6 +520,7 @@ export class SignalBindingManager {
   /** Unbind every slot of an element and forget it (relays + state). */
   unbindAll(placedId: string): void {
     this._unbindAllSilent(placedId);
+    this._syncAddedWatch();
     // Also without an element entry: an undo to an empty list must still let a
     // listener clear what it derived from the previous binding set.
     this._emitBindingsChanged(placedId, NO_MAPPINGS);
@@ -496,6 +528,8 @@ export class SignalBindingManager {
 
   /** {@link unbindAll} without the bindings-changed notification (used by applyMappings). */
   private _unbindAllSilent(placedId: string): void {
+    this._requested.delete(placedId);
+    this._retireUnresolvedProblems(placedId);
     const entry = this._elements.get(placedId);
     if (!entry) return;
     for (const binding of [...entry.bindings.values()]) {
@@ -528,15 +562,36 @@ export class SignalBindingManager {
    * gone" — had nothing on the screen to corroborate it.
    */
   applyMappings(placedId: string, node: Object3D, mappings: readonly SignalMapping[]): SignalMapping[] {
+    const applied = this._apply(placedId, node, mappings);
+    this._emitBindingsChanged(placedId, mappings);
+    return applied;
+  }
+
+  /** {@link applyMappings} without the bindings-changed notification (also the re-check path). */
+  private _apply(placedId: string, node: Object3D, mappings: readonly SignalMapping[]): SignalMapping[] {
     this._unbindAllSilent(placedId);
     const entry = this._ensureElement(placedId, node);
-    const { applied, unresolved } = this._resolveMappings(entry.slots, this._readMappings(node, mappings));
+    const read = this._readMappings(node, mappings);
+    const { applied, unresolved, appliedFrom, unresolvedFrom } = this._resolveMappings(entry.slots, read);
     // Set unconditionally: an element that resolves cleanly must CLEAR a stale
     // finding from an earlier load, or a repaired binding keeps being reported.
     if (unresolved.length > 0) this._unresolved.set(placedId, unresolved);
     else this._unresolved.delete(placedId);
+    const request: RequestedMappings = {
+      node,
+      mappings: mappings.map((m) => ({ ...m })),
+      sources: read.map((m) => this._sourceStateOf(m)),
+      live: mappings.map(() => null),
+      unresolvedAt: mappings.map(() => null),
+      waiting: new Set(),
+    };
+    applied.forEach((m, k) => { request.live[appliedFrom[k]] = m; });
+    unresolved.forEach((u, k) => { request.unresolvedAt[unresolvedFrom[k]] = u; });
+    this._requested.set(placedId, request);
+    this._reportUnresolved(placedId, node, unresolved);
+    this._awaitPendingSources(placedId, request, read);
     for (const m of applied) this.bind(placedId, node, m);
-    this._emitBindingsChanged(placedId, mappings);
+    this._syncAddedWatch();
     return applied;
   }
 
@@ -581,10 +636,19 @@ export class SignalBindingManager {
   private _resolveMappings(
     slots: readonly BindableSlot[],
     mappings: readonly SignalMapping[],
-  ): { applied: SignalMapping[]; unresolved: UnresolvedMapping[] } {
+  ): { applied: SignalMapping[]; unresolved: UnresolvedMapping[]; appliedFrom: number[]; unresolvedFrom: number[] } {
     const applied: SignalMapping[] = [];
+    const appliedFrom: number[] = [];
+    const unresolvedFrom: number[] = [];
     const unresolved: UnresolvedMapping[] = [];
-    for (const mapping of mappings) {
+    for (let i = 0; i < mappings.length; i++) {
+      const mapping = mappings[i];
+      // Address names no signal: not bound, not repaired by name (doc-node-paths.md § 5.4).
+      if (mapping.sourceUnresolved) {
+        unresolved.push({ mapping: { ...mapping }, reason: 'source-unresolved' });
+        unresolvedFrom.push(i);
+        continue;
+      }
       const requestedKind = mapping.kind ?? 'mapped-signal';
       const resolves = slots.some((slot) =>
         slot.kind !== 'unavailable'
@@ -593,6 +657,7 @@ export class SignalBindingManager {
         && (mapping.componentPath === undefined || slot.componentPath === mapping.componentPath));
       if (resolves) {
         applied.push({ ...mapping });
+        appliedFrom.push(i);
         continue;
       }
       // Second pass (case B). It NEVER binds — `findRepairCandidate` returning a
@@ -607,8 +672,9 @@ export class SignalBindingManager {
           ? { candidateComponentPath: lookup.componentPath }
           : { reason: lookup.reason }),
       });
+      unresolvedFrom.push(i);
     }
-    return { applied, unresolved };
+    return { applied, unresolved, appliedFrom, unresolvedFrom };
   }
 
   /**
@@ -625,6 +691,156 @@ export class SignalBindingManager {
   /** Every element with unbindable mappings, for whole-scene reporting. */
   getAllUnresolvedMappings(): ReadonlyMap<string, readonly UnresolvedMapping[]> {
     return this._unresolved;
+  }
+
+  // ─── address-bound internal sources (doc-node-paths.md § 5.4) ──
+
+  /** Signal name, NUL+pending / NUL+missing, or null when not addressed. */
+  private _sourceStateOf(m: SignalMapping): string | null {
+    if (m.sourceKind !== 'internal' || typeof m.sourceAddress !== 'string' || !m.sourceAddress) return null;
+    if (m.sourceUnresolved) return `\u0000${m.sourceUnresolved}`;
+    return m.signal;
+  }
+
+  /** Re-checks addressed sources (viewer: on placement content). */
+  recheckSources(): void {
+    this._onCatalogChanged();
+  }
+
+  /** Re-checks every element with addressed sources (delete, undo, rename, arrival). */
+  private _onCatalogChanged(): void {
+    if (this._requested.size === 0) return;
+    for (const [placedId, request] of [...this._requested]) {
+      if (request.sources.some((x) => x !== null)) this._reconcile(placedId, request, false);
+    }
+  }
+
+  /**
+   * Re-binds ONLY the mappings whose addressed source resolves differently now; every
+   * other binding of the element stays untouched (no handover, no stopped drive).
+   */
+  private _reconcile(placedId: string, request: RequestedMappings, force: boolean): void {
+    const entry = this._elements.get(placedId);
+    if (!entry || this._requested.get(placedId) !== request) return;
+    const read = this._readMappings(request.node, request.mappings);
+    let changed = force;
+    read.forEach((r, i) => {
+      const state = this._sourceStateOf(r);
+      if (state === request.sources[i]) return;
+      changed = true;
+      request.sources[i] = state;
+      const prev = request.live[i];
+      const was = prev ? entry.bindings.get(bindingKey(prev.componentPath ?? '', prev.slot)) : undefined;
+      if (prev) this.unbind(placedId, prev.slot, prev.componentPath);
+      request.live[i] = null;
+      // A control slot whose source vanished goes neutral (as the hold expiry would), not latched.
+      if (was && was.role === 'control' && was.sink.kind === 'store' && r.sourceUnresolved
+        && was.mapping.enabled && (was.liveness === 'live' || was.liveness === 'hold')) {
+        this._queueWrite(was.sink.targetName, was.type === 'bool' ? false : 0);
+      }
+      const { applied, unresolved } = this._resolveMappings(entry.slots, [r]);
+      request.unresolvedAt[i] = unresolved[0] ?? null;
+      if (applied[0]) {
+        this.bind(placedId, request.node, applied[0]);
+        request.live[i] = applied[0];
+        // A sibling may keep the component live: then no transition seeds this slot.
+        const nb = entry.bindings.get(bindingKey(applied[0].componentPath ?? '', applied[0].slot));
+        if (nb && nb.role === 'control' && nb.liveness === 'live' && !nb.edgeTriggered
+          && (entry.gates.get(nb.resolved.componentPath) ?? false)) {
+          const current = this._store.get(nb.sourceName);
+          if (current !== undefined) this._dispatchToSink(nb, current);
+        }
+      }
+    });
+    if (!changed) return;
+    const list = request.unresolvedAt.filter((u): u is UnresolvedMapping => u !== null);
+    if (list.length > 0) this._unresolved.set(placedId, list);
+    else this._unresolved.delete(placedId);
+    this._reportUnresolved(placedId, request.node, list);
+    this._awaitPendingSources(placedId, request, read);
+    this._syncAddedWatch();
+  }
+
+  /**
+   * A source can come back without a catalog event (placement content restored by
+   * undo registers its signals directly): while any addressed source is missing or
+   * pending, a NEW signal name schedules one re-check (coalesced per microtask).
+   */
+  private _syncAddedWatch(): void {
+    let open = false;
+    for (const r of this._requested.values()) {
+      if (r.sources.some((x) => x !== null && x.charCodeAt(0) === 0)) { open = true; break; }
+    }
+    if (open && !this._unsubAdded) {
+      this._unsubAdded = this._store.onSignalAdded(() => {
+        if (this._addedScheduled) return;
+        this._addedScheduled = true;
+        queueMicrotask(() => { this._addedScheduled = false; this._onCatalogChanged(); });
+      });
+    } else if (!open && this._unsubAdded) {
+      this._unsubAdded();
+      this._unsubAdded = null;
+    }
+  }
+
+  /** A source in a placement still loading waits (R8); arrival or drop re-checks the element. */
+  private _awaitPendingSources(placedId: string, request: RequestedMappings, read: readonly SignalMapping[]): void {
+    const root = this._registry.rootOfOccurrence(ROOT_OCCURRENCE);
+    if (!root) return;
+    for (const m of read) {
+      const address = m.sourceAddress;
+      // A dropped wait is final; a queued one is not queued twice.
+      if (m.sourceUnresolved !== 'pending' || !address || this._droppedSources.has(address) || request.waiting.has(address)) continue;
+      request.waiting.add(address);
+      this._registry.whenResolved(root, { address }, () => {
+        request.waiting.delete(address);
+        this._reconcile(placedId, request, false);
+      }, () => {
+        request.waiting.delete(address);
+        this._droppedSources.add(address);
+        this._reconcile(placedId, request, true);
+      });
+    }
+  }
+
+  /** Retire-then-report the element's address-based misses in Problems. */
+  private _reportUnresolved(placedId: string, node: Object3D, unresolved: readonly UnresolvedMapping[]): void {
+    this._retireUnresolvedProblems(placedId);
+    const nodePath = this._registry.getPathForNode(node) ?? node.name;
+    const ids: string[] = [];
+    for (const { mapping } of unresolved) {
+      const sourceMissing = mapping.sourceUnresolved === 'missing'
+        || (mapping.sourceUnresolved === 'pending' && !!mapping.sourceAddress && this._droppedSources.has(mapping.sourceAddress));
+      const componentMissing = !mapping.sourceUnresolved
+        && typeof mapping.componentPath === 'string' && mapping.componentPath.startsWith(UNRESOLVED_ADDRESS_PREFIX);
+      if (!sourceMissing && !componentMissing) continue;
+      const where = componentMissing ? mapping.componentAddress ?? '' : mapping.componentPath ?? '.';
+      const id = `${SIGNAL_BINDING_UNRESOLVED_CODE}:${placedId}:${where}:${mapping.slot}`;
+      ids.push(id);
+      reportProblem({
+        id,
+        severity: 'error',
+        code: SIGNAL_BINDING_UNRESOLVED_CODE,
+        title: sourceMissing
+          ? `Linked signal not found: ${mapping.signal}`
+          : `Linked component not found: ${mapping.slot}`,
+        detail: sourceMissing
+          ? `Slot "${mapping.slot}" on "${nodePath}" is linked to the model signal at ${mapping.sourceAddress} `
+            + `(last known as "${mapping.signal}"). That node carries no signal any more, so the slot stays unlinked; `
+            + 'a signal with the same name elsewhere is not used. Link the slot again.'
+          : `A signal link on "${nodePath}" names its component by ${mapping.componentAddress}, and no node `
+            + `answers that address. The slot "${mapping.slot}" stays unlinked. Link the slot again.`,
+        nodePath,
+      });
+    }
+    if (ids.length > 0) this._problemIds.set(placedId, ids);
+  }
+
+  private _retireUnresolvedProblems(placedId: string): void {
+    const ids = this._problemIds.get(placedId);
+    if (!ids) return;
+    this._problemIds.delete(placedId);
+    for (const id of ids) clearProblem(id);
   }
 
   // ─── tick ────────────────────────────────────────────────────────────
@@ -903,10 +1119,16 @@ export class SignalBindingManager {
   // ─── dispose ─────────────────────────────────────────────────────────
 
   dispose(): void {
+    this._unsubCatalog();
+    this._unsubAdded?.();
+    this._unsubAdded = null;
     for (const [placedId] of [...this._elements]) this.unbindAll(placedId);
     this._elements.clear();
     this._scopes.clear();
     this._unresolved.clear();
+    this._requested.clear();
+    this._droppedSources.clear();
+    for (const placedId of [...this._problemIds.keys()]) this._retireUnresolvedProblems(placedId);
     this._feedbackWriters.clear();
     for (const k in this._pendingWrites) delete this._pendingWrites[k];
   }

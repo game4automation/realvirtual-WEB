@@ -3,6 +3,11 @@
 
 import { createTheme, type Theme } from '@mui/material/styles';
 import { ACCENT, CHIP_RADIUS, ERROR, FIELD_BORDER, PANEL_SURFACE, SECONDARY, SUCCESS, WARN } from './shared-sx';
+import { isRecordingMode } from '../recording-mode';
+
+/** plan-2240: no listener-opened MUI tooltips in recording mode. */
+export const recordingTooltipDefaults = (on: boolean) =>
+  (on ? { disableHoverListener: true, disableFocusListener: true, disableTouchListener: true } : {});
 
 /** Create a branded theme with custom primary/secondary colors. */
 export function createBrandedTheme(primary?: string, secondary?: string): Theme {
@@ -42,6 +47,7 @@ export const rvDarkTheme = createTheme({
     borderRadius: 4,
   },
   components: {
+    MuiTooltip: { defaultProps: recordingTooltipDefaults(isRecordingMode()) },
     MuiCssBaseline: {
       styleOverrides: {
         body: { backgroundColor: 'transparent' },

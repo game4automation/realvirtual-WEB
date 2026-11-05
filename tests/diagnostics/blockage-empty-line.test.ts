@@ -85,7 +85,7 @@ it('accepts a signal-stopped source when its line declares expected waiting', ()
   } finally { fixture.dispose(); }
 });
 
-it('unsubscribes on reset/clear and rebinds after a simulation reset', () => {
+it('rebinds once on a simulation reset and unsubscribes on dispose', () => {
   const fixture = conveyorLineFixture({ expectFlow: () => true });
   try {
     fixture.run(4);
@@ -93,12 +93,15 @@ it('unsubscribes on reset/clear and rebinds after a simulation reset', () => {
     const id = progressNodeId(sink.node, 'sink');
     const mu = fixture.manager.mus[0];
     expect(mu).toBeDefined();
+    // The ledger reset re-seeds the sink population (plan-2241a F13): the sink is bound again at once.
     fixture.wiring.reset();
     sink.notifyConsumed(mu);
     expect(fixture.wiring.ledger.sample(0).coverage.unknown).toEqual([]);
+    expect(fixture.wiring.ledger.entry(id)?.count).toBe(1);
+    // The next sample keeps that one binding: a consumption counts once, not twice.
     fixture.wiring.sample();
     sink.notifyConsumed(mu);
-    expect(fixture.wiring.ledger.entry(id)?.count).toBe(1);
+    expect(fixture.wiring.ledger.entry(id)?.count).toBe(2);
     fixture.setRunning(false);
     fixture.wiring.sample();
     expect(fixture.wiring.ledger.entry(id)?.state).toBe('inactive');

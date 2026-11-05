@@ -29,6 +29,7 @@ import {
   type AiTouchView, type ButtonSimPhase,
 } from './button-sim-state';
 import { useUIZoom } from './visual-settings-store';
+import { isRecordingMode } from '../recording-mode';
 import {
   ACCENT, CHIP_RADIUS, FIELD_BORDER, FS, ICON_SIZE, INK_HIGH, INK_LOW, INK_MID, MONO,
 } from './shared-sx';
@@ -534,7 +535,7 @@ export function ActionMenuRow(props: ActionMenuRowProps) {
     <Tooltip
       placement="left"
       disableInteractive
-      open={tip === tipKey}
+      open={tip === tipKey && !isRecordingMode()}
       title={<ActionMenuTip label={label} shortcut={shortcut} description={description} />}
       // Above the open menu's own layer (and with it the watermark).
       slotProps={{ popper: { style: { zIndex: DROPDOWN_Z_INDEX + 1 } } }}
@@ -785,7 +786,7 @@ export function ActionDropdownSegment(props: ActionDropdownSegmentProps) {
     <>
       {/* Controlled tooltip: a hover open would otherwise stack tooltip and
           menu on top of each other (§2.6). */}
-      <Tooltip title={title} placement="top" open={!open && hovering}>
+      <Tooltip title={title} placement="top" open={!open && hovering && !isRecordingMode()}>
         {trigger}
       </Tooltip>
       <Popper

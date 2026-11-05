@@ -57,7 +57,8 @@ function fixture() {
   const group = { name: 'Cover', visible: true, nodes: [node] };
   const collisionManager = {
     register: vi.fn(), unregister: vi.fn(), invalidate: vi.fn(), reset: vi.fn(),
-    bodies: [{ key: 'Robot', role: 'Robot', meshes: [node], aabbOnly: false }],
+    // plan-781: a body is chunk segment ranges + keep parts.
+    bodies: [{ key: 'Robot', role: 'Robot', parts: [{ kind: 'chunk', segments: 3 }, { kind: 'keep', segments: 0 }] }],
     activePairs: [{ aPath: 'Robot', aRole: 'Robot', bPath: 'Floor', bRole: 'Environment', since: 2 }],
     pairs: [{}],
   };
@@ -164,7 +165,8 @@ describe('Phase 1 session command contracts', () => {
     expect(status).toEqual({
       bodies: 1, bodiesByRole: { Robot: 1 }, checkedPairs: 1, sessionWatched: 1, collisions: 1,
       pairs: [{ a: 'Robot', aRole: 'Robot', b: 'Floor', bRole: 'Environment', since: 2 }],
-      bodyList: [{ path: 'Robot', role: 'Robot', meshes: 1, aabbOnly: false }],
+      // F13: parts / segments / keepParts; `meshes` is the deprecated alias of `parts` (one release); no aabbOnly.
+      bodyList: [{ path: 'Robot', role: 'Robot', parts: 2, segments: 3, keepParts: 1, meshes: 2 }],
     });
     expect(await read(queryValue(viewer, 'collision.status', { includeBodies: true }))).toEqual(status);
     expect((await read(queryValue(fixture().viewer, 'collision.status'))).sessionWatched).toBe(0);

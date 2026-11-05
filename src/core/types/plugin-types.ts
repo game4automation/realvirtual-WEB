@@ -426,9 +426,12 @@ export interface WallStatus {
   } | null;
   viewports: {
     label: string;
-    headPosePrefix: string;
+    /** plan-2233 F9: slots bound / no pose slots (sweet spot) / pose slots without a Frame slot. */
+    tracking: 'slots' | 'sweet-spot' | 'unavailable';
+    /** Signal of the Frame (heartbeat) slot, or null. */
+    frameSlot: string | null;
     ageMs: number | null;
-    status: 'fresh' | 'sweet spot' | 'too close';
+    status: 'fresh' | 'sweet spot' | 'too close' | 'paused' | 'unavailable';
     rect: { x: number; y: number; w: number; h: number };
     eye: string;
   }[];

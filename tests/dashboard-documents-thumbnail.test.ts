@@ -16,6 +16,8 @@ import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/re
 import { documentCardPicture } from '../src/core/hmi/projects/dashboard-documents';
 import { ProjectCard } from '../src/core/hmi/projects/ProjectCard';
 import { AssetCard } from '../src/core/library/AssetCard';
+import { ProjectsDetailPane } from '../src/core/hmi/projects/ProjectsDetailPane';
+import { detailPaneThumbnail } from '../src/core/hmi/projects/ProjectsDashboardHost';
 import { resetThumbnailUrlStoreForTests } from '../src/core/thumbnails/rv-thumbnail-url-store';
 import type { LibraryCatalogEntry } from '../src/core/library/library-types';
 import type { ProjectBackend } from '../src/core/project/backends/project-backend';
@@ -40,6 +42,14 @@ describe('documentCardPicture — the mapping', () => {
   it('a catalog asset brings its own entry and picture', () => {
     const catalogEntry: LibraryCatalogEntry = { id: 'c', name: 'C', category: 'custom', thumbnailUrl: 'https://x/c.webp' };
     expect(documentCardPicture({ path: 'c', name: 'c', catalogEntry })).toEqual({ entry: catalogEntry, thumbnailPointer: null });
+  });
+
+  it('a library project document brings its saved-thumbnail pointer (plan-778)', () => {
+    const catalogEntry: LibraryCatalogEntry = {
+      id: 'doc_mhm', name: 'mhm', category: 'custom', thumbnailPointer: '.thumbnails/doc_mhm.webp',
+      libraryOrigin: { providerId: 'library-projects', sourceId: 'prj_b' },
+    };
+    expect(documentCardPicture({ path: 'b/mhm', name: 'mhm', catalogEntry }).thumbnailPointer).toBe('.thumbnails/doc_mhm.webp');
   });
 });
 
@@ -77,5 +87,19 @@ describe('the card', () => {
     expect(screen.queryByAltText('Gone')).toBeNull();
     expect(screen.getByTestId('glyph-tile').textContent).toContain('No preview');
     expect(document.querySelector('[data-testid="ImageNotSupportedOutlinedIcon"]')).toBeNull();
+  });
+});
+
+describe('the detail pane picture (plan-780 R6)', () => {
+  it('an entry with `thumbnailUrl: \'\'` still shows the pointer picture (`||`, not `??`)', () => {
+    expect(detailPaneThumbnail('', 'blob:test/.thumbnails/d1.webp')).toBe('blob:test/.thumbnails/d1.webp');
+    expect(detailPaneThumbnail(undefined, 'blob:p')).toBe('blob:p');
+    expect(detailPaneThumbnail('https://x/c.webp', 'blob:p')).toBe('https://x/c.webp');
+    expect(detailPaneThumbnail('', null)).toBeNull();
+
+    render(createElement(ProjectsDetailPane, {
+      title: 'Pump', thumbnailUrl: detailPaneThumbnail('', 'blob:test/.thumbnails/d1.webp'),
+    }));
+    expect(screen.getByAltText('Pump').getAttribute('src')).toBe('blob:test/.thumbnails/d1.webp');
   });
 });

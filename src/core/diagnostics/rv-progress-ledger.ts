@@ -34,6 +34,7 @@ export class ProgressLedger {
   }
   adapterSources(): readonly string[] { return [...this.adapters].map(a => a.id).sort(); }
   unregister(unitId: string): void {
+    this._gen++;
     this.entries.delete(unitId);
     this.reported.delete(unitId);
     this.observed.delete(unitId);
@@ -47,24 +48,35 @@ export class ProgressLedger {
 
   constructor(private readonly opts: { clock: { now(): number } }) {}
 
+  /** @internal Push handles (rv-progress-handle): bumped whenever a row is dropped or replaced. */
+  _gen = 0;
+  /** @internal */
+  _row(id: string): ProgressEntry | undefined { return this.entries.get(id); }
+  /** @internal */
+  _reported(id: string, set: boolean): boolean {
+    if (set) this.reported.set(id, true);
+    return this.reported.get(id) === true;
+  }
+
   addPopulation(src: PopulationSource): () => void {
     this.populations.add(src);
     return () => { this.populations.delete(src); };
   }
 
-  register(unitId: string, kind: UnitKind, instrumentedBy: string): void {
-    if (this.entries.has(unitId)) return;
+  register(unitId: string, kind: UnitKind, instrumentedBy: string): boolean {
+    if (this.entries.has(unitId)) return false;
     const now = this.opts.clock.now();
     this.entries.set(unitId, { unitId, kind, instrumentedBy, count: 0,
       firstSeenSec: now, lastChangeSec: now, state: 'inactive' });
     this.reported.set(unitId, false);
+    return true;
   }
 
-  arm(unitId: string): void {
+  arm(unitId: string, atSec?: number): void {
     const entry = this.entries.get(unitId);
     if (entry && entry.state !== 'armed') {
       entry.state = 'armed';
-      entry.lastChangeSec = this.opts.clock.now();
+      entry.lastChangeSec = atSec ?? this.opts.clock.now();
     }
   }
 
@@ -78,7 +90,7 @@ export class ProgressLedger {
     if (entry) entry.state = 'inactive';
   }
 
-  bump(unitId: string, _kind: UnitKind, by = 1): void {
+  bump(unitId: string, _kind: UnitKind, by = 1, atSec?: number): void {
     const entry = this.entries.get(unitId);
     if (!entry) { this.observed.add(unitId); return; }
     if (!Number.isFinite(by) || by <= 0) return;
@@ -86,7 +98,7 @@ export class ProgressLedger {
     if (!Number.isFinite(next) || next === entry.count) return;
     entry.count = next;
     this.reported.set(unitId, true);
-    entry.lastChangeSec = this.opts.clock.now();
+    entry.lastChangeSec = atSec ?? this.opts.clock.now();
   }
 
   sample(idleSec: number, now = this.opts.clock.now(), readOnly = false): {
@@ -105,6 +117,7 @@ export class ProgressLedger {
         if (this.expectedLast.has(id)) this.observed.delete(id);
         else if (this.reported.get(id)) this.observed.add(id);
         entry.state = 'complete';
+        this._gen++;
         this.entries.delete(id);
         this.reported.delete(id);
       }
@@ -136,6 +149,7 @@ export class ProgressLedger {
       lastFindings: this.lastFindings };
   }
   restoreState(state: ReturnType<ProgressLedger['snapshotState']>): void {
+    this._gen++;
     this.entries.clear();
     for (const [id, entry] of state.entries) this.entries.set(id, entry);
     this.observed.clear(); state.observed.forEach(id => this.observed.add(id));
@@ -146,10 +160,12 @@ export class ProgressLedger {
 
   /** Reset runtime accounting; population subscriptions live until their unsubscribers run. */
   reset(): void {
+    this._gen++;
     this.lastFindings = [];
     this.entries.clear();
     this.observed.clear();
     this.reported.clear();
     this.expectedLast.clear();
+    for (const p of this.populations) p.seed?.();
   }
 }

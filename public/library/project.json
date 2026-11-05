@@ -22,8 +22,8 @@
       "id": "pallethandling-cartonbox",
       "name": "Carton Box",
       "path": "PalletHandling/CartonBox.glb",
-      "sha256": "909cea385922ba675c6b3b064cc96fbd3363cb65bac6120587da5fb50645831d",
-      "sizeBytes": 15598364,
+      "sha256": "0e0985858e08c570b033cf9515620462f1bccb4f9fb448a5efb98ea9e854caf1",
+      "sizeBytes": 244524,
       "thumbnail": "PalletHandling/.thumbnails/pallethandling-cartonbox.37e19906.webp",
       "collections": [
         "Pallet Handling"
@@ -120,8 +120,8 @@
       "id": "pallethandling-europalletloaded",
       "name": "Europallet Loaded",
       "path": "PalletHandling/EuropalletLoaded.glb",
-      "sha256": "d65005b73098b5e8f945b45842cf19e443adcb4f6d0bcda263132f450b4913e8",
-      "sizeBytes": 17361652,
+      "sha256": "3dbfa9e644d37ec64ac8be0626293f6020b4927f95024c1fd1c8318a066dc7d7",
+      "sizeBytes": 2007816,
       "thumbnail": "PalletHandling/.thumbnails/pallethandling-europalletloaded.b96ac8c0.webp",
       "collections": [
         "Pallet Handling"

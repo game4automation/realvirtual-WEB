@@ -3,7 +3,7 @@
 
 import type { Object3D } from 'three';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
-import { registerComponentSchema, loadSchemaFromSpec } from './rv-component-registry';
+import { registerComponentSchema, loadSchemaFromSpec, setComponentInstance, removeComponentInstance } from './rv-component-registry';
 import { RVDrive } from './rv-drive';
 import { NodeRegistry } from './rv-node-registry';
 import { debug } from './rv-debug';
@@ -40,6 +40,12 @@ export type DriveCylinderMode = 'Legacy' | 'DoubleActing' | 'SingleActingPositiv
 export class RVDriveCylinder implements RVComponent {
   static readonly schema: ComponentSchema = loadSchemaFromSpec('Drive_Cylinder');
 
+  private initialRunState = {};
+  resetRunState(): void {
+    Object.assign(this, this.initialRunState);
+    this.forceEndpointFeedback = true;
+  }
+
   readonly node: Object3D;
   isOwner = true;
   liveControlled = false;
@@ -72,6 +78,10 @@ export class RVDriveCylinder implements RVComponent {
   private _pendingTime = 1;
   /** Home pose of this cylinder (MinPos, or MaxPos when the drive starts there). */
   private _home = 0;
+  private previousOut = false;
+  private previousIn = true;
+  private forceEndpointFeedback = false;
+  private writeMovingFeedback: ((out?: boolean, inn?: boolean) => void) | null = null;
   /** plan-570 F2 — current levels of Out / In (level-based modes only). */
   private _outLevel = false;
   private _inLevel = false;
@@ -84,6 +94,8 @@ export class RVDriveCylinder implements RVComponent {
    *  drop them — before plan-427 the handles were discarded (F6). */
   private readonly inputUnsubs: (() => void)[] = [];
 
+  get commandFeedbackWriter() { return this.writeMovingFeedback; }
+
   constructor(node: Object3D) {
     this.node = node;
   }
@@ -94,35 +106,30 @@ export class RVDriveCylinder implements RVComponent {
   }
 
   commandOut(value: boolean | number): void {
-    const drive = this.drive;
-    if (!drive) return;
+    if (!this.drive) return;
     if (this.levelMode) {
       this._outLevel = value === true;
       this._evaluate();
-      return;
+    } else {
+      let active = value === true;
+      if (this.InvertOutputLogic) active = !active;
+      if (this.OneBitCylinder) this._command(active ? this.MaxPos : this.MinPos, active ? this.TimeOut : this.TimeIn);
+      else if (active) this._command(this.MaxPos, this.TimeOut);
     }
-    let active = value === true;
-    if (this.InvertOutputLogic) active = !active;
-    if (this.OneBitCylinder) {
-      this._command(active ? this.MaxPos : this.MinPos, active ? this.TimeOut : this.TimeIn);
-      return;
-    }
-    if (active) this._command(this.MaxPos, this.TimeOut);
+    this.drive?.onCommand?.(this);
   }
 
   commandIn(value: boolean | number): void {
-    const drive = this.drive;
-    if (!drive) return;
+    if (!this.drive) return;
     if (this.levelMode) {
       this._inLevel = value === true;
       this._evaluate();
-      return;
+    } else if (!this.OneBitCylinder) {
+      let active = value === true;
+      if (this.InvertOutputLogic) active = !active;
+      if (active) this._command(this.MinPos, this.TimeIn);
     }
-    if (this.OneBitCylinder) return;
-    let active = value === true;
-    if (this.InvertOutputLogic) active = !active;
-    if (!active) return;
-    this._command(this.MinPos, this.TimeIn);
+    this.drive?.onCommand?.(this);
   }
 
   /** True while the motion enable allows the cylinder to move (plan-538 F3). */
@@ -134,23 +141,21 @@ export class RVDriveCylinder implements RVComponent {
    */
   setEnable(value: boolean | number): void {
     const enabled = value === true;
-    if (enabled === this._enabled) return;
-    this._enabled = enabled;
-    const drive = this.drive;
-    if (!drive) return;
-    if (!enabled) {
-      drive.stop();
-      drive.targetPosition = drive.currentPosition;
-      return;
+    if (enabled !== this._enabled) {
+      this._enabled = enabled;
+      const drive = this.drive;
+      if (!drive) return;
+      if (!enabled) {
+        drive.stop();
+        drive.targetPosition = drive.currentPosition;
+      } else if (this.levelMode) {
+        this._evaluate();
+      } else {
+        const target = this._pendingTarget;
+        if (target !== null && Math.abs(drive.currentPosition - target) >= 0.01) this._move(drive, target, this._pendingTime);
+      }
     }
-    if (this.levelMode) {
-      this._evaluate();
-      return;
-    }
-    const target = this._pendingTarget;
-    if (target !== null && Math.abs(drive.currentPosition - target) >= 0.01) {
-      this._move(drive, target, this._pendingTime);
-    }
+    this.drive?.onCommand?.(this);
   }
 
   /** Remember a command; execute it unless the enable holds the cylinder. */
@@ -207,12 +212,14 @@ export class RVDriveCylinder implements RVComponent {
   }
 
   neutralizeOut(): void {
-    if (this.levelMode) { this._outLevel = false; this._evaluate(); return; }
-    this.drive?.stop();
+    if (this.levelMode) { this._outLevel = false; this._evaluate(); }
+    else this.drive?.stop();
+    this.drive?.onCommand?.(this);
   }
   neutralizeIn(): void {
-    if (this.levelMode) { this._inLevel = false; this._evaluate(); return; }
-    this.drive?.stop();
+    if (this.levelMode) { this._inLevel = false; this._evaluate(); }
+    else this.drive?.stop();
+    this.drive?.onCommand?.(this);
   }
 
   /** Direct-binding command contract of the `Enable` slot (plan-538 F3). */
@@ -228,6 +235,7 @@ export class RVDriveCylinder implements RVComponent {
     this._enabled = true;
     // plan-570: the level-based modes follow the levels present right now.
     if (this.levelMode) this._evaluate();
+    this.drive?.onCommand?.(this);
   }
 
   addFeedbackListener(cb: () => void): void {
@@ -262,6 +270,7 @@ export class RVDriveCylinder implements RVComponent {
     const drive = context.registry.getByPath<RVDrive>('Drive', path);
     if (!drive) return;
     this.drive = drive;
+    setComponentInstance(this.node, this);
 
     const minPos = this.MinPos;
     const maxPos = this.MaxPos;
@@ -311,26 +320,31 @@ export class RVDriveCylinder implements RVComponent {
     }
 
     const feedback = new Map(feedbackRefs.map((entry) => [entry.key, entry.addr]));
-    let previousOut = false;
-    let previousIn = true;
+    this.writeMovingFeedback = (
+      out = Boolean(this.readFeedbackSlot('IsMovingOut')), inn = Boolean(this.readFeedbackSlot('IsMovingIn')),
+    ) => {
+      if (feedback.has('IsMovingOut')) writer.setByPath(feedback.get('IsMovingOut')!, out);
+      if (feedback.has('IsMovingIn')) writer.setByPath(feedback.get('IsMovingIn')!, inn);
+      for (let i = 0; i < this.feedbackListeners.length; i++) this.feedbackListeners[i]();
+    };
     const writeFeedback = (all: boolean): void => {
+      all ||= this.forceEndpointFeedback;
+      this.forceEndpointFeedback = false;
       const atMax = Boolean(this.readFeedbackSlot('IsMax'));
       const atMin = Boolean(this.readFeedbackSlot('IsMin'));
       const movingOut = Boolean(this.readFeedbackSlot('IsMovingOut'));
       const movingIn = Boolean(this.readFeedbackSlot('IsMovingIn'));
-      if (all || atMax !== previousOut) {
+      if (all || atMax !== this.previousOut) {
         if (feedback.has('IsOut')) writer.setByPath(feedback.get('IsOut')!, atMax);
         if (feedback.has('IsMax')) writer.setByPath(feedback.get('IsMax')!, atMax);
-        previousOut = atMax;
+        this.previousOut = atMax;
       }
-      if (all || atMin !== previousIn) {
+      if (all || atMin !== this.previousIn) {
         if (feedback.has('IsIn')) writer.setByPath(feedback.get('IsIn')!, atMin);
         if (feedback.has('IsMin')) writer.setByPath(feedback.get('IsMin')!, atMin);
-        previousIn = atMin;
+        this.previousIn = atMin;
       }
-      if (feedback.has('IsMovingOut')) writer.setByPath(feedback.get('IsMovingOut')!, movingOut);
-      if (feedback.has('IsMovingIn')) writer.setByPath(feedback.get('IsMovingIn')!, movingIn);
-      for (let i = 0; i < this.feedbackListeners.length; i++) this.feedbackListeners[i]();
+      this.writeMovingFeedback?.(movingOut, movingIn);
     };
     this.feedbackCb = () => writeFeedback(false);
     this._writeAllFeedback = () => writeFeedback(true);
@@ -347,6 +361,7 @@ export class RVDriveCylinder implements RVComponent {
     // feedback again.
     this._offSimStart?.();
     this._offSimStart = context.events?.on('simulation-start', () => this.onSimulationStart()) ?? null;
+    this.initialRunState = { _enabled: this._enabled, _pendingTarget: this._pendingTarget, _pendingTime: this._pendingTime, _outLevel: this._outLevel, _inLevel: this._inLevel, previousOut: this.previousOut, previousIn: this.previousIn };
   }
 
   /** plan-538 F2/F6 — re-initialise pose and feedback after a simulation reset. */
@@ -364,12 +379,14 @@ export class RVDriveCylinder implements RVComponent {
   }
 
   dispose(): void {
+    removeComponentInstance(this.node, this);
     if (this.drive && this.feedbackCb) this.drive.removeAfterUpdate(this.feedbackCb);
     for (const unsub of this.inputUnsubs) unsub();
     this.inputUnsubs.length = 0;
     this._offSimStart?.();
     this._offSimStart = null;
     this._writeAllFeedback = null;
+    this.writeMovingFeedback = null;
     this.feedbackCb = null;
     this.drive = null;
     this.feedbackListeners.length = 0;

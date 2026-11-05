@@ -222,6 +222,7 @@ export class RVIKPath implements RVComponent {
   private _activeMoving = false;
   private _waitSignalAddr: string | null = null;
   private _pendingReset: PendingSignalReset | null = null;
+  get hasPendingWork(): boolean { return this._pendingReset !== null || this._waitForStartTimer > 0; }
   private _warnedNoDrives = false;
   /** Kept for the per-target diagnosis (target node paths). */
   private _registry: NodeRegistry | null = null;

@@ -261,6 +261,8 @@ function cleanEnv(port: number, extra: Record<string, string | undefined> = {}):
   if (nodeOptions) env.NODE_OPTIONS = nodeOptions;
   else delete env.NODE_OPTIONS;
   env.RV_TEST_LOCK_PORT = String(port);
+  // plan-2247: these cases are about the lock, not the machine's free memory — gate off.
+  env.RV_TEST_MIN_FREE_GB = '0';
   for (const [key, value] of Object.entries(extra)) {
     if (value === undefined) delete env[key];
     else env[key] = value;

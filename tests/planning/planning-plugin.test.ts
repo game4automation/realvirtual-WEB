@@ -131,10 +131,11 @@ describe('PlanningParametersPlugin', () => {
     for (const id of [
       'planning-declaration-invalid', 'planning-param-orphaned', 'planning-scenario-value-invalid',
       'planning-apply-failed', 'planning-apply-rollback-failed',
+      'planning-committed-recovered', 'planning-committed-recovery-failed',
     ]) {
       reportProblem({ id, severity: 'warning', code: id, title: id, detail: 'test' });
     }
-    expect(getProblems()).toHaveLength(5);
+    expect(getProblems()).toHaveLength(7);
 
     plugin.onModelCleared(viewer as unknown as RVViewer);
 

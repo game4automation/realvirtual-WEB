@@ -90,6 +90,7 @@ export function GroupsOverlay() {
       open={open}
       onClose={handleClose}
       title="Display"
+      panelId="groups"
       titleColor="#4fc3f7"
       subtitle={subtitle}
       defaultWidth={DEFAULT_W}

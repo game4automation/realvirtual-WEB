@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import type { DesUnsuitableEntry } from './des-unsuitable-entry';
 
 /**
  * Subsystems that run in a DES run without a snapshot participant (LogicSteps, PLC programs, IK paths, playback,
@@ -13,8 +14,11 @@ export interface DesLogicPresence {
   readonly nodes: readonly string[];
 }
 
+type Unsuitable = () => readonly DesUnsuitableEntry[];
+
 export class DesSnapshotBlockers {
-  private readonly blockers = new Map<symbol, { id: string; reason: () => string | null; presence?: () => readonly DesLogicPresence[] }>();
+  private readonly blockers = new Map<symbol, { id: string; reason: () => string | null; presence?: () => readonly DesLogicPresence[]; unsuitable?: Unsuitable }>();
+  private readonly listeners = new Set<() => void>();
 
   /**
    * Register a blocker; returns the function that removes it again.
@@ -23,9 +27,9 @@ export class DesSnapshotBlockers {
    * model HAVE such a subsystem at all" — the DES experiment batch pauses the viewer, so logic that merely exists would
    * stand still during the batch (plan-2062 / plan-2207). {@link batchHazards} collects the answers.
    */
-  register(id: string, reason: () => string | null, presence?: () => readonly DesLogicPresence[]): () => void {
+  register(id: string, reason: () => string | null, presence?: () => readonly DesLogicPresence[], unsuitable?: Unsuitable): () => void {
     const token = Symbol(id);
-    this.blockers.set(token, { id, reason, presence });
+    this.blockers.set(token, { id, reason, presence, unsuitable });
     return () => { this.blockers.delete(token); };
   }
 
@@ -33,6 +37,12 @@ export class DesSnapshotBlockers {
   batchHazards(): DesLogicPresence[] {
     return [...this.blockers.values()].flatMap(({ presence }) => (presence?.() ?? []).filter(p => p.nodes.length > 0));
   }
+
+  desUnsuitable(): DesUnsuitableEntry[] { return [...this.blockers.values()].flatMap(b => b.unsuitable?.() ?? []); }
+
+  onChanged(cb: () => void): () => void { this.listeners.add(cb); return () => { this.listeners.delete(cb); }; }
+
+  notifyChanged(): void { for (const cb of this.listeners) try { cb(); } catch (e) { console.warn('[des-blockers]', e); } }
 
   /** `id: reason` of every blocker that is active right now. */
   reasons(): string[] {

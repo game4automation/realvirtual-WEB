@@ -117,7 +117,8 @@ import {
 import { stampJsonIdentity, type JsonIdentityReport } from '../../engine/rv-json-identity';
 import { storedSignalMappingsOf } from '../../engine/rv-signal-mapping-address';
 import { reportSaveIdentityProblems } from '../problems-store';
-import { isQualifiedRef } from '../../library/library-origin';
+import { referenceForWrite } from '../../library/library-reference-write';
+import type { DocumentScope } from '../../library/library-origin';
 
 /** plan-769 Phase 3b: a re-minted duplicate id of a planner save is a visible Problem. */
 function reportJsonIdentity(r: JsonIdentityReport): void {
@@ -331,6 +332,8 @@ export interface BakeOptions {
    * unrelated save, which is why it is off by default.
    */
   clearCameraWhenUnset?: boolean;
+  /** plan-780 R4: project of the written document (null = open project); references are written by id in it. */
+  documentScope?: DocumentScope;
   /**
    * Node name for a placement whose label is empty. Only reached by a malformed
    * placement; exposed so the fallback is testable rather than magic.
@@ -1260,16 +1263,19 @@ function findByScenePath(root: Object3D, path: string): Object3D | null {
  * every splat only to report it missing. Its catalog identity moves into
  * `PlacementMeta.catalogId` instead — the one case where that field is written.
  */
-export function placementExtras(placement: PlacedComponent): Record<string, unknown> {
+export function placementExtras(placement: PlacedComponent, scope: DocumentScope = null): Record<string, unknown> {
   const isSplat = !!placement.splatUrl;
 
   const meta: PlacementMeta = {};
   if (isSplat) {
     meta.splatUrl = placement.splatUrl;
-    if (placement.catalogId) meta.catalogId = placement.catalogId;
-    // plan-778: a splat has no AssetReference — its qualifier rides in the meta.
-    if (placement.providerId) meta.providerId = placement.providerId;
-    if (placement.sourceId) meta.sourceId = placement.sourceId;
+    // plan-778: a splat's identity rides in the meta; plan-780 R4: by document id (url = transport).
+    if (placement.catalogId) {
+      const written = referenceForWrite({ catalogId: placement.catalogId, providerId: placement.providerId, sourceId: placement.sourceId }, scope);
+      meta.catalogId = written.assetId;
+      if (written.providerId) meta.providerId = written.providerId;
+      if (written.sourceId) meta.sourceId = written.sourceId;
+    }
   }
   if (placement.visible === false) meta.visible = false;
   if (placement.signalMappings?.length) {
@@ -1279,18 +1285,9 @@ export function placementExtras(placement: PlacedComponent): Record<string, unkn
 
   const out: Record<string, unknown> = { [RV_NODE_ID_KEY]: placement.id };
   if (!isSplat) {
-    const reference: Record<string, unknown> = { assetId: placement.catalogId };
-    // plan-778 F4: the qualifier as stored on the record — a qualified one
-    // (library project) is written WITHOUT a `path`: the library resolves it,
-    // a path could only ever point somewhere else. A legacy pair (pre-778
-    // `global` + catalog URL) is kept as it was written, never upgraded.
-    if (placement.providerId) reference.providerId = placement.providerId;
-    if (placement.sourceId) reference.sourceId = placement.sourceId;
-    const qualified = isQualifiedRef(placement);
-    // A blob: URL is a session artifact (ResolvedAsset contract: volatile,
-    // NEVER persisted) — dead on the next load, where it would shadow the
-    // assetId resolution with a guaranteed fetch failure (plan-921 finding).
-    if (!qualified && placement.glbUrl && !placement.glbUrl.startsWith('blob:')) reference.path = placement.glbUrl;
+    // Contract documents-projects 4 / plan-780 R4/D1/R4a: by document id in the
+    // document's scope (`referenceForWrite`); blob: urls never persist (plan-921).
+    const reference: Record<string, unknown> = { ...referenceForWrite(placement, scope) };
     // The authoring half of plan-703 §2.8: the extents measured when the asset
     // was placed travel into the file, so a later load that cannot resolve it
     // still knows how big to draw the hole. Additive — a placement recorded
@@ -1341,6 +1338,7 @@ function buildPlacementNode(
   placement: PlacedComponent,
   fallbackName: string,
   patch?: Record<string, Record<string, unknown>>,
+  scope: DocumentScope = null,
 ): Object3D {
   const node = new Object3D();
   node.name = placementNodeName(placement, fallbackName);
@@ -1353,7 +1351,7 @@ function buildPlacementNode(
   ));
   node.scale.set(placement.scale[0], placement.scale[1], placement.scale[2]);
   if (placement.visible === false) node.visible = false;
-  const rv = placementExtras(placement);
+  const rv = placementExtras(placement, scope);
   if (patch) mergePlacementPatch(rv, patch);
   node.userData.realvirtual = rv;
   return node;
@@ -1439,6 +1437,7 @@ function reconcilePlacements(
   placements: readonly PlacedComponent[],
   fallbackName: string,
   placementPatches?: ReadonlyMap<string, Record<string, Record<string, unknown>>>,
+  scope: DocumentScope = null,
 ): { updated: number; remaining: PlacedComponent[] } {
   if (placements.length === 0) return { updated: 0, remaining: [] };
 
@@ -1476,7 +1475,7 @@ function reconcilePlacements(
     else node.scale = [sx, sy, sz];
 
     const rv = rvExtrasOf(node);
-    const fresh = placementExtras(placement);
+    const fresh = placementExtras(placement, scope);
     // A splat placement has no AssetReference; a placement that stopped being a
     // splat has one again. Clearing the key the fresh extras do NOT carry is
     // what keeps the two shapes from being merged into a contradiction.
@@ -1698,7 +1697,7 @@ export async function bakeIntoGlb(
   // Placements the file already holds are patched here, in the JSON, so a
   // re-save of an already-baked scene neither duplicates them nor drags the
   // whole file through the exporter for a transform change.
-  const reconciled = reconcilePlacements(chunks.json, edits.placements, fallbackName, placementPatches);
+  const reconciled = reconcilePlacements(chunks.json, edits.placements, fallbackName, placementPatches, options.documentScope ?? null);
   // plan-769 Phase 7 (D23): moves of base-file placements — TRS only, in the JSON.
   const baseline = patchBaselinePlacementTransforms(chunks.json, edits.baselinePlacementTransforms);
   const warnings: string[] = [];
@@ -1812,7 +1811,7 @@ export async function bakeIntoGlb(
   }
 
   for (const placement of reconciled.remaining) {
-    tree.add(buildPlacementNode(placement, fallbackName, placementPatches.get(placement.id)));
+    tree.add(buildPlacementNode(placement, fallbackName, placementPatches.get(placement.id), options.documentScope ?? null));
   }
 
   // plan-628 8.7: authored removals BEFORE the added nodes (an added node may

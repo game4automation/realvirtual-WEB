@@ -19,6 +19,8 @@ import type { FrozenDescriptor, ReservationRecord } from '../../core/material-fl
 import type { TweenDataSnapshot } from '../../core/material-flow/tween-registry';
 import type { DESSnapshotV4 } from './rv-des-snapshot-v4';
 import { componentStateKeys, componentServices } from './rv-des-component-state';
+import { driveParticipant } from './rv-des-drive-participant';
+import type { RngStream } from '../../core/rv-rng-distribution';
 import { rngParticipant } from './rv-des-rng-participant';
 import { decodeHookPayload } from './rv-des-hook-payload-codec';
 import { validateFrozen } from './rv-des-frozen-validation';
@@ -28,9 +30,13 @@ export interface ParticipantWorld {
   manager: DESManager;
   blockageWatch?: BlockageWatch;
   progressWiring?: ProgressWiring | null;
+  /** plan-2241: the DES units the runner's diagnostics push into the ledger; absent while unbound. */
+  progressUnits?: () => readonly string[];
   components: ReadonlyMap<string, DESComponent>;
   componentExtraServices?: ReadonlyMap<string, readonly string[]>;
   drives: ReadonlyMap<string, RVDrive>;
+  taktDrives?: ReadonlyMap<string, RVDrive>;
+  rngOwners?: ReadonlyMap<string, RngStream>;
   signals: SignalStore | null;
   signalKey?(key: string, restoring: boolean): string;
   tweens(): TweenDataSnapshot[];
@@ -146,6 +152,39 @@ export function runnerParticipants(w: ParticipantWorld, raw?: DESSnapshotV4, res
   const muSchema: SnapshotSchema = { codecs: { 'records[].plannedExitTime': 'number-tags',
     'records[].position[]': 'number-tags', 'records[].quaternion[]': 'number-tags',
     'records[].forward[]': 'number-tags', 'records[]._bugSize[]': 'number-tags' } };
+  const snapshotTime = () => raw?.simTime ?? w.manager.currentTime;
+  const rawPart = raw ? (key: string): unknown => raw.parts.find(p => p.key === key)?.state : null;
+  // plan-2241 decision 8: validated before any mutation; no fields -> deterministic default.
+  const legacyArmedAt = (c: DESComponent): number | undefined => {
+    if (byPath.get(c.path) == null) return undefined;
+    const ledger = (rawPart?.('diag.blockage') as { ledger?: { entries?: unknown } } | undefined)?.ledger;
+    const hit = Array.isArray(ledger?.entries) ? (ledger.entries as Array<[string, { state?: unknown; lastChangeSec?: unknown }]>)
+      .find(e => Array.isArray(e) && e[0] === `des:${c.path}`) : undefined;
+    const at = hit?.[1]?.lastChangeSec;
+    return hit?.[1]?.state === 'armed' && typeof at === 'number' && Number.isFinite(at) && at >= 0 ? at : undefined;
+  };
+  const progressState = (c: DESComponent, s: Omit<DESComponentSnapshot, 'path'> & { blocked: Array<{ mus: number[]; since?: number }> }) => {
+    const time = snapshotTime();
+    const stamp = (v: unknown, name: string) => {
+      if (v !== null && (typeof v !== 'number' || !Number.isFinite(v) || v > time)) throw new Error(`invalid ${name}`);
+    };
+    for (const b of s.blocked) if (b.since !== undefined) stamp(b.since, 'blocked wait start');
+    if (s.categorySince !== undefined) stamp(s.categorySince, 'categorySince');
+    // restoreMURefs installs load = held MUs; a disagreeing load would only surface after commit.
+    if (s.currentLoad !== s.muIds.length) throw new Error('currentLoad disagrees with the held MUs');
+    const armed = c.snapshotProgressArmed(s, s.blocked.filter(b => b.mus.length > 0).length, rawPart);
+    const since = s.progressArmedSince, last = s.lastProgressSec;
+    if (since === undefined && last === undefined) {
+      // Legacy: an earlier armed ledger entry of the unit wins for the progress time.
+      const at = armed ? Math.min(time, legacyArmedAt(c) ?? time) : null;
+      return { progressArmedSince: at, lastProgressSec: at };
+    }
+    if (since === undefined || last === undefined) throw new Error('incomplete progress lifecycle');
+    stamp(since, 'progressArmedSince'); stamp(last, 'lastProgressSec');
+    if ((since !== null) !== armed) throw new Error('progress lifecycle disagrees with the saved state');
+    if (since !== null && (last === null || last < since)) throw new Error('lastProgressSec before progressArmedSince');
+    return { progressArmedSince: since, lastProgressSec: last };
+  };
   function add<T>(key: string, capture: () => T, check: (value: T) => void = () => {},
     prepare: (value: T) => unknown = v => v, schema?: SnapshotSchema) {
     const decode = (json: unknown) => fromSnapshotData(json, { participant: key, ...schema }) as T;
@@ -227,13 +266,62 @@ export function runnerParticipants(w: ParticipantWorld, raw?: DESSnapshotV4, res
   }, muSchema);
   if (w.blockageWatch) {
     const watch = w.blockageWatch;
-    add('diag.blockage', () => ({ ...watch.snapshotState(), sampler: w.progressWiring?.snapshotState(visual => {
+    // plan-2241 decision 8 (ledger half): a pushed ledger agrees with the component stamps.
+    type Ledger = ReturnType<BlockageWatch['snapshotState']>['ledger'];
+    const savedProgress = (id: string, c: DESComponent) => {
+      const part = rawPart?.(id);
+      const p = part === undefined ? { progressArmedSince: c.progressArmedSince === c.progressArmedSince ? c.progressArmedSince : null,
+        lastProgressSec: c.lastProgressSec === c.lastProgressSec ? c.lastProgressSec : null }
+        : progressState(c, fromSnapshotData(part, { participant: id }) as Parameters<typeof progressState>[1]);
+      return { armed: p.progressArmedSince !== null, last: p.lastProgressSec };
+    };
+    // An ambiguous path (two components, one unit id) is never guessed: no lifecycle to compare.
+    const unitProgress = (unit: string) => {
+      const id = unit.startsWith('des:') ? byPath.get(unit.slice(4)) : undefined;
+      return id ? savedProgress(id, w.components.get(id)!) : null;
+    };
+    const desEntries = (ledger: Ledger) => ledger.entries.flatMap(([unit, entry]) => {
+      const p = unitProgress(unit);
+      return p ? [{ entry, ...p }] : [];
+    });
+    /** Bound units the saved ledger has no row for (a push-bound world registers every unit at bind). */
+    const missingUnits = (ledger: Ledger) => {
+      const saved = new Set(ledger.entries.map(([id]) => id));
+      return (w.progressUnits?.() ?? []).filter(id => !saved.has(id));
+    };
+    add('diag.blockage', () => ({ ...watch.snapshotState(), pushed: !!w.progressUnits, sampler: w.progressWiring?.snapshotState(visual => {
       for (let id = 0; id < w.manager.muCount; id++) if ((w.manager.getMU(id) as DESMU | null)?.visual === visual) return { id, gen: (w.manager.getMU(id) as DESMU).generation };
       return null;
     }) ?? null }), s => {
       if (!!s.sampler !== !!w.progressWiring) throw new Error('diag.blockage: sampler unavailable');
       if (s.sampler) w.progressWiring!.validateSnapshot(s.sampler);
-    }, s => ({ ...watch.prepareSnapshot(s), sampler: s.sampler }));
+      // A sampled (pre-push) ledger is normalised in prepare instead.
+      if (s.pushed && Array.isArray(s.ledger?.entries)) {
+        for (const { entry, armed, last } of desEntries(s.ledger)) {
+          if ((entry.state === 'armed') !== armed || armed && entry.lastChangeSec !== last)
+            throw new Error(`diag.blockage: ledger disagrees with the lifecycle of ${entry.unitId}`);
+        }
+        const missing = missingUnits(s.ledger);
+        if (missing.length) throw new Error(`diag.blockage: no ledger entry for ${missing.join(', ')}`);
+      }
+    }, s => {
+      const state = { ...watch.prepareSnapshot(s), sampler: s.sampler };
+      if (s.pushed) return state;
+      // Sampler era (or an unbound capture): rows follow the component stamps; bound units without a
+      // row (e.g. captured right after a mode-switch ledger reset) are added from them, never dropped.
+      const fix = new Map(desEntries(state.ledger).map(d => [d.entry, d] as const));
+      const time = snapshotTime();
+      const added = missingUnits(state.ledger).flatMap(unitId => {
+        const p = unitProgress(unitId);
+        return p ? [[unitId, { unitId, kind: 'des' as const, instrumentedBy: 'des', count: 0, firstSeenSec: time,
+          lastChangeSec: p.armed ? p.last! : time, state: p.armed ? 'armed' as const : 'inactive' as const }] as const] : [];
+      });
+      return { ...state, ledger: { ...state.ledger, entries: [...state.ledger.entries.map(([id, e]) => {
+        const d = fix.get(e);
+        return [id, !d ? e : d.armed ? { ...e, state: 'armed' as const, lastChangeSec: d.last! }
+          : e.state === 'armed' ? { ...e, state: 'inactive' as const } : e] as const;
+      }), ...added] } };
+    });
   }
   const snapshotMasterSeed = (): number | undefined => {
     if (!raw || typeof raw !== 'object' || !Array.isArray(raw.parts)) return undefined;
@@ -241,7 +329,7 @@ export function runnerParticipants(w: ParticipantWorld, raw?: DESSnapshotV4, res
     if (!state || typeof state !== 'object' || Array.isArray(state) || !('masterSeed' in state)) return undefined;
     return typeof state.masterSeed === 'number' ? state.masterSeed : undefined;
   };
-  const rng = rngParticipant(w.components, w.manager, snapshotMasterSeed);
+  const rng = rngParticipant(w.components, w.manager, snapshotMasterSeed, w.rngOwners);
   registry.register(rng);
   add('des.reservations', () => ({ records: w.manager.snapshotReservations().map(r => ({ ...r,
     holderId: idForPath(r.holderId), targetId: idForPath(r.targetId) })), nextId: w.manager.nextReservationId }), s => {
@@ -283,16 +371,8 @@ export function runnerParticipants(w: ParticipantWorld, raw?: DESSnapshotV4, res
       }
     }
   });
-  add('des.drives', () => [...w.drives].map(([id, d]) => ({ id, currentPosition: d.currentPosition,
-    targetPosition: d.targetPosition, currentSpeed: d.currentSpeed, isRunning: d.isRunning, overwrite: d.captureOverwriteState() })), list => {
-    if (list.length !== w.drives.size || new Set(list.map(d => d.id)).size !== list.length) throw new Error('incomplete drives');
-    for (const d of list) {
-      if (!w.drives.has(d.id)) throw new Error(`unknown drive '${d.id}'`);
-      if (![d.currentPosition, d.targetPosition, d.currentSpeed, d.overwrite?.previousPosition].every(Number.isFinite)
-        || typeof d.overwrite?.enabled !== 'boolean' || typeof d.isRunning !== 'boolean')
-        throw new Error(`invalid drive '${d.id}'`);
-    }
-  }, list => list.map(d => ({ drive: w.drives.get(d.id)!, state: d })));
+  const drives = driveParticipant(w.drives, w.taktDrives);
+  registry.register(drives);
   add('des.signals', () => ({ values: new Map([...(w.signals?.getAll() ?? [])].map(([k, v]) => [w.signalKey?.(k, false) ?? k, v] as const).sort(([a], [b]) => a.localeCompare(b))), pins: new Map([...(w.signals?.getForced() ?? [])].map(([k, v]) => [w.signalKey?.(k, false) ?? k, v] as const).sort(([a], [b]) => a.localeCompare(b))) }), s => {
     if (!(s.values instanceof Map) || !(s.pins instanceof Map)) throw new Error('invalid signals');
     for (const [name, value] of [...s.values, ...s.pins])
@@ -301,7 +381,7 @@ export function runnerParticipants(w: ParticipantWorld, raw?: DESSnapshotV4, res
   for (const [id, c] of w.components) {
     add(id, () => { const { path: _path, ...s } = c.toSnapshot();
       return { ...s, blocked: c.snapshotBlockedMUs().map(([target, mus]) =>
-        ({ target: idOf(target), mus: mus.map(mu => mu.id) })) }; }, s => {
+        ({ target: idOf(target), mus: mus.map(mu => mu.id), since: c.blockedSinceOf(target) })) }; }, s => {
       if (!Array.isArray(s.muIds) || !s.prop || typeof s.prop !== 'object' || !s.stateTimings || typeof s.stateTimings !== 'object'
         || typeof s.currentStateName !== 'string' || !Number.isFinite(s.state)) throw new Error('invalid component state');
       if (!Number.isFinite(s.stateStartTime) || s.stateStartTime > (raw?.simTime ?? w.manager.currentTime))
@@ -310,6 +390,7 @@ export function runnerParticipants(w: ParticipantWorld, raw?: DESSnapshotV4, res
         throw new Error('invalid pending transfer count');
       for (const id of s.muIds) muRef(id);
       for (const b of s.blocked) { component(b.target); b.mus.forEach(id => muRef(id)); }
+      progressState(c, s);
       checkRefs(s);
       const saved = s as { behaviourState?: unknown; frozen?: FrozenDescriptor[]; selfRunState?: { fsmState?: string } };
       if (saved.frozen !== undefined) validateFrozen(saved.frozen, muRef, w.pathExists);
@@ -320,7 +401,8 @@ export function runnerParticipants(w: ParticipantWorld, raw?: DESSnapshotV4, res
         ownsMU: (id, gen) => s.muIds.includes(id) && savedMUIndex().byId.has(id)
           && (gen === undefined || savedMUIndex().byId.get(id)?.generation === gen),
       });
-    }, s => ({ blocked: s.blocked.map(b => [component(b.target), b.mus.map(id => preparedSlots[id]!)]), state: { ...s, path: c.path }, mus: s.muIds.map(id => {
+    }, s => ({ blocked: s.blocked.map(b => [component(b.target), b.mus.map(id => preparedSlots[id]!)]),
+      blockedSince: s.blocked.map(b => b.since ?? snapshotTime()), state: { ...s, ...progressState(c, s), path: c.path }, mus: s.muIds.map(id => {
       const mu = preparedSlots[id]; if (!mu) throw new Error(`unknown MU '${id}'`); return mu;
     }) }));
   }
@@ -412,7 +494,7 @@ export function runnerParticipants(w: ParticipantWorld, raw?: DESSnapshotV4, res
     stateKeys: ['queue', '_mus', '_freeMuIds', '_muGenerations', '_retireAfterEvent', '_reservations', '_nextReservationId',
       '_currentTime', '_totalEventsProcessed', '_statResetTime', '_statResetDone', '_masterSeed', '_rng',
       '_lastListenerTime', '_completeNotified', '_checkpointEventId', '_warmupEventId', '_eventData', 'customIdCounter'],
-    services: ['_components', '_componentPaths', 'onEventConsumed', '_lastFailedEvent', 'onMURetired',
+    services: ['restHold', 'onPostDispatch', '_components', '_componentPaths', 'onEventConsumed', '_lastFailedEvent', 'onMURetired',
       'onHierarchyChanged', 'onReservationsRolledBack', '_isPaused', '_mode', '_duration', '_processingTarget',
       '_processingTargetAlreadyReached', '_rngVersion', '_streams', '_maxEventsPerBatch', 'onTimeAdvance',
       '_timeAdvanceListeners', 'onBeforeReset', 'onCheckpoint', '_ctx'] });
@@ -428,25 +510,19 @@ export function runnerParticipants(w: ParticipantWorld, raw?: DESSnapshotV4, res
       const schema = getActionSchema(e.action); return schema === 'non-persistent' ? false : !schema?.nonPersistent;
     }); },
     apply(time: number) {
+      // Inputs are replaced silently before drive state; subscriptions must not
+      // overwrite a captured drive with a never-delivered model start value.
+      const signals = staged.get('des.signals') as { values: Map<string, boolean | number>; pins: Map<string, boolean | number> };
+      w.signals?.replaceForcePins(new Map([...signals.pins].map(([k, v]) => [w.signalKey?.(k, true) ?? k, v])));
+      w.signals?.restoreValuesSilently(new Map([...signals.values].map(([k, v]) => [w.signalKey?.(k, true) ?? k, v])));
       const mu = staged.get('des.mus') as MUState & { slots: (DESMU | null)[] };
       for (const [id, c] of w.components) c.fromSnapshot((staged.get(id) as { state: DESComponentSnapshot }).state, time);
       w.manager.replaceMUSlots(mu.slots, mu.freeSlots, mu.generations, mu.pendingRetire ?? []);
       for (const [id, c] of w.components) {
-        const prepared = staged.get(id) as { mus: DESMU[]; blocked: Array<[DESComponent, DESMU[]]> };
-        c.restoreMURefs(prepared.mus, prepared.blocked);
+        const prepared = staged.get(id) as { mus: DESMU[]; blocked: Array<[DESComponent, DESMU[]]>; blockedSince: number[] };
+        c.restoreMURefs(prepared.mus, prepared.blocked, prepared.blockedSince);
       }
-      for (const d of staged.get('des.drives') as Array<{ drive: RVDrive; state: {
-        currentPosition: number; targetPosition: number; currentSpeed: number; isRunning: boolean;
-        overwrite: ReturnType<RVDrive['captureOverwriteState']>;
-      } }>) {
-        Object.assign(d.drive, { currentPosition: d.state.currentPosition, targetPosition: d.state.targetPosition,
-          currentSpeed: d.state.currentSpeed, isRunning: d.state.isRunning });
-        d.drive.restoreOverwriteState(d.state.overwrite);
-        d.drive.applyToNode();
-      }
-      const signals = staged.get('des.signals') as { values: Map<string, boolean | number>; pins: Map<string, boolean | number> };
-      w.signals?.replaceForcePins(new Map([...signals.pins].map(([k, v]) => [w.signalKey?.(k, true) ?? k, v])));
-      w.signals?.replaceSnapshotValues(new Map([...signals.values].map(([k, v]) => [w.signalKey?.(k, true) ?? k, v])));
+      drives.apply();
       rng.apply();
       const reservations = staged.get('des.reservations') as { records: Map<number, ReservationRecord>; nextId: number };
       w.manager.swapPreparedReservations(reservations.records, reservations.nextId);
@@ -458,6 +534,8 @@ export function runnerParticipants(w: ParticipantWorld, raw?: DESSnapshotV4, res
         const result = c.onRestored?.() as unknown;
         if (result && typeof result === 'object' && 'ok' in result && result.ok === false) throw result;
       }
+      // Not a second rejection point after commit (the live world is already replaced).
+      for (const [id, c] of w.components) if (c._repairProgress(time)) console.warn(`[DES] ${id}: progress lifecycle re-stamped after restore`);
       for (const m of mu.slots) if (m?.isLoaded && m.loadedOn && !m.parentMU) (m.loadedOn as DESComponent).loadMU(m, m.loadedOnNode ?? undefined);
       parentHierarchyVisuals(mu.slots.filter((m): m is DESMU => m !== null));
       if (w.blockageWatch) w.blockageWatch.restoreSnapshot(staged.get('diag.blockage') as ReturnType<BlockageWatch['snapshotState']>);

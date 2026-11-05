@@ -1323,6 +1323,7 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
         open
         onClose={handleClose}
         title={nodeName}
+        panelId="property-inspector"
         titleColor={LINK}
         subtitle={selectedPath ?? undefined}
         defaultWidth={420}

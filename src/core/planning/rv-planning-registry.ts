@@ -71,6 +71,12 @@ export interface PlanningHandle {
   get<T extends PlanningValue>(key: string): T;
   /** Takes this owner's pending values over. Idempotent; only from the structural reset / experiment. */
   commitPending(): void;
+  /**
+   * Only from the owner's structural reset, after its structure fell back to `values`
+   * (plan-681 F2). Commits exactly these keys; factor values the cross rules then reject
+   * go to their default. Pending stays; no log, no apply. Problems entry either way.
+   */
+  recoverCommitted(values: Readonly<Record<string, PlanningValue>>): { ok: boolean; reset: string[]; error?: string };
   /** Replaces the declared parameters (instance keys change only in the structural reset). */
   redeclare(params: readonly PlanningParamDef[]): void;
   /** Removes the declaration; non-default committed values stay dormant for a later declare. */
@@ -352,6 +358,7 @@ const PROBLEM_ORPHAN = 'planning-param-orphaned';
 const PROBLEM_SCENARIO = 'planning-scenario-value-invalid';
 const PROBLEM_APPLY = 'planning-apply-failed';
 const PROBLEM_ROLLBACK = 'planning-apply-rollback-failed';
+const PROBLEM_RECOVERED = 'planning-committed-recovered';
 
 function compareChanges(a: PlanningChange, b: PlanningChange): number {
   return a.simTime !== b.simTime ? a.simTime - b.simTime : a.seq - b.seq;
@@ -637,6 +644,43 @@ export function createPlanningRegistry(options: PlanningRegistryOptions = {}): P
         commitOwner(entry);
         publish();
       },
+      recoverCommitted(values) {
+        const owner = entry.decl.owner;
+        const fail = (error: string) => {
+          problems.report({ id: `${PROBLEM_RECOVERED}:${owner}`, severity: 'error', code: 'planning-committed-recovery-failed',
+            title: `Planning values of '${owner}' not recovered`, detail: error });
+          return { ok: false, reset: [], error };
+        };
+        if (owners.get(owner) !== entry) return fail('not declared');
+        const cand = new Map(entry.committed);
+        for (const [key, raw] of Object.entries(values)) {
+          const def = entry.defs.get(key);
+          const r = def ? checkPlanningValue(def, raw) : null;
+          if (!r?.ok) return fail(`${key}: ${r ? r.error : 'unknown key'}`);
+          cand.set(key, r.value);
+        }
+        const reset = new Set<string>();
+        for (let pass = 0; ; pass++) {
+          const bad = Object.entries(crossErrors(entry, cand)).filter(([, e]) => e);
+          if (!bad.length) break;
+          for (const [key, e] of bad) {
+            const def = entry.defs.get(key);
+            if (pass > 8 || !def || key in values || planningRoleOf(def) !== 'factor' || cand.get(key) === def.default) return fail(`${key || owner}: ${e}`);
+            cand.set(key, def.default);
+            reset.add(key);
+          }
+        }
+        for (const [key, v] of cand) {
+          if (entry.committed.get(key) === v) continue;
+          entry.committed.set(key, v);
+          entry.sources.set(key, 'default');
+        }
+        problems.report({ id: `${PROBLEM_RECOVERED}:${owner}`, severity: 'warning', code: PROBLEM_RECOVERED,
+          title: `Planning values of '${owner}' recovered`,
+          detail: `${JSON.stringify(values)}${reset.size ? `; default: ${[...reset].join(', ')}` : ''}` });
+        publish();
+        return { ok: true, reset: [...reset] };
+      },
       redeclare(params) {
         if (owners.get(entry.decl.owner) !== entry) return;
         const parsed = parsePlanningDeclaration({ ...entry.decl, params });
@@ -663,6 +707,7 @@ export function createPlanningRegistry(options: PlanningRegistryOptions = {}): P
       }
     }
     owners.delete(owner);
+    problems.clear(`${PROBLEM_RECOVERED}:${owner}`);
   }
 
   function inertHandle(): PlanningHandle {
@@ -671,6 +716,7 @@ export function createPlanningRegistry(options: PlanningRegistryOptions = {}): P
       values: () => empty,
       get: <T extends PlanningValue>() => undefined as unknown as T,
       commitPending: () => {},
+      recoverCommitted: () => ({ ok: false, reset: [], error: 'not declared' }),
       redeclare: () => {},
       dispose: () => {},
     };
@@ -786,13 +832,27 @@ export function createPlanningRegistry(options: PlanningRegistryOptions = {}): P
 
   async function runApply(reconcile: readonly string[]): Promise<PlanningApplyResult> {
     if (applyInProgress) return { ok: false, generation, error: 'apply-in-progress' };
+    // Committed may have moved under a pending value (`recoverCommitted`): the whole
+    // candidate is checked before anything is committed; refused = nothing changes.
+    for (const entry of owners.values()) {
+      if (!entry.pending.size) continue;
+      const cand = new Map([...entry.committed, ...entry.pending]);
+      const bad = Object.entries(crossErrors(entry, cand)).filter(([, e]) => e);
+      if (!bad.length) continue;
+      const detail = `${entry.decl.owner}: ${bad.map(([k, e]) => `${k} ${e}`).join('; ')}`;
+      problems.report({ id: PROBLEM_APPLY, severity: 'error', code: PROBLEM_APPLY, title: 'Applying planning parameters failed', detail });
+      return { ok: false, generation, error: 'invalid-values', detail };
+    }
     applyInProgress = true;
     reconcileOwners = reconcile;
     let release!: () => void;
     applyIdle = new Promise<void>((resolve) => { release = resolve; });
     try {
       const r = await applyRunner(applyContext);
-      if (r.ok) generation++;
+      if (r.ok) {
+        generation++;
+        for (const o of owners.keys()) problems.clear(`${PROBLEM_RECOVERED}:${o}`);
+      }
       return { ...r, generation };
     } catch (err) {
       return { ok: false, generation, error: 'materialize-failed', detail: err instanceof Error ? err.message : String(err) };

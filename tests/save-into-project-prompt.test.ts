@@ -92,6 +92,8 @@ const store = {
 import { saveDocument, decideSaveVerb, forgetSavedRevisions } from '../src/core/editor/rv-save-document';
 import type { AssetBase } from '../src/core/editor/rv-asset-document';
 
+const idleTail = Promise.resolve();
+
 function makeDoc(base: AssetBase, name = 'Demo') {
   const doc = {
     name,
@@ -104,6 +106,7 @@ function makeDoc(base: AssetBase, name = 'Demo') {
     tryLock: () => ({ kind: 'save', token: Symbol('stub'), generation: 1 }),
     unlock: () => {},
     document: {
+      whenIdle: () => idleTail,
       opCount: 3,
       runExclusive<T>(work: () => Promise<T>): Promise<T> { return work(); },
       markSaved() {},

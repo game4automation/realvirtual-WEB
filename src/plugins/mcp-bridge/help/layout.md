@@ -31,8 +31,11 @@ files) — always take them from `web_query("library.catalogList", {})`, never f
 Three origins of placeable parts, ONE list (`web_query("library.catalogList", {})`, field `source`):
 
 - **Project parts** (`source: "project"`) — every document of the open project, wherever it sits
-  (a part saved under `library/Interroll/` is one). catalogId `project:<path>`; the `documentId`
-  works too and survives a rename / move (`document.rename` / `document.move` via `web_execute`).
+  (a part saved under `library/Interroll/` is one). catalogId = its `documentId`, which survives a
+  rename / move (`document.rename` / `document.move` via `web_execute`). An old `project:<path>` is
+  still accepted as a lookup (answered with a `deprecation` hint) — never send or store it.
+- **Scope** — a reference is read in the project of the document it is written in: inside a library
+  document (Edit in library) an unqualified id is THAT library's document, never the open project's.
 - **Library project parts** (`source: "library"`, with `libraryProjectId`) — the documents of another
   PROJECT the open project uses as a library, named by its project id in `project.json.libraries[]`.
   The standard realvirtual library is the project `prj_realvirtual_library` (CartonBox, pallets,

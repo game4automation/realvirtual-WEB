@@ -1,0 +1,164 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
+
+import type { PrimIdentity } from './usd-prim-identity';
+
+export type VisibilityToken = 'invisible' | 'inherited';
+export interface PrimPostData {
+  customData?: PrimIdentity;
+  visibility?: VisibilityToken;
+  visibilitySamples?: readonly (readonly [number, VisibilityToken])[];
+}
+export interface StagePostOptions {
+  finalNames: readonly string[];
+  prims?: ReadonlyMap<number, PrimPostData>;
+  writeAddresses?: boolean;
+}
+interface Token { value: string; start: number; end: number }
+interface Edit { start: number; end: number; text: string }
+
+/** Token positions only: quoted strings, paths, assets and comments hide delimiters. */
+function tokens(text: string): Token[] {
+  const out: Token[] = [];
+  for (let i = 0; i < text.length;) {
+    const c = text[i];
+    if (/\s/.test(c)) { i++; continue; }
+    if (c === '#') { while (i < text.length && text[i] !== '\n') i++; continue; }
+    const start = i++;
+    if (c === '"' || c === '@' || c === '<') {
+      const end = c === '<' ? '>' : c;
+      let closed = false;
+      while (i < text.length) {
+        if (text[i] === '\\') { i += 2; continue; }
+        if (text[i++] === end) { closed = true; break; }
+      }
+      if (!closed) throw new Error('Unclosed USDA string/path');
+    } else if (/[A-Za-z_]/.test(c)) {
+      while (i < text.length && /[\w:.]/.test(text[i])) i++;
+    }
+    out.push({ value: text.slice(start, i), start, end: i });
+  }
+  return out;
+}
+function closing(ts: readonly Token[], index: number): number {
+  const end = ts[index].value === '(' ? ')' : '}';
+  const stack = [end];
+  for (let i = index + 1; i < ts.length; i++) {
+    const value = ts[i].value;
+    if (value === '(' || value === '{') stack.push(value === '(' ? ')' : '}');
+    else if (value === ')' || value === '}') {
+      if (stack.pop() !== value) throw new Error('Unbalanced USDA block');
+      if (!stack.length) return i;
+    }
+  }
+  throw new Error('Unclosed USDA block');
+}
+function apply(text: string, edits: Edit[]): string {
+  edits.sort((a, b) => b.start - a.start);
+  let before = text.length;
+  for (const edit of edits) {
+    if (edit.end > before) throw new Error('Overlapping USDA edits');
+    text = text.slice(0, edit.start) + edit.text + text.slice(edit.end);
+    before = edit.start;
+  }
+  return text;
+}
+function quote(value: string): string {
+  if (/[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(value)) throw new Error('Unsupported USDA string control character');
+  return '"' + value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t') + '"';
+}
+
+/** Merge existing customData metadata rather than authoring a duplicate dictionary. */
+function withIdentity(metadata: string, identity: PrimIdentity, pad: string): string {
+  const entries = Object.entries(identity).filter((entry): entry is [string, string] => entry[1] !== undefined).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+  for (const [key] of entries) if (!/^[A-Za-z_]\w*$/.test(key)) throw new Error('Invalid customData key');
+  if (!entries.length) return metadata;
+  const fields = entries.map(([key, value]) => `${pad}\t\t\tstring ${key} = ${quote(value)}`).join('\n');
+  const ts = tokens(metadata);
+  const custom = ts.findIndex((t) => t.value === 'customData');
+  if (custom < 0) return metadata + `\n${pad}\tcustomData = {\n${pad}\t\tdictionary realvirtual = {\n${fields}\n${pad}\t\t}\n${pad}\t}\n${pad}`;
+  if (ts[custom + 1]?.value !== '=' || ts[custom + 2]?.value !== '{') throw new Error('Unsupported customData metadata');
+  const open = custom + 2, end = closing(ts, open);
+  for (let i = open + 1; i < end; i++) {
+    if (ts[i].value === 'dictionary' && ts[i + 1]?.value === 'realvirtual' && ts[i + 2]?.value === '=' && ts[i + 3]?.value === '{') {
+      const dictEnd = closing(ts, i + 3), edits: Edit[] = [];
+      const remaining = new Map(entries);
+      for (let j = i + 4; j < dictEnd; j++) {
+        if (ts[j].value === 'string' && remaining.has(ts[j + 1]?.value) && ts[j + 2]?.value === '=') {
+          const key = ts[j + 1].value;
+          edits.push({ start: ts[j + 3].start, end: ts[j + 3].end, text: quote(remaining.get(key)!) });
+          remaining.delete(key);
+        }
+      }
+      if (remaining.size) edits.push({ start: ts[dictEnd].start, end: ts[dictEnd].start,
+        text: [...remaining].map(([key, value]) => `\n${pad}\t\t\tstring ${key} = ${quote(value)}`).join('') + `\n${pad}\t\t` });
+      return apply(metadata, edits);
+    }
+    if (ts[i].value === '{' || ts[i].value === '(') i = closing(ts, i);
+  }
+  return apply(metadata, [{ start: ts[end].start, end: ts[end].start,
+    text: `\n${pad}\t\tdictionary realvirtual = {\n${fields}\n${pad}\t\t}\n${pad}\t` }]);
+}
+
+/**
+ * ID1/ID3 post-pass on three's model.usda. Rename ONLY def declarations.
+ * Bindings, geometry references and existing TRS animation stay byte-identical.
+ * The real prim block receives visibility; metadata receives customData.
+ * Run after exporter-id normalization and before packaging (plan-2229 §2.9.13).
+ */
+export function postProcessModelUsda(usda: string, options: StagePostOptions): { text: string; renamed: number; unmatched: number[] } {
+  for (const name of options.finalNames) if (!/^[A-Za-z_]\w*$/.test(name)) throw new Error(`Invalid final prim name: ${name}`);
+  const ts = tokens(usda), edits: Edit[] = [], seen = new Set<number>();
+  for (let i = 0; i < ts.length; i++) {
+    if (ts[i].value !== 'def') continue;
+    let name = i + 1;
+    if (!ts[name]?.value.startsWith('"')) name++;
+    const match = /^"_rvN(\d+)"$/.exec(ts[name]?.value ?? '');
+    if (!match) continue;
+    const k = Number(match[1]);
+    if (k >= options.finalNames.length || seen.has(k)) throw new Error(`Unknown or repeated placeholder _rvN${k}`);
+    seen.add(k);
+    edits.push({ start: ts[name].start, end: ts[name].end, text: quote(options.finalNames[k]) });
+    let body = name + 1;
+    const metaOpen = ts[body]?.value === '(' ? body : -1;
+    const metaEnd = metaOpen >= 0 ? closing(ts, metaOpen) : -1;
+    if (metaEnd >= 0) body = metaEnd + 1;
+    if (ts[body]?.value !== '{') throw new Error(`No body for _rvN${k}`);
+    const bodyEnd = closing(ts, body);
+    const data = options.prims?.get(k);
+    if (!data) continue;
+    const lineStart = usda.lastIndexOf('\n', ts[i].start) + 1;
+    const pad = /^[\t ]*/.exec(usda.slice(lineStart, ts[i].start))![0];
+    if (options.writeAddresses !== false && data.customData && Object.keys(data.customData).length) {
+      const metadata = metaOpen >= 0 ? usda.slice(ts[metaOpen].end, ts[metaEnd].start) : '';
+      const updated = withIdentity(metadata, data.customData, pad);
+      edits.push(metaOpen >= 0
+        ? { start: ts[metaOpen].end, end: ts[metaEnd].start, text: updated }
+        : { start: ts[name].end, end: ts[name].end, text: ` (${updated})` });
+    }
+    if (data.visibility !== undefined || data.visibilitySamples !== undefined) {
+      if (data.visibility !== undefined && !['invisible', 'inherited'].includes(data.visibility)) throw new Error('Invalid visibility');
+      if (data.visibility !== undefined && data.visibilitySamples !== undefined) throw new Error('Choose static or animated visibility');
+      // Never silently duplicate an existing direct visibility property.
+      for (let j = body + 1; j < bodyEnd; j++) {
+        if (ts[j].value === 'visibility' || ts[j].value === 'visibility.timeSamples') throw new Error(`Visibility already authored for _rvN${k}`);
+        if (ts[j].value === '{' || ts[j].value === '(') j = closing(ts, j);
+      }
+      let value = `\n${pad}\ttoken visibility = ${quote(data.visibility ?? 'inherited')}`;
+      if (data.visibilitySamples !== undefined) {
+        let last = -1;
+        const lines: string[] = [];
+        for (const [frame, token] of data.visibilitySamples) {
+          if (!Number.isInteger(frame) || frame < 0 || frame <= last || !['invisible', 'inherited'].includes(token)) throw new Error('Invalid visibility samples');
+          last = frame;
+          lines.push(`${pad}\t\t${frame}: ${quote(token)},`);
+        }
+        value = `\n${pad}\ttoken visibility.timeSamples = {\n${lines.join('\n')}\n${pad}\t}`;
+      }
+      edits.push({ start: ts[body].end, end: ts[body].end, text: value });
+    }
+  }
+  const unmatched = options.finalNames.flatMap((_, k) => seen.has(k) ? [] : [k]);
+  if (unmatched.length) throw new Error(`Exporter omitted placeholders: ${unmatched.join(', ')}`);
+  return { text: apply(usda, edits), renamed: seen.size, unmatched };
+}

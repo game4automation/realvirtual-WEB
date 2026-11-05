@@ -724,7 +724,7 @@ export class FleetJobRunner {
       const paused = this.pauses.paused(this.dropIds.indexOf(station), this.clock.now());
       const reserved = this.dispatcher.reservedBy(station);
       const occupant = this.handover.inputOccupant?.(station);
-      return { waiterId: v.id, resourceId: station, ownerIds: !paused && occupant ? [occupant] : [],
+      return { waiterId: v.id, resourceId: station, ownerIds: !paused && occupant ? [occupant] : [], ownerMUs: true,
         nodePath: station, order, waitingFor: `drop at ${station}`, heldBy: paused ? 'input paused (pause plan)'
         : !this.handover.inputFree(station) ? `input occupied${occupant ? ` by MU ${occupant}` : ''}` : 'hand-over refused',
         extra: reserved ? `Reserved by: ${reserved}` : undefined };

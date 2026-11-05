@@ -314,7 +314,14 @@ describe('viewerMode_WelcomeModalDoesNotAutoOpen', () => {
     // Pinned as source text because the split into two state flags IS the
     // mechanism: folding them back into one would re-gate the About button.
     expect(buttonPanelSource).toContain('onClick={() => setManualOpen(true)}');
-    expect(buttonPanelSource).toContain('manualOpen || (autoPending && autoOpenAllowed)');
+    // Structure: `manualOpen` is the bare left disjunct (ungated); the right
+    // disjunct is the automatic opening and must carry `autoOpenAllowed`.
+    // Further conjuncts on the automatic side (e.g. the recording-mode
+    // suppression) are allowed — they gate only the automatic opening too.
+    const m = /const aboutOpen = manualOpen \|\| \((autoPending && autoOpenAllowed(?: && [^;]+)?)\);/
+      .exec(buttonPanelSource);
+    expect(m, 'aboutOpen = manualOpen || (autoPending && autoOpenAllowed …)').not.toBeNull();
+    expect(m![1]).not.toContain('manualOpen');
   });
 });
 

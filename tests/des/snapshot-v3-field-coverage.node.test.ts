@@ -3,6 +3,7 @@
 import { expect, it, vi } from 'vitest';
 import { lineFixture } from './c2a-fixture';
 import { Object3D } from 'three';
+import { RVDrive } from '../../src/core/engine/rv-drive';
 import { DESRunner } from '../../src/plugins/des/des-runner';
 import { createDESMU } from '../../src/plugins/des/rv-des-mu';
 
@@ -69,11 +70,9 @@ it('preserves nested loads, retired queue references, reservations, drives and t
   manager.scheduleEvent(100, queued.action, owner.entityId, retired.id);
   manager.retireMU(retired);
   manager.createReservation(a.station.path, a.sink.path, 1);
-  // Shape of RVDrive the des.drives part reads (incl. the phase-8 overwrite state).
-  const overwrite = { enabled: false, previousPosition: 0 };
-  const drive = { node: a.station.node, currentPosition: 3, targetPosition: 7, currentSpeed: 2, isRunning: true,
-    captureOverwriteState: () => ({ ...overwrite }), restoreOverwriteState: (s: typeof overwrite) => { Object.assign(overwrite, s); },
-    applyToNode: () => {} };
+  // v2 captures the complete declared run state and guards every drive own key.
+  const drive = new RVDrive(a.station.node); drive.initDrive();
+  Object.assign(drive, { currentPosition: 3, targetPosition: 7, currentSpeed: 2, isRunning: true });
   (a.station as unknown as { _drives: Map<string, unknown> })._drives.set('drv', drive); // `drives` is a copy
   const tween = { kind: 'position' as const, t0: 0, t1: 10, muId: child.id, from: [0, 0, 0], to: [1, 0, 0] };
   const spy = vi.spyOn((a.runner as unknown as { tweens: { toSnapshot(): unknown[] } }).tweens, 'toSnapshot').mockReturnValue([tween as never]);
@@ -86,7 +85,7 @@ it('preserves nested loads, retired queue references, reservations, drives and t
   expect(manager.getMU(child.id)?.parentMU).toEqual({ id: parent.id, gen: parent.generation });
   expect(manager.snapshotReservations()).toHaveLength(1);
   const b = lineFixture();
-  const freshDrive = { ...drive, node: b.station.node, currentPosition: -1 };
+  const freshDrive = new RVDrive(b.station.node); freshDrive.initDrive(); freshDrive.currentPosition = -1;
   (b.station as unknown as { _drives: Map<string, unknown> })._drives.set('drv', freshDrive);
   b.runner.restoreJson(JSON.stringify(saved));
   expect(freshDrive.currentPosition).toBe(3);

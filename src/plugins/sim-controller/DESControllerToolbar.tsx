@@ -38,12 +38,14 @@ import { ensureDesPlcCommandsRegistered } from '../../core/hmi/des-plc-commands'
 import { useKernelSnapshot } from '../../hooks/use-kernel-snapshot';
 import { PlayPauseSegment, ResetSegment } from './SimControllerToolbar';
 import type { SimDesControl } from '../../core/material-flow/simulation-kernel';
-import { ensureDesManagerNode, persistDesEndTime, persistDesStatReset, applyDesMasterSeed } from '../../core/material-flow/des-manager-node';
-import { formatSimClock, formatDesDuration, parseDesDuration, formatRunFinishedTime } from './format-sim-time';
+import { commandRegistry } from '../../core/hmi/rv-command-registry';
+import { formatSimClock, formatDesDuration, formatDesTimeArg, parseDesDuration, formatRunFinishedTime } from './format-sim-time';
 import { setDesStatsWindowOpen } from './des-stats-window-store';
 import { FloatingPanel } from '../../core/hmi/FloatingPanel';
-import { desRunSettingsStore, updateDesRunSettings, setCheckpointAutosaveInterval, setCheckpointKeep, type SeedMode } from '../../core/hmi/des-run-settings-store';
+import { desRunSettingsStore, setCheckpointAutosaveInterval, setCheckpointKeep, type SeedMode } from '../../core/hmi/des-run-settings-store';
 import { ensureActiveScope } from '../../core/material-flow/rv-project-manager';
+import { DES_DEFAULT_CYCLE_TIME, findDesManager } from '../../core/material-flow/des-manager-settings';
+import { isRecordingMode } from '../../core/recording-mode';
 
 ensureDesRunCommandsRegistered();
 
@@ -81,19 +83,41 @@ export { formatDesDuration, parseDesDuration } from './format-sim-time';
 
 /** Compact, centered monospace DD:HH:MM:SS input with a subtle helper line (no
  *  floating label — the section header + helper give the context). */
-function TimeField({ defaultValue, onChange, helper }: {
-  defaultValue: string; onChange: (v: string) => void; helper: string;
+/**
+ * Edit draft of a settings field: typing stays local, blur / Enter commits only an actual edit (a
+ * focus + blur without typing commits nothing). Without a draft the field shows the stored value.
+ */
+function useCommitDraft(stored: string, onCommit: (v: string) => void) {
+  const [draft, setDraft] = useState<string | null>(null);
+  return {
+    value: draft ?? stored,
+    onChange: (e: { target: { value: string } }) => setDraft(e.target.value),
+    onBlur: () => {
+      if (draft === null) return;
+      setDraft(null);
+      if (draft !== stored) onCommit(draft);
+    },
+    onKeyDown: (e: { key: string; target: unknown }) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); },
+  };
+}
+
+function TimeField({ defaultValue, onCommit, helper, error }: {
+  /** Called once per finished edit (blur or Enter) — typing is a local draft and commits nothing. */
+  defaultValue: string; onCommit: (v: string) => void; helper: string;
+  /** A refused or failed write (variant in the scene, scene not accepting edits) — shown instead of the helper. */
+  error?: string | null;
 }) {
+  const draft = useCommitDraft(defaultValue, onCommit);
   return (
     <TextField
       size="small"
       fullWidth
-      defaultValue={defaultValue}
-      onChange={(e) => onChange(e.target.value)}
+      {...draft}
       placeholder="00:00:00:00"
       inputProps={{ style: { fontFamily: 'ui-monospace, monospace', fontSize: 14, letterSpacing: 1.5, textAlign: 'center', padding: '6px 8px' } }}
-      helperText={helper}
-      FormHelperTextProps={{ sx: { fontSize: 10, mx: 0, mt: 0.4, textAlign: 'center', color: 'text.disabled' } }}
+      error={!!error}
+      helperText={error ?? helper}
+      FormHelperTextProps={{ sx: { fontSize: 10, mx: 0, mt: 0.4, textAlign: 'center', ...(error ? {} : { color: 'text.disabled' }) } }}
     />
   );
 }
@@ -119,30 +143,42 @@ export function DESControllerToolbar({ viewer }: UISlotProps) {
   );
 
   // ── Clock settings (sim end + statistics-reset) ──
-  // Each change updates BOTH the live manager (desControl) AND the scene's
-  // DESManager component (durable setField op) so the values survive a reload.
+  // Each change goes through the des.setEnd command (→ `applyDesClockSettings`): the
+  // scene's DESManager component first (durable setField op, awaited and read back),
+  // the live manager only after — refused during a batch and while a variant is in
+  // the scene (Base setting).
   // The FIRST edit creates the `Simulation` node (plan-616 Teil 1 — mode entry
-  // only reads): `ensureDesManagerNode` queues its `addNode` op, the persister
-  // then queues the `setField`, and the document's single-flight op queue runs
-  // them in that call order, so no await is needed between the two.
+  // only reads): `ensureDesManagerNode` queues its `addNode` op before the `setField`.
   const [clockOpen, setClockOpen] = useState(false);
   const endInfinite = !Number.isFinite(snap.endTime);
+  // A refused write (variant in the scene, run lease) or a failed one is shown under its field.
+  const [endError, setEndError] = useState<string | null>(null);
+  const [statError, setStatError] = useState<string | null>(null);
+  const [cycleError, setCycleError] = useState<string | null>(null);
+  // ONE path for the window and MCP (LOP #248): the des.setEnd / des.seed.set commands, so the window
+  // gets the same run-lease, variant and document checks. Resolves to the refusal text, or null.
+  const runClockCommand = useCallback((id: string, args: Record<string, unknown>): Promise<string | null> =>
+    commandRegistry.execute(id, args, { origin: 'ui', viewer }).then(r => (r.ok ? null : r.reason)), [viewer]);
   const setEndInfinite = useCallback((infinite: boolean) => {
     const seconds = infinite ? Infinity : (Number.isFinite(snap.endTime) ? snap.endTime : 86400);
-    desControl()?.setEndTime?.(seconds);
-    persistDesEndTime(ensureDesManagerNode(viewer), seconds);
-  }, [desControl, snap.endTime, viewer]);
+    void runClockCommand('des.setEnd', { end: formatDesTimeArg(seconds) }).then(setEndError);
+  }, [runClockCommand, snap.endTime]);
+  /** A finished end edit: validated here, 0 is not "indefinite" (that is the checkbox). */
   const setEndValue = useCallback((v: string) => {
     const seconds = parseDesDuration(v);
-    if (seconds == null) return; // partial / invalid entry → leave unchanged
-    desControl()?.setEndTime?.(seconds);
-    persistDesEndTime(ensureDesManagerNode(viewer), seconds);
-  }, [desControl, viewer]);
+    const arg = seconds == null ? null : formatDesTimeArg(seconds);
+    if (seconds == null || arg == null || seconds <= 0) {
+      setEndError('Enter an end time greater than 0 (DD:HH:MM:SS), or tick "Run indefinitely"');
+      return;
+    }
+    void runClockCommand('des.setEnd', { end: arg }).then(setEndError);
+  }, [runClockCommand]);
   const setStatResetValue = useCallback((v: string) => {
-    const seconds = parseDesDuration(v) ?? 0; // empty → off (0)
-    desControl()?.setStatResetTime?.(seconds);
-    persistDesStatReset(ensureDesManagerNode(viewer), seconds);
-  }, [desControl, viewer]);
+    const seconds = v.trim() === '' ? 0 : parseDesDuration(v); // empty → off (0)
+    const arg = seconds == null ? null : formatDesTimeArg(seconds);
+    if (arg == null) { setStatError('Enter the warm-up as DD:HH:MM:SS, or leave it empty for none'); return; }
+    void runClockCommand('des.setEnd', { statReset: arg }).then(setStatError);
+  }, [runClockCommand]);
 
   // ── Seed + run settings (plan-260) ──
   const runSettings = useSyncExternalStore(desRunSettingsStore.subscribe, desRunSettingsStore.getSnapshot);
@@ -156,15 +192,18 @@ export function DESControllerToolbar({ viewer }: UISlotProps) {
   }, [snap.hasDes, snap.mode, viewer]);
 
   const setSeedValue = useCallback((v: string) => {
-    // A refused seed (a variant is in the scene) or a failed scene write is shown under the field;
-    // an incomplete entry while typing is not.
-    void applyDesMasterSeed(viewer, desControl(), Number(v))
-      .then(r => setSeedError(r.ok || r.code === 'invalid' ? null : r.reason));
-  }, [desControl, viewer]);
+    // A refused seed (a variant is in the scene, a batch) or a failed scene write is shown under the
+    // field; an incomplete entry while typing is not sent.
+    const seed = Number(v);
+    if (!Number.isInteger(seed) || seed < 1 || seed > 0x7fffffff) { setSeedError('The seed must be an integer from 1 to 2147483647'); return; }
+    void runClockCommand('des.seed.set', { seed }).then(setSeedError);
+  }, [runClockCommand]);
+
+  const seedDraft = useCommitDraft(String(currentSeed), setSeedValue);
 
   const setSeedMode = useCallback((mode: SeedMode | null) => {
-    if (mode) updateDesRunSettings({ seedMode: mode });
-  }, []);
+    if (mode) void runClockCommand('des.seed.set', { mode }).then(setSeedError);
+  }, [runClockCommand]);
 
   const setAutoSave = useCallback((v: string) => {
     const seconds = parseDesDuration(v) ?? 0; // empty → off (0)
@@ -237,7 +276,8 @@ export function DESControllerToolbar({ viewer }: UISlotProps) {
               '&:hover': { bgcolor: clockOpen ? 'action.selected' : 'action.hover' },
             }}
             data-testid="des-clock"
-            title="Simulation end + statistics reset (toggle)"
+            title={isRecordingMode() ? undefined : 'Simulation end + statistics reset (toggle)'}
+            aria-label="Simulation end + statistics reset (toggle)"
           >
             <Schedule sx={{ fontSize: 18, color: clockOpen ? '#4fc3f7' : 'text.secondary' }} />
             <Box component="span" sx={{ fontFamily: 'ui-monospace, monospace', fontSize: 11, fontWeight: 600, color: '#4fc3f7', letterSpacing: 0.3 }}>
@@ -318,12 +358,31 @@ export function DESControllerToolbar({ viewer }: UISlotProps) {
                 <TimeField
                   key={`end-${clockOpen ? 'o' : 'c'}`}
                   defaultValue={formatDesDuration(snap.endTime)}
-                  onChange={setEndValue}
+                  onCommit={setEndValue}
                   helper="DD:HH:MM:SS — e.g. 01:00:00:00 = 1 day"
+                  error={endError}
                 />
               )}
+              {endInfinite && endError && <Typography role="alert" sx={{ fontSize: 10, color: 'error.main', textAlign: 'center' }}>{endError}</Typography>}
 
               <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)', mt: 0.25 }} />
+
+              <TextField
+                key={`cycle-${clockOpen}`}
+                label="Cycle time (s)"
+                type="number" size="small"
+                defaultValue={desControl()?.cycleTime ?? (viewer.scene ? findDesManager(viewer.scene)?.cycleTime : undefined) ?? DES_DEFAULT_CYCLE_TIME}
+                inputProps={{ min: 0.001, max: 0.1, step: 0.001 }}
+                error={!!cycleError}
+                helperText={cycleError ?? 'Motion step for robot paths and moving drives in DES'}
+                onBlur={e => {
+                  const value = Number(e.target.value);
+                  if (!Number.isFinite(value) || value < 0.001 || value > 0.1) {
+                    setCycleError('Enter a cycle time between 0.001 and 0.1 s'); return;
+                  }
+                  void import('../../core/material-flow/des-manager-node').then(m => m.applyDesCycleTime(viewer, desControl(), value)).then(r => setCycleError(r.ok ? null : r.reason));
+                }}
+              />
 
               {/* Statistics reset */}
               <Typography sx={{ fontSize: 10, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: 'text.secondary' }}>
@@ -332,8 +391,9 @@ export function DESControllerToolbar({ viewer }: UISlotProps) {
               <TimeField
                 key={`stat-${clockOpen ? 'o' : 'c'}`}
                 defaultValue={formatDesDuration(snap.statResetTime)}
-                onChange={setStatResetValue}
+                onCommit={setStatResetValue}
                 helper="DD:HH:MM:SS — empty = off"
+                error={statError}
               />
 
               <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)', mt: 0.25 }} />
@@ -346,9 +406,8 @@ export function DESControllerToolbar({ viewer }: UISlotProps) {
                 <TextField
                   key={`seed-${clockOpen ? 'o' : 'c'}-${currentSeed}`}
                   size="small"
-                  defaultValue={String(currentSeed)}
+                  {...seedDraft}
                   disabled={runSettings.seedMode === 'auto'}
-                  onChange={(e) => setSeedValue(e.target.value)}
                   error={!!seedError}
                   helperText={seedError ?? undefined}
                   inputProps={{
@@ -376,7 +435,7 @@ export function DESControllerToolbar({ viewer }: UISlotProps) {
               <TimeField
                 key={`autosave-${clockOpen ? 'o' : 'c'}`}
                 defaultValue={formatDesDuration(runSettings.autoSaveInterval)}
-                onChange={setAutoSave}
+                onCommit={setAutoSave}
                 helper="sim-time interval DD:HH:MM:SS — empty = off"
               />
               <Box sx={{ display: 'flex', gap: 0.75, alignItems: 'center' }}>

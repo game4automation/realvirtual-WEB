@@ -15,7 +15,7 @@ import {
   setComponentInstance,
 } from './rv-component-registry';
 import { parseColorToHex } from './rv-error-visual';
-import { wireValueSignal } from './rv-signal-wiring';
+import { wireDisplaySignal } from './rv-signal-wiring';
 import { slotCommand, slotTryRead } from './rv-slot-io';
 import type { LampManager } from './rv-lamp-manager';
 
@@ -152,11 +152,11 @@ export class RVLamp implements RVComponent {
     // combined state itself at the end — hence the `_wiring` gate below.
     // Unwired slots are bound directly (SlotIO); neutralize switches them off.
     this._wiring = true;
-    this._unsubOn = wireValueSignal(ctx.signalStore, this.SignalLampOn, (value) => {
+    this._unsubOn = wireDisplaySignal(ctx.signalStore, this.SignalLampOn, (value) => {
       this.LampOn = Boolean(value);
       if (!this._wiring && !this.Flashing) this._apply(this.LampOn);
     }, undefined, ctx.reapply, { instance: this, field: 'SignalLampOn', unbound: false }).unsubscribe;
-    this._unsubFlash = wireValueSignal(ctx.signalStore, this.SingalLampFlashing, (value) => {
+    this._unsubFlash = wireDisplaySignal(ctx.signalStore, this.SingalLampFlashing, (value) => {
       this.Flashing = Boolean(value);
       if (!this._wiring) this._syncManager();
     }, undefined, ctx.reapply, { instance: this, field: 'SingalLampFlashing', unbound: false }).unsubscribe;

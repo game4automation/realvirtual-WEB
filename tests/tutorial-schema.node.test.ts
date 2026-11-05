@@ -3,7 +3,7 @@
 
 import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
-import { parseTutorial, SCHEMA_ID } from '../scripts/tutorial/lib/tutorial-schema.mjs';
+import { parseTutorial, RECORDER_SEED_KEYS, SCHEMA_ID } from '../scripts/tutorial/lib/tutorial-schema.mjs';
 import { frameBudget } from '../scripts/tutorial/lib/tutorial-events.mjs';
 
 function pilotStoryboard(): Record<string, unknown> {
@@ -200,11 +200,40 @@ describe('tutorial-schema command/pick/targets (plan-2031 P2)', () => {
     for (const script of scripts) expect(() => parseTutorial(script)).toThrow(/duplicate pick binding 'agv'/);
   });
 
-  it('Test_FastForward_UntilSimTime_OnlyAllowedInSetup', () => {
+  it('Test_FastForward_UntilSimTime_AllowedInTakeAndSetup', () => {
+    // plan-2237 F7: the segment gate treats FF as a transition, so it may run inside the take.
     const command = { type: 'command', id: 'des.fastForward', args: { untilSimTime: '00:02:00:00' } };
-    expect(() => parseTutorial(storyboard([command]))).toThrow(/untilSimTime.*setup/);
+    expect(() => parseTutorial(storyboard([command]))).not.toThrow();
     expect(() => parseTutorial({ ...pilotStoryboard(), setup: [command] })).not.toThrow();
     expect(() => parseTutorial(storyboard([{ type: 'command', id: 'des.fastForward' }]))).not.toThrow();
+  });
+
+  it('Test_Timelapse_Normalised_FpsBounds2To8', () => {
+    // plan-2237 F8: `timelapse {fps, maxWallSec}` on a command action, fps 2..8.
+    const batch = (timelapse: Record<string, unknown>) => ({ type: 'command', id: 'experiment.run', via: 'direct', timelapse });
+    const parsed = parseTutorial(storyboard([batch({ fps: 4, maxWallSec: 20 })]));
+    expect(parsed.steps[0].actions[0]).toEqual({
+      type: 'command', id: 'experiment.run', via: 'direct', waitSec: 0.3, maxWaitSec: 30, timelapse: { fps: 4, maxWallSec: 20 },
+    });
+    for (const fps of [2, 8, 2.5]) expect(() => parseTutorial(storyboard([batch({ fps, maxWallSec: 5 })]))).not.toThrow();
+    for (const fps of [1, 1.99, 8.01, 30]) expect(() => parseTutorial(storyboard([batch({ fps, maxWallSec: 5 })]))).toThrow(/steps.0.actions.0/);
+    expect(() => parseTutorial(storyboard([batch({ fps: 4, maxWallSec: 0 })]))).toThrow(/steps.0.actions.0/);
+    expect(() => parseTutorial(storyboard([batch({ fps: 4 })]))).toThrow(/steps.0.actions.0/);
+    expect(() => parseTutorial(storyboard([batch({ fps: 4, maxWallSec: 5, extra: 1 })]))).toThrow(/steps.0.actions.0/);
+  });
+
+  it('Test_Timelapse_MaxWaitSecBelowMaxWallSec_SchemaError', () => {
+    // plan-2237 Phase 2: during the time-lapse maxWallSec is the wait budget.
+    const batch = { type: 'command', id: 'experiment.run', via: 'direct', timelapse: { fps: 4, maxWallSec: 60 } };
+    expect(() => parseTutorial(storyboard([{ ...batch, maxWaitSec: 10 }]))).toThrow(/maxWaitSec 10 s is below timelapse.maxWallSec 60 s/);
+    // The default maxWaitSec (30) is not an explicit contradiction; an equal or larger one is fine.
+    expect(() => parseTutorial(storyboard([batch]))).not.toThrow();
+    expect(() => parseTutorial(storyboard([{ ...batch, maxWaitSec: 60 }]))).not.toThrow();
+  });
+
+  it('Test_Timelapse_InSetup_Rejected', () => {
+    const batch = { type: 'command', id: 'experiment.run', via: 'direct', timelapse: { fps: 4, maxWallSec: 5 } };
+    expect(() => parseTutorial({ ...pilotStoryboard(), setup: [batch] })).toThrow(/timelapse.*not in setup/);
   });
 
   it('Test_Start_DefaultRunningAndExplicitPaused_Accepted', () => {
@@ -266,5 +295,67 @@ describe('tutorial-schema command/pick/targets (plan-2031 P2)', () => {
     expect(typeAction.text).toContain('web_editor_import_cad');
     expect(typeAction.text).toContain('web_help');
     expect(typeAction.text).toContain('kinematize');
+  });
+});
+
+describe('tutorial-schema plan-2240 step options', () => {
+  it('Test_Schema_Motion_EnumAccepted_AbsentStaysAbsent', () => {
+    const raw = pilotStoryboard();
+    raw.steps = [
+      { id: 'a', motion: 'require', actions: [{ type: 'wait', ms: 10 }] },
+      { id: 'b', motion: 'warn', actions: [{ type: 'wait', ms: 10 }] },
+      { id: 'c', motion: 'off', actions: [{ type: 'wait', ms: 10 }] },
+      { id: 'd', actions: [{ type: 'wait', ms: 10 }] },
+    ];
+    const tutorial = parseTutorial(raw);
+    expect(tutorial.steps.map((step) => step.motion)).toEqual(['require', 'warn', 'off', undefined]);
+    // Not normalised early: the explicitness survives until the run resolves the policy.
+    expect('motion' in tutorial.steps[3]).toBe(false);
+  });
+
+  it('Test_Schema_Motion_UnknownValue_Rejected', () => {
+    const raw = pilotStoryboard();
+    raw.steps = [{ id: 'a', motion: 'maybe', actions: [{ type: 'wait', ms: 10 }] }];
+    expect(() => parseTutorial(raw)).toThrow(/steps\.0\.motion/);
+  });
+
+  it('Test_Schema_Motion_OnlyOffSteps_Rejected', () => {
+    const raw = pilotStoryboard();
+    raw.steps = [
+      { id: 'a', motion: 'off', actions: [{ type: 'wait', ms: 10 }] },
+      { id: 'b', motion: 'off', actions: [{ type: 'wait', ms: 10 }] },
+    ];
+    expect(() => parseTutorial(raw)).toThrow(/every step has motion 'off'/);
+  });
+
+  it('Test_Schema_Storage_DefaultEmpty_RvPrefixOnly', () => {
+    expect(parseTutorial(pilotStoryboard())).toMatchObject({ storage: {}, storageOverride: false });
+    const ok = parseTutorial({ ...pilotStoryboard(), storage: { 'rv-problems-acked': '[]', 'rv-panel-geo:stats-hub': '{"x":1}' } });
+    expect(ok.storage).toEqual({ 'rv-problems-acked': '[]', 'rv-panel-geo:stats-hub': '{"x":1}' });
+    expect(() => parseTutorial({ ...pilotStoryboard(), storage: { 'other-key': '1' } })).toThrow(/storage keys must start with 'rv-'/);
+    expect(() => parseTutorial({ ...pilotStoryboard(), storage: { 'rv-x': 1 } })).toThrow(/storage/);
+  });
+
+  it('Test_Schema_Storage_RecorderSeed_NeedsOverride', () => {
+    expect(RECORDER_SEED_KEYS).toEqual(['rv-terms-accepted', 'rv-connect-autoconnect-optout', 'rv-auto-quality-applied', 'rv-welcome-dismissed']);
+    for (const key of RECORDER_SEED_KEYS) {
+      expect(() => parseTutorial({ ...pilotStoryboard(), storage: { [key]: '0' } }), key).toThrow(/storageOverride: true/);
+      expect(parseTutorial({ ...pilotStoryboard(), storage: { [key]: '0' }, storageOverride: true }).storage).toEqual({ [key]: '0' });
+    }
+  });
+
+  it('Test_Schema_TargetOffset_Accepted_OnlyOnSelectorTargets', () => {
+    const raw = pilotStoryboard();
+    raw.setup = [{ type: 'drag', from: { selector: '#panel', offset: { dx: 100, dy: -20 } }, to: { x: 10, y: 20 } }];
+    raw.steps = [{ id: 'a', actions: [{ type: 'click', target: { selector: '#label', offset: { dx: 30, dy: 0 } } }] }];
+    const tutorial = parseTutorial(raw);
+    expect(tutorial.setup[0]).toMatchObject({ from: { selector: '#panel', offset: { dx: 100, dy: -20 } }, to: { x: 10, y: 20 } });
+    expect(tutorial.steps[0].actions[0]).toMatchObject({ target: { selector: '#label', offset: { dx: 30, dy: 0 } } });
+    const bad = pilotStoryboard();
+    bad.steps = [{ id: 'a', actions: [{ type: 'click', target: { x: 1, y: 2, offset: { dx: 1, dy: 1 } } }] }];
+    expect(() => parseTutorial(bad)).toThrow();
+    const partial = pilotStoryboard();
+    partial.steps = [{ id: 'a', actions: [{ type: 'click', target: { selector: '#a', offset: { dx: 1 } } }] }];
+    expect(() => parseTutorial(partial)).toThrow();
   });
 });

@@ -150,11 +150,16 @@ describe('plan-717 R1-T5 baseline — the path chips, unchanged by Phase 2', () 
 // ─── Identity and naming ────────────────────────────────────────────────
 
 describe('plan-717 R1-T5 baseline — the two keys and the three naming rules', () => {
-  it('the catalog id is path-derived and the document id rides along beside it', async () => {
+  it('RE-PINNED by plan-778/780: the catalog id IS the document id; the path form stays a readable legacy key', async () => {
+    // Contract documents-projects 4: a reference is written with the document id,
+    // never with a path — so the entry a placement is made from carries the id.
+    // The `project:<path>` form is still ANSWERED (old files), never handed out.
     const [entry] = await entriesFor([row('library/Conveyors/Roll2m.glb', { id: 'doc_stable' })]);
-    expect(entry.id).toBe('project:library/Conveyors/Roll2m.glb');
+    expect(entry.id).toBe('doc_stable');
     expect(entry.documentId).toBe('doc_stable');
     expect(entry.localPath).toBe('library/Conveyors/Roll2m.glb');
+    const source = listLibrarySources().find((s) => s.providerId === PROJECT_LIBRARY_PROVIDER_ID)!.source;
+    expect(source.getEntry('project:library/Conveyors/Roll2m.glb')).toBe(entry);
   });
 
   it('a row with a blank id contributes no documentId rather than an empty one', async () => {

@@ -33,6 +33,7 @@ import type { RVViewerPlugin } from '../../rv-plugin';
 import type { DocumentClassification } from '../../project/rv-document-classification';
 import { macrosForEmbed } from '../../editor/rv-macro-store';
 import { finishDocumentSave } from '../../editor/rv-finish-document-save';
+import { whenDocumentSettled } from '../rv-bind-queue';
 import type {
   RvScene, SceneBase, BuiltinSceneEntry,
 } from './rv-scene-types';
@@ -2457,6 +2458,7 @@ export class SceneStore {
    * The work is kept, never dropped — the difference to `_cancelAutosave`.
    */
   private async _flushAutosave(): Promise<void> {
+    await whenDocumentSettled(this);
     if (this._draftAutosaveTimer !== null) {
       clearTimeout(this._draftAutosaveTimer);
       this._draftAutosaveTimer = null;
@@ -2657,6 +2659,7 @@ export class SceneStore {
    */
   async save(): Promise<SceneSaveVerdict> {
     this._refuseWhileReplacing('Saving the scene');
+    await whenDocumentSettled(this);
     return this._doc.runExclusive(() => {
       // Re-asked ON the queue: a replace takes its lock from inside the queue,
       // so a save queued just before it would otherwise run after it.
@@ -3153,6 +3156,21 @@ export class SceneStore {
     };
   }
 
+  /** JSON-only preflight source. Never serialises the authored or rendered tree.
+   * An edited/projection-owned document needs that serialisation for an exact snapshot;
+   * refuse the optional count rather than hiding an expensive export in the dialog. */
+  async documentExportJson(): Promise<Record<string, unknown>> {
+    const workspace = this._workspace;
+    const unavailable = () => new Error('Placement count is unavailable for edited documents until they are reopened. You can still export.');
+    if (!workspace) throw new Error('No document is open.');
+    if (this._projectionSuspended || this._ops.length > 0) throw unavailable();
+    const [bytes, { parseGlbChunks }] = await Promise.all([
+      this._ensureBaseBytes(), import('../../persistence/rv-glb-chunks'),
+    ]);
+    if (!bytes || this._workspace !== workspace || this._projectionSuspended || this._ops.length > 0) throw unavailable();
+    return parseGlbChunks(bytes).json;
+  }
+
   // ─── Flat export (plan-397 phase 8, F8) ─────────────────────────────
 
   /**
@@ -3190,6 +3208,7 @@ export class SceneStore {
    * its references are already resolved, and the next save would write that.
    */
   async exportSceneGlb(opts: { embedReferences: boolean } = { embedReferences: false }): Promise<Uint8Array> {
+    await whenDocumentSettled(this);
     if (!this._workspace) throw new Error('No scene is open.');
 
     if (!opts.embedReferences) {
@@ -3264,6 +3283,8 @@ export class SceneStore {
       {
         expectedNames: registry.getGltfNodeNames(),
         settings: { ...this._settings },
+        // plan-780 R4: references are written by id in the document's own project.
+        documentScope: this._viewer.currentModelScope ?? null,
         clearCameraWhenUnset: true,
         // plan-641 M5: the document's macros (undefined = keep what the bytes hold).
         macros: macrosForEmbed(this._doc),
@@ -3314,6 +3335,8 @@ export class SceneStore {
       { locate: () => null },
       {
         settings: { ...this._settings },
+        // plan-780 R4: references are written by id in the document's own project.
+        documentScope: this._viewer.currentModelScope ?? null,
         clearCameraWhenUnset: true,
         macros: macrosForEmbed(this._doc),
         variants,
@@ -3326,6 +3349,7 @@ export class SceneStore {
   /** Save under a new name — always creates a new id. */
   async saveAs(name: string): Promise<string> {
     this._refuseWhileReplacing('Save as');
+    await whenDocumentSettled(this);
     return this._doc.runExclusive(() => {
       this._refuseWhileReplacing('Save as');
       return this._saveAs(name);
@@ -3729,7 +3753,7 @@ export class SceneStore {
    * Must be called from a user gesture — a folder project prompts for File
    * System Access permission.
    */
-  saveSettingsIntoModel(name: string): Promise<SaveSettingsIntoModelOutcome> {
+  async saveSettingsIntoModel(name: string): Promise<SaveSettingsIntoModelOutcome> {
     // The WHOLE transaction runs inside the op queue, not just a drain in front
     // of it. Fetching 35 MB and writing it back takes seconds, and `applyOp` /
     // `undo` / `redo` all queue here — draining first and then working outside
@@ -3737,6 +3761,7 @@ export class SceneStore {
     // by the empty op log this method installs at the end.
     const refused = this._replaceRefusal('Saving settings into the model');
     if (refused) return Promise.reject(refused);
+    await whenDocumentSettled(this);
     return this._enqueueResult(() => this._saveSettingsIntoModel(name));
   }
 
@@ -3926,6 +3951,11 @@ export class SceneStore {
   }
 
   // ─── Replace from outside (plan-527, ported for plan-764) ────────────────────────────────
+
+  /** False while a load or a replace holds the document: an op queued now would be dropped (`canApply`). */
+  get acceptsOps(): boolean {
+    return !this._loading && this._replaceLock === null;
+  }
 
   /** What holds the document for a replace, or null. */
   get replaceLockOwner(): DocumentLockOwner | null {
@@ -4302,6 +4332,8 @@ export class SceneStore {
       {
         expectedNames: registry.getGltfNodeNames(),
         settings: { ...this._settings },
+        // plan-780 R4: references are written by id in the document's own project.
+        documentScope: this._viewer.currentModelScope ?? null,
         clearCameraWhenUnset: true,
         // plan-641 M5: the document's macros (undefined = keep what the bytes hold).
         macros: macrosForEmbed(this._doc),
@@ -4377,6 +4409,7 @@ export class SceneStore {
   }
 
   private async _autosaveBodyInner(): Promise<void> {
+    await whenDocumentSettled(this);
     const slot = this._bodySlots().draft;
     try {
       // `?? null` — for the DRAFT slot "I have never seen one" and "there is

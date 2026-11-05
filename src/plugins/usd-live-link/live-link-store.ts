@@ -14,46 +14,8 @@ import { readLocalStorage, writeLocalStorage } from '../../core/rv-safe-storage'
 
 import { USD_LIVE_LINK_SEEN_LIVE_KEY, USD_LIVE_LINK_SETTINGS_KEY } from '../../core/hmi/rv-storage-keys';
 
-/**
- * `needs-token`: the user switched sync on but no access token is stored — the
- * switch stays on and the link starts as soon as a token is committed.
- */
-export type LiveLinkStatus = 'off' | 'needs-token' | 'connecting' | 'mounting' | 'live' | 'error';
-
-export interface LiveLinkState {
-  status: LiveLinkStatus;
-  /** Current mount generation (0 before the first mount). */
-  session: number;
-  port: number;
-  rateHz: number;
-  /** Frames actually sent per second, measured. */
-  sentHz: number;
-  /** Updates per second the extension reports applying. */
-  appliedHz?: number;
-  /** Plain-language detail (progress, error, why the last attempt failed). */
-  message?: string;
-  /**
-   * Number of the connection attempt in progress while `connecting` (1 = the
-   * first). From 2 on the previous attempt failed and the link is retrying.
-   */
-  attempt?: number;
-  /** Textures the last sync left out because they cannot be exported (undefined = none). */
-  texturesSkipped?: number;
-  /** "Isaac Sim extension outdated (…) — download v…" while the connected extension is too old. */
-  extensionNotice?: string;
-}
-
-export interface LiveLinkSettings {
-  port: number;
-  token: string;
-  rateHz: number;
-  /**
-   * True once the user set the port in the menu. Stored with the settings so a
-   * deliberately chosen port survives a later change of the default; records
-   * without it predate the flag (see {@link loadLiveLinkSettings}).
-   */
-  portChosen?: boolean;
-}
+import type { LiveLinkSettings, LiveLinkState } from './live-link-types';
+export type { LiveLinkMountTimings, LiveLinkSettings, LiveLinkState, LiveLinkStatus } from './live-link-types';
 
 export const LIVE_LINK_MIN_HZ = 10;
 export const LIVE_LINK_MAX_HZ = 60;
@@ -135,6 +97,7 @@ export function loadLiveLinkSettings(): LiveLinkSettings {
       rateHz: clampRateHz(typeof o.rateHz === 'number' ? o.rateHz : LIVE_LINK_DEFAULT_HZ),
     };
     if (o.portChosen === true) s.portChosen = true;
+    if (typeof o.remountDebounceMs === 'number') s.remountDebounceMs = o.remountDebounceMs;
     return s;
   } catch {
     return { ...DEFAULT_SETTINGS };

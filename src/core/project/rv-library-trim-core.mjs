@@ -214,7 +214,9 @@ function sameProjectRow(rows, ref) {
     const byId = rows.find((row) => row.id === ref.assetId);
     if (byId) return byId;
   }
-  const path = ref.path ? normalizeLibraryPath(ref.path) : '';
+  // A legacy `project:<path>` id names the row at that path (read, never written).
+  const legacy = typeof ref.assetId === 'string' && ref.assetId.startsWith('project:') ? ref.assetId.slice('project:'.length) : '';
+  const path = legacy || ref.path ? normalizeLibraryPath(legacy || ref.path) : '';
   if (path && isContainedPath(path)) {
     const byPath = rows.find((row) => normalizeLibraryPath(row.path) === path);
     if (byPath) return byPath;

@@ -153,6 +153,8 @@ export interface ReferenceAuditRegistry {
     | { verdict: 'legacy' };
   /** plan-769 Phase 3 (optional): the verdict of an address-form reference. */
   readStoredRef?(referrer: Object3D, ref: StoredReferenceValue): { status: string; address?: string };
+  /** Optional: `NodeRegistry.runtimeSignalLeafFor`. */
+  runtimeSignalLeafFor?(referrer: Object3D, ref: unknown): Object3D | null;
   /**
    * plan-774 F7 (optional): the reference node whose materialised content an
    * unresolved target (full address, or written path) points into — see
@@ -359,6 +361,7 @@ export function auditReferences(
           : registry.readStoredRef(node, ref.stored);
         const status = read ? read.status : 'unresolved';
         if (status === 'resolved' || status === 'pending') return;
+        if (isRuntimeSignalLeaf(registry, ref, node, ref.stored)) return;
         if (isLateField(ref.componentType, ref.field)) { counts.lateSkipped++; return; }
         counts.unresolved++;
         const miss: ReferenceAuditFinding = {
@@ -378,6 +381,7 @@ export function auditReferences(
       const stored = registry.auditStoredReference?.({ path: ref.writtenPath }, ref.targetComponentType ?? '', node);
       const fileVerdict = stored?.verdict === 'file' ? stored : null;
       if (fileVerdict && (fileVerdict.hit || fileVerdict.reason !== 'missing')) return;
+      if (fileVerdict && isRuntimeSignalLeaf(registry, ref, node, { path: ref.writtenPath })) return;
       const hit = fileVerdict ? null : resolveForAudit(registry, ref, node);
       const base: ReferenceAuditFinding = {
         kind: 'unresolved',
@@ -406,6 +410,11 @@ export function auditReferences(
 
   const t1 = typeof performance !== 'undefined' ? performance.now() : Date.now();
   return { findings, counts, ms: t1 - t0 };
+}
+
+/** A signal ref bound to an FMU runtime leaf is no miss. */
+function isRuntimeSignalLeaf(registry: ReferenceAuditRegistry, ref: StoredReference, node: Object3D, stored: unknown): boolean {
+  return /Signal|PLC/.test(ref.targetComponentType ?? '') && !!registry.runtimeSignalLeafFor?.(node, stored);
 }
 
 /** `Drive_Cylinder.IsIn`, `Connections.connections[2].source` — the field as the Problems panel names it. */

@@ -226,6 +226,7 @@ export function plannerDocumentExportContext(
     documentName,
     documentRevision: () => facts().revision,
     documentGlb: () => store.exportSceneGlb({ embedReferences: false }),
+    documentJson: () => store.documentExportJson(),
     hasUsdPrimPaths: () => facts().hasUsdPrimPaths,
     replaceDocument: async (bytes, expectedRevision, target) => {
       const { replaceDocument, createViewerReplaceDeps } = await import('../../../plugins/mcp-bridge/rv-document-replace');
@@ -277,6 +278,7 @@ export function sceneFileExports(
         id: provider.id,
         label: provider.label,
         modes: () => provider.modes(ctx),
+        ...(provider.preflight ? { preflight: (modeId: string) => provider.preflight!(ctx, modeId) } : {}),
         run: (modeId: string) => provider.run(ctx, modeId),
         ...(apply
           ? {

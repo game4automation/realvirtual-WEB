@@ -41,6 +41,7 @@ import {
 import { commandRegistry } from './rv-command-registry';
 import { useOptionalViewer } from '../../hooks/use-viewer';
 import { FloatingPanel } from './FloatingPanel';
+import { isRecordingMode } from '../recording-mode';
 
 /** Shared Warning Amber (DESIGN.md §2) — the one colour a rejection may take. */
 const AMBER = '#ffa726';
@@ -85,18 +86,19 @@ function loadAcked(): string[] {
 const _acked = new Set<string>(loadAcked());
 
 function saveAcked(): void {
+  if (isRecordingMode()) return; // plan-2240: a take writes no acks
   try {
     // Oldest first (insertion order), so the cap drops the longest-acknowledged entries.
     writeLocalStorage(ACKED_KEY, JSON.stringify([..._acked].slice(-ACKED_MAX)));
   } catch { /* private window / blocked storage: the acknowledgement holds for this session only */ }
 }
 
-function hasNews(): boolean {
+export function hasNews(): boolean {
   // plan-628 8.11g: a `quiet` entry (its marker sits in the view) is never news.
   return getProblems().some(e => !e.quiet && !_acked.has(fingerprint(e)));
 }
 
-let _open = hasNews();
+let _open = !isRecordingMode() && hasNews();
 const _openListeners = new Set<() => void>();
 
 function setProblemsPanelOpenInternal(open: boolean): void {
@@ -106,7 +108,7 @@ function setProblemsPanelOpenInternal(open: boolean): void {
 }
 
 subscribeProblems(() => {
-  if (!_open && hasNews()) setProblemsPanelOpenInternal(true);
+  if (!_open && !isRecordingMode() && hasNews()) setProblemsPanelOpenInternal(true);
 });
 
 // ── Code filter (plan-778 §2.7) ────────────────────────────────────────────
@@ -139,16 +141,21 @@ export function showProblems(opts: { code?: string | null } = {}): void {
   setByUser(true);
 }
 
+/** Acknowledge entries (default: all listed); `problems.ack`. */
+export function acknowledgeProblems(entries: readonly ProblemEntry[] = getProblems()): void {
+  for (const e of entries) {
+    const fp = fingerprint(e);
+    _acked.delete(fp); // re-insert so it counts as most recent
+    _acked.add(fp);
+  }
+  saveAcked();
+}
+
 /** User intent: closing acknowledges everything currently listed; opening just opens. */
 function setByUser(open: boolean): void {
   if (!open) {
     setCodeFilter(null);
-    for (const e of getProblems()) {
-      const fp = fingerprint(e);
-      _acked.delete(fp); // re-insert so it counts as most recent
-      _acked.add(fp);
-    }
-    saveAcked();
+    acknowledgeProblems();
   }
   setProblemsPanelOpenInternal(open);
 }

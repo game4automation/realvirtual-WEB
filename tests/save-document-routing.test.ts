@@ -129,6 +129,8 @@ import {
   projectDocumentBase,
 } from '../src/core/editor/active-asset-store';
 
+const idleTail = Promise.resolve();
+
 async function revisionOf(value: string): Promise<string> {
   return revisionOfBytes(new TextEncoder().encode(value));
 }
@@ -147,6 +149,7 @@ interface FakeDoc {
   tryLock: () => { kind: string; token: symbol; generation: number };
   unlock: () => void;
   document: {
+    whenIdle(): Promise<void>;
     opCount: number;
     runExclusive<T>(work: () => Promise<T>): Promise<T>;
     markSaved(opts?: { floor?: number }): void;
@@ -169,6 +172,7 @@ function makeDoc(base: AssetBase, name = 'Belt', dirty = true): FakeDoc {
     tryLock: () => ({ kind: 'save', token: Symbol('stub'), generation: 1 }),
     unlock: () => {},
     document: {
+      whenIdle: () => idleTail,
       opCount: 3,
       savedFloors: [] as number[],
       runExclusive<T>(work: () => Promise<T>): Promise<T> { return work(); },

@@ -115,6 +115,8 @@ export class RVGrip implements RVComponent {
 
   // Currently gripped MUs
   readonly grippedMUs: RVMovingUnit[] = [];
+  /** DES seam: called when `grippedMUs` changes. */
+  onHeldChange: (() => void) | null = null;
   private waitingForPart = false;
   // Updated only on pick/place events, not during velocity sampling or signal polling.
   private readonly refusedTargets = new WeakMap<RVMovingUnit, RVGripTarget>();
@@ -315,6 +317,7 @@ export class RVGrip implements RVComponent {
     this.refusedOwners.delete(mu);
     this.waitingForPart = false;
     if (this.pickAlignNode) this.alignOnPick(mu, this.pickAlignNode);
+    this.onHeldChange?.();
 
     debug('grip', `Grip "${this.node.name}" picked MU "${mu.getName()}"`);
   }
@@ -352,6 +355,7 @@ export class RVGrip implements RVComponent {
     if (idx < 0) return;
     this.grippedMUs.splice(idx, 1);
     if (mu.heldBy === 'grip') mu.heldBy = null;
+    this.onHeldChange?.();
     debug('grip', `Grip "${this.node.name}" handed MU "${mu.getName()}" over`);
   }
 
@@ -522,7 +526,10 @@ export class RVGrip implements RVComponent {
 
     // Remove from gripped list
     const idx = this.grippedMUs.indexOf(mu);
-    if (idx >= 0) this.grippedMUs.splice(idx, 1);
+    if (idx >= 0) {
+      this.grippedMUs.splice(idx, 1);
+      this.onHeldChange?.();
+    }
 
     debug('grip', `Grip "${this.node.name}" released MU "${mu.getName()}"`);
   }
@@ -687,6 +694,7 @@ export class RVGrip implements RVComponent {
     if (idx >= 0) {
       this.grippedMUs.splice(idx, 1);
       if (mu.heldBy === 'grip') mu.heldBy = null;
+      this.onHeldChange?.();
     }
   }
 
@@ -712,6 +720,7 @@ export class RVGrip implements RVComponent {
     // transport manager resets all grips together).
     this._seatProblemIds.clear();
     clearSeatOccupiedProblems();
+    this.onHeldChange?.();
   }
 
   /**

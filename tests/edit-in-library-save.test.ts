@@ -73,6 +73,8 @@ import { getPendingDialog } from '@rv-private/plugins/asset-editor/editor-dialog
 import { FakeDir, asDirHandle } from './helpers/fake-fs-handles';
 import { fakeGlb } from './helpers/fake-document-project';
 
+const idleTail = Promise.resolve();
+
 const PUMP = 'models/pump';
 const PATH = 'models/pump.glb';
 
@@ -161,7 +163,7 @@ interface FakeDoc {
   tryLock: () => { kind: string; token: symbol; generation: number };
   unlock: () => void;
   renameDocument: (n: string) => void;
-  document: { opCount: number; runExclusive<T>(w: () => Promise<T>): Promise<T>; markSaved(): void };
+  document: { whenIdle(): Promise<void>; opCount: number; runExclusive<T>(w: () => Promise<T>): Promise<T>; markSaved(): void };
   markSaved(base: AssetBase, name?: string): Promise<void>;
 }
 
@@ -175,7 +177,7 @@ function makeDoc(base: AssetBase): FakeDoc {
     tryLock: () => ({ kind: 'save', token: Symbol('stub'), generation: 1 }),
     unlock: () => {},
     renameDocument: (n) => { doc.name = n; },
-    document: { opCount: 2, runExclusive: (w) => w(), markSaved: () => {} },
+    document: { whenIdle: () => idleTail, opCount: 2, runExclusive: (w) => w(), markSaved: () => {} },
     async markSaved(next) { doc.base = next; doc.dirty = false; },
   };
   return doc;

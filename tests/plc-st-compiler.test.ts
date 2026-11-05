@@ -168,8 +168,8 @@ describe('ST compiler — assignments and VAR_EXTERNAL', () => {
     const program = compileOk(source);
     expect(program.name).toBe('Main');
     expect(program.externals).toEqual([
-      { name: 'SensorA', type: 'BOOL', written: false },
-      { name: 'MotorOn', type: 'BOOL', written: true },
+      { name: 'SensorA', type: 'BOOL', written: false, read: true },
+      { name: 'MotorOn', type: 'BOOL', written: true, read: false },
     ]);
   });
 

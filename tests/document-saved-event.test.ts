@@ -85,6 +85,8 @@ import {
   projectDocumentBase,
 } from '../src/core/editor/active-asset-store';
 
+const idleTail = Promise.resolve();
+
 interface Emitted { event: string; payload: unknown }
 
 function makeDoc(base: AssetBase, name = 'Belt') {
@@ -99,6 +101,7 @@ function makeDoc(base: AssetBase, name = 'Belt') {
     tryLock: () => ({ kind: 'save', token: Symbol('stub'), generation: 1 }),
     unlock: () => {},
     document: {
+      whenIdle: () => idleTail,
       opCount: 3,
       runExclusive<T>(work: () => Promise<T>): Promise<T> { return work(); },
       markSaved() {},

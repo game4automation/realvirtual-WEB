@@ -4,7 +4,7 @@
 import { Object3D, Vector3, Quaternion, Euler, MathUtils } from 'three';
 import { DriveDirection, directionToGltfAxis, isRotation } from './rv-coordinate-utils';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
-import { registerComponentSchema, registerCapabilities, loadSchemaFromSpec, setComponentInstance } from './rv-component-registry';
+import { registerComponentSchema, registerCapabilities, loadSchemaFromSpec, setComponentInstance, getComponentInstances } from './rv-component-registry';
 import { MM_TO_METERS } from './rv-constants';
 import { RV_DRIVE_HOME_KEY } from './rv-pre-bake-keys';
 import { parentScaleAlong } from './rv-drive-units';
@@ -28,14 +28,24 @@ import {
 // Re-export for backward compatibility
 export { DriveDirection } from './rv-coordinate-utils';
 
+/** Authored edits update only the edited baseline field, never sibling runtime values. */
+export function setDriveBehaviorLiveField(owner: object, baseline: Record<string, number>, field: string, value: unknown): boolean {
+  if (!Object.hasOwn(baseline, field)) return false;
+  (owner as Record<string, unknown>)[field] = baseline[field] = Number(value);
+  return true;
+}
+
 /**
  * IDriveBehavior - mirrors Unity's IDriveBehavior interface.
  * Behaviors are owned by the drive and called before drive physics,
  * exactly like Unity's Drive.CalcFixedUpdate() calls its DriveBehaviours.
  */
 export interface IDriveBehavior {
+  resetRunState?(): void;
+  /** Autonomous work that keeps the DES motion cycle alive. */
+  readonly cycleAlive?: boolean;
   /** Called every fixed timestep, before drive physics. Sets targetPosition/targetSpeed/startMove. */
-  update(dt: number): void;
+  update?(dt: number): void;
 
   /**
    * OPTIONAL — contribute the axis SETPOINT while an external authority owns the
@@ -244,6 +254,10 @@ export class RVDrive implements RVComponent {
   isOwner = true;
   /** True while live signal bindings own this drive's command slots. */
   liveControlled = false;
+  eventDrivenFeedback = false;
+  onCommand: ((owner: IDriveBehavior) => void) | null = null;
+  arrivedThisUpdate = false;
+  private _initialConfig: { TargetSpeed?: number; Acceleration?: number; UseAcceleration?: boolean } = {};
 
   // Properties — exact C# Inspector field names
   Direction: DriveDirection = DriveDirection.LinearX;
@@ -542,6 +556,8 @@ export class RVDrive implements RVComponent {
     setComponentInstance(node, this);
   }
 
+  usesSmoothCore(): boolean { return this._smoothHandle !== 0 || this._smoothPlanned; }
+
   captureOverwriteState(): { enabled: boolean; previousPosition: number } {
     return { enabled: this.positionOverwrite, previousPosition: this._prevOverwritePos };
   }
@@ -615,6 +631,7 @@ export class RVDrive implements RVComponent {
    * Called by the loader after applySchema (or by tests after setting properties manually).
    */
   initDrive(): void {
+    this._initialConfig = { TargetSpeed: this.TargetSpeed, Acceleration: this.Acceleration, UseAcceleration: this.UseAcceleration };
     this.isRotary = isRotation(this.Direction);
 
     // Store base transform. plan-754 D18: on the destructive pipeline the
@@ -790,6 +807,7 @@ export class RVDrive implements RVComponent {
     if (fieldName === 'TargetSpeed') {
       const n = Number(value);
       this.TargetSpeed = n;
+      this._initialConfig.TargetSpeed = n;
       this.targetSpeed = n;
       this._smoothLimitsDirty = true;
       this._smoothRejected = false;
@@ -797,8 +815,14 @@ export class RVDrive implements RVComponent {
     }
     if (fieldName === 'Acceleration' || fieldName === 'Jerk') {
       (this as unknown as Record<string, number>)[fieldName] = Number(value);
+      if (fieldName === 'Acceleration') this._initialConfig.Acceleration = this.Acceleration;
       this._smoothLimitsDirty = true;
       this._smoothRejected = false;
+      return true;
+    }
+    if (fieldName === 'UseAcceleration') {
+      this.UseAcceleration = Boolean(value);
+      this._initialConfig.UseAcceleration = this.UseAcceleration;
       return true;
     }
     if (fieldName === 'JogForward') {
@@ -895,6 +919,7 @@ export class RVDrive implements RVComponent {
    * contract (plan-554 F3c): {@link stepTravel}, {@link travelOdometer}, {@link discontinuityRev}.
    */
   update(dt: number) {
+    this.arrivedThisUpdate = false;
     const start = this.currentPosition;
     this.stepTravel = 0;
     this._stepWrap = 0;
@@ -973,7 +998,7 @@ export class RVDrive implements RVComponent {
 
     // Call drive behaviors first (mirrors Unity: Drive.CalcFixedUpdate calls IDriveBehavior[])
     for (const behavior of this.driveBehaviors) {
-      behavior.update(dt);
+      behavior.update!(dt);
     }
 
     // A behavior that FOLLOWED an external position command owns the axis for
@@ -1010,6 +1035,7 @@ export class RVDrive implements RVComponent {
 
     const dist = this.targetPosition - this.currentPosition;
     if (Math.abs(dist) < 0.01) {
+      this.arrivedThisUpdate = !this.isAtTarget;
       this.currentPosition = this.targetPosition;
       this.isRunning = false;
       this.currentSpeed = 0;
@@ -1037,6 +1063,9 @@ export class RVDrive implements RVComponent {
       nextPos = Math.max(this.LowerLimit, Math.min(this.UpperLimit, nextPos));
     }
 
+    if (!this.isAtTarget && Math.abs(nextPos - this.targetPosition) < this.arrivalTolerance) {
+      this.arrivedThisUpdate = true;
+    }
     this.currentPosition = nextPos;
     this.applyToNode();
     this.dispatchAfterUpdate();
@@ -1260,6 +1289,7 @@ export class RVDrive implements RVComponent {
    * so the caller runs the trapezoidal path instead.
    */
   private updateSmoothMove(dt: number, globalOverride: number): boolean {
+    const wasAtTarget = this.isAtTarget;
     const provider = this.acquireSmooth();
     if (!provider) return false;
     const handle = this._smoothHandle;
@@ -1285,6 +1315,7 @@ export class RVDrive implements RVComponent {
         this.currentPosition = this._smoothSnapshot.position;
         this.currentSpeed = 0;
         this.isRunning = false;
+        this.arrivedThisUpdate = !wasAtTarget && this.isAtTarget;
         this.applyToNode();
         this.dispatchAfterUpdate();
         return true;
@@ -1309,6 +1340,8 @@ export class RVDrive implements RVComponent {
       this.currentSpeed = 0;
       this._smoothPlanned = false;
     }
+
+    this.arrivedThisUpdate = !wasAtTarget && this.isAtTarget;
 
     this.applyToNode();
     this.dispatchAfterUpdate();
@@ -1520,7 +1553,10 @@ export class RVDrive implements RVComponent {
    * post-load without compounding the StartPosition offset. Mirrors the
    * config→runtime sync in initDrive (axis, isRotary, targetSpeed).
    */
-  reapplyConfig(): void {
+  reapplyConfig(field?: string): void {
+    // Only the authored field becomes a reset baseline; runtime commands on siblings stay out.
+    for (const k of ['TargetSpeed', 'Acceleration', 'UseAcceleration'] as const)
+      if (field === undefined || field === k) (this._initialConfig as Record<string, unknown>)[k] = this[k];
     this.isRotary = isRotation(this.Direction);
     const rawAxis = directionToGltfAxis(this.Direction);
     this.axis.copy(rawAxis);
@@ -1544,6 +1580,7 @@ export class RVDrive implements RVComponent {
    * fresh command on the next tick, matching Unity's DriveReset/Stop semantics.
    */
   reset(): void {
+    Object.assign(this, this._initialConfig);
     this.currentPosition = this.StartPosition;
     this.markDiscontinuity();
     this.travelOdometer = 0; // a fresh run counts from zero (deterministic per run)
@@ -1569,13 +1606,28 @@ export class RVDrive implements RVComponent {
     this.jogBackward = this.JogBackward;
     this._wasJogging = false;
     this._stoppingJog = false;
+    this._moveSign = 1;
+    this._stepWrap = 0;
+    this.arrivedThisUpdate = false;
+    this.positionClaimedThisTick = false;
+    this.behaviorChangedThisTick = false;
     // Park the core at the authored start pose. The context is KEPT — a sim
     // reset is not a teardown, and re-creating it would churn handles on every
     // reset (plan-281 §2.7 Reset).
     this._smoothEffectiveTarget = Number.NaN;
     this._smoothJogBlocked = 0;
+    this._smoothPlanned = false;
+    this._smoothPlanTarget = Number.NaN;
+    this._smoothJogDir = 0;
+    this._smoothRebasePending = false;
+    this._smoothLimitsDirty = true;
+    this._smoothRejected = false;
     this.rebaseSmooth(this.StartPosition, 0);
     this.applyToNode();
+    for (const owner of this.driveBehaviors) owner.resetRunState?.();
+    // Node registration also covers signal-only adapters in Continuous.
+    for (const owner of getComponentInstances(this.node) as readonly IDriveBehavior[])
+      if (owner !== this && !this.driveBehaviors.includes(owner)) owner.resetRunState?.();
     this.dispatchAfterUpdate();
   }
 

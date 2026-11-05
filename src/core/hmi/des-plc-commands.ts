@@ -28,10 +28,10 @@ function plcEnabled(program: string | undefined): CommandEnabled {
 
 export const desStep: CommandImpl<{ count?: number }> = {
   enabled: desEnabled,
-  run: async ({ viewer }, { count }) => {
+  run: async ({ viewer }, args) => {
     const ctl = viewer?.simulationKernel?.desControl?.();
     if (!ctl) return { error: 'DES not active — call web_execute("workspace.setMode", {"mode":"des"}) first.' };
-    const n = Math.max(1, count || 1);
+    const n = Math.max(1, args?.count || 1);
     let stepped = 0;
     for (let i = 0; i < n; i++) { if (!ctl.step()) break; stepped++; }
     return { stepped, events: ctl.eventStats?.() ?? null };

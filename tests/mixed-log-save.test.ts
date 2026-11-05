@@ -76,6 +76,8 @@ import { __clearDraftStoresForTests } from '../src/core/ops/rv-document-drafts';
 import type { AssetBase } from '../src/core/editor/rv-asset-document';
 import type { RvScenePrimitiveOp } from '../src/core/ops/rv-unified-ops';
 
+const idleTail = Promise.resolve();
+
 // ─── Doubles ────────────────────────────────────────────────────────────
 
 /** The scene store as `saveDocument` sees it, plus a log of what was called. */
@@ -109,6 +111,7 @@ function makeBoundDoc(base: AssetBase) {
     tryLock: () => ({ kind: 'save', token: Symbol('stub'), generation: 1 }),
     unlock: () => {},
     document: {
+      whenIdle: () => idleTail,
       opCount: 3,
       runExclusive<T>(work: () => Promise<T>): Promise<T> { return work(); },
       markSaved() {},

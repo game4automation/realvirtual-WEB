@@ -24,6 +24,7 @@
 
 import { Box } from '@mui/material';
 import type { SxProps, Theme } from '@mui/material';
+import { isRecordingMode } from '../recording-mode';
 
 /** What every dirty mark in the product is tinted with. */
 export const DIRTY_INK = 'warning.main';
@@ -43,7 +44,7 @@ export function DirtyDot({ size = 7, title = 'Unsaved changes', sx }: DirtyDotPr
       component="span"
       data-testid="dirty-dot"
       aria-label={title}
-      title={title}
+      title={isRecordingMode() ? undefined : title}
       sx={{
         display: 'inline-block',
         width: size,

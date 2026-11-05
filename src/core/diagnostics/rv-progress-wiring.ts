@@ -51,7 +51,7 @@ export class ProgressWiring {
     this.waitRegistry.addSource(gripWaitSource(opts.transport));
     this.every = Math.max(1, Math.floor(opts.sampleEveryTicks ?? 60));
     this.ledger = new ProgressLedger({ clock: opts.clock });
-    this.populationUnsubs = createCorePopulationSources(opts).map(s => this.ledger.addPopulation(s));
+    this.populationUnsubs = createCorePopulationSources(opts).map(s => this.ledger.addPopulation({ ...s, seed: () => this.observe(s.kind) }));
     this.sample();
   }
 
@@ -62,9 +62,18 @@ export class ProgressWiring {
   }
 
   sample(idleSec = this.opts.idleSec ?? 120): ReturnType<ProgressLedger['sample']> {
+    this.observe();
+    const sampled = this.ledger.sample(idleSec);
+    this.opts.onSample?.();
+    return sampled;
+  }
+
+  /** `only`: seeds one population after a ledger reset. */
+  private observe(only?: string): void {
     const { ledger, opts } = this;
-    if (opts.adapters?.vehicle !== false) {
-      const handles = opts.fleet.all();
+    const on = (k: 'vehicle' | 'surface' | 'sink') => opts.adapters?.[k] !== false && (!only || only === k);
+    if (on('vehicle')) {
+      const handles = opts.fleet.all().filter(h => h.kernel !== 'des');
       const live = new Set(handles);
       for (const handle of this.vehicles.keys()) if (!live.has(handle)) this.vehicles.delete(handle);
       for (const handle of handles) {
@@ -90,7 +99,7 @@ export class ProgressWiring {
         }
       }
     }
-    if (opts.adapters?.surface !== false) {
+    if (on('surface')) {
       const surfaces = this.detached.length
         ? new Map(opts.transport.surfaces.map(s => [progressNodeId(s.node, 'surface'), s])) : null;
       for (const [id, gen, x, y, z, surface, fx, fy, fz] of this.detached) {
@@ -130,7 +139,7 @@ export class ProgressWiring {
     for (const [sink, unsubscribe] of this.sinks) {
       if (!expectedSinks.has(sink)) { unsubscribe(); this.sinks.delete(sink); }
     }
-    if (opts.adapters?.sink !== false) {
+    if (on('sink')) {
       for (const sink of expectedSinks) {
         const id = progressNodeId(sink.node, 'sink');
         ledger.register(id, 'sink', 'sink');
@@ -141,9 +150,6 @@ export class ProgressWiring {
         else ledger.inactive(id);
       }
     }
-    const sampled = ledger.sample(idleSec);
-    opts.onSample?.();
-    return sampled;
   }
 
   /** Retain final travel before disposal or reuse of an instancing slot. */
@@ -223,7 +229,7 @@ export class ProgressWiring {
 
   dispose(): void {
     this.waitRegistry.clear();
-    this.reset();
     for (const unsubscribe of this.populationUnsubs) unsubscribe();
+    this.reset();
   }
 }

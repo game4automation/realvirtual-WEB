@@ -47,6 +47,7 @@ import {
   type ParsedAddressTable,
 } from '../import/rv-address-table-import';
 import { connectRestFetch } from './connect-rest';
+import type { MappingConversion } from './connect-mapping-options';
 import { configOpsLimitError, rawRowLimitError } from './connect-ops-limits';
 import { clearLicenseStatus, fetchLicenseStatus } from './license-store';
 import { fetchConnectNews } from '../news-store';
@@ -838,6 +839,7 @@ export interface ConnectSnapshot {
    * viewer would otherwise open a window on somebody else's desk.
    */
   revealSupported: boolean;
+  mappingConversion?: boolean;
   /**
    * AI-diagnosis (RAG/LLM) status from `GET /diagnose/status` (plan-284). `undefined` until the
    * first poll completes; `{ supported: false }` for gateways without the endpoint.
@@ -1901,6 +1903,7 @@ export interface GatewayHealth {
    * every gateway older than that plan, and false on one without a project root.
    */
   revealSupported?: boolean;
+  mappingConversion?: boolean;
   /**
    * Is the browser bridge endpoint `/webviewer` mapped, i.e. the MCP server switched on (plan-541
    * F10)? Absent on every gateway older than the bridge pairing — the AI Bridge reads its absence
@@ -2023,6 +2026,7 @@ export async function connectToServer(opts?: { explicit?: boolean }): Promise<vo
       // Strict `=== true`, like `updateSupported` beside it: an older gateway omits the field, and
       // `undefined` must read as "cannot", never as "unknown, try anyway".
       revealSupported: health.revealSupported === true,
+      mappingConversion: health.mappingConversion === true,
     });
 
     if (opts?.explicit) _recordUserConnected();
@@ -2182,6 +2186,7 @@ export function disconnectFromServer(): void {
     updateSupported: false,
     updateReason: null,
     revealSupported: false,
+    mappingConversion: false,
     autoMapReport: null,
     autoMapBusy: false,
     reconcileReports: {},
@@ -4824,7 +4829,7 @@ export interface ConnectMirrorRule {
 }
 
 /** Manual 1:1 bridge: the value of `sourceSignal` is written to `destSignal` of another interface. */
-export interface ConnectSignalMapping {
+export interface ConnectSignalMapping extends MappingConversion {
   enabled: boolean;
   sourceSignal: string;
   destSignal: string;

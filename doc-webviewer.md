@@ -2432,17 +2432,36 @@ Give a node a **Collision Role** in the inspector and the viewer checks it again
 every other body of a *different* role while the simulation runs. There is one
 dropdown and nothing else — no group names, no exclusion matrix:
 
-`None` · `Tool` · `Workpiece` · `Machine` · `Robot` · `Environment` (default `None`).
+`None` · `Tool` · `Workpiece` · `Machine` · `Robot` · `Environment` · `Cutter` (default `None`).
 
 - **What a body is.** The role covers the node's whole subtree, down to the next
   descendant carrying a role of its own. A robot marked `Robot` with a gripper
   marked `Tool` is therefore *two* bodies — "the robot counts up to the gripper".
+  Since plan-781 a body is resolved on the **pick structure** of the baked model:
+  the node's segment ranges in every chunk (through `BakeRegistry.visitChunkGeometry`,
+  the same walk highlight and bounds use) plus the kept meshes of its subtree. A
+  role on a *static* node — a fence or a machine frame whose triangles the bake
+  merged into the asset's root chunk — therefore collides like any other. Hidden
+  nodes (`.visible` along the parents) take no part.
 - **What is checked.** Different roles always, identical roles never, `None`
   never, and a body is never checked against a body nested inside it (a robot
   against its own gripper would report the design-inherent flange contact on
-  tick one). The check is two-stage: the body's world AABB — re-unioned every
-  tick from all its meshes, so it is correct while an arm extends — and then
-  exact triangle against triangle.
+  tick one). A pair is re-tested only when one of its bodies **moved** (the
+  part poses are compared every tick); then the world boxes, then an exact
+  triangle-against-triangle walk over the chunks' own cluster trees
+  (`rv-collision-narrowphase.ts`, `rv-collision-tri-tri.ts`). Collision builds
+  no structure of its own — it only reads `ChunkPickData` and the keep meshes'
+  `KeepPick` (contract bake-picking rule 15). Spawned MUs are checked against
+  node bodies through the transport's MU grid.
+- **Touching is not a collision.** Only real penetration counts: faces resting
+  flush on each other (a box on a conveyor), parts whose boxes only abut and
+  contacts within 0.01 mm (scaled up for coordinates far from the origin) raise
+  nothing.
+- **Start overlaps.** A pair that already overlaps at its first check (after a
+  load, a rebuild or a simulation reset) is a **start baseline**: quiet until it
+  has been apart once, then armed. Two bodies that cannot move and overlap are
+  never an alarm. Both kinds are listed once, as quiet info entries in the
+  **Problems** panel (`collision-authored-overlap`, `collision-start-overlap`).
 - **What happens on a hit.** The involved nodes get the pulsing severity
   outline (the same OutlinePass status silhouette the error-message system
   uses) and one **collision card per pair** appears in the right-side messages
@@ -2457,18 +2476,38 @@ dropdown and nothing else — no group names, no exclusion matrix:
 - **Signals.** `CollisionActive` (bool) and `CollisionCount` (int) mirror the
   latched state for the PLC; a rising edge on `ResetCollisions` clears the
   reported state (still-intersecting, non-ignored pairs are re-detected on
-  the next tick).
+  the next tick). A pair in its start baseline counts towards neither.
 - **Spawned parts.** A Source has its own **Collision Role For MUs** field —
   every MU it spawns joins the check with that role and leaves it at the sink.
-  Instanced MUs are checked at box precision only (they share one geometry, so
-  there is no per-instance BVH).
-- **Only visible geometry participates** (`visible` chain plus render layer), so
-  hidden MU templates and batch source meshes cause no phantom hits.
-- **Known limits.** Geometry that is deformed at runtime — skinned meshes,
-  morph targets, energy chains — is excluded and reported once per model load in
-  the console. Geometry that already overlaps when you press Play is reported
-  immediately: there is deliberately no baseline, so set floors, frames and
-  supports to `None`.
+  Clone and instanced MUs are both checked with their exact triangles (an
+  instance through its pool slot pose).
+- **`collision.status`** (`web_query`) with `includeBodies` lists `parts`,
+  `segments` and `keepParts` per body; `meshes` is a deprecated alias of `parts`
+  for one release, `aabbOnly` is gone.
+- **On demand (plan-781 F21).** The detector is the on-demand feature
+  `collision` (`src/features/collision.register.ts` + `collision.body.ts`, see
+  [doc-extending-webviewer.md](doc-extending-webviewer.md#on-demand-features--the-featureloader-plan-652)).
+  It loads with the first model that carries a `CollisionRole` or a Source whose
+  **Collision Role For MUs** is not `None` — the load prescan activates it before
+  anything is built — or with `collision.watch`. A model without either never
+  downloads it: `viewer.collisionManager` stays `null`, the three signals are not
+  registered, and `collision.status` / `collision.reset` answer with the empty
+  result without loading anything. Startup keeps only the `CollisionRole` marker,
+  the registrar slot (`rv-collision-slot.ts` — what components and the MU spawn
+  hook register with; it buffers until the feature installs the manager, so a
+  role added later in the editor or a Source role edited at runtime still loads
+  and joins it) and the card UI.
+- **Known limits.** Geometry that is deformed or rewritten at runtime — skinned
+  meshes, morph targets, energy chains, ribbon bands — is excluded and reported
+  once per model load in the console. A machining workpiece is NOT: its authored
+  mesh is a brute-force keep part (only the runtime CSG chunks are left out), and
+  while a grid is attached that mesh is hidden and the stock box stands in. A part that is fast enough to pass completely
+  through a thin body between two ticks (at 60 Hz) is not seen; there is no
+  swept test. A crossing whose triangles meet the other part's plane only
+  exactly at a vertex row (within the tolerance) counts as touching there. Two
+  parts whose lateral faces are ALL exactly coplanar (equal boxes pushed into each
+  other end-on) are missed even with deep overlap — every crossing is a flush
+  face; an inside test is a follow-up plan (plan-781 review #2).
 
 ### Unsupported-part detection (DropDetection)
 
@@ -3711,7 +3750,12 @@ stereo plugin (SBS for 3D TVs, Private) and display wall plugin use this seam. R
 - `web_status` carries a `stereo` block when the stereo plugin is registered.
 - The optional wall strategy reports `web_status.wall` and `wall.status` / `wall.viewports` queries;
   `wall.start` / `wall.stop` execute through the command registry. Its view cameras share one
-  navigation rig snapshot per frame. Tracking is polled before the render decision, also while paused.
+  navigation rig snapshot per frame. Tracking is polled before the render decision, also while paused
+  (paused: the last pose is held, status `paused`). Viewports and Flysticks are `WallViewport` /
+  `WallFlystick` child components whose tracking values are signal slots (plan-2233);
+  `web_status.wall.viewports[]` carries `tracking` (`slots` / `sweet-spot` / `unavailable`) and
+  `frameSlot`. `wall.fillFromBody { node, pose, frame, select?, grab?, nav?, joyX?, joyY?, clearMissing? }`
+  binds them in one undo step through the batch form of `signal.bind { bindings: [...] }`.
 - `viewer.clickFromHit(hit, { shiftKey?, clientX?, clientY? })` is the click logic of the canvas
   `pointerup` (chart filter, `pick:'action'`, select / shift-toggle, empty space clears) with an
   already resolved hit. The mouse calls it with the `raycastForRVNodeDetailed` hit, the private
@@ -3733,7 +3777,7 @@ controls and the pipeline features.
 | Unlit | `simple` | flat ambient light, no environment, no tone mapping, no post-processing | always |
 | Shaded | `default` | HDRI environment + key light, shadow map, AO, bloom, floor reflection | always |
 | Toon | `toon` | cel bands + edge lines, flat ambient fill | always |
-| Ray traced (WebGPU, internal) | `raytraced` | Shaded's primary hit (raster), but the lighting is traced per pixel in compute passes and accumulated over frames: diffuse (environment, 1–3 bounces, emissive) and GGX specular reflections, lit by the HDRI environment only (no key light); transparent materials attenuate the rays; no shadow map, no AO pass | real WebGPU backend **and** a registered backend (internal builds only) |
+| Ray traced (WebGPU, commercial beta) | `raytraced` | Shaded's primary hit (raster), but the lighting is traced per pixel in compute passes and accumulated over frames: diffuse (environment, 1–3 bounces, emissive) and GGX specular reflections, lit by the HDRI environment only (no key light); transparent materials attenuate the rays; no shadow map, no AO pass | real WebGPU backend **and** a registered backend (commercial builds and the public demo since plan-767; not in the community build) |
 
 **Backend gate (plan-762).** `raytraced` declares `requires: 'compute'`. Whether it is offered is
 decided only by `availableRenderModes(ctx)` / `resolveRenderMode(id, ctx)` with
@@ -3746,7 +3790,7 @@ only after boot (private plugins register after `RVViewer.create`), the persiste
 pending — the viewer renders Shaded — until `main.ts` calls `viewer.resolvePendingRenderMode()`.
 The backend registers through the hook `src/core/engine/rv-raytraced-hook.ts`
 (`registerRaytracedBackend` / `getRaytracedBackend`); its lifecycle (epoch token, scene wait,
-fatal fallback to `default`) lives in `src/core/engine/rv-raytraced-host.ts`. Internal builds also
+fatal fallback to `default`) lives in `src/core/engine/rv-raytraced-host.ts`. Builds with the private tree (`__RV_HAS_PRIVATE__`) also
 request the adapter's storage-buffer limits when creating the WebGPU device (one retry without
 them, then the usual WebGL fallback).
 
@@ -4343,6 +4387,8 @@ function KpiBar() {
 | `?doc=new&mode=editor` | Editor entry: mint a new document, open the editor and the CAD import dialog |
 | `?renderer=webgpu` | Use WebGPU renderer |
 | `?option=<id>` | Load a **model variant** (see below) |
+| `?recording=1` | Recording mode for the tutorial recorder (plan-2240, set by `scripts/tutorial/run.mjs`): no toolbar tooltips (MUI hover/focus/touch listeners off, controlled action-group tooltips and native `title`s of the toolbars suppressed, `aria-label` stays), the Problems panel does not open by itself and stores no acknowledgements, no startup dialog opens by itself (welcome, Projects dashboard incl. the missing-document and hosted-start openings, news, opener, demo-welcome, autoquality). Manual opening, problem reports and domain tooltips (3D hover cards, chart tooltips) stay. Also installs the `window.__rvRecording` seam. Without the flag nothing changes |
+| `?recordingWelcome=1` | With `?recording=1` only: the welcome dialog may still open itself (the recorder adds it for storyboards with `welcome: "show"`) |
 
 #### `?option=` — deep-link model variants
 

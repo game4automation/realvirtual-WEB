@@ -82,6 +82,11 @@ function resetViaViewer(tm: RVTransportManager, kernel: SimulationKernel | null 
     blockageWatch: { reset() {} }, // plan-2038: resetSimulation clears the blockage watch
     transportManager: tm,
     logicEngine: null,
+    // resetSimulation in DES mode also resets the cycle owners (playback, IK paths, replays, scene buttons).
+    playback: null,
+    ikPaths: [] as { reset(): void }[],
+    replayRecordings: [] as { reset(): void }[],
+    sceneButtonManager: { resetAll() {} },
     logicRunState: 'active',
     _kernel: kernel,
     statisticsManager: { resetAll() {} },

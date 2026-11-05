@@ -799,11 +799,13 @@ export class RVMachiningVolume implements RVComponent, StockBoundsSource {
     this.IsInitialized = false;
     this.PendingChunkCount = 0;
     this.PendingJobCount = 0;
-    // plan-409 F4 — the authored meshes are visible again (and back in the
-    // body, with their BVHs), so the stock box must stop standing in for them.
-    // `getStockBoundsLocal()` returns null from here, which alone is enough:
-    // the collision manager reads it per tick. The invalidate() is for the
-    // meshes themselves, whose `boundsTree`s restore triangle precision.
+    // plan-409 F4 — the authored meshes are visible again, so the stock box
+    // must stop standing in for them. `getStockBoundsLocal()` returns null from
+    // here and the collision manager reads it per tick; the authored mesh has
+    // stayed a part of its body all along (plan-781: a brute-force keep part,
+    // dropped only while hidden or layer-masked), so its exact triangles speak
+    // again at the next tick. The invalidate() rebuilds the body because the
+    // chunk container left the subtree.
     this._stockBoundsLocal = null;
     this._stockBoundsDirty = true;
     this._collision?.invalidate();

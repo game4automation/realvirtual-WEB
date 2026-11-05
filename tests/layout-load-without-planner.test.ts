@@ -178,6 +178,6 @@ describe('layout document in a viewer WITHOUT the layout planner (plan-753)', ()
     const source = (await import('../src/core/rv-viewer.ts?raw')).default as string;
     expect(source).toContain('deferPlacements: true,');
     expect(source).not.toContain("deferPlacements: !!this.getPlugin('layout-planner')");
-    expect(source).toContain('this.placements.materializeDeferred(collectDeferredPlacements(result.root))');
+    expect(source).toContain('this.placements.materializeDeferred(collectDeferredPlacements(result.root, this._currentModelScope))');
   });
 });

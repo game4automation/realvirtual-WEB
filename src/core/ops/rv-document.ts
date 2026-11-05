@@ -2,7 +2,7 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { bumpModelEditEpoch } from '../engine/rv-model-edit-epoch';
-import { isDesRunConfigField } from '../material-flow/des-manager-settings';
+import { isDesRunConfigField, isRunConfigOnlyComponents } from '../material-flow/des-manager-settings';
 /**
  * rv-document — ONE op-log document class (plan-703 Phase 1).
  *
@@ -548,13 +548,17 @@ export class RvDocument {
   }
 
   private _recordModelEdit(op: RvOp): void {
+    // Adding the des.setEnd run-config holder neither.
+    const holder = (s?: { position?: number[]; quaternion?: number[]; scale?: number[]; components?: unknown }): boolean =>
+      !!s && isRunConfigOnlyComponents(s.components) && `${s.position}${s.quaternion}${s.scale}` === '0,0,00,0,0,11,1,1';
     // Camera ops share the document log, but carry view state only. Authored
     // setNodeVisible changes the file; groups-panel hide/isolate uses no op.
     // DESManager run parameters (end / warm-up / seed) are run configuration, not model.
     const authored = (item: RvOp): boolean => item.kind === 'composite'
       ? item.ops.some(authored)
       : item.kind !== 'setCamera'
-        && !((item.kind === 'setField' || item.kind === 'unsetField') && isDesRunConfigField(item.componentType, item.fieldName));
+        && !((item.kind === 'setField' || item.kind === 'unsetField') && isDesRunConfigField(item.componentType, item.fieldName))
+        && !(item.kind === 'addNode' && holder(item.spec));
     if (authored(op)) bumpModelEditEpoch('document-edit');
   }
 

@@ -410,6 +410,28 @@ When CONNECT serves the page (marker cookie or same-origin `/health` signature, 
 
 Tool ownership is strict: CONNECT owns the `web_*` browser tools, the Unity Python MCP server owns the 80+ Unity Editor tools. The Python server's historic `web_*` proxy on `:18712` still exists (arming `--no-webviewer` everywhere is follow-up plan 348) — ignore it and call `web_*` through CONNECT. Full reference: `doc-ai-integration.md`.
 
+## Architecture contracts (mandatory)
+
+`../realvirtual-WebViewer-Private~/.contracts/` (Private sibling, not on the public mirror) holds the
+architecture contracts of realvirtual WEB: golden rules, the reasons behind them, the rejected
+alternatives and the guard tests. They are binding for every plan and every change to WebViewer
+code, small fixes included. The folder is authoritative, not this list:
+
+| Contract | Read before you touch … |
+|---|---|
+| `contract-bake-picking.md` | anything that draws, hides, picks or highlights |
+| `contract-node-identity.md` | anything that stores, migrates or resolves a reference |
+| `contract-signals.md` | signal direction, slots, bindings, mappings, connectors |
+| `contract-component-model.md` | component schemas, fields, units and coordinate conversion |
+| `contract-documents-projects.md` | documents, projects, manifests, libraries |
+| `contract-plugins.md` | plugin lifecycle, listeners, model/placement events |
+| `contract-commands-mcp.md` | commands, MCP tools, undo/macro, read-only gates |
+| `contract-tier-boundary.md` | Community vs. Commercial vs. internal code, imports across the boundary |
+
+Enforcement: `/planweb`, `/doweb` and `/fix` require reading the touched contracts and naming every
+touched rule; `/check-plan` treats a violation as a blocker. A deviation is never worked around
+silently: stop and ask. A rule change belongs in the contract itself, not in a plan.
+
 ## Documentation Files
 
 | File | Contents |

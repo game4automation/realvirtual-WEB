@@ -155,6 +155,7 @@ export function CycleTimeChart({ open, onClose }: CycleTimeChartProps) {
       open={open}
       onClose={onClose}
       title="Cycle Time"
+      panelId="demo-cycle-time"
       titleColor="#ffa726"
       subtitle="Last 100 Cycles"
       defaultWidth={700}

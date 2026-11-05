@@ -74,7 +74,7 @@ describe('problems.list', () => {
       expect(registry.list()).toEqual(first);
       expect(first.map(d => d.id)).toEqual(DIAGNOSE_COMMAND_IDS);
       for (const d of first) {
-        expect(d).toMatchObject({ scope: 'none', readOnly: d.id !== 'diag.blockageWatch', available: true });
+        expect(d).toMatchObject({ scope: 'none', readOnly: d.id !== 'diag.blockageWatch' && d.id !== 'problems.ack', available: true });
         expect(d.eagerImpl).toBeUndefined();
         expect(d.undoLabel).toBeUndefined();
         expect(d.macro).toBeUndefined();

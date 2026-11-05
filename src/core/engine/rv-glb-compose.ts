@@ -65,7 +65,7 @@ import {
   type ResolvedOverrides,
 } from './rv-asset-reference';
 import { pivotToFloorCenter } from './rv-placement-pivot';
-import { isQualifiedRef } from '../library/library-origin';
+import { isQualifiedRef, isStrictDocumentRef, type DocumentScope } from '../library/library-origin';
 import {
   buildMissingReferencePlaceholder,
   missingReferenceLabel,
@@ -226,6 +226,8 @@ export interface ResolveContext {
   depth: number;
   /** `ref.path` already resolved against `baseUrl`, for a plain fetch. */
   resolvedPath: string;
+  /** plan-780 R1: project of the containing file; its unqualified refs resolve there. Absent = open project. */
+  scope?: DocumentScope;
 }
 
 /** Bytes plus everything only the fetching side can know about them. */
@@ -237,6 +239,8 @@ export interface ResolvedReference {
   sha256?: string;
   signatureState?: SignatureState;
   signaturePresent?: boolean;
+  /** plan-780: scope of this file's own references (null = open project); absent = the containing file's. */
+  scope?: DocumentScope;
 }
 
 /**
@@ -270,6 +274,8 @@ export interface GlbTemplate {
   gltfNodeNames: readonly (string | undefined)[];
   /** plan-769: the referenced file's identity record (seeded ids, authored index). */
   identity?: FileIdentity | null;
+  /** plan-780: the scope the file's own references resolve in (absent = the referencing file's). */
+  scope?: DocumentScope;
 }
 
 /**
@@ -456,6 +462,8 @@ export interface ComposeOptions {
   signaturePresent?: boolean;
   /** Identity of the root file itself, so a self-reference reads as a cycle. */
   assetId?: string;
+  /** plan-780 R1: project of the root file (null = open project); passed per frame as `ResolveContext.scope`. */
+  scope?: DocumentScope;
   resolve: ReferenceResolver;
   /** Reuse a cache across compositions. Omit and one is created and owned here. */
   cache?: GlbTemplateCache;
@@ -477,6 +485,8 @@ export interface ComposeOptions {
 interface Frame {
   assetId: string;
   baseUrl: string;
+  /** plan-780: project of this frame's file. */
+  scope: DocumentScope;
   signatureState: SignatureState;
   effectiveState: SignatureState;
   occurrence: string;
@@ -486,12 +496,15 @@ interface Frame {
 }
 
 /** The cache/cycle key of a reference: identity first, location second. */
-function referenceKey(ref: AssetReference, resolvedPath: string): string {
+function referenceKey(ref: AssetReference, resolvedPath: string, scope: DocumentScope = null): string {
   // plan-778: a QUALIFIED reference names (library, document) — two libraries'
   // equal document ids are two assets, so B's `models/pump` placing C's
-  // `models/pump` is no cycle. A legacy reference keeps its bare-id key.
+  // `models/pump` is no cycle. plan-780: an unqualified id in a library scope keys into that library.
   if (ref.assetId && isQualifiedRef(ref)) {
     return `id:${ref.providerId}/${ref.sourceId}/${ref.assetId}`;
+  }
+  if (ref.assetId && scope && isStrictDocumentRef({ catalogId: ref.assetId, providerId: ref.providerId, sourceId: ref.sourceId }, scope)) {
+    return `id:${scope.providerId}/${scope.sourceId}/${ref.assetId}`;
   }
   return ref.assetId ? `id:${ref.assetId}` : `url:${resolvedPath}`;
 }
@@ -570,6 +583,7 @@ export async function compose(root: Object3D, options: ComposeOptions): Promise<
   const rootFrame: Frame = {
     assetId: options.assetId ?? '',
     baseUrl: options.baseUrl,
+    scope: options.scope ?? null,
     signatureState: rootState,
     effectiveState: rootState,
     occurrence: ROOT_OCCURRENCE,
@@ -604,7 +618,7 @@ export async function compose(root: Object3D, options: ComposeOptions): Promise<
       const segment = occurrenceSegment(referenceNode, ordinal++);
       const occurrence = childOccurrence(frame.occurrence, segment);
       const resolvedPath = ref.path ? resolveReferenceUrl(frame.baseUrl, ref.path) : '';
-      const key = referenceKey(ref, resolvedPath);
+      const key = referenceKey(ref, resolvedPath, frame.scope);
       const label = ref.assetId || resolvedPath || '<unnamed>';
 
       if (frame.visited.has(key)) {
@@ -629,6 +643,7 @@ export async function compose(root: Object3D, options: ComposeOptions): Promise<
         occurrence,
         depth: frame.depth,
         resolvedPath,
+        scope: frame.scope,
       };
 
       let template: GlbTemplate | null;
@@ -649,6 +664,7 @@ export async function compose(root: Object3D, options: ComposeOptions): Promise<
             gltfNodeIndices: parsed.gltfNodeIndices,
             gltfNodeNames: parsed.gltfNodeNames,
             identity: parsed.identity ?? null,
+            ...(resolved.scope !== undefined ? { scope: resolved.scope } : {}),
           };
         });
       } catch (e) {
@@ -691,6 +707,8 @@ export async function compose(root: Object3D, options: ComposeOptions): Promise<
         assetId: ref.assetId,
         // Relative paths inside the referenced file resolve against ITS url (F18).
         baseUrl: template.url,
+        // plan-780: its own references resolve in the project it came from.
+        scope: template.scope !== undefined ? template.scope : frame.scope,
         signatureState: template.signatureState,
         effectiveState,
         occurrence,

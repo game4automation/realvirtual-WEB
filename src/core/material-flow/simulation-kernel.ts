@@ -186,6 +186,8 @@ export interface DesPeekResult {
  * kernel exposes it via `desControl()`, returning `null` outside DES mode.
  */
 export interface SimDesControl {
+  readonly cycleTime?: number;
+  setCycleTime?(seconds: number): void;
   /** Lifecycle generation, incremented on reset/restart and restore. */
   readonly lifecycleGeneration?: number;
   /** Pause state of the DES manager. */
@@ -255,6 +257,8 @@ export interface SimDesControl {
   snapshotJson?(): string;
   /** Restore the DES manager state from a JSON snapshot (Load Snapshot). */
   restoreJson?(json: string): void;
+  /** Resolves once no snapshot gate refuses (scripts loading, PLC deploy pending); awaited before an async restore. */
+  whenCycleOwnersReady?(): Promise<void>;
 
   // ── Lifecycle service + callback scheduler (plan-645 Phase 2) ──────────
   // Optional members: an older runner without them stays a valid SimDesControl.

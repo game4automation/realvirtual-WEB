@@ -344,6 +344,7 @@ function env(): NodeJS.ProcessEnv {
   const e: NodeJS.ProcessEnv = { ...process.env };
   for (const key of Object.keys(e)) if (key.startsWith('RV_TEST_LOCK') || key.startsWith('VITEST')) delete e[key];
   delete e.NODE_OPTIONS;
+  e.RV_TEST_MIN_FREE_GB = '0'; // plan-2247: not about the machine's free memory
   return e;
 }
 

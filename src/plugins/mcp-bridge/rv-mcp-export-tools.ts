@@ -14,6 +14,14 @@
  * through the one project write path (`backend.writeDocument`), never back to
  * the agent as bytes.
  *
+ * `mode: "animated"` (plan-2229 Phase 3) is the shortcut "record N seconds
+ * deterministically, then export": it dispatches ONE command,
+ * `usd.export.animated` with `mode: "record-and-export"`, through the generic
+ * command wrapper (`web_execute`). That command's `timeoutMs` is above 120 s, so
+ * the wrapper answers with a `jobId` at once and the job owns recording AND
+ * export — `web_macro_cancel` aborts both, the export starts only after the
+ * recording finished (Re-Gate #5).
+ *
  * `web_import_usd_extras` / `_commit` (plan-764 Phase 2) are the card's
  * "Apply USD extras…" as two calls — the SAME bound `apply.preview` /
  * `apply.commit` of the active view: the preview changes nothing and hands out
@@ -24,6 +32,8 @@ import type { RVViewer } from '../../core/rv-viewer';
 import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
 import { resolveActiveDocumentView, type ActiveDocumentFileExport } from '../../core/editor/active-document-view';
 import type { ApplyPreview } from '../../core/export/rv-export-provider';
+/** Command the `mode: "animated"` shortcut dispatches (record-and-export as one job). */
+export const USD_ANIMATED_EXPORT_COMMAND = 'usd.export.animated';
 
 /** Error code when no USD export provider is registered (public build, kill-switch). */
 export const USD_EXPORT_UNAVAILABLE = 'usd-export-unavailable';
@@ -44,15 +54,19 @@ export class McpExportTools {
 
   @McpTool(
     'Export the open document as OpenUSD with every realvirtual extra 1:1 as customData.realvirtual in an own sublayer. '
-    + 'mode standalone = .usdz (root + rv layer + geometry); overlay = bare .rv.usda on the prim paths of the USD the document came from. '
+    + 'mode standalone = .usdz (root + rv layer + geometry); overlay = bare .rv.usda on the prim paths of the USD the document came from; '
+    + 'animated = record `seconds` of simulation deterministically at `fps` and export an animated .usdz (runs as a job: poll web_macro_status). '
     + 'Writes exports/<name> into the open project; returns path, size, prim counts, referencesWithoutGeometry.',
     { readOnly: false, timeoutMs: 120_000 },
   )
   async webExportUsd(
-    @McpParam('mode', 'standalone (default) | overlay.', 'string', false) mode?: string,
+    @McpParam('mode', 'standalone (default) | overlay | animated.', 'string', false) mode?: string,
     @McpParam('name', 'File name without extension (default: document name).', 'string', false) name?: string,
+    @McpParam('fps', 'animated: 24 | 30 (default) | 60.', 'number', false) fps?: number,
+    @McpParam('seconds', 'animated: simulation seconds to record (1-600, required).', 'number', false) seconds?: number,
   ): Promise<string> {
     const modeId = (mode ?? 'standalone').trim().toLowerCase() || 'standalone';
+    if (modeId === 'animated') return this.exportAnimated(name, fps, seconds);
     const view = resolveActiveDocumentView(this.getViewer()?.modes?.activeMode ?? null);
     if (!view) return JSON.stringify({ error: 'No document is open.' });
     const exp = view.actions.exports?.find((e) => e.id === 'usd');
@@ -69,11 +83,15 @@ export class McpExportTools {
     } catch (e) {
       return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
     }
-    if (!modes.some((m) => m.id === modeId)) {
+    const selectedMode = modes.find((m) => m.id === modeId);
+    if (!selectedMode) {
       return JSON.stringify({
         error: `Mode "${modeId}" is not available for this document.`,
         availableModes: modes.map((m) => m.id),
       });
+    }
+    if (selectedMode.disabledReason) {
+      return JSON.stringify({ error: selectedMode.disabledReason });
     }
 
     let result;
@@ -111,6 +129,29 @@ export class McpExportTools {
       });
     }
     return JSON.stringify({ path: relPath, fileName, ...summary });
+  }
+
+  /**
+   * `mode: "animated"` — one `usd.export.animated` command through the generic
+   * wrapper (never a direct registry dispatch): its `timeoutMs` makes it a job
+   * that owns recording and export.
+   */
+  private async exportAnimated(name: string | undefined, fps: number | undefined, seconds: number | undefined): Promise<string> {
+    if (seconds == null) return JSON.stringify({ error: 'seconds is required for mode "animated" (simulation seconds, 1-600).' });
+    const args = {
+      mode: 'record-and-export',
+      target: 'project',
+      durationSec: seconds,
+      ...(fps != null ? { fps } : {}),
+      ...(name ? { name } : {}),
+    };
+    // Lazy: core `document-commands` imports this file eagerly; the descriptors ride with the bridge.
+    const [{ McpCommandTools }, { ensureUsdRecordCommandsRegistered }] = await Promise.all([
+      import('./rv-mcp-command-tools'),
+      import('../../core/hmi/commands/usd-record-commands'),
+    ]);
+    ensureUsdRecordCommandsRegistered();
+    return new McpCommandTools(this.getViewer).webExecute(USD_ANIMATED_EXPORT_COMMAND, JSON.stringify(args));
   }
 
   /** The bound USD apply of the active view, or the JSON refusal to answer with. */

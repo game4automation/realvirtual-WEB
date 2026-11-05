@@ -23,9 +23,9 @@ const privateRoot = resolve('../realvirtual-WebViewer-Private~');
 const sourceRoot = join(privateRoot, 'src');
 const manifest = loadTierManifest(privateRoot);
 
-/** The two per-customer joint developments, the public-demo welcome window (plan-646 F14,
- *  entitled only by bunny-deploy's DEMO_PROFILE) and the internal ray traced render test
- *  (plan-762); nothing else may be `restricted`. */
+/** The two per-customer joint developments and the public-demo welcome window (plan-646 F14,
+ *  entitled only by bunny-deploy's DEMO_PROFILE); nothing else may be `restricted`. The ray
+ *  traced render mode (plan-762) left this list for commercial beta on 2026-11-04 (plan-767). */
 const RESTRICTED_PREFIXES = [
   'features/agents.register.ts',
   'features/omniverse.register.ts',
@@ -34,8 +34,6 @@ const RESTRICTED_PREFIXES = [
   'plugins/demo-welcome/',
   'render-backends/',
   'omniverse-streaming-lib.d.ts',
-  'features/raytraced-render.register.ts',
-  'raytraced/',
 ];
 
 /** Aggregate entry points that import everything and must never be delivered. */
@@ -129,7 +127,7 @@ describe('private source tier classification', () => {
   it('names the owning feature on every restricted file', () => {
     for (const rel of ALL_SOURCES.filter(isRestricted)) {
       const resolved = resolveTier(manifest, `src/${rel}`);
-      expect(['agents', 'omniverse', 'demo-welcome', 'raytraced-render'], rel).toContain(resolved.feature);
+      expect(['agents', 'omniverse', 'demo-welcome'], rel).toContain(resolved.feature);
     }
   });
 
@@ -141,12 +139,9 @@ describe('private source tier classification', () => {
     for (const rel of ALL_SOURCES.filter(isInternal)) {
       expect(sourceAllowed(rel, profile), `${rel} must not be staged`).toBe(false);
     }
-    // plan-762: the ray traced backend folder is restricted BEFORE its first file
-    // exists — a future src/raytraced/** module is withheld without the entitlement.
-    expect(sourceAllowed('raytraced/rv-raytraced-backend.ts', profile)).toBe(false);
-    expect(sourceAllowed('features/raytraced-render.register.ts', profile)).toBe(false);
-    expect(sourceAllowed('raytraced/rv-raytraced-backend.ts',
-      { tier: 'commercial', restrictedFeatures: ['raytraced-render'] })).toBe(true);
+    // plan-767: the ray traced render mode is commercial beta — it ships without an entitlement.
+    expect(sourceAllowed('raytraced/rv-raytraced-backend.ts', profile)).toBe(true);
+    expect(sourceAllowed('features/raytraced-render.register.ts', profile)).toBe(true);
     // The positive half: a plain commercial file DOES ship, so the assertions above
     // are not passing because everything is blocked.
     expect(sourceAllowed('features/step-import.register.ts', profile)).toBe(true);
@@ -164,7 +159,8 @@ describe('private source tier classification', () => {
     expect(source).not.toContain('features/des.register');
     expect(source).not.toContain('agents.register');
     expect(source).not.toContain('omniverse.register');
-    expect(source).not.toContain('raytraced-render.register');
+    // plan-767: commercial beta since 2026-11-04.
+    expect(source).toContain('features/raytraced-render.register');
   });
 
   it('delivers a tier manifest that mentions neither restricted feature', () => {
@@ -181,7 +177,7 @@ describe('private source tier classification', () => {
       .filter((feature) => generated.includes(`${manifest.registrations[feature].adapter}'`));
     expect(delivered).not.toContain('agents');
     expect(delivered).not.toContain('omniverse');
-    expect(delivered).not.toContain('raytraced-render');
+    expect(delivered).toContain('raytraced-render');
     expect(delivered).toContain('step-import');
   });
 });

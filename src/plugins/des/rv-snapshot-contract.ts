@@ -3,3 +3,4 @@
 
 // Shared pure data contract; retain the DES import path for existing callers.
 export * from '../../core/engine/rv-snapshot-contract';
+export type { SnapshotJson, SnapshotCodec, SnapshotSchema } from '../../core/sdk/rv-snapshot-contract-types';

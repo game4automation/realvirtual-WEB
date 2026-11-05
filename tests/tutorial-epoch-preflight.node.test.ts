@@ -11,6 +11,9 @@
  * speed, double speed — each have their own case.
  */
 
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -18,8 +21,13 @@ import {
   PREFLIGHT_SIM_TOLERANCE_SEC,
   PREFLIGHT_WINDOW_FRAMES,
   preflightVerdict,
+  segmentGate,
   simProgressVerdict,
+  TIME_COMMANDS,
+  timeCommandWindows,
   warmupEndIndex,
+  type GateSample,
+  type GateWindow,
   type PreflightSample,
 } from '../scripts/tutorial/lib/epoch-preflight.mjs';
 
@@ -434,5 +442,307 @@ describe('preflightVerdict — order and completeness', () => {
     const samples = samplesFrom([8, ...repeat(2, PREFLIGHT_WINDOW_FRAMES)]);
     expect(() => preflightVerdict({ samples, fps: 0, warmupMaxFrames: WARMUP_MAX_30 })).toThrow(/fps/);
     expect(() => preflightVerdict({ samples, fps: FPS_30, warmupMaxFrames: 0 })).toThrow(/warmupMaxFrames/);
+  });
+});
+
+// ─── plan-2237: the segment gate ─────────────────────────────────────────────────────────────────
+
+const TRACES = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'tutorial-clock-traces.json'), 'utf8'));
+type TraceRow = [number, number, number, number | null, string | null, number | null, number | null];
+const desFactor = (sub: string, m: number): number | null => (sub === 'animated' ? 1 : sub === 'hybrid' ? Math.max(1, m) : sub === 'step' ? 0 : null);
+
+/** A measured spike trace as gate input; the windows are the recorder's time-command dispatches. */
+function traceInput(key: string): { samples: GateSample[]; windows: GateWindow[] } {
+  const trace = TRACES[key] as { rows: TraceRow[]; ops: { frame: number; cmd: string; completion: number }[] };
+  const samples = trace.rows.map(([paused, simTime, steps, renderClock, subMode, multiplier, speed]): GateSample => (subMode
+    ? { mode: 'des', paused: paused === 1, simTime, fixedStepCount: steps, factor: desFactor(subMode, multiplier ?? 1), subMode,
+      renderClock, endTime: null, clampBudget: 0, clampEnd: 0 }
+    : { mode: 'continuous', paused: paused === 1, simTime, fixedStepCount: steps, factor: speed, subMode: null,
+      renderClock: null, endTime: null, clampBudget: 0, clampEnd: 0 }));
+  const windows = trace.ops.filter((op) => TIME_COMMANDS.includes(op.cmd))
+    .map((op) => ({ start: op.frame, end: op.completion + 1, cmd: op.cmd, kind: 'transition' as const }));
+  return { samples, windows };
+}
+
+interface TakeOptions {
+  factor?: number | null;
+  stepsAt?: (k: number) => number;
+  clockPerStep?: (k: number) => number;
+  des?: string;
+  paused?: boolean;
+  start?: Partial<GateSample>;
+}
+
+/**
+ * Synthetic take: `n` frames of `stepsAt(k)` fixed steps each (default 2 = 30 fps at 60 Hz); the
+ * tempo clock advances by `clockPerStep(k)` per step (default factor/60). Continuous unless `des`.
+ */
+function take(n: number, opts: TakeOptions = {}): GateSample[] {
+  const factor = opts.factor === undefined ? 1 : opts.factor;
+  const first: GateSample = {
+    mode: opts.des ? 'des' : 'continuous', paused: opts.paused ?? false, simTime: 0, fixedStepCount: 1000, factor,
+    subMode: opts.des ?? null, renderClock: opts.des ? 0 : null, endTime: null, clampBudget: 0, clampEnd: 0, ...opts.start,
+  };
+  const samples = [first];
+  for (let k = 1; k <= n; k++) {
+    const prev = samples[k - 1];
+    const steps = opts.paused ? 0 : (opts.stepsAt ? opts.stepsAt(k) : 2);
+    const per = opts.clockPerStep ? opts.clockPerStep(k) : (factor ?? 0) / 60;
+    const advance = steps * per;
+    samples.push({ ...prev, fixedStepCount: prev.fixedStepCount + steps,
+      simTime: prev.simTime + (opts.des ? 0 : advance),
+      renderClock: opts.des ? (prev.renderClock as number) + advance : null });
+  }
+  return samples;
+}
+
+/** Continues `samples` with a new state; the builder's first sample is the last one given. */
+function then(samples: GateSample[], n: number, opts: TakeOptions = {}): GateSample[] {
+  const last = samples.at(-1) as GateSample;
+  const tail = take(n, { ...opts, start: { simTime: last.simTime, fixedStepCount: last.fixedStepCount,
+    renderClock: last.renderClock, ...(opts.start ?? {}) } });
+  return [...samples, ...tail.slice(1)];
+}
+
+describe('segment gate (plan-2237 F3-F5) — measured spike traces', () => {
+  it('Test_SegmentGate_SpikeContinuousCarry_Green', () => {
+    const report = segmentGate({ ...traceInput('continuousCarry'), fps: 30 });
+    expect(report.verdict).toBe('ok');
+    expect(report.segments.filter((s) => s.verdict === 'pass').map((s) => s.factor)).toEqual([1, 5, 0.5, 0.5, 0.5, 0, 100, 100, 1, 1]);
+    expect(report.simJumps.map((j) => j.cmd)).toEqual(['sim.reset']);
+  });
+
+  it('Test_SegmentGate_SpikeOriginalClockWithoutCarry_RedAroundFrame400', () => {
+    // The old ~16 s limit: the recorder creep lets the page run 2 fixed steps ahead after ~400 frames.
+    const report = segmentGate({ ...traceInput('continuousOriginal'), fps: 30 });
+    expect(report.verdict).toBe('fail');
+    expect(report.reason).toMatch(/I1: 538 fixed steps over 268 frames.*at frame 419/);
+  });
+
+  it('Test_SegmentGate_SpikeDes_FastForwardCheckpointStepReset_GreenWithJumps', () => {
+    const report = segmentGate({ ...traceInput('desCarryLike'), fps: 30 });
+    expect(report.verdict).toBe('ok');
+    expect(report.segments.every((s) => s.clock === 'renderClock')).toBe(true);
+    expect(report.simJumps.map((j) => j.cmd)).toEqual(['des.fastForward', 'des.checkpoint.load', 'des.step', 'des.step', 'sim.reset']);
+    expect(report.simJumps.find((j) => j.cmd === 'des.checkpoint.load')).toMatchObject({ fromSim: 10800, toSim: 3600 });
+    expect(report.segments.some((s) => s.kind === 'hold' && s.factor === 0 && s.verdict === 'pass')).toBe(true);
+  });
+});
+
+describe('segment gate (plan-2237 F4) — counter-cases stay red', () => {
+  it('Test_SegmentGate_SteadyLoss_OneStepPer130Frames_Red', () => {
+    const report = segmentGate({ samples: take(1000, { stepsAt: (k) => (k % 130 === 0 ? 1 : 2) }), fps: 30 });
+    expect(report.verdict).toBe('fail');
+    expect(report.reason).toMatch(/I1.*at frame 260$/);
+  });
+
+  it('Test_SegmentGate_WrongTempo_097x_RedInFirstFrame', () => {
+    const report = segmentGate({ samples: take(100, { clockPerStep: () => 0.97 / 60 }), fps: 30 });
+    expect(report.verdict).toBe('fail');
+    expect(report.reason).toMatch(/I2.*at frame 1$/);
+  });
+
+  it('Test_SegmentGate_WrongTempo_OneStepPer20Frames_Red', () => {
+    const report = segmentGate({ samples: take(200, { stepsAt: (k) => (k % 20 === 0 ? 1 : 2) }), fps: 30 });
+    expect(report.verdict).toBe('fail');
+    expect(report.reason).toMatch(/I1.*at frame 40$/);
+  });
+
+  it('Test_SegmentGate_OneStepGainPer260_RedWithoutCarry_GreenWithCarry', () => {
+    // Without the creep carry the page gains one fixed step per ~260 frames (measured 175..265).
+    const noCarry = take(1000, { stepsAt: (k) => (k % 260 === 0 ? 3 : 2) });
+    expect(segmentGate({ samples: noCarry, fps: 30 }).verdict).toBe('fail');
+    const carry = take(1000, { stepsAt: (k) => (k % 2 ? 1 : 3) }); // accumulator jitter, no gain
+    expect(segmentGate({ samples: carry, fps: 30 }).verdict).toBe('ok');
+  });
+
+  it('Test_SegmentGate_ToleranceIsConstant_DoesNotGrowWithLength', () => {
+    expect(segmentGate({ samples: take(10_000, { stepsAt: (k) => (k % 2 ? 3 : 1) }), fps: 30 }).verdict).toBe('ok');
+    expect(segmentGate({ samples: take(10_000, { stepsAt: (k) => (k === 9000 ? 3 : k === 9001 ? 2 : k % 2 ? 3 : 1) }), fps: 30 }).verdict).toBe('fail');
+  });
+});
+
+describe('segment gate (plan-2237 F4) — holds, factors, short', () => {
+  it('Test_SegmentGate_Hold_GreenWhenClockStands_RedWhenItMoves', () => {
+    expect(segmentGate({ samples: take(60, { paused: true }), fps: 30 }).segments[0]).toMatchObject({ kind: 'hold', verdict: 'pass' });
+    expect(segmentGate({ samples: take(60, { factor: 0 }), fps: 30 }).segments[0]).toMatchObject({ kind: 'hold', verdict: 'pass', factor: 0 });
+    expect(segmentGate({ samples: take(60, { des: 'step', factor: 0 }), fps: 30 }).segments[0])
+      .toMatchObject({ kind: 'hold', verdict: 'pass', clock: 'renderClock' });
+    const moving = segmentGate({ samples: take(60, { factor: 0, clockPerStep: () => 1 / 60 }), fps: 30 });
+    expect(moving.verdict).toBe('fail');
+    expect(moving.reason).toMatch(/hold segment: clock moved/);
+  });
+
+  it('Test_SegmentGate_Factors_0_05_2_100_Green_ClampedFactorIsTheReading', () => {
+    for (const factor of [0, 0.5, 2, 100]) {
+      expect(segmentGate({ samples: take(120, { factor }), fps: 30 }).verdict, `factor ${factor}`).toBe('ok');
+    }
+    // `sim.clock.get` reports the CLAMPED factor (150 -> 100); a clock running at 150 against it is red.
+    expect(segmentGate({ samples: take(120, { factor: 100, clockPerStep: () => 150 / 60 }), fps: 30 }).verdict).toBe('fail');
+  });
+
+  it('Test_SegmentGate_Short_UnderThreeFrames_ReportedNotRed', () => {
+    const report = segmentGate({ samples: then(take(2), 30, { factor: 3 }), fps: 30 });
+    expect(report.verdict).toBe('ok');
+    expect(report.segments[0]).toMatchObject({ kind: 'short', verdict: 'short', startFrame: 1, endFrame: 2 });
+  });
+
+  it('Test_SegmentGate_StateChangeWithoutCommand_EndsSegment_Rebases', () => {
+    // A UI click on the speed menu: no recorder command, but the factor read from the state changes.
+    const report = segmentGate({ samples: then(take(60), 60, { factor: 5 }), fps: 30 });
+    expect(report.verdict).toBe('ok');
+    expect(report.segments.map((s) => [s.kind, s.factor, s.verdict])).toEqual([['run', 1, 'pass'], ['run', 5, 'pass']]);
+    expect(report.segments[1].startFrame).toBe(62); // frame 61 is the transition frame
+  });
+
+  it('Test_SegmentGate_RepeatedRearm_ManyTransitions_Green', () => {
+    let samples = take(10);
+    const windows: GateWindow[] = [];
+    for (let i = 0; i < 20; i++) {
+      const at = samples.length;
+      samples = then(samples, 10, { factor: (i % 4) + 1 });
+      windows.push({ start: at, end: at + 1, cmd: 'sim.speedOverride' });
+    }
+    const report = segmentGate({ samples, fps: 30, windows });
+    expect(report.verdict).toBe('ok');
+    expect(report.segments.filter((s) => s.verdict === 'pass')).toHaveLength(21);
+  });
+});
+
+describe('segment gate (plan-2237 F4/F5) — DES clamps and jumps', () => {
+  const hybrid = (n: number, start?: Partial<GateSample>): GateSample[] => take(n, { des: 'hybrid', factor: 50, start });
+
+  it('Test_SegmentGate_OneBudgetClampWithProof_ThenRuns_Green_NoDeficit', () => {
+    const before = hybrid(100);
+    const last = before.at(-1) as GateSample;
+    // The clamped frame: render clock pulled back to the event clock, the clamp counter grew.
+    const clamped: GateSample = { ...last, fixedStepCount: last.fixedStepCount + 2, renderClock: (last.renderClock as number) + 0.4, clampBudget: 1 };
+    const report = segmentGate({ samples: [...before, clamped, ...hybrid(100, clamped).slice(1)], fps: 30 });
+    expect(report.verdict).toBe('ok');
+    expect(report.segments.map((s) => s.verdict)).toEqual(['pass', 'clamped', 'pass']);
+    expect(report.segments[1]).toMatchObject({ clampedAt: 'budget', startFrame: 101, endFrame: 101 });
+  });
+
+  it('Test_SegmentGate_EqualClocksWithoutClampProof_NotClamped_Red', () => {
+    const before = hybrid(100);
+    const last = before.at(-1) as GateSample;
+    const pulled = (last.renderClock as number) + 0.4;
+    const frozen: GateSample = { ...last, fixedStepCount: last.fixedStepCount + 2, renderClock: pulled, simTime: pulled };
+    const report = segmentGate({ samples: [...before, frozen, ...hybrid(100, frozen).slice(1)], fps: 30 });
+    expect(report.verdict).toBe('fail');
+    expect(report.segments.some((s) => s.verdict === 'clamped')).toBe(false);
+  });
+
+  it('Test_SegmentGate_FrozenDesClockWhileStepsRun_NoClampedAt_Red', () => {
+    const report = segmentGate({ samples: take(60, { des: 'hybrid', factor: 50, clockPerStep: () => 0 }), fps: 30 });
+    expect(report.verdict).toBe('fail');
+    expect(report.reason).toMatch(/I2/);
+  });
+
+  it('Test_SegmentGate_WrongDesTempo_Red', () => {
+    expect(segmentGate({ samples: take(60, { des: 'hybrid', factor: 50, clockPerStep: () => 40 / 60 }), fps: 30 }).verdict).toBe('fail');
+  });
+
+  it('Test_SegmentGate_EndClamp_StopsJudgingUntilStateChange', () => {
+    const before = hybrid(60);
+    const last = before.at(-1) as GateSample;
+    const atEnd: GateSample = { ...last, fixedStepCount: last.fixedStepCount + 2, renderClock: (last.renderClock as number) + 0.5, clampEnd: 1 };
+    // After the end the render clock stands while steps run — no further clamp is counted.
+    const stand = take(40, { des: 'hybrid', factor: 50, clockPerStep: () => 0, start: atEnd }).slice(1);
+    const pausedStart = { ...(stand.at(-1) as GateSample), paused: true };
+    const paused = take(30, { des: 'hybrid', factor: 50, paused: true, start: pausedStart });
+    const report = segmentGate({ samples: [...before, atEnd, ...stand, ...paused], fps: 30 });
+    expect(report.verdict).toBe('ok');
+    expect(report.segments.map((s) => [s.kind, s.verdict])).toEqual([['run', 'pass'], ['run', 'clamped'], ['hold', 'pass']]);
+    expect(report.segments[1]).toMatchObject({ clampedAt: 'end', startFrame: 61, endFrame: 101 });
+  });
+
+  it('Test_SegmentGate_BackwardsJumpInTransition_LoggedAsSimJump', () => {
+    const before = hybrid(60, { renderClock: 10800, simTime: 10800 });
+    const last = before.at(-1) as GateSample;
+    const loaded: GateSample = { ...last, fixedStepCount: last.fixedStepCount + 2, renderClock: 3600, simTime: 3600, subMode: 'step', factor: 0, paused: true };
+    const after = take(30, { des: 'step', factor: 0, paused: true, start: loaded }).slice(1);
+    const report = segmentGate({ samples: [...before, loaded, ...after], fps: 30,
+      windows: [{ start: 58, end: 62, cmd: 'des.checkpoint.load' }] });
+    expect(report.verdict).toBe('ok');
+    expect(report.simJumps).toEqual([{ frame: 61, cmd: 'des.checkpoint.load', fromSim: before[57].renderClock, toSim: 3600 }]);
+  });
+
+  it('Test_SegmentGate_TimelapseWindow_SkippedSegment', () => {
+    const samples = then(take(30), 40, { start: { simTime: 500 } });
+    const report = segmentGate({ samples, fps: 30, windows: [{ start: 31, end: 50, cmd: 'experiment.run', kind: 'timelapse' }] });
+    expect(report.verdict).toBe('ok');
+    expect(report.segments.map((s) => [s.kind, s.verdict])).toEqual([['run', 'pass'], ['timelapse', 'skipped'], ['run', 'pass']]);
+  });
+
+  it('Test_SegmentGate_UnreadableSample_Red', () => {
+    const samples: (GateSample | null)[] = take(10);
+    samples[5] = null;
+    expect(segmentGate({ samples, fps: 30 }).reason).toMatch(/frame 5/);
+  });
+});
+
+describe('DES preflight on the render clock (plan-2237 F6)', () => {
+  it('Test_Preflight_Des_RenderClockRuns_SimTimeStaysZero_Ok', () => {
+    // Measured: after Play the DES event time stays 0 while the render clock runs.
+    const samples: (PreflightSample & { des: boolean; renderClock: number })[] = [{ simTime: 0, fixedStepCount: 1000, des: true, renderClock: 0 }];
+    for (let k = 1; k <= 1 + PREFLIGHT_WINDOW_FRAMES; k++) {
+      const prev = samples[k - 1];
+      samples.push({ simTime: 0, fixedStepCount: prev.fixedStepCount + 2, des: true, renderClock: prev.renderClock + 2 / 60 });
+    }
+    expect(preflightVerdict({ samples, fps: FPS_30, warmupMaxFrames: WARMUP_MAX_30 }).verdict).toBe('ok');
+    // The same take read on simTime is the measured 0-s failure.
+    const old = samples.map(({ simTime, fixedStepCount }) => ({ simTime, fixedStepCount }));
+    expect(preflightVerdict({ samples: old, fps: FPS_30, warmupMaxFrames: WARMUP_MAX_30 }).verdict).toBe('fail');
+  });
+
+  it('Test_Preflight_FactorFromClock_HybridFiftyStart_Ok', () => {
+    const samples = samplesFrom([2, ...Array(PREFLIGHT_WINDOW_FRAMES).fill(2)], 50 * FIXED_DT);
+    expect(preflightVerdict({ samples, fps: FPS_30, warmupMaxFrames: WARMUP_MAX_30, factor: 50 }).verdict).toBe('ok');
+    expect(preflightVerdict({ samples, fps: FPS_30, warmupMaxFrames: WARMUP_MAX_30 }).verdict).toBe('fail');
+  });
+});
+
+describe('time-command windows from the take-wide watch (plan-2237 review 3)', () => {
+  it('Test_TimeCommandWindows_SyncAsyncAndOpen', () => {
+    const at: { id: string; phase: 'dispatch' | 'done'; ok?: boolean }[][] = Array.from({ length: 20 }, () => []);
+    at[3].push({ id: 'sim.reset', phase: 'dispatch' }, { id: 'sim.reset', phase: 'done', ok: true });
+    at[8].push({ id: 'des.checkpoint.load', phase: 'dispatch' });
+    at[11].push({ id: 'des.checkpoint.load', phase: 'done', ok: true });
+    at[15].push({ id: 'des.step', phase: 'done', ok: true }); // completion without a seen dispatch
+    at[17].push({ id: 'sim.playPause', phase: 'dispatch' }); // never completed
+    expect(timeCommandWindows(at, 19)).toEqual([
+      { start: 3, end: 4, cmd: 'sim.reset', kind: 'transition' },
+      { start: 8, end: 12, cmd: 'des.checkpoint.load', kind: 'transition' },
+      { start: 15, end: 16, cmd: 'des.step', kind: 'transition' },
+      { start: 17, end: 19, cmd: 'sim.playPause', kind: 'transition' },
+    ]);
+  });
+
+  it('Test_SegmentGate_UiResetWithoutWindow_Red_WithWatchWindow_GreenAndJump', () => {
+    // A reset by a UI click changes neither mode, factor nor pause: only the watch makes it a transition.
+    const before = take(60, { start: { simTime: 30 } });
+    const samples = then(before, 60, { start: { simTime: 0 } });
+    expect(segmentGate({ samples, fps: 30 }).verdict).toBe('fail');
+    const at = samples.map(() => [] as { id: string; phase: 'dispatch' | 'done' }[]);
+    at[61].push({ id: 'sim.reset', phase: 'dispatch' }, { id: 'sim.reset', phase: 'done' });
+    const report = segmentGate({ samples, fps: 30, windows: timeCommandWindows(at, samples.length - 1) });
+    expect(report.verdict).toBe('ok');
+    expect(report.simJumps.map((jump) => jump.cmd)).toEqual(['sim.reset']);
+  });
+});
+
+describe('simProgress compatibility fields (plan-2237 review 5)', () => {
+  it('Test_SegmentGate_PrePlanFields_FromFirstJudgedRunSegment', () => {
+    const report = segmentGate({ samples: then(take(2), 90, { factor: 5 }), fps: 30 });
+    const first = report.segments.find((s) => s.kind === 'run' && s.verdict === 'pass');
+    expect(first).toBeDefined();
+    expect(report.factor).toBe(5);
+    expect(report.expectedSimTime).toBeCloseTo(5 * (first?.frames ?? 0) / 30, 12);
+    expect(report.sumSimTime).toBeCloseTo(first?.sumClock ?? NaN, 12);
+    expect(report.deviation).toBeLessThanOrEqual(report.tolerance as number);
+    // No judged run segment: the fields are null, not invented.
+    const held = segmentGate({ samples: take(30, { paused: true }), fps: 30 });
+    expect([held.sumSimTime, held.expectedSimTime, held.deviation, held.tolerance]).toEqual([null, null, null, null]);
   });
 });

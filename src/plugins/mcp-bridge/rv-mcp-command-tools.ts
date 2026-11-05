@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { whenDocumentSettled } from '../../core/hmi/rv-bind-queue';
 import { getLocalStorage } from '../../core/rv-safe-storage';
 
 /**
@@ -200,7 +201,7 @@ export async function runCommandStep(req: CommandStepRequest): Promise<CommandSt
   const plain = async (): Promise<CommandStepOutcome> => {
     const before = macro && doc ? doc.changeSeq : null;
     const result = await registry.execute(req.command, req.args, execOpts);
-    if (macro && doc && result.ok) await doc.whenIdle();
+    if (macro && doc && result.ok) await whenDocumentSettled(doc);
     const changed = before !== null && doc ? doc.changeSeq !== before : null;
     return { result, outcome: classifyCommandOutcome(result, changed), args: req.args, recorded: false };
   };
@@ -227,7 +228,7 @@ export async function runCommandStep(req: CommandStepRequest): Promise<CommandSt
     let changes: number | null = null;
     try {
       result = await registry.execute(req.command, prep.args, execOpts);
-      if (result.ok) await doc.whenIdle();
+      if (result.ok) await whenDocumentSettled(doc);
     } finally {
       changes = recorder.closeWindow(doc);
     }

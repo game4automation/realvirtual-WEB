@@ -20,7 +20,7 @@
 
 import { useCallback, useMemo, memo } from 'react';
 import { Box, IconButton, Tooltip, Typography } from '@mui/material';
-import { ExpandMore, ChevronRight, VisibilityOutlined, VisibilityOffOutlined, OpenInNewRounded, Inventory2Outlined, LockOutlined, LinkRounded } from '@mui/icons-material';
+import { ExpandMore, ChevronRight, VisibilityOutlined, VisibilityOffOutlined, Inventory2Outlined, LockOutlined, LinkRounded } from '@mui/icons-material';
 import type { RVViewer } from '../rv-viewer';
 import type { SignalStore } from '../engine/rv-signal-store';
 import type { RVLogicEngine } from '../engine/rv-logic-engine';
@@ -28,7 +28,7 @@ import { isLogicStepType, isSignalType, signalOwnerLabel, type TreeNode, type Vi
 import type { SceneTreeNode } from './hierarchy-rows';
 import { NodeBadges, StateBadge, StepStateDot } from './hierarchy-badge-components';
 import { useLongPress } from '../../hooks/use-long-press';
-import { ICON_SIZE } from './shared-sx';
+import { ICON_SIZE, LINK } from './shared-sx';
 import { useStepState } from '../../hooks/use-step-state';
 import { SignalUsageButton } from './rv-signal-usage-list';
 import { signalNameForPath } from './use-signal-usages';
@@ -235,37 +235,6 @@ function EyeToggle({
   );
 }
 
-/** Trailing "open in inspector" affordance shown on the selected row. Makes the
- *  double-click-to-open gesture discoverable: after a single click selects a row,
- *  this ↗ appears (dimmed, brightening on hover) as an explicit way to open the
- *  property inspector — clicking it runs the same action as the row's dblclick. */
-function OpenInspectorButton({ node, onOpen }: { node: TreeNode; onOpen: (node: TreeNode) => void }) {
-  const handleClick = useCallback((e: React.MouseEvent) => {
-    e.stopPropagation();
-    onOpen(node);
-  }, [onOpen, node]);
-  return (
-    <IconButton
-      size="small"
-      aria-label="Open in inspector"
-      title="Open in inspector"
-      onClick={handleClick}
-      onDoubleClick={(e) => e.stopPropagation()}
-      className="rv-open-inspector"
-      sx={{
-        p: 0,
-        ml: 0.25,
-        flexShrink: 0,
-        color: 'text.disabled',
-        opacity: 0.55,
-        transition: 'opacity 0.1s, color 0.1s',
-        '&:hover': { color: 'primary.main', opacity: 1 },
-      }}
-    >
-      <OpenInNewRounded sx={{ fontSize: 13 }} />
-    </IconButton>
-  );
-}
 
 export interface ReferenceRowProps {
   /** Opens the asset a reference row places. Absent = glyph is a plain marker. */
@@ -293,28 +262,28 @@ function ReferenceGlyph({ node, selected, onOpen }: {
       sx={{ fontSize: ICON_SIZE.sm, transform: 'rotate(-45deg)' }}
     />
   );
-  const color = selected ? 'primary.main' : 'text.secondary';
+  const color = selected ? 'primary.main' : LINK;
   if (!onOpen) {
     return (
       <Box
         component="span"
         aria-label="Asset reference"
         data-testid="hierarchy-reference-glyph"
-        sx={{ display: 'inline-flex', mr: 0.5, flexShrink: 0, color }}
+        sx={{ display: 'inline-flex', ml: 0.5, flexShrink: 0, color }}
       >
         {glyph}
       </Box>
     );
   }
   return (
-    <Tooltip title={OPEN_REFERENCE_TITLE} placement="right" enterDelay={400} disableInteractive>
+    <Tooltip title={OPEN_REFERENCE_TITLE} placement="left" enterDelay={400} disableInteractive>
       <IconButton
         size="small"
         aria-label={OPEN_REFERENCE_TITLE}
         data-testid="hierarchy-reference-glyph"
         onClick={handleClick}
         onDoubleClick={(e) => e.stopPropagation()}
-        sx={{ p: 0, mr: 0.5, flexShrink: 0, color, '&:hover': { color: 'primary.main' } }}
+        sx={{ p: 0, ml: 0.5, flexShrink: 0, color, '&:hover': { color: 'primary.main' } }}
       >
         {glyph}
       </IconButton>
@@ -612,9 +581,6 @@ export const TreeNodeRow = memo(function TreeNodeRow({
           />
         )}
 
-        {/* Reference marker: this node places another asset. */}
-        {isReference && <ReferenceGlyph node={node} selected={isSelected} onOpen={onOpenReference} />}
-
         <Tooltip
           title={isRootRow
             ? `${label}\nModel root — locked (node: ${node.name})`
@@ -638,6 +604,10 @@ export const TreeNodeRow = memo(function TreeNodeRow({
                 ? 'primary.main'
                 : isRootRow
                   ? 'text.primary'
+                  // A reference row (opens another asset) reads like Unity's
+                  // prefab rows: its own quiet link blue, distinct from selection.
+                  : isReference
+                    ? LINK
                   : isMeshOnly
                     ? 'text.disabled'
                     : hasComponents
@@ -666,15 +636,14 @@ export const TreeNodeRow = memo(function TreeNodeRow({
         )}
         {hasComponents && <SignalRowUsage node={node} viewer={viewer} />}
 
-        {isSelectable && isSelected && (
-          <OpenInspectorButton node={node} onOpen={onDoubleClick} />
-        )}
-
         {canToggleVis && (
           <EyeToggle node={node} visible={selfVisible} onToggle={onToggleVisible!} disabledReason={eyeReason} />
         )}
 
         {isLocked && <LockToggle node={node} onUnlock={onUnlock} />}
+
+        {/* Reference marker (trailing): this node places another asset. */}
+        {isReference && <ReferenceGlyph node={node} selected={isSelected} onOpen={onOpenReference} />}
 
     </Box>
   );
@@ -857,10 +826,6 @@ export const FlatNodeRow = memo(function FlatNodeRow({
 
       <NodeBadges types={node.types} signalStore={signalStore} path={node.path} stepInfo={stepInfo} viewer={viewer} onOpenInspector={handleOpenInspector} />
       {isSignal && <SignalRowUsage node={node} viewer={viewer} />}
-
-      {selected && (
-        <OpenInspectorButton node={node} onOpen={onDoubleClick} />
-      )}
 
       {canToggleVis && (
         <EyeToggle node={node} visible={selfVisible} onToggle={onToggleVisible!} disabledReason={eyeReason} />

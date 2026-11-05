@@ -2,6 +2,7 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { readLocalStorage, writeLocalStorage } from '../../rv-safe-storage';
+import { writeAborted } from '../../engine/rv-local-filesystem';
 
 /**
  * browser-backend — the writable project that needs no filesystem (§2.5).
@@ -475,6 +476,8 @@ export class BrowserBackend implements ProjectBackend {
     const { path: relPath, meta } = docRefOf(ref);
     const expected = preconditionOf(opts.expectedRevision);
     return this._writes.run(async () => {
+      // plan-2229: a write aborted while it waited in the queue touches nothing.
+      if (opts.signal?.aborted) throw writeAborted();
       // A caller that hands over a scene row hands over its id with it. An
       // empty one is not "write this as a blob then" — it is a planner save that
       // has lost track of what it is saving, and the body would land under a
@@ -485,6 +488,8 @@ export class BrowserBackend implements ProjectBackend {
       if (sceneId && meta) this._assertPathBelongsToScene(relPath, meta);
       if (sceneId) {
         assertRevisionPrecondition(relPath, expected, sceneGlbRevision(sceneId));
+        // The scene-store put IS the commit point: last check before it.
+        if (opts.signal?.aborted) throw writeAborted();
         const revision = await writeSceneGlb(sceneId, bytes);
         noteSceneMembership(sceneId, this._projectId);
         return { revision };
@@ -497,7 +502,13 @@ export class BrowserBackend implements ProjectBackend {
       // manifest entries pointing at identical bytes cost one copy.
       const blob = new Blob([bytes as unknown as BlobPart]);
       const sha = await sha256OfBlob(blob);
+      // plan-2229: the commit point of a blob is the index update below — the
+      // put only stores content under its digest, which no path names yet. An
+      // abort up to here leaves the path's document untouched (an unreferenced
+      // digest blob may remain, exactly as after any failed write).
+      if (opts.signal?.aborted) throw writeAborted();
       await putBlob(sha, blob);
+      if (opts.signal?.aborted) throw writeAborted();
       // Re-read: `putBlob` awaited, so an entry written by an earlier queue
       // item is already in localStorage, but the object read above is a
       // snapshot from before that await.

@@ -9,14 +9,24 @@
  * their own copy of it. This test fails when a copy drifts:
  *
  * - the Unity vector copy must have the same CONTENT as the canonical table,
- * - the CONNECT vector copy (once it exists) the same content,
- * - the CONNECT kernel (once it exists) must be byte-identical to the Unity kernel (line endings
- *   normalised: git autocrlf in CONNECT and Plastic in Unity may check the same content out differently).
+ * - the CONNECT vector copy the same content,
+ * - the CONNECT kernel must be byte-identical to the Unity kernel (line endings normalised: git
+ *   autocrlf in CONNECT and Plastic in Unity may check the same content out differently).
  *
- * A sibling checkout that is not there (a bare web clone, a worktree session, CONNECT before
- * Phase 5) is skipped WITH the reason, never failed and never silently passed.
+ * Since Phase 5 the CONNECT copies are REQUIRED wherever a CONNECT checkout is found (marker
+ * `src/Connect/Connect.csproj`): a missing kernel or vector copy fails, and the message says whether
+ * the CONNECT checkout is merely behind its `origin/main` (pull it) or the file is really gone. The
+ * CONNECT checkout is `<unity>/Assets/realvirtual-Connect~`, or `RV_CONNECT_ROOT` (a worktree session
+ * points it at its own CONNECT worktree).
+ *
+ * The Unity copies (kernel + vector table) are not in every Plastic workspace yet (plan-2227 Phase 3 waits
+ * for a Unity licence): a Unity project WITHOUT them skips the Unity comparisons with that reason, while
+ * the CONNECT kernel is still checked on its own (present, `System` only) and its vectors against the
+ * canonical table. A sibling checkout that is not there at all is skipped WITH the reason, never failed
+ * and never silently passed.
  */
 
+import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,8 +39,10 @@ const CANONICAL = join(repoRoot, 'tests/fixtures/signal-conversion-vectors.json'
 
 const UNITY_VECTORS = 'Packages/io.realvirtual.starter/Tests/Data/signal-conversion-vectors.json';
 const UNITY_KERNEL = 'Packages/io.realvirtual.starter/Runtime/Interfaces/SignalConversion.cs';
-const CONNECT_KERNEL = 'Assets/realvirtual-Connect~/src/Connect/Core/SignalConversion.cs';
-const CONNECT_VECTORS = 'Assets/realvirtual-Connect~/tests/Connect.Tests/signal-conversion-vectors.json';
+const CONNECT_DIR = 'Assets/realvirtual-Connect~';
+const CONNECT_KERNEL = 'src/Connect/Core/SignalConversion.cs';
+const CONNECT_VECTORS = 'tests/Connect.Tests/signal-conversion-vectors.json';
+const CONNECT_MARKER = 'src/Connect/Connect.csproj';
 
 const STARTER_MARKER = 'Packages/io.realvirtual.starter/package.json';
 
@@ -107,8 +119,37 @@ function json(path: string): unknown {
   return JSON.parse(readFileSync(path, 'utf8'));
 }
 
+/**
+ * The CONNECT checkout, found by its project file: an explicit `RV_CONNECT_ROOT` (used as given), else the
+ * one inside the Unity project. Null only when there is no CONNECT checkout at all.
+ */
+function connectRoot(unityRoot: string | null): string | null {
+  const explicit = process.env.RV_CONNECT_ROOT;
+  if (explicit) return resolve(explicit);
+  if (!unityRoot) return null;
+  const c = join(unityRoot, CONNECT_DIR);
+  return existsSync(join(c, CONNECT_MARKER)) ? c : null;
+}
+
+/**
+ * Why a CONNECT file is missing, for the failure message: `origin/main` of the CONNECT checkout already
+ * has it (read from the local remote-tracking ref, no fetch) means the checkout is just behind.
+ */
+function connectMissingHint(root: string, rel: string): string {
+  try {
+    execFileSync('git', ['-C', root, 'cat-file', '-e', `origin/main:${rel}`], { stdio: 'ignore' });
+    return `the CONNECT checkout ${root} is behind origin/main, which has ${rel} — pull CONNECT (/sync or git -C "${root}" pull)`;
+  } catch {
+    return `${rel} is missing in ${root} and in its origin/main as far as this checkout knows — fetch/pull CONNECT; if it is still missing, restore the verbatim copy of ${UNITY_KERNEL}`;
+  }
+}
+
 const unity = unityProjectRoot();
+const connect = connectRoot(unity);
+const unityKernel = unity ? join(unity, UNITY_KERNEL) : null;
+const UNITY_NOT_CHECKED_IN = 'the Unity copy of the kernel / vectors is not in this workspace (plan-2227 Phase 3 not checked in yet)';
 const NO_UNITY = 'no Unity project with the starter package next to this checkout (set RV_UNITY_PROJECT to check it)';
+const NO_CONNECT = 'no CONNECT checkout next to this checkout (set RV_CONNECT_ROOT to check it)';
 
 describe('signal conversion copies (plan-2227 R7)', () => {
   it('the canonical vector table is present and readable', () => {
@@ -137,34 +178,44 @@ describe('signal conversion copies (plan-2227 R7)', () => {
   it('the Unity vector copy has the content of the canonical table', (ctx) => {
     if (!unity) return ctx.skip(NO_UNITY);
     const copy = join(unity, UNITY_VECTORS);
-    expect(existsSync(copy), `missing Unity vector copy: ${copy}`).toBe(true);
+    if (!existsSync(copy)) return ctx.skip(UNITY_NOT_CHECKED_IN);
     expect(json(copy), `${UNITY_VECTORS} drifted from tests/fixtures/signal-conversion-vectors.json — copy the canonical file`)
       .toEqual(json(CANONICAL));
   });
 
   it('the Unity kernel exists and stays self-contained (System only, no UnityEngine)', (ctx) => {
-    if (!unity) return ctx.skip(NO_UNITY);
-    const kernel = join(unity, UNITY_KERNEL);
-    expect(existsSync(kernel), `missing Unity kernel: ${kernel}`).toBe(true);
-    const code = stripCSharpNoise(readFileSync(kernel, 'utf8'));
+    if (!unity || !unityKernel) return ctx.skip(NO_UNITY);
+    if (!existsSync(unityKernel)) return ctx.skip(UNITY_NOT_CHECKED_IN);
+    const code = stripCSharpNoise(readFileSync(unityKernel, 'utf8'));
     // Every using directive, in any form (plain, alias, static, global), must name System itself.
     const usings = usingTargets(code);
     expect(usings,'SignalConversion.cs is copied verbatim into CONNECT: only `using System;`').toEqual(['System']);
     expect(code, 'no UnityEngine reference in code').not.toMatch(/\bUnityEngine\b/);
   });
 
+  it('the CONNECT kernel exists and stays self-contained (System only)', (ctx) => {
+    if (!connect) return ctx.skip(NO_CONNECT);
+    const kernel = join(connect, CONNECT_KERNEL);
+    expect(existsSync(kernel), `missing CONNECT kernel: ${connectMissingHint(connect, CONNECT_KERNEL)}`).toBe(true);
+    const code = stripCSharpNoise(readFileSync(kernel, 'utf8'));
+    expect(usingTargets(code), 'the CONNECT kernel is the verbatim Unity kernel: only `using System;`').toEqual(['System']);
+  });
+
   it('the CONNECT kernel is a byte-identical copy of the Unity kernel', (ctx) => {
-    if (!unity) return ctx.skip(NO_UNITY);
-    const connect = join(unity, CONNECT_KERNEL);
-    if (!existsSync(connect)) return ctx.skip(`CONNECT kernel not there yet (${CONNECT_KERNEL}, plan-2227 Phase 5)`);
-    expect(normalizedBytes(connect).equals(normalizedBytes(join(unity, UNITY_KERNEL))),
-      `${CONNECT_KERNEL} drifted from ${UNITY_KERNEL} — copy the Unity file, never edit the CONNECT copy`).toBe(true);
+    if (!connect) return ctx.skip(NO_CONNECT);
+    if (!unity || !unityKernel) return ctx.skip(NO_UNITY);
+    if (!existsSync(unityKernel)) return ctx.skip(UNITY_NOT_CHECKED_IN);
+    const kernel = join(connect, CONNECT_KERNEL);
+    expect(existsSync(kernel), `missing CONNECT kernel: ${connectMissingHint(connect, CONNECT_KERNEL)}`).toBe(true);
+    expect(normalizedBytes(kernel).equals(normalizedBytes(unityKernel)),
+      `${CONNECT_KERNEL} differs from ${UNITY_KERNEL} — if the CONNECT checkout is behind, pull it; otherwise copy the Unity file, never edit the CONNECT copy`).toBe(true);
   });
 
   it('the CONNECT vector copy has the content of the canonical table', (ctx) => {
-    if (!unity) return ctx.skip(NO_UNITY);
-    const copy = join(unity, CONNECT_VECTORS);
-    if (!existsSync(copy)) return ctx.skip(`CONNECT vector copy not there yet (${CONNECT_VECTORS}, plan-2227 Phase 5)`);
-    expect(json(copy)).toEqual(json(CANONICAL));
+    if (!connect) return ctx.skip(NO_CONNECT);
+    const copy = join(connect, CONNECT_VECTORS);
+    expect(existsSync(copy), `missing CONNECT vector copy: ${connectMissingHint(connect, CONNECT_VECTORS)}`).toBe(true);
+    expect(json(copy), `${CONNECT_VECTORS} drifted from tests/fixtures/signal-conversion-vectors.json — copy the canonical file`)
+      .toEqual(json(CANONICAL));
   });
 });

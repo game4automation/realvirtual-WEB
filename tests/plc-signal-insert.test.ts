@@ -330,8 +330,8 @@ describe('signal insert — @signal pragma roundtrip', () => {
   it('compileSt decorates externals[].signalName from the pragma', () => {
     const program = compileOk(PRAGMA_PROGRAM);
     expect(program.externals).toEqual([
-      { name: 'SensorX', type: 'BOOL', written: false, signalName: 'MC02.07/Sensor X' },
-      { name: 'MotorOn', type: 'BOOL', written: true, signalName: 'MC02.07/Motor On' },
+      { name: 'SensorX', type: 'BOOL', written: false, read: true, signalName: 'MC02.07/Sensor X' },
+      { name: 'MotorOn', type: 'BOOL', written: true, read: false, signalName: 'MC02.07/Motor On' },
     ]);
   });
 

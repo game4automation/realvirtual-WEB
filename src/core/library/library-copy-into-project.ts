@@ -30,6 +30,8 @@ import { getProjectStore } from '../project/project-store';
 import { libraryLabelOf, libraryNodeOf } from './library-document-edit';
 import { listLibrarySources, subscribeLibrarySources } from './library-source-registry';
 import { OPEN_PROJECT_PROVIDER_ID } from './library-origin';
+import { requalifyCopiedReferences } from './library-reference-requalify';
+import { copyThumbnailSidecar } from './resolve-document-thumbnail';
 import type { LibraryCatalogEntry } from './library-types';
 
 /** The open project as this verb needs it (the store, narrowed — a test seam). */
@@ -86,6 +88,12 @@ export async function copyLibraryDocumentIntoProject(
     return { kind: 'error', message: `"${row.name}" could not be read from library '${label}' (${e instanceof Error ? e.message : String(e)}).` };
   }
   if (!bytes) return { kind: 'error', message: `"${row.name}" could not be read from library '${label}'.` };
+  // plan-780 A3: the copy's unqualified refs get B's qualifier; computed before any write.
+  try {
+    bytes = requalifyCopiedReferences(bytes, libraryProjectId).bytes;
+  } catch (e) {
+    return { kind: 'error', message: `"${row.name}" is not a readable GLB — nothing was copied (${e instanceof Error ? e.message : String(e)}).` };
+  }
 
   const { stem, ext } = splitPath(row.path);
   const taken = new Set((readDocuments(store.getProject()) ?? []).map((d) => (d.path ?? '').toLowerCase()));
@@ -110,9 +118,19 @@ export async function copyLibraryDocumentIntoProject(
   };
   if (switched()) return orphan(SWITCHED);
 
+  const newId = newDocumentId();
+  // plan-780 R6: B's thumbnail sidecar is copied as bytes under the copy's id; a failure leaves no pointer.
+  const thumbnail = await copyThumbnailSidecar(
+    { read: async (p) => (await state.backend!.readDocument(p).catch(() => null))?.bytes ?? null },
+    { write: async (p, b) => { await target.writeDocument(p, b, { expectedRevision: 'any' }); } },
+    row.thumbnail,
+    row.id,
+    newId,
+  );
+  if (switched()) return orphan(SWITCHED);
   const entry: RvDocumentEntry = {
     ...row,
-    id: newDocumentId(),
+    id: newId,
     path,
     name: splitPath(path).stem === stem ? row.name : splitPath(path).stem,
     sizeBytes: bytes.byteLength,
@@ -120,6 +138,7 @@ export async function copyLibraryDocumentIntoProject(
     copiedFrom: { projectId: libraryProjectId, documentId },
   };
   for (const field of FILE_FIELDS) delete (entry as Record<string, unknown>)[field];
+  if (thumbnail) entry.thumbnail = thumbnail;
   entry.copiedFrom = { projectId: libraryProjectId, documentId };
   let recorded = false;
   let written: RvProject | null;

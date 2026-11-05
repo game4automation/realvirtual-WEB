@@ -12,7 +12,7 @@
  * resolution tail of the raycast manager and the editor share.
  */
 
-import type { Mesh, Object3D } from 'three';
+import type { Material, Mesh, Object3D } from 'three';
 import { getCapabilities } from './rv-component-registry';
 import type { NodeRegistry } from './rv-node-registry';
 
@@ -94,6 +94,39 @@ export function isPickableMesh(mesh: Mesh): boolean {
   if ((mesh as Mesh & { skeleton?: unknown }).skeleton) return false;
   if (mesh.morphTargetInfluences && mesh.morphTargetInfluences.length > 0) return false;
   return true;
+}
+
+/**
+ * Does ownerless geometry OCCLUDE a pick (plan-756 Q5)? The one place the rule
+ * lives (chunks and keep meshes): opaque unless `transparent`, `alphaTest` or
+ * `opacity` < 1; an array blocks only if every entry does (pick the hit
+ * face's entry with {@link faceMaterial} first).
+ */
+export function materialBlocks(material: Material | Material[]): boolean {
+  if (Array.isArray(material)) {
+    for (let i = 0; i < material.length; i++) if (!materialBlocks(material[i])) return false;
+    return material.length > 0;
+  }
+  const m = material as Material & { opacity?: number; alphaTest?: number };
+  if (m.transparent === true) return false;
+  if ((m.alphaTest ?? 0) > 0) return false;
+  if ((m.opacity ?? 1) < 1) return false;
+  return true;
+}
+
+/** The material of triangle `faceIndex` (its geometry group); the whole array when unknown. */
+export function faceMaterial(
+  material: Material | Material[],
+  groups: readonly { start: number; count: number; materialIndex?: number }[],
+  faceIndex: number,
+): Material | Material[] {
+  if (!Array.isArray(material) || faceIndex < 0) return material;
+  const i = faceIndex * 3;
+  for (let g = 0; g < groups.length; g++) {
+    const gr = groups[g];
+    if (i >= gr.start && i < gr.start + gr.count) return material[gr.materialIndex ?? 0] ?? material;
+  }
+  return material;
 }
 
 /** Authored hidden flag (editor eye toggle / `rv.Hidden` in the GLB). Keyed on

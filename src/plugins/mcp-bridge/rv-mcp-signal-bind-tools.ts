@@ -59,6 +59,7 @@ import { collectBindingInventory, mergeAppliedMappings } from '../signal-bind/bi
 import { emitSignalBindingApplied } from '../signal-bind/binding-applied-pulse';
 import { enumerateAllBindableTargets } from '../signal-bind/bindable-targets';
 import { bindWithUnitScale, describeUnitStatus } from '../signal-bind/unit-scale';
+import { enqueueBind, holdsBindQueue, runInBindQueue, writeQueued } from '../../core/hmi/rv-bind-queue';
 import { createSignalBindingPersistence } from '../signal-bind/signal-binding-persistence';
 import { signalBindTargetId, type SignalBindTarget } from '../signal-bind/signal-bind-target';
 import {
@@ -105,6 +106,19 @@ function withComponentAddresses<T extends { targetId: string; componentPath: str
 
 function err(message: string, extra?: Record<string, unknown>): string {
   return JSON.stringify({ error: message, ...extra });
+}
+
+/** An `err()` JSON of one batch entry, with its index. */
+function withIndex(json: string, index: number): string {
+  return JSON.stringify({ ...JSON.parse(json), index });
+}
+
+/** One entry of the batch form of `signal.bind`; `signal: null` clears the slot. */
+export interface BatchEntry {
+  readonly targetId: string;
+  readonly componentPath: string;
+  readonly slot: string;
+  readonly signal: string | null;
 }
 
 export class McpSignalBindTools {
@@ -385,6 +399,122 @@ export class McpSignalBindTools {
     });
   }
 
+  /**
+   * The batch form of `signal.bind` (plan-2233 F6): `signal: null` clears the slot.
+   *
+   * Every entry is resolved and checked first (slot, signal, type, direction,
+   * persistence) — a refused entry touches nothing. Then the whole batch runs as
+   * ONE entry of the document's bind queue (a picker or MCP bind of another
+   * caller waits behind it, never between two of its binds) inside ONE document
+   * transaction: one undo step, and a bind that does not stick rolls the whole
+   * batch back. Each bind is the picker's own `bindWithUnitScale`, so the stored
+   * `SignalLinks.Mappings` are byte-identical to binding the slots one by one.
+   */
+  async bindBatch(entries: readonly BatchEntry[], label = 'Bind signals', queueHold?: object): Promise<string> {
+    const viewer = this.viewer;
+    const manager = viewer?.signalBindingManager;
+    const store = viewer?.signalStore;
+    if (!viewer || !manager || !store) return err('No signal binding manager available');
+    const planned: Array<{ resolved: ResolvedSlot; source: PickerSignal | null }> = [];
+    for (const [i, entry] of entries.entries()) {
+      const resolved = this._resolveSlot(entry.targetId, entry.componentPath || undefined, entry.slot);
+      if (typeof resolved === 'string') return withIndex(resolved, i);
+      if (resolved.entry.target.kind !== 'node') return err('A batch binds node targets only', { index: i });
+      const blocked = this._persistenceBlocked(resolved.entry.target);
+      if (blocked) return err(blocked, { persisted: false, index: i });
+      if (entry.signal === null) {
+        planned.push({ resolved, source: null });
+        continue;
+      }
+      const source = this._sourceFor(entry.signal);
+      if (typeof source === 'string') return withIndex(source, i);
+      const reject = slotRejectReason(
+        { type: resolved.slot.type, direction: resolved.slot.direction },
+        { plcType: source.dataType ?? '', direction: source.direction, origin: source.origin, interfaceId: source.interfaceId },
+      );
+      if (reject) return err(dropRejectText(reject), { reason: reject.kind, index: i });
+      if (!upsertMappingForRow([], resolved.slot, source)) {
+        return err('The signal carries no provider identity — it cannot be linked', { index: i });
+      }
+      planned.push({ resolved, source });
+    }
+    const et = getActiveEditTarget();
+    let failedAt = -1;
+    let reason: string | undefined;
+    try {
+      // A caller that already holds this document's queue (a composite edit, e.g. a wall
+      // template) passes its hold object: the batch then runs inside that one entry.
+      const run = (hold: object) => et.withTransaction(label, async () => {
+        for (const [i, p] of planned.entries()) {
+          failedAt = i;
+          const target = p.resolved.entry.target;
+          const persistence = createSignalBindingPersistence(viewer, target);
+          if (!p.source) {
+            const before = persistence.read();
+            const next = removeMappingForRow(before, p.resolved.slot);
+            if (next.length === before.length) continue;
+            const merged = mergeAppliedMappings(next, manager.previewMappings(p.resolved.entry.id, target.node, next));
+            if (persistence.writeAsync) await persistence.writeAsync(merged);
+            else persistence.write(merged);
+            continue;
+          }
+          const result = await bindWithUnitScale(viewer, target, persistence, p.resolved.slot, p.source,
+            { editTarget: et, queueHold: hold });
+          const bound = manager.getBindingLiveness(
+            p.resolved.entry.id, p.resolved.slot.slot, p.resolved.slot.componentPath) !== undefined;
+          if (!result?.persisted || !bound) {
+            throw new Error(result?.error ?? `slot "${p.resolved.slot.slot}" refused the binding`);
+          }
+        }
+        failedAt = -1;
+      });
+      await (holdsBindQueue(et, queueHold) ? run(queueHold!) : runInBindQueue(et, run));
+    } catch (e) {
+      reason = e instanceof Error ? e.message : String(e);
+    }
+    if (reason !== undefined) {
+      return err(`The batch was rolled back: ${reason}`, { persisted: false, index: failedAt, reason });
+    }
+    for (const p of planned) {
+      if (!p.source) continue;
+      emitSignalBindingApplied(viewer, p.resolved.entry.id, {
+        componentPath: p.resolved.slot.componentPath, slot: p.resolved.slot.slot, signal: p.source.name,
+        sourceKind: p.source.origin === 'internal' ? 'internal' : 'connect',
+      });
+    }
+    return JSON.stringify({
+      persisted: true,
+      bound: planned.filter((p) => p.source)
+        .map((p) => ({ targetId: p.resolved.entry.id, slot: p.resolved.slot.slot, signal: p.source!.name })),
+      cleared: planned.filter((p) => !p.source).map((p) => ({ targetId: p.resolved.entry.id, slot: p.resolved.slot.slot })),
+    });
+  }
+
+  /** The picker source of one signal name: exact lookup, exactly one provider. */
+  private _sourceFor(signal: string): PickerSignal | string {
+    const store = this.viewer!.signalStore!;
+    if (store.get(signal) === undefined) {
+      return err(`Signal "${signal}" not found`, {
+        hint: 'Use web_query("signal.sourcesList", {}) for bindable signal names.',
+      });
+    }
+    const providers = store.getSignalProviders(signal);
+    if (providers.length > 1) {
+      return err(`Signal "${signal}" is offered by more than one interface`, {
+        interfaces: providers.map((p) => p.interfaceId),
+      });
+    }
+    const type = store.getType(signal) ?? '';
+    return {
+      name: signal,
+      direction: type.startsWith('PLCOutput') ? 'output'
+        : type.startsWith('PLCInput') ? 'input' : 'unknown',
+      dataType: type || undefined,
+      ...(providers[0] ? { interfaceId: providers[0].interfaceId, topic: providers[0].topic } : {}),
+      origin: providers.length === 1 ? 'connect' : 'internal',
+    };
+  }
+
   /** The unbind itself — the body of `signal.unbind`. JSON, `{error}` on refusal. */
   async unbindSlot(targetId: string, componentPath: string, slot: string): Promise<string> {
     const viewer = this.viewer;
@@ -398,17 +528,25 @@ export class McpSignalBindTools {
     if (blocked) return err(blocked, { persisted: false });
 
     const persistence = createSignalBindingPersistence(viewer, resolved.entry.target);
-    const before = persistence.read();
-    const next = removeMappingForRow(before, resolved.slot);
-    if (next.length === before.length) {
+    // plan-2233: queued like every bind — never inside another edit's open transaction.
+    const out: { applied?: ReturnType<typeof manager.applyMappings> } = {};
+    const et = getActiveEditTarget();
+    await enqueueBind(et, async () => {
+      const before = persistence.read();
+      const next = removeMappingForRow(before, resolved.slot);
+      if (next.length === before.length) return;
+      const applied = out.applied = manager.applyMappings(
+        signalBindTargetId(resolved.entry.target),
+        resolved.entry.node as Parameters<typeof manager.applyMappings>[1],
+        next,
+      );
+      // Awaited: the op must have landed before the queue lets the next edit open its transaction.
+      await writeQueued(persistence, et, mergeAppliedMappings(next, applied));
+    });
+    const applied = out.applied;
+    if (!applied) {
       return err(`Slot "${slot}" carries no binding`, { persisted: false });
     }
-    const applied = manager.applyMappings(
-      signalBindTargetId(resolved.entry.target),
-      resolved.entry.node as Parameters<typeof manager.applyMappings>[1],
-      next,
-    );
-    persistence.write(mergeAppliedMappings(next, applied));
     return JSON.stringify({
       targetId: resolved.entry.id,
       componentPath: resolved.slot.componentPath,
@@ -428,24 +566,51 @@ interface SlotArgs {
   readonly componentPath: string;
   readonly slot: string;
 }
-interface BindArgs extends SlotArgs { readonly signal: string }
+interface BindArgs extends SlotArgs {
+  readonly signal: string;
+  /** Batch form (plan-2233): many slots in one queue entry and one undo step. */
+  readonly bindings?: readonly BatchEntry[];
+  readonly label?: string;
+  /** Internal: the hold OBJECT of a queue the caller holds (core/hmi/rv-bind-queue); a JSON value
+   *  can never match it (identity), and it is never recorded. */
+  readonly _queueHold?: object;
+}
 
 const trimmed = (v: unknown): string => String(v ?? '').trim();
 const slotRefusal = (a: SlotArgs | undefined): string | null =>
   !trimmed(a?.targetId) ? 'targetId is required' : !trimmed(a?.slot) ? 'slot is required' : null;
 
+const batchOf = (a: BindArgs | undefined): BatchEntry[] | null => (Array.isArray(a?.bindings)
+  ? a!.bindings.map((b) => ({
+    targetId: trimmed(b?.targetId), componentPath: String(b?.componentPath ?? ''), slot: trimmed(b?.slot),
+    signal: b?.signal === null ? null : trimmed(b?.signal),
+  }))
+  : null);
+
 const signalBind: CommandImpl<BindArgs, Record<string, unknown>> = {
   enabled: (_ctx, a) => {
-    const r = slotRefusal(a) ?? (!trimmed(a?.signal) ? 'signal is required' : null);
+    const batch = batchOf(a);
+    const r = batch
+      ? (batch.length === 0 ? 'bindings is empty'
+        : batch.map((b) => slotRefusal(b) ?? (b.signal === '' ? 'signal is required' : null)).find((x) => x) ?? null)
+      : slotRefusal(a) ?? (!trimmed(a?.signal) ? 'signal is required' : null);
     return r ? { reason: r } : true;
   },
-  run: async (ctx, a) => valueOrThrowToolJson(
-    await new McpSignalBindTools(() => ctx.viewer).bindSlot(a.targetId, a.componentPath, a.slot, a.signal),
-  ),
+  run: async (ctx, a) => {
+    const tools = new McpSignalBindTools(() => ctx.viewer);
+    const batch = batchOf(a);
+    return valueOrThrowToolJson(batch
+      ? await tools.bindBatch(batch, a.label || undefined, a._queueHold)
+      : await tools.bindSlot(a.targetId, a.componentPath, a.slot, a.signal));
+  },
   // M4: explicit, trimmed values — the slot is addressed by args only, never by selection.
-  resolveArgs: (_ctx, a) => ({
-    targetId: trimmed(a?.targetId), componentPath: String(a?.componentPath ?? ''), slot: trimmed(a?.slot), signal: trimmed(a?.signal),
-  }),
+  resolveArgs: (_ctx, a) => {
+    const batch = batchOf(a);
+    if (batch) return { bindings: batch, ...(a.label ? { label: a.label } : {}) } as unknown as BindArgs;
+    return {
+      targetId: trimmed(a?.targetId), componentPath: String(a?.componentPath ?? ''), slot: trimmed(a?.slot), signal: trimmed(a?.signal),
+    };
+  },
 };
 
 const signalUnbind: CommandImpl<SlotArgs, Record<string, unknown>> = {
@@ -469,6 +634,7 @@ const slotParams = [
 export function createSignalBindCommandDescriptors(): CommandDescriptor<never, unknown>[] {
   const bind: CommandDescriptor<BindArgs, Record<string, unknown>> = {
     id: SIGNAL_BIND_COMMAND,
+    // Batch form (plan-2233): `{ bindings: [{ targetId, componentPath, slot, signal | null }], label? }`.
     label: 'Bind signal',
     undoLabel: 'Bind signal',
     readOnly: false,
@@ -477,7 +643,9 @@ export function createSignalBindCommandDescriptors(): CommandDescriptor<never, u
     available: true,
     unavailableReason: 'Not available',
     mcp: { tool: 'web_signal_bind', params: [...slotParams, { name: 'signal', type: 'string', required: true }] },
-    argsSchema: { targetId: 'string', componentPath: 'string', slot: 'string', signal: 'string' },
+    argsSchema: {
+      targetId: 'string', componentPath: 'string', slot: 'string', signal: 'string', bindings: 'object[]', label: 'string',
+    },
     eagerImpl: signalBind,
     impl: () => Promise.resolve(signalBind),
   };

@@ -302,6 +302,15 @@ describe('library trim core (plan-778 9.13)', () => {
     expect(plan.legacyRefs.map((r) => [r.document, r.assetId])).toEqual([['B:x.glb', 'foreign']]);
   });
 
+  it('a legacy project:<path> ref inside a library ships that library\'s document at the path', async () => {
+    const a = lib('A', [{ id: 'main', refs: [['B', 'x']] }], ['B']);
+    const b = lib('B', [{ id: 'x' }, { id: 'sibling' }]);
+    b.docs.set('x.glb', glbWithNodeExtras([{ AssetReference: { assetId: 'project:sibling.glb' } }]));
+    const plan = await run(a, [b]);
+    expect(plan.errors).toEqual([]);
+    expect(plan.libraries[0].documentIds).toEqual(['x', 'sibling']);
+  });
+
   it('the sync and the async driver are one algorithm (same plan)', async () => {
     const a = lib('A', [{ id: 'main', refs: [['B', 'x'], ['B', 'nope']] }], ['B']);
     const b = lib('B', [{ id: 'x', refs: [['C', 'c1']] }, { id: 'y' }], ['C']);

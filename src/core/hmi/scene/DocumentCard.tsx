@@ -84,7 +84,7 @@ import {
   type ActiveDocumentVerb,
   type ActiveDocumentView,
 } from '../../editor/active-document-view';
-import type { ApplyPreview, DocumentExportMode } from '../../export/rv-export-provider';
+import type { DocumentExportMode } from '../../export/rv-export-provider';
 import type { Object3D } from 'three';
 import { useOptionalViewer } from '../../../hooks/use-viewer';
 import { getAssetReference, isUnresolvedReferenceNode } from '../../engine/rv-asset-reference';
@@ -258,13 +258,12 @@ type FileExportDialogState = {
 } | null;
 
 /**
- * The open "Apply … extras" dialog (plan-764 F7): the preview is on screen.
- * Nothing is changed before the click.
+ * The shared Apply flow, starting with an explanation before file selection.
+ * Nothing changes until the preview's explicit confirmation.
  */
 type ApplyDialogState = {
   exp: ActiveDocumentFileExport;
-  preview: ApplyPreview;
-  dialogs: FileExportDialogsModule;
+  Flow: typeof import('./document-apply-flow').DocumentApplyFlow;
 } | null;
 
 /**
@@ -534,9 +533,6 @@ export function DocumentCard({
   const [exporting, setExporting] = useState(false);
   const [fileExportDialog, setFileExportDialog] = useState<FileExportDialogState>(null);
   const [applyDialog, setApplyDialog] = useState<ApplyDialogState>(null);
-  /** The provider whose apply the hidden file input is choosing a file for. */
-  const applyTargetRef = useRef<ActiveDocumentFileExport | null>(null);
-  const applyInputRef = useRef<HTMLInputElement | null>(null);
   /** The live region. Written on save transitions only — never on an edit. */
   const [announcement, setAnnouncement] = useState('');
 
@@ -804,42 +800,19 @@ export function DocumentCard({
     setFileExportDialog({ exp, modes, dialogs });
   }, [closeMenu]);
 
-  /** "Apply … extras" (plan-764 F7): choose the file first — nothing happens before. */
-  const openApply = useCallback((exp: ActiveDocumentFileExport) => {
+  /** Both entry points use the same lazy file-selection, preview and commit flow. */
+  const openApply = useCallback(async (exp: ActiveDocumentFileExport) => {
     closeMenu();
     if (!exp.apply) return;
-    // Start the dialog module while the user picks the file. Its outcome is
-    // read in onApplyFile, where a failure is shown; here it is only a head start.
-    loadFileExportDialogs().catch(() => undefined);
-    applyTargetRef.current = exp;
-    applyInputRef.current?.click();
-  }, [closeMenu]);
-
-  /** The chosen file → preview (reads, matches, guards — changes nothing). */
-  const onApplyFile = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    e.target.value = '';
-    const exp = applyTargetRef.current;
-    if (!file || !exp?.apply) return;
-    setExporting(true);
     try {
-      let dialogs: FileExportDialogsModule;
-      try {
-        dialogs = await loadFileExportDialogs();
-      } catch (err) {
-        // No dialog, no preview: nothing was read or changed.
-        setMessage(dialogLoadFailure('apply', err));
-        return;
-      }
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      const preview = await exp.apply.preview({ name: file.name, bytes });
-      setApplyDialog({ exp, preview, dialogs });
+      const [, { DocumentApplyFlow }] = await Promise.all([
+        loadFileExportDialogs(), import('./document-apply-flow'),
+      ]);
+      setApplyDialog({ exp, Flow: DocumentApplyFlow });
     } catch (err) {
-      setMessage(err instanceof Error ? err.message : String(err));
-    } finally {
-      setExporting(false);
+      setMessage(dialogLoadFailure('apply', err));
     }
-  }, []);
+  }, [closeMenu]);
 
   // Nothing open — the header renders no chrome, the hero renders its own
   // empty state (which is why that lives in the hero SECTION, not here).
@@ -1251,7 +1224,7 @@ export function DocumentCard({
               key={`apply-${exp.id}`}
               data-testid={`document-card-verb-apply-${exp.id}`}
               disabled={exporting}
-              onClick={() => openApply(exp)}
+              onClick={() => { void openApply(exp); }}
             >
               <ListItemIcon sx={{ minWidth: 28 }}><FileUpload sx={{ fontSize: 16 }} /></ListItemIcon>
               <ListItemText primaryTypographyProps={{ fontSize: 13 }}>{exp.apply!.label}</ListItemText>
@@ -1271,23 +1244,10 @@ export function DocumentCard({
         onCancel={() => setConfirmVerb(null)}
       />
 
-      {/* The file of an apply — chosen BEFORE anything is read or changed. */}
-      {fileExports.some((exp) => exp.apply) && (
-        <input
-          ref={applyInputRef}
-          type="file"
-          accept=".usdz,.usda,.usd"
-          style={{ display: 'none' }}
-          data-testid="document-card-apply-file"
-          onChange={(e) => { void onApplyFile(e); }}
-        />
-      )}
-
-      {/* Apply … extras (plan-764 §3.1) — the lazily loaded dialog module. */}
+      {/* The same lazy Apply flow as the USD menu. */}
       {applyDialog && (
-        <applyDialog.dialogs.DocumentApplyDialog
+        <applyDialog.Flow
           exp={applyDialog.exp}
-          preview={applyDialog.preview}
           onClose={() => setApplyDialog(null)}
           onMessage={setMessage}
         />

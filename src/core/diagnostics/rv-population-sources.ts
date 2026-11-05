@@ -10,6 +10,7 @@ export interface PopulationSource {
   readonly id: string;
   readonly kind: UnitKind;
   expected(): readonly string[];
+  seed?(): void;
 }
 
 /** Hierarchy paths match the node registry; a suffix distinguishes components on one node. */
@@ -35,7 +36,7 @@ export interface CoreProgressModel {
 
 export function createCorePopulationSources(model: CoreProgressModel): readonly PopulationSource[] {
   return [
-    { id: 'fleet', kind: 'vehicle', expected: () => model.fleet.all().map(h => h.id).sort() },
+    { id: 'fleet', kind: 'vehicle', expected: () => model.fleet.all().filter(h => h.kernel !== 'des').map(h => h.id).sort() },
     { id: 'surfaces', kind: 'surface', expected: () => model.transport.surfaces.map(s => progressNodeId(s.node, 'surface')).sort() },
     { id: 'sinks', kind: 'sink', expected: () => model.transport.sinks
       .filter(s => s.DeleteMus === true && (model.expectFlow?.(s) ?? false))

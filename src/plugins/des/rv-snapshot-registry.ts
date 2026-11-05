@@ -19,44 +19,13 @@ import { snapshotUserMessage } from '../../core/sdk/rv-des-snapshot-messages';
  */
 
 import {
-  fromSnapshotData, type CaptureSession, type SnapshotJson, type SnapshotSchema,
+  fromSnapshotData, type CaptureSession,
 } from './rv-snapshot-contract';
 
-export interface Snapshottable {
-  /** Capture already applied this participant's explicit transport codecs. */
-  readonly captureIsEncoded?: boolean;
-  /** Participant-relative handles, expanded per list/map element without mutation. */
-  readonly handleFields?: (json: SnapshotJson) => readonly ParticipantHandleField[];
-  readonly key: string;
-  readonly version: number;
-  readonly dependencies?: readonly string[];
-  readonly services?: readonly string[];
-  readonly schema?: SnapshotSchema;
-  readonly owner?: object;
-  readonly stateKeys?: readonly string[];
-  claimsDrives?(): readonly object[];
-  capture(): unknown;
-  validate(json: SnapshotJson): readonly string[];
-  prepare(json: SnapshotJson): unknown;
-  commit(prepared: unknown): void;
-  onRestore?(): void;
-}
-
-export interface ParticipantHandleField {
-  path: string;
-  eventId: number;
-  owner: string;
-  alternatives: readonly { action: string; kind: string | null }[];
-  notify?: boolean;
-  zone?: string;
-}
-
-export interface SnapshotPart { key: string; version: number; state: SnapshotJson }
-export interface SnapshotStateNotDeclaredError {
-  code: 'des-state-not-declared';
-  participant: string;
-  property: string;
-}
+import type { Snapshottable, SnapshotPart, SnapshotStateNotDeclaredError } from '../../core/sdk/rv-snapshot-contract-types';
+export type {
+  Snapshottable, ParticipantHandleField, SnapshotPart, SnapshotStateNotDeclaredError, SnapshotOwnerDecl,
+} from '../../core/sdk/rv-snapshot-contract-types';
 
 export class SnapshotRegistry {
   private readonly participants = new Map<string, Snapshottable>();
@@ -93,12 +62,17 @@ export class SnapshotRegistry {
     const ordered = this.order();
     const undeclared: SnapshotStateNotDeclaredError[] = [];
     for (const p of ordered) {
-      if (!p.owner) continue;
-      const allowed = new Set([...(p.stateKeys ?? []), ...(p.services ?? [])]);
-      for (const key of Reflect.ownKeys(p.owner)) {
-        if (typeof key === 'string' && allowed.has(key)) continue;
-        undeclared.push({ code: 'des-state-not-declared', participant: p.key, property: String(key) });
-      }
+      const check = (owner: object, stateKeys: readonly string[], services: readonly string[], path?: string): void => {
+        const allowed = new Set([...stateKeys, ...services]);
+        for (const key of Reflect.ownKeys(owner)) {
+          if (typeof key === 'string' && allowed.has(key)) continue;
+          undeclared.push({ code: 'des-state-not-declared', participant: p.key,
+            property: path === undefined ? String(key) : `${path}.${String(key)}`,
+            ...(path === undefined ? {} : { owner: path }) });
+        }
+      };
+      if (p.owner) check(p.owner, p.stateKeys ?? [], p.services ?? []);
+      for (const decl of p.owners?.() ?? []) check(decl.owner, decl.stateKeys, decl.services ?? [], decl.path);
     }
     if (undeclared.length) throw Object.assign(new Error(undeclared.map(e =>
       `${e.code}: ${e.participant}.${e.property}`).join('\n')), { ...undeclared[0], userMessage: snapshotUserMessage(undeclared[0].code).text, errors: undeclared });

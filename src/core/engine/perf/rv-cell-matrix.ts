@@ -59,6 +59,7 @@ import type { RVSensor } from '../rv-sensor';
 import type { RVTransportSurface } from '../rv-transport-surface';
 import { NodeRegistry } from '../rv-node-registry';
 import type { RVTransportManager } from '../rv-transport-manager';
+import { removeSensorsFrom } from '../rv-sensor-registration';
 import { integratePlacedContent, canIntegratePlacedContent } from '../rv-placement-integrate';
 import { getBakeTimings } from '../rv-bake-timings';
 
@@ -526,7 +527,7 @@ export function deactivateSensorsUnder(viewer: CellMatrixHost, root: Object3D): 
   const mine: RVSensor[] = tm.sensors.filter((s) => isUnder(s.node, root));
   if (mine.length === 0) return 0;
   const set = new Set<RVSensor>(mine);
-  tm.sensors = tm.sensors.filter((s) => !set.has(s));
+  removeSensorsFrom(tm, (s) => set.has(s));
   for (const sensor of mine) sensor.dispose();
   tm.notifyTopologyChanged?.();
   return mine.length;
@@ -772,7 +773,7 @@ export function disposeCellMatrix(viewer: CellMatrixHost): void {
   if (tm) {
     const surfaceSet = new Set(state.surfaces);
     tm.surfaces = tm.surfaces.filter((s) => !surfaceSet.has(s));
-    tm.sensors = tm.sensors.filter((s) => !isUnder(s.node, state.root));
+    removeSensorsFrom(tm, (s) => isUnder(s.node, state.root));
     tm.sources = tm.sources.filter((s) => !isUnder((s as unknown as { node?: Object3D }).node, state.root));
     tm.sinks = tm.sinks.filter((s) => !isUnder((s as unknown as { node?: Object3D }).node, state.root));
     for (const surface of state.surfaces) (surface as unknown as { dispose?(): void }).dispose?.();

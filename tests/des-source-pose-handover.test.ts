@@ -861,20 +861,23 @@ const countersOf = (s: RVSource): EngineCounters => {
 };
 
 describe('R3-1 / R3-2 — the standard path keeps its measurement; templateSize() has no side effect', () => {
-  it('standard source headless-first: one throw-away spawn measures the size (as on main)', () => {
+  it('standard source headless-first: no throw-away spawn, the MU carries the canonical templateSize()', () => {
+    // Since 048b5361 (canonical MU size, A1) the scene binding captures ONE size per
+    // source at bind from the template (templateSize(), local matrices) and presets it
+    // on every MU — pose, standard, visual and headless. The headless-first throw-away
+    // spawn (templateBugSizeFor → spawnMU → measure → dispose) is gone, so the engine
+    // counters stay untouched on the standard path too.
     const b = buildScene({ sourceAt: [0, BELT_TOP, -1.25] }); // not contained
     const before = countersOf(b.engine!);
     const rig = startRig(b, 'fastforward');
     const after = countersOf(b.engine!);
     expect(before).toEqual({ Created: 0, spawnCount: 0, lastSpawnedMU: null });
-    // main: templateBugSizeFor(null) → engineSource.spawnMU() → measure → dispose.
-    expect(after.Created).toBe(1);
-    expect(after.spawnCount).toBe(1);
-    expect(after.lastSpawnedMU).not.toBeNull();
+    expect(after).toEqual({ Created: 0, spawnCount: 0, lastSpawnedMU: null });
     const mu = held(rig.adapter('Conveyor_1'))[0] as unknown as { _bugSize?: number[]; visual: unknown };
+    expect(mu, 'standard MU on the belt').toBeDefined();
     expect(mu.visual).toBeNull();
+    expect(mu._bugSize).toEqual(b.engine!.templateSize());
     const expected = templateSizeOf(b.source, b.scene)!;
-    expect(mu._bugSize).toBeDefined();
     for (let i = 0; i < 3; i++) expect(mu._bugSize![i]).toBeCloseTo(expected[i], 9);
     rig.dispose();
   });

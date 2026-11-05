@@ -37,6 +37,8 @@ export type UISlot =
   | 'view-overflow'    // Bottom-right view cluster: a ROW in its "⋯" overflow menu. The
                        //   component renders an `ActionMenuRow` (action-group.tsx) directly —
                        //   no wrapper element — and closes the menu via the row itself.
+  | 'usd-menu'         // Activity-bar USD menu: a visible `SlotMenuRow` (slot-menu-row.tsx)
+                       //   without a wrapper; the host closes enabled rows via data-rv-dropdown-item.
   | 'overlay';         // Full-screen overlay panels (left panels, modals, etc.)
 
 /** Props passed to every UI slot component. */

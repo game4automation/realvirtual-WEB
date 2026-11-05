@@ -20,8 +20,9 @@
  * and GLTFLoader through the save path, which is legitimate there. What this
  * guard owns is that nothing the READ side writes leads to a renderer.
  *
- * And the other direction: only the one post-save step every save path ends in
- * (`rv-finish-document-save.ts`, plan-777 P4), the "Regenerate
+ * And the other direction: only the post-save step
+ * (`rv-finish-document-save.ts`, plan-777 P4), the library save path
+ * (`library-document-edit.ts`, plan-780 R6), the "Regenerate
  * thumbnails" loop (plan-776 #20) and the writer itself may import the
  * renderer / writer / content rule (exact set, so a new importer fails here) —
  * the renderer itself imports the content rule. The loop is imported by its
@@ -92,9 +93,19 @@ function forbiddenReach(entry: string): string[] {
     const { file, chain } = stack.pop()!;
     if (seen.has(file)) continue;
     seen.add(file);
-    for (const spec of specifiersOf(file)) {
+    const src = readFileSync(file, 'utf8');
+    const imports = [
+      ...staticSpecifiers(src).map((spec) => ({ spec, dynamic: false })),
+      ...dynamicSpecifiers(src).map((spec) => ({ spec, dynamic: true })),
+    ];
+    for (const { spec, dynamic } of imports) {
       const resolved = resolveSpec(file, spec);
       const target = resolved ? norm(resolved) : spec;
+      // Write path plan-780 R6: no read side renders. Exempt ONLY this lazy
+      // save edge; static imports and every other source/target still fail.
+      if (dynamic
+        && norm(file) === norm(resolve(SRC, 'core/library/library-document-edit.ts'))
+        && target === norm(resolve(SRC, 'core/thumbnails/rv-thumbnail-write.ts'))) continue;
       if (FORBIDDEN.some((re) => re.test(target))) {
         hits.push([...chain, target].map((p) => p.replace(norm(REPO_ROOT), '')).join(' -> '));
         continue;
@@ -129,7 +140,7 @@ describe('thumbnail read side — import boundary (plan-776 guard 2)', () => {
     expect(targets.some((t) => FORBIDDEN.some((re) => re.test(t)))).toBe(true);
   });
 
-  it('only the post-save step imports the renderer, the writer or the content rule — the exact set', () => {
+  it('only the save paths and thumbnail modules import the renderer, writer or content rule — the exact set', () => {
     const importers = new Set<string>();
     for (const file of walkDir(SRC)) {
       for (const spec of specifiersOf(file)) {
@@ -142,6 +153,7 @@ describe('thumbnail read side — import boundary (plan-776 guard 2)', () => {
     }
     expect([...importers].sort()).toEqual([
       'core/editor/rv-finish-document-save.ts',
+      'core/library/library-document-edit.ts', // Write path plan-780 R6; no read side renders.
       'core/thumbnails/rv-thumbnail-regenerate.ts',
       'core/thumbnails/rv-thumbnail-write.ts',
       'core/thumbnails/thumbnail-renderer.ts',

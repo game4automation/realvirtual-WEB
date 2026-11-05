@@ -19,6 +19,7 @@
  *   scene with address, Mode, active slots, current values and problem codes.
  */
 
+import { whenDocumentSettled } from './rv-bind-queue';
 import type { Object3D } from 'three';
 import { CommandError, type CommandContext, type CommandEnabled, type CommandImpl } from './rv-command-registry';
 import type { AssetDocument } from '../editor/rv-asset-document';
@@ -327,7 +328,7 @@ export const signalConnectorCreateBitsImpl: CommandImpl<SignalConnectorCreateBit
           created.push(child);
         }
       });
-      await doc.whenIdle();
+      await whenDocumentSettled(doc);
     } catch (e) {
       throw new CommandError(`Bit connectors not created - ${e instanceof Error ? e.message : String(e)}`, { path: r.path });
     }

@@ -138,10 +138,13 @@
       "Files that import dev-asset-available but are NOT dev-asset dependent, measured 2026-11-01 (with-sibling and RV_NO_PRIVATE=1 runs identical):",
       "tests/des/pallet-yard-*: since plan-680 (891282de) they load the PUBLIC /demo-realvirtual/PalletYard.glb, so the probe is always true and they never skip.",
       "tests/diagnostics/progress-sampler-mode-switch: same public PalletYard.glb; measured 2026-11-04, passed in both worlds.",
+      "tests/des/des-clock-reset-pallet-yard + des-seed-pallet-yard: same public PalletYard.glb (PALLET_YARD_URL); measured 2026-11-05 with the sibling, passed, 0 skipped.",
       "spike-756-pick-structure: needs the Mauser source GLB, absent from this checkout, so it skips in both worlds; not measurable here."
     ],
     "files": [
       "tests/_spike-756/spike-756-pick-structure.test.ts",
+      "tests/des/des-clock-reset-pallet-yard.test.ts",
+      "tests/des/des-seed-pallet-yard.test.ts",
       "tests/des/experiment-mcp-e2e-pallet-yard.test.ts",
       "tests/des/pallet-yard-active.test.ts",
       "tests/des/pallet-yard-continuous-handover.test.ts",

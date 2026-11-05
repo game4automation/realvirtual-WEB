@@ -9,7 +9,7 @@
  * is no compiler check tying the two together.
  */
 
-export type SegmentKind = 'action' | 'command' | 'wait' | 'hold' | 'marker';
+export type SegmentKind = 'action' | 'command' | 'wait' | 'hold' | 'marker' | 'timelapse';
 export type Verdict = 'ok' | 'fail';
 
 export interface Box { x: number; y: number; w: number; h: number }
@@ -23,6 +23,30 @@ export interface Segment {
   actionIndex?: number;
   target?: Box;
   approach?: Box;
+  /** plan-2237: `timelapse` segments — the command, the wall fps, the wall time (ms since
+   *  `wallBegin`) of every output frame and the wall slots dropped because a grab ran late. */
+  cmd?: string;
+  wallFps?: number;
+  wallMs?: number[];
+  droppedSlots?: number;
+}
+
+/** plan-2237 F5: a simulation-time jump inside a transition (`events.simJumps`). */
+export interface SimJumpRecord { frame: number; cmd: string; fromSim: number; toSim: number }
+
+/** plan-2237 F4: one gate segment (`events.simProgress.segments`). */
+export interface SimProgressSegment {
+  index: number;
+  startFrame: number;
+  endFrame: number;
+  kind: 'run' | 'hold' | 'jump' | 'timelapse' | 'short';
+  factor: number | null;
+  clock: 'simTime' | 'renderClock';
+  i1: number;
+  i2: number;
+  verdict: 'pass' | 'fail' | 'clamped' | 'short' | 'skipped';
+  clampedAt?: 'budget' | 'end';
+  cmd?: string;
 }
 
 export interface PointerSample { frame: number; t: number; x: number; y: number }
@@ -80,6 +104,43 @@ export function motionVerdict(
   stillThreshold?: number,
   minMovedFraction?: number,
 ): { diffs: number; movedFrames: number; movedFraction: number; longestStillFrames: number; verdict: Verdict; diagnosis?: string };
+
+export type MotionPolicy = 'require' | 'warn' | 'off';
+
+/** plan-2240: one entry of `events.motion.perStep`. */
+export interface StepMotionRecord {
+  stepId: string;
+  policy: MotionPolicy;
+  source: 'step' | 'cli' | 'default';
+  start: number;
+  end: number;
+  /** Frame pairs inside the step (`end - start - 1`, clamped to the measured video). */
+  pairs: number;
+  movedFrames?: number;
+  movedFraction?: number;
+  longestStillFrames?: number;
+  verdict: 'ok' | 'fail' | 'warn' | 'skipped';
+  reason?: 'too-short' | 'motion-below-threshold';
+}
+
+export function resolveMotionPolicy(
+  stepMotion: MotionPolicy | undefined,
+  cliMotionCheck: MotionPolicy | undefined,
+): { policy: MotionPolicy; source: 'step' | 'cli' | 'default' };
+
+export function stepMotionVerdicts(
+  diffs: number[],
+  steps: Array<{ id: string; start: number; end: number }>,
+  policies: Record<string, { policy: MotionPolicy; source: 'step' | 'cli' | 'default' }>,
+  stillThreshold?: number,
+  minMovedFraction?: number,
+): {
+  perStep: StepMotionRecord[];
+  verdict: Verdict;
+  diagnosis?: 'motion-below-threshold';
+  failed: string[];
+  warned: string[];
+};
 
 export function controlFrameVerdict(
   controlThumbnail: ArrayLike<number>,

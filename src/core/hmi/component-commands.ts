@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 
+import { whenDocumentSettled } from './rv-bind-queue';
 import { commandRegistry, type CommandImpl, type CommandRegistry } from './rv-command-registry';
 import { ensureEditorCommandsRegistered } from './editor-command-descriptors';
 import { getActiveAssetContext } from '../editor/active-asset-store';
@@ -111,7 +112,7 @@ export const componentSetFields: CommandImpl<SetFieldsArgs> = {
           applied[field] = value;
         }
       });
-      await doc.whenIdle();
+      await whenDocumentSettled(doc);
     } else if (!doc) {
       for (const [field, value] of valid) {
         if (overlay!.updateOverlayField(path, type, field, value)) applied[field] = value;

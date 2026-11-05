@@ -20,6 +20,14 @@ export const DES_STAT_RESET_FIELD = 'StatisticsResetTime';
  *  turn every legacy GLB without the field into seed 0 → different RNG stream
  *  → silently different results.) */
 export const DES_MASTER_SEED_FIELD = 'MasterSeed';
+/** The DES manager's code default seed — what an unset `MasterSeed` (missing / `<= 0`) means. */
+export const DES_DEFAULT_MASTER_SEED = 42;
+export const DES_CYCLE_TIME_FIELD = 'CycleTime';
+export const DES_DEFAULT_CYCLE_TIME = 1 / 60;
+export function normalizeDesCycleTime(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.max(0.001, Math.min(0.1, value)) : DES_DEFAULT_CYCLE_TIME;
+}
 
 /**
  * True for the DESManager run-parameter fields (end time, warm-up, seed). They are
@@ -32,8 +40,18 @@ export function isDesRunConfigField(component: string, field: string): boolean {
     && (field === DES_END_TIME_FIELD || field === DES_STAT_RESET_FIELD || field === DES_MASTER_SEED_FIELD);
 }
 
+/** Run fields + default CycleTime (+ NodeId): the des.setEnd holder. */
+export function isRunConfigOnlyComponents(c: unknown): boolean {
+  // 'NodeId' = RV_NODE_ID_KEY (guard test)
+  const m = c && typeof c === 'object' && Object.keys(c).filter(k => k !== 'NodeId').length === 1 ? (c as Record<string, unknown>)[DES_MANAGER_COMPONENT] : null;
+  return !!m && typeof m === 'object' && Object.entries(m).every(([f, v]) =>
+    isDesRunConfigField(DES_MANAGER_COMPONENT, f) || (f === DES_CYCLE_TIME_FIELD && v === DES_DEFAULT_CYCLE_TIME));
+}
+
 /** Parsed DESManager clock settings + the bookkeeping the persister needs. */
 export interface DesManagerSettings {
+  cycleTime: number;
+  rawCycleTime: number;
   /** Registry path of the DESManager-carrying node. */
   path: string;
   /** Sim end in seconds; `Infinity` = infinite. */
@@ -82,6 +100,9 @@ export function findDesManager(root: Object3D): DesManagerSettings | null {
   const rawStatReset = numField(found.data[DES_STAT_RESET_FIELD]);
   const rawMasterSeed = numField(found.data[DES_MASTER_SEED_FIELD]);
   return {
+    cycleTime: normalizeDesCycleTime(found.data[DES_CYCLE_TIME_FIELD]),
+    rawCycleTime: typeof found.data[DES_CYCLE_TIME_FIELD] === 'number'
+      ? found.data[DES_CYCLE_TIME_FIELD] as number : DES_DEFAULT_CYCLE_TIME,
     path: NodeRegistry.computeNodePath(found.node),
     endTime: endTimeOf(rawEndTime),
     statResetTime: rawStatReset > 0 ? rawStatReset : 0,

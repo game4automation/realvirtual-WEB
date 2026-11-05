@@ -121,6 +121,8 @@ import type { AssetBase } from '../src/core/editor/rv-asset-document';
 import { libraryDocumentBase } from '../src/core/editor/active-asset-store';
 import { encodeThumbnailId } from '../src/core/library/library-types';
 
+const idleTail = Promise.resolve();
+
 /** Answer the next save dialog of `kind`; returns an unsubscribe. */
 function autoAnswer(kind: string, answer: unknown): () => void {
   return subscribeSaveDialogs(() => {
@@ -160,6 +162,7 @@ function context(name: string) {
     // The unified document underneath. `runExclusive` really does run the work
     // (the save must not be skipped) and the op floor never moves here.
     document: {
+      whenIdle: () => idleTail,
       opCount: 0,
       runExclusive: <T,>(work: () => Promise<T>) => work(),
       markSaved: () => {},

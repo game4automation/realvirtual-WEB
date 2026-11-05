@@ -10,6 +10,7 @@ import type { SignalStore } from '../src/core/engine/rv-signal-store';
 function makeStore(initial: Record<string, boolean | number> = {}) {
   const values = new Map<string, boolean | number>(Object.entries(initial));
   const subs = new Map<string, Set<(v: boolean | number) => void>>();
+  const restored = new Set<() => void>();
   const store = {
     get: (name: string) => values.get(name),
     subscribe: (name: string, cb: (v: boolean | number) => void) => {
@@ -25,6 +26,9 @@ function makeStore(initial: Record<string, boolean | number> = {}) {
     },
     /** test helper — active subscriber count for a signal. */
     subCount: (name: string) => subs.get(name)?.size ?? 0,
+    onValuesRestored: (cb: () => void) => { restored.add(cb); return () => { restored.delete(cb); }; },
+    /** test helper — silent DES restore: value changes WITHOUT subscriber calls (plan-2207). */
+    silentRestore(name: string, v: boolean | number) { values.set(name, v); restored.forEach(cb => cb()); },
   };
   return store;
 }
@@ -94,6 +98,14 @@ describe('useThrottledSignalValue', () => {
 
     expect(result.current).toBe(10);
     expect(renders - rendersBefore).toBe(0); // no re-render at all (latest === committed)
+  });
+
+  it('re-reads the value after a silent snapshot restore (plan-2207)', () => {
+    const store = makeStore({ sig: 1 });
+    const { result } = renderHook(() => useThrottledSignalValue(store as unknown as SignalStore, 'sig'));
+    act(() => { store.silentRestore('sig', 7); });
+    act(() => { vi.advanceTimersByTime(200); });
+    expect(result.current).toBe(7);
   });
 
   it('is disabled with a null store and never subscribes', () => {

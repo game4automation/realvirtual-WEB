@@ -109,6 +109,7 @@ export function OeeChart({ open, onClose }: OeeChartProps) {
       open={open}
       onClose={onClose}
       title="OEE Breakdown"
+      panelId="demo-oee"
       titleColor="#66bb6a"
       subtitle="Last 24h"
       defaultWidth={750}

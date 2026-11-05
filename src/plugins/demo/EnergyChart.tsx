@@ -114,6 +114,7 @@ export function EnergyChart({ open, onClose }: EnergyChartProps) {
       open={open}
       onClose={onClose}
       title="Power Consumption"
+      panelId="demo-energy"
       titleColor="#ef5350"
       subtitle="Last 24h"
       defaultWidth={750}

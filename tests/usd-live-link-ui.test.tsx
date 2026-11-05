@@ -17,6 +17,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { ThemeProvider } from '@mui/material/styles';
 import { rvDarkTheme } from '../src/core/hmi/theme';
+import { ActionMenuRow } from '../src/core/hmi/action-group';
+import { SlotMenuRow } from '../src/core/hmi/slot-menu-row';
+import { UIPluginRegistry } from '../src/core/rv-ui-registry';
+import { RVViewerProvider } from '../src/hooks/use-viewer';
 import { evaluateVisibilityRule } from '../src/core/hmi/ui-context-store';
 import { modeContext } from '../src/core/rv-mode-manager';
 import { importProviderRegistry, type CadImportProvider } from '../src/core/import/rv-import-provider';
@@ -28,13 +32,14 @@ import {
 import { UsdLiveLinkPlugin } from '../src/plugins/usd-live-link/usd-live-link-plugin';
 import * as sessionModule from '../src/plugins/usd-live-link/usd-live-link-session';
 import { USD_MENU_ID, UsdToolButton, usdStatusDotColor } from '../src/plugins/usd-live-link/UsdToolButton';
-import { LiveLinkPill, pillTitle } from '../src/plugins/usd-live-link/LiveLinkPill';
+import { LiveLinkPill, pillLabel, pillTitle } from '../src/plugins/usd-live-link/LiveLinkPill';
 import {
   LIVE_LINK_NOT_REACHABLE_RETRYING,
   LIVE_LINK_TOKEN_MISSING,
   LiveLinkStore,
 } from '../src/plugins/usd-live-link/live-link-store';
 import { USD_MENU_ANCHOR, describeLiveLink } from '../src/plugins/usd-live-link/UsdToolMenu';
+import { clampRemountMs } from '../src/plugins/usd-live-link/remount-debounce';
 import { ERROR, SUCCESS, WARN } from '../src/core/hmi/shared-sx';
 import { USD_LIVE_LINK_SEEN_LIVE_KEY } from '../src/core/hmi/rv-storage-keys';
 import type { RVViewer } from '../src/core/rv-viewer';
@@ -44,8 +49,12 @@ function setup(token = '') {
   const start = vi.fn();
   const createClient = vi.fn(() => ({ start, stop: vi.fn(), isReady: false }) as never);
   const plugin = new UsdLiveLinkPlugin({ store, sessionModule, createClient });
-  const viewer = { getPlugin: (id: string) => (id === 'usd-live-link' ? plugin : undefined) } as unknown as RVViewer;
-  return { store, plugin, viewer, start, createClient };
+  const uiRegistry = new UIPluginRegistry();
+  const viewer = {
+    uiRegistry,
+    getPlugin: (id: string) => (id === 'usd-live-link' ? plugin : undefined),
+  } as unknown as RVViewer;
+  return { store, plugin, viewer, start, createClient, uiRegistry };
 }
 
 async function openMenu() {
@@ -58,8 +67,12 @@ function clickPill() {
   act(() => { fireEvent.click(pill.querySelector('button') ?? pill); });
 }
 
-function renderInTheme(node: React.ReactNode) {
-  return render(<ThemeProvider theme={rvDarkTheme}>{node}</ThemeProvider>);
+function renderInTheme(node: React.ReactNode, viewer: RVViewer) {
+  return render(
+    <ThemeProvider theme={rvDarkTheme}>
+      <RVViewerProvider value={viewer}>{node}</RVViewerProvider>
+    </ThemeProvider>,
+  );
 }
 
 afterEach(() => {
@@ -70,6 +83,83 @@ afterEach(() => {
 });
 
 describe('usd-live-link UI', () => {
+  it('plan-2251: shows three groups, visible file descriptions and the live sync setup text', async () => {
+    const { viewer, uiRegistry } = setup('tok');
+    function RecordRow() {
+      return <SlotMenuRow label="Record USD animation…" secondary="Capture simulation motion as a USD file" />;
+    }
+    uiRegistry.register({ id: 'usd-record-test', slots: [{ slot: 'usd-menu', component: RecordRow }] });
+    importProviderRegistry.register({ id: 'usd', label: 'USD' } as unknown as CadImportProvider);
+    setActiveDocumentView({
+      sourceMode: 'hmi',
+      actions: { exports: [{
+        id: 'usd', label: 'Export USD…', modes: () => [], run: vi.fn(),
+        apply: { label: 'Apply USD extras…', preview: vi.fn(), commit: vi.fn() },
+      }] },
+    } as unknown as ActiveDocumentView);
+    renderInTheme(<UsdToolButton viewer={viewer} />, viewer);
+    await openMenu();
+    for (const text of [
+      'USD files', 'Animation', 'Isaac Sim live sync',
+      'Export USD scene…', 'Geometry and realvirtual data as a USD file',
+      'Import USD scene…', 'Open a USD file as a new document',
+      'Apply realvirtual data from USD…', "Replaces this document's realvirtual data",
+      'Record USD animation…',
+      'Streams the scene and live motion one-way to Isaac Sim. Creates no file.',
+      'Set up Isaac Sim (extension)',
+    ]) expect(screen.getByText(text)).toBeVisible();
+    expect(screen.getByTestId('usd-menu-export').compareDocumentPosition(screen.getByText('Animation')) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByText('Animation').compareDocumentPosition(screen.getByTestId('usd-menu-sync-header')) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('plan-2251: the activity bar tooltip includes recording as visible text', async () => {
+    const { viewer } = setup();
+    renderInTheme(<UsdToolButton viewer={viewer} />, viewer);
+    fireEvent.mouseOver(screen.getByTestId('usd-tool-button'));
+    expect(await screen.findByRole('tooltip')).toHaveTextContent('USD — export, import, record animation, sync to Isaac Sim');
+    expect(screen.getByRole('tooltip')).toBeVisible();
+  });
+
+  it.each([false, true])('plan-2251: menu Apply explains, chooses a file and previews before committing (data loss: %s)', async (loss) => {
+    const { viewer } = setup();
+    const preview = vi.fn(async () => ({
+      previewToken: 'menu-preview', targetRevision: 'rev-1', matched: 2,
+      unmatchedPrims: [], ambiguous: [], extrasLost: loss ? ['Part'] : [], warnings: [], blocked: null,
+    }));
+    const commit = vi.fn(async () => ({ ok: false, code: 'stale-preview' }));
+    setActiveDocumentView({
+      sourceMode: 'hmi', actions: { exports: [{
+        id: 'usd', label: 'Export USD…', modes: () => [], run: vi.fn(),
+        apply: { label: 'Apply USD extras…', preview, commit },
+      }] },
+    } as unknown as ActiveDocumentView);
+    const fileClick = vi.spyOn(HTMLInputElement.prototype, 'click').mockImplementation(() => undefined);
+    try {
+      renderInTheme(<UsdToolButton viewer={viewer} />, viewer);
+      await openMenu();
+      fireEvent.click(screen.getByText('Apply realvirtual data from USD…'));
+      const choose = await screen.findByRole('button', { name: 'Choose USD file…' });
+      expect(screen.getByText("Choose a USD file to replace this document's realvirtual data. Geometry stays unchanged. You will review matched nodes and any data that would be removed before applying.")).toBeVisible();
+      expect(preview).not.toHaveBeenCalled();
+      expect(fileClick).not.toHaveBeenCalled();
+      expect(screen.getByTestId('usd-tool-button').getAttribute('aria-expanded')).toBe('false');
+      fireEvent.click(choose);
+      expect(fileClick).toHaveBeenCalledTimes(1);
+      fireEvent.change(screen.getByTestId('document-card-apply-file'), {
+        target: { files: [new File([new Uint8Array([1, 2])], 'data.usda')] },
+      });
+      const apply = await screen.findByRole('button', { name: loss ? 'Apply and remove missing data' : 'Apply data' });
+      expect(apply).toBeVisible();
+      expect(screen.getByText('Review the realvirtual data matched to this document. Applying replaces its realvirtual data; geometry stays unchanged.')).toBeVisible();
+      expect(preview).toHaveBeenCalledWith({ name: 'data.usda', bytes: new Uint8Array([1, 2]) });
+      expect(commit).not.toHaveBeenCalled();
+      fireEvent.click(apply);
+      await waitFor(() => expect(commit).toHaveBeenCalledWith('menu-preview', loss ? { confirmExtrasLost: true } : {}));
+    } finally {
+      fileClick.mockRestore();
+    }
+  });
+
   it('registers the button in the activity bar (main menu) with a rule that keeps it in editor and planner', () => {
     const { plugin } = setup();
     expect(plugin.slots.find((s) => s.slot === 'button-group')).toBeUndefined();
@@ -87,7 +177,7 @@ describe('usd-live-link UI', () => {
 
   it('without providers only Export / Import are disabled; Sync is usable', async () => {
     const { viewer, plugin } = setup('tok');
-    renderInTheme(<UsdToolButton viewer={viewer} />);
+    renderInTheme(<UsdToolButton viewer={viewer} />, viewer);
     expect(screen.queryByTestId('usd-menu')).toBeNull(); // not loaded before the first click
     fireEvent.click(screen.getByTestId('usd-tool-button'));
     // The menu is a lazy chunk (entry budget): it appears after its import.
@@ -100,6 +190,140 @@ describe('usd-live-link UI', () => {
     expect(screen.getByTestId('usd-menu-status').textContent).toContain('Connecting');
   });
 
+  it('without USD slot entries shows no contributed row or separator', async () => {
+    const { viewer } = setup();
+    renderInTheme(<UsdToolButton viewer={viewer} />, viewer);
+    await openMenu();
+    expect(screen.queryByRole('menu', { name: 'USD actions' })).toBeNull();
+    expect(screen.queryByTestId('usd-menu-slot-divider')).toBeNull();
+    expect(screen.queryByTestId('usd-test-action')).toBeNull();
+  });
+
+  it('renders a registered USD slot row and closes the menu when its icon is clicked', async () => {
+    const { viewer, uiRegistry } = setup();
+    const onClick = vi.fn();
+    function TestRow() {
+      return (
+        <ActionMenuRow
+          label="Test USD action"
+          kind="action"
+          icon={<span data-testid="usd-test-action-icon">USD</span>}
+          onClick={onClick}
+          testId="usd-test-action"
+        />
+      );
+    }
+    uiRegistry.register({ id: 'usd-test', slots: [{ slot: 'usd-menu', component: TestRow }] });
+    renderInTheme(<UsdToolButton viewer={viewer} />, viewer);
+    await openMenu();
+    expect(screen.getByTestId('usd-menu-slot-divider')).toBeTruthy();
+    expect(screen.getByRole('menuitem', { name: 'Test USD action' })).toBeTruthy();
+    fireEvent.click(screen.getByTestId('usd-test-action-icon'));
+    expect(onClick).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('usd-tool-button').getAttribute('aria-expanded')).toBe('false');
+    await waitFor(() => expect(screen.queryByTestId('usd-menu')).toBeNull());
+  });
+
+  it('reacts to slot registration and removal; a disabled row keeps the menu open', async () => {
+    const { viewer, uiRegistry } = setup();
+    const onClick = vi.fn();
+    function TestRow() {
+      return (
+        <ActionMenuRow
+          label="Test USD action"
+          kind="action"
+          disabled
+          description="Test action is unavailable."
+          onClick={onClick}
+          testId="usd-test-action"
+        />
+      );
+    }
+    renderInTheme(<UsdToolButton viewer={viewer} />, viewer);
+    await openMenu();
+    act(() => {
+      uiRegistry.register({ id: 'usd-test', slots: [{ slot: 'usd-menu', component: TestRow }] });
+    });
+    const row = screen.getByTestId('usd-test-action');
+    expect(row.getAttribute('aria-disabled')).toBe('true');
+    expect(row.getAttribute('aria-description')).toBe('Test action is unavailable.');
+    fireEvent.click(row);
+    expect(onClick).not.toHaveBeenCalled();
+    expect(screen.getByTestId('usd-tool-button').getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByTestId('usd-menu-slot-divider')).toBeTruthy();
+    act(() => { uiRegistry.unregister('usd-test'); });
+    expect(screen.queryByTestId('usd-test-action')).toBeNull();
+    expect(screen.queryByTestId('usd-menu-slot-divider')).toBeNull();
+    expect(screen.queryByRole('menu', { name: 'USD actions' })).toBeNull();
+  });
+
+  it('shows the slot label and second line as visible text; clicking the text closes the menu', async () => {
+    const { viewer, uiRegistry } = setup();
+    const onClick = vi.fn();
+    function TestRow() {
+      return (
+        <SlotMenuRow
+          label="Test USD action"
+          icon={<span>USD</span>}
+          secondary="A visible action description."
+          onClick={onClick}
+          testId="usd-visible-action"
+        />
+      );
+    }
+    uiRegistry.register({ id: 'usd-visible-test', slots: [{ slot: 'usd-menu', component: TestRow }] });
+    renderInTheme(<UsdToolButton viewer={viewer} />, viewer);
+    await openMenu();
+    const row = screen.getByTestId('usd-visible-action');
+    expect(row.textContent).toContain('Test USD action');
+    expect(row.textContent).toContain('A visible action description.');
+    await waitFor(() => {
+      expect(screen.getByText('Test USD action')).toBeVisible();
+      expect(screen.getByText('A visible action description.')).toBeVisible();
+    });
+    fireEvent.click(screen.getByText('Test USD action'));
+    expect(onClick).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('usd-tool-button').getAttribute('aria-expanded')).toBe('false');
+    await waitFor(() => expect(screen.queryByTestId('usd-menu')).toBeNull());
+  });
+
+  it('shows a disabled slot reason as visible text and keeps the menu open when it is clicked', async () => {
+    const { viewer, uiRegistry } = setup();
+    const onClick = vi.fn();
+    const onMouseEnter = vi.fn();
+    function TestRow() {
+      return (
+        <SlotMenuRow
+          label="Test USD action"
+          icon={<span>USD</span>}
+          secondary="Test action is unavailable."
+          disabled
+          onClick={onClick}
+          attrs={{ onMouseEnter }}
+          testId="usd-visible-action"
+        />
+      );
+    }
+    uiRegistry.register({ id: 'usd-visible-test', slots: [{ slot: 'usd-menu', component: TestRow }] });
+    renderInTheme(<UsdToolButton viewer={viewer} />, viewer);
+    await openMenu();
+    const row = screen.getByTestId('usd-visible-action');
+    expect(row.getAttribute('aria-disabled')).toBe('true');
+    expect(getComputedStyle(row).pointerEvents).not.toBe('none');
+    expect(row.textContent).toContain('Test USD action');
+    expect(row.textContent).toContain('Test action is unavailable.');
+    await waitFor(() => {
+      expect(screen.getByText('Test USD action')).toBeVisible();
+      expect(screen.getByText('Test action is unavailable.')).toBeVisible();
+    });
+    fireEvent.mouseEnter(row);
+    expect(onMouseEnter).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByText('Test action is unavailable.'));
+    expect(onClick).not.toHaveBeenCalled();
+    expect(screen.getByTestId('usd-tool-button').getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByTestId('usd-menu')).toBeVisible();
+  });
+
   it('enables Export / Import when the providers exist', async () => {
     const { viewer } = setup();
     importProviderRegistry.register({ id: 'usd', label: 'USD' } as unknown as CadImportProvider);
@@ -107,7 +331,7 @@ describe('usd-live-link UI', () => {
       sourceMode: 'hmi',
       actions: { exports: [{ id: 'usd', label: 'Export USD…', modes: () => [], run: vi.fn() }] },
     } as unknown as ActiveDocumentView);
-    renderInTheme(<UsdToolButton viewer={viewer} />);
+    renderInTheme(<UsdToolButton viewer={viewer} />, viewer);
     fireEvent.click(screen.getByTestId('usd-tool-button'));
     expect((await screen.findByTestId('usd-menu-export')).getAttribute('aria-disabled')).not.toBe('true');
     expect(screen.getByTestId('usd-menu-import').getAttribute('aria-disabled')).not.toBe('true');
@@ -115,7 +339,7 @@ describe('usd-live-link UI', () => {
 
   it('missing token: the switch stays on (amber), the settings open with the token field focused, a commit connects', async () => {
     const { viewer, plugin, store, start } = setup('');
-    renderInTheme(<><UsdToolButton viewer={viewer} /><LiveLinkPill viewer={viewer} /></>);
+    renderInTheme(<><UsdToolButton viewer={viewer} /><LiveLinkPill viewer={viewer} /></>, viewer);
     await openMenu();
     const sync = screen.getByTestId('usd-menu-sync') as HTMLInputElement;
     act(() => { fireEvent.click(sync); });
@@ -150,7 +374,7 @@ describe('usd-live-link UI', () => {
   it('retrying: from the 2nd attempt the status says why and links the README; the first attempt says Connecting…', async () => {
     const { viewer, store } = setup('tok');
     act(() => { store.set({ status: 'connecting', attempt: 1, message: 'Connecting to ws://127.0.0.1:8765' }); });
-    renderInTheme(<UsdToolButton viewer={viewer} />);
+    renderInTheme(<UsdToolButton viewer={viewer} />, viewer);
     await openMenu();
     const status = screen.getByTestId('usd-menu-status');
     expect(status.textContent).toContain('Connecting…');
@@ -163,7 +387,7 @@ describe('usd-live-link UI', () => {
 
   it('switching off from error or needs-token always ends in off; the pill stops in every state', async () => {
     const { viewer, store, plugin } = setup('');
-    renderInTheme(<><UsdToolButton viewer={viewer} /><LiveLinkPill viewer={viewer} /></>);
+    renderInTheme(<><UsdToolButton viewer={viewer} /><LiveLinkPill viewer={viewer} /></>, viewer);
     // needs-token -> switch off
     act(() => { plugin.setSyncEnabled(true); });
     expect(store.state.status).toBe('needs-token');
@@ -193,7 +417,7 @@ describe('usd-live-link UI', () => {
       sourceMode: 'hmi',
       actions: { exports: [{ id: 'usd', label: 'Export USD…', modes: () => [], run: vi.fn() }] },
     } as unknown as ActiveDocumentView);
-    renderInTheme(<UsdToolButton viewer={viewer} />);
+    renderInTheme(<UsdToolButton viewer={viewer} />, viewer);
     const button = screen.getByTestId('usd-tool-button');
     expect(button.getAttribute('aria-haspopup')).toBe('dialog');
     expect(button.getAttribute('aria-expanded')).toBe('false');
@@ -214,11 +438,11 @@ describe('usd-live-link UI', () => {
     expect(status.getAttribute('aria-live')).toBe('polite');
   });
 
-  it('without file providers the switch is the first focused element', async () => {
+  it('without file providers the sync row is the first focused element', async () => {
     const { viewer } = setup('tok');
-    renderInTheme(<UsdToolButton viewer={viewer} />);
+    renderInTheme(<UsdToolButton viewer={viewer} />, viewer);
     await openMenu();
-    await waitFor(() => expect(document.activeElement).toBe(screen.getByTestId('usd-menu-sync')));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByTestId('usd-menu-sync-row')));
   });
 
   it('popover is anchored at the bottom (grows upward, no jump)', () => {
@@ -228,13 +452,13 @@ describe('usd-live-link UI', () => {
 
   it('extension steps: open before the first live on this device, collapsed afterwards, open again for an outdated extension', async () => {
     const { viewer, store } = setup('tok');
-    const r1 = renderInTheme(<UsdToolButton viewer={viewer} />);
+    const r1 = renderInTheme(<UsdToolButton viewer={viewer} />, viewer);
     await openMenu();
     expect(screen.getByTestId('usd-menu-extension-disclosure').getAttribute('data-open')).toBe('true');
     r1.unmount();
     act(() => { store.set({ status: 'live', sentHz: 30 }); }); // remembers the first live
     expect(localStorage.getItem(USD_LIVE_LINK_SEEN_LIVE_KEY)).toBe('1');
-    renderInTheme(<UsdToolButton viewer={viewer} />);
+    renderInTheme(<UsdToolButton viewer={viewer} />, viewer);
     await openMenu();
     expect(screen.getByTestId('usd-menu-extension-disclosure').getAttribute('data-open')).toBe('false');
     expect(screen.queryByTestId('usd-menu-extension-download')).toBeNull();
@@ -244,7 +468,7 @@ describe('usd-live-link UI', () => {
 
   it('status dot on the button: none while off, amber waiting, green live, red error', () => {
     const { viewer, store } = setup('tok');
-    renderInTheme(<UsdToolButton viewer={viewer} />);
+    renderInTheme(<UsdToolButton viewer={viewer} />, viewer);
     expect(screen.queryByTestId('usd-status-dot')).toBeNull();
     act(() => { store.set({ status: 'connecting' }); });
     expect(screen.getByTestId('usd-status-dot').getAttribute('data-color')).toBe(WARN);
@@ -267,12 +491,23 @@ describe('usd-live-link UI', () => {
 
   it('menu: extension download with version and the three install steps', async () => {
     const { viewer } = setup('tok');
-    renderInTheme(<UsdToolButton viewer={viewer} />);
+    renderInTheme(<UsdToolButton viewer={viewer} />, viewer);
     fireEvent.click(screen.getByTestId('usd-tool-button'));
     const link = await screen.findByTestId('usd-menu-extension-download');
     expect(link.querySelector('[data-testid="ExtensionIcon"]')).toBeTruthy(); // not a second download icon
     // vitest runs vite.config.ts, whose plugin defines __RV_LIVESYNC_EXT__ from extension.toml.
     expect(link.textContent).toContain('Download extension (v0.2.1)');
+    screen.getByTestId('usd-menu-paper').style.width = '300px';
+    const disclosure = screen.getByTestId('usd-menu-extension-disclosure');
+    const title = screen.getByText('Set up Isaac Sim (extension)');
+    const version = screen.getByText('v0.2.1');
+    expect(title).toBeVisible();
+    expect(version).toBeVisible();
+    expect(getComputedStyle(title).textOverflow).not.toBe('ellipsis');
+    expect(title.scrollWidth).toBeLessThanOrEqual(title.clientWidth);
+    expect(title.clientWidth).toBeGreaterThan(0);
+    expect(version.getBoundingClientRect().top).toBeGreaterThanOrEqual(title.getBoundingClientRect().bottom);
+    expect(disclosure.getBoundingClientRect().width).toBeLessThanOrEqual(320);
     expect(link.getAttribute('href')).toMatch(/downloads\/realvirtual-livesync-0\.2\.1\.zip$/);
     const steps = screen.getByTestId('usd-menu-extension').querySelectorAll('li');
     expect(steps).toHaveLength(3);
@@ -283,7 +518,7 @@ describe('usd-live-link UI', () => {
   it('menu + pill: an outdated extension shows the hint with the download link', async () => {
     const { viewer, store } = setup('tok');
     act(() => { store.set({ status: 'live', sentHz: 30, extensionNotice: 'Isaac Sim extension outdated (v0.1.0) — download v0.2.0' }); });
-    renderInTheme(<><UsdToolButton viewer={viewer} /><LiveLinkPill viewer={viewer} /></>);
+    renderInTheme(<><UsdToolButton viewer={viewer} /><LiveLinkPill viewer={viewer} /></>, viewer);
     fireEvent.click(screen.getByTestId('usd-tool-button'));
     const notice = await screen.findByTestId('usd-menu-extension-notice');
     expect(notice.textContent).toBe('Isaac Sim extension outdated (v0.1.0) — download v0.2.0');
@@ -294,9 +529,27 @@ describe('usd-live-link UI', () => {
     );
   });
 
+  it('plan-2239: remounting is amber with the reason; live shows the prim detail; the debounce field clamps', async () => {
+    const { viewer, store, plugin } = setup('tok');
+    const remounting = { status: 'remounting' as const, message: 'Structure changed (re-parent: Arm) — remounting…' };
+    expect(describeLiveLink({ ...store.state, ...remounting }, true)).toEqual({ text: remounting.message, color: WARN });
+    expect(usdStatusDotColor({ ...store.state, ...remounting })).toBe(WARN);
+    expect(pillLabel({ ...store.state, ...remounting })).toBe('Isaac Sim · remounting');
+    act(() => { store.set({ status: 'live', session: 7, sentHz: 30, prims: { total: 1284, withAddress: 1102 } }); });
+    renderInTheme(<UsdToolButton viewer={viewer} />, viewer);
+    await openMenu();
+    expect(screen.getByTestId('usd-menu-mount-detail').textContent).toBe('Session 7 · 1,284 prims (1,102 with address)');
+    fireEvent.click(screen.getByTestId('usd-menu-settings-toggle'));
+    expect(await screen.findByTestId('usd-menu-remount')).toBeTruthy();
+    expect(clampRemountMs(10)).toBe(250);
+    expect(clampRemountMs(99_999)).toBe(5000);
+    expect(clampRemountMs(undefined)).toBe(750);
+    expect(plugin.store.settings.remountDebounceMs).toBeUndefined(); // default until the user sets one
+  });
+
   it('pill: hidden while off, shows the rate when live', () => {
     const { viewer, store } = setup('tok');
-    const { container } = renderInTheme(<LiveLinkPill viewer={viewer} />);
+    const { container } = renderInTheme(<LiveLinkPill viewer={viewer} />, viewer);
     expect(container.querySelector('[data-testid="usd-live-link-pill"]')).toBeNull();
     act(() => { store.set({ status: 'live', sentHz: 30 }); });
     expect(screen.getByTestId('usd-live-link-pill').textContent).toContain('30 Hz');

@@ -4,11 +4,12 @@
 import type { Object3D, Vector3 } from 'three';
 import type { RVViewer } from '../rv-viewer';
 import { commandRegistry, type ExecuteResult } from '../hmi/rv-command-registry';
+import { isRecordingMode } from '../recording-mode';
 
 type ScreenPoint = { x: number; y: number };
 type TargetResolver = (key: string) => ScreenPoint | null;
 type PickResult = { path: string } | { error: 'pick-no-match' };
-type WatchedCommand = { id: string; args: unknown; ok?: boolean };
+type WatchedCommand = { id: string; args: unknown; ok?: boolean; kind?: string; reason?: string };
 const targets = new Map<string, { resolve: TargetResolver }>();
 
 /** Registration is cheap and independent of the opt-in page seam. */
@@ -49,11 +50,11 @@ declare global {
 
 /** No globals, subscriptions or scene work unless explicitly opted in. */
 export async function installRecordingSeam(viewer: RVViewer): Promise<void> {
-  if (typeof window === 'undefined' || new URLSearchParams(window.location.search).get('recording') !== '1') return;
+  if (typeof window === 'undefined' || !isRecordingMode()) return;
   if (window.__rvRecording) return;
   // Keep the static seam dependency limited to the command registry and types.
-  const math = await import('three');
-  if (!window.__rvRecording) window.__rvRecording = createRecordingSeam(viewer, math);
+  const [math, tw] = await Promise.all([import('three'), import('./rv-recording-time-watch')]);
+  if (!window.__rvRecording) window.__rvRecording = { ...createRecordingSeam(viewer, math), ...tw.createTimeWatch(viewer) };
 }
 
 function createRecordingSeam(viewer: RVViewer, { Box3, Vector3 }: typeof import('three')) {
@@ -100,7 +101,7 @@ function createRecordingSeam(viewer: RVViewer, { Box3, Vector3 }: typeof import(
   return {
     version: 1 as const,
     async execute(id: string, args?: unknown): Promise<ExecuteResult> {
-      const result = await commandRegistry.execute(id, args, { origin: 'ui', viewer });
+      const result = await commandRegistry.execute(id, args ?? {}, { origin: 'ui', viewer });
       try { return serialisable(result); }
       catch { return { ok: false, kind: 'threw', reason: 'Recording command result is not serialisable' }; }
     },
@@ -153,7 +154,7 @@ function createRecordingSeam(viewer: RVViewer, { Box3, Vector3 }: typeof import(
       watched = [];
       // onExecuted fires after the command promise settles: an event is completion.
       stopWatching = commandRegistry.onExecuted(({ id, args, result }) => {
-        watched.push({ id, args: serialisable(args), ok: result.ok });
+        watched.push({ id, args: serialisable(args), ok: result.ok, ...(result.ok ? {} : { kind: result.kind, reason: result.reason }) });
       });
     },
     takeCommandWatch(): WatchedCommand[] {

@@ -23,7 +23,8 @@
  */
 
 import type { ProjectBackend } from '../project/backends/project-backend';
-import type { RvDocumentEntry } from '../project/rv-project-types';
+import type { RvDocumentEntry, RvProject } from '../project/rv-project-types';
+import type { ThumbnailViewer } from '../thumbnails/rv-thumbnail-write';
 import { revisionOfBytes } from '../project/rv-scene-record';
 import { clearProblem, reportProblem } from '../hmi/problems-store';
 import {
@@ -239,12 +240,16 @@ async function writeLibraryRow(projectId: string, dir: FileSystemDirectoryHandle
  * project would keep serving its cached old model under the old hash. The
  * caller gets the failure, and a Problems row offers **Retry**, which hashes
  * the file as it is on disk and writes the row again.
+ *
+ * plan-780 R6: with `opts.viewer` the thumbnail is regenerated into B through B's
+ * backend; a failure never fails the save nor touches the open project.
  */
 export async function finishLibraryDocumentSave(
   projectId: string,
   backend: ProjectBackend,
   relPath: string,
   bytes: Uint8Array,
+  opts: { viewer?: ThumbnailViewer | null; documentId?: string | null } = {},
 ): Promise<LibraryRowUpdate> {
   let result: LibraryRowUpdate = { ok: true };
   const dir = folderDirOf(backend);
@@ -259,8 +264,47 @@ export async function finishLibraryDocumentSave(
       result = { ok: false, reason };
     }
   }
+  if (dir && opts.viewer) await writeLibraryThumbnail(projectId, dir, backend, relPath, opts.viewer, opts.documentId ?? null);
   getLibraryProjectLoader()?.invalidate(projectId);
   return result;
+}
+
+/** plan-780 R6: `writeDocumentThumbnail` with B as its row store. Never throws. */
+async function writeLibraryThumbnail(
+  projectId: string,
+  dir: FileSystemDirectoryHandle,
+  backend: ProjectBackend,
+  relPath: string,
+  viewer: ThumbnailViewer,
+  documentId: string | null,
+): Promise<void> {
+  try {
+    const [{ writeDocumentThumbnail }, { updateManifestCas }, { readDocuments }] = await Promise.all([
+      import('../thumbnails/rv-thumbnail-write'),
+      import('../project/rv-project-storage'),
+      import('../project/rv-project-documents'),
+    ]);
+    let manifest: RvProject | null = await backend.readManifest().catch(() => null);
+    const store = {
+      getProject: () => manifest,
+      setDocumentThumbnail: async (id: string, pointer: string | null): Promise<void> => {
+        const written = await updateManifestCas(dir, (current) => {
+          if (!current) throw new Error(`Library '${projectId}' has no project.json.`);
+          const documents = (readDocuments(current) ?? []).map((d) => {
+            if (d.id !== id) return d;
+            const next: RvDocumentEntry = { ...d };
+            if (pointer) next.thumbnail = pointer; else delete next.thumbnail;
+            return next;
+          });
+          return { ...current, documents };
+        });
+        manifest = (written as { project?: RvProject } | null)?.project ?? manifest;
+      },
+    };
+    await writeDocumentThumbnail({ viewer, store, backend, documentId, relPath });
+  } catch (e) {
+    console.warn(`[library-edit] the thumbnail of "${relPath}" in library '${projectId}' could not be written (the document saved fine):`, e);
+  }
 }
 
 /**

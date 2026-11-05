@@ -50,7 +50,7 @@ import { setPendingAssetOpen } from '@rv-private/plugins/asset-editor/shared/pen
 import { libraryDocumentBase, projectDocumentBase } from '../../core/editor/active-asset-store';
 import type { AssetBase } from '../../core/editor/rv-asset-document';
 import type { LayoutPlannerPlugin } from './index';
-import type { LibraryCatalogEntry, LayoutSnapshot } from './rv-layout-store';
+import type { LibraryCatalogEntry } from './rv-layout-store';
 
 import { setLayoutDragData, suppressDragImage } from './drag-types';
 import { matchMaterialFlows } from '../../core/material-flow/registry';
@@ -75,7 +75,7 @@ import {
   type RegisteredLibrarySource,
 } from '../../core/library/library-source-registry';
 import { PROJECT_LIBRARY_PROVIDER_ID } from '../../core/library/project-library-provider';
-import { isProjectBackedProvider, LIBRARY_PROJECTS_PROVIDER_ID } from '../../core/library/library-origin';
+import { entryKeyOf, isProjectBackedProvider, LIBRARY_PROJECTS_PROVIDER_ID } from '../../core/library/library-origin';
 import { isLibraryProjectSource, type LibraryProjectSource } from '../../core/library/library-projects-provider';
 import { buildNeededByGroups, libraryStateBadge, runLibraryRepair } from '../../core/library/library-project-ui';
 import { ensureLibraryCommandsRegistered } from '../../core/library/library-commands';
@@ -91,6 +91,7 @@ import { AssetPreviewDialog } from '../../core/library/AssetPreviewDialog';
 import { openAddLibraryDialog } from '../../core/hmi/projects/projects-dashboard-store';
 import { useThumbnailUrl } from '../../core/thumbnails/rv-thumbnail-url-store';
 import { getProjectStore } from '../../core/project/project-store';
+import { libraryBackendOf } from '../../core/library/library-save-target';
 // Lives in its own module so the lazy-loading host (LayoutLibraryPanelHost) can
 // show it WITHOUT pulling this panel's chunk (plan-344 Phase 4).
 import { MobileLibraryTab } from './MobileLibraryTab';
@@ -350,6 +351,8 @@ export function storeTabUrlOf(tabId: string): string | null {
 // (React "Maximum update depth exceeded", minified error #185).
 const EMPTY_CLOUD_SNAPSHOT = { connections: [], activeConnectionId: null };
 
+const NOOP_SUBSCRIBE = (): (() => void) => () => {};
+
 export function LayoutLibraryPanel() {
   const viewer = useViewer();
   const isMobile = useMobileLayout();
@@ -363,11 +366,12 @@ export function LayoutLibraryPanel() {
   const plugin = viewer.getPlugin<LayoutPlannerPlugin>('layout-planner');
   const store = plugin?.store;
 
-  // Subscribe to store
-  const snapshot = useSyncExternalStore(
-    store?.subscribe ?? (() => () => {}),
-    store?.getSnapshot ?? (() => null as unknown as LayoutSnapshot),
-  );
+  // Primitive fields, not the snapshot (it carries the selection).
+  const sub = store?.subscribe ?? NOOP_SUBSCRIBE;
+  const snap = () => store?.getSnapshot();
+  const activeTabUrl = useSyncExternalStore(sub, () => snap()?.activeTabUrl ?? null);
+  const placedCount = useSyncExternalStore(sub, () => snap()?.placed.length ?? 0);
+  const placementMode = useSyncExternalStore(sub, () => snap()?.placementMode ?? null);
 
   // Unity Asset Manager store (lives on the plugin for restore access)
   const cloudStore = plugin?.cloudStore ?? null;
@@ -461,7 +465,7 @@ export function LayoutLibraryPanel() {
   }
   const growRenderLimit = useCallback(() => setRenderLimit((n) => n + LIBRARY_RENDER_PAGE), []);
 
-  if (!plugin || !store || !snapshot) return null;
+  if (!plugin || !store) return null;
 
   // The panel itself:
   if (!isOpen) {
@@ -478,7 +482,7 @@ export function LayoutLibraryPanel() {
   // the first tab, which is the project whenever there is one (F2).
   const resolvedActiveTabId = resolveDefaultTab(
     tabs,
-    normalizePersistedTab(activeTabId, snapshot.activeTabUrl),
+    normalizePersistedTab(activeTabId, activeTabUrl),
   );
   const activeTab = tabs.find(t => t.id === resolvedActiveTabId) ?? null;
   const isAmTab = resolvedActiveTabId?.startsWith(AM_TAB_PREFIX) ?? false;
@@ -608,7 +612,7 @@ export function LayoutLibraryPanel() {
           remaining={displayedEntries.length - visibleEntries.length}
           onMore={growRenderLimit}
           plugin={plugin}
-          snapshot={snapshot}
+          placementMode={placementMode}
           isAmTab={isAmTab}
           libraryItems={libraryItems}
           activeId={resolvedActiveTabId}
@@ -631,10 +635,10 @@ export function LayoutLibraryPanel() {
         maxWidth={600}
         onResize={(w) => lpm.open(PANEL_ID, w, 'right')}
         footer={
-          snapshot.placed.length > 0 ? (
+          placedCount > 0 ? (
             <Box sx={{ px: 1.5, py: 0.75 }}>
               <Typography variant="caption" sx={{ color: 'text.secondary', fontSize: 10 }}>
-                {snapshot.placed.length} object{snapshot.placed.length !== 1 ? 's' : ''} placed
+                {placedCount} object{placedCount !== 1 ? 's' : ''} placed
               </Typography>
             </Box>
           ) : null
@@ -671,7 +675,7 @@ export function LayoutLibraryPanel() {
             <ThumbnailCard
               key={entry.id}
               entry={entry}
-              isPlacing={snapshot.placementMode === entry.id}
+              isPlacing={placementMode === entry.id}
               plugin={plugin}
             />
           ))}
@@ -738,7 +742,7 @@ interface MobileLibraryStripProps {
   remaining?: number;
   onMore?: () => void;
   plugin: LayoutPlannerPlugin;
-  snapshot: LayoutSnapshot;
+  placementMode: string | null;
   isAmTab: boolean;
   libraryItems: LibraryItem[];
   activeId: string | null;
@@ -752,7 +756,7 @@ interface MobileLibraryStripProps {
  *  docked above the bottom nav. Keeps the 3D scene visible (unlike the
  *  fullscreen panel) — tap a card to enter placement mode, then tap the scene. */
 function MobileLibraryStrip({
-  entries, remaining, onMore, plugin, snapshot, isAmTab, libraryItems, activeId,
+  entries, remaining, onMore, plugin, placementMode, isAmTab, libraryItems, activeId,
   onSelect, onManage, onClose,
 }: MobileLibraryStripProps) {
   // Single combined menu (library switch + manage) opened from the floating ⋮.
@@ -798,7 +802,7 @@ function MobileLibraryStrip({
               <Box key={entry.id} sx={{ width: MOBILE_CARD_WIDTH }}>
                 <ThumbnailCard
                   entry={entry}
-                  isPlacing={snapshot.placementMode === entry.id}
+                  isPlacing={placementMode === entry.id}
                   plugin={plugin}
                 />
               </Box>
@@ -818,10 +822,10 @@ function MobileLibraryStrip({
             <Typography
               sx={{
                 fontSize: 9.5, textAlign: 'center',
-                color: snapshot.placementMode ? 'primary.light' : 'text.disabled',
+                color: placementMode ? 'primary.light' : 'text.disabled',
               }}
             >
-              {snapshot.placementMode ? 'Tap in the scene to place · tap part again to cancel' : 'Tap a part, then tap the scene to place'}
+              {placementMode ? 'Tap in the scene to place · tap part again to cancel' : 'Tap a part, then tap the scene to place'}
             </Typography>
           </Box>
         )}
@@ -891,12 +895,17 @@ function MobileLibraryStrip({
  * latter to `libraryDocumentBase` produced `library/library/...` — an editor
  * that opened nothing (plan-660 G3).
  */
+/** A document of the open project (by id, or the path key of a row without one) — not a library's. */
+function isOpenProjectEntry(entry: LibraryCatalogEntry): boolean {
+  return !entry.libraryOrigin && (entry.id.startsWith(PROJECT_PLACEMENT_PREFIX) || (!!entry.documentId && entry.id === entry.documentId));
+}
+
 export function editAssetBaseOf(entry: LibraryCatalogEntry): AssetBase | null {
   if (!entry.localPath) return null;
   // plan-778 Decision 3: a library project is read-only inside this project;
   // "Edit in library" (Phase 5) is the explicit door — no editor base here.
   if (entry.libraryOrigin) return null;
-  if (entry.id.startsWith(PROJECT_PLACEMENT_PREFIX)) {
+  if (isOpenProjectEntry(entry)) {
     const file = entry.localPath.split('/').pop() ?? entry.localPath;
     return projectDocumentBase(entry.localPath, file.replace(/\.glb$/i, ''));
   }
@@ -918,7 +927,11 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry: catalogEntry, 
   // its own `thumbnailUrl`. The resolved picture is merged into a copy — the
   // entry is store state.
   const savedPointer = !catalogEntry.thumbnailUrl ? catalogEntry.thumbnailPointer ?? null : null;
-  const savedUrl = useThumbnailUrl(savedPointer ? getProjectStore().getBackend() : null, savedPointer);
+  // A library entry's pointer is relative to ITS project (plan-778), not the open one.
+  const savedUrl = useThumbnailUrl(
+    savedPointer ? (catalogEntry.libraryOrigin ? libraryBackendOf(catalogEntry) : getProjectStore().getBackend()) : null,
+    savedPointer,
+  );
   const entry = useMemo(
     () => (savedUrl ? { ...catalogEntry, thumbnailUrl: savedUrl } : catalogEntry),
     [catalogEntry, savedUrl],
@@ -928,7 +941,8 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry: catalogEntry, 
   // every planner store change.
   const preparing = useSyncExternalStore(
     plugin.store.subscribe,
-    () => plugin.store.getSnapshot().preparingEntryIds.includes(catalogEntry.id),
+    // plan-780 R7: the qualified key — a same-id entry of another library is not this card.
+    () => plugin.store.getSnapshot().preparingEntryIds.includes(entryKeyOf(catalogEntry)),
   );
   // Hover-intent prefetch (plan-371 F8). The timer is the whole mechanism:
   // start on enter, drop on leave, so only a deliberate rest over the card
@@ -967,7 +981,7 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry: catalogEntry, 
   useEffect(() => cancelPrefetchIntent, [cancelPrefetchIntent]);
 
   // A project document has no `glbUrl`; it is opened by its own path.
-  const isProjectEntry = entry.id.startsWith(PROJECT_PLACEMENT_PREFIX);
+  const isProjectEntry = isOpenProjectEntry(entry);
 
   const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null);
   // The larger view of the picture (magnifier on the card, or the context menu).

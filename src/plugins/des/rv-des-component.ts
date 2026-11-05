@@ -306,7 +306,18 @@ export interface DESComponentSnapshot {
   statBaselineTime?: number;
   /** totalProcessed captured at the last stats reset (plan-261 Phase 0). */
   processedBaseline?: number;
+  /** plan-2241 (sim s; null = not armed / never); optional, defaulted on restore. */
+  progressArmedSince?: number | null;
+  lastProgressSec?: number | null;
+  categorySince?: number;
 }
+
+export type ProgressKind = 'arm' | 'idle' | 'bump';
+
+// plan-2241 F12: restore silence from the first participant commit; changes are dropped.
+let _progressSilence = 0;
+export function beginProgressSilence(): void { _progressSilence++; }
+export function endProgressSilence(): void { if (_progressSilence > 0) _progressSilence--; }
 
 // ── Register signal-change action ──
 
@@ -384,7 +395,7 @@ export class DESComponent implements IDESComponent, IDESComponentRef {
   set currentLoad(value: number) {
     const delta = value - this._currentLoad;
     this._currentLoad = value;
-    if (delta) this.onLoadChanged?.(delta);
+    if (delta) { this.onLoadChanged?.(delta); this._progressCheck(); }
   }
   isBlocked = false;
   isWorking = false;
@@ -412,7 +423,7 @@ export class DESComponent implements IDESComponent, IDESComponentRef {
   get progressUnitId(): string { return `des:${this.path}`; }
   get progressArmed(): boolean { return this.currentLoad > 0 || this.blockedMUs.size > 0 || this.state === DESComponentState.Blocked; }
   /** Blocked output belongs to this instance; downstream capacity belongs to the target
-   * instance. Wait start is not retained by blockedMUs, so it remains explicitly unknown. */
+   * instance. Wait ages come from own begin stamps, never from the statistics window. */
   waitEdges(_now: number): readonly WaitEdge[] {
     const out: WaitEdge[] = [];
     // State waits carry no dependency. Budgets, not the DES source, decide
@@ -420,17 +431,103 @@ export class DESComponent implements IDESComponent, IDESComponentRef {
     const waitKind = this.currentStateName.toLowerCase();
     if (this.progressArmed && (waitKind === 'setup' || waitKind === 'failure')) {
       out.push({ waiterId: this.progressUnitId, resourceId: this.path, ownerIds: [],
-        kind: waitKind, sinceSimSec: this.stateStartTime, analysed: true, nodePath: this.path });
+        kind: waitKind, sinceSimSec: this.categorySince, analysed: true, nodePath: this.path });
     }
     for (const [target, mus] of this.blockedMUs) if (mus.length > 0) {
       out.push({ waiterId: this.progressUnitId, resourceId: target.path,
-        ownerIds: [target.progressUnitId], kind: 'des-exit', sinceSimSec: NaN,
+        ownerIds: [target.progressUnitId], kind: 'des-exit', sinceSimSec: this.blockedSince.get(target) ?? NaN,
         analysed: true, nodePath: this.path });
     }
     return out;
   }
 
   protected blockedMUs: Map<DESComponent, DESMU[]> = new Map();
+  /** First block per downstream target (sim s); a retry that blocks again keeps it. A released target
+   * keeps its key with NaN (no map shrink per episode, plan-2241a P3): NaN = not blocked for every reader. */
+  protected blockedSince: Map<DESComponent, number> = new Map();
+  private _stampBlockedSince(target: DESComponent): void {
+    const s = this.blockedSince.get(target);
+    if (s === undefined || s !== s) this.blockedSince.set(target, this.manager?.currentTime ?? 0);
+  }
+
+  // ── Progress lifecycle (plan-2241; diagnosis only, never read by model logic) ──
+
+  progressArmedSince = NaN;
+  lastProgressSec = NaN;
+  /** Not re-stamped by a stats reset. */
+  protected categorySince = 0;
+  onProgress: ((kind: ProgressKind, atSec: number, n?: number) => void) | null = null;
+  // F11: an open attempt defers checks to its end; a held pose release waits for its commit.
+  private _attemptDepth = 0;
+  private readonly _heldMUs: DESMU[] = [];
+  private readonly _heldBumps: number[] = [];
+
+  /** @internal O(1); no-op inside an attempt or a restore. */
+  _progressCheck(): void {
+    if (this._attemptDepth > 0 || _progressSilence > 0) return;
+    const since = this.progressArmedSince;
+    if (this.progressArmed) {
+      if (since === since) return;
+      const now = this.manager?.currentTime ?? 0;
+      this.progressArmedSince = now;
+      if (!(this.lastProgressSec >= now)) this.lastProgressSec = now;
+      this.onProgress?.('arm', now);
+    } else if (since === since) {
+      this.progressArmedSince = NaN;
+      this.onProgress?.('idle', this.manager?.currentTime ?? 0);
+    }
+  }
+
+  progressConsistent(): boolean {
+    return this.progressArmed === (this.progressArmedSince === this.progressArmedSince);
+  }
+
+  /** Armed as restore will install it: the load comes from the held MU refs (restoreMURefs). */
+  snapshotProgressArmed(snap: Omit<DESComponentSnapshot, 'path'>, blockedCount: number, _part: ((key: string) => unknown) | null): boolean {
+    return snap.muIds.length > 0 || blockedCount > 0 || snap.state === DESComponentState.Blocked;
+  }
+
+  /** @internal Restore post-check, diagnostic only: re-stamp a disagreeing lifecycle deterministically. */
+  _repairProgress(time: number): boolean {
+    if (this.progressConsistent()) return false;
+    if (this.progressArmed) {
+      this.progressArmedSince = time;
+      if (!(this.lastProgressSec >= time)) this.lastProgressSec = time;
+    } else this.progressArmedSince = NaN;
+    return true;
+  }
+
+  /** @internal */
+  _beginProgressAttempt(): void { this._attemptDepth++; }
+  /** @internal */
+  _endProgressAttempt(): void { if (--this._attemptDepth === 0) this._progressCheck(); }
+  /** @internal */
+  _holdProgress(mu: DESMU): void {
+    this._heldMUs.push(mu); this._heldBumps.push(0); this._attemptDepth++;
+  }
+  /** @internal */
+  _releaseHeldProgress(mu: DESMU, committed: boolean): void {
+    const i = this._heldMUs.lastIndexOf(mu);
+    let n = 0;
+    if (i >= 0) {
+      n = this._heldBumps[i];
+      // try/finally nests strictly: the entry is the last one (pop, no splice result array).
+      if (i === this._heldMUs.length - 1) { this._heldMUs.pop(); this._heldBumps.pop(); }
+      else { this._heldMUs.splice(i, 1); this._heldBumps.splice(i, 1); }
+    }
+    if (committed && n > 0) this._noteProgress(n);
+    this._endProgressAttempt();
+  }
+  private _noteProgress(n: number): void {
+    if (_progressSilence > 0) return;
+    const now = this.manager?.currentTime ?? 0;
+    this.lastProgressSec = now;
+    this.onProgress?.('bump', now, n);
+  }
+  blockedSinceOf(target: DESComponent): number {
+    const s = this.blockedSince.get(target);
+    return s !== undefined && s === s ? s : this.manager?.currentTime ?? 0;
+  }
 
   // ── State timing ──
 
@@ -730,6 +827,7 @@ export class DESComponent implements IDESComponent, IDESComponentRef {
 
     this.currentStateName = name;
     this.stateStartTime = now;
+    this.categorySince = now;
 
     // Increment entry count for new state
     const newEntry = this.stateTimings.get(name);
@@ -751,6 +849,7 @@ export class DESComponent implements IDESComponent, IDESComponentRef {
       case 'Stopped': this.state = DESComponentState.Stopped; break;
       case 'Charging': this.state = DESComponentState.Charging; break;
     }
+    this._progressCheck(); // a real category change only (idempotent calls returned above)
   }
 
   // ── Statistics ──
@@ -839,6 +938,11 @@ export class DESComponent implements IDESComponent, IDESComponentRef {
   /** Count `n` outputs that are not MUs leaving this component (a vehicle
    *  finishing a job) — feeds totalProcessed / outputPerHour like releaseMU. */
   recordOutput(n = 1): void {
+    this._countOutput(n);
+    this._noteProgress(n);
+  }
+
+  private _countOutput(n: number): void {
     this.totalProcessed += n;
     for (const listener of this.completionListeners) listener(n);
   }
@@ -868,7 +972,10 @@ export class DESComponent implements IDESComponent, IDESComponentRef {
     this.currentLoad = this.mus.length;
     if (mu.currentComponent === this) mu.currentComponent = null;
     this.onMUExit?.(mu);
-    if (this.tentativeReleases.length === 0 || !this.tentativeReleases.includes(mu)) this.recordOutput();
+    if (this.tentativeReleases.length === 0 || !this.tentativeReleases.includes(mu)) {
+      const held = this._heldMUs.length === 0 ? -1 : this._heldMUs.lastIndexOf(mu);
+      if (held >= 0) { this._heldBumps[held]++; this._countOutput(1); } else this.recordOutput();
+    }
 
     // Notify upstream that space is available
     if (this.currentLoad < this.MaxCapacity) {
@@ -896,6 +1003,8 @@ export class DESComponent implements IDESComponent, IDESComponentRef {
       if (waiting.length === 0) this.blockedMUs.delete(from);
       mu.isBlocked = false;
       this.tryTransferMU(mu);
+      // Re-blocking at `from` keeps the wait age.
+      if (!this.blockedMUs.has(from) && this.blockedSince.has(from)) this.blockedSince.set(from, NaN);
     }
   }
 
@@ -904,10 +1013,17 @@ export class DESComponent implements IDESComponent, IDESComponentRef {
    * plan-261): the serialized `muIds` resolve to the re-created MUs so
    * `_onProcessComplete`/`tryTransferMU`/`releaseMU` find them again.
    */
-  restoreMURefs(held: DESMU[], blocked?: Array<[DESComponent, DESMU[]]>): void {
+  restoreMURefs(held: DESMU[], blocked?: Array<[DESComponent, DESMU[]]>, blockedSince?: readonly number[]): void {
+    const now = this.manager?.currentTime ?? 0;
     this.mus = [...held];
     this.currentLoad = this.mus.length;
-    if (blocked) { this.blockedMUs = new Map(blocked); return; }
+    this.blockedSince.clear();
+    if (blocked) {
+      this.blockedMUs = new Map(blocked);
+      for (let i = 0; i < blocked.length; i++) this.blockedSince.set(blocked[i][0], blockedSince?.[i] ?? now);
+      this._progressCheck();
+      return;
+    }
     // MU snapshots retain isBlocked, but the retry map holds live references.
     // Rebuild it so downstream-ready can retry the restored instances.
     this.blockedMUs.clear();
@@ -919,9 +1035,11 @@ export class DESComponent implements IDESComponent, IDESComponentRef {
       if (!waiting) {
         waiting = [];
         this.blockedMUs.set(target, waiting);
+        this.blockedSince.set(target, now);
       }
       waiting.push(mu);
     }
+    this._progressCheck();
   }
 
   /**
@@ -937,10 +1055,16 @@ export class DESComponent implements IDESComponent, IDESComponentRef {
    * TotalProcessed KPI source) kept counting across runs.
    */
   clearMUState(): void {
+    // plan-2241 E-A: lifecycle reset; no half-cleared publication.
+    const wasArmed = this.progressArmedSince === this.progressArmedSince;
+    this._attemptDepth = 1;
+    this._heldMUs.length = 0;
+    this._heldBumps.length = 0;
     // Reset starts a new run; repairing would replay work from the old queue.
     this.isFailure = false;
     this.mus.length = 0;
     this.blockedMUs.clear();
+    this.blockedSince.clear();
     this.currentLoad = 0;
     this.isBlocked = false;
     this.exitBlocked = false;
@@ -952,6 +1076,11 @@ export class DESComponent implements IDESComponent, IDESComponentRef {
     // Fresh window at the manager's clock (0 after manager.reset()); attachManager
     // re-baselines again when the next start registers the component.
     this._resetStatisticsWindow();
+    this.categorySince = this.manager?.currentTime ?? 0;
+    this._attemptDepth = 0;
+    this.progressArmedSince = NaN;
+    this.lastProgressSec = NaN;
+    if (wasArmed && _progressSilence === 0) this.onProgress?.('idle', this.manager?.currentTime ?? 0);
   }
 
   // ── Internal MU management ──
@@ -982,7 +1111,7 @@ export class DESComponent implements IDESComponent, IDESComponentRef {
         if (waiting) {
           const idx = waiting.indexOf(mu);
           if (idx >= 0) waiting.splice(idx, 1);
-          if (waiting.length === 0) this.blockedMUs.delete(target);
+          if (waiting.length === 0) { this.blockedMUs.delete(target); this.blockedSince.set(target, NaN); }
         }
         // The loop-fill guard historically observed this MU between holders
         // during the sender's wake-up. Preserve that count with accept-first
@@ -1009,8 +1138,10 @@ export class DESComponent implements IDESComponent, IDESComponentRef {
       if (!list) {
         list = [];
         this.blockedMUs.set(target, list);
+        this._stampBlockedSince(target);
       }
       if (!list.includes(mu)) list.push(mu);
+      this._progressCheck(); // inserting while already Blocked bypasses setState
     } else if (this.nextComponents.length === 0) {
       // No downstream configured — MU stays here (end of line)
     } else {
@@ -1026,8 +1157,10 @@ export class DESComponent implements IDESComponent, IDESComponentRef {
       if (!list) {
         list = [];
         this.blockedMUs.set(first, list);
+        this._stampBlockedSince(first);
       }
       if (!list.includes(mu)) list.push(mu);
+      this._progressCheck();
     }
     return 'blocked';
   }
@@ -1273,6 +1406,9 @@ export class DESComponent implements IDESComponent, IDESComponentRef {
       stateStartTime: this.stateStartTime,
       statBaselineTime: this.statBaselineTime,
       processedBaseline: this.processedBaseline,
+      progressArmedSince: this.progressArmedSince === this.progressArmedSince ? this.progressArmedSince : null,
+      lastProgressSec: this.lastProgressSec === this.lastProgressSec ? this.lastProgressSec : null,
+      categorySince: this.categorySince,
     };
   }
 
@@ -1309,5 +1445,9 @@ export class DESComponent implements IDESComponent, IDESComponentRef {
     // window restarts at the restore point instead of producing NaN).
     this.statBaselineTime = snap.statBaselineTime ?? now;
     this.processedBaseline = snap.processedBaseline ?? 0;
+    // Literal; the participant normalised a legacy snapshot (plan-2241 F4).
+    this.progressArmedSince = snap.progressArmedSince ?? NaN;
+    this.lastProgressSec = snap.lastProgressSec ?? NaN;
+    this.categorySince = snap.categorySince ?? snap.stateStartTime;
   }
 }

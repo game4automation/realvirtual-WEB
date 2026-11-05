@@ -15,6 +15,7 @@ import { useCustomBranding } from './branding-store';
 import { useKioskHasTour, startKioskFromWelcome } from '../../plugins/kiosk-plugin';
 import { useActiveContexts, useUIVisible } from './ui-context-store';
 import { WELCOME_AUTO_OPEN_UI_ELEMENT_ID, WELCOME_AUTO_OPEN_VISIBILITY_RULE } from './welcome-modal-store';
+import { isRecordingMode, isWelcomeAutoOpenSuppressed } from '../recording-mode';
 import { useMode } from '../../hooks/use-mode';
 import { computeToolSections, countToolEntries } from './button-panel-sections';
 import { FIELD_BORDER_HOVER } from './shared-sx';
@@ -69,7 +70,7 @@ export function LogoBadge() {
     WELCOME_AUTO_OPEN_UI_ELEMENT_ID,
     WELCOME_AUTO_OPEN_VISIBILITY_RULE,
   );
-  const aboutOpen = manualOpen || (autoPending && autoOpenAllowed);
+  const aboutOpen = manualOpen || (autoPending && autoOpenAllowed && !isWelcomeAutoOpenSuppressed());
 
   return (
     <>
@@ -85,7 +86,9 @@ export function LogoBadge() {
           '&:hover': { backgroundColor: 'rgba(255,255,255,0.06)' },
         }}
         onClick={() => setManualOpen(true)}
-        title="About"
+        title={isRecordingMode() ? undefined : 'About'}
+        aria-label="About"
+        data-testid="rv-logo-badge"
       >
         <BrandingContent />
       </Box>

@@ -110,9 +110,11 @@ describe('exportAssetGlb round-trip', () => {
     // root (static under root, kinematic under Drive nodes).
     const staticBvh = new Mesh(new BoxGeometry(1, 1, 1), new MeshStandardMaterial());
     staticBvh.name = '__raycastBVH_static';
+    staticBvh.userData._rvRaycastBVH = true; // helpers are pruned by MARKER, never by name
     root.add(staticBvh);
     const driveBvh = new Mesh(new BoxGeometry(1, 1, 1), new MeshStandardMaterial());
     driveBvh.name = '__raycastBVH_Housing';
+    driveBvh.userData._rvRaycastBVH = true;
     findByName(root, 'Housing')!.add(driveBvh);
 
     const glb = await exportAssetGlb(root);
@@ -171,6 +173,7 @@ describe('pruneRuntimeHelpers', () => {
     const root = buildAssetTree();
     const bvh = new Mesh(new BoxGeometry(1, 1, 1), new MeshStandardMaterial());
     bvh.name = '__raycastBVH';
+    bvh.userData._rvRaycastBVH = true;
     root.add(bvh);
     pruneRuntimeHelpers(root);
     expect(findByName(root, '__raycastBVH')).toBeNull();
@@ -189,9 +192,11 @@ describe('pruneRuntimeHelpers', () => {
     root.add(gizmo);
     const sensorViz = new Mesh(new BoxGeometry(1, 1, 1), new MeshStandardMaterial());
     sensorViz.name = 'S1_sensorViz';
+    sensorViz.userData._rvRuntimeVisual = true; // what RVSensor sets at creation
     root.add(sensorViz);
     const tankViz = new Mesh(new BoxGeometry(1, 1, 1), new MeshStandardMaterial());
     tankViz.name = '_tankFillViz';
+    tankViz.userData._tankFillViz = true; // what rv-tank-fill sets at creation
     root.add(tankViz);
 
     pruneRuntimeHelpers(root);

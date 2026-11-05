@@ -29,6 +29,8 @@ import { getDefaultMovementAuthority, type MbPlan, type MovementAuthority } from
 import { positionAt } from '../../src/core/engine/rv-motion-profile';
 import { DESComponent } from '@rv/plugins/des/rv-des-component';
 import { DESRunner } from '@rv/plugins/des/des-runner';
+import type { ProgressLedger } from '../../src/core/diagnostics/rv-progress-ledger';
+import type { WaitRegistry } from '../../src/core/diagnostics/rv-wait-registry';
 import {
   TICK, makeHost, makeAgvRoot, bindContinuous, bindDes, footprint, satOverlap, stepFleet,
   type AgvTestHost, type BodyExtents, type TestBody,
@@ -123,6 +125,11 @@ export interface StubWorld {
   now(): number;
   step(): void;
   done(): boolean;
+  /**
+   * DES modes: attach the runner's push diagnostics to `ledger`/`registry`, as every start does with
+   * the viewer's (plan-2241): DES vehicles are then the units `des:<name>`, never sampled fleet ids.
+   */
+  bindDiagnostics?(ledger: ProgressLedger, registry: WaitRegistry): void;
   /** DES statistics state of a vehicle (DES modes only). */
   desState?(name: string): string;
   /** FastForward: SAT overlap frames re-computed from the recorded plans (sample step `dt`). */
@@ -199,7 +206,9 @@ export function makeStubWorld(mode: Mode, specs: VehicleSpec[], simLimit = 900):
   const runner = new DESRunner(mode === 'fastforward'
     ? { subMode: 'fastforward', durationSeconds: simLimit }
     : { subMode: 'animated' });
-  for (const n of all) bindDes(runner, roots[n], host);
+  // A common parent gives every vehicle a node path (`des:<name>`); identity transform.
+  const layout = new Object3D();
+  for (const n of all) { layout.add(roots[n]); bindDes(runner, roots[n], host); }
   runner.start([], { root: new Object3D() });
   const mgr = runner.getManager();
   const mb = getDefaultMovementAuthority('des');
@@ -211,6 +220,8 @@ export function makeStubWorld(mode: Mode, specs: VehicleSpec[], simLimit = 900):
       adapter.setFailure(true);
       delay(sec, () => adapter.setFailure(false));
     },
+    bindDiagnostics: (progressLedger, waitRegistry) => (runner as unknown as { _bindDiagnostics(t: unknown): void })
+      ._bindDiagnostics({ root: layout, host: { ...host, progressLedger, waitRegistry } }),
     now: () => mgr.currentTime,
     step: () => { runner.tick(TICK); runner.lateTick(TICK); },
     done: () => mgr.isComplete || mgr.currentTime > simLimit,

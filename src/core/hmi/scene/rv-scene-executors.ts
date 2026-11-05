@@ -405,7 +405,7 @@ function notifyParametricValues(viewer: RVViewer, op: { nodePath: string; compon
   emitParametricValuesChanged(viewer, op.nodePath);
 }
 
-function syncSignalLinksRuntime(
+export function syncSignalLinksRuntime(
   viewer: RVViewer,
   nodePath: string,
   componentType: string,

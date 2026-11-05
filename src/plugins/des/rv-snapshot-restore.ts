@@ -56,6 +56,10 @@ export interface RestoreContext {
   detach?(): void;
   hooks?: readonly RestoreHook[];
   onCorrupt?(info: RestoreFailure): void;
+  /** Called once before the first participant commit; `endCommit` after the restore hooks
+   *  (before deferred reactions) or on failure before `onCorrupt` (plan-2241 F12). */
+  beginCommit?(): void;
+  endCommit?(): void;
 }
 
 /** Also honor explicit failures from callbacks implemented outside TypeScript. */
@@ -72,7 +76,10 @@ export function restoreTransaction(raw: unknown, ctx: RestoreContext): RestoreRe
   let participant: string | undefined;
   let hook: string | undefined;
   let committing = false;
+  let silenced = false;
+  const unsilence = () => { if (silenced) { silenced = false; ctx.endCommit?.(); } };
   const fail = (details: Partial<RestoreFailure>): RestoreFailure => {
+    unsilence();
     const failure: RestoreFailure = {
       ok: false, stage, status: committing ? 'corrupt' : 'unchanged',
       participant, hook, ...details, discarded: ctx.deferred.discard(),
@@ -96,6 +103,7 @@ export function restoreTransaction(raw: unknown, ctx: RestoreContext): RestoreRe
       prepared.push(p.prepare(parts.get(p.key)!.state));
     }
     stage = 'commit';
+    ctx.beginCommit?.(); silenced = true;
     for (let i = 0; i < ordered.length; i++) {
       participant = ordered[i].key;
       committing = true;
@@ -112,6 +120,7 @@ export function restoreTransaction(raw: unknown, ctx: RestoreContext): RestoreRe
       checkResult(h.run());
     }
     hook = undefined;
+    unsilence(); // deferred reactions are the restored run continuing, not restore artefacts
     const errors = ctx.deferred.runAll();
     if (errors.length) return fail({ cause: errors[0].error, deferredErrors: errors });
     return { ok: true };

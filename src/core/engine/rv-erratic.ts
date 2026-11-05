@@ -27,6 +27,8 @@ export class RVErraticDriver implements IDriveBehavior, RVComponent {
   // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
   static readonly schema: ComponentSchema = loadSchemaFromSpec('Drive_ErraticPosition');
 
+  resetRunState(): void { this.driving = false; this.destPos = 0; this.movingToZero = false; }
+
   readonly node: Object3D;
   isOwner = true;
 
@@ -44,8 +46,11 @@ export class RVErraticDriver implements IDriveBehavior, RVComponent {
   drive: RVDrive | null = null;
   private signalStore: SignalStore | null = null;
 
+  random: (() => number) | null = null;
+
   // Runtime state
   private driving = false;
+  get cycleAlive(): boolean { return !!this.drive && this.isOwner && (this.isEnabled || this.movingToZero); }
   private destPos = 0;
   private movingToZero = false;
   private readonly tolerance = 0.01;
@@ -200,7 +205,7 @@ export class RVErraticDriver implements IDriveBehavior, RVComponent {
 
       if (!this.IterateBetweenMaxAndMin) {
         // Random position between min and max
-        this.drive.targetPosition = min + Math.random() * (max - min);
+        this.drive.targetPosition = min + (this.random ? this.random() : Math.random()) * (max - min);
       } else {
         // Toggle between min and max (compared against the CLAMPED max — the
         // authored MaxPos may sit outside the limits and is then never reached)

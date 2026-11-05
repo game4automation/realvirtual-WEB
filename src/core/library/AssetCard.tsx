@@ -32,7 +32,7 @@ import {
   ArchiveOutlined, CategoryOutlined, ZoomIn, ViewInArOutlined,
 } from '@mui/icons-material';
 import type { LibraryCatalogEntry } from './library-types';
-import { LABEL_CHIP_SX, LABEL_CHIP_ON_PREVIEW_BG } from '../hmi/shared-sx';
+import { LABEL_CHIP_SX, LABEL_CHIP_ON_PREVIEW_SX } from '../hmi/shared-sx';
 
 /** Matches `CatalogBrowserVariant`; kept structural to avoid a circular import. */
 export type AssetCardVariant = 'compact' | 'comfortable';
@@ -430,7 +430,7 @@ export const AssetCard = forwardRef<HTMLDivElement, AssetCardProps>(function Ass
               title="Ships with this build — edits are saved as your own copy"
               sx={{
                 ...LABEL_CHIP_SX,
-                bgcolor: LABEL_CHIP_ON_PREVIEW_BG,
+                ...LABEL_CHIP_ON_PREVIEW_SX,
                 position: 'absolute',
                 left: 4,
                 bottom: 4,

@@ -38,6 +38,9 @@
  * a pre-778 `global` + realvirtual-catalog qualifier maps to the realvirtual
  * library project (F5).
  *
+ * plan-780 R1: every lookup goes through `resolveDocumentRef` in the scope of the
+ * file the reference is written in (`ResolveContext.scope`).
+ *
  * `sha256` is deliberately not a resolution key. The user decided that library
  * corrections must reach every referencing plant; a hash key would pin each
  * file to the bytes it last saw and quietly defeat that.
@@ -55,10 +58,13 @@ import {
   type ResolvedAsset,
 } from '../library/library-source-registry';
 import {
-  findLegacyOrigin,
-  findQualifiedOrigin,
-  findQualifiedOriginSettled,
   isQualifiedRef,
+  isStrictDocumentRef,
+  resolveDocumentRef,
+  resolveDocumentRefSettled,
+  scopeOfQualifiedRef,
+  type DocumentScope,
+  type ResolvedRef,
 } from '../library/library-origin';
 import { verifyRvSigBuffer } from '../persistence/rv-sig-verify';
 import { sha256Hex } from '../import/rv-cad-glb-cache';
@@ -89,15 +95,44 @@ export async function resolveQualifiedReference(
   ref: Pick<AssetReference, 'assetId' | 'providerId' | 'sourceId'>,
 ): Promise<{ resolved: ResolvedAsset; url: string } | null> {
   if (!isQualifiedRef(ref) || !ref.assetId) return null;
-  const found = await findQualifiedOriginSettled({ ...ref, assetId: ref.assetId });
-  if (!found) return null;
-  try {
-    const resolved = await found.registered.source.resolveAsset(found.entry.id, 'place');
-    return { resolved, url: resolved.url };
-  } catch (e) {
-    debug('loader', `[compose] library "${ref.sourceId}" failed to resolve "${ref.assetId}": ${String(e)}`);
+  const via = await resolveStrictReference(ref, null);
+  return via ? { resolved: via.resolved, url: via.url } : null;
+}
+
+/** plan-780 R1: a strict reference waits for its ONE source, then resolves there or nowhere. */
+async function resolveStrictReference(
+  ref: Pick<AssetReference, 'assetId' | 'providerId' | 'sourceId'>,
+  scope: DocumentScope,
+): Promise<{ resolved: ResolvedAsset; url: string; scope: DocumentScope } | null> {
+  const r = await resolveDocumentRefSettled(docRefOf(ref), scope);
+  if (!('hit' in r)) {
+    debug('loader', `[compose] "${ref.assetId}" not resolved: ${'missing' in r ? r.reason : 'its library is still loading'}`);
     return null;
   }
+  return resolveHit(r.hit);
+}
+
+async function resolveHit(hit: ResolvedRef): Promise<{ resolved: ResolvedAsset; url: string; scope: DocumentScope } | null> {
+  try {
+    const resolved = await hit.registered.source.resolveAsset(hit.assetId, 'place');
+    return { resolved, url: resolved.url, scope: scopeOfHit(hit) };
+  } catch (e) {
+    debug('loader', `[compose] source "${hit.registered.source.id}" failed to resolve "${hit.assetId}": ${String(e)}`);
+    return null;
+  }
+}
+
+/** Scope of a resolved file's own references: its library project, else null. */
+function scopeOfHit(hit: ResolvedRef): DocumentScope {
+  return scopeOfQualifiedRef({ providerId: hit.registered.providerId, sourceId: hit.registered.source.id });
+}
+
+function docRefOf(ref: Pick<AssetReference, 'assetId' | 'providerId' | 'sourceId'>): { catalogId: string; providerId?: string; sourceId?: string } {
+  return {
+    catalogId: ref.assetId ?? '',
+    ...(ref.providerId ? { providerId: ref.providerId } : {}),
+    ...(ref.sourceId ? { sourceId: ref.sourceId } : {}),
+  };
 }
 
 /**
@@ -108,7 +143,7 @@ export async function resolveQualifiedReference(
  * on a machine where the same catalog is registered under a different provider —
  * must still resolve, which is the entire reason identity is the asset id.
  */
-async function resolveThroughLibrary(ref: AssetReference): Promise<{ resolved: ResolvedAsset; url: string } | null> {
+async function resolveThroughLibrary(ref: AssetReference): Promise<{ resolved: ResolvedAsset; url: string; scope: DocumentScope } | null> {
   if (!ref.assetId) return null;
   const found = await findInLibrarySources(ref);
   if (found || !hasPendingLibrarySources()) return found;
@@ -121,18 +156,11 @@ async function resolveThroughLibrary(ref: AssetReference): Promise<{ resolved: R
   return findInLibrarySources(ref);
 }
 
-async function findInLibrarySources(ref: AssetReference): Promise<{ resolved: ResolvedAsset; url: string } | null> {
+async function findInLibrarySources(ref: AssetReference): Promise<{ resolved: ResolvedAsset; url: string; scope: DocumentScope } | null> {
   if (!ref.assetId) return null;
-  // Canonical ids over every source first, then aliases (findLegacyOrigin).
-  const origin = findLegacyOrigin(ref.assetId, ref);
-  if (!origin) return null;
-  try {
-    const resolved = await origin.source.resolveAsset(ref.assetId, 'place');
-    return { resolved, url: resolved.url };
-  } catch (e) {
-    debug('loader', `[compose] source "${origin.source.id}" failed to resolve "${ref.assetId}": ${String(e)}`);
-    return null;
-  }
+  // THE resolver in the open project's scope (plan-780 R1).
+  const r = resolveDocumentRef(docRefOf(ref), null);
+  return 'hit' in r ? resolveHit(r.hit) : null;
 }
 
 /**
@@ -174,27 +202,31 @@ async function resolveThroughProjectManifest(assetId: string): Promise<string | 
  * just resolves to nothing, which is what a blob-sourced asset with relative
  * children deserves.
  */
-export function createReferenceResolver(): ReferenceResolver {
+export function createReferenceResolver(opts?: { scope?: DocumentScope }): ReferenceResolver {
   return async (ref, context): Promise<ResolvedReference | null> => {
     let bytes: ArrayBuffer | null = null;
     let url = '';
+    // plan-780: the containing file's scope.
+    const scope: DocumentScope = context.scope !== undefined ? context.scope : (opts?.scope ?? null);
 
-    // plan-778 F4: a qualified reference resolves in its own library or not at
-    // all — the manifest and path steps below never run for it.
-    if (isQualifiedRef(ref)) {
-      const viaQualified = await resolveQualifiedReference(ref);
-      if (!viaQualified) return null;
-      url = viaQualified.url;
+    // plan-778 F4 / plan-780 D2: a strict reference never reaches the manifest / path steps.
+    if (isQualifiedRef(ref) || (ref.assetId && isStrictDocumentRef(docRefOf(ref), scope))) {
+      const viaStrict = await resolveStrictReference(ref, scope);
+      if (!viaStrict) return null;
+      url = viaStrict.url;
       bytes = await fetchBytes(url);
-      viaQualified.resolved.revokeUrl?.();
-      return bytes ? verifiedReference(bytes, url) : null;
+      viaStrict.resolved.revokeUrl?.();
+      return bytes ? verifiedReference(bytes, url, viaStrict.scope) : null;
     }
 
+    // The resolved file's own scope: the answering library, else the containing file's.
+    let resolvedScope: DocumentScope = scope;
     const viaLibrary = await resolveThroughLibrary(ref);
     if (viaLibrary) {
       url = viaLibrary.url;
       bytes = await fetchBytes(url);
       viaLibrary.resolved.revokeUrl?.();
+      if (bytes) resolvedScope = viaLibrary.scope;
     }
 
     // The manifest row the tree-move writer keeps honest (F12). Checked after
@@ -214,12 +246,12 @@ export function createReferenceResolver(): ReferenceResolver {
     }
 
     if (!bytes) return null;
-    return verifiedReference(bytes, url);
+    return verifiedReference(bytes, url, resolvedScope);
   };
 }
 
 /** The verified form of fetched bytes — every resolved file carries its OWN signature state (§2.9). */
-async function verifiedReference(bytes: ArrayBuffer, url: string): Promise<ResolvedReference> {
+async function verifiedReference(bytes: ArrayBuffer, url: string, scope: DocumentScope): Promise<ResolvedReference> {
   const verified = await verifyRvSigBuffer(bytes);
   return {
     bytes: verified.buffer,
@@ -227,5 +259,6 @@ async function verifiedReference(bytes: ArrayBuffer, url: string): Promise<Resol
     sha256: await sha256Hex(verified.buffer),
     signatureState: verified.state,
     signaturePresent: verified.signaturePresent,
+    scope,
   };
 }

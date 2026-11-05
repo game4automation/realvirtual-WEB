@@ -3,7 +3,7 @@
 
 import { useSyncExternalStore } from 'react';
 import { useViewer } from './use-viewer';
-import { useEditorPlugin } from './use-editor-plugin';
+import { useEditorState } from './use-editor-plugin';
 
 /**
  * Reactive width (px) of the currently open left-docked window, or 0 if none.
@@ -22,12 +22,12 @@ export function useLeftWindowWidth(): number {
   const viewer = useViewer();
   const lpm = viewer.leftPanelManager;
   const snap = useSyncExternalStore(lpm.subscribe, lpm.getSnapshot);
-  const { state } = useEditorPlugin();
-
-  const inspectorExtra = state.panelOpen && state.showInspector && state.selectedNodePath
-    ? state.inspectorWidth : 0;
-  const hierarchyWidth = state.panelOpen && !state.settingsOpen
-    ? state.panelWidth + inspectorExtra : 0;
+  // A number slice, not the full state: this hook sits under the whole shell.
+  const hierarchyWidth = useEditorState((state) => {
+    const inspectorExtra = state.panelOpen && state.showInspector && state.selectedNodePath
+      ? state.inspectorWidth : 0;
+    return state.panelOpen && !state.settingsOpen ? state.panelWidth + inspectorExtra : 0;
+  });
   const lpmWidth = snap.activePanel && snap.activePanel !== 'hierarchy'
     ? snap.activePanelWidth : 0;
 

@@ -21,6 +21,7 @@
  */
 
 import type { RVViewer } from '../../core/rv-viewer';
+import { ensureUsdRecordCommandsRegistered } from '../../core/hmi/commands/usd-record-commands';
 import { McpViewTools } from './rv-mcp-view-tools';
 import { McpObserveTools } from './rv-mcp-observe-tools';
 import { McpEditorTools } from './rv-mcp-editor-tools';
@@ -40,6 +41,9 @@ import { McpCommandTools } from './rv-mcp-command-tools';
 import { McpMacroTools } from './rv-mcp-macro-tools';
 import { McpCheckTools } from './rv-mcp-check-tools';
 import { McpRobotTools } from './rv-mcp-robot-tools';
+
+// plan-2229: `web_commands` lists the USD recording commands (open descriptors, private impl).
+ensureUsdRecordCommandsRegistered();
 
 /** Accessor the delegates share; `undefined` before a viewer is bound. */
 export type ViewerAccessor = () => RVViewer | undefined;

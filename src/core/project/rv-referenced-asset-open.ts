@@ -31,11 +31,21 @@
  * Step 2 sitting above step 3 is the whole point of `moveDocumentPath()`: if the
  * path won, a move would break every reference the moment the id stopped being
  * consulted.
+ *
+ * plan-780 2.3: a reference is read in its referrer's scope (contract
+ * documents-projects 4); {@link openDocumentScoped} is the ONE open helper.
  */
 
 import type { RvProject } from './rv-project-types';
 import { findDocumentById, findDocumentByPath } from './rv-asset-identity';
-import { isQualifiedRef } from '../library/library-origin';
+import {
+  hasLegacyHint,
+  isQualifiedRef,
+  LIBRARY_PROJECTS_PROVIDER_ID,
+  resolveDocumentRef,
+  type DocumentScope,
+} from '../library/library-origin';
+import type { AssetDraftBase } from '../editor/rv-asset-draft-storage';
 
 /** `PROJECT_PLACEMENT_PREFIX` of `core/library/rv-placement-source.ts`, kept local so this module stays pure. */
 const PROJECT_ASSET_PREFIX = 'project:';
@@ -102,9 +112,24 @@ export function planReferencedAssetOpen(
   ref: ReferencedAssetLocator,
   project: RvProject | null | undefined,
   ownerPath: string | null,
+  scope: DocumentScope = null,
 ): ReferencedAssetPlan {
   if (isQualifiedRef(ref) && ref.sourceId) {
-    return { via: 'library', libraryProjectId: ref.sourceId, documentId: ref.assetId };
+    // A legacy path qualified into a library maps through that library's index.
+    const r = ref.assetId.startsWith(PROJECT_ASSET_PREFIX) ? resolveDocumentRef({ catalogId: ref.assetId, providerId: ref.providerId, sourceId: ref.sourceId }, null) : null;
+    const documentId = r && 'hit' in r ? r.hit.assetId : ref.assetId;
+    return { via: 'library', libraryProjectId: ref.sourceId, documentId };
+  }
+  // plan-780 D2: in library B an unqualified reference is B's, never the open project's.
+  if (scope && !hasLegacyHint(ref)) {
+    if (!ref.assetId) return { via: 'unresolvable', reason: 'no-locator' };
+    const r = resolveDocumentRef({ catalogId: ref.assetId }, scope);
+    if ('hit' in r && r.hit.registered.providerId === LIBRARY_PROJECTS_PROVIDER_ID) {
+      return { via: 'library', libraryProjectId: r.hit.registered.source.id, documentId: r.hit.assetId };
+    }
+    // Still loading: B's document as written.
+    if ('pending' in r) return { via: 'library', libraryProjectId: r.source?.sourceId ?? scope.sourceId, documentId: ref.assetId };
+    return { via: 'unresolvable', reason: 'unknown-asset' };
   }
   if (ref.providerId && ref.sourceId) {
     return {
@@ -134,4 +159,63 @@ export function planReferencedAssetOpen(
   // An assetId with no row and no path is a reference into a project this one
   // cannot see — §2.8's placeholder case, reported rather than guessed at.
   return { via: 'unresolvable', reason: ref.assetId ? 'unknown-asset' : 'no-locator' };
+}
+
+/** The referrer: the document the reference is written in. */
+export interface ReferrerContext {
+  /** Library B's qualifier, or null = the open project. */
+  scope: DocumentScope;
+  /** The open project's manifest (for a null scope). */
+  project: RvProject | null | undefined;
+  /** Project-relative path of the referrer (null = not a manifest document). */
+  ownerPath: string | null;
+}
+
+/** Builds a library document's base (injected; keeps this module pure). */
+export type LibraryBaseOf = (libraryProjectId: string, documentId: string) => AssetDraftBase | null;
+
+/** The base to open, or why there is none. */
+export type ScopedOpen =
+  | { ok: true; base: AssetDraftBase; plan: ReferencedAssetPlan }
+  | { ok: false; reason: string; plan: ReferencedAssetPlan };
+
+/**
+ * plan-780 2.3 — THE open helper: reference + referrer scope → editor base
+ * (`document` / `libraryDocument` / `referencedAsset`); never an open-project row
+ * for a reference written in a library document.
+ */
+export function openDocumentScoped(
+  ref: ReferencedAssetLocator,
+  referrer: ReferrerContext,
+  libraryBaseOf: LibraryBaseOf,
+  label = '',
+): ScopedOpen {
+  const plan = planReferencedAssetOpen(ref, referrer.project, referrer.ownerPath, referrer.scope);
+  const name = label || ref.path?.split('/').pop() || ref.assetId;
+  switch (plan.via) {
+    case 'library': {
+      const base = libraryBaseOf(plan.libraryProjectId, plan.documentId);
+      return base
+        ? { ok: true, base, plan }
+        : { ok: false, reason: `Library '${plan.libraryProjectId}' is not available or no longer lists "${plan.documentId}".`, plan };
+    }
+    case 'manifest': {
+      const row = findDocumentById(referrer.project, plan.assetId);
+      return { ok: true, base: { kind: 'document', documentId: plan.assetId, path: plan.relPath, name: row?.name || name }, plan };
+    }
+    case 'catalog':
+      return { ok: true, base: { kind: 'referencedAsset', assetId: plan.assetId, providerId: plan.providerId, sourceId: plan.sourceId, label: name }, plan };
+    case 'path':
+      return { ok: true, base: { kind: 'referencedAsset', assetId: ref.assetId, path: plan.relPath, label: name }, plan };
+    default:
+      return {
+        ok: false,
+        reason: plan.reason === 'no-locator'
+          ? 'The reference names no asset to open.'
+          : referrer.scope
+            ? `"${ref.assetId}" is missing in library '${referrer.scope.sourceId}'.`
+            : `No document with id "${ref.assetId}" is known in this project.`,
+        plan,
+      };
+  }
 }

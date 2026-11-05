@@ -9,7 +9,8 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { BoxGeometry, Mesh, MeshBasicMaterial, PerspectiveCamera, Scene } from 'three';
+import { BoxGeometry, Group, Mesh, MeshBasicMaterial, PerspectiveCamera, Scene } from 'three';
+import { objectToGlb } from '../src/core/import/rv-import-object';
 import { createTestViewer, type TestViewerHandle } from './helpers/create-test-viewer';
 import type { RenderStrategy, RenderStrategyContext } from '../src/core/engine/rv-render-strategy';
 import { RaycastManager } from '../src/core/engine/rv-raycast-manager';
@@ -65,14 +66,19 @@ describe('viewer.pointerPickBlocked (plan-2215 2.6)', () => {
   it('measurement tool: no points and no cursor under an active strategy, a running tap is dropped', async () => {
     handle = await createTestViewer('webgl', { width: 320, height: 240 });
     const viewer = handle.viewer;
-    viewer.loop.stop();
+    // A real (baked) model: the measurement tool picks through the pick
+    // pipeline (`raycastSurface`), which a raw mesh in the scene never reaches.
+    const root = new Group();
+    root.name = 'PickBlocked';
     const box = new Mesh(new BoxGeometry(1, 1, 1), new MeshBasicMaterial());
-    viewer.scene.add(box);
+    box.name = 'Box';
+    root.add(box);
+    await viewer.loadModel('pick-blocked.glb', { data: await objectToGlb(root) });
+    viewer.loop.stop();
     const cam = viewer.camera as PerspectiveCamera;
     cam.position.set(0, 0, 5);
     cam.lookAt(0, 0, 0);
     cam.updateMatrixWorld(true);
-    box.updateMatrixWorld(true);
     const m = new MeasurementPlugin();
     m.onModelLoaded({ drives: [] } as unknown as LoadResult, viewer);
     m.measurementMode = true;

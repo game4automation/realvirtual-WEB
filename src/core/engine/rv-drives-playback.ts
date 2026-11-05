@@ -107,6 +107,8 @@ export class RVDrivesPlayback {
   private _startFrame = 0;
   private _endFrame = 0;
   private _pendingRelease = false;
+  get hasPendingWork(): boolean { return this._pendingRelease; }
+  get hasRecording(): boolean { return this.recording.numberFrames > 0; }
 
   /** ActiveOnly mode parsed from DrivesRecorder GLB extras. */
   activeOnly: ActiveOnly = 'Always';

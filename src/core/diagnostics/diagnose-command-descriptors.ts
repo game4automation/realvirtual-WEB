@@ -32,6 +32,11 @@ const descriptors: readonly CommandDescriptor<never, unknown>[] = [
     impl: () => import('./diagnose-commands').then(m => m.problemsList as CommandImpl<never, unknown>),
   },
   {
+    id: 'problems.ack', label: 'Acknowledge problems', scope: 'none', readOnly: false, toolClass: 'edit',
+    available: true, unavailableReason: 'Problems unavailable', argsSchema: { id: 'string', code: 'string' },
+    impl: () => import('./diagnose-commands').then(m => m.problemsAck as CommandImpl<never, unknown>),
+  },
+  {
     id: 'diag.blockage', label: 'blockage', scope: 'none', readOnly: true,
     available: true, unavailableReason: 'Diagnostics unavailable', argsSchema: {},
     impl: () => import('./blockage-commands').then(m => m.blockage as CommandImpl<never, unknown>),

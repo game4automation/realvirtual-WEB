@@ -18,6 +18,11 @@ import { MaintenancePanel } from './MaintenancePanel';
 import { useOverlayVisible } from '../../hooks/use-overlay-visible';
 import { registerOverlayProducer, unregisterOverlayProducer } from '../overlay-visibility-store';
 import { useActiveContexts, evaluateVisibilityRule } from './ui-context-store';
+import { useCollisionAlert } from './collision-alert-store';
+import { useDropAlert } from './drop-alert-store';
+
+/** Shown in every mode, also where other messages are hidden (Thomas 2026-11-04). */
+const ALWAYS_SHOWN_PLUGINS = new Set(['web-error', 'collision-alert', 'drop-alert']);
 
 /** Core layout container for messages (right side). Renders 'messages' slot entries.
  *  When maintenance mode is active, swaps to the MaintenancePanel stepper.
@@ -37,7 +42,10 @@ export function MessagePanel({ alarmsOnly = false }: { alarmsOnly?: boolean }) {
     (cb) => viewer.errorStore.subscribe(cb),
     () => viewer.errorStore.getCount(),
   );
-  const entries = allEntries.filter((e) => !alarmsOnly || e.pluginId === 'web-error').filter(
+  const collisionCount = useCollisionAlert().pairs.length;
+  const dropCount = useDropAlert().drops.length;
+  const findingCount = alarmCount + collisionCount + dropCount;
+  const entries = allEntries.filter((e) => !alarmsOnly || ALWAYS_SHOWN_PLUGINS.has(e.pluginId ?? '')).filter(
     (e) => !e.visibilityRule || evaluateVisibilityRule(e.visibilityRule, contexts),
   );
   const isMobile = useMobileLayout();
@@ -54,14 +62,14 @@ export function MessagePanel({ alarmsOnly = false }: { alarmsOnly?: boolean }) {
   // the 'status' category. Content-driven presence (register only while there is
   // something to show), registered BEFORE the visibility gate.
   const catVisible = useOverlayVisible('status');
-  const hasStatusContent = isMaintenanceActive || (messagePanelOpen && entries.length > 0 && (!alarmsOnly || alarmCount > 0));
+  const hasStatusContent = isMaintenanceActive || (messagePanelOpen && entries.length > 0 && (!alarmsOnly || findingCount > 0));
   useEffect(() => {
     if (!hasStatusContent) return;
     registerOverlayProducer('status');
     return () => unregisterOverlayProducer('status');
   }, [hasStatusContent]);
 
-  if (alarmsOnly && alarmCount === 0) return null;
+  if (alarmsOnly && findingCount === 0) return null;
   if (!catVisible) return null; // 'status' overlay category switched off
 
   // ── Maintenance Mode: show MaintenancePanel instead of messages ──

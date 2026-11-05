@@ -31,7 +31,8 @@ import { RvDocument } from '../src/core/ops/rv-document';
 import type { RvSceneOp } from '../src/core/ops/rv-unified-ops';
 import { freshOpId } from '../src/core/ops/rv-op-utils';
 import { applyForward, applyInverse } from '../src/core/hmi/scene/rv-scene-executors';
-import { setActiveEditTarget, type EditTarget } from '../src/core/hmi/rv-edit-target';
+import { getActiveEditTarget, setActiveEditTarget, type EditTarget } from '../src/core/hmi/rv-edit-target';
+import { enqueueBind } from '../src/core/hmi/rv-bind-queue';
 import { ComponentSection } from '../src/core/hmi/rv-component-section';
 import { rvDarkTheme } from '../src/core/hmi/theme';
 import { RVViewerProvider } from '../src/hooks/use-viewer';
@@ -191,6 +192,9 @@ describe('FMU units demo — unbound fixture, standalone (plan-512 F12)', () => 
       // Unbind: the number stays, the badge goes.
       const unbind = view.container.querySelector<HTMLElement>('button[aria-label="unbind Position"]')!;
       fireEvent.click(unbind);
+      // Unbinds run in the per-document bind queue since plan-2233 (mappings read inside the job):
+      // wait for that queue, then for the document.
+      await enqueueBind(getActiveEditTarget(), async () => {});
       await l.doc.whenIdle();
       view.rerender(inspector(l));
       expect((l.ball.node.userData.realvirtual as Record<string, Record<string, unknown>>)[FP].Scale).toBe(1000);

@@ -31,8 +31,9 @@
 
 import { lazy, Suspense, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { Box, Button, Divider, IconButton, Stack, TextField, Typography } from '@mui/material';
-import { Close } from '@mui/icons-material';
-import { RV_SCROLL_CLASS } from '../shared-sx';
+import { Close, ViewInArOutlined } from '@mui/icons-material';
+import { ACCENT_BORDER, FS, INK_LOW, INK_MID, LABEL_CHIP_SX, RV_SCROLL_CLASS } from '../shared-sx';
+import { formatRelativeAge } from '../rv-node-knowledge-field-renderer';
 import { SectionHeader } from '../shared-components';
 import { LazyMarkdown } from '../rv-markdown-lazy';
 
@@ -185,6 +186,16 @@ export interface DetailAction {
   destructive?: boolean;
 }
 
+/** The document facts the preview card shows as corner chips. */
+export interface PreviewInfo {
+  /** File type, e.g. `GLB`. */
+  type?: string | null;
+  /** Last change, ISO-8601. */
+  modified?: string | null;
+  /** Size, already formatted (`6.0 MB`). */
+  size?: string | null;
+}
+
 export interface ProjectsDetailPaneProps {
   /** Headline — usually the asset / scene / project name. */
   title: string | null;
@@ -192,6 +203,23 @@ export interface ProjectsDetailPaneProps {
   subtitle?: string | null;
   /** Optional preview image URL. */
   thumbnailUrl?: string | null;
+  /**
+   * Several selected documents: drawn as a stack of placeholder cards with the
+   * count, plus their names, in place of the preview image.
+   */
+  stack?: { names: readonly string[] } | null;
+  /**
+   * Show the card's "No preview" tile when there is no picture (or it does not
+   * load), so a document always gets the big preview square.
+   */
+  previewPlaceholder?: boolean;
+  /**
+   * Facts drawn as chips on the preview's corners — type top-right, modified
+   * (relative, exact date on hover) bottom-left, size bottom-right.
+   */
+  previewInfo?: PreviewInfo | null;
+  /** A control on the preview's top-left corner — the document's open-mode chip. */
+  previewModeControl?: ReactNode;
   /** Badge text, e.g. "Sample" for bundled entries. */
   badge?: string | null;
   /**
@@ -221,6 +249,8 @@ export interface ProjectsDetailPaneProps {
    * union of every selection's fields in here eventually.
    */
   extra?: ReactNode;
+  /** Controls below the verbs, at the very bottom of the pane (the document description). */
+  footer?: ReactNode;
   /**
    * Commit a new name for the selection, making the title editable in place.
    *
@@ -278,18 +308,26 @@ export function ProjectsDetailPane({
   title,
   subtitle,
   thumbnailUrl,
+  stack,
+  previewPlaceholder = false,
+  previewInfo,
+  previewModeControl,
   badge,
   badges = [],
   fields = [],
   actions = [],
   description,
   extra,
+  footer,
   onRename,
   markdown,
   variant = 'column',
   onClose,
 }: ProjectsDetailPaneProps) {
   const sheet = variant === 'sheet';
+  // A picture that fails to load falls back to the placeholder, like the card.
+  const [failedThumb, setFailedThumb] = useState<string | null>(null);
+  const showImage = !!thumbnailUrl && thumbnailUrl !== failedThumb;
   const [editValue, setEditValue] = useState<string | null>(null);
   // A different selection means a different name — never carry a half-typed
   // rename from one asset onto the next.
@@ -479,21 +517,31 @@ export function ProjectsDetailPane({
             className={RV_SCROLL_CLASS}
             sx={{ flex: 1, minHeight: 0, overflowY: 'auto', p: 1.5 }}
           >
-          {thumbnailUrl && (
-            <Box
-              component="img"
-              src={thumbnailUrl}
-              alt={title}
-              sx={{
-                width: '100%',
-                aspectRatio: '1',
-                objectFit: 'cover',
-                borderRadius: 1,
-                bgcolor: 'rgba(255,255,255,0.05)',
-                mb: 1,
-              }}
-            />
+          {stack && <SelectionStack names={stack.names} />}
+          {!stack && (showImage || previewPlaceholder) && (
+            // The preview card: the picture (or the "No preview" tile) with the
+            // open-mode control on its corner; the facts sit in a row below it.
+            <Box data-testid="projects-detail-preview" sx={{ position: 'relative', mb: 0.75 }}>
+              {showImage ? (
+                <Box
+                  component="img"
+                  onError={() => setFailedThumb(thumbnailUrl)}
+                  src={thumbnailUrl}
+                  alt={title}
+                  sx={{
+                    display: 'block',
+                    width: '100%',
+                    aspectRatio: '1',
+                    objectFit: 'cover',
+                    borderRadius: 1,
+                    bgcolor: 'rgba(255,255,255,0.05)',
+                  }}
+                />
+              ) : <NoPreviewTile />}
+              <PreviewCorner control={previewModeControl} />
+            </Box>
           )}
+          {!stack && (showImage || previewPlaceholder) && <PreviewInfoRow info={previewInfo} />}
 
           {subtitle && (
             <Typography sx={{ fontSize: 11, color: 'text.secondary', mt: 0.25 }}>
@@ -532,9 +580,10 @@ export function ProjectsDetailPane({
 
           {shownActions.length > 0 && (
             <>
-              <Divider sx={{ my: 1.25, borderColor: 'rgba(255,255,255,0.06)' }} />
-              <SectionHeader>Actions</SectionHeader>
-              <Stack spacing={0.5} sx={{ mt: 0.5 }}>
+              <Divider sx={{ my: 1, borderColor: 'rgba(255,255,255,0.06)' }} />
+              {/* No heading: the buttons say what they are. The group keeps
+                  the name for assistive technology. */}
+              <Stack role="group" aria-label="Actions" spacing={0.5}>
                 {shownActions.map(a => (
                   <Box key={a.key}>
                     <Button
@@ -544,7 +593,18 @@ export function ProjectsDetailPane({
                       color={a.destructive ? 'error' : 'primary'}
                       disabled={a.disabled}
                       onClick={a.onClick}
-                      sx={{ fontSize: 11, textTransform: 'none', justifyContent: 'flex-start' }}
+                      sx={{
+                        fontSize: FS.label,
+                        textTransform: 'none',
+                        justifyContent: 'flex-start',
+                        minHeight: 0,
+                        height: 26,
+                        py: 0,
+                        px: 1,
+                        lineHeight: 1,
+                        // Quieter outlines: the filled primary carries the weight.
+                        ...(!a.primary && !a.destructive ? { borderColor: ACCENT_BORDER } : {}),
+                      }}
                     >
                       {a.label}
                     </Button>
@@ -559,8 +619,199 @@ export function ProjectsDetailPane({
               </Stack>
             </>
           )}
+
+          {footer}
           </Box>
         </>
+      )}
+    </Box>
+  );
+}
+
+/** How many names the stack lists before "+N more". */
+const STACK_NAME_LIMIT = 6;
+
+/**
+ * A multi-selection as a stack of up to three placeholder cards, the count on
+ * the top card, and the names below. Placeholders on purpose: loading every
+ * selected document's preview for a pile nobody inspects card by card would
+ * cost reads for nothing.
+ */
+function SelectionStack({ names }: { names: readonly string[] }) {
+  const layers = Math.min(names.length, 3);
+  const shown = names.slice(0, STACK_NAME_LIMIT);
+  const more = names.length - shown.length;
+  return (
+    <Box data-testid="projects-detail-stack" sx={{ mb: 1 }}>
+      <Box sx={{ position: 'relative', width: '100%', aspectRatio: '1.4', mb: 1 }}>
+        {Array.from({ length: layers }, (_, i) => {
+          // i = 0 is the back card; the top card is drawn last.
+          const depth = layers - 1 - i;
+          return (
+            <Box
+              key={i}
+              sx={{
+                position: 'absolute',
+                inset: 0,
+                m: 'auto',
+                width: '72%',
+                height: '78%',
+                transform: `translate(${depth * 9}px, ${-depth * 9}px) rotate(${depth * 3}deg)`,
+                borderRadius: 1,
+                border: 1,
+                borderColor: 'divider',
+                bgcolor: depth === 0 ? 'grey.900' : 'background.default',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+              }}
+            >
+              {depth === 0 && (
+                <>
+                  <ViewInArOutlined sx={{ fontSize: 36, color: INK_LOW }} />
+                  <Typography
+                    sx={{
+                      position: 'absolute', top: 6, right: 8,
+                      fontSize: FS.label, fontWeight: 600, fontFamily: 'monospace',
+                      color: INK_MID,
+                    }}
+                  >
+                    {names.length}
+                  </Typography>
+                </>
+              )}
+            </Box>
+          );
+        })}
+      </Box>
+      <Stack spacing={0.25}>
+        {shown.map((name, i) => (
+          <Typography
+            key={`${i}:${name}`}
+            title={name}
+            sx={{ fontSize: FS.label, color: 'text.secondary', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+          >
+            {name}
+          </Typography>
+        ))}
+        {more > 0 && (
+          <Typography sx={{ fontSize: FS.label, color: 'text.disabled' }}>+{more} more</Typography>
+        )}
+      </Stack>
+    </Box>
+  );
+}
+
+/**
+ * The big preview square of a document without a picture — the same cube icon
+ * and "No preview" label as the card's placeholder tile, at pane size.
+ */
+function NoPreviewTile() {
+  return (
+    <Box
+      data-testid="projects-detail-no-preview"
+      sx={{
+        width: '100%',
+        aspectRatio: '1',
+        borderRadius: 1,
+        bgcolor: 'rgba(255,255,255,0.05)',
+        border: '1px dashed rgba(255,255,255,0.12)',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 0.75,
+      }}
+    >
+      <ViewInArOutlined sx={{ fontSize: 64, color: 'rgba(255,255,255,0.45)' }} />
+      <Typography sx={{ fontSize: FS.label, color: INK_LOW, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+        No preview
+      </Typography>
+    </Box>
+  );
+}
+
+/**
+ * The box of the open-mode chip on the preview card — a touch larger than a
+ * label chip, since it is the card's one control. Shared by the menu chip and
+ * the plain chip a demo shows, so both sit identically.
+ */
+export const PREVIEW_MODE_CHIP_BOX = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  height: 22,
+  py: 0,
+  px: 1,
+  lineHeight: 1,
+  fontSize: FS.label,
+} as const;
+
+/**
+ * An info chip in the row under the preview (type, age, size): the shared
+ * chip's type and padding, but quiet — a faint fill instead of a border.
+ */
+const INFO_CHIP_SX = {
+  ...LABEL_CHIP_SX,
+  display: 'inline-flex',
+  alignItems: 'center',
+  height: 20,
+  py: 0,
+  lineHeight: 1,
+  borderColor: 'transparent',
+  bgcolor: 'rgba(255,255,255,0.05)',
+  color: INK_MID,
+  minWidth: 0,
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+} as const;
+
+/** "29 Oct 2026, 11:39" — English like the rest of the pane. */
+function exactDate(iso: string): string | null {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return null;
+  return new Date(t).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+/** The caller's control on the preview's top-left corner (the open mode). */
+function PreviewCorner({ control }: { control?: ReactNode }) {
+  if (!control) return null;
+  return (
+    <Box sx={{ position: 'absolute', top: 6, left: 6, right: 6, display: 'flex', minWidth: 0 }}>
+      {control}
+    </Box>
+  );
+}
+
+/** Type, age (exact date on hover) and size — one quiet row under the preview card. */
+function PreviewInfoRow({ info }: { info?: PreviewInfo | null }) {
+  const age = info?.modified ? formatRelativeAge(info.modified) : null;
+  if (!info?.type && !age && !info?.size) return null;
+  return (
+    <Box data-testid="projects-detail-info-row" sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mb: 0.75 }}>
+      {info?.type && (
+        <Box component="span" data-testid="projects-detail-chip-type" sx={INFO_CHIP_SX}>
+          {info.type}
+        </Box>
+      )}
+      {age && (
+        <Box
+          component="span"
+          data-testid="projects-detail-chip-modified"
+          title={`Modified ${exactDate(info!.modified!) ?? info!.modified}`}
+          sx={INFO_CHIP_SX}
+        >
+          {age}
+        </Box>
+      )}
+      {info?.size && (
+        <Box
+          component="span"
+          data-testid="projects-detail-chip-size"
+          title="File size"
+          sx={{ ...INFO_CHIP_SX, fontFamily: 'monospace' }}
+        >
+          {info.size}
+        </Box>
       )}
     </Box>
   );

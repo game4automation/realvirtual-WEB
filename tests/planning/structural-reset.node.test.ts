@@ -131,7 +131,7 @@ function harness(opts: {
     signal: () => abort.signal,
     boundTimeoutMs: 200,
   }));
-  registry.declare({
+  const handle = registry.declare({
     owner: 'yard',
     title: 'Yard',
     params: PARAMS,
@@ -147,6 +147,7 @@ function harness(opts: {
   return {
     viewer,
     registry,
+    handle,
     calls,
     changeDocument(id: string) { documentLoadId = id; abort.abort(); abort = new AbortController(); },
   };
@@ -327,6 +328,50 @@ describe('structural reset (plan-630 §2.5a)', () => {
     h.calls.length = 0;
     await h.registry.applyPendingAndReset();
     expect(h.calls).toEqual([]);
+  });
+
+  it('a failed reconcile recovers committed to the restored structure; a change meanwhile stays pending (plan-681 F2)', async () => {
+    let first = true;
+    const h = harness({
+      onStructuralReset: async () => {
+        if (!first) return;
+        first = false;
+        // The owner rolled back to the document (slots 6) while the user set slots = 2.
+        h.registry.set('yard.slots', 2, 'ui');
+        expect(h.handle.recoverCommitted({ slots: 6 }).ok).toBe(true);
+        throw new Error('placement failed');
+      },
+    });
+    h.registry.loadScenario({ 'yard.slots': 8 });
+    const r = await h.registry.reconcileStructure('yard');
+    expect(r.error).toBe('materialize-failed');
+    expect(h.viewer.resets).toBe(1);
+    const state = h.registry.list().find((p) => p.key === 'yard.slots');
+    expect(state?.value).toBe(6);
+    expect(state?.pending).toBe(2);
+    const ids = getProblems().map((p) => p.id);
+    expect(ids).toContain('planning-apply-failed');
+    expect(ids).toContain('planning-committed-recovered:yard');
+    expect((await h.registry.applyPendingAndReset()).ok).toBe(true);
+    expect(h.handle.get('slots')).toBe(2);
+    expect(getProblems().map((p) => p.id)).not.toContain('planning-committed-recovered:yard');
+  });
+
+  it('refuses a recovery the declaration rejects, changing nothing, as a Problems entry', () => {
+    const h = harness();
+    h.registry.loadScenario({ 'yard.slots': 8 });
+    expect(h.handle.recoverCommitted({ slots: 99 }).ok).toBe(false);
+    expect(h.handle.get('slots')).toBe(8);
+    expect(getProblems().find((p) => p.id === 'planning-committed-recovered:yard')?.code).toBe('planning-committed-recovery-failed');
+  });
+
+  it('a retired owner takes its recovery warning with it', () => {
+    const h = harness();
+    h.registry.loadScenario({ 'yard.slots': 8 });
+    expect(h.handle.recoverCommitted({ slots: 6 }).ok).toBe(true);
+    expect(getProblems().map((p) => p.id)).toContain('planning-committed-recovered:yard');
+    h.handle.dispose();
+    expect(getProblems().map((p) => p.id)).not.toContain('planning-committed-recovered:yard');
   });
 
   it('answers unknown-owner for a reconcile of something nobody declared', async () => {

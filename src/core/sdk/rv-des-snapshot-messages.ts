@@ -19,12 +19,16 @@ export const SNAPSHOT_MESSAGES = {
     "text": "A component has no stable ID for saving. Assign stable IDs to the affected components, then start a new run."
   },
   "des-snapshot-unsupported-component": {
-    "title": "Logic cannot be saved",
-    "text": "LogicSteps, PLC programs, IK paths or a replay are running. Models with them cannot be saved or loaded in this version. Stop or remove them, or continue without saving."
+    "title": "Cannot be saved yet",
+    "text": "A PLC program, IK path, replay, playback, smooth-motion drive, unsupported logic step or a gripped part is active. Stop it, or continue without saving."
   },
   "des-snapshot-scripts-pending": {
     "title": "Run still starting",
     "text": "The run is waiting for its scripts to load and has not started its components yet. Wait until the run has started, then save or load the snapshot."
+  },
+  "des-snapshot-plc-pending": {
+    "title": "PLC program still loading",
+    "text": "A PLC program is still being deployed. Wait until it has loaded, then save or load the snapshot."
   },
   "des-snapshot-agv-busy": {
     "title": "AGV is busy",
@@ -62,13 +66,17 @@ export const SNAPSHOT_MESSAGES = {
     "title": "Script state not declared",
     "text": "A script has state that cannot be restored safely. Declare persistent state with self.persist(...), then start a new run."
   },
+  "des-plc-not-event-suitable": {
+    "title": "PLC program cannot run on events",
+    "text": "A PLC program never settles in event-driven DES. Fix the lines marked DES: in the PLC editor."
+  },
   "des-batch-logic-unsupported": {
     "title": "Experiments not available",
-    "text": "Experiments cannot run on models with logic steps, PLC programs or IK paths yet. The logic would not advance during the batch. Remove them from the model, or run the simulation live instead."
+    "text": "Experiments cannot run on IK paths, smooth-motion drives or logic steps that cannot run on events. The detail names them. Remove them, or run the simulation live."
   },
   "des-fastforward-logic-warning": {
     "title": "Logic timing is not exact",
-    "text": "This model has logic steps, PLC programs or IK paths. In fast forward and hybrid mode their cycles are counted wrongly, so results can differ from a live run. Use animated mode for exact logic timing."
+    "text": "This model has IK paths, smooth-motion drives or logic that cannot run on events. In fast forward and hybrid mode their cycles are counted wrongly. Use animated mode for exact timing."
   },
   "rng-version-unknown": {
     "title": "Unknown random generator version",

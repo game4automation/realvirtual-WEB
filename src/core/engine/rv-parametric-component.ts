@@ -81,8 +81,11 @@ export interface ParametricUse {
   FamilyNodeId: string;
   /** Document hash of the child family; changing the child document changes the parent `InputHash`. */
   DocHash: string;
-  /** Optional relative path fallback of the child asset (`AssetReference.path`). */
+  /** Optional relative path fallback (`AssetReference.path`); never for a project document (plan-780 R4). */
   Path?: string;
+  /** plan-780 R4: qualifier when the child is another project's document. */
+  ProviderId?: string;
+  SourceId?: string;
 }
 
 /** Most declared child families per family. */
@@ -306,6 +309,11 @@ function parseUses(raw: unknown, errors: string[]): ParametricUse[] | undefined 
     if (e.Path !== undefined) {
       if (typeof e.Path !== 'string') errors.push(`Uses[${i}].Path must be a string`);
       else use.Path = e.Path;
+    }
+    // plan-780 R4: an optional qualifier pair — both halves or neither.
+    if (typeof e.ProviderId === 'string' && e.ProviderId && typeof e.SourceId === 'string' && e.SourceId) {
+      use.ProviderId = e.ProviderId;
+      use.SourceId = e.SourceId;
     }
     out.push(use);
   });

@@ -67,6 +67,8 @@ export interface AuthoringIdentity {
 
 export interface AuthoringLoadOptions {
   identity: AuthoringIdentity;
+  /** plan-778: the document is this library's (Edit in library) — its references resolve there. */
+  library?: { providerId: string; sourceId: string };
   /**
    * plan-774 F6: keep the baked placed assets of the PREVIOUS document for
    * this load (`viewer.loadModel({ keepBaked })` → `clearModel` →
@@ -129,7 +131,7 @@ export function isSupersededLoadError(e: unknown): boolean {
 export interface AuthoringLoadViewer {
   loadModel(url: string, options?: {
     preserveHierarchy?: boolean; preserveAuthoringHierarchy?: boolean; data?: ArrayBuffer;
-    keepBaked?: boolean; holdKept?: boolean;
+    keepBaked?: boolean; holdKept?: boolean; library?: { providerId: string; sourceId: string };
   }): Promise<unknown>;
   whenSceneReady(): Promise<void>;
   readonly currentModelRoot: Object3D | null;
@@ -153,7 +155,8 @@ export async function loadAuthoringModel(
 ): Promise<AuthoringLoadResult> {
   try {
     const keep = opts.keepBaked ? { keepBaked: true, ...(opts.holdKept ? { holdKept: true } : {}) } : { keepBaked: false };
-    await viewer.loadModel(url, opts.data ? { ...AUTHORING_LOAD_FLAGS, ...keep, data: opts.data } : { ...AUTHORING_LOAD_FLAGS, ...keep });
+    const lib = opts.library ? { library: opts.library } : {};
+    await viewer.loadModel(url, opts.data ? { ...AUTHORING_LOAD_FLAGS, ...keep, ...lib, data: opts.data } : { ...AUTHORING_LOAD_FLAGS, ...keep, ...lib });
   } catch (e) {
     if (isSupersededLoadError(e)) return { ok: false, reason: 'superseded' };
     throw e;

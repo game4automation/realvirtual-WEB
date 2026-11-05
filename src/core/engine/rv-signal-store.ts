@@ -17,6 +17,7 @@
  * Foundation for future React HMI binding (useSignal hook).
  */
 import { debug } from './rv-debug';
+import type { SignalValue } from '../sim-event-facade';
 import type { UnitDef } from './rv-units';
 import {
   deriveSignalActivity,
@@ -295,6 +296,26 @@ interface ListenerRef {
 }
 
 export class SignalStore {
+  private readonly writeObservers = new Set<(batch: ReadonlyMap<string, SignalValue>) => void>();
+  private readonly valuesRestoredListeners = new Set<() => void>();
+
+  observeWrites(cb: (batch: ReadonlyMap<string, SignalValue>) => void): () => void {
+    this.writeObservers.add(cb);
+    return () => { this.writeObservers.delete(cb); };
+  }
+
+  onValuesRestored(cb: () => void): () => void {
+    this.valuesRestoredListeners.add(cb);
+    return () => { this.valuesRestoredListeners.delete(cb); };
+  }
+
+  /** Replace values without replaying component inputs or generating write batches. */
+  restoreValuesSilently(values: ReadonlyMap<string, SignalValue>): void {
+    for (const name of this.byName.keys()) if (!values.has(name)) this.byName.delete(name);
+    for (const [name, value] of values) this.byName.set(name, value);
+    this._version++;
+    for (const cb of this.valuesRestoredListeners) cb();
+  }
   /** Canonical value store keyed by name (Signal.Name if set, otherwise node name). */
   private byName = new Map<string, boolean | number>();
   /** Path → name mapping for path-based access. */
@@ -800,6 +821,10 @@ export class SignalStore {
         cb(value);
       }
     }
+    if (this.writeObservers.size !== 0) {
+      const batch = new Map([[name, this.byName.get(name) ?? value]]);
+      for (const cb of this.writeObservers) cb(batch);
+    }
     return true;
   }
 
@@ -1263,6 +1288,11 @@ export class SignalStore {
       // Remote write-through moved force pins — notify force subscribers once
       // per batch (badges re-read the pinned value).
       if (forcePinsChanged) this._notifyForce();
+      if (this.writeObservers.size !== 0 && changedNames.length > 0) {
+        const batch = new Map<string, SignalValue>();
+        for (let i = 0; i < changedNames.length; i++) batch.set(changedNames[i], this.byName.get(changedNames[i]) ?? changedValues[i]);
+        for (const cb of this.writeObservers) cb(batch);
+      }
     } finally {
       if (!reentrant) this._setManyActive = false;
     }

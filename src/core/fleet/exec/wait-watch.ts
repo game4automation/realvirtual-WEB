@@ -33,7 +33,8 @@ export function waitTimeoutProblemId(vehicle: string, kind: string): string {
   return `${FLEET_WAIT_TIMEOUT_CODE}:${vehicle}:${kind}`;
 }
 
-export interface WaitCause { order?: string; waitingFor: string; heldBy?: string; extra?: string; waiterId?: string; resourceId?: string; ownerIds?: string[]; nodePath?: string }
+/** `ownerMUs`: the owners are MU ids (an occupied drop input), not vehicles - never mapped onto units. */
+export interface WaitCause { order?: string; waitingFor: string; heldBy?: string; extra?: string; waiterId?: string; resourceId?: string; ownerIds?: string[]; nodePath?: string; ownerMUs?: boolean }
 export function formatWaitCause(vehicle: string, cause: WaitCause): string {
   return `Vehicle: ${vehicle}\nOrder: ${cause.order ?? 'none'}\nWaiting for: ${cause.waitingFor}\nHeld by: ${cause.heldBy ?? 'unknown'}`
     + (cause.extra ? `\n${cause.extra}` : '');
@@ -119,6 +120,8 @@ function isJson(v: unknown): v is JsonValue {
 /** The generic watcher of all wait states (plan-559 F8). */
 export class WaitWatch implements WaitEdgeSource {
   readonly id = 'fleet';
+  /** Waiters and vehicle owners are fleet ids: the registry maps DES-bound ones onto their units (plan-2241). */
+  readonly vehicles = true;
 
   /** Read-only pull: do not poll deadlines or invalidate waits while diagnosing. */
   edges(_now: number): readonly WaitEdge[] {
@@ -129,7 +132,7 @@ export class WaitWatch implements WaitEdgeSource {
       if (!cause || typeof cause === 'string' || !cause.resourceId) continue;
       out.push({ waiterId: cause.waiterId ?? w.vehicle, resourceId: cause.resourceId,
         ownerIds: [...(cause.ownerIds ?? [])], kind: `fleet:${w.kind}`, sinceSimSec: w.start,
-        analysed: true, nodePath: cause.nodePath });
+        analysed: true, nodePath: cause.nodePath, ...(cause.ownerMUs ? { ownerMUs: true } : {}) });
     }
     return out;
   }

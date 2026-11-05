@@ -711,7 +711,9 @@ function completeCycle(self: RobotHandlingSelf, payload: CyclePayload): void {
   self.prop.cycle = null;
   setBusy(self, false);
   self.statCycleEnd();
-  if (committed) self.statOutput(currentCycle.n);
+  // No self.statOutput here: commitMany → MaterialFlowAdapter.commitReservation
+  // already counts the n hand-overs (recordOutput), and only when they commit.
+  // statOutput is forwarded to the same recordOutput in DES and double-counted.
   updatePartCount(self);
 
   if (self.prop.failurePending === true) {

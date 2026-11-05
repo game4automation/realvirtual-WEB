@@ -27,6 +27,7 @@ import { AssetCard, type AssetCardGlyph } from '../../library/AssetCard';
 import type { LibraryCatalogEntry } from '../../library/library-types';
 import type { ProjectBackend } from '../../project/backends/project-backend';
 import { useThumbnailUrl } from '../../thumbnails/rv-thumbnail-url-store';
+import type { SelectModifiers } from './document-multi-select';
 
 /**
  * Two pointer clicks on one card within this window are a double-click.
@@ -49,7 +50,8 @@ export interface ProjectCardModel {
   entry: LibraryCatalogEntry;
   tier: 'bundled' | 'user';
   selected: boolean;
-  onSelect: () => void;
+  /** A click selects; Ctrl/Cmd and Shift are passed on for multi-select. */
+  onSelect: (mods?: SelectModifiers) => void;
   /**
    * The card's default action — double-click. Opening is what a user means by
    * double-clicking a card everywhere else in the product, so a card that can
@@ -154,16 +156,21 @@ export function ProjectCard({ card, touchInput = false, cornerBadge }: ProjectCa
     const now = performance.now();
     // AssetCard forwards Enter/Space as a KeyboardEvent, whose `detail` is 0.
     const isPointer = (e.detail ?? 0) > 0;
-    if (isPointer && card.onOpen && now - lastClickAt.current <= DOUBLE_CLICK_MS) {
+    const modified = e.ctrlKey || e.metaKey || e.shiftKey;
+    // Quick Ctrl/Shift clicks are multi-select, never a double-click open.
+    if (isPointer && !modified && card.onOpen && now - lastClickAt.current <= DOUBLE_CLICK_MS) {
       lastClickAt.current = 0;
       open();
       return;
     }
-    lastClickAt.current = isPointer ? now : 0;
-    card.onSelect();
+    lastClickAt.current = isPointer && !modified ? now : 0;
+    card.onSelect({ toggle: e.ctrlKey || e.metaKey, range: e.shiftKey });
   };
   const handleDoubleClick = card.onOpen
-    ? () => { if (performance.now() - openedAt.current > DOUBLE_CLICK_MS) open(); }
+    ? (e: React.MouseEvent<HTMLDivElement>) => {
+        if (e.ctrlKey || e.metaKey || e.shiftKey) return;
+        if (performance.now() - openedAt.current > DOUBLE_CLICK_MS) open();
+      }
     : undefined;
 
   const body = (

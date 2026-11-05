@@ -6,7 +6,7 @@
  * rotation of layout objects.
  *
  * Reads the selected node the SAME way as PropertyInspector: via
- * useEditorPlugin().state.selectedNodePath + viewer.registry.getNode().
+ * useEditorState(s => s.selectedNodePath) + viewer.registry.getNode().
  * This guarantees both panels always show the same values.
  */
 
@@ -25,7 +25,7 @@ import type { RVViewer } from '../rv-viewer';
 import { USER_PAUSE_REASON } from '../engine/rv-constants';
 import { Vector3Editor } from './rv-field-editors';
 import { useViewer } from '../../hooks/use-viewer';
-import { useEditorPlugin } from '../../hooks/use-editor-plugin';
+import { useEditorState } from '../../hooks/use-editor-plugin';
 
 // ─── Module-level open/close store (minimal — just tracks open state) ───
 
@@ -93,8 +93,7 @@ function useDrag(initialPos: { x: number; y: number }) {
 export function SetPositionDialog() {
   const open = useSyncExternalStore(subscribe, getSnapshot);
   const viewer = useViewer();
-  const { state } = useEditorPlugin();
-  const selectedPath = state.selectedNodePath;
+  const selectedPath = useEditorState((s) => s.selectedNodePath);
 
   const [position, setPosition] = useState({ x: 0, y: 0, z: 0 });
   const [rotation, setRotation] = useState({ x: 0, y: 0, z: 0 });

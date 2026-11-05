@@ -34,8 +34,9 @@ import {
   releaseSharedVizGeometry,
 } from './rv-shared-viz-geometry';
 import { syncColliderGizmo } from './rv-collider-gizmo-sync';
-import { isSensorRuntimeVizName } from './rv-sensor-viz-names';
+import { isConfirmedSensorRuntimeViz, isSensorRuntimeVizName } from './rv-sensor-viz-names';
 import { refreshWorldMatrix } from './rv-world-matrix';
+import { addSensorTo, removeSensorFrom, type SensorListHost } from './rv-sensor-registration';
 import { rayColliderDistance, rayObbDistance, type RayCollider } from './rv-ray-colliders';
 
 // Shared materials (reused across all sensors to save GPU resources)
@@ -66,7 +67,7 @@ const wireRed = new LineBasicMaterial({ color: RED, transparent: true, opacity: 
  *  prune carries. Detached only, not disposed: after the bake's dedup or a
  *  placement clone their geometry may be shared with the template. */
 function removePersistedSensorViz(node: Object3D): void {
-  const stale = node.children.filter((c) => isSensorRuntimeVizName(c.name));
+  const stale = node.children.filter(isConfirmedSensorRuntimeViz);
   for (const child of stale) child.removeFromParent();
 }
 
@@ -502,6 +503,9 @@ export class RVSensor implements RVComponent {
     }
   }
 
+  /** The transport manager {@link init} registered this sensor in (deregistered in {@link dispose}). */
+  private _owningTm: SensorListHost | null = null;
+
   /** Node-local half extents from the pre-bake box (plan-655 B1), else null. */
   private _localHalf: Vector3 | null = null;
 
@@ -636,8 +640,11 @@ export class RVSensor implements RVComponent {
       }
     }
 
-    // Register in transport manager
-    context.transportManager.sensors.push(this);
+    // Register in transport manager (remembered: dispose deregisters itself,
+    // so a component removed on its own - editor remove / undo of add - does
+    // not keep ticking or stay announced to onSensorsChanged listeners).
+    this._owningTm = context.transportManager;
+    addSensorTo(context.transportManager, this);
 
     // Refresh the AABB whenever an ancestor LayoutObject is moved/rotated by
     // the planner, inspector, snap-flip, etc. The fixed-loop already refreshes
@@ -666,6 +673,12 @@ export class RVSensor implements RVComponent {
    *  tree dispose helpers skip them — this is the one place that releases
    *  this sensor's reference; the geometry is freed with the last user. */
   dispose(): void {
+    // Idempotent: a teardown path that already removed the sensor makes this a no-op.
+    const tm = this._owningTm;
+    if (tm) {
+      this._owningTm = null;
+      removeSensorFrom(tm, this);
+    }
     if (this._layoutUnsub) {
       this._layoutUnsub();
       this._layoutUnsub = null;
@@ -713,10 +726,12 @@ export class RVSensor implements RVComponent {
     this.visMesh.position.set(localCenter.x, localCenter.y, localCenter.z);
     this.visMesh.renderOrder = 999; // render on top of scene geometry
     this.visMesh.name = `${this.node.name}_sensorViz`;
+    this.visMesh.userData._rvRuntimeVisual = true;
 
     const edgesGeo = acquireSensorEdgesGeometry(geo);
     this.visEdges = new LineSegments(edgesGeo, wireYellow);
     this.visEdges.name = `${this.node.name}_sensorViz_edges`;
+    this.visEdges.userData._rvRuntimeVisual = true;
     this.visEdges.position.copy(this.visMesh.position);
     this.visEdges.renderOrder = 999;
 
@@ -764,6 +779,7 @@ export class RVSensor implements RVComponent {
     this.rayTube.renderOrder = 999;
     this.rayTube.frustumCulled = false;
     this.rayTube.name = `${this.node.name}_sensorRay`;
+    this.rayTube.userData._rvRuntimeVisual = true;
 
     // Parent the tube to `this.node` and set its pose in LOCAL space. The
     // scene graph then carries any ancestor translation/rotation — no per-tick

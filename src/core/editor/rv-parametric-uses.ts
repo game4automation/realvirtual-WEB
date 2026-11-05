@@ -90,6 +90,17 @@ export const parametricUseImpl: CommandImpl<ParametricUseArgs, Record<string, un
         if (a.assetPath) use.Path = a.assetPath;
       }
     }
+    // plan-780 R4: a project-document child is declared by id, no path fallback.
+    if (use) {
+      const { referenceForWrite } = await import('../library/library-reference-write');
+      const written = referenceForWrite(
+        { catalogId: use.Family, glbUrl: use.Path, providerId: use.ProviderId, sourceId: use.SourceId },
+        (ctx.viewer as { currentModelScope?: import('../library/library-origin').DocumentScope }).currentModelScope ?? null,
+      );
+      if (!written.path) delete use.Path;
+      if (written.providerId && written.sourceId) { use.ProviderId = written.providerId; use.SourceId = written.sourceId; }
+      else { delete use.ProviderId; delete use.SourceId; }
+    }
     const before = Array.isArray(pc.Uses) ? pc.Uses as ParametricUse[] : undefined;
     let next: ParametricUse[];
     try {

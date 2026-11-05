@@ -305,6 +305,7 @@ export function DriveChartOverlay() {
       open={open && !suppressed}
       onClose={() => viewer.toggleDriveChart(false)}
       title="Drive Monitor"
+      panelId="demo-drive-monitor"
       titleColor="#4fc3f7"
       subtitle={driveCount}
       defaultWidth={CHART_DEFAULT_WIDTH}

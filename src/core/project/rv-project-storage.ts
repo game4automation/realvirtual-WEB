@@ -465,6 +465,7 @@ export async function atomicReplaceFile(
   dir: FileSystemDirectoryHandle,
   filename: string,
   blob: Blob,
+  signal?: AbortSignal,
 ): Promise<void> {
   let previous: Blob | null = null;
   let existed = false;
@@ -476,8 +477,13 @@ export async function atomicReplaceFile(
   }
 
   try {
-    await writeBlobFile(dir, filename, blob);
+    await writeBlobFile(dir, filename, blob, signal);
   } catch (e) {
+    // Aborted before the commit (plan-2229, `writeBlobFile`): an existing file
+    // was never touched, so there is nothing to restore — rewriting `previous`
+    // would be a write the caller just cancelled. A NEW file falls through to
+    // the rollback below, which removes the empty entry `getFileHandle` created.
+    if (existed && (e as { committed?: boolean }).committed === false) throw e;
     try {
       if (existed && previous) await writeBlobFile(dir, filename, previous);
       else await removeFileEntry(dir, filename);

@@ -5,7 +5,7 @@ import { readLocalStorage } from '../rv-safe-storage';
 
 import { FIELD_BORDER, PANEL_SURFACE } from './shared-sx';
 import { useState, useEffect, useSyncExternalStore, useRef, type ReactElement } from 'react';
-import { useEditorPlugin } from '../../hooks/use-editor-plugin';
+import { useEditorPluginInstance, useEditorState } from '../../hooks/use-editor-plugin';
 import { Typography, Box, Paper } from '@mui/material';
 import { Layers, MoreHoriz, ViewInAr } from '@mui/icons-material';
 import { useMobileLayout, isMobileDevice } from '../../hooks/use-mobile-layout';
@@ -180,10 +180,13 @@ export function TopBar() {
   // Display panel is reachable when there are groups OR overlay categories (plan-250).
   const overlayPresent = useOverlayVisibilityState().present.length > 0;
 
-  // Hierarchy panel state from plugin
-  const { plugin, state: pluginState } = useEditorPlugin();
-  const hierarchyOpen = pluginState.panelOpen;
-  const settingsOpen = pluginState.settingsOpen;
+  // Primitive slices only (doc-extending-webviewer.md §6).
+  const plugin = useEditorPluginInstance();
+  const hierarchyOpen = useEditorState((s) => s.panelOpen);
+  const settingsOpen = useEditorState((s) => s.settingsOpen);
+  const inspectorWanted = useEditorState(
+    (s) => s.showInspector && (s.selectedNodePath !== null || s.selectedNode !== null),
+  );
 
   const lpm = viewer.leftPanelManager;
   const panelSnapshot = useSyncExternalStore(lpm.subscribe, lpm.getSnapshot);
@@ -423,8 +426,7 @@ export function TopBar() {
           A path-less selection (a chunk mesh, a light — plan-754 D2) mounts it too:
           the inspector renders its read-only runtime view, and for a chunk the
           "Baked geometry" section (plan-505 F7). */}
-      {showPropertyInspector && !isMobile && !settingsOpen && pluginState.showInspector
-        && (pluginState.selectedNodePath || pluginState.selectedNode)
+      {showPropertyInspector && !isMobile && !settingsOpen && inspectorWanted
         && (hierarchyOpen || readLocalStorage('rv-inspector-detached') === 'true')
         && <PropertyInspector viewer={viewer} />}
 

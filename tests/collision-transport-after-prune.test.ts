@@ -11,6 +11,10 @@
  * Phase 1c deleted both carve-outs (and `TransportSurface._isBakedHelper` with
  * them). These cases pin that a chunk mesh now COUNTS as geometry in both
  * readers, for the main model exactly as for a planner placement.
+ *
+ * plan-781: the collision reader resolves the chunk as a body PART through the
+ * bake registry and never builds a tree on it — "no tree is ever built on a
+ * chunk" (rules 10/15).
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { BoxGeometry, Group, Mesh, MeshStandardMaterial, Object3D, Scene } from 'three';
@@ -19,6 +23,7 @@ import { loadGLB, type LoadResult } from '../src/core/engine/rv-scene-loader';
 import { BakeRegistry, RV_BAKE_CHUNK_KEY } from '../src/core/engine/rv-bake-registry';
 import { createPickBuildPort } from '../src/core/engine/rv-pick-build-port';
 import { RVTransportSurface } from '../src/core/engine/rv-transport-surface';
+import { RVCollisionManager } from '../src/core/engine/rv-collision-manager';
 
 
 const material = new MeshStandardMaterial({ color: 0x334422 });
@@ -49,11 +54,14 @@ function buildLine(): Group {
 let bytes: ArrayBuffer;
 beforeAll(async () => { bytes = await objectToGlb(buildLine()); });
 
+let lastBakeRegistry: BakeRegistry | null = null;
+
 async function load(): Promise<LoadResult> {
+  lastBakeRegistry = new BakeRegistry();
   const result = await loadGLB('line.glb', new Scene(), {
     data: bytes.slice(0),
     loadKinematicsSidecar: false,
-    bakeRegistry: new BakeRegistry(),
+    bakeRegistry: lastBakeRegistry,
     bakePickPort: createPickBuildPort({ createWorker: () => null }),
   });
   return result;
@@ -99,5 +107,21 @@ describe('collision + transport readers after the prune (plan-754 §9.18)', () =
       ._computeGizmoAABB();
     expect(aabb, 'gizmo AABB must not be null after the prune').toBeTruthy();
     expect(aabb!.isEmpty()).toBe(false);
+  });
+
+  it('a collision body over the surface reads its chunk as a part and builds no tree on it', async () => {
+    const result = await load();
+    const belt = result.registry.getNode('Line/Belt')!;
+    const manager = new RVCollisionManager();
+    manager.setGeometrySource(lastBakeRegistry);
+    manager.register(belt, 'Machine');
+    manager.rebuild();
+    const body = manager.bodies.find((b) => b.root === belt)!;
+    expect(body.parts.length).toBeGreaterThan(0);
+    expect(body.parts.every((p) => p.kind === 'chunk' && p.mesh.userData[RV_BAKE_CHUNK_KEY] === true)).toBe(true);
+    for (const m of chunkMeshesUnder(belt)) {
+      expect((m.geometry as unknown as { boundsTree?: unknown }).boundsTree).toBeUndefined();
+    }
+    manager.dispose();
   });
 });

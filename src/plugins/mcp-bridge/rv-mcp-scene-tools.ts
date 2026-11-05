@@ -59,7 +59,7 @@ import { computeSubtreeAABB } from '../../core/engine/rv-traverse-utils';
 // plan-754 F11 — panel and agent classify a node with the SAME two predicates.
 import { NodeRegistry } from '../../core/engine/rv-node-registry';
 
-import { freeSnapsOf, pickSnap, resolvePlaceEntry } from '../layout-planner/planner-commands';
+import { freeSnapsOf, legacyCatalogIdHint, pickSnap, resolvePlaceEntry } from '../layout-planner/planner-commands';
 import { PROJECT_LIBRARY_PROVIDER_ID, refreshProjectLibrary } from '../../core/library/project-library-provider';
 import { isProjectBackedProvider, LIBRARY_PROJECTS_PROVIDER_ID } from '../../core/library/library-origin';
 import { isLibraryProjectSource } from '../../core/library/library-projects-provider';
@@ -331,7 +331,7 @@ export class McpSceneTools {
   /**
    * plan-655 F3: THE one parts list — entries of the attached catalogs
    * (`source: 'catalog'`, with the library URL) plus every document of the open
-   * project (`source: 'project'`, catalogId `project:<path>`, documentId). Both
+   * project (`source: 'project'`, catalogId = the document id, plan-780 R5). Both
    * kinds are accepted by layout.place AND layout.snapAttach.
    *
    * plan-778 Phase 2: the third origin — every document of a DIRECT, ready
@@ -405,7 +405,8 @@ export class McpSceneTools {
         if (libFilter !== null && (library ?? '').toLowerCase() !== libFilter) continue;
         seen.add(e.id);
         out.push({
-          catalogId: e.id, name: e.name, category: e.category, source: src,
+          // plan-780 R5: a project / library document is addressed by its DOCUMENT id.
+          catalogId: src === 'catalog' ? e.id : (e.documentId ?? e.id), name: e.name, category: e.category, source: src,
           ...(src === 'catalog' ? { library }
             : src === 'library' ? { libraryProjectId: library, documentId: e.documentId ?? e.id, path: e.localPath ?? null }
             : { documentId: e.documentId ?? null, path: e.localPath ?? null }),
@@ -461,8 +462,11 @@ export class McpSceneTools {
     const entry = resolvePlaceEntry(planner, catalogId);
     if (!entry) return JSON.stringify({ error: `No catalog entry "${catalogId}". Use web_query("library.catalogList", {}).` });
     const def = this._behaviorForEntry(entry);
+    // plan-780 R5: the document id, whatever form was asked for (`project:<path>` is a deprecated lookup).
+    const deprecation = legacyCatalogIdHint(catalogId, entry);
     return JSON.stringify({
-      catalogId,
+      catalogId: entry.documentId ?? entry.id,
+      ...(deprecation ? { deprecation } : {}),
       name: entry.name,
       category: entry.category,
       footprintMm: entry.footprintMm ?? null,

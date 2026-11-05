@@ -125,8 +125,10 @@ export class YardPlanning implements PlantParameters {
         await this.materialize(next, ctx);
       } catch (err) {
         if (this.reconciling && this.docSize !== size && !ctx.signal.aborted) {
-          // No previous values to revert to: back to the document's own size.
+          // No previous values to revert to: back to the document's own size, and
+          // committed follows the scene (plan-681 F2; a refusal is a Problems entry).
           await this.materialize(this.composeFor(this.docSize), ctx);
+          this.planning?.recoverCommitted({ [SIZE_KEY]: this.yard.size });
         }
         throw err;
       }

@@ -20,6 +20,7 @@ import { Group, Object3D, Scene } from 'three';
 import {
   flattenSceneRows,
   structuralListenTargets,
+  structureChangeMatters,
   subscribeStructure,
   type SceneRowContext,
 } from '../src/core/hmi/hierarchy-rows';
@@ -131,5 +132,76 @@ describe('live scene mutation (§9.11)', () => {
     }
     expect(onChange).toHaveBeenCalledTimes(20);
     unsubscribe();
+  });
+
+  it('passes the child and whether it was removed', () => {
+    const s = makeScene();
+    const onChange = vi.fn();
+    const unsubscribe = subscribeStructure([s.open], onChange);
+    const child = new Group();
+    s.open.add(child);
+    s.open.remove(child);
+    expect(onChange.mock.calls).toEqual([[child, false], [child, true]]);
+    unsubscribe();
+  });
+});
+
+/**
+ * 2026-11-05: with the hierarchy open, dragging a placement re-rendered the
+ * whole panel 2-3 times (75-85 ms each in the dev build) because the planner
+ * adds neighbour guides, distance labels and drive gizmos under the scene root
+ * and the dragged object. With runtime rows hidden none of them is ever a row.
+ */
+describe('structureChangeMatters — helper objects do not re-render the tree', () => {
+  const shownOf = (rows: ReturnType<typeof flattenSceneRows>) =>
+    new Set(rows.map((r) => (r.node as unknown as { object: Object3D }).object));
+
+  it('an unregistered helper added while runtime rows are hidden does not matter', () => {
+    const s = makeScene();
+    const guide = new Object3D(); guide.name = '_layoutNeighborGuide';
+    s.scene.add(guide);
+    expect(structureChangeMatters(guide, false, true, new Set(), s.ctx.getPathForNode)).toBe(false);
+  });
+
+  it('a registered node added (a new placement) matters — checked after it was registered', () => {
+    const s = makeScene();
+    const placement = new Group();
+    s.scene.add(placement);
+    s.paths.set(placement, 'Placement');
+    expect(structureChangeMatters(placement, false, true, new Set(), s.ctx.getPathForNode)).toBe(true);
+  });
+
+  it('a child added and removed again in the same frame does not matter', () => {
+    const s = makeScene();
+    const placement = new Group();
+    s.paths.set(placement, 'Placement');
+    s.scene.add(placement);
+    s.scene.remove(placement);
+    expect(structureChangeMatters(placement, false, true, new Set(), s.ctx.getPathForNode)).toBe(false);
+  });
+
+  it('removing a node that is a row matters even when it is already unregistered', () => {
+    const s = makeScene();
+    const expanded = new Set([s.scene.uuid]);
+    const shown = shownOf(flattenSceneRows(s.scene, expanded, s.ctx));
+    s.scene.remove(s.open);
+    s.paths.delete(s.open);
+    expect(structureChangeMatters(s.open, true, true, shown, s.ctx.getPathForNode)).toBe(true);
+  });
+
+  it('removing a helper that was never a row does not matter', () => {
+    const s = makeScene();
+    const helper = new Object3D();
+    s.scene.add(helper);
+    const shown = shownOf(flattenSceneRows(s.scene, new Set([s.scene.uuid]), { ...s.ctx, hideRuntime: true }));
+    s.scene.remove(helper);
+    expect(structureChangeMatters(helper, true, true, shown, s.ctx.getPathForNode)).toBe(false);
+  });
+
+  it('with runtime rows shown, every change matters (as before)', () => {
+    const s = makeScene();
+    const helper = new Object3D();
+    s.scene.add(helper);
+    expect(structureChangeMatters(helper, false, false, new Set(), s.ctx.getPathForNode)).toBe(true);
   });
 });

@@ -8,12 +8,12 @@
  *  - no provider: only "Export .glb…", test id unchanged;
  *  - with a provider: its entry from `exports[]`, its modes, its MIME type and
  *    file name in the download;
- *  - overlay is offered only while the document carries USD prim paths;
+ *  - overlay stays listed, disabled without USD prim paths;
  *  - a result with placements written without geometry says so;
  *  - Apply: the entry only for a provider with `apply`; choosing a file runs
  *    `preview` (nothing else), the dialog shows the counters and the loss list,
  *    `commit` runs only on the click and with exactly the confirmation shown;
- *    Cancel commits nothing; extras-wipe offers "Apply anyway", ambiguous no
+ *    Cancel commits nothing; extras-wipe explicitly confirms missing data removal, ambiguous no
  *    apply at all; a document-switched result says "Written — open the
  *    document to see it" (LOP #180);
  *  - both dialogs live in a lazily loaded module (plan-764 "Lazy-Apply-Dialog"):
@@ -82,11 +82,13 @@ function usdLikeProvider(run = vi.fn()): DocumentExportProvider {
     id: 'usd',
     label: 'Export USD…',
     modes: (ctx) => [
-      { id: 'standalone', label: 'Standalone (.usdz)', fileName: `${ctx.documentName}.usdz`, mime: 'model/vnd.usdz+zip' },
-      ...(ctx.hasUsdPrimPaths()
-        ? [{ id: 'overlay', label: 'Overlay only (.rv.usda)', fileName: `${ctx.documentName}.rv.usda`, mime: 'model/vnd.usda' }]
-        : []),
+      { id: 'standalone', label: 'Complete scene (.usdz)', fileName: `${ctx.documentName}.usdz`, mime: 'model/vnd.usdz+zip' },
+      {
+        id: 'overlay', label: 'realvirtual data layer (.rv.usda)', fileName: `${ctx.documentName}.rv.usda`, mime: 'model/vnd.usda',
+        ...(!ctx.hasUsdPrimPaths() ? { disabledReason: 'Only for documents imported from USD.' } : {}),
+      },
     ],
+    preflight: async (_ctx, modeId) => ({ referencesWithoutGeometry: modeId === 'standalone' ? 2 : 0 }),
     run: async (ctx, modeId) => {
       run(ctx, modeId);
       const bytes = await ctx.documentGlb();
@@ -166,11 +168,13 @@ describe('DocumentCard export — with a provider', () => {
     expect(screen.getByTestId('document-card-verb-export-glb')).toBeTruthy();
     fireEvent.click(screen.getByTestId('document-card-verb-export-usd'));
 
-    // Standalone only: this document carries no USD prim paths.
+    // The data layer remains visible even without USD prim paths.
     expect(await screen.findByTestId('document-card-export-mode-standalone')).toBeTruthy();
-    expect(screen.queryByTestId('document-card-export-mode-overlay')).toBeNull();
+    expect(screen.getByTestId('document-card-export-mode-overlay')).toBeDisabled();
+    expect(screen.getByText('Only for documents imported from USD.')).toBeVisible();
     expect(screen.getByText('Line_2.usdz')).toBeTruthy();
 
+    await waitFor(() => expect(screen.getByTestId('document-card-export-run')).toBeEnabled());
     await act(async () => { fireEvent.click(screen.getByTestId('document-card-export-run')); });
     await waitFor(() => expect(downloads).toHaveLength(1));
     expect(downloads[0]).toEqual({ name: 'Line_2.usdz', type: 'model/vnd.usdz+zip' });
@@ -182,11 +186,12 @@ describe('DocumentCard export — with a provider', () => {
     openMenu();
     fireEvent.click(screen.getByTestId('document-card-verb-export-usd'));
     await screen.findByTestId('document-card-export-run');
+    expect(await screen.findByText('2 placements will be exported without geometry.')).toBeVisible();
     await act(async () => { fireEvent.click(screen.getByTestId('document-card-export-run')); });
     expect(await screen.findByText(/2 placements exported without geometry/)).toBeTruthy();
   });
 
-  it('offers overlay only when the document has USD prim paths, and runs the chosen mode', async () => {
+  it('enables the data layer when the document has USD prim paths, and downloads the chosen mode', async () => {
     const run = vi.fn();
     const { exports } = boundExports(true, run);
     mount(makeView({ exports }));
@@ -194,6 +199,7 @@ describe('DocumentCard export — with a provider', () => {
     fireEvent.click(screen.getByTestId('document-card-verb-export-usd'));
     const overlay = await screen.findByTestId('document-card-export-mode-overlay');
     fireEvent.click(overlay);
+    await waitFor(() => expect(screen.getByTestId('document-card-export-run')).toBeEnabled());
     await act(async () => { fireEvent.click(screen.getByTestId('document-card-export-run')); });
     await waitFor(() => expect(downloads).toHaveLength(1));
     expect(downloads[0]).toEqual({ name: 'Line_2.rv.usda', type: 'model/vnd.usda' });
@@ -202,7 +208,7 @@ describe('DocumentCard export — with a provider', () => {
     expect(screen.queryByText(/exported without geometry/)).toBeNull();
   });
 
-  it('Cancel runs nothing', async () => {
+  it('Cancel never runs the exporter or downloads a file', async () => {
     const run = vi.fn();
     const { exports } = boundExports(false, run);
     mount(makeView({ exports }));
@@ -213,7 +219,7 @@ describe('DocumentCard export — with a provider', () => {
     expect(downloads).toHaveLength(0);
   });
 
-  it('a failing export lands in the message dialog', async () => {
+  it('an export failing after the explicit click shows its reason in the message dialog', async () => {
     const failing: ActiveDocumentFileExport = {
       id: 'usd', label: 'Export USD…',
       modes: () => [{ id: 'standalone', label: 'Standalone (.usdz)', fileName: 'x.usdz', mime: 'model/vnd.usdz+zip' }],
@@ -229,6 +235,23 @@ describe('DocumentCard export — with a provider', () => {
 });
 
 describe('scene export context', () => {
+  it('binds the cheap preflight to document JSON without exporting document bytes', async () => {
+    const documentJson = { scene: 0, scenes: [{ nodes: [] }], nodes: [] };
+    const store = stubStore(false);
+    store.documentExportJson = vi.fn(async () => documentJson);
+    const registry = new ExportProviderRegistry();
+    const preflight = vi.fn(async (ctx: DocumentExportContext, _modeId: string) => {
+      expect(await ctx.documentJson!()).toBe(documentJson);
+      return { referencesWithoutGeometry: 5 };
+    });
+    registry.register({ ...usdLikeProvider(), preflight });
+    const bound = sceneFileExports(store, 'Line_2', registry).exports![0];
+    expect(await bound.preflight!('standalone')).toEqual({ referencesWithoutGeometry: 5 });
+    expect(preflight).toHaveBeenCalledWith(expect.anything(), 'standalone');
+    expect(store.documentExportJson).toHaveBeenCalledTimes(1);
+    expect(store.exportSceneGlb).not.toHaveBeenCalled();
+  });
+
   it('reads the authored (non-embedding) bytes and the store facts lazily', async () => {
     let ctx: DocumentExportContext | null = null;
     const registry = new ExportProviderRegistry();
@@ -314,10 +337,11 @@ function applyExport(
   return { exp, previewFn, commit };
 }
 
-/** Pick a file for the apply: the hidden input is clicked by the card, the change is ours. */
+/** The shared flow explains first; the native chooser is stubbed, then a real File is read. */
 async function chooseApplyFile(name = 'line.usdz'): Promise<void> {
   fireEvent.click(screen.getByTestId('document-card-verb-apply-usd'));
-  const input = screen.getByTestId('document-card-apply-file') as HTMLInputElement;
+  fireEvent.click(await screen.findByRole('button', { name: 'Choose USD file…' }));
+  const input = await screen.findByTestId('document-card-apply-file') as HTMLInputElement;
   const f = new File([new Uint8Array([1, 2, 3])], name);
   await act(async () => { fireEvent.change(input, { target: { files: [f] } }); });
 }
@@ -389,7 +413,7 @@ describe('DocumentCard — Apply USD extras', () => {
     expect(commit).toHaveBeenCalledWith('usdx-1', {});
   });
 
-  it('extras-wipe: the blocked dialog explains it and offers "Apply anyway" (acceptExtrasLoss)', async () => {
+  it('extras-wipe: the blocked dialog explicitly confirms removal (acceptExtrasLoss)', async () => {
     const { exp, commit } = applyExport(previewOf({
       blocked: 'extras-wipe', matched: 0, unmatchedPrims: [], extrasLost: ['Cell', '<scene>'],
     }));
@@ -398,10 +422,10 @@ describe('DocumentCard — Apply USD extras', () => {
     await chooseApplyFile();
     expect((await screen.findByTestId('document-card-apply-wipe')).textContent)
       .toContain('line.usdz carries no realvirtual data at all, the document has 214 nodes with data.');
-    expect(screen.getByText(/Apply USD extras — blocked/)).toBeTruthy();
+    expect(screen.getByText(/Apply realvirtual data from USD — blocked/)).toBeTruthy();
     expect(screen.queryByTestId('document-card-apply-run')).toBeNull();
     const anyway = screen.getByTestId('document-card-apply-anyway');
-    expect(anyway.textContent).toBe('Apply anyway');
+    expect(anyway.textContent).toBe('Apply and remove missing data');
     await act(async () => { fireEvent.click(anyway); });
     expect(commit).toHaveBeenCalledWith('usdx-1', { acceptExtrasLoss: true, confirmExtrasLost: true });
   });
@@ -496,7 +520,7 @@ describe('DocumentCard — the dialog module fails to load', () => {
     const { exp, previewFn, commit } = applyExport(previewOf());
     mount(makeView({ exports: [exp] }));
     openMenu();
-    await chooseApplyFile();
+    fireEvent.click(screen.getByTestId('document-card-verb-apply-usd'));
     expect(await screen.findByText(/The apply dialog could not be loaded \(Failed to fetch dynamically imported module/)).toBeTruthy();
     expect(screen.queryByTestId('document-card-apply-dialog')).toBeNull();
     expect(previewFn).not.toHaveBeenCalled();
@@ -525,7 +549,7 @@ describe('DocumentCard — the dialog module fails to load', () => {
     const { exp } = applyExport(previewOf());
     mount(makeView({ exports: [exp] }));
     openMenu();
-    await chooseApplyFile();
+    fireEvent.click(screen.getByTestId('document-card-verb-apply-usd'));
     expect(await screen.findByText(/The apply dialog could not be loaded/)).toBeTruthy();
     fireEvent.click(screen.getByText('Close'));
     openMenu();

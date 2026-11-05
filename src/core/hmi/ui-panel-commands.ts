@@ -4,6 +4,7 @@
 import { commandRegistry, type CommandRegistry } from './rv-command-registry';
 
 export interface UiPanelArgs { panelId: string; rect?: number[]; collapsed?: boolean }
+export interface UiPanelOpenArgs { panelId: string; target?: string }
 
 const registered = new WeakSet<CommandRegistry>();
 export function ensureUiPanelCommandsRegistered(registry: CommandRegistry = commandRegistry): void {
@@ -15,4 +16,17 @@ export function ensureUiPanelCommandsRegistered(registry: CommandRegistry = comm
     argsSchema: { panelId: 'string', rect: 'number[]', collapsed: 'boolean' },
     impl: () => import('./ui-panel-command-impl').then(m => m.uiPanel),
   });
+  registry.register<never, unknown>({
+    id: 'ui.panel.list', label: 'List panels', readOnly: true,
+    scope: 'none', available: true, unavailableReason: 'Panel unavailable', argsSchema: {},
+    impl: () => import('./ui-panel-command-impl').then(m => m.uiPanelList),
+  });
+  for (const [id, label, open] of [['ui.panel.open', 'Open panel', true], ['ui.panel.close', 'Close panel', false]] as const) {
+    registry.register<UiPanelOpenArgs, unknown>({
+      id, label, readOnly: false, toolClass: 'edit',
+      scope: 'none', available: true, unavailableReason: 'Panel unavailable',
+      argsSchema: open ? { panelId: 'string', target: 'string' } : { panelId: 'string' },
+      impl: () => import('./ui-panel-command-impl').then(m => (open ? m.uiPanelOpen : m.uiPanelClose)),
+    });
+  }
 }

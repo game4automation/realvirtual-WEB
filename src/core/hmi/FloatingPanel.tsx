@@ -15,12 +15,13 @@ import { useState, useRef, useEffect, useCallback, useSyncExternalStore, type Re
 import { createPortal } from 'react-dom';
 import { Box, IconButton, Typography, Paper } from '@mui/material';
 import { Close, UnfoldMore, UnfoldLess, DragIndicator, ExpandLess, ExpandMore } from '@mui/icons-material';
-import { loadPanelGeometry, savePanelGeometry, loadPanelCollapsed, savePanelCollapsed, subscribePanelGeometry, type PanelGeometry } from './floating-panel-store';
+import { loadPanelGeometry, savePanelGeometry, loadPanelCollapsed, savePanelCollapsed, subscribePanelGeometry, migratePanelKeys, type PanelGeometry } from './floating-panel-store';
 import { BOTTOM_BAR_HEIGHT } from './layout-constants';
 import { PANEL_SURFACE, INK_LOW } from './shared-sx';
 import { useMobileLayout } from '../../hooks/use-mobile-layout';
 import { getRecentAnchorPoint, placeAdjacentToAnchor, getCSSViewportSize, clientToCSS } from './panel-anchor-store';
 import { getFloatingPanelRoot } from './HMIShell';
+import { notePanelMounted } from './panel-registry';
 import { isContextActive, _subscribe as subscribeUiContext } from './ui-context-store';
 
 // ─── Constants ──────────────────────────────────────────────────────────
@@ -427,9 +428,14 @@ export function FloatingPanel({
   const isMobile = useMobileLayout();
   const minW = isMobile ? MIN_W_MOBILE : (minWidth ?? MIN_W_DESKTOP);
   const stableId = panelId ?? title;
+  useState(() => { if (panelId && panelId !== title) migratePanelKeys(title, panelId); });
   // A panel that cannot be closed is always open (F1). Every place that used
   // `open` to decide "is this panel alive right now" uses this instead.
   const effectiveOpen = closable ? open : true;
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+  useEffect(() => notePanelMounted(stableId, { title, open: effectiveOpen, close: closable ? () => closeRef.current?.() : undefined }),
+    [stableId, title, effectiveOpen, closable]);
   // All dimension/position state lives in CSS-px (the coord system of
   // style.left/top inside the zoomed HMIShell). Use getCSSViewportSize()
   // wherever the calc would otherwise read window.innerWidth/Height.

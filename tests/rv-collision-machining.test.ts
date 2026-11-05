@@ -21,6 +21,14 @@
  * mesh box are far apart — the cutter sits inside the stock envelope but well
  * outside the authored mesh, so "which box is the body using" is answered by
  * whether a collision is reported at all, not by a tolerance comparison.
+ *
+ * plan-781: the bodies here are real (unbaked) meshes — keep parts; there is
+ * no `aabbOnly` any more, a live stock box makes a body `stockActive` (the one
+ * box-only case left). A pair overlapping at its FIRST evaluation is a quiet
+ * start baseline, so the cases that expect an alarm let one tick pass with the
+ * cutter outside the authored mesh (no grid yet) before the stock box appears.
+ * A pair muted by an active association is armed directly — it alarms the
+ * moment the spindle stops inside the material.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -28,6 +36,7 @@ import { Object3D, Scene } from 'three';
 import { RVCollisionManager } from '../src/core/engine/rv-collision-manager';
 import { RVMachiningVolume } from '../src/core/engine/rv-machining-volume';
 import { RVMachiningTool } from '../src/core/engine/rv-machining-tool';
+import '../src/core/engine/rv-ribbon-path';   // registers RibbonPath (dynamicGeometry)
 import { MachiningManager, type MachiningSignalHost } from '../src/core/engine/rv-machining-manager';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { applySchema, type ComponentContext } from '../src/core/engine/rv-component-registry';
@@ -91,6 +100,11 @@ function fixture(machining?: MachiningManager): Fixture {
 
   const volumeNode = new Object3D();
   volumeNode.name = 'Workpiece';
+  // REAL extras, exactly as the loader leaves them on the node: the collision
+  // body reads the component capabilities (`dynamicGeometry`) from here.
+  volumeNode.userData.realvirtual = {
+    MachiningVolume: { gridResolution: { x: 32, y: 32, z: 32 }, workpieceSize: { x: 100, y: 60, z: 80 } },
+  };
   // 20 mm cube — an order of magnitude smaller than the 100 mm stock.
   volumeNode.add(boxMesh({ name: 'StockMesh', size: [0.02, 0.02, 0.02] }));
 
@@ -157,33 +171,81 @@ describe('chunk meshes never join a collision body (F3)', () => {
     const chunkRoot = new Object3D();
     chunkRoot.name = 'CsgChunks';
     chunkRoot.userData._rvMachiningChunks = true;
-    const flagged = boxMesh({ name: 'Chunk_0', bvh: false });
+    const flagged = boxMesh({ name: 'Chunk_0' });
     flagged.userData._rvMachiningChunk = 0;      // index 0 — falsy on purpose
-    const unflagged = boxMesh({ name: 'ChunkHelper', bvh: false });
+    const unflagged = boxMesh({ name: 'ChunkHelper' });
     chunkRoot.add(flagged, unflagged);
     f.volumeNode.add(chunkRoot);
     f.scene.updateMatrixWorld(true);
 
     f.collision.rebuild();
     const body = f.collision.bodies.find((b) => b.root === f.volumeNode)!;
-    expect(body.meshes.map((m) => m.mesh.name)).toEqual(['StockMesh']);
-    // The decisive consequence: a BVH-less chunk would have degraded the whole
-    // workpiece body to a box test for EVERY pair it takes part in.
-    expect(body.aabbOnly).toBe(false);
-    expect(body.baseAabbOnly).toBe(false);
+    expect(body.parts.map((p) => p.mesh.name)).toEqual(['StockMesh']);
+    // The runtime chunks never join: they are created long after any build.
+    expect(body.stockActive).toBe(false);
   });
 
   it('still filters a chunk mesh that sits outside the container', () => {
     const f = fixture();
-    const stray = boxMesh({ name: 'StrayChunk', bvh: false });
+    const stray = boxMesh({ name: 'StrayChunk' });
     stray.userData._rvMachiningChunk = 0;        // falsy index, must still match
     f.volumeNode.add(stray);
     f.scene.updateMatrixWorld(true);
 
     f.collision.rebuild();
     const body = f.collision.bodies.find((b) => b.root === f.volumeNode)!;
-    expect(body.meshes.map((m) => m.mesh.name)).toEqual(['StockMesh']);
-    expect(body.aabbOnly).toBe(false);
+    expect(body.parts.map((p) => p.mesh.name)).toEqual(['StockMesh']);
+    expect(body.stockActive).toBe(false);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════
+describe('the authored workpiece is collision geometry without a grid (plan-781 review #1)', () => {
+  it('keeps the authored MachiningVolume mesh as a body part despite dynamicGeometry', () => {
+    const f = fixture();
+    expect(f.volumeNode.userData.realvirtual.MachiningVolume).toBeTruthy();
+    f.collision.rebuild();
+    const body = f.collision.bodies.find((b) => b.root === f.volumeNode)!;
+    expect(body.parts.map((p) => p.mesh.name)).toEqual(['StockMesh']);
+    expect(body.parts[0].kind).toBe('keep');
+  });
+
+  it('collides with the authored mesh when no grid ever arrives (Community, provider off)', () => {
+    const f = fixture();
+    f.collision.update(DT);                       // apart: armed
+    expect(reported(f.collision)).toEqual([]);
+    expect(f.volume.getStockBoundsLocal()).toBeNull();
+
+    f.cutterNode.position.set(0.012, 0.004, 0.003); // into the 20 mm authored cube
+    f.collision.update(DT);
+    expect(reported(f.collision)).toEqual(['Cutter|Workpiece']);
+    const body = f.collision.bodies.find((b) => b.root === f.volumeNode)!;
+    expect(body.stockActive).toBe(false);         // the triangles answered, not a box
+  });
+
+  it('uses the stock box while a grid is attached — the hidden authored mesh drops out', () => {
+    const f = fixture();
+    f.collision.update(DT);
+    f.volume.attachGrid(gridHandle());
+    f.collision.update(DT);
+    const body = f.collision.bodies.find((b) => b.root === f.volumeNode)!;
+    expect(body.stockActive).toBe(true);
+    // The cutter sits only inside the STOCK envelope, so this is the box.
+    expect(reported(f.collision)).toEqual(['Cutter|Workpiece']);
+    expect(body.parts.every((p) => !p.visible)).toBe(true);
+  });
+
+  it('still excludes the mesh of another dynamicGeometry component (RibbonPath, F19)', () => {
+    const f = fixture();
+    const band = boxMesh({ name: 'Band', size: [0.02, 0.02, 0.02] });
+    band.userData.realvirtual = { RibbonPath: {} };
+    f.machineNode.add(band);
+    f.scene.updateMatrixWorld(true);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    f.collision.rebuild();
+    const body = f.collision.bodies.find((b) => b.root === f.machineNode)!;
+    expect(body.parts.map((p) => p.mesh.name)).toEqual(['MachineMesh']);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes('rewritten geometry'))).toBe(true);
   });
 });
 
@@ -197,7 +259,7 @@ describe('stock bounds stand in for the hidden workpiece (F4)', () => {
     // The cutter is outside the 20 mm authored mesh, so nothing is reported.
     expect(reported(f.collision)).toEqual([]);
     const body = f.collision.bodies.find((b) => b.root === f.volumeNode)!;
-    expect(body.aabbOnly).toBe(false);
+    expect(body.stockActive).toBe(false);
   });
 
   it('picks the stock box up on the NEXT tick after an async attachGrid — no manual rebuild', () => {
@@ -214,12 +276,12 @@ describe('stock bounds stand in for the hidden workpiece (F4)', () => {
     f.collision.update(DT);                       // no rebuild() call anywhere
     expect(reported(f.collision)).toEqual(['Cutter|Workpiece']);
     const body = f.collision.bodies.find((b) => b.root === f.volumeNode)!;
-    expect(body.aabbOnly).toBe(true);             // a box has no triangles
-    expect(body.baseAabbOnly).toBe(false);        // ...but only for this reason
+    expect(body.stockActive).toBe(true);          // a box has no triangles: box-only
   });
 
   it('returns to the authored mesh bounds after teardownRender — again without a manual rebuild', () => {
     const f = fixture();
+    f.collision.update(DT);                       // apart: armed
     f.volume.attachGrid(gridHandle());
     f.collision.update(DT);
     expect(reported(f.collision)).toEqual(['Cutter|Workpiece']);
@@ -231,8 +293,8 @@ describe('stock bounds stand in for the hidden workpiece (F4)', () => {
     f.collision.update(DT);
     expect(reported(f.collision)).toEqual([]);
     const body = f.collision.bodies.find((b) => b.root === f.volumeNode)!;
-    expect(body.aabbOnly).toBe(false);            // triangle precision restored
-    expect(body.meshes.map((m) => m.mesh.name)).toEqual(['StockMesh']);
+    expect(body.stockActive).toBe(false);         // triangle precision restored
+    expect(body.parts.map((p) => p.mesh.name)).toEqual(['StockMesh']);
   });
 
   it('covers the true stock extent including the grid padding', () => {
@@ -302,8 +364,9 @@ describe('machining suppression mutes exactly the machined pair (F5/F6)', () => 
     f.collision.update(DT);
     expect(reported(f.collision)).toEqual([]);
 
-    // The very same cutter against the MACHINE is still a crash.
-    f.cutterNode.position.set(0.5, 0, 0);
+    // The very same cutter against the MACHINE is still a crash (offset: a real
+    // penetration, not two coincident cubes).
+    f.cutterNode.position.set(0.505, 0.003, 0.002);
     f.scene.updateMatrixWorld(true);
     f.collision.update(DT);
     expect(reported(f.collision)).toEqual(['Cutter|Machine']);
@@ -432,19 +495,22 @@ describe('association → body resolution (nearest role-carrying ancestor)', () 
 describe('unlatching a pair that became legitimate (F8)', () => {
   it('drops the latched card of the muted pair and republishes, keeping others', () => {
     const f = fixture();
-    f.volume.attachGrid(gridHandle());
 
     // An unrelated, genuinely crashing pair that must survive untouched.
     const robot = new Object3D();
     robot.name = 'Robot';
     robot.add(boxMesh({ name: 'RobotMesh', size: [0.02, 0.02, 0.02] }));
-    robot.position.set(0.505, 0, 0);
+    robot.position.set(0.6, 0, 0);
     f.scene.add(robot);
     f.scene.updateMatrixWorld(true);
     f.collision.register(robot, 'Robot');
-
-    // Spindle off: the cutter in the material latches as a crash.
     f.collision.setMachiningAssociation('a1', f.cutterNode, f.volumeNode, false);
+    f.collision.update(DT);                       // everything apart: armed
+
+    // Spindle off: the cutter in the material latches as a crash; the robot
+    // drives into the machine.
+    f.volume.attachGrid(gridHandle());
+    robot.position.set(0.505, 0.003, 0.002);
     f.collision.update(DT);
     expect(reported(f.collision)).toEqual(['Cutter|Workpiece', 'Machine|Robot']);
     expect(f.highlight.current).toContain(f.cutterNode);
@@ -526,6 +592,7 @@ describe('lifecycle', () => {
 
   it('unregisters the stock source when the volume is disposed', () => {
     const f = fixture();
+    f.collision.update(DT);                       // apart: armed
     f.volume.attachGrid(gridHandle());
     f.collision.update(DT);
     expect(reported(f.collision)).toEqual(['Cutter|Workpiece']);
@@ -591,6 +658,14 @@ describe('MachiningManager reports the spindle state (F5, end to end)', () => {
   it('does not suppress while the authored spindle signal is false', () => {
     const s = wired('Sig/SpindleOn', false);
     s.machining.update(DT);
+    s.collision.update(DT);
+    expect(s.collision.suppressedPairKeys.size).toBe(0);
+    // Buried in the stock at the very first evaluation: a quiet start baseline
+    // (plan-781 F7) — the alarm comes once the cutter has been out and goes back in.
+    expect(reported(s.collision)).toEqual([]);
+    s.cutterNode.position.set(0.3, 0, 0);
+    s.collision.update(DT);
+    s.cutterNode.position.set(IN_STOCK_ONLY, 0, 0);
     s.collision.update(DT);
     expect(reported(s.collision)).toEqual(['Cutter|Workpiece']);
   });

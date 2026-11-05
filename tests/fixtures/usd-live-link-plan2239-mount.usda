@@ -1,0 +1,91 @@
+#usda 1.0
+(
+	customLayerData = {
+		string creator = "Three.js USDZExporter"
+	}
+	defaultPrim = "Root"
+	metersPerUnit = 1
+	upAxis = "Y"
+)
+
+def Xform "Root"
+{
+	def Scope "Scenes" (
+		kind = "sceneLibrary"
+	)
+	{
+		def Xform "Scene" (
+			customData = {
+				bool preliminary_collidesWithEnvironment = 0
+				string sceneName = "Scene"
+			}
+			sceneName = "Scene"
+		)
+		{
+			def Xform "Cell"
+			{
+				matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (2, 0, 0, 1) )
+				uniform token[] xformOpOrder = ["xformOp:transform"]
+
+				def Xform "Axis" (
+					prepend references = @./geometries/Geometry_3.usda@</Geometry>
+					prepend apiSchemas = ["MaterialBindingAPI"]
+				)
+				{
+					matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
+					uniform token[] xformOpOrder = ["xformOp:transform"]
+					rel material:binding = </Root/Materials/Material_6>
+				}
+
+				def Xform "Axis_2" (
+					prepend references = @./geometries/Geometry_3.usda@</Geometry>
+					prepend apiSchemas = ["MaterialBindingAPI"]
+				)
+				{
+					matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (3, 0, 0, 1) )
+					uniform token[] xformOpOrder = ["xformOp:transform"]
+					rel material:binding = </Root/Materials/Material_6>
+				}
+
+				def Xform "Geometry_1" (
+					prepend references = @./geometries/Geometry_3.usda@</Geometry>
+					prepend apiSchemas = ["MaterialBindingAPI"]
+				)
+				{
+					matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
+					uniform token[] xformOpOrder = ["xformOp:transform"]
+					rel material:binding = </Root/Materials/Material_6>
+				}
+
+				def Xform "Aexis" (
+					prepend references = @./geometries/Geometry_3.usda@</Geometry>
+					prepend apiSchemas = ["MaterialBindingAPI"]
+				)
+				{
+					matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
+					uniform token[] xformOpOrder = ["xformOp:transform"]
+					rel material:binding = </Root/Materials/Material_6>
+				}
+			}
+		}
+	}
+
+	def "Materials"
+	{
+		def Material "Material_6"
+		{
+			token outputs:surface.connect = </Root/Materials/Material_6/PreviewSurface.outputs:surface>
+
+			def Shader "PreviewSurface"
+			{
+				uniform token info:id = "UsdPreviewSurface"
+				color3f inputs:diffuseColor = (0.033104766565152086, 0.13286832154414627, 0.31854677811435356)
+				float inputs:roughness = 1
+				float inputs:metallic = 0
+				float inputs:opacity = 1
+				int inputs:useSpecularWorkflow = 0
+				token outputs:surface
+			}
+		}
+	}
+}

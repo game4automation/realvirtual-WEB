@@ -21,10 +21,19 @@ import { z } from 'zod';
 export const SCHEMA_ID = 'rv-tutorial/1';
 
 /** Step ids must be filename-safe: they end up in `stills-*.jpg` names. */
+/** plan-2240: Gate C policy of a step. */
+export const MOTION_POLICIES = /** @type {const} */ (['require', 'warn', 'off']);
+
 const STEP_ID = z.string().regex(/^[a-z0-9-]+$/, 'step id must match [a-z0-9-]+ (it becomes part of a file name)');
 
+/**
+ * plan-2240: a selector target may carry an `offset` in CSS pixels from the element's centre (a
+ * window grip, a point beside a label). Visibility and covering are checked AT the offset point.
+ */
+const offset = z.object({ dx: z.number(), dy: z.number() }).strict();
+
 const target = z.union([
-  z.object({ selector: z.string().min(1) }).strict(),
+  z.object({ selector: z.string().min(1), offset: offset.optional() }).strict(),
   z.object({ x: z.number(), y: z.number() }).strict(),
   z.object({ command: z.string(), buttonKey: z.string().optional() }).strict(),
   z.object({ node: z.string(), anchor: z.enum(['center', 'top']).default('center') }).strict(),
@@ -111,6 +120,17 @@ const cameraAction = z.object({
   durationSec: z.number().positive().default(0.6),
 });
 
+/**
+ * plan-2237 F8: a time-lapse section. While the command runs, the take leaves the virtual clock and
+ * grabs `fps` frames per WALL second (2..8) for at most `maxWallSec` wall seconds.
+ */
+export const TIMELAPSE_FPS_MIN = 2;
+export const TIMELAPSE_FPS_MAX = 8;
+const timelapse = z.object({
+  fps: z.number().min(TIMELAPSE_FPS_MIN).max(TIMELAPSE_FPS_MAX),
+  maxWallSec: z.number().positive(),
+}).strict();
+
 const commandAction = z.object({
   type: z.literal('command'),
   id: z.string().min(1),
@@ -119,6 +139,7 @@ const commandAction = z.object({
   via: z.enum(['click', 'direct']).default('click'),
   waitSec: z.number().nonnegative().default(0.3),
   maxWaitSec: z.number().positive().default(30),
+  timelapse: timelapse.optional(),
 });
 
 const pickAction = z.object({
@@ -153,10 +174,25 @@ export const stepSchema = z.object({
   actions: z.array(actionSchema).min(1),
   zoom: z.union([z.literal('auto'), z.literal('none'), z.number()]).default('auto'),
   tailSec: z.number().nonnegative().default(0.4),
+  // plan-2240: Gate C per step. Deliberately NOT defaulted here: an absent value means "follow the
+  // CLI --motion-check", an explicit one wins over it. The run resolves it (`resolveMotionPolicy`).
+  motion: z.enum(MOTION_POLICIES).optional(),
   say: z.unknown().optional(),                 // plan-676: tolerated, ignored, never a refusal
 }).passthrough();
 
 const box = z.object({ x: z.number(), y: z.number(), w: z.number().positive(), h: z.number().positive() }).strict();
+
+/**
+ * plan-2240: the localStorage keys the recorder itself seeds before every load (terms, CONNECT
+ * auto-connect opt-out, auto-quality, welcome). A storyboard `storage` entry may overwrite one of
+ * them only with `storageOverride: true`.
+ */
+export const RECORDER_SEED_KEYS = Object.freeze([
+  'rv-terms-accepted', 'rv-connect-autoconnect-optout', 'rv-auto-quality-applied', 'rv-welcome-dismissed',
+]);
+
+/** plan-2240: storyboard localStorage seeds — only keys of the viewer's own `rv-` namespace. */
+const storage = z.record(z.string().regex(/^rv-/, "storage keys must start with 'rv-'"), z.string());
 
 export const tutorialSchema = z.object({
   $schema: z.literal(SCHEMA_ID, { message: `unsupported schema version — this runner reads '${SCHEMA_ID}' only (renaming a field is a major bump)` }),
@@ -177,6 +213,10 @@ export const tutorialSchema = z.object({
   // burned into the app's top-left corner (the behaviour before plan-2043). CLI `--stamp` overrides it.
   stamp: z.enum(['proof', 'inline']).default('proof'),
   setup: z.array(actionSchema).default([]),
+  // plan-2240: localStorage seeds, applied before every load AFTER the recorder's own seeds and its
+  // panel cleanup — an explicit `rv-panel-geo:*` entry therefore survives.
+  storage: storage.default({}),
+  storageOverride: z.boolean().default(false),
   steps: z.array(stepSchema).min(1),
   voice: z.unknown().optional(),               // plan-676: tolerated, ignored
 }).passthrough();
@@ -211,7 +251,7 @@ export function parseTutorial(raw) {
     }
   }
 
-  function checkActions(actions, location, isSetup) {
+  function checkActions(actions, location, isSetup, rawActions) {
     for (const [index, action] of actions.entries()) {
       const where = `${location} action ${index}`;
       if (action.type === 'pick') {
@@ -221,8 +261,16 @@ export function parseTutorial(raw) {
         bindings.add(action.as);
       }
       if (action.type === 'command') {
-        if (!isSetup && action.id === 'des.fastForward' && action.args?.untilSimTime !== undefined) {
-          throw new Error(`storyboard ${where}: des.fastForward with untilSimTime is allowed only in setup`);
+        // plan-2237 F7: `des.fastForward {untilSimTime}` is allowed in the take — the segment gate
+        // treats it as a transition and the following paused frames as a hold segment.
+        if (action.timelapse) {
+          if (isSetup) throw new Error(`storyboard ${where}: timelapse records frames and is allowed only in a step, not in setup`);
+          // Phase 2: during the time-lapse `maxWallSec` is the command's wait budget; an EXPLICIT
+          // `maxWaitSec` below it contradicts that.
+          const rawMax = rawActions?.[index]?.maxWaitSec;
+          if (typeof rawMax === 'number' && rawMax < action.timelapse.maxWallSec) {
+            throw new Error(`storyboard ${where}: maxWaitSec ${rawMax} s is below timelapse.maxWallSec ${action.timelapse.maxWallSec} s — during a time-lapse maxWallSec is the wait budget`);
+          }
         }
         checkReferences(action.args, where);
       }
@@ -236,14 +284,24 @@ export function parseTutorial(raw) {
     }
   }
 
-  checkActions(script.setup, 'setup', true);
+  checkActions(script.setup, 'setup', true, raw?.setup);
+
+  if (!script.storageOverride) {
+    const protectedKeys = Object.keys(script.storage).filter((key) => RECORDER_SEED_KEYS.includes(key));
+    if (protectedKeys.length > 0) {
+      throw new Error(`storyboard storage: ${protectedKeys.join(', ')} ${protectedKeys.length === 1 ? 'is a seed' : 'are seeds'} of the recorder itself — set 'storageOverride: true' to overwrite`);
+    }
+  }
+  if (script.steps.every((step) => step.motion === 'off')) {
+    throw new Error("storyboard steps: every step has motion 'off' — a take needs at least one step that Gate C measures");
+  }
 
   const seen = new Set();
   for (const step of script.steps) {
     if (seen.has(step.id)) throw new Error(`storyboard has a duplicate step id '${step.id}' — ids address segments and still frames and must be unique`);
     seen.add(step.id);
     if (step.holdSec === undefined) step.holdSec = script.minStepSec;
-    checkActions(step.actions, `step '${step.id}'`, false);
+    checkActions(step.actions, `step '${step.id}'`, false, Array.isArray(raw?.steps) ? raw.steps.find((candidate) => candidate?.id === step.id)?.actions : undefined);
   }
   return script;
 }

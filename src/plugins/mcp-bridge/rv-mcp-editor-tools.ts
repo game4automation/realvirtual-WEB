@@ -18,6 +18,7 @@
  * "Not in editor mode" error outside editor mode.
  */
 
+import { whenDocumentSettled } from '../../core/hmi/rv-bind-queue';
 import { Box3, Vector3 } from 'three';
 import type { BufferGeometry, Mesh, Object3D } from 'three';
 import type { RVViewer } from '../../core/rv-viewer';
@@ -238,6 +239,7 @@ export class McpEditorTools {
   private async _handleDirty(
     ctx: ActiveAssetContext, ifDirty: string | undefined, saveName?: string,
   ): Promise<string | null> {
+    await whenDocumentSettled(ctx.doc);
     if (!ctx.doc.dirty) return null;
     const policy = (ifDirty || 'fail').toLowerCase();
     // plan-462 B3 — BEFORE the draft is deleted, not after. `discard` clears the
@@ -856,7 +858,7 @@ export class McpEditorTools {
     await ctx.doc.withTransaction(`Generate UVs (${requested})`, async () => {
       result = await applyGeneratedUVs(ctx.doc, meshes, requested, overwrite === true);
     });
-    await ctx.doc.whenIdle();
+    await whenDocumentSettled(ctx.doc);
     const skipped = [...missing.map((p) => ({ path: p, reason: 'Node not found' })), ...result.skipped];
     if (meshes.length === 0 && missing.length === 0) skipped.push({ path: list.join(', '), reason: 'No meshes under the given paths' });
     return JSON.stringify({
@@ -920,7 +922,7 @@ export class McpEditorTools {
     } else {
       await separateOne(list[0]);
     }
-    await ctx.doc.whenIdle();
+    await whenDocumentSettled(ctx.doc);
     // The Group took each source's path — re-selecting keeps the user in place,
     // now with the parts one level below (same move as the context-menu flow).
     if (results.length > 0) ctx.viewer.selectionManager?.select(results[0].path);
@@ -1320,7 +1322,7 @@ export class McpEditorTools {
         await mods.transform.centerKinematicToGroup(ctx.viewer, ctx.doc, kinPath);
       }
     });
-    await ctx.doc.whenIdle();
+    await whenDocumentSettled(ctx.doc);
 
     if (!kinPath) return JSON.stringify({ error: 'Kinematize failed — no kinematic path' });
     const kinNode = ctx.viewer.registry?.getNode(kinPath);
@@ -1479,7 +1481,7 @@ export class McpEditorTools {
       const paths = await mods.importAsset.importIntoAsset(ctx.doc, [{
         kind: 'glb', bytes: read.bytes, suggestedName: read.name,
       } as import('../../core/import/rv-import-provider').ImportResultItem]);
-      await ctx.doc.whenIdle();
+      await whenDocumentSettled(ctx.doc);
       return JSON.stringify({ ok: true, rootPaths: paths });
     } catch (e) {
       return JSON.stringify({ error: String(e) });
@@ -1506,7 +1508,7 @@ export class McpEditorTools {
       const file = new File([read.bytes], read.name);
       const result = await provider.importFile(file, quality?.trim() || 'standard');
       const rootPath = await ctx.doc.importCad(result);
-      await ctx.doc.whenIdle();
+      await whenDocumentSettled(ctx.doc);
       // plan-561: non-fatal notes (e.g. CONNECT failed, converted in the browser —
       // colours may be incomplete) reach the agent instead of a console line.
       const warnings = result.warnings ?? [];
@@ -1528,7 +1530,7 @@ export class McpEditorTools {
       const resolved = await resolveFileViaImportProvider(importProviderRegistry, new File([read.bytes], read.name));
       if (!resolved.ok) return JSON.stringify({ error: resolved.error });
       const paths = await mods.importAsset.importIntoAsset(doc, resolved.items);
-      await doc.whenIdle();
+      await whenDocumentSettled(doc);
       const warnings = resolved.failed.map((f) => `${f.id}: ${f.error}`);
       const q = quality?.trim();
       if (q && q !== 'standard') {

@@ -2,7 +2,6 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import type { Object3D } from 'three';
-import { isSensorRuntimeVizName } from '../engine/rv-sensor-viz-names';
 import {
   RV_CHAIN_ELEMENT,
   RV_CHAIN_PROXY,
@@ -17,11 +16,12 @@ import {
  * thumbnail (plan-776 F2): what the file does not contain is not in its picture.
  */
 export function isRuntimeHelperNode(node: Object3D): boolean {
+  // MARKERS only, never a name (an authored `X_sensorRay` must survive); legacy
+  // sensor viz is migrated on load (`isLegacySensorVizChild`).
   const ud = node.userData as Record<string, unknown>;
   // `!!`: the markers are truthy flags of any type, the prune only ever tested truthiness.
   return !!(
-      node.name.startsWith('__raycastBVH')
-      || ud['_rvRaycastBVH']
+      ud['_rvRaycastBVH']
       // A BatchedMesh render arena (`rv-batched-render.ts`). Arenas are parented
       // INTO the model tree (`anchor.add(batch)`) and their source meshes stay in
       // the tree as well — only hidden per instance via `setVisibleAt`. Since the
@@ -71,10 +71,8 @@ export function isRuntimeHelperNode(node: Object3D): boolean {
       // the node `userData._rvRuntimeVisual = true` and it never reaches the
       // file — otherwise every save/load round trip would add one more copy.
       || ud['_rvRuntimeVisual'] === true
-      // Sensor box / outline / ray tube, any dedup suffix — the ray was missing
-      // here, so every save added one more beam to the file.
-      || isSensorRuntimeVizName(node.name)
-      || node.name === '_tankFillViz'
+      // Tank-fill / pipe-flow overlays (`<mesh>_fillOverlay`, `_fillLine`).
+      || ud['_tankFillViz'] === true
       // EnergyChain runtime rig (plan-362). The export must contain the
       // ORIGINAL CAD meshes, not a skinned reconstruction of them: the rig is
       // deterministically reproducible from the rv_extras on load, and glTF
@@ -82,10 +80,6 @@ export function isRuntimeHelperNode(node: Object3D): boolean {
       // dropped here, which `onlyVisible: false` would otherwise happily bake in.
       || ud[RV_CHAIN_PROXY]
       || ud[RV_CHAIN_SKIN]
-      // The bone container takes its whole subtree with it. Matching on
-      // `isBone` instead would be over-broad: an imported skinned GLB may carry
-      // legitimate authored bones that must survive a save.
-      || node.name === '__rvEnergyChainBones'
       // Chain element clones (plan-733). `RVChain` builds `NumberOfElements`
       // copies of its template at load; they are deterministically reproducible
       // from the rv_extras, so the file must keep the TEMPLATE only. The primary

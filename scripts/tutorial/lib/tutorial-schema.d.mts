@@ -6,12 +6,24 @@
  * import the module statically from TypeScript. Keep in step with the .mjs by hand.
  */
 
+/** plan-2240: CSS pixels from the element's centre. */
+export interface TargetOffset { dx: number; dy: number }
+
 export type TutorialTarget =
-  | { selector: string }
+  | { selector: string; offset?: TargetOffset }
   | { x: number; y: number }
   | { command: string; buttonKey?: string }
   | { node: string; anchor: 'center' | 'top' }
   | { recordingTarget: string; key: string };
+
+/** plan-2237 F8: time-lapse section of a command action (wall clock, `fps` 2..8). */
+export interface TimelapseSpec {
+  fps: number;
+  maxWallSec: number;
+}
+
+export const TIMELAPSE_FPS_MIN: number;
+export const TIMELAPSE_FPS_MAX: number;
 
 export interface CommandAction {
   type: 'command';
@@ -21,6 +33,7 @@ export interface CommandAction {
   via: 'click' | 'direct';
   waitSec: number;
   maxWaitSec: number;
+  timelapse?: TimelapseSpec;
 }
 
 export interface PickAction {
@@ -50,6 +63,8 @@ export interface TutorialStep {
   actions: TutorialAction[];
   zoom: 'auto' | 'none' | number;
   tailSec: number;
+  /** plan-2240: Gate C policy; absent = follow CLI `--motion-check` (never defaulted by the schema). */
+  motion?: MotionPolicy;
   say?: unknown;
   [key: string]: unknown;
 }
@@ -62,19 +77,27 @@ export interface TutorialScript {
   connect: 'off' | 'live';
   viewport: { width: number; height: number };
   welcome: 'show' | 'dismiss';
-  start: 'running' | 'paused';
+  start: 'running' | 'paused' | 'editor';
   ready: string;
   minStepSec: number;
   motionRegion: { x: number; y: number; w: number; h: number };
   /** Frame stamp: separate proof track (default) or burned into the app corner (plan-2043). */
   stamp: 'proof' | 'inline';
   setup: TutorialAction[];
+  /** plan-2240: localStorage seeds (`rv-` keys), applied after the recorder's seeds and panel cleanup. */
+  storage: Record<string, string>;
+  /** plan-2240: allows `storage` to overwrite one of {@link RECORDER_SEED_KEYS}. */
+  storageOverride: boolean;
   steps: TutorialStep[];
   voice?: unknown;
   [key: string]: unknown;
 }
 
+export type MotionPolicy = 'require' | 'warn' | 'off';
+
 export const SCHEMA_ID: 'rv-tutorial/1';
+export const MOTION_POLICIES: readonly MotionPolicy[];
+export const RECORDER_SEED_KEYS: readonly string[];
 export const actionSchema: unknown;
 export const stepSchema: unknown;
 export const tutorialSchema: unknown;

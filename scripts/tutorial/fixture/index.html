@@ -87,12 +87,75 @@
     })();
   </script>
   <script>
+    // plan-2240 fixtures, each behind its own query flag so the older cases see the page unchanged.
+    (() => {
+      const query = new URLSearchParams(location.search);
+      const report = (path, value) => fetch(`${path}?data=${encodeURIComponent(JSON.stringify(value))}`).catch(() => {});
+      // ?storage=1 — report the rv-* localStorage keys the init script left for this document.
+      if (query.get('storage') === '1') {
+        const seen = {};
+        for (const key of Object.keys(localStorage)) if (key.startsWith('rv-')) seen[key] = localStorage.getItem(key);
+        void report('/storage', seen);
+      }
+      // ?offset=1 — log every press and release with the rects of the offset bases.
+      if (query.get('offset') === '1') {
+        const rectOf = (id) => {
+          const r = document.getElementById(id).getBoundingClientRect();
+          return { x: r.x, y: r.y, w: r.width, h: r.height };
+        };
+        for (const type of ['pointerdown', 'pointerup']) {
+          document.addEventListener(type, (event) => {
+            void report('/geometry', {
+              type, id: event.target.id || '', x: event.clientX, y: event.clientY,
+              rects: { instant: rectOf('instant'), dragFrom: rectOf('drag-from'), dragTo: rectOf('drag-to') },
+            });
+          }, true);
+        }
+      }
+      // ?pulse=1 — a block inside the motion region that flips black/white on every animation
+      // frame while switched on; the switches sit outside the region.
+      if (query.get('pulse') === '1') {
+        const pulse = document.createElement('div');
+        pulse.id = 'pulse';
+        pulse.style.cssText = 'position:absolute;left:800px;top:620px;width:300px;height:250px;z-index:3;background:#000';
+        document.body.appendChild(pulse);
+        let on = false;
+        let flip = false;
+        const button = (id, top, value) => {
+          const element = document.createElement('button');
+          element.id = id;
+          element.type = 'button';
+          element.textContent = id;
+          element.style.cssText = `left:1400px;top:${top}px;width:200px;height:60px;z-index:3`;
+          element.addEventListener('click', () => { on = value; });
+          document.body.appendChild(element);
+        };
+        button('pulse-on', 100, true);
+        button('pulse-off', 200, false);
+        const tick = () => {
+          if (on) { flip = !flip; pulse.style.background = flip ? '#fff' : '#000'; }
+          requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      }
+    })();
+  </script>
+  <script>
     (() => {
       const query = new URLSearchParams(location.search);
       if (query.get('cmdfixture') !== '1') return;
 
       const factor = Number(query.get('factor') ?? 1);
       let subMode = query.get('mode') ?? 'animated';
+      // plan-2237: `?mode=` makes the fixture a DES viewer for `sim.clock.get`; without it the
+      // fixture is a continuous sim whose factor is the speed override.
+      const desMode = query.has('mode');
+      let multiplier = factor;
+      let speed = 1;
+      const community = query.get('community') === '1';
+      const factorNow = () => (desMode
+        ? (subMode === 'animated' ? 1 : subMode === 'hybrid' ? Math.max(1, multiplier) : subMode === 'step' ? 0 : null)
+        : speed);
       const continuousMotion = query.get('motion') === 'continuous';
       const variant = query.get('variant') ?? 'base';
       const viewer = window.viewer = {
@@ -101,6 +164,9 @@
       const executed = window.__fixture.executed = [];
       let watch = [];
       let watching = false;
+      // plan-2237: the take-wide time-command watch of the real seam (dispatch + completion).
+      let timeWatch = null;
+      let timeEvents = [];
       let ticks = 0;
       let dotTicks = 0;
       const pending = [];
@@ -131,6 +197,21 @@
         if (variant === 'ambiguous') addButton('reset-command-other', 'sim.reset', 50);
       }
       addButton('play-command', 'sim.playPause', 100);
+      // plan-2237: a batch button, so a time-lapse can be dispatched by a recorded click.
+      if (query.get('batchbutton') === '1') {
+        const batchButton = addButton('batch-command', 'experiment.run', 0, { ticks: Number(query.get('ticks') ?? 90) });
+        batchButton.style.cssText += ';position:absolute;left:0;top:-60px';
+      }
+      // plan-2237: UI buttons for time commands and for a Commercial command (community click path).
+      if (query.get('stepbutton') === '1') {
+        addButton('step-command', 'des.step', 0).style.cssText += ';position:absolute;left:0;top:-110px';
+      }
+      if (query.get('checkpointbutton') === '1' || query.get('checkpointbutton') === 'disabled') {
+        const checkpoint = addButton('checkpoint-command', 'des.checkpoint.load', 0, { t: 0 });
+        checkpoint.style.cssText += ';position:absolute;left:0;top:-160px';
+        // A disabled button never dispatches — the case the recorder must diagnose before the click.
+        if (query.get('checkpointbutton') === 'disabled') checkpoint.disabled = true;
+      }
       const bar = document.createElement('div');
       bar.id = 'bar-agv';
       bar.style.cssText = 'position:absolute;left:0;top:160px;width:120px;height:30px;background:#087f5b';
@@ -161,11 +242,64 @@
       document.addEventListener('pointermove', () => { dotTicks = 1; }, { once: true });
 
       async function execute(id, args) {
+        if (timeWatch?.has(id)) timeEvents.push({ id, phase: 'dispatch' });
+        const result = await executeInner(id, args);
+        if (timeWatch?.has(id)) timeEvents.push({ id, phase: 'done', ok: result.ok });
+        return result;
+      }
+
+      async function executeInner(id, args) {
         let result = { ok: true, value: null };
+        // plan-2237 F9: a Community build answers kind 'commercial-feature' for the Commercial families (measured on a VITE_PUBLIC_BUILD dist).
+        if (community && ['des.checkpoint.', 'experiment.', 'snapshot.'].some((prefix) => id.startsWith(prefix))) {
+          result = { ok: false, kind: 'commercial-feature', reason: 'experiment manager is a commercial module (realvirtual Commercial)' };
+          const refused = { id, args, ok: false, kind: result.kind, reason: result.reason };
+          executed.push(refused);
+          if (watching) watch.push(refused);
+          await report('/exec', refused);
+          return result;
+        }
         switch (id) {
-          case 'sim.reset': break;
-          case 'sim.playPause': viewer.isSimulationPaused = !viewer.isSimulationPaused; break;
-          case 'des.status': result.value = { subMode, multiplier: factor }; break;
+          case 'sim.reset': viewer.simTime = 0; break;
+          // plan-2237: one event gap — a jump without any change of mode, factor or pause.
+          case 'des.step': viewer.simTime += 2.5; break;
+          case 'sim.playPause':
+            viewer.isSimulationPaused = typeof args?.paused === 'boolean' ? args.paused : !viewer.isSimulationPaused;
+            break;
+          case 'des.status': result.value = { subMode, multiplier }; break;
+          // plan-2237 F2: the read-only clock query; reading it is not logged as an execution.
+          case 'sim.clock.get':
+            return { ok: true, value: {
+              mode: desMode ? 'des' : 'continuous', paused: viewer.isSimulationPaused, simTime: viewer.simTime,
+              fixedStepCount: viewer.fixedStepCount, factor: factorNow(), factorSource: desMode ? 'des-subMode' : 'speedOverride',
+              ...(desMode ? { des: { subMode, multiplier, renderClock: viewer.simTime, simTime: viewer.simTime, endTime: null,
+                clampedAt: null, clampCounts: { budget: 0, end: 0 } } } : {}),
+            } };
+          case 'sim.speedOverride': speed = Math.max(0, Math.min(100, Number(args?.factor ?? 1))); result.value = { factor: speed }; break;
+          case 'des.setMode':
+            if (args?.subMode) subMode = args.subMode;
+            if (Number.isFinite(args?.multiplier)) multiplier = Math.max(1, args.multiplier);
+            break;
+          case 'des.fastForward':
+            // A jump in the dispatch frame; FF ends paused (measured on the real viewer).
+            viewer.simTime = Number(args?.untilSimTime ?? viewer.simTime + 3600);
+            viewer.isSimulationPaused = true;
+            break;
+          case 'des.checkpoint.load':
+            // Asynchronous like the real one: the jump lands 3 frames after dispatch, then step mode.
+            await new Promise((resolve) => pending.push({ at: ticks + 3, resolve: () => {
+              viewer.simTime = Number(args?.t ?? 0);
+              subMode = 'step';
+              resolve();
+            } }));
+            break;
+          case 'experiment.run':
+            // A batch that needs `ticks` animation frames — in a time-lapse those run on the wall clock.
+            await new Promise((resolve) => pending.push({ at: ticks + Math.max(1, args?.ticks ?? 30), resolve, batch: true }));
+            break;
+          case 'experiment.run.cancel':
+            for (let i = pending.length - 1; i >= 0; i--) if (pending[i].batch) pending.splice(i, 1)[0].resolve();
+            break;
           case 'fixture.setMode': subMode = args.mode; break;
           case 'selection.select': break;
           case 'sim.slow':
@@ -186,6 +320,16 @@
         armCommandWatch() { watching = true; watch = []; },
         takeCommandWatch() { const events = watch; watch = []; return events; },
         stopCommandWatch() { watching = false; watch = []; },
+        armTimeWatch(ids) { timeWatch = new Set(ids); timeEvents = []; },
+        // plan-2237: the registry's verdict without executing — Community: Commercial ids are not
+        // registered; `?commercial=disabled`: registered but not enabled (a production build without licence).
+        async commandState(id) {
+          const commercial = ['des.checkpoint.', 'experiment.', 'snapshot.'].some((prefix) => id.startsWith(prefix));
+          if (community && commercial) return { known: false };
+          if (query.get('commercial') === 'disabled' && commercial) return { known: true, enabled: false, reason: 'live checkpoints need a realvirtual Commercial licence' };
+          return { known: true, enabled: true, reason: null };
+        },
+        takeTimeWatch() { const events = timeEvents; timeEvents = []; return events; },
         target(id, key) { return id === 'des-stats-bar' ? center(document.getElementById(`bar-${key}`)) : null; },
         nodeScreen(path, anchor) {
           const point = path === 'Yard/AGV_1' ? center(dot) : null;
@@ -211,7 +355,8 @@
       const animate = () => {
         ticks++;
         if (!viewer.isSimulationPaused) {
-          viewer.simTime += (subMode === 'hybrid' ? factor : 1) / 30;
+          const f = factorNow();
+          if (f !== null) viewer.simTime += f / 30;
           viewer.fixedStepCount += 2;
           for (const node of nodes) node.x += node.speed;
         }

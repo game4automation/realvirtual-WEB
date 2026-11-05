@@ -47,6 +47,11 @@ export const PREFLIGHT_WINDOW_FRAMES = 40;
 /** Resolution allowance on top of one fixed step, in seconds (the measured log resolution was 1e-5). */
 export const PREFLIGHT_SIM_TOLERANCE_SEC = 1e-4;
 
+/** plan-2237 F6: the preflight clock — the DES render clock when the sample carries one, else simTime. */
+function preflightClockOf(sample) {
+  return sample.des === true && Number.isFinite(sample.renderClock) ? sample.renderClock : sample.simTime;
+}
+
 function isReading(sample) {
   return sample != null && Number.isFinite(sample.simTime) && Number.isFinite(sample.fixedStepCount);
 }
@@ -172,12 +177,14 @@ export function warmupEndIndex(samples, warmupMaxFrames) {
  *   firstViolationFrame: number | null,
  * }}
  */
-export function preflightVerdict({ samples, fps, warmupMaxFrames, epoch = undefined, windowFrames = PREFLIGHT_WINDOW_FRAMES }) {
+export function preflightVerdict({ samples, fps, warmupMaxFrames, epoch = undefined, windowFrames = PREFLIGHT_WINDOW_FRAMES, factor = 1 }) {
   if (!Number.isFinite(fps) || fps <= 0) throw new Error(`preflightVerdict: fps must be > 0, got ${fps}`);
   if (!Number.isInteger(warmupMaxFrames) || warmupMaxFrames < 1) {
     throw new Error(`preflightVerdict: warmupMaxFrames must be a positive integer, got ${warmupMaxFrames}`);
   }
-  const expectedSimTime = windowFrames / fps;
+  // plan-2237 F6: the expected progress follows the factor read from `sim.clock.get` (default 1).
+  const speed = Number.isFinite(factor) ? factor : 1;
+  const expectedSimTime = speed * windowFrames / fps;
   const report = {
     verdict: 'fail',
     diagnosis: 'virtual-clock-epoch',
@@ -235,7 +242,9 @@ export function preflightVerdict({ samples, fps, warmupMaxFrames, epoch = undefi
       return report;
     }
     const dSteps = cur.fixedStepCount - prev.fixedStepCount;
-    const dSimTime = cur.simTime - prev.simTime;
+    // plan-2237 F6: in DES the tempo clock is the render clock — `simTime` is the EVENT time and
+    // stays at 0 for the first frames after Play (measured), so a running DES start measured 0 s.
+    const dSimTime = preflightClockOf(cur) - preflightClockOf(prev);
     report.window.push({ dSimTime, dSteps });
     if (!(dSteps >= 1)) {
       report.reason = `window frame ${k - 1}: Δ fixedStepCount = ${dSteps}, expected ≥ 1`;
@@ -263,4 +272,269 @@ export function preflightVerdict({ samples, fps, warmupMaxFrames, epoch = undefi
   report.verdict = 'ok';
   report.diagnosis = null;
   return report;
+}
+
+// ─── plan-2237: the segment gate ─────────────────────────────────────────────────────────────────
+
+/** The viewer's fixed-step rate in Hz (`fixedDt = 1/60`). */
+export const FIXED_STEP_HZ = 60;
+/** I1 (takt): the cumulative step count may deviate from `(60/fps)·N` by at most ONE fixed step. */
+export const I1_TOLERANCE_STEPS = 1;
+/** I2 (integrator): `|Σ Δclock − Σ ΔfixedStepCount·f/60| ≤ 1e-6 s · N` — exact up to float noise. */
+export const I2_TOLERANCE_PER_FRAME_SEC = 1e-6;
+/** A segment with fewer evaluable frames is `short` (reported, never red). */
+export const MIN_SEGMENT_FRAMES = 3;
+/** Float noise allowed for "the clock stood still" (hold) and for the jump test. */
+const CLOCK_EPS = 1e-9;
+
+/**
+ * plan-2237 F3 — the commands that change tempo or time. A segment ends BEFORE each of them; the
+ * dispatch frame up to the command's completion plus one frame is a transition (F5).
+ */
+export const TIME_COMMANDS = Object.freeze([
+  'des.setMode', 'des.fastForward', 'des.checkpoint.load', 'des.step', 'snapshot.load',
+  'experiment.snapshot.load', 'sim.reset', 'sim.speedOverride', 'sim.playPause',
+]);
+
+/**
+ * Normalises one `sim.clock.get` value (plan-2237 F2) into a gate sample. Returns null for an
+ * unreadable value.
+ */
+export function clockSampleOf(value) {
+  if (!value || typeof value !== 'object' || !Number.isFinite(value.fixedStepCount) || !Number.isFinite(value.simTime)) return null;
+  const des = value.mode === 'des' && value.des ? value.des : null;
+  return {
+    mode: des ? 'des' : 'continuous',
+    paused: value.paused === true,
+    simTime: value.simTime,
+    fixedStepCount: value.fixedStepCount,
+    factor: value.factor === null || value.factor === undefined ? null : Number(value.factor),
+    subMode: des ? String(des.subMode) : null,
+    renderClock: des && Number.isFinite(des.renderClock) ? des.renderClock : null,
+    endTime: des && Number.isFinite(des.endTime) ? des.endTime : null,
+    clampBudget: des ? Number(des.clampCounts?.budget ?? 0) : 0,
+    clampEnd: des ? Number(des.clampCounts?.end ?? 0) : 0,
+  };
+}
+
+/** The tempo clock of a sample: DES -> render clock, continuous -> simTime. */
+export function gateClockOf(sample) {
+  return sample.mode === 'des' && Number.isFinite(sample.renderClock) ? sample.renderClock : sample.simTime;
+}
+
+/** The state that defines a segment; a change ends the segment even without a recorder command. */
+export function gateStateKey(sample) {
+  return `${sample.mode}|${sample.paused}|${sample.factor}|${sample.subMode ?? ''}`;
+}
+
+function isHoldState(sample) {
+  return sample.paused === true || sample.factor === 0 || (sample.mode === 'des' && sample.subMode === 'step');
+}
+
+function isSample(sample) {
+  return sample != null && Number.isFinite(sample.fixedStepCount) && Number.isFinite(gateClockOf(sample));
+}
+
+/**
+ * plan-2237 F3-F5 — the simulation-time gate of a whole take, as ONE pure decision.
+ *
+ * `samples[k]` is the `clockSampleOf` reading after output frame k. `windows` are the frames the
+ * runner excludes: `{ start, end, cmd, kind: 'transition' | 'timelapse' }`, both bounds inclusive
+ * (a time command: dispatch frame .. completion frame + 1; a time-lapse: its wall-clock frames
+ * plus the first frame after `wallEnd`).
+ *
+ * Per frame k ≥ 1 (Δ = sample k − sample k−1):
+ *  - inside a window, or the state (`mode | paused | factor | subMode`) changed -> transition: not
+ *    evaluated; `Δclock < 0` or `|Δclock| > max(1,f)·(ΔfixedStepCount+1)/60` (f = the larger factor
+ *    before/after the frame; null = any change) records ONE `simJumps` entry for the window;
+ *  - a DES clamp proven by the viewer (`clampCounts` grew — `_advanceTimed` set `clampedAt`) ->
+ *    the frame is `clamped`, unevaluated; `'end'` keeps every later frame clamped until the next
+ *    state change. Equal clocks alone are NEVER taken as a clamp;
+ *  - else the frame is evaluated in the open segment, which bases on the sample BEFORE its first
+ *    frame (rebase after every transition and clamp, so no deficit stays in the sum).
+ *
+ * A segment is judged cumulatively over its prefix, never reset per block: run -> I1
+ * `|ΣΔsteps − (60/fps)·k| ≤ 1` and I2 `|ΣΔclock − ΣΔsteps·f/60| ≤ 1e-6·k` at every prefix k; hold
+ * (paused, DES step, factor 0) -> Δclock = 0 at every prefix; jump (DES fastforward, factor null)
+ * -> skipped; fewer than 3 frames -> short.
+ */
+export function segmentGate({ samples, fps, windows = [] }) {
+  if (!Number.isFinite(fps) || fps <= 0) throw new Error(`segmentGate: fps must be > 0, got ${fps}`);
+  const stepsPerFrame = FIXED_STEP_HZ / fps;
+  // `sumSimTime` / `expectedSimTime` / `deviation` / `tolerance` keep the meaning of the report
+  // before plan-2237, now taken over the FIRST judged run segment (null without one):
+  // clock advance, `factor · frames / fps`, their distance, and one fixed step at the factor plus
+  // the I2 allowance. A passing segment always has `deviation ≤ tolerance`.
+  const report = { verdict: 'ok', diagnosis: null, reason: null, segments: [], simJumps: [], factor: null, clock: null,
+    sumSimTime: null, expectedSimTime: null, deviation: null, tolerance: null };
+  const unreadable = samples.findIndex((sample) => !isSample(sample));
+  if (unreadable >= 0) {
+    return { ...report, verdict: 'fail', diagnosis: 'sim-progress', reason: `sim.clock.get reading missing or not finite at frame ${unreadable}` };
+  }
+  const windowAt = new Map();
+  for (const w of windows) for (let f = w.start; f <= w.end; f++) if (!windowAt.has(f)) windowAt.set(f, w);
+
+  let open = null;     // evaluated segment in progress
+  let clamped = null;  // run of clamped frames in progress
+  let group = null;    // transition group in progress (one window or one state change)
+  let ended = false;   // 'end' clamp latched until the next state change
+
+  const closeOpen = () => {
+    if (!open) return;
+    const seg = open;
+    open = null;
+    const factor = seg.factor;
+    const entry = { index: report.segments.length, startFrame: seg.startFrame, endFrame: seg.endFrame,
+      kind: 'run', factor, clock: seg.clock, i1: seg.maxI1, i2: seg.maxI2, verdict: 'pass',
+      frames: seg.frames, sumClock: seg.sumClock, sumSteps: seg.sumSteps };
+    if (seg.hold) entry.kind = 'hold';
+    else if (factor === null) entry.kind = 'jump';
+    if (seg.frames < MIN_SEGMENT_FRAMES) { entry.kind = 'short'; entry.verdict = 'short'; }
+    else if (entry.kind === 'jump') entry.verdict = 'skipped';
+    else if (seg.failFrame !== null) {
+      entry.verdict = 'fail';
+      if (report.verdict !== 'fail') {
+        report.verdict = 'fail';
+        report.diagnosis = 'sim-progress';
+        report.reason = `segment ${entry.index} (${entry.kind}, frames ${seg.startFrame}..${seg.endFrame}, factor ${factor}, ${seg.clock}): ${seg.failReason} at frame ${seg.failFrame}`;
+      }
+    }
+    if (entry.kind === 'run' && entry.verdict !== 'short' && report.factor === null) {
+      report.factor = factor;
+      report.clock = seg.clock;
+      report.sumSimTime = seg.sumClock;
+      report.expectedSimTime = factor * seg.frames / fps;
+      report.deviation = Math.abs(report.sumSimTime - report.expectedSimTime);
+      report.tolerance = I1_TOLERANCE_STEPS * factor / FIXED_STEP_HZ + I2_TOLERANCE_PER_FRAME_SEC * seg.frames;
+    }
+    report.segments.push(entry);
+  };
+  const closeClamped = () => {
+    if (!clamped) return;
+    report.segments.push({ index: report.segments.length, startFrame: clamped.startFrame, endFrame: clamped.endFrame,
+      kind: 'run', factor: clamped.factor, clock: 'renderClock', i1: 0, i2: 0, verdict: 'clamped', clampedAt: clamped.kind });
+    clamped = null;
+  };
+  const closeGroup = () => {
+    if (!group) return;
+    if (group.kind === 'timelapse') {
+      report.segments.push({ index: report.segments.length, startFrame: group.startFrame, endFrame: group.endFrame,
+        kind: 'timelapse', factor: null, clock: group.clock, i1: 0, i2: 0, verdict: 'skipped', cmd: group.cmd });
+    }
+    if (group.jumpFrame !== null) {
+      report.simJumps.push({ frame: group.jumpFrame, cmd: group.cmd, fromSim: group.fromSim, toSim: group.toSim });
+    }
+    group = null;
+  };
+
+  for (let k = 1; k < samples.length; k++) {
+    const prev = samples[k - 1];
+    const cur = samples[k];
+    const sameMode = prev.mode === cur.mode;
+    const dClock = sameMode ? gateClockOf(cur) - gateClockOf(prev) : cur.simTime - prev.simTime;
+    const dSteps = cur.fixedStepCount - prev.fixedStepCount;
+    const w = windowAt.get(k) ?? null;
+    const stateChanged = gateStateKey(cur) !== gateStateKey(prev);
+
+    if (w || stateChanged) {
+      closeOpen();
+      closeClamped();
+      ended = false;
+      // One group per window; a state change outside a window is a one-frame group of its own.
+      if (!group || !w || group.window !== w) {
+        closeGroup();
+        group = { window: w, cmd: w ? w.cmd : 'state-change', kind: w?.kind ?? 'transition', startFrame: k, endFrame: k,
+          fromSim: sameMode ? gateClockOf(prev) : prev.simTime, toSim: null, jumpFrame: null,
+          clock: cur.mode === 'des' ? 'renderClock' : 'simTime' };
+      }
+      group.endFrame = k;
+      group.toSim = sameMode ? gateClockOf(cur) : cur.simTime;
+      // The larger of the two factors: a tempo change applies within its own dispatch frame.
+      const f = prev.factor === null || cur.factor === null ? null : Math.max(prev.factor, cur.factor);
+      const limit = f === null ? 0 : Math.max(1, f) * (dSteps + 1) / FIXED_STEP_HZ;
+      if (group.jumpFrame === null && (dClock < -CLOCK_EPS || Math.abs(dClock) > limit + CLOCK_EPS)) group.jumpFrame = k;
+      continue;
+    }
+    closeGroup();
+
+    const clampedNow = cur.mode === 'des' && (cur.clampBudget > prev.clampBudget || cur.clampEnd > prev.clampEnd);
+    if (ended || clampedNow) {
+      closeOpen();
+      const kind = ended || cur.clampEnd > prev.clampEnd ? 'end' : 'budget';
+      if (kind === 'end') ended = true;
+      if (!clamped) clamped = { startFrame: k, endFrame: k, kind, factor: cur.factor };
+      clamped.endFrame = k;
+      if (kind === 'end') clamped.kind = 'end';
+      continue;
+    }
+    closeClamped();
+
+    if (!open) {
+      open = { base: prev, startFrame: k, endFrame: k, frames: 0, factor: cur.factor, hold: isHoldState(cur),
+        clock: cur.mode === 'des' ? 'renderClock' : 'simTime', maxI1: 0, maxI2: 0, failFrame: null, failReason: null,
+        sumClock: 0, sumSteps: 0 };
+    }
+    open.frames++;
+    open.endFrame = k;
+    open.sumClock = gateClockOf(cur) - gateClockOf(open.base);
+    open.sumSteps = cur.fixedStepCount - open.base.fixedStepCount;
+    if (open.factor === null && !open.hold) continue; // jump segment: not evaluated
+    const n = open.frames;
+    const sumSteps = cur.fixedStepCount - open.base.fixedStepCount;
+    const sumClock = gateClockOf(cur) - gateClockOf(open.base);
+    if (open.hold) {
+      const i2 = Math.abs(sumClock);
+      open.maxI2 = Math.max(open.maxI2, i2);
+      if (open.failFrame === null && i2 > CLOCK_EPS) {
+        open.failFrame = k;
+        open.failReason = `hold segment: clock moved ${sumClock} s`;
+      }
+      continue;
+    }
+    const i1 = Math.abs(sumSteps - stepsPerFrame * n);
+    const i2 = Math.abs(sumClock - sumSteps * open.factor / FIXED_STEP_HZ);
+    open.maxI1 = Math.max(open.maxI1, i1);
+    open.maxI2 = Math.max(open.maxI2, i2);
+    if (open.failFrame === null) {
+      if (i1 > I1_TOLERANCE_STEPS + CLOCK_EPS) {
+        open.failFrame = k;
+        open.failReason = `I1: ${sumSteps} fixed steps over ${n} frames, expected ${stepsPerFrame * n} ± ${I1_TOLERANCE_STEPS}`;
+      } else if (i2 > I2_TOLERANCE_PER_FRAME_SEC * n) {
+        open.failFrame = k;
+        open.failReason = `I2: clock advanced ${sumClock} s, ${sumSteps} steps at factor ${open.factor} give ${sumSteps * open.factor / FIXED_STEP_HZ} s`;
+      }
+    }
+  }
+  closeOpen();
+  closeClamped();
+  closeGroup();
+  return report;
+}
+
+/**
+ * plan-2237 F3 (review 2026-11-04) — the transition windows of time commands, from the take-wide
+ * watch (`__rvRecording.armTimeWatch`), whoever dispatched them: recorder action, UI click or
+ * shortcut. `eventsAt[k]` are the watch events drained after frame k. Per id, a `dispatch` opens a
+ * window at its frame, the next `done` closes it one frame after its own (F5). A dispatch never
+ * completed stays open to the last frame; a completion without a seen dispatch is a window of its
+ * own frame plus one.
+ */
+export function timeCommandWindows(eventsAt, lastFrame) {
+  const open = new Map();
+  const windows = [];
+  for (let k = 0; k < eventsAt.length; k++) {
+    for (const event of eventsAt[k] ?? []) {
+      if (!event || typeof event.id !== 'string') continue;
+      if (event.phase === 'dispatch') {
+        if (!open.has(event.id)) open.set(event.id, []);
+        open.get(event.id).push(k);
+      } else if (event.phase === 'done') {
+        const starts = open.get(event.id);
+        const start = starts && starts.length > 0 ? starts.shift() : k;
+        windows.push({ start, end: k + 1, cmd: event.id, kind: 'transition' });
+      }
+    }
+  }
+  for (const [id, starts] of open) for (const start of starts) windows.push({ start, end: lastFrame, cmd: id, kind: 'transition' });
+  return windows.sort((a, b) => a.start - b.start);
 }

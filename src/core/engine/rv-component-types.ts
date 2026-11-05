@@ -29,10 +29,58 @@ function baseType(key: string): string {
   return i >= 1 && key.charCodeAt(i - 1) === 95 /* _ */ ? key.slice(0, i - 1) : key;
 }
 
+/** A component field whose value needs another type's feature. */
+interface FieldTypeTrigger {
+  readonly field: string;
+  readonly yields: string;
+  readonly when: (value: unknown) => boolean;
+}
+
+const FIELD_TRIGGERS = new Map<string, FieldTypeTrigger[]>();
+
+/**
+ * Declares that a `type` component whose `field` satisfies `when` needs the feature of
+ * `yields`, as if its node carried a `yields` component (plan-781 F21:
+ * `Source.CollisionRoleForMUs ≠ None` needs `CollisionRole`). Registered by the module
+ * that owns `yields`; idempotent per (type, field, yields).
+ */
+export function registerFieldTypeTrigger(
+  type: string, field: string, yields: string, when: (value: unknown) => boolean,
+): void {
+  const list = FIELD_TRIGGERS.get(type) ?? [];
+  if (list.some((t) => t.field === field && t.yields === yields)) return;
+  list.push({ field, yields, when });
+  FIELD_TRIGGERS.set(type, list);
+}
+
+/** The field triggers per type whose result is wanted (all of them when `wanted` is null). */
+function fieldTriggersFor(wanted: ReadonlySet<string> | null): Map<string, FieldTypeTrigger[]> | null {
+  if (FIELD_TRIGGERS.size === 0) return null;
+  let out: Map<string, FieldTypeTrigger[]> | null = null;
+  for (const [type, list] of FIELD_TRIGGERS) {
+    const hits = wanted ? list.filter((t) => wanted.has(t.yields)) : list;
+    if (hits.length > 0) (out ??= new Map()).set(type, hits);
+  }
+  return out;
+}
+
+/** Adds the types one component entry's field triggers yield; returns how many were new. */
+function addFieldTypes(types: Set<string>, triggers: readonly FieldTypeTrigger[], fields: unknown): number {
+  if (!fields || typeof fields !== 'object') return 0;
+  let added = 0;
+  for (const t of triggers) {
+    if (types.has(t.yields) || !t.when((fields as Record<string, unknown>)[t.field])) continue;
+    types.add(t.yields);
+    added++;
+  }
+  return added;
+}
+
 /**
  * The component types (rv_extras keys of `userData.realvirtual`) of every node under
  * `root`, plus the types an overlay introduces (it is applied later, during the
- * traversal, and can add components). One cheap pass; keys only, no values read.
+ * traversal, and can add components). One cheap pass; keys only — except the one
+ * field a registered field trigger reads ({@link registerFieldTypeTrigger}).
  *
  * With `wanted` (the trigger types of the declared, inactive features) only those
  * types are collected and the walk stops as soon as all of them were seen; an empty
@@ -48,6 +96,7 @@ export function collectComponentTypes(
   const types = new Set<string>();
   if (wanted && wanted.size === 0) return types;
   let missing = wanted ? wanted.size : -1;
+  const fieldTriggers = fieldTriggersFor(wanted ?? null);
   const stack: Object3D[] = [root];
   walk: while (stack.length > 0) {
     const node = stack.pop()!;
@@ -55,6 +104,11 @@ export function collectComponentTypes(
     if (rv && typeof rv === 'object') {
       for (const key in rv) {
         const type = baseType(key);
+        const triggers = fieldTriggers?.get(type);
+        if (triggers) {
+          missing -= addFieldTypes(types, triggers, rv[key]);
+          if (wanted && missing === 0) break walk;
+        }
         if (wanted) {
           if (!wanted.has(type) || types.has(type)) continue;
           types.add(type);
@@ -83,9 +137,15 @@ export function addPatchTypes(
   patches: Record<string, Record<string, unknown>> | null | undefined,
 ): Set<string> {
   if (!patches) return types;
+  const fieldTriggers = fieldTriggersFor(null);
   for (const patch of Object.values(patches)) {
     if (!patch || typeof patch !== 'object') continue;
-    for (const key of Object.keys(patch)) types.add(baseType(key));
+    for (const key of Object.keys(patch)) {
+      const type = baseType(key);
+      types.add(type);
+      const triggers = fieldTriggers?.get(type);
+      if (triggers) addFieldTypes(types, triggers, patch[key]);
+    }
   }
   return types;
 }

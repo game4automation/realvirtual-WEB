@@ -248,6 +248,7 @@ export function SensorChartOverlay() {
       open={open && !suppressed}
       onClose={() => viewer.toggleSensorChart(false)}
       title="Sensor Monitor"
+      panelId="demo-sensor-monitor"
       titleColor="#66bb6a"
       subtitle={`${sensorCount} sensors`}
       defaultWidth={CHART_DEFAULT_WIDTH}

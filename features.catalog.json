@@ -75,6 +75,14 @@
       "docs": "immersive/display-wall/#use-flysticks"
     },
     {
+      "id": "raytraced-render",
+      "label": "Ray-traced render mode",
+      "group": "visualize",
+      "summary": "Lights the live twin with WebGPU ray tracing: bounced light, reflections, transparency and soft shadows.",
+      "ids": ["raytraced-render"],
+      "docs": "getting-started/viewer/ray-traced-rendering/"
+    },
+    {
       "id": "guided-maintenance",
       "label": "Guided maintenance (the machine follows the steps)",
       "group": "visualize",
@@ -317,7 +325,15 @@
       "group": "integrate",
       "summary": "Exports the twin as USD including its realvirtual component data.",
       "ids": ["usd-export"],
-      "docs": "physical-ai/isaac-sim-live-link/"
+      "docs": "physical-ai/usd-export-import/"
+    },
+    {
+      "id": "usd-record-animation",
+      "label": "USD animation recording",
+      "group": "integrate",
+      "summary": "Records the running simulation as an animated USD file, live or for a set duration in deterministic mode.",
+      "ids": ["usd-record-animation"],
+      "docs": "physical-ai/usd-record-animation/"
     },
     {
       "id": "ai-prompt",

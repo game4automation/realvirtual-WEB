@@ -6,6 +6,8 @@ import type { RVViewer } from '../rv-viewer';
 import type { Object3D } from 'three';
 import { loadGroupVisibilitySettings, saveGroupVisibilitySettings } from './group-visibility-store';
 import { toCollisionRole } from '../engine/rv-collision-role';
+import { ensureFeatureIfDeclared } from '../rv-feature-loader';
+import { COLLISION_FEATURE } from '../../features/collision.register';
 import type { TraceRange } from '../engine/rv-path-trace';
 import type { PathTracePlugin } from '../../plugins/path-trace-plugin';
 import { isOverlayVisible, setOverlayVisible } from '../overlay-visibility-store';
@@ -123,16 +125,24 @@ export const collisionWatch: CommandImpl<{ assignmentsJson: string }> = {
     const registered: { path: string; role: string }[] = [];
     const missing: string[] = [];
     const invalid: string[] = [];
+    const found: { node: Object3D; path: string; role: ReturnType<typeof toCollisionRole> }[] = [];
     for (const { path, role } of entries) {
       const r = toCollisionRole(role);
       if (r === 'None') { invalid.push(`${path} (${role})`); continue; }
       const node = v.registry?.getNode(path) ?? null;
       if (!node) { missing.push(path); continue; }
-      v.collisionManager.register(node, r);
-      watchedFor(v).set(node, r);
-      registered.push({ path, role: r });
+      found.push({ node, path, role: r });
     }
-    v.collisionManager.invalidate();
+    // plan-781 F21: collision detection is on demand — a watch is a reason to load it.
+    if (found.length > 0) await ensureFeatureIfDeclared(v, COLLISION_FEATURE, 'command:collision.watch');
+    const m = v.collisionManager;
+    if (found.length > 0 && !m) return { error: 'Collision detection is not available in this viewer' };
+    for (const { node, path, role } of found) {
+      m!.register(node, role);
+      watchedFor(v).set(node, role);
+      registered.push({ path, role });
+    }
+    m?.invalidate();
     return {
       registered, missing, invalid,
       note: 'Bodies are rebuilt on the next simulation tick; check web_query("collision.status", {}) while the simulation runs.',
@@ -146,6 +156,8 @@ export const collisionReset: CommandImpl<{ clearWatch?: boolean }> = {
     const v = viewer;
     if (!v) return { error: 'No viewer' };
     const m = v.collisionManager;
+    // plan-781 F21: without the feature nothing was ever checked — nothing to reset.
+    if (!m) return { ok: true, removedWatch: 0, remainingWatch: watchedFor(v).size };
     m.reset();
     let removed = 0;
     if (clearWatch) {
@@ -184,6 +196,15 @@ export const collisionStatus: CommandImpl<{ includeBodies?: boolean }> = {
     const v = viewer;
     if (!v) return { error: 'No viewer' };
     const m = v.collisionManager;
+    // plan-781 F21: the feature is not loaded (no role in this model, no watch) —
+    // the empty-scene answer, without loading anything to give it.
+    if (!m) {
+      return {
+        bodies: 0, bodiesByRole: {}, checkedPairs: 0,
+        sessionWatched: watchedFor(v).size, collisions: 0, pairs: [],
+        ...(includeBodies ? { bodyList: [] } : {}),
+      };
+    }
     const byRole: Record<string, number> = {};
     for (const b of m.bodies) byRole[b.role] = (byRole[b.role] ?? 0) + 1;
     const pairs = m.activePairs.map((p) => ({
@@ -197,7 +218,22 @@ export const collisionStatus: CommandImpl<{ includeBodies?: boolean }> = {
       collisions: pairs.length,
       pairs,
       ...(includeBodies ? {
-        bodyList: m.bodies.map((b) => ({ path: b.key, role: b.role, meshes: b.meshes.length, aabbOnly: b.aabbOnly })),
+        // plan-781 F13: a body is segment ranges of chunks plus keep meshes.
+        // `meshes` is the deprecated alias of `parts` for one release; `aabbOnly`
+        // is gone (only a live machining stock box is still box-only).
+        bodyList: m.bodies.map((b) => {
+          let segments = 0;
+          let keepParts = 0;
+          for (const p of b.parts) {
+            segments += p.segments;
+            if (p.kind !== 'chunk') keepParts++;
+          }
+          return {
+            path: b.key, role: b.role,
+            parts: b.parts.length, segments, keepParts,
+            meshes: b.parts.length,
+          };
+        }),
       } : {}),
     };
   },

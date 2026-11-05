@@ -24,6 +24,7 @@ export function pillLabel(state: LiveLinkState): string {
     case 'needs-token': return 'Isaac Sim · token needed';
     case 'connecting': return (state.attempt ?? 1) >= 2 ? 'Isaac Sim · retrying' : 'Isaac Sim · connecting';
     case 'mounting': return 'Isaac Sim · transferring';
+    case 'remounting': return 'Isaac Sim · remounting';
     case 'error': return 'Isaac Sim · error';
     default: return 'Isaac Sim';
   }

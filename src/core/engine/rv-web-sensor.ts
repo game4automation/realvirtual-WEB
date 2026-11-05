@@ -17,7 +17,7 @@ import type { Object3D } from 'three';
 import type { ComponentContext, ComponentSchema, RVComponent } from './rv-component-registry';
 import { registerComponent, setComponentInstance, loadSchemaFromSpec } from './rv-component-registry';
 import type { GizmoHandle, GizmoShape } from './rv-gizmo-manager';
-import { wireValueSignal } from './rv-signal-wiring';
+import { wireDisplaySignal } from './rv-signal-wiring';
 
 // ─── Types ─────────────────────────────────────────────────────────────
 
@@ -242,10 +242,10 @@ export class RVWebSensor implements RVComponent {
     // unchanged level does not touch the gizmo.
     if (this.SignalInt) {
       this._intMap = parseIntStateMap(this.IntStateMap);
-      this._unsubscribe = wireValueSignal(ctx.signalStore, this.SignalInt,
+      this._unsubscribe = wireDisplaySignal(ctx.signalStore, this.SignalInt,
         (v) => this._onIntChange(Number(v)), undefined, ctx.reapply).unsubscribe;
     } else if (this.SignalBool) {
-      this._unsubscribe = wireValueSignal(ctx.signalStore, this.SignalBool,
+      this._unsubscribe = wireDisplaySignal(ctx.signalStore, this.SignalBool,
         (v) => this._onBoolChange(!!v), undefined, ctx.reapply).unsubscribe;
     } else if (WebSensorConfig.randomDemoStates) {
       // Demo mode: assign a random state instead of 'unbound'.

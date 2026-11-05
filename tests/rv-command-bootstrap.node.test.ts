@@ -10,7 +10,13 @@
  * a document swap writes nothing, and nothing ever answers "Unknown command".
  */
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  ensureWallCommandsRegistered, WALL_FILL_COMMAND, WALL_FILL_UNAVAILABLE,
+} from '../src/core/hmi/wall-command-descriptors';
+
+// plan-2233: the community build resolves `@rv-private/display-wall/wall-fill-commands` to the stub.
+vi.mock('@rv-private/display-wall/wall-fill-commands', () => import('../src/private-stubs/display-wall/wall-fill-commands'));
 import type { RVViewer } from '../src/core/rv-viewer';
 import { CommandRegistry, type CommandImpl } from '../src/core/hmi/rv-command-registry';
 import {
@@ -138,5 +144,18 @@ describe('editor command bootstrap', () => {
     const r = await reg.execute('selection.clear', {}, { origin: 'mcp', viewer });
     expect(r).toEqual({ ok: true, value: { selected: 0 } });
     expect(cleared).toBe(true);
+  });
+});
+
+describe('wall.fillFromBody in the community build (plan-2233 F6, tier-boundary 6)', () => {
+  it('is registered without private code and answers unavailable, never unknown', async () => {
+    const reg = new CommandRegistry();
+    ensureWallCommandsRegistered(reg);
+    const desc = reg.get(WALL_FILL_COMMAND)!;
+    expect(desc).toBeTruthy();
+    expect([desc.readOnly, desc.macro, desc.available]).toEqual([false, true, true]);
+    const r = await reg.execute(WALL_FILL_COMMAND, { node: 'Wall/Viewport', pose: 'dtrack.body1', frame: 'dtrack.frame' },
+      { origin: 'mcp', viewer: fakeViewer('hmi') });
+    expect(r).toEqual({ ok: false, kind: 'unavailable', reason: WALL_FILL_UNAVAILABLE });
   });
 });

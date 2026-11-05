@@ -18,7 +18,7 @@ export function fleetSourceParticipants({ takt, pause, wait }: FleetSourceWorld)
     prepare: json => pause.prepareState(json), commit: p => pause.swapState(p as { generation: number }),
   }, {
     key: 'fleet.wait', version: 1, dependencies: ['fleet.clock'], owner: wait,
-    stateKeys: ['waits', 'kindStats', 'defaultLimit', 'nextToken'], services: ['id', 'clock', 'sink', 'cancelOnEnd', 'onTimeout', 'resolver'],
+    stateKeys: ['waits', 'kindStats', 'defaultLimit', 'nextToken'], services: ['id', 'vehicles', 'clock', 'sink', 'cancelOnEnd', 'onTimeout', 'resolver'],
     capture: () => wait.exportState(), validate: json => wait.validateState(json),
     prepare: json => wait.prepareState(json), commit: p => wait.swapState(p as PreparedWaitWatch),
   }];

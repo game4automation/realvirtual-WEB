@@ -2,39 +2,47 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * plan-394 §9.3 — the per-tick union world box (F5), visibility (F6) and the
- * exclusion of deformed geometry (F17).
+ * plan-394 §9.3 / plan-781 — the per-tick union world box (F5), visibility
+ * (F6/F12) and the exclusion of deformed and rewritten geometry (F17/F19).
  *
- * The articulation case is the second regression test of the plan: a cached
- * half-size (`AABB.fromNode`) freezes the build pose, so a robot arm extending
- * would keep the box of its folded pose and the broadphase would drop real
- * collisions forever.
+ * The articulation case is the regression test of plan-394: a cached box would
+ * freeze the build pose, so a robot arm extending would keep the box of its
+ * folded pose and the broadphase would drop real collisions forever. Since
+ * plan-781 the body is BAKED (two mover chunks) and the box is re-derived from
+ * fresh part poses.
+ *
+ * The plan-394 `aabbOnly` fallback is gone: a body part either has the pick
+ * structure (chunk, or a keep mesh's KeepPick) or takes the brute-force path.
+ * The only box-only case left is a live machining stock box
+ * (`rv-collision-machining.test.ts`).
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { BoxGeometry, Mesh, MeshBasicMaterial, Object3D, Scene, SkinnedMesh, MathUtils } from 'three';
+import type { BufferGeometry } from 'three';
 import { RVCollisionManager } from '../src/core/engine/rv-collision-manager';
-import { boxMesh, withBVH } from './collision-fixture';
+import { registerComponentSchema } from '../src/core/engine/rv-component-registry';
+import { KEEP_BRUTE_TRIS } from '../src/core/engine/rv-pick-backend';
+import { bakeCollisionScene, bodyNode, boxMesh, plainGroup } from './collision-fixture';
 import { __resetCollisionAlertStore } from '../src/core/hmi/collision-alert-store';
+
+registerComponentSchema('TestCollisionDynGeo', {}, { bake: 'keep', dynamicGeometry: true });
 
 const MAT = new MeshBasicMaterial();
 
-/** Body root with an "upper arm" that can slide away from the root. */
-function articulatedBody(): { manager: RVCollisionManager; root: Object3D; arm: Object3D; scene: Scene } {
-  const scene = new Scene();
-  const root = new Object3D();
-  root.name = 'Robot';
-  root.add(boxMesh({ name: 'Base' }));
-  const arm = new Object3D();
-  arm.name = 'Arm';
-  arm.add(boxMesh({ name: 'ArmMesh' }));
-  root.add(arm);
-  scene.add(root);
-  scene.updateMatrixWorld(true);
-  const manager = new RVCollisionManager();
-  manager.register(root, 'Robot');
-  manager.rebuild();
-  return { manager, root, arm, scene };
+/** Robot (mover) with an "upper arm" (mover) that can slide away from the root. */
+async function articulatedBody() {
+  const root = plainGroup('Asset',
+    bodyNode('Robot', { role: 'Robot', mover: true },
+      bodyNode('Arm', { role: 'Robot', mover: true })),
+  );
+  const s = await bakeCollisionScene(root);
+  const robot = s.node('Robot');
+  const arm = s.node('Arm');
+  // Only the outer node carries the checked role (the arm's extras keep it alive).
+  s.manager.register(robot, 'Robot');
+  s.manager.rebuild();
+  return { manager: s.manager, root: robot, arm, scene: s.scene };
 }
 
 function bodyOf(manager: RVCollisionManager, root: Object3D) {
@@ -47,49 +55,55 @@ beforeEach(() => __resetCollisionAlertStore());
 afterEach(() => vi.restoreAllMocks());
 
 describe('body bounds', () => {
-  it('grows when a child mesh moves relative to the body root (articulation, F5)', () => {
-    const { manager, root, arm, scene } = articulatedBody();
+  it('grows when a child moves relative to the body root (articulation, F5)', async () => {
+    const { manager, root, arm } = await articulatedBody();
     const body = bodyOf(manager, root);
+    expect(body.parts).toHaveLength(2);                 // two mover chunks
     manager.updateBodyBounds(body);
     const folded = body.worldBox.max.x;
 
-    arm.position.x += 5;
-    scene.updateMatrixWorld(true);
+    arm.position.x += 5;                               // no updateMatrixWorld: fresh poses (F16)
     manager.updateBodyBounds(body);
+    expect(body.moved).toBe(true);
     expect(body.worldBox.max.x).toBeGreaterThan(folded + 4);
   });
 
-  it('tracks world scale applied on a parent', () => {
-    const { manager, root, scene } = articulatedBody();
+  it('tracks world scale applied on a parent', async () => {
+    const { manager, root } = await articulatedBody();
     const body = bodyOf(manager, root);
     manager.updateBodyBounds(body);
     const before = body.worldBox.max.x - body.worldBox.min.x;
 
     root.scale.setScalar(2);
-    scene.updateMatrixWorld(true);
     manager.updateBodyBounds(body);
     const after = body.worldBox.max.x - body.worldBox.min.x;
     expect(after).toBeCloseTo(before * 2, 5);
   });
 
-  it('tracks rotation of the body root (wider axis-aligned box at 45 deg)', () => {
-    const { manager, root, scene } = articulatedBody();
+  it('tracks rotation of the body root (wider axis-aligned box at 45 deg)', async () => {
+    const { manager, root } = await articulatedBody();
     const body = bodyOf(manager, root);
     manager.updateBodyBounds(body);
     const before = body.worldBox.max.x - body.worldBox.min.x;
 
     root.rotation.y = MathUtils.degToRad(45);
-    scene.updateMatrixWorld(true);
     manager.updateBodyBounds(body);
     const after = body.worldBox.max.x - body.worldBox.min.x;
     expect(after).toBeGreaterThan(before * 1.3);   // 1 -> sqrt(2)
   });
 
-  it('excludes meshes hidden by an ancestor (F6)', () => {
-    const { manager, root, arm, scene } = articulatedBody();
+  it('does not move when nothing moved (motion stamp, F5)', async () => {
+    const { manager, root } = await articulatedBody();
+    const body = bodyOf(manager, root);
+    manager.updateBodyBounds(body);
+    manager.updateBodyBounds(body);
+    expect(body.moved).toBe(false);
+  });
+
+  it('excludes parts hidden by an ancestor (F6)', async () => {
+    const { manager, root, arm } = await articulatedBody();
     const body = bodyOf(manager, root);
     arm.position.x = 5;
-    scene.updateMatrixWorld(true);
     manager.updateBodyBounds(body);
     expect(body.worldBox.max.x).toBeGreaterThan(4);
 
@@ -98,22 +112,20 @@ describe('body bounds', () => {
     expect(body.worldBox.max.x).toBeLessThan(1);
   });
 
-  it('excludes meshes with layers.mask === 0 (batch sources, F6)', () => {
-    const { manager, root, arm, scene } = articulatedBody();
+  it('excludes parts with layers.mask === 0 (renderer-masked sources, F6)', async () => {
+    const { manager, root, arm } = await articulatedBody();
     const body = bodyOf(manager, root);
     arm.position.x = 5;
-    scene.updateMatrixWorld(true);
-    const armMesh = arm.children[0] as Mesh;
-    armMesh.layers.mask = 0;
+    const armPart = body.parts.find((p) => p.mesh.parent === arm)!;
+    armPart.mesh.layers.mask = 0;
     manager.updateBodyBounds(body);
     expect(body.worldBox.max.x).toBeLessThan(1);
   });
 
-  it('produces an empty box when every mesh is hidden (no phantom overlap)', () => {
-    const { manager, root } = articulatedBody();
+  it('produces an empty box when every part is hidden (no phantom overlap)', async () => {
+    const { manager, root } = await articulatedBody();
     const body = bodyOf(manager, root);
     root.visible = false;
-    // The root itself is an ancestor of its meshes.
     manager.updateBodyBounds(body);
     expect(body.worldBox.isEmpty()).toBe(true);
   });
@@ -125,12 +137,12 @@ describe('body bounds', () => {
     root.name = 'Chain';
     root.add(boxMesh({ name: 'Solid' }));
 
-    const skinned = new SkinnedMesh(withBVH(new BoxGeometry(1, 1, 1)), MAT);
+    const skinned = new SkinnedMesh(new BoxGeometry(1, 1, 1), MAT);
     skinned.name = 'Skinned';
     skinned.position.x = 20;
     root.add(skinned);
 
-    const morph = new Mesh(withBVH(new BoxGeometry(1, 1, 1)), MAT);
+    const morph = new Mesh(new BoxGeometry(1, 1, 1), MAT);
     morph.name = 'Morph';
     morph.morphTargetInfluences = [0];
     morph.position.x = 40;
@@ -144,12 +156,11 @@ describe('body bounds', () => {
     manager.rebuild();
     const body = bodyOf(manager, root);
 
-    expect(body.meshes.map((m) => m.mesh.name)).toEqual(['Solid']);
+    expect(body.parts.map((p) => p.mesh.name)).toEqual(['Solid']);
     manager.updateBodyBounds(body);
     expect(body.worldBox.max.x).toBeLessThan(1);
 
-    const deformWarnings = warn.mock.calls.filter(
-      (c) => String(c[0]).includes('deformed mesh'));
+    const deformWarnings = warn.mock.calls.filter((c) => String(c[0]).includes('deformed mesh'));
     expect(deformWarnings).toHaveLength(1);
 
     // A second rebuild in the same model load must NOT warn again.
@@ -158,72 +169,42 @@ describe('body bounds', () => {
     expect(warn.mock.calls.filter((c) => String(c[0]).includes('deformed mesh'))).toHaveLength(1);
   });
 
-  it('does not let an excluded deformed mesh pull the whole body to aabbOnly (F17)', () => {
-    const scene = new Scene();
-    const root = new Object3D();
-    root.name = 'Machine';
-    root.add(boxMesh({ name: 'Solid' }));            // has a BVH
-    // A skinned mesh has no boundsTree — if it were part of the body it would
-    // set aabbOnly and silently downgrade the whole body to a box test.
-    const skinned = new SkinnedMesh(new BoxGeometry(1, 1, 1), MAT);
-    skinned.name = 'Skinned';
-    root.add(skinned);
-    scene.add(root);
-    scene.updateMatrixWorld(true);
-
-    const manager = new RVCollisionManager();
-    manager.register(root, 'Machine');
-    manager.rebuild();
-    expect(bodyOf(manager, root).aabbOnly).toBe(false);
-  });
-
-  it('BUILDS the missing boundsTree of a body mesh rather than falling back (F14)', () => {
-    // 2026-09-02: the batched loader stopped emitting per-mesh trees, so every
-    // role-carrying body fell to the AABB check and a Workpiece inside a
-    // Machine was a permanent box overlap. `_ensureBoundsTree` now builds the
-    // tree on the spot for an eligible mesh — a plain box qualifies, so the
-    // body keeps triangle precision and nothing is warned about.
+  it('excludes keep meshes with rewritten geometry (dynamicGeometry, F19) and warns once', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const scene = new Scene();
     const root = new Object3D();
     root.name = 'Machine';
-    const mesh = boxMesh({ name: 'NoBVH', bvh: false });
-    root.add(mesh);
-    scene.add(root);
-    scene.updateMatrixWorld(true);
-
+    root.add(boxMesh({ name: 'Solid' }));
+    const band = boxMesh({ name: 'Band', pos: [3, 0, 0] });
+    band.userData.realvirtual = { TestCollisionDynGeo: { enabled: true } };
+    root.add(band);
     const manager = new RVCollisionManager();
     manager.register(root, 'Machine');
     manager.rebuild();
-
-    expect(mesh.geometry.boundsTree).toBeTruthy();   // built, not skipped
-    expect(bodyOf(manager, root).aabbOnly).toBe(false);
-    expect(warn.mock.calls.filter((c) => String(c[0]).includes('boundsTree'))).toHaveLength(0);
-  });
-
-  it('keeps the AABB fallback (warning once) past the triangle budget (F14)', () => {
-    // The budget is the one case that still falls back: a body far too big to
-    // tessellate synchronously at rebuild time. 12·200² = 480 000 triangles is
-    // comfortably over the 300 000 budget in `rv-collision-manager.ts`.
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const scene = new Scene();
-    const root = new Object3D();
-    root.name = 'Machine';
-    const huge = new Mesh(new BoxGeometry(1, 1, 1, 200, 200, 200), MAT);
-    huge.name = 'TooBig';
-    root.add(huge);
-    scene.add(root);
-    scene.updateMatrixWorld(true);
-
-    const manager = new RVCollisionManager();
-    manager.register(root, 'Machine');
-    manager.rebuild();
-
-    expect(huge.geometry.boundsTree).toBeFalsy();    // over budget → not built
-    expect(bodyOf(manager, root).aabbOnly).toBe(true);
-
+    expect(bodyOf(manager, root).parts.map((p) => p.mesh.name)).toEqual(['Solid']);
+    expect(warn.mock.calls.filter((c) => String(c[0]).includes('rewritten geometry'))).toHaveLength(1);
     manager.invalidate();
     manager.rebuild();
-    expect(warn.mock.calls.filter((c) => String(c[0]).includes('boundsTree'))).toHaveLength(1);
+    expect(warn.mock.calls.filter((c) => String(c[0]).includes('rewritten geometry'))).toHaveLength(1);
+  });
+
+  it('a big keep mesh joins through its KeepPick; a small one is brute-forced — no boundsTree is built', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const root = new Object3D();
+    root.name = 'Machine';
+    const big = boxMesh({ name: 'Big', segments: 12 });            // 12·12·12 → 1728 triangles
+    const small = boxMesh({ name: 'Small', pos: [3, 0, 0] });      // 12 triangles
+    root.add(big, small);
+    const manager = new RVCollisionManager();
+    manager.register(root, 'Machine');
+    manager.rebuild();
+    const parts = bodyOf(manager, root).parts;
+    const bigPart = parts.find((p) => p.mesh === big)!;
+    const smallPart = parts.find((p) => p.mesh === small)!;
+    expect(bigPart.triangles).toBeGreaterThan(KEEP_BRUTE_TRIS);
+    expect(bigPart.pick).not.toBeNull();
+    expect(smallPart.pick).toBeNull();
+    expect((big.geometry as BufferGeometry).boundsTree).toBeUndefined();
+    expect((small.geometry as BufferGeometry).boundsTree).toBeUndefined();
+    expect(warn).not.toHaveBeenCalled();
   });
 });

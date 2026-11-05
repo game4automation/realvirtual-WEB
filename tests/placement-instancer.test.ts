@@ -340,14 +340,14 @@ describe('PlacementInstancer — the primitive itself', () => {
 
   it('one key derivation: url wins over glbUrl, a bundled library path is re-rooted, no source → null', () => {
     const { instancer } = makeInstancer();
-    expect(instancer.sourceOf({ catalogId: 'a', glbUrl: 'https://x.invalid/a.glb' })?.key).toBe('https://x.invalid/a.glb');
-    expect(instancer.sourceOf({ catalogId: 'a', glbUrl: 'blob:dead', url: 'blob:fresh' })?.key).toBe('blob:fresh');
+    expect(instancer.sourceOf({ catalogId: 'a', glbUrl: 'https://x.invalid/a.glb' }, null)?.key).toBe('https://x.invalid/a.glb');
+    expect(instancer.sourceOf({ catalogId: 'a', glbUrl: 'blob:dead', url: 'blob:fresh' }, null)?.key).toBe('blob:fresh');
     const base = import.meta.env.BASE_URL ?? '/';
     const rooted = (base.endsWith('/') ? base : base + '/') + 'library/conv/Belt.glb';
-    expect(instancer.sourceOf({ catalogId: 'a', glbUrl: '/models/library/conv/Belt.glb' })?.key).toBe(rooted);
-    expect(instancer.sourceOf({ catalogId: 'a', glbUrl: rooted })?.key).toBe(rooted);
-    expect(instancer.sourceOf({ catalogId: 'project:library/Nope.glb', glbUrl: '' })).toBeNull();
-    expect(instancer.sourceOf({ catalogId: 'nothing', glbUrl: '' })).toBeNull();
+    expect(instancer.sourceOf({ catalogId: 'a', glbUrl: '/models/library/conv/Belt.glb' }, null)?.key).toBe(rooted);
+    expect(instancer.sourceOf({ catalogId: 'a', glbUrl: rooted }, null)?.key).toBe(rooted);
+    expect(instancer.sourceOf({ catalogId: 'project:library/Nope.glb', glbUrl: '' }, null)).toBeNull();
+    expect(instancer.sourceOf({ catalogId: 'nothing', glbUrl: '' }, null)).toBeNull();
   });
 
   it('an UNANCHORED relative path with an asset id goes through the host resolver, not a page-root fetch', async () => {
@@ -362,12 +362,12 @@ describe('PlacementInstancer — the primitive itself', () => {
       applyRenderMode: vi.fn(), resolveReference,
     });
     const ref = { catalogId: 'doc_vehicle_sedan', glbUrl: 'assets/vehicles/sedan.glb' };
-    expect(instancer.sourceOf(ref), 'no url-keyed source for a bare path').toBeNull();
+    expect(instancer.sourceOf(ref, null), 'no url-keyed source for a bare path').toBeNull();
     await expect(instancer.resolveBaked(ref)).rejects.toThrow(/resolves to nothing/);
     expect(resolveReference).toHaveBeenCalledWith(ref);
     // Anchored paths, and a bare path without an id or without a host resolver, keep the url key.
-    expect(instancer.sourceOf({ catalogId: 'doc_x', glbUrl: '/private-assets/p/a.glb' })?.key).toBe('/private-assets/p/a.glb');
-    expect(instancer.sourceOf({ catalogId: '', glbUrl: 'a.glb' })?.key).toBe('a.glb');
+    expect(instancer.sourceOf({ catalogId: 'doc_x', glbUrl: '/private-assets/p/a.glb' }, null)?.key).toBe('/private-assets/p/a.glb');
+    expect(instancer.sourceOf({ catalogId: '', glbUrl: 'a.glb' }, null)?.key).toBe('a.glb');
   });
 
   it('materialize applies overrides AFTER the pivot, and pivot:false keeps the authored frame', async () => {

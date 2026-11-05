@@ -17,16 +17,35 @@
  * originals still exist.
  */
 
+import type { SimEventFacade } from '../sim-event-facade';
+import type { Object3D } from 'three';
+
 const DEV_WARNING_THRESHOLD = 200;
 
 /** One tickable/disposable member of the scene-button family. */
 export interface SceneButtonMember {
+  readonly node?: Object3D;
+  pulseDeadline?(now: number): number | null;
+  releasePulse?(now: number): boolean;
+  resetButton?(): void;
+  leaveEventClock?(now: number): void;
   /** Advance by `dt` seconds; true when something visible changed. */
   updateButton?(dt: number): boolean;
   dispose?(): void;
 }
 
 export class SceneButtonManager {
+  private _eventClock: SimEventFacade | null = null;
+  get eventClock(): SimEventFacade | null { return this._eventClock; }
+
+  setEventClock(clock: SimEventFacade | null): void {
+    if (clock === this._eventClock) return;
+    if (this._eventClock) for (const member of this._members) member.leaveEventClock?.(this._eventClock.now);
+    this._eventClock = clock;
+  }
+
+  members(): IterableIterator<SceneButtonMember> { return this._members.values(); }
+  resetAll(): void { for (const member of this._members) member.resetButton?.(); }
   private readonly _members = new Set<SceneButtonMember>();
   private readonly _active = new Set<SceneButtonMember>();
   private _warnedAboutCount = false;

@@ -19,7 +19,8 @@ plugins/pallet-yard/index.ts`).
 | `src/core/fleet/continuous/handover.ts` | Shared continuous kernel adapters (`ContinuousHandover`) |
 | `continuous-bind.ts` | PalletYard scene lookup and geometry for `bindContinuousYard` |
 | `parameters.ts` | The planning-window declaration (`Size`, `Production load`, `Stations`, `Shipping`, `Fleet` — the AGV count lives here as `vehicles`) and the mapping of committed values onto the runtime configuration |
-| `index.ts` | The yard's configuration of the executor (`createYardRun`, `yardSite`), the DES scene bind (`bindDesYard`: nodes + hand-over poses), live planning values, viewer plugin (`bakeClaims`, bind per kernel, reset, per-frame work, planning lifecycle) |
+| `index.ts` | The plant definition: one `definePlantPlugin` call (takts, shipping pauses, retrieval rule, lamp map, planning parameters) plus `plantPluginExports` with the yard binder; the generic lifecycle (bind per kernel, reset, dispose) is owned by `FleetPlugin` in the core (plan-559 Phase 8) |
+| `yard-binder.ts`, `yard-runtime.ts` | The yard's scene lookup and its executor configuration (`createYardRun`, `yardSite`), the DES scene bind (`bindDesYard`: nodes + hand-over poses) and `bakeClaims` |
 
 ## Flow
 
@@ -156,7 +157,9 @@ pattern already confirmed for the AGV family (plan-680 E22).
 ## Status
 
 - DES runtime: done (CP1). Continuous backend and DES ↔ continuous parity: CP2. Soak: CP3.
-- DES snapshots are not supported: loading one reports `pallet-yard-snapshot-unsupported`
-  in the Problems panel and the yard restarts.
+- DES snapshots are supported (plan-2059): the yard, its fleet jobs, orders, zones and AGVs are
+  saved and continue bit-exactly in a fresh scene, verified by the continuation matrix. A snapshot
+  matches the identical model only; see `doc-persistence.md`.
 - plan-559: the yard runs on the fleet core — dispatch since Phase 4, the job execution and
-  the DES adapters since Phase 5 (wait reports `fleet-wait-timeout:<vehicle>:fork|exit`).
+  the DES adapters since Phase 5 (wait reports `fleet-wait-timeout:<vehicle>:fork|exit`), the
+  plugin lifecycle since Phase 8 (`definePlantPlugin`, see `doc-extending-webviewer.md`).

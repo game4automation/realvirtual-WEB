@@ -42,6 +42,9 @@ export class RVDriveFollowPosition implements IDriveBehavior, RVComponent {
   // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
   static readonly schema: ComponentSchema = loadSchemaFromSpec('Drive_FollowPosition');
 
+  // directPosition is a held input level (released by neutralize), not reset state.
+  resetRunState(): void { this.holdPosition = null; this.wasLive = false; }
+
   readonly node: Object3D;
   isOwner = true;
 

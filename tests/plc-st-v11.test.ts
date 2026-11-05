@@ -220,7 +220,7 @@ describe('ST v1.1 FB output parameters (9.5)', () => {
     const source = P('t(Q => done, IN := TRUE, ET => elapsed, PT := T#0ms);',
       'VAR t : TON; END_VAR VAR_EXTERNAL done : BOOL; elapsed : TIME; END_VAR');
     expect(compileOk(source).externals).toEqual([
-      { name: 'done', type: 'BOOL', written: true }, { name: 'elapsed', type: 'TIME', written: true },
+      { name: 'done', type: 'BOOL', written: true, read: false }, { name: 'elapsed', type: 'TIME', written: true, read: false },
     ]);
     const store = new SignalStore();
     store.register('done', 'PLC/done', false); store.register('elapsed', 'PLC/elapsed', 0);

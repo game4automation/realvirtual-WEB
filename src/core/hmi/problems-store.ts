@@ -382,6 +382,7 @@ export function reportLogicGated(m: LogicGatedReport): void {
 /** Drop every gated-logic problem — the document changed. */
 export function clearLogicGatedProblems(): void {
   clearProblemsOfCode('logic-gated');
+  clearProblemsOfCode('logic-instant-loop');
 }
 
 // ─── Orphaned asset overrides (plan-757 F9 / D13) ───────────────────────
@@ -2324,4 +2325,63 @@ export function clearBlockageProblems(): void {
   clearProblemsOfCode('blockage-deadlock');
   clearProblemsOfCode('blockage-stall');
   clearProblemsOfCode('blockage-coverage-gap');
+}
+
+// ─── Collision start overlaps (plan-781 F6/F7) ─────────────────────────
+
+/** Two still bodies overlap in the authored layout — never an alarm. */
+export const COLLISION_AUTHORED_OVERLAP_CODE = 'collision-authored-overlap';
+/** A pair touched in the start pose — quiet until it separates once. */
+export const COLLISION_START_OVERLAP_CODE = 'collision-start-overlap';
+
+/** One quiet pair of a collision overlap entry. */
+export interface CollisionOverlapPair {
+  aLabel: string;
+  aRole: string;
+  bLabel: string;
+  bRole: string;
+}
+
+/** At most this many pairs are spelled out in one entry's detail. */
+const COLLISION_OVERLAP_LISTED = 20;
+
+/**
+ * Report (or replace) the ONE entry of `code` listing the quiet pairs — info,
+ * `quiet: true` (the panel does not open by itself). `nodePath` is the real
+ * node path of the first pair's body, never a chunk or partition path
+ * (contract bake-picking rules 12/13). An empty list clears the entry.
+ */
+export function reportCollisionOverlaps(
+  code: 'collision-authored-overlap' | 'collision-start-overlap',
+  pairs: readonly CollisionOverlapPair[],
+  nodePath: string | undefined,
+): void {
+  if (pairs.length === 0) {
+    clearProblem(code);
+    return;
+  }
+  const listed = pairs.slice(0, COLLISION_OVERLAP_LISTED)
+    .map((p) => `${p.aLabel} (${p.aRole}) ↔ ${p.bLabel} (${p.bRole})`);
+  const more = pairs.length - listed.length;
+  const authored = code === COLLISION_AUTHORED_OVERLAP_CODE;
+  reportProblem({
+    id: code,
+    severity: 'info',
+    code,
+    title: authored
+      ? `Collision: parts overlap in the authored layout (${pairs.length})`
+      : `Collision: parts touch in the start pose (${pairs.length}) — quiet until they separate`,
+    detail: listed.join(' · ') + (more > 0 ? ` · and ${more} more` : '')
+      + (authored
+        ? '. Neither part moves, so this is never reported as a collision.'
+        : '. These pairs raise no collision until they have been apart once.'),
+    ...(nodePath ? { nodePath } : {}),
+    quiet: true,
+  });
+}
+
+/** Model change: drop both collision overlap entries. */
+export function clearCollisionOverlapProblems(): void {
+  clearProblemsOfCode(COLLISION_AUTHORED_OVERLAP_CODE);
+  clearProblemsOfCode(COLLISION_START_OVERLAP_CODE);
 }

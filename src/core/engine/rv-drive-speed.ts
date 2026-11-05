@@ -2,7 +2,7 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import type { Object3D } from 'three';
-import { RVDrive, type IDriveBehavior } from './rv-drive';
+import { RVDrive, setDriveBehaviorLiveField, type IDriveBehavior } from './rv-drive';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
 import { registerComponentSchema, loadSchemaFromSpec } from './rv-component-registry';
 import { NodeRegistry } from './rv-node-registry';
@@ -53,6 +53,13 @@ export class RVDriveSpeed implements IDriveBehavior, RVComponent {
   // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
   static readonly schema: ComponentSchema = loadSchemaFromSpec('Drive_Speed');
 
+  resetRunState(): void { Object.assign(this, this.initialRunState); }
+  setLiveField(field: string, value: unknown): boolean { return setDriveBehaviorLiveField(this, this.initialRunState, field, value); }
+  reapplyConfig(field?: string): void {
+    if (field === undefined || field === 'TargetSpeed') this.initialRunState.TargetSpeed = this.TargetSpeed;
+    if (field === undefined || field === 'Acceleration') this.initialRunState.Acceleration = this.Acceleration;
+  }
+
   readonly node: Object3D;
   isOwner = true;
 
@@ -73,13 +80,24 @@ export class RVDriveSpeed implements IDriveBehavior, RVComponent {
   private drive: RVDrive | null = null;
   private signalStore: SignalStore | null = null;
   private signalWriter: SignalWriter | null = null;
-  private authoredTargetSpeed = 100;
-  private authoredAcceleration = 100;
+  private initialRunState = { TargetSpeed: 100, Acceleration: 100 };
   private feedbackCb: ((drive: RVDrive) => void) | null = null;
 
   constructor(node: Object3D) {
     this.node = node;
   }
+
+  commandTargetSpeed(value: boolean | number): void {
+    this.TargetSpeed = Number(value);
+    this.drive?.onCommand?.(this);
+  }
+
+  commandAcceleration(value: boolean | number): void {
+    this.Acceleration = Number(value);
+    this.drive?.onCommand?.(this);
+  }
+
+  get commandFeedbackWriter() { return this.signalWriter; }
 
   /** Current value of a feedback slot, from the drive's state. */
   private feedbackValue(drive: RVDrive, slot: FeedbackSlot): boolean | number {
@@ -114,19 +132,17 @@ export class RVDriveSpeed implements IDriveBehavior, RVComponent {
       'component',
       { slotContext: path },
     );
-    this.authoredTargetSpeed = this.TargetSpeed;
-    this.authoredAcceleration = this.Acceleration;
-
+    this.reapplyConfig();
     // Register self as a drive behavior so drive.update() calls our update().
     drive.driveBehaviors.push(this);
     slotDeclare(this, 'SignalTargetSpeed', 'setter', {
-      apply: (value) => { this.TargetSpeed = Number(value); },
-      neutral: () => { this.TargetSpeed = this.authoredTargetSpeed; },
+      apply: (value) => this.commandTargetSpeed(value),
+      neutral: () => this.commandTargetSpeed(this.initialRunState.TargetSpeed),
       reapply: context.reapply,
     });
     slotDeclare(this, 'SignalAcceleration', 'setter', {
-      apply: (value) => { this.Acceleration = Number(value); },
-      neutral: () => { this.Acceleration = this.authoredAcceleration; },
+      apply: (value) => this.commandAcceleration(value),
+      neutral: () => this.commandAcceleration(this.initialRunState.Acceleration),
       reapply: context.reapply,
     });
     slotDeclare(this, 'SignalCurrentSpeed', 'feedback');

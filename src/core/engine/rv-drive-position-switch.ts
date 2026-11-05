@@ -44,6 +44,8 @@ export class RVDrivePositionSwitch implements IDriveBehavior, RVComponent {
   // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
   static readonly schema: ComponentSchema = loadSchemaFromSpec('Drive_PositionSwitch');
 
+  resetRunState(): void {}
+
   readonly node: Object3D;
   isOwner = true;
 

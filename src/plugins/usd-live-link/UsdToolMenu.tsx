@@ -11,19 +11,22 @@ import { writeLocalStorage } from '../../core/rv-safe-storage';
  *
  * One button, one menu (on the dark panel surface — text must stay readable
  * over any scene):
- *   Export USD…        → the open document's USD export (private provider, plan-764)
- *   Import USD…        → the unified import dialog on its USD tab (private provider)
+ *   USD FILES
+ *   Export USD scene…  → the open document's USD export (private provider, plan-764)
+ *   Import USD scene…  → the unified import dialog on its USD tab (private provider)
+ *   Apply realvirtual data from USD… → the shared Core-HMI apply flow
+ *   ANIMATION          → contributed usd-menu rows
  *   ─────────────
  *   ISAAC SIM LIVE SYNC
  *   Sync to Isaac Sim  [switch]
  *   <status> · Port 8775  ⚙ (token / port / rate)
  *   Setup and troubleshooting   (needs-token, retrying, error)
  *   ─────────────
- *   ▸ Isaac Sim extension   v0.2.0   (open until the first `live` on this device,
+ *   ▸ Set up Isaac Sim (extension)   (open until the first `live` on this device,
  *     Download extension             and whenever the extension is outdated)
  *     1. Unzip  2. Start Isaac Sim with a .bat  3. Copy the access token
  *
- * Without the private providers (community build) only Export / Import are
+ * Without the private providers (community build) Export / Import / Apply are
  * disabled — the live link is open and works without them.
  */
 
@@ -33,7 +36,6 @@ import {
   Collapse,
   Divider,
   IconButton,
-  MenuItem,
   MenuList,
   Popover,
   Switch,
@@ -41,8 +43,11 @@ import {
   Tooltip,
   Typography,
 } from '@mui/material';
-import { Extension, FileDownload, FileUpload, Settings } from '@mui/icons-material';
+import { Extension, FileDownload, FileUpload, Settings, SyncAlt } from '@mui/icons-material';
 import type { UISlotProps } from '../../core/rv-ui-plugin';
+import { useSlot } from '../../hooks/use-slot';
+import { SlotRenderer } from '../../core/hmi/HMIShell';
+import { SlotMenuRow } from '../../core/hmi/slot-menu-row';
 import {
   getActiveDocumentView,
   subscribeActiveDocumentView,
@@ -77,6 +82,7 @@ import {
   type LiveLinkState,
 } from './live-link-store';
 import { livesyncExtensionDownload, type LivesyncExtensionDownload } from './livesync-extension';
+import { LIVE_LINK_MAX_REMOUNT_MS, LIVE_LINK_MIN_REMOUNT_MS, clampRemountMs } from './remount-debounce';
 
 /** Provider id of the USD export / import (plan-764). */
 const USD_PROVIDER_ID = 'usd';
@@ -129,6 +135,7 @@ export function describeLiveLink(state: LiveLinkState, enabled: boolean): { text
     case 'connecting':
       return { text: isRetrying(state) && state.message ? state.message : 'Connecting…', color: WARN };
     case 'mounting': return { text: state.message ?? 'Transferring the scene…', color: WARN };
+    case 'remounting': return { text: state.message ?? 'Structure changed — remounting…', color: WARN };
     case 'error': return { text: state.message ?? 'Error', color: ERROR };
     default: return { text: enabled ? 'Starting…' : 'Off', color: INK_LOW };
   }
@@ -144,6 +151,13 @@ export function describeTextureNotice(state: LiveLinkState): string | null {
   const n = state.texturesSkipped ?? 0;
   if (n <= 0 || (state.status !== 'live' && state.status !== 'mounting')) return null;
   return `${n} ${n === 1 ? 'texture' : 'textures'} skipped (not exportable)`;
+}
+
+/** Detail line while live: "Session 7 · 1 284 prims (1 102 with address)", or null. */
+export function describeMountDetail(state: LiveLinkState): string | null {
+  if (state.status !== 'live' || !state.prims) return null;
+  const { total, withAddress } = state.prims;
+  return `Session ${state.session} · ${total.toLocaleString('en-US')} prims (${withAddress.toLocaleString('en-US')} with address)`;
 }
 
 /** The three install steps under the download link. */
@@ -188,32 +202,41 @@ function TextLink({ href, children, testId, download, icon }: {
 /** The "Isaac Sim extension" disclosure: download link + install steps. */
 function ExtensionSection({ download, defaultOpen }: { download: LivesyncExtensionDownload | null; defaultOpen: boolean }) {
   return (
-    <DetailsDisclosure
-      title="Isaac Sim extension"
-      summary={download ? `v${download.version}` : undefined}
-      defaultOpen={defaultOpen}
-      data-testid="usd-menu-extension-disclosure"
-    >
-      <Box data-testid="usd-menu-extension" sx={{ px: 2, pb: 0.75 }}>
-        {download ? (
-          <TextLink
-            href={download.url}
-            download
-            testId="usd-menu-extension-download"
-            icon={<Extension sx={{ fontSize: ICON_SIZE.md }} />}
-          >
-            Download extension (v{download.version})
-          </TextLink>
-        ) : (
-          <Typography sx={{ fontSize: FS.label, color: INK_MID }}>
-            Not included in this build — <TextLink href={LIVE_SYNC_README_URL}>see the README</TextLink>
-          </Typography>
-        )}
-        <Box component="ol" sx={{ m: 0, mt: 0.25, pl: 2.25, color: INK_MID, fontSize: FS.label }}>
-          {EXTENSION_INSTALL_STEPS.map((step) => <li key={step}>{step}</li>)}
+    <Box sx={{
+      '& > div > [role="button"]': {
+        gridTemplateColumns: 'auto minmax(0, 1fr)',
+        '& > .MuiTypography-root': {
+          gridColumn: 2, whiteSpace: 'normal', overflow: 'visible', textOverflow: 'clip',
+        },
+      },
+    }}>
+      <DetailsDisclosure
+        title="Set up Isaac Sim (extension)"
+        summary={download ? `v${download.version}` : undefined}
+        defaultOpen={defaultOpen}
+        data-testid="usd-menu-extension-disclosure"
+      >
+        <Box data-testid="usd-menu-extension" sx={{ px: 2, pb: 0.75 }}>
+          {download ? (
+            <TextLink
+              href={download.url}
+              download
+              testId="usd-menu-extension-download"
+              icon={<Extension sx={{ fontSize: ICON_SIZE.md }} />}
+            >
+              Download extension (v{download.version})
+            </TextLink>
+          ) : (
+            <Typography sx={{ fontSize: FS.label, color: INK_MID }}>
+              Not included in this build — <TextLink href={LIVE_SYNC_README_URL}>see the README</TextLink>
+            </Typography>
+          )}
+          <Box component="ol" sx={{ m: 0, mt: 0.25, pl: 2.25, color: INK_MID, fontSize: FS.label }}>
+            {EXTENSION_INSTALL_STEPS.map((step) => <li key={step}>{step}</li>)}
+          </Box>
         </Box>
-      </Box>
-    </DetailsDisclosure>
+      </DetailsDisclosure>
+    </Box>
   );
 }
 
@@ -233,11 +256,6 @@ export interface UsdToolMenuProps extends UISlotProps {
   onClose: () => void;
 }
 
-/** Secondary text of a file action that this build does not provide. */
-function NotInBuild() {
-  return <Box component="span" sx={{ ml: 'auto', fontSize: FS.micro, color: INK_LOW }}>Not in this build</Box>;
-}
-
 /** The inspector's inline text field (StringEditor): 18px input, MONO value, field tokens. */
 const fieldSx = { '& .MuiOutlinedInput-root': inspectorInputSx } as const;
 const fieldInputSlot = { sx: { fontSize: FS.label, fontFamily: MONO, height: 18 } } as const;
@@ -247,6 +265,7 @@ export function UsdToolMenu({ viewer, anchorEl, onClose }: UsdToolMenuProps) {
   const state = useLiveLink(plugin);
   const usdExport = useUsdExport();
   const importAvailable = useUsdImportAvailable();
+  const pluginRows = useSlot('usd-menu');
   const [showSettings, setShowSettings] = useState(() => plugin?.store.state.status === 'needs-token');
   const [dialog, setDialog] = useState<Dialog>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -263,7 +282,8 @@ export function UsdToolMenu({ viewer, anchorEl, onClose }: UsdToolMenuProps) {
   const textureNotice = describeTextureNotice(state);
   const download = livesyncExtensionDownload();
   const switchOn = state.status !== 'off';
-  const portLocked = state.status === 'connecting' || state.status === 'mounting' || state.status === 'live';
+  const portLocked = state.status === 'connecting' || state.status === 'mounting' || state.status === 'remounting' || state.status === 'live';
+  const mountDetail = describeMountDetail(state);
 
   const openExport = async () => {
     if (!usdExport) return;
@@ -295,6 +315,17 @@ export function UsdToolMenu({ viewer, anchorEl, onClose }: UsdToolMenuProps) {
     try { writeLocalStorage(IMPORT_LAST_PROVIDER_KEY, USD_PROVIDER_ID); } catch { /* private mode */ }
     const { UnifiedImportDialog } = await import('../unified-import/UnifiedImportDialog');
     setDialog({ node: (close) => <UnifiedImportDialog viewer={viewer} open onClose={close} /> });
+  };
+
+  const openApply = async () => {
+    if (!usdExport?.apply) return;
+    onClose();
+    try {
+      const { DocumentApplyFlow } = await import('../../core/hmi/scene/document-apply-flow');
+      setDialog({ node: (close) => <DocumentApplyFlow exp={usdExport} onClose={close} onMessage={setMessage} /> });
+    } catch (e) {
+      setMessage(`The apply dialog could not be loaded (${e instanceof Error ? e.message : String(e)}). Check the connection and try again.`);
+    }
   };
 
   /** Open the settings (never closes them) and put the cursor into the token field. */
@@ -347,47 +378,81 @@ export function UsdToolMenu({ viewer, anchorEl, onClose }: UsdToolMenuProps) {
             role: 'dialog',
             'aria-label': 'USD',
             'data-testid': 'usd-menu-paper',
-            sx: { ml: 1, width: 300, py: 0.5, backgroundColor: `${PANEL_SURFACE} !important` },
+            sx: { ml: 1, width: 360, maxWidth: 'calc(100vw - 16px)', py: 0.5, backgroundColor: `${PANEL_SURFACE} !important` },
           } as never,
           transition: { onEntered: focusFirst },
         }}
       >
         <Box data-testid="usd-menu">
+          <InspectorSubheader>USD files</InspectorSubheader>
           <MenuList dense aria-label="USD files" sx={{ py: 0 }}>
-            <MenuItem
-              data-testid="usd-menu-export"
+            <SlotMenuRow
+              label="Export USD scene…"
+              secondary={usdExport ? 'Geometry and realvirtual data as a USD file' : 'Not in this build'}
+              icon={<FileDownload />}
+              testId="usd-menu-export"
               disabled={!usdExport}
               onClick={() => { void openExport(); }}
-              sx={{ fontSize: FS.body, gap: 1, minHeight: 28 }}
-            >
-              <FileDownload sx={{ fontSize: ICON_SIZE.md }} /> Export USD…
-              {!usdExport && <NotInBuild />}
-            </MenuItem>
-            <MenuItem
-              data-testid="usd-menu-import"
+            />
+            <SlotMenuRow
+              label="Import USD scene…"
+              secondary={importAvailable ? 'Open a USD file as a new document' : 'Not in this build'}
+              icon={<FileUpload />}
+              testId="usd-menu-import"
               disabled={!importAvailable}
               onClick={() => { void openImport(); }}
-              sx={{ fontSize: FS.body, gap: 1, minHeight: 28 }}
-            >
-              <FileUpload sx={{ fontSize: ICON_SIZE.md }} /> Import USD…
-              {!importAvailable && <NotInBuild />}
-            </MenuItem>
+            />
+            <SlotMenuRow
+              label="Apply realvirtual data from USD…"
+              secondary={usdExport?.apply ? "Replaces this document's realvirtual data" : 'Not in this build'}
+              icon={<SyncAlt />}
+              testId="usd-menu-apply"
+              disabled={!usdExport?.apply}
+              onClick={() => { void openApply(); }}
+            />
           </MenuList>
+          <Divider data-testid={pluginRows.length > 0 ? 'usd-menu-slot-divider' : undefined} sx={{ my: 0.5 }} />
+          <InspectorSubheader>Animation</InspectorSubheader>
+          {pluginRows.length > 0 && (
+            <>
+              <MenuList
+                dense
+                aria-label="USD actions"
+                sx={{ py: 0 }}
+                onClickCapture={(event) => {
+                  // Bridge slot rows to this popover: close before the row's action,
+                  // while a refusing row keeps the menu and its reason available.
+                  const row = event.target instanceof Element
+                    ? event.target.closest('[data-rv-dropdown-item]')
+                    : null;
+                  if (row && row.getAttribute('aria-disabled') !== 'true') onClose();
+                }}
+              >
+                <SlotRenderer slot="usd-menu" />
+              </MenuList>
+            </>
+          )}
           <Divider sx={{ my: 0.5 }} />
           <InspectorSubheader data-testid="usd-menu-sync-header">Isaac Sim live sync</InspectorSubheader>
-          <Box sx={{ display: 'flex', alignItems: 'center', px: 2 }}>
-            <Typography component="label" htmlFor="usd-menu-sync-input" sx={{ fontSize: FS.body, flex: 1 }}>
-              Sync to Isaac Sim
-            </Typography>
-            <Switch
-              size="small"
-              checked={switchOn}
-              onChange={(_, on) => toggleSync(on)}
-              slotProps={{
-                input: { id: 'usd-menu-sync-input', role: 'switch', 'aria-label': 'Sync to Isaac Sim', 'data-testid': 'usd-menu-sync' } as never,
-              }}
+          <MenuList dense aria-label="Isaac Sim live sync" sx={{ py: 0 }}>
+            <SlotMenuRow
+              label="Sync to Isaac Sim"
+              secondary="Streams the scene and live motion one-way to Isaac Sim. Creates no file."
+              testId="usd-menu-sync-row"
+              onClick={() => toggleSync(!switchOn)}
+              icon={(
+                <Switch
+                  size="small"
+                  checked={switchOn}
+                  onClick={(e) => e.stopPropagation()}
+                  onChange={(_, on) => toggleSync(on)}
+                  slotProps={{
+                    input: { id: 'usd-menu-sync-input', role: 'switch', 'aria-label': 'Sync to Isaac Sim', 'data-testid': 'usd-menu-sync' } as never,
+                  }}
+                />
+              )}
             />
-          </Box>
+          </MenuList>
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, px: 2, pb: 0.25 }}>
             <Typography
               data-testid="usd-menu-status"
@@ -414,6 +479,11 @@ export function UsdToolMenu({ viewer, anchorEl, onClose }: UsdToolMenuProps) {
               </IconButton>
             </Tooltip>
           </Box>
+          {mountDetail && (
+            <Typography data-testid="usd-menu-mount-detail" sx={{ fontSize: FS.label, color: INK_LOW, px: 2, pb: 0.5 }}>
+              {mountDetail}
+            </Typography>
+          )}
           {textureNotice && (
             <Typography data-testid="usd-menu-texture-notice" sx={{ fontSize: FS.label, color: WARN, px: 2, pb: 0.5 }}>
               {textureNotice}
@@ -492,6 +562,18 @@ export function UsdToolMenu({ viewer, anchorEl, onClose }: UsdToolMenuProps) {
                     min={LIVE_LINK_MIN_HZ}
                     max={LIVE_LINK_MAX_HZ}
                     ariaLabel="Rate"
+                  />
+                </Box>
+              </InspectorRow>
+              <InspectorRow label="Remount after" labelColor={INK_MID} fullWidthField>
+                <Box data-testid="usd-menu-remount" sx={{ minWidth: 0 }}>
+                  <NumberEditor
+                    value={clampRemountMs(settings.remountDebounceMs)}
+                    onChange={(ms) => plugin.store.updateSettings({ remountDebounceMs: clampRemountMs(ms) })}
+                    unit="ms"
+                    min={LIVE_LINK_MIN_REMOUNT_MS}
+                    max={LIVE_LINK_MAX_REMOUNT_MS}
+                    ariaLabel="Remount after"
                   />
                 </Box>
               </InspectorRow>

@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { after, before, beforeEach, test } from 'node:test';
 import { createServer } from 'node:http';
 import {
-  copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync,
+  copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync,
   statSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { basename, dirname, extname, join, resolve } from 'node:path';
@@ -42,12 +42,13 @@ const dispatched = [];
 const simLog = [];
 const executedLog = [];
 const geometryLog = [];
+const storageLog = [];
 // node:test aborts `t.signal` when a test times out or is cancelled. Every run gets it, so a test
 // timeout tears the runner down (browser, ffmpeg, server) instead of leaving them alive — the
 // 2026-10-27 hang kept Chrome and ffmpeg running for 37 minutes after its test had given up.
 let currentSignal;
 beforeEach((t) => { currentSignal = t.signal; });
-beforeEach(() => { simLog.length = 0; executedLog.length = 0; geometryLog.length = 0; });
+beforeEach(() => { simLog.length = 0; executedLog.length = 0; geometryLog.length = 0; storageLog.length = 0; });
 
 function mime(file) {
   return ({ '.js': 'text/javascript', '.json': 'application/json', '.mp4': 'video/mp4' })[extname(file)]
@@ -75,6 +76,10 @@ before(async () => {
     const url = new URL(request.url ?? '/', 'http://127.0.0.1');
     if (url.pathname === '/sim') {
       simLog.push({ frame: Number(url.searchParams.get('frame')), t: Number(url.searchParams.get('t')) });
+      response.writeHead(204); response.end(); return;
+    }
+    if (url.pathname === '/storage') {
+      storageLog.push(JSON.parse(url.searchParams.get('data')));
       response.writeHead(204); response.end(); return;
     }
     if (url.pathname === '/exec' || url.pathname === '/geometry') {
@@ -573,13 +578,16 @@ test('Test_Run_Publish_AbortAfterEachGroup_EventsNeverFirst', { timeout: 600_000
   const oldFiles = { 'recording.mp4': 'old-v', 'motion-control.jpg': 'old-c', 'stills-f000000-start.jpg': 'old-s', 'events.json': 'old-e' };
   for (const [name, bytes] of Object.entries(oldFiles)) writeFileSync(join(old.dir, name), bytes);
   let failNewControl = false;
+  // The runner canonicalises --dir (realpath.native), so on a SUBST drive (E: -> C:\Daten) `to`
+  // names the real path; compare against the same canonical form or the seam never fires.
+  const oldDirCanon = realpathSync.native(old.dir);
   const replaced = await runCase('publish-old-run', oneClick('publish-old-run'), { outputDir: old.dir, overwrite: true }, {
     rename(from, to) {
       // The failure has to hit the PUBLICATION, which is recognised by its DESTINATION: the
       // move-aside step renames out of the project folder INTO `<temp>/replaced/`, and its source
       // path carries no marker to tell the two phases apart. Keyed on `from`, this seam aborted
       // the move-aside itself, so the old set never reached `replaced/` at all.
-      if (basename(from) === 'motion-control.jpg' && dirname(to) === old.dir && !failNewControl) {
+      if (basename(from) === 'motion-control.jpg' && dirname(to) === oldDirCanon && !failNewControl) {
         failNewControl = true; throw new Error('prepared replacement failure');
       }
       renameSync(from, to);
@@ -975,3 +983,478 @@ test('Test_Run_BurnCursor_SecondMp4_SameFrames_CursorOnlyInSecond', LONG, async 
   assert.ok(meanAbsDiff(cleanSpot, cursorSpot) > 3, 'the cursor file shows the cursor at pointer[frame]');
   assert.ok(meanAbsDiff(cleanSpot, plainSpot) < 2, 'recording.mp4 is unchanged by the flag');
 });
+
+// ── plan-2240: Gate C per step, storyboard storage, target offsets ────────────────────────────
+
+/** A pulse step: switch the block on, let it flip for a second, switch it off. */
+function pulseStep(id, extra = {}) {
+  return {
+    id, holdSec: 0.01, tailSec: 0.01, ...extra,
+    actions: [
+      { type: 'click', target: { selector: '#pulse-on' } },
+      { type: 'wait', ms: 1000 },
+      { type: 'click', target: { selector: '#pulse-off' } },
+    ],
+  };
+}
+
+function stillStep(extra = {}) {
+  return { id: 'still', holdSec: 0.01, tailSec: 0.01, actions: [{ type: 'wait', ms: 1000 }], ...extra };
+}
+
+function gateStoryboard(id, still) {
+  return storyboard(id, [pulseStep('move-a'), still, pulseStep('move-b')], { url: '/?pulse=1' });
+}
+
+/** Gate C measured for real: the canvas-less fixture, but without `--motion-check off`. */
+const MEASURED = { gpuCheck: 'off', motionCheck: undefined };
+
+test('Test_Run_GateC_StandingStepWithoutMotion_NoCli_Fails', LONG, async () => {
+  const run = await runCase('gate-still-default', gateStoryboard('gate-still-default', stillStep()), MEASURED);
+  expectError(run, 1, 'motion-below-threshold');
+  assert.match(run.error.message, /step 'still' \(require\)/);
+  assert.doesNotMatch(run.error.message, /move-a|move-b/);
+  assert.equal(published(run.dir), null);
+});
+
+test('Test_Run_GateC_StandingStepWarn_PublishesWithWarning', LONG, async () => {
+  const run = await runCase('gate-still-warn', gateStoryboard('gate-still-warn', stillStep({ motion: 'warn' })), MEASURED);
+  assert.ifError(run.error);
+  const motion = published(run.dir).motion;
+  const still = motion.perStep.find((entry) => entry.stepId === 'still');
+  assert.equal(still.verdict, 'warn');
+  assert.equal(still.policy, 'warn');
+  assert.equal(still.source, 'step');
+  assert.equal(still.reason, 'motion-below-threshold');
+  for (const id of ['move-a', 'move-b']) assert.equal(motion.perStep.find((entry) => entry.stepId === id).verdict, 'ok', id);
+  // Additive only: the whole-take fields are still there.
+  for (const field of ['frames', 'movedFrames', 'movedFraction', 'longestStillFrames', 'controlMad', 'verdict']) assert.ok(field in motion, field);
+});
+
+test('Test_Run_GateC_MixedOffStep_Succeeds', LONG, async () => {
+  const run = await runCase('gate-still-off', gateStoryboard('gate-still-off', stillStep({ motion: 'off' })), MEASURED);
+  assert.ifError(run.error);
+  const still = published(run.dir).motion.perStep.find((entry) => entry.stepId === 'still');
+  assert.equal(still.verdict, 'skipped');
+  assert.equal('movedFraction' in still, false);
+});
+
+test('Test_Run_GateC_OnlyOffSteps_Rejected', LONG, async () => {
+  const raw = storyboard('gate-only-off', [stillStep({ motion: 'off' })], { url: '/?pulse=1' });
+  const run = await runCase('gate-only-off', raw, MEASURED);
+  expectError(run, 2, 'configuration-error');
+  assert.match(run.error.message, /every step has motion 'off'/);
+});
+
+test('Test_Run_GateC_ExplicitRequire_UnderCliWarn_Fails', LONG, async () => {
+  const run = await runCase('gate-require-cliwarn', gateStoryboard('gate-require-cliwarn', stillStep({ motion: 'require' })),
+    { ...MEASURED, motionCheck: 'warn' });
+  expectError(run, 1, 'motion-below-threshold');
+  assert.match(run.error.message, /step 'still' \(require\)/);
+});
+
+test('Test_Run_GateC_StepWithoutMotion_UnderCliWarn_WarnsAndPublishes', LONG, async () => {
+  const run = await runCase('gate-default-cliwarn', gateStoryboard('gate-default-cliwarn', stillStep()),
+    { ...MEASURED, motionCheck: 'warn' });
+  assert.ifError(run.error);
+  const still = published(run.dir).motion.perStep.find((entry) => entry.stepId === 'still');
+  assert.equal(still.verdict, 'warn');
+  assert.equal(still.source, 'cli');
+});
+
+test('Test_Run_GateC_OneFrameRequireStep_TooShort', LONG, async () => {
+  const raw = storyboard('gate-one-frame', [
+    pulseStep('move-a'),
+    { id: 'one', holdSec: 0.01, tailSec: 0, actions: [{ type: 'press', key: 'Shift' }] },
+  ], { url: '/?pulse=1' });
+  const run = await runCase('gate-one-frame', raw, MEASURED);
+  expectError(run, 1, 'motion-below-threshold');
+  assert.match(run.error.message, /step 'one' \(require\): too short/);
+});
+
+test('Test_Run_Storage_SeededAfterCleanup_PanelKeyKept', LONG, async () => {
+  const raw = storyboard('storage-seed', [stillStep()], {
+    url: '/?storage=1',
+    storage: { 'rv-tutorial-e2e': 'seed', 'rv-panel-geo:e2e': '{"x":1}' },
+  });
+  const run = await runCase('storage-seed', raw);
+  assert.ifError(run.error);
+  assert.ok(storageLog.length >= 1, 'the fixture did not report its storage');
+  const seen = storageLog[0];
+  assert.equal(seen['rv-tutorial-e2e'], 'seed');
+  assert.equal(seen['rv-panel-geo:e2e'], '{"x":1}');
+  assert.equal(seen['rv-terms-accepted'], '1');
+});
+
+test('Test_Run_Storage_RecorderSeedWithoutOverride_Rejected', LONG, async () => {
+  const raw = storyboard('storage-protected', [stillStep()], { storage: { 'rv-terms-accepted': '0' } });
+  const run = await runCase('storage-protected', raw);
+  expectError(run, 2, 'configuration-error');
+  assert.match(run.error.message, /storageOverride/);
+});
+
+function near(actual, expected, what) {
+  assert.ok(actual, `${what}: no event logged`);
+  assert.ok(Math.abs(actual.x - expected.x) <= 1 && Math.abs(actual.y - expected.y) <= 1,
+    `${what}: (${actual.x}, ${actual.y}) != expected (${expected.x}, ${expected.y})`);
+}
+
+function centrePlus(rect, offset) {
+  return { x: rect.x + rect.w / 2 + offset.dx, y: rect.y + rect.h / 2 + offset.dy };
+}
+
+test('Test_Run_OffsetClick_SetupAndTake_LandAtCentrePlusOffset', LONG, async () => {
+  const setupOffset = { dx: 120, dy: 40 };
+  const takeOffset = { dx: -120, dy: -40 };
+  const raw = storyboard('offset-click', [{
+    id: 'click', holdSec: 0.01, tailSec: 0.01,
+    actions: [{ type: 'click', target: { selector: '#instant', offset: takeOffset } }],
+  }], { url: '/?offset=1', setup: [{ type: 'click', target: { selector: '#instant', offset: setupOffset } }] });
+  const run = await runCase('offset-click', raw);
+  assert.ifError(run.error);
+  const downs = geometryLog.filter((entry) => entry.type === 'pointerdown');
+  assert.equal(downs.length, 2, JSON.stringify(downs));
+  near(downs[0], centrePlus(downs[0].rects.instant, setupOffset), 'setup click');
+  near(downs[1], centrePlus(downs[1].rects.instant, takeOffset), 'take click');
+  assert.equal(downs[1].id, 'instant');
+});
+
+test('Test_Run_OffsetDrag_SetupAndTake_LandAtCentrePlusOffset', LONG, async () => {
+  const from = { dx: 30, dy: 10 };
+  const to = { dx: 80, dy: -10 };   // beside #drag-to, on the stage (an ancestor): not covered
+  const raw = storyboard('offset-drag', [{
+    id: 'drag', holdSec: 0.01, tailSec: 0.01,
+    actions: [{ type: 'drag', from: { selector: '#drag-from', offset: from }, to: { selector: '#drag-to', offset: to }, durationMs: 200 }],
+  }], {
+    url: '/?offset=1',
+    setup: [{ type: 'drag', from: { selector: '#drag-from', offset: from }, to: { selector: '#drag-to', offset: to } }],
+  });
+  const run = await runCase('offset-drag', raw);
+  assert.ifError(run.error);
+  const downs = geometryLog.filter((entry) => entry.type === 'pointerdown');
+  const ups = geometryLog.filter((entry) => entry.type === 'pointerup');
+  assert.equal(downs.length, 2, JSON.stringify(downs));
+  assert.equal(ups.length, 2, JSON.stringify(ups));
+  for (const [index, label] of [[0, 'setup'], [1, 'take']]) {
+    near(downs[index], centrePlus(downs[index].rects.dragFrom, from), `${label} drag start`);
+    near(ups[index], centrePlus(ups[index].rects.dragTo, to), `${label} drag end`);
+  }
+});
+
+test('Test_Run_SetupDrag_AbsoluteCoordinates', LONG, async () => {
+  const raw = storyboard('setup-drag-xy', [stillStep()], {
+    url: '/?offset=1',
+    setup: [{ type: 'drag', from: { x: 300, y: 300 }, to: { x: 420, y: 330 } }],
+  });
+  const run = await runCase('setup-drag-xy', raw);
+  assert.ifError(run.error);
+  near(geometryLog.find((entry) => entry.type === 'pointerdown'), { x: 300, y: 300 }, 'absolute drag start');
+  near(geometryLog.find((entry) => entry.type === 'pointerup'), { x: 420, y: 330 }, 'absolute drag end');
+});
+
+test('Test_Run_CoveredOffsetPoint_StepErrorExit1', LONG, async () => {
+  // #instant itself is free; its centre + offset lies on #cover.
+  const raw = storyboard('offset-covered', [{
+    id: 'click', holdSec: 0.01, tailSec: 0.01,
+    actions: [{ type: 'click', target: { selector: '#instant', offset: { dx: -130, dy: 355 } } }],
+  }], { url: '/?offset=1' });
+  const run = await runCase('offset-covered', raw);
+  expectError(run, 1, 'step-error');
+  assert.match(run.error.message, /covered at its offset point/);
+});
+
+// ─── plan-2237: time control (segment gate, time commands in the take, time-lapse) ──────────────
+
+function runLogOf(run) {
+  const temp = /temp folder: (.+?)(?:;|$)/.exec(run.error?.message ?? '')?.[1]?.trim();
+  return temp && existsSync(join(temp, 'run.log')) ? JSON.parse(readFileSync(join(temp, 'run.log'), 'utf8')) : null;
+}
+
+const batch = (ticks, timelapse = { fps: 4, maxWallSec: 20 }, extra = {}) => ({
+  type: 'command', id: 'experiment.run', via: 'direct', args: { ticks }, timelapse, waitSec: 0.2, ...extra,
+});
+
+test('Test_Run_Gate_RunningStart_FactorChangeOverCommandPath_Green', LONG, async () => {
+  // F3/F4: a running start is gated too; the speed override ends a segment, the next one judges 5x.
+  const run = await runCase('gate-factor', commandStoryboard('gate-factor', [
+    { type: 'wait', ms: 400 },
+    { type: 'command', id: 'sim.speedOverride', via: 'direct', args: { factor: 5 } },
+    { type: 'wait', ms: 600 },
+  ]));
+  assert.ifError(run.error);
+  const progress = run.result.summary.simProgress;
+  assert.equal(progress.verdict, 'ok');
+  const judged = progress.segments.filter((segment) => segment.verdict === 'pass');
+  assert.deepEqual([...new Set(judged.map((segment) => segment.factor))], [1, 5]);
+  const events = published(run.dir);
+  assert.equal(events.simProgress.verdict, 'ok');
+  assert.deepEqual(events.simJumps, []);
+});
+
+test('Test_Run_Gate_DesFiftyFastForwardCheckpointLoad_OneTake_GreenWithJumps', LONG, async () => {
+  // F5/F7: setMode 50x -> fast-forward (in the take) -> earlier checkpoint (async, 3 frames) -> step mode.
+  const run = await runCase('gate-des-jumps', commandStoryboard('gate-des-jumps', [
+    { type: 'wait', ms: 300 },
+    { type: 'command', id: 'des.setMode', via: 'direct', args: { subMode: 'hybrid', multiplier: 50 } },
+    { type: 'wait', ms: 300 },
+    { type: 'command', id: 'des.fastForward', via: 'direct', args: { untilSimTime: 10800 } },
+    { type: 'wait', ms: 300 },
+    { type: 'command', id: 'des.checkpoint.load', via: 'direct', args: { t: 3600 } },
+    { type: 'command', id: 'sim.playPause', via: 'direct', args: { paused: false } },
+    { type: 'wait', ms: 300 },
+  ], { url: '/?cmdfixture=1&mode=animated&factor=1' }));
+  assert.ifError(run.error);
+  const events = published(run.dir);
+  assert.equal(events.simProgress.verdict, 'ok');
+  assert.deepEqual(events.simJumps.map((jump) => jump.cmd), ['des.fastForward', 'des.checkpoint.load']);
+  const back = events.simJumps.find((jump) => jump.cmd === 'des.checkpoint.load');
+  assert.equal(back.toSim, 3600);
+  assert.ok(back.fromSim > back.toSim, 'the checkpoint lies earlier: a backwards jump');
+  const kinds = events.simProgress.segments.filter((s) => s.verdict === 'pass').map((s) => `${s.kind}:${s.factor}`);
+  assert.ok(kinds.includes('run:50') && kinds.includes('hold:0'), kinds.join(','));
+});
+
+test('Test_Run_Timelapse_ThreeDisjointSegments_GateAGreenAcrossBothTransitions', LONG, async () => {
+  // Phase 2: command (dispatch) | timelapse (wall clock) | command (rest) — Gate A (frame count,
+  // proof stamps) holds over wallBegin and wallEnd, the published take is gapless.
+  // Dispatched by a recorded CLICK, so the approach is the head segment; the click itself is the
+  // first act inside wall mode (a direct dispatch has no approach and its head segment is dropped).
+  const run = await runCase('timelapse', commandStoryboard('timelapse', [
+    { type: 'command', id: 'experiment.run', timelapse: { fps: 4, maxWallSec: 20 }, waitSec: 0.2 },
+    { type: 'wait', ms: 300 },
+  ], { url: '/?cmdfixture=1&batchbutton=1&ticks=90' }));
+  assert.ifError(run.error);
+  const events = published(run.dir);
+  const own = events.segments.filter((segment) => segment.stepId === 'exercise' && segment.actionIndex === 0);
+  assert.deepEqual(own.map((segment) => segment.kind), ['command', 'timelapse', 'command']);
+  assert.ok(own.every((segment, i) => i === 0 || segment.start === own[i - 1].end));
+  const lapse = own[1];
+  assert.equal(lapse.cmd, 'experiment.run');
+  assert.equal(lapse.wallFps, 4);
+  assert.equal(lapse.wallMs.length, lapse.end - lapse.start);
+  assert.ok(lapse.wallMs.every((ms, i) => i === 0 || ms > lapse.wallMs[i - 1]), 'wall stamps are monotonic');
+  assert.equal(events.frameCheck.verdict, 'ok');
+  assert.equal(events.frameCheck.stampsContiguous, true);
+  assert.equal(events.frameCheck.budget.withinBudget, true);
+  assert.equal(events.simProgress.verdict, 'ok');
+  assert.ok(events.simProgress.segments.some((segment) => segment.kind === 'timelapse' && segment.verdict === 'skipped'));
+  assert.equal(executedLog.filter((item) => item.id === 'experiment.run').length, 1);
+  assert.ok(run.result.summary.timelapses[0].wallEnd && run.result.summary.timelapses[0].wallEnd.already !== true);
+  assert.equal(events.buttons.filter((event) => event.type === 'down').length, 1);
+});
+
+test('Test_Run_Timelapse_Long_DroppedSlotsCountedNotFrames', { timeout: 300_000 }, async () => {
+  // A longer batch (~5 s wall at the fixture's 60 Hz pump) at 8 fps: output frames never exceed
+  // ceil(maxWallSec * fps), dropped slots are counted, not recorded.
+  const run = await runCase('timelapse-long', commandStoryboard('timelapse-long', [batch(300, { fps: 8, maxWallSec: 30 })]));
+  assert.ifError(run.error);
+  const events = published(run.dir);
+  const lapse = events.segments.find((segment) => segment.kind === 'timelapse');
+  assert.ok(lapse.end - lapse.start <= Math.ceil(30 * 8));
+  assert.ok(lapse.end - lapse.start >= 10, `only ${lapse.end - lapse.start} time-lapse frames`);
+  assert.ok(Number.isInteger(lapse.droppedSlots) && lapse.droppedSlots >= 0);
+  assert.equal(events.frameCheck.budget.withinBudget, true);
+  assert.equal(events.frameCheck.verdict, 'ok');
+});
+
+test('Test_Run_Timelapse_ImmediateCompletion_EmptyTimelapseSegmentDropped', LONG, async () => {
+  const run = await runCase('timelapse-immediate', commandStoryboard('timelapse-immediate', [
+    { type: 'command', id: 'sim.reset', via: 'direct', timelapse: { fps: 4, maxWallSec: 5 } },
+  ]));
+  assert.ifError(run.error);
+  const events = published(run.dir);
+  assert.equal(events.segments.some((segment) => segment.kind === 'timelapse'), false);
+  assert.equal(events.segments.filter((segment) => segment.kind === 'command').length, 1);
+  // wallBegin -> dispatch -> already complete -> wallEnd: no wall frame was taken.
+  assert.equal(run.result.summary.timelapses.length, 1);
+  assert.equal(run.result.summary.timelapses[0].start, run.result.summary.timelapses[0].end);
+});
+
+test('Test_Run_Timelapse_Timeout_CancelsBatch_Exit1', LONG, async () => {
+  const run = await runCase('timelapse-timeout', commandStoryboard('timelapse-timeout', [batch(1_000_000, { fps: 4, maxWallSec: 1 })]));
+  expectError(run, 1, 'timelapse-timeout');
+  assert.match(run.error.message, /experiment\.run\.cancel: ok/);
+  assert.equal(executedLog.filter((item) => item.id === 'experiment.run.cancel').length, 1);
+  const log = runLogOf(run);
+  assert.ok(log?.timelapses?.[0]?.wallEnd, 'wallEnd ran in finally');
+});
+
+test('Test_Run_Timelapse_MaxWaitSecBelowMaxWallSec_Exit2', LONG, async () => {
+  const run = await runCase('timelapse-budget', commandStoryboard('timelapse-budget', [batch(30, { fps: 4, maxWallSec: 60 }, { maxWaitSec: 10 })]));
+  expectError(run, 2, 'configuration-error');
+  assert.match(run.error.message, /maxWaitSec 10 s is below timelapse\.maxWallSec 60 s/);
+});
+
+test('Test_Run_Timelapse_GrabTimeoutTwice_Exit1_ClockRestored', LONG, async () => {
+  let calls = 0;
+  const run = await runCase('timelapse-grab', commandStoryboard('timelapse-grab', [batch(600)]), {}, {
+    // Every time-lapse grab misses its deadline: one re-grab of the same frame, then Exit 1.
+    timelapseGrab: async () => { calls++; return null; },
+  });
+  expectError(run, 1, 'timelapse-grab-timeout');
+  assert.equal(calls, 2, 'exactly one re-grab of the same frame, never a duplicate');
+  const log = runLogOf(run);
+  assert.ok(log?.timelapses?.[0]?.wallEnd && log.timelapses[0].wallEnd.already !== true, 'wallEnd restored the clock after the abort');
+});
+
+test('Test_Run_CommunityBuild_CommercialCommandUnavailable_Exit1Diagnosis', LONG, async () => {
+  // F9 (contract-tier-boundary rules 5/6): a Community build answers "unavailable" for
+  // des.checkpoint.*, experiment.* and snapshot.* — the recorder names the command, no crash.
+  const run = await runCase('community', commandStoryboard('community', [
+    { type: 'command', id: 'des.checkpoint.load', via: 'direct', args: { t: 0 } },
+  ], { url: '/?cmdfixture=1&community=1&mode=animated' }));
+  expectError(run, 1, 'command-unavailable');
+  assert.match(run.error.message, /'des\.checkpoint\.load' is not available in this build \(commercial-feature/);
+  assert.match(run.error.message, /Commercial command/);
+});
+
+// ── plan-2237 post-implementation review (Codex 2026-11-04) ──────────────────────────────────
+
+test('Test_Run_Timelapse_CompletionAfterAbsoluteDeadline_TimeoutWithCancel', LONG, async () => {
+  // Review 1: maxWallSec 0.1 at 2 fps, the batch completes at ~400 ms (24 pump ticks). The next slot
+  // (500 ms) lies after the deadline: no further frame, `timelapse-timeout`, cancel dispatched.
+  const started = Date.now();
+  const run = await runCase('timelapse-deadline', commandStoryboard('timelapse-deadline', [
+    batch(24, { fps: 2, maxWallSec: 0.1 }),
+  ]));
+  expectError(run, 1, 'timelapse-timeout');
+  assert.match(run.error.message, /timelapse\.maxWallSec 0\.1 s; experiment\.run\.cancel: ok/);
+  assert.equal(executedLog.filter((item) => item.id === 'experiment.run.cancel').length, 1);
+  const lapse = runLogOf(run)?.timelapses?.[0];
+  assert.ok(lapse, 'the time-lapse ran');
+  assert.equal(lapse.end - lapse.start, 1, 'only the slot at 0 ms lies before the deadline');
+  assert.ok(lapse.wallEnd.wallMs < 400, `wallEnd after ${lapse.wallEnd.wallMs} ms — the section outlived its deadline`);
+  assert.ok(Date.now() - started < 120_000);
+});
+
+test('Test_Run_Timelapse_GrabBTimeout_RetryYieldsCleanAAndB', LONG, async () => {
+  // Review 2: the first B grab of the first time-lapse frame times out; the re-grab of that frame
+  // must start from a clean page — no proof stamp and no cursor in A, no stamp in B.
+  let calls = 0;
+  const run = await runCase('timelapse-b-retry', commandStoryboard('timelapse-b-retry', [
+    { type: 'command', id: 'experiment.run', timelapse: { fps: 4, maxWallSec: 20 }, waitSec: 0.2 },
+  ], { url: '/?cmdfixture=1&batchbutton=1&ticks=60' }), { burnCursor: true }, {
+    timelapseGrab: async (params, ms, real) => (++calls === 2 ? null : real(params, ms)),
+  });
+  assert.ifError(run.error);
+  const events = published(run.dir);
+  const lapse = events.segments.find((segment) => segment.kind === 'timelapse');
+  assert.ok(lapse, 'a time-lapse segment exists');
+  assert.equal(events.frameCheck.verdict, 'ok');
+  assert.equal(events.frameCheck.stampsContiguous, true, 'the re-grabbed frame carries its own stamp in the proof track');
+  for (const file of ['recording.mp4', 'recording-cursor.mp4']) {
+    const cells = await stampCellMeans(join(run.dir, file), lapse.start);
+    assert.ok(Math.max(...cells) - Math.min(...cells) < 16, `${file} frame ${lapse.start}: corner cells ${cells.join(',')} look like a stamp`);
+  }
+  const press = events.buttons.find((event) => event.type === 'down');
+  const clean = await regionPixels(join(run.dir, 'recording.mp4'), lapse.start, press);
+  const later = await regionPixels(join(run.dir, 'recording.mp4'), lapse.start + 1, press);
+  assert.ok(meanAbsDiff(clean, later) < 3, 'no cursor in the re-grabbed app frame');
+});
+
+test('Test_Run_Gate_UiReset_ClickWithoutCommandAction_WindowAndSimJump', LONG, async () => {
+  // Review 3: a UI click on the reset button (a plain click, not a command action) jumps the clock
+  // without changing mode, factor or pause. The take-wide time watch makes it a transition.
+  const run = await runCase('gate-ui-reset', commandStoryboard('gate-ui-reset', [
+    { type: 'wait', ms: 400 },
+    { type: 'click', target: { selector: '#reset-command' } },
+    { type: 'wait', ms: 400 },
+  ]));
+  assert.ifError(run.error);
+  const events = published(run.dir);
+  assert.equal(events.simProgress.verdict, 'ok');
+  assert.deepEqual(events.simJumps.map((jump) => jump.cmd), ['sim.reset']);
+  assert.equal(events.simJumps[0].toSim < events.simJumps[0].fromSim, true);
+});
+
+test('Test_Run_Gate_UiDesStep_ClickWithoutCommandAction_WindowAndSimJump', LONG, async () => {
+  const run = await runCase('gate-ui-step', commandStoryboard('gate-ui-step', [
+    { type: 'wait', ms: 400 },
+    { type: 'click', target: { selector: '#step-command' } },
+    { type: 'wait', ms: 400 },
+  ], { url: '/?cmdfixture=1&mode=animated&stepbutton=1' }));
+  assert.ifError(run.error);
+  const events = published(run.dir);
+  assert.equal(events.simProgress.verdict, 'ok');
+  assert.deepEqual(events.simJumps.map((jump) => jump.cmd), ['des.step']);
+});
+
+test('Test_Run_CommunityBuild_CommercialCommandByClick_Exit1Diagnosis', LONG, async () => {
+  // Review 4: the default click path keeps the structured cause from the command watch.
+  const run = await runCase('community-click', commandStoryboard('community-click', [
+    { type: 'command', id: 'des.checkpoint.load' },
+  ], { url: '/?cmdfixture=1&community=1&mode=animated&checkpointbutton=1' }));
+  expectError(run, 1, 'command-unavailable');
+  assert.match(run.error.message, /'des\.checkpoint\.load' is not available in this build \(commercial-feature/);
+  assert.match(run.error.message, /Commercial command/);
+});
+
+test('Test_Run_SimProgressSummary_KeepsPrePlanFields', LONG, async () => {
+  // Review 5: summary.simProgress keeps sumSimTime / expectedSimTime / deviation / tolerance —
+  // the actual produced summary, not a hand-made object.
+  const run = await runCase('compat', pausedStoryboard('compat'));
+  assert.ifError(run.error);
+  const progress = run.result.summary.simProgress;
+  for (const field of ['verdict', 'factor', 'clock', 'windowFrames', 'sumSimTime', 'expectedSimTime', 'deviation', 'tolerance']) {
+    assert.ok(field in progress, `summary.simProgress.${field} is missing`);
+  }
+  assert.equal(progress.verdict, 'ok');
+  assert.equal(progress.factor, 5);
+  for (const field of ['sumSimTime', 'expectedSimTime', 'deviation', 'tolerance']) assert.equal(typeof progress[field], 'number', field);
+  const first = progress.segments.find((segment) => segment.kind === 'run' && segment.verdict === 'pass');
+  assert.ok(Math.abs(progress.expectedSimTime - 5 * first.frames / 30) < 1e-9);
+  assert.ok(Math.abs(progress.sumSimTime - first.sumClock) < 1e-12);
+  assert.ok(progress.deviation <= progress.tolerance);
+});
+
+// ── plan-2237 review round 2 (Codex 2026-11-04) ──────────────────────────────────────────────
+
+test('Test_Run_Timelapse_NextSlotBeyondDeadline_CompletionBeforeDeadline_NoCancel', LONG, async () => {
+  // Round 2, finding 1: at 2 fps the next slot (500 ms) lies beyond maxWallSec 0.3 s. The section
+  // must keep waiting for the completion (~150 ms: 9 pump ticks) up to the deadline instead of
+  // giving up after the first frame — the command completes and is NOT cancelled.
+  const run = await runCase('timelapse-wait-to-deadline', commandStoryboard('timelapse-wait-to-deadline', [
+    batch(9, { fps: 2, maxWallSec: 0.3 }),
+  ]));
+  assert.ifError(run.error);
+  assert.equal(executedLog.filter((item) => item.id === 'experiment.run.cancel').length, 0, 'a command completing before the deadline is never cancelled');
+  assert.equal(executedLog.filter((item) => item.id === 'experiment.run' && item.ok).length, 1);
+  const lapse = run.result.summary.timelapses[0];
+  assert.ok(lapse.end - lapse.start <= 1, 'no frame after the last slot that fits before the deadline');
+  assert.ok(lapse.wallEnd.wallMs < 300, `wallEnd after ${lapse.wallEnd.wallMs} ms`);
+});
+
+test('Test_Run_Timelapse_HangingGrabsBoundedByDeadline_TimeoutWithCancel', LONG, async () => {
+  // Round 2, finding 2: grabs that hang until their budget must not stretch maxWallSec 0.1 s (the
+  // slot allowance at 2 fps is 1000 ms). Each grab gets at most the time left; the miss that the
+  // deadline caused is `timelapse-timeout` WITH the cancel, not `timelapse-grab-timeout`.
+  const budgets = [];
+  const run = await runCase('timelapse-hanging-grabs', commandStoryboard('timelapse-hanging-grabs', [
+    batch(1_000_000, { fps: 2, maxWallSec: 0.1 }),
+  ]), {}, {
+    timelapseGrab: (params, ms) => { budgets.push(ms); return new Promise((done) => setTimeout(() => done(null), ms)); },
+  });
+  expectError(run, 1, 'timelapse-timeout');
+  assert.match(run.error.message, /experiment\.run\.cancel: ok/);
+  assert.equal(executedLog.filter((item) => item.id === 'experiment.run.cancel').length, 1);
+  assert.ok(budgets.length >= 1 && budgets.every((ms) => ms <= 100), `grab budgets ${budgets.join(',')} exceed the 100-ms section`);
+  const lapse = runLogOf(run)?.timelapses?.[0];
+  assert.ok(lapse?.wallEnd && lapse.wallEnd.wallMs < 400, `wallEnd after ${lapse?.wallEnd?.wallMs} ms — the deadline did not bound the grabs`);
+});
+
+for (const [variant, url] of [
+  ['MissingCommunityButton', '/?cmdfixture=1&community=1&mode=animated'],
+  ['DisabledCommunityButton', '/?cmdfixture=1&community=1&mode=animated&checkpointbutton=disabled'],
+  ['DisabledProductionButton', '/?cmdfixture=1&commercial=disabled&mode=animated&checkpointbutton=disabled'],
+]) {
+  test(`Test_Run_ClickPath_${variant}_CommandUnavailableWithCommercialHint`, LONG, async () => {
+    // Round 2, finding 3: the registry is asked (read-only) before the button lookup, so neither a
+    // missing button nor a disabled one hides the cause; nothing is dispatched.
+    const id = `click-${variant.toLowerCase()}`;
+    const run = await runCase(id, commandStoryboard(id, [{ type: 'command', id: 'des.checkpoint.load' }], { url }));
+    expectError(run, 1, 'command-unavailable');
+    assert.match(run.error.message, /'des\.checkpoint\.load' is not available in this build/);
+    assert.match(run.error.message, /Commercial command/);
+    assert.equal(executedLog.filter((item) => item.id === 'des.checkpoint.load').length, 0);
+  });
+}

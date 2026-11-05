@@ -16,7 +16,7 @@ import { ContextMenuStore } from '../src/core/hmi/context-menu-store';
 import { commandRegistry } from '../src/core/hmi/rv-command-registry';
 import { ensureDesRunCommandsRegistered } from '../src/core/hmi/des-run-commands';
 import { ensureDesPlcCommandsRegistered } from '../src/core/hmi/des-plc-commands';
-import { persistDesEndTime, persistDesStatReset } from '../src/core/material-flow/des-manager-node';
+import { applyDesClockSettings } from '../src/core/material-flow/des-manager-node';
 import { USER_PAUSE_REASON } from '../src/core/engine/rv-constants';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { getDesStatsGizmos } from '@rv/plugins/des/hmi/des-stats-gizmos';
@@ -32,10 +32,11 @@ vi.mock('../src/core/engine/rv-des-yield', () => {
   return { yieldToBrowser: yieldTurn, yieldToTimers: yieldTurn };
 });
 
-vi.mock('../src/core/material-flow/des-manager-node', async importOriginal => ({
-  ...await importOriginal<typeof import('../src/core/material-flow/des-manager-node')>(),
-  ensureDesManagerNode: () => 'Simulation', persistDesEndTime: vi.fn(), persistDesStatReset: vi.fn(),
-}));
+// The command writes end and warm-up through the safe DESManager path: observed, kept real.
+vi.mock('../src/core/material-flow/des-manager-node', async importOriginal => {
+  const real = await importOriginal<typeof import('../src/core/material-flow/des-manager-node')>();
+  return { ...real, applyDesClockSettings: vi.fn(real.applyDesClockSettings) };
+});
 vi.mock('@rv/plugins/des/hmi/des-stats-gizmos', () => {
   const gizmo = { enabled: false, setEnabled(on: boolean) { this.enabled = on; } };
   return { getDesStatsGizmos: () => gizmo };
@@ -302,13 +303,17 @@ describe('DES run commands (plan-2031)', () => {
     expect(await f.execute('des.setEnd', { end: '100:00:00:00', statReset: '01:00:00:00' })).toMatchObject({ ok: true });
     expect(f.runner.endTime).toBe(8640000);
     expect(f.runner.statResetTime).toBe(86400);
-    expect(persistDesEndTime).toHaveBeenCalledExactlyOnceWith('Simulation', 8640000);
-    expect(persistDesStatReset).toHaveBeenCalledExactlyOnceWith('Simulation', 86400);
+    expect(applyDesClockSettings).toHaveBeenCalledExactlyOnceWith(f.viewer, f.runner, { end: 8640000, statReset: 86400 });
     expect(await f.execute('des.setEnd', { end: 'xx', statReset: '00:00:00:01' })).toMatchObject({ ok: false, reason: 'end must be DD:HH:MM:SS' });
     expect(f.runner.endTime).toBe(8640000);
     expect(f.runner.statResetTime).toBe(86400);
-    expect(persistDesEndTime).toHaveBeenCalledTimes(1);
-    expect(persistDesStatReset).toHaveBeenCalledTimes(1);
+    expect(applyDesClockSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it('LOP #248: end 0 runs indefinitely on the real runner, like the stored 0 after a reload', async () => {
+    const f = fixture();
+    expect(await f.execute('des.setEnd', { end: '00:00:00:00' })).toMatchObject({ ok: true, value: { endTime: Infinity } });
+    expect(f.runner.endTime).toBe(Infinity);
   });
 
   it('updates the statistics window, hidden kinds and scene badges', async () => {

@@ -572,9 +572,11 @@ export interface RVComponent {
    *  axis / isRotary from Direction). Called by the SceneStore op executor after
    *  re-applying the schema, mirroring the scene loader's overlay reconciliation.
    *  Must be safe to call post-load (do NOT re-cache base transforms or reset
-   *  runtime position). Components whose config fields take effect on read omit
+   *  runtime position). A single-field caller passes its name so reset baselines
+   *  only refresh that authored field; omit it after applying the full schema.
+   *  Components whose config fields take effect on read omit
    *  this. */
-  reapplyConfig?(): void;
+  reapplyConfig?(fieldName?: string): void;
 
   // ── Optional component-level event callbacks (dispatched by
   //    ComponentEventDispatcher). Components opt in by implementing any of these.
@@ -817,9 +819,9 @@ function queueLateComponentRef(
     const value = res.signalAddress ?? res.sensor ?? res.drive ?? res.node ?? res.component;
     if (value === undefined || value === null) return;
     instance[key] = value;
-    const reapply = (instance as { reapplyConfig?: () => void }).reapplyConfig;
+    const reapply = (instance as { reapplyConfig?: (fieldName?: string) => void }).reapplyConfig;
     if (typeof reapply === 'function') {
-      try { reapply.call(instance); } catch (e) { console.warn(`[components] reapplyConfig after a late reference failed (${key}):`, e); }
+      try { reapply.call(instance, key); } catch (e) { console.warn(`[components] reapplyConfig after a late reference failed (${key}):`, e); }
     }
   }, () => { fields.delete(key); });
 }

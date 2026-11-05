@@ -121,6 +121,8 @@ import {
   libraryDocumentBase,
 } from '../src/core/editor/active-asset-store';
 
+const idleTail = Promise.resolve();
+
 // ─── Doubles ──────────────────────────────────────────────────────────────
 
 const BELT: AssetBase = libraryDocumentBase('Custom/Belt.glb');
@@ -139,6 +141,7 @@ function makeDoc(base: AssetBase = BELT, name = 'Belt') {
     tryLock: () => ({ kind: 'save', token: Symbol('stub'), generation: 1 }),
     unlock: () => {},
     document: {
+      whenIdle: () => idleTail,
       opCount: 2,
       runExclusive<T>(work: () => Promise<T>): Promise<T> { return work(); },
       markSaved(): void {},

@@ -267,10 +267,12 @@ VAR
   parts  : INT := 0;               (* start value, applied at every COLD start *)
   starts : INT;                    (* counts COLD starts *)
   tDelay : TON := (PT := T#2s);    (* FB start input *)
+  delayEdge : R_TRIG;
 END_VAR
   IF RV_FirstScan THEN starts := starts + 1; END_IF;
   tDelay(IN := Feed);              (* PT keeps the start value *)
-  IF tDelay.Q AND parts < MAXP THEN parts := parts + 1; END_IF;
+  delayEdge(CLK := tDelay.Q);
+  IF delayEdge.Q AND parts < MAXP THEN parts := parts + 1; END_IF;
 END_PROGRAM
 ```
 
@@ -291,6 +293,14 @@ Run states are `stopped`, `running`, and `error`:
 - A simulation reset (`simulation-reset`) also COLD-resets the PLC: FB states back to
   initial values, program memory rebuilt, PLC time back to 0.
 - **Stop** is WARM: memory and FB states are kept, outputs keep their last values.
+
+For DES, follow [Writing ST for DES](https://realvirtual.io/doc/web/components/virtual-plc/#writing-st-for-des):
+change persistent state only on an edge, timer completion or step change; use timer FBs
+for time, wait between scans and hold commands until feedback arrives. A timer's `Q` is
+a level; the example above counts its rising edge once. `(* @des: allow *)` on a
+statement's line suppresses D1/D2 only when you know it settles. Here, "batch" means
+a `setMany` write is seen as its end state. The editor already reports these findings;
+programs still scan on the DES cycle until a later update adds event-driven scans.
 
 ## Persistence
 

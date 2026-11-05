@@ -3,7 +3,7 @@
 
 import type { Object3D } from 'three';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
-import { registerComponentSchema, loadSchemaFromSpec } from './rv-component-registry';
+import { registerComponentSchema, loadSchemaFromSpec, setComponentInstance, removeComponentInstance } from './rv-component-registry';
 import { RVDrive } from './rv-drive';
 import { NodeRegistry } from './rv-node-registry';
 import { scaleFeedbackPosition, wireBoolSignal, wireNumberSignal } from './rv-signal-wiring';
@@ -36,6 +36,9 @@ export class RVDriveDestinationMotor implements RVComponent {
   // `signal:` marks the slot as bindable. Empty slots remain null.
   // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
   static readonly schema: ComponentSchema = loadSchemaFromSpec('Drive_DestinationMotor');
+
+  private initialRunState = {};
+  resetRunState(): void { Object.assign(this, this.initialRunState); }
 
   readonly node: Object3D;
   isOwner = true;
@@ -70,6 +73,8 @@ export class RVDriveDestinationMotor implements RVComponent {
    *  `dispose()` can drop them — before plan-427 the handles were discarded (F6). */
   private readonly inputUnsubs: (() => void)[] = [];
 
+  get commandFeedbackWriter() { return this.feedbackCb; }
+
   constructor(node: Object3D) {
     this.node = node;
   }
@@ -80,22 +85,26 @@ export class RVDriveDestinationMotor implements RVComponent {
       Number(value) * this.CurrentPositionScale + this.CurrentPositionOffset,
       this.drive,
     );
+    this.drive?.onCommand?.(this);
   }
 
   commandStartDrive(value: boolean | number): void {
     const active = Boolean(value);
     if (active && !this.startDriveValue) this.drive?.startMove();
     this.startDriveValue = active;
+    this.drive?.onCommand?.(this);
   }
 
   commandTargetSpeed(value: boolean | number): void {
     if (this.drive) this.drive.targetSpeed = Number(value);
+    this.drive?.onCommand?.(this);
   }
 
   commandAcceleration(value: boolean | number): void {
     if (!this.drive) return;
     this.drive.Acceleration = Number(value);
     this.drive.UseAcceleration = true;
+    this.drive?.onCommand?.(this);
   }
 
   neutralizeDestination(): void {}
@@ -143,6 +152,7 @@ export class RVDriveDestinationMotor implements RVComponent {
       return;
     }
     this.drive = drive;
+    setComponentInstance(this.node, this);
     // A slot the reference resolution left as a non-string (a malformed or
     // unresolved reference object) is unwired — the input wiring already treats
     // it so; the feedback writes below would hand the object to `setByPath`.
@@ -178,6 +188,7 @@ export class RVDriveDestinationMotor implements RVComponent {
       for (let i = 0; i < this.feedbackListeners.length; i++) this.feedbackListeners[i]();
     };
     drive.addAfterUpdate(this.feedbackCb);
+    this.initialRunState = { startDriveValue: this.startDriveValue };
   }
 
   /**
@@ -196,6 +207,7 @@ export class RVDriveDestinationMotor implements RVComponent {
   }
 
   dispose(): void {
+    removeComponentInstance(this.node, this);
     if (this.drive && this.feedbackCb) {
       this.drive.removeAfterUpdate(this.feedbackCb);
     }

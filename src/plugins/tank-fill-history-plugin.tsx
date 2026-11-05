@@ -330,6 +330,7 @@ function TankFillHistoryPanel({ viewer, open, onClose }: { viewer: RVViewer; ope
       open={open}
       onClose={onClose}
       title="Tank Fill History"
+      panelId="tank-fill-history"
       titleColor="#4fc3f7"
       subtitle={`Last ${HISTORY_WINDOW_S / 60} min · ${SAMPLE_INTERVAL_MS} ms`}
       defaultWidth={DEFAULT_WIDTH}

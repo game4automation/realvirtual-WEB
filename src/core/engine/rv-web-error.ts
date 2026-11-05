@@ -27,7 +27,7 @@ import type { ComponentContext, ComponentSchema, RVComponent } from './rv-compon
 import { registerComponent, setComponentInstance, loadSchemaFromSpec } from './rv-component-registry';
 import type { GizmoHandle } from './rv-gizmo-manager';
 import { NodeRegistry } from './rv-node-registry';
-import { wireValueSignal } from './rv-signal-wiring';
+import { wireDisplaySignal } from './rv-signal-wiring';
 import {
   ERROR_COLOR,
   normalizeHighlightStyle,
@@ -94,7 +94,7 @@ export class RVWebError implements RVComponent {
     // the point of the hand-written initial read this replaces).
     if (this.SignalError) {
       let deferInitial = true;
-      this._unsubscribe = wireValueSignal(ctx.signalStore, this.SignalError, (v) => {
+      this._unsubscribe = wireDisplaySignal(ctx.signalStore, this.SignalError, (v) => {
         if (deferInitial) { deferInitial = false; this._active = !!v; return; }
         this._onChange(!!v);
       }, undefined, ctx.reapply).unsubscribe;

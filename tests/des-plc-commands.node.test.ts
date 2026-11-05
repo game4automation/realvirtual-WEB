@@ -121,7 +121,7 @@ describe('Phase 1 DES / PLC command parity', () => {
     registerPlcControl(plc);
     const runtime: PlcRuntime = {
       program: (name) => name === 'Main' ? plc : null,
-      programs: () => [{ name: 'Main', path: 'Machine/Main', order: 1, selected: true, state, scanTimeMs: plc.scanTimeMs, lastError: null }],
+      programs: () => [{ name: 'Main', path: 'Machine/Main', order: 1, selected: true, desBlocking: 0, state, scanTimeMs: plc.scanTimeMs, lastError: null }],
       conflicts: () => [{ signal: 'Q', programs: ['Main', 'Other'] }],
     };
     registerPlcRuntime(runtime);
@@ -191,7 +191,7 @@ describe('plc.deploy persistence (PlcPersistence seam)', () => {
     registerPlcRuntime({
       program: () => plc, conflicts: () => [],
       programs: () => ['Cell/A', 'Cell/B'].map((path, order) => ({
-        name: path.slice(5), path, order, selected: path === selected, state: 'stopped' as const, scanTimeMs: 0, lastError: null,
+        name: path.slice(5), path, order, selected: path === selected, desBlocking: 0, state: 'stopped' as const, scanTimeMs: 0, lastError: null,
       })),
     });
     const persistence: PlcPersistence = { persistCode: vi.fn(async (_c, p) => ({ persisted: true, nodePath: p })) };

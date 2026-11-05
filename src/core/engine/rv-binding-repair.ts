@@ -66,7 +66,9 @@ export type RepairRejectReason =
   /** Nothing in the model has this type + slot + leaf. */
   | 'no-candidate'
   /** Two or more equally good matches — a coin flip is not a repair. */
-  | 'ambiguous';
+  | 'ambiguous'
+  /** The internal source's `sourceAddress` names no signal — never repaired by name (doc-node-paths.md § 5.4). */
+  | 'source-unresolved';
 
 export type RepairLookup =
   | { found: true; componentPath: string }

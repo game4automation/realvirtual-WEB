@@ -31,7 +31,7 @@ import { AiBridgeDownloadDialog } from './AiBridgeGate';
 import { requestSettingsTab } from './settings-tab-store';
 import { useViewer } from '../../hooks/use-viewer';
 import { useSlot } from '../../hooks/use-slot';
-import { useEditorPlugin } from '../../hooks/use-editor-plugin';
+import { useEditorPluginInstance, useEditorState } from '../../hooks/use-editor-plugin';
 import { useMobileLayout } from '../../hooks/use-mobile-layout';
 import {
   ACTIVITY_BAR_WIDTH, ANNOTATION_PANEL_WIDTH, LEFT_PANEL_ZINDEX,
@@ -236,7 +236,11 @@ interface ActivityBarProps {
 
 export function ActivityBar({ entryAllowlist }: ActivityBarProps = {}) {
   const viewer = useViewer();
-  const { plugin, state: editorState } = useEditorPlugin();
+  const plugin = useEditorPluginInstance();
+  const editorState = {
+    panelOpen: useEditorState((s) => s.panelOpen),
+    settingsOpen: useEditorState((s) => s.settingsOpen),
+  };
   const isMobile = useMobileLayout();
   const lpm = viewer.leftPanelManager;
   const panelSnapshot = useSyncExternalStore(lpm.subscribe, lpm.getSnapshot);

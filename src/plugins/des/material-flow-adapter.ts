@@ -90,6 +90,9 @@ export type PoseTransferResult =
       readonly ownerKept: boolean;
     };
 
+// plan-2241: armed rule per definition kind.
+const PROGRESS_BASE = 0, PROGRESS_SOURCE = 1, PROGRESS_AGV = 2, PROGRESS_SINK = 3;
+
 /** One pending pose: valid for exactly this MU on this (target) adapter. */
 interface PendingPose {
   readonly muId: number;
@@ -191,6 +194,8 @@ export class MaterialFlowAdapter extends DESComponent implements HookDispatchTar
   private readonly pendingPoses: PendingPose[] = [];
   private readonly savedAccept: AcceptState = { owner: null, entryTime: 0, componentsVisited: 0 };
 
+  private readonly _progressKind: number;
+
   /** Canonical adapter-held collection projected by `self.mus/currentLoad`. */
   get heldMUs(): ReadonlyArray<DESMU> {
     return this.mus;
@@ -212,6 +217,34 @@ export class MaterialFlowAdapter extends DESComponent implements HookDispatchTar
     };
     // Share the prop bag so DESComponent snapshots and self.prop stay identical.
     this.prop = self.prop;
+    this._progressKind = def.kind === 'sink' ? PROGRESS_SINK
+      : def.type === 'Source' ? PROGRESS_SOURCE : def.type === 'Agv' ? PROGRESS_AGV : PROGRESS_BASE;
+  }
+
+  /** plan-2241: Source also while `pending`, Agv while it has a task, Sink never. */
+  override get progressArmed(): boolean {
+    switch (this._progressKind) {
+      case PROGRESS_SINK: return false;
+      case PROGRESS_AGV: return (this.self.local as { task?: unknown }).task != null;
+      case PROGRESS_SOURCE: return super.progressArmed || (this.self.local as { pending?: unknown }).pending != null;
+      default: return super.progressArmed;
+    }
+  }
+
+  override snapshotProgressArmed(snap: Omit<DESComponentSnapshot, 'path'>, blockedCount: number, part: ((key: string) => unknown) | null): boolean {
+    switch (this._progressKind) {
+      case PROGRESS_SINK: return false;
+      case PROGRESS_AGV: {
+        // Capture (no raw snapshot): the live task is the saved one.
+        if (!part) return this.progressArmed;
+        const state = part(`fleet.agv:${this.desId}`) as { task?: unknown } | undefined;
+        return state?.task != null;
+      }
+      case PROGRESS_SOURCE:
+        return super.snapshotProgressArmed(snap, blockedCount, part)
+          || (snap as { sourcePending?: unknown }).sourcePending != null;
+      default: return super.snapshotProgressArmed(snap, blockedCount, part);
+    }
   }
 
   // ── Material-flow handshake (delegates into def.des) ────────────────────
@@ -253,22 +286,28 @@ export class MaterialFlowAdapter extends DESComponent implements HookDispatchTar
     saved.owner = owner;
     saved.entryTime = entryTime;
     saved.componentsVisited = componentsVisited;
-    this.addMU(mu);
-    if (this.processingPoint === 'accept' && this.processingAttachmentTime > 0) {
-      this.beginAttachedProcessing(mu, 'accept', entryTime, componentsVisited);
-    } else {
-      const ctx = this.poseContext(mu);
-      const accepted = ctx
-        ? this.def.des?.onAccept?.(this.self, mu as unknown as MU, undefined, ctx)
-        : this.def.des?.onAccept?.(this.self, mu as unknown as MU, undefined);
-      // A hook returning `false` rejects after the fact — roll back the add.
-      if (accepted === false) {
-        saved.owner = owner;
-        saved.entryTime = entryTime;
-        saved.componentsVisited = componentsVisited;
-        this.rollbackAccept(mu, saved);
-        return false;
+    // plan-2241 F11: an attempt until onAccept's verdict.
+    this._beginProgressAttempt();
+    try {
+      this.addMU(mu);
+      if (this.processingPoint === 'accept' && this.processingAttachmentTime > 0) {
+        this.beginAttachedProcessing(mu, 'accept', entryTime, componentsVisited);
+      } else {
+        const ctx = this.poseContext(mu);
+        const accepted = ctx
+          ? this.def.des?.onAccept?.(this.self, mu as unknown as MU, undefined, ctx)
+          : this.def.des?.onAccept?.(this.self, mu as unknown as MU, undefined);
+        // A hook returning `false` rejects after the fact — roll back the add.
+        if (accepted === false) {
+          saved.owner = owner;
+          saved.entryTime = entryTime;
+          saved.componentsVisited = componentsVisited;
+          this.rollbackAccept(mu, saved);
+          return false;
+        }
       }
+    } finally {
+      this._endProgressAttempt();
     }
     // Sink semantics: the MU was consumed (destroyed) in onAccept, not held —
     // release the slot immediately so the sink never accumulates load, counts the
@@ -317,8 +356,9 @@ export class MaterialFlowAdapter extends DESComponent implements HookDispatchTar
     try {
       return fn();
     } finally {
-      const i = this.pendingPoses.lastIndexOf(entry);
-      if (i >= 0) this.pendingPoses.splice(i, 1);
+      const stack = this.pendingPoses, i = stack.lastIndexOf(entry);
+      if (i === stack.length - 1) stack.pop();
+      else if (i >= 0) stack.splice(i, 1);
     }
   }
 
@@ -378,16 +418,23 @@ export class MaterialFlowAdapter extends DESComponent implements HookDispatchTar
     if (unsupported) return { ok: false, reason: unsupported, ownerKept: true };
     return this.withPose(mu.id, pose, (): PoseTransferResult => {
       if (!this.canAccept(mu)) return { ok: false, reason: 'refused', ownerKept: true };
-      owner.releaseMU(mu);
-      if (this.acceptMU(mu)) return { ok: true };
-      // Refused after the pre-check: back to the owner. The owner just released
-      // it, so its own accept normally succeeds; if a re-entrant wake-up filled
-      // the owner too, the MU is re-attached without the capacity check — an
-      // MU must never be lost (no owner) by a failed hand-over.
-      if (!owner.acceptMU(mu)) {
-        (owner as unknown as { addMU(m: DESMU): void }).addMU(mu);
+      // plan-2241 F11: the owner's progress and lifecycle count only on commit.
+      let committed = false;
+      owner._holdProgress(mu);
+      try {
+        owner.releaseMU(mu);
+        if (this.acceptMU(mu)) { committed = true; return { ok: true }; }
+        // Refused after the pre-check: back to the owner. The owner just released
+        // it, so its own accept normally succeeds; if a re-entrant wake-up filled
+        // the owner too, the MU is re-attached without the capacity check — an
+        // MU must never be lost (no owner) by a failed hand-over.
+        if (!owner.acceptMU(mu)) {
+          (owner as unknown as { addMU(m: DESMU): void }).addMU(mu);
+        }
+        return { ok: false, reason: 'rolled-back', ownerKept: true };
+      } finally {
+        owner._releaseHeldProgress(mu, committed);
       }
-      return { ok: false, reason: 'rolled-back', ownerKept: true };
     });
   }
 
@@ -400,6 +447,8 @@ export class MaterialFlowAdapter extends DESComponent implements HookDispatchTar
     } else if (this.def.kind !== 'storage') {
       super.onDownstreamReady(from);
     }
+    // A Source's `pending` changes only in its own hooks.
+    if (this._progressKind === PROGRESS_SOURCE) this._progressCheck();
   }
 
   override onTransferCommitted(mu: DESMU): void {
@@ -666,6 +715,26 @@ export class MaterialFlowAdapter extends DESComponent implements HookDispatchTar
       }
     }
 
+    // plan-2241 F11: holder and target are one attempt.
+    this._beginProgressAttempt();
+    target._beginProgressAttempt();
+    try {
+      return this.commitReservationBatch(id, target, sourceMUs, carrierMU, hierarchyOrigins, parentChildren, port);
+    } finally {
+      target._endProgressAttempt();
+      this._endProgressAttempt();
+    }
+  }
+
+  private commitReservationBatch(
+    id: number,
+    target: MaterialFlowAdapter,
+    sourceMUs: readonly DESMU[],
+    carrierMU: DESMU | null,
+    hierarchyOrigins: ReadonlyArray<{ mu: DESMU; parent: DESMU | null }>,
+    parentChildren: ReadonlyMap<DESMU, MuRef[]>,
+    port: Port | undefined,
+  ): boolean {
     const accepted: DESMU[] = [];
     for (const mu of sourceMUs) {
       unloadMUFromCarrier(mu, this.manager);
@@ -874,6 +943,7 @@ export class MaterialFlowAdapter extends DESComponent implements HookDispatchTar
     ) {
       for (const prev of this.previousComponents) prev.onDownstreamReady(this);
     }
+    if (this._progressKind === PROGRESS_SOURCE) this._progressCheck();
   }
 
   override setFailure(failure: boolean): void {

@@ -22,7 +22,7 @@ import {
   exportRuntimeStage,
   type RuntimeStageInput,
   type RuntimeStageSnapshot,
-} from '../src/plugins/usd-live-link/runtime-stage-export';
+} from '../src/core/usd/runtime-stage-export';
 import type { KitLinkClient, KitLinkClientOptions } from '../src/plugins/usd-live-link/kit-link-client';
 import type { LiveSyncAck } from '../src/plugins/usd-live-link/livesync-protocol';
 import { MIN_EXTENSION_VERSION } from '../src/plugins/usd-live-link/livesync-extension';
@@ -122,6 +122,9 @@ describe('usd-live-link lifecycle', () => {
     // resetSimulation(): the event fires FIRST, then drives / MUs are reset.
     m.emit('simulation-reset');
     w.axis.position.x = 0;
+    // The transport reset disposes every spawned MU, which detaches its node
+    // (plan-2239: a node left behind would be a new child to the structure guard).
+    for (const mu of w.mus as Array<{ node: Object3D }>) mu.node.removeFromParent();
     w.mus.length = 0;
     expect(m.client().sent).toEqual([]); // nothing sent from inside the event
     await Promise.resolve();

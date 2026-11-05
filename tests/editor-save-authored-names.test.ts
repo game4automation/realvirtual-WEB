@@ -39,6 +39,8 @@ import { documentBase, setActiveAssetContext } from '../src/core/editor/active-a
 import { setAssetReference } from '../src/core/engine/rv-asset-reference';
 import { McpEditorTools } from '../src/plugins/mcp-bridge/rv-mcp-editor-tools';
 
+const idleTail = Promise.resolve();
+
 // ─── save fixture (9.8 / 9.10) ────────────────────────────────────────────
 // The save path with the REAL export (the save-routing suites mock it; the guard
 // measures inside the export's clone callback, so it needs the real one). Only
@@ -595,7 +597,7 @@ function saveContext(root: Object3D, documentId: string) {
     unlock: () => {},
     markSaved: async () => {},
     get isBound() { return false; },
-    document: { opCount: 0, runExclusive: <T,>(work: () => Promise<T>) => work(), markSaved: () => {} },
+    document: { whenIdle: () => idleTail, opCount: 0, runExclusive: <T,>(work: () => Promise<T>) => work(), markSaved: () => {} },
   };
   const viewer = {
     currentModelRoot: root, renderer: {}, scene: {}, emit: () => {}, getPlugin: () => undefined,

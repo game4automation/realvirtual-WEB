@@ -35,7 +35,9 @@ export function useSignal(addr: string): boolean | number | undefined {
     // Sync initial value (store may have been populated after first render)
     setValue(store.get(addr));
 
-    return store.subscribe(addr, setValue);
+    const off = store.subscribe(addr, setValue);
+    const offRestore = store.onValuesRestored?.(() => setValue(store.get(addr)));
+    return () => { off(); offRestore?.(); };
   }, [viewer, addr]);
 
   // Re-subscribe when signalStore changes (model load/clear)

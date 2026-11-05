@@ -235,6 +235,7 @@ export function DESEventQueueWindow({ source, open, onClose }: DESEventQueueWind
       open={open}
       onClose={onClose}
       title="Event Queue"
+      panelId="des-event-queue"
       subtitle={subtitle}
       defaultWidth={DEFAULT_W}
       defaultHeight={DEFAULT_H}

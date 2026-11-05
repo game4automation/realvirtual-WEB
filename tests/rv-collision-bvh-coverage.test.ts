@@ -17,6 +17,9 @@
  *
  * The measurement runs the PRODUCTION path (`computeBVHAsync` with the inline
  * port), so a future change to the skip rules shows up here.
+ *
+ * plan-781: collision no longer depends on these trees (its bodies read the
+ * bake's pick structure); the measurement stays for the remaining consumers.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -92,44 +95,36 @@ describe.skipIf(!DEV_ASSETS)('BVH coverage on the reference model (plan-394 Phas
 });
 
 /**
- * plan-756 §2.4a.10 / risk R13 — the collision manager must not reorder a chunk
- * index.
+ * plan-781 — collision builds NO tree on a baked chunk (rules 10/15).
  *
- * `_ensureBoundsTree` builds `new MeshBVH(geo)` on the spot for a body whose
- * geometry has no tree yet, and the DEFAULT build permutes the index in place.
- * On a baked chunk that would scatter the pick structure's segments (and the
- * window table) — the one thing nothing may do after the bake. Chunk geometries
- * therefore get an `indirect` tree, which keeps its own triangle order and
- * leaves `geometry.index` untouched.
+ * Until plan-781 `_ensureBoundsTree` put an `indirect` MeshBVH on every body
+ * geometry, chunks included. Collision now READS the chunk's pick structure and
+ * builds nothing: after a full collision tick with motion the chunk geometry
+ * carries no `boundsTree` and its index order (data after the bake) is unchanged.
  */
-describe('collision trees on baked chunks stay index-preserving (plan-756 R13)', () => {
-  it('building a collision tree on a chunk geometry leaves the index order unchanged', async () => {
-    const { RVUberMaterial } = await import('../src/core/engine/rv-uber-material');
-    const { group, uberMesh, bakeTree } = await import('./fixtures/bake-fixture');
-    const { RVCollisionManager } = await import('../src/core/engine/rv-collision-manager');
-    const uber = new RVUberMaterial(false);
+describe('collision builds no tree on baked chunks (plan-781, rules 10/15)', () => {
+  it('a collision tick over chunk bodies leaves no boundsTree and the index order unchanged', async () => {
+    const { bakeCollisionScene, bodyNode, plainGroup } = await import('./collision-fixture');
+    const root = plainGroup('Asset');
+    // Enough static role bodies that a default tree build would permute something.
+    for (let i = 0; i < 24; i++) {
+      root.add(bodyNode('part' + i, { role: 'Environment', at: [i * 1.5, (i % 3) * 0.7, 0] }));
+    }
+    root.add(bodyNode('Slide', { role: 'Robot', mover: true, size: [1, 0.6, 0.6], at: [0, 3, 0] }));
+    const s = await bakeCollisionScene(root);
+    const chunks = [...s.bakeRegistry.instances][0].chunks;
+    const before = chunks.map((m) => Uint32Array.from(m.geometry.index!.array as Uint32Array));
 
-    const root = group('Asset');
-    // Enough triangles that a default build would really permute something.
-    for (let i = 0; i < 24; i++) root.add(uberMesh(uber, 'part' + i, [i * 1.5, (i % 3) * 0.7, 0]));
-    const asset = await bakeTree(root, { uber, destructive: true });
-    const chunk = asset.chunks[0];
-    expect(chunk.pick.segmentCount).toBeGreaterThan(0);
-    const before = Uint32Array.from(chunk.geometry.index!.array as Uint32Array);
+    for (let i = 0; i < 24; i++) s.manager.register(s.node('part' + i), 'Environment');
+    s.manager.register(s.node('Slide'), 'Robot');
+    s.manager.update(1 / 60);
+    s.node('Slide').position.set(0.3, 0.1, 0);          // through part0's right face
+    s.manager.update(1 / 60);
+    expect(s.manager.activePairs.length).toBeGreaterThan(0);
 
-    // Precondition of the build under test: no tree on the geometry yet. The bake
-    // itself builds none any more (plan-756 1d deleted `chunk.boundsTree` and the
-    // chunk BVH queue) — a tree on a chunk can only come from a collision body.
-    chunk.geometry.boundsTree = undefined;
-
-    const mesh = chunk.templateMesh!;
-    const built = (new RVCollisionManager() as unknown as {
-      _ensureBoundsTree(m: typeof mesh): boolean;
-    })._ensureBoundsTree(mesh);
-    expect(built).toBe(true);
-    expect(chunk.geometry.boundsTree).toBeTruthy();
-    // Index untouched — segments and `faceIndex` all still address the same
-    // triangles.
-    expect(Array.from(chunk.geometry.index!.array as Uint32Array)).toEqual(Array.from(before));
+    chunks.forEach((m, i) => {
+      expect((m.geometry as unknown as { boundsTree?: unknown }).boundsTree, m.name).toBeUndefined();
+      expect(Array.from(m.geometry.index!.array as Uint32Array)).toEqual(Array.from(before[i]));
+    });
   });
 });

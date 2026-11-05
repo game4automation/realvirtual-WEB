@@ -58,6 +58,7 @@ import type {
   ApplyCommitResult,
   ApplyPreview,
   DocumentExportMode,
+  DocumentExportPreflight,
   DocumentExportResult,
 } from '../export/rv-export-provider';
 
@@ -127,8 +128,11 @@ export interface ActiveDocumentFileExport {
   id: string;
   /** Menu label, e.g. 'Export USD…'. */
   label: string;
-  /** The modes offered now (e.g. overlay only for USD-stamped documents). */
+  /** All modes, including visible descriptions and shared UI/MCP refusal reasons. */
   modes(): DocumentExportMode[];
+  /** Optional cheap check; never prepares export bytes. */
+  preflight?(modeId: string): Promise<DocumentExportPreflight>;
+  /** Produce export bytes on explicit request; does not download or write a project file. */
   run(modeId: string): Promise<DocumentExportResult>;
   /**
    * The provider's re-import, bound to the open document (plan-764 F7) —

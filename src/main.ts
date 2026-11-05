@@ -195,6 +195,7 @@ import { reportProblem } from './core/hmi/problems-store';
 import { forgetRememberedSession, readRememberedSession } from './core/project/rv-project-resume-store';
 import { reportMissingDocument } from './core/hmi/scene/rv-scene-live-sync';
 import { openProjectsDashboard } from './core/hmi/projects/projects-dashboard-store';
+import { isRecordingMode } from './core/recording-mode';
 import { DEMO_PROJECT_FOLDER, DEMO_BASE_PATH } from './core/project/backends/bundled-backend';
 import { getLibraryStore } from './core/library/library-store-singleton';
 import { installProjectLibraryProvider } from './core/library/project-library-provider';
@@ -2177,7 +2178,7 @@ async function init() {
               console.warn(`[main] ${urlScene} was converted to ${route.documentId}, which no longer exists.`);
               hideLoadingOverlay();
               reportMissingDocument(route.documentId);
-              openProjectsDashboard();
+              autoOpenProjectsDashboard();
               sceneRouted = true;
             }
           }
@@ -2216,7 +2217,7 @@ async function init() {
         console.warn(`[main] Failed to open ?doc=${urlDoc}:`, e);
         hideLoadingOverlay();
         reportMissingDocument(urlDoc);
-        openProjectsDashboard();
+        autoOpenProjectsDashboard();
         sceneRouted = true;
       }
     }
@@ -2461,7 +2462,7 @@ async function init() {
           if (hostedBoot.kind === 'document' && hostedBoot.deepLink
               && !await guardHeavyRestore(hostedBoot.docId, hostedBoot.docName)) {
             hideLoadingOverlay();
-            openProjectsDashboard();
+            autoOpenProjectsDashboard();
             sceneRouted = true;
           } else
           if (sceneRouted) {
@@ -2507,7 +2508,7 @@ async function init() {
               });
             }
             hideLoadingOverlay();
-            openProjectsDashboard();
+            autoOpenProjectsDashboard();
             sceneRouted = true;
           } else if (modeLocked && servedProjectUrl) {
             const documents = documentsOf(project);
@@ -2929,3 +2930,8 @@ async function init() {
 }
 
 init().catch(console.error);
+
+/** Boot-time dashboard openings; none in recording mode (plan-2240). */
+function autoOpenProjectsDashboard(): void {
+  if (!isRecordingMode()) openProjectsDashboard();
+}

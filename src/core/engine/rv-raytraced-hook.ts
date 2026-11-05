@@ -5,10 +5,10 @@
  * rv-raytraced-hook — the seam between the viewer's `raytraced` render mode
  * (plan-762) and an optional backend implementation.
  *
- * The core never imports a tracer: an internal build registers a factory with
+ * The core never imports a tracer: a commercial build registers a factory with
  * {@link registerRaytracedBackend} from its feature adapter. The render-mode
  * gate (`RenderModeContext.backendRegistered`, rv-render-modes.ts) reads
- * {@link getRaytracedBackend}; without a registration (community / customer
+ * {@link getRaytracedBackend}; without a registration (community
  * build) the mode is not offered anywhere and a request for it is refused with
  * {@link RAYTRACED_UNAVAILABLE_MESSAGE}.
  *

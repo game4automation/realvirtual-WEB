@@ -3,7 +3,7 @@
 
 import type { Object3D } from 'three';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
-import { registerComponentSchema, loadSchemaFromSpec } from './rv-component-registry';
+import { registerComponentSchema, loadSchemaFromSpec, setComponentInstance, removeComponentInstance } from './rv-component-registry';
 import { RVDrive } from './rv-drive';
 import { NodeRegistry } from './rv-node-registry';
 import { wireBoolSignal, wireNumberSignal, scaleFeedbackPosition } from './rv-signal-wiring';
@@ -37,6 +37,9 @@ export class RVDriveSimple implements RVComponent {
   // `signal:` marks the slot as bindable. Empty slots remain null.
   // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
   static readonly schema: ComponentSchema = loadSchemaFromSpec('Drive_Simple');
+
+  private initialRunState = {};
+  resetRunState(): void { Object.assign(this, this.initialRunState); }
 
   readonly node: Object3D;
   isOwner = true;
@@ -77,6 +80,8 @@ export class RVDriveSimple implements RVComponent {
    *  a removed drive kept receiving PLC commands. */
   private readonly inputUnsubs: (() => void)[] = [];
 
+  get commandFeedbackWriter() { return this.feedbackCb; }
+
   constructor(node: Object3D) {
     this.node = node;
   }
@@ -84,11 +89,13 @@ export class RVDriveSimple implements RVComponent {
   commandForward(value: boolean | number): void {
     this._forward = Boolean(value);
     if (this.drive) this.drive.jogForward = this._enabled && this._forward;
+    this.drive?.onCommand?.(this);
   }
 
   commandBackward(value: boolean | number): void {
     this._backward = Boolean(value);
     if (this.drive) this.drive.jogBackward = this._enabled && this._backward;
+    this.drive?.onCommand?.(this);
   }
 
   /** True while the motion enable allows the drive to move (plan-539 F14). */
@@ -110,11 +117,11 @@ export class RVDriveSimple implements RVComponent {
       drive.jogForward = false;
       drive.jogBackward = false;
       if (changed || drive.isRunning) drive.stop();
-      return;
+    } else if (changed) {
+      drive.jogForward = this._forward;
+      drive.jogBackward = this._backward;
     }
-    if (!changed) return;
-    drive.jogForward = this._forward;
-    drive.jogBackward = this._backward;
+    this.drive?.onCommand?.(this);
   }
 
   /** Direct-binding command contract of the `Enable` slot (plan-539 F14). */
@@ -125,12 +132,14 @@ export class RVDriveSimple implements RVComponent {
 
   commandSpeed(value: boolean | number): void {
     if (this.drive) this.drive.targetSpeed = Number(value) * this.ScaleSpeed;
+    this.drive?.onCommand?.(this);
   }
 
   commandAccelaration(value: boolean | number): void {
     if (!this.drive) return;
     this.drive.Acceleration = Number(value) * this.ScaleSpeed;
     this.drive.UseAcceleration = true;
+    this.drive?.onCommand?.(this);
   }
 
   neutralizeForward(): void { this.commandForward(false); }
@@ -178,6 +187,7 @@ export class RVDriveSimple implements RVComponent {
       return;
     }
     this.drive = drive;
+    setComponentInstance(this.node, this);
     this._enabled = true;
     this._forward = drive.jogForward;
     this._backward = drive.jogBackward;
@@ -216,9 +226,11 @@ export class RVDriveSimple implements RVComponent {
       for (let i = 0; i < this.feedbackListeners.length; i++) this.feedbackListeners[i]();
     };
     drive.addAfterUpdate(this.feedbackCb);
+    this.initialRunState = { _enabled: this._enabled, _forward: this._forward, _backward: this._backward };
   }
 
   dispose(): void {
+    removeComponentInstance(this.node, this);
     if (this.drive && this.feedbackCb) {
       this.drive.removeAfterUpdate(this.feedbackCb);
     }

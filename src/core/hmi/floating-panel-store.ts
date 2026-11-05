@@ -1,13 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 
-import { readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
+import { readLocalStorage, removeLocalStorage, writeLocalStorage } from '../rv-safe-storage';
 
 export interface PanelGeometry { x: number; y: number; w: number; h: number }
 export interface PanelGeometryUpdate { rect?: readonly number[]; collapsed?: boolean }
 const listeners = new Map<string, Set<(update: PanelGeometryUpdate) => void>>();
 const LS_PREFIX = 'rv-panel-geo:';
 const LS_COLLAPSED_PREFIX = 'rv-panel-collapsed:';
+
+/** Move what a window stored under its title key to its panelId key, once. */
+export function migratePanelKeys(from: string, to: string): void {
+  for (const p of [LS_PREFIX, LS_COLLAPSED_PREFIX]) {
+    try {
+      const old = readLocalStorage(p + from);
+      if (old === null) continue;
+      // Storage full: keep the old key for the next attempt.
+      if (readLocalStorage(p + to) !== null || writeLocalStorage(p + to, old)) removeLocalStorage(p + from);
+    } catch { /* unavailable */ }
+  }
+}
 
 export function loadPanelGeometry(panelId: string): PanelGeometry | null {
   try {

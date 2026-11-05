@@ -4,8 +4,9 @@
 /**
  * rv-collision-role.ts — the `CollisionRole` marker component (plan-394).
  *
- * A node carrying this component becomes a **collision body**: the union of all
- * effectively visible, non-deformed meshes in its subtree, cut off at the next
+ * A node carrying this component becomes a **collision body**: its subtree's
+ * geometry — since plan-781 the node's segment ranges in the baked chunks plus
+ * its kept meshes, effectively visible and not deformed — cut off at the next
  * descendant that carries a role of its own (a robot's body ends at its
  * gripper). While the simulation runs, {@link RVCollisionManager} checks every
  * pair of bodies with DIFFERENT roles against each other.
@@ -23,6 +24,7 @@
 import type { Box3, Object3D } from 'three';
 import type { ComponentContext, ComponentSchema, RVComponent } from './rv-component-registry';
 import { registerComponent, setComponentInstance, loadSchemaFromSpec } from './rv-component-registry';
+import { registerFieldTypeTrigger } from './rv-component-types';
 
 /**
  * Role identifiers. English, NOT localized (user decision 2026-08-06).
@@ -57,8 +59,9 @@ export function toCollisionRole(value: unknown): CollisionRoleName {
  *
  * The moment machining starts, `attachGrid()` HIDES the authored workpiece and
  * the dynamic chunk meshes stand in for it. Those chunks never join a body (F3:
- * they have no BVH and would degrade the whole body to a box test), and the
- * hidden originals fail the visibility rule — so without this seam the
+ * they are rewritten at runtime, and since plan-781 rewritten geometry is
+ * excluded from collision), and the hidden originals fail the visibility rule
+ * — so without this seam the
  * workpiece would silently VANISH from collision detection at exactly the
  * moment a crash matters most.
  */
@@ -164,3 +167,8 @@ registerComponent({
   create: (node) => new RVCollisionRole(node),
   afterCreate: (inst, node) => setComponentInstance(node, inst),
 });
+
+// plan-781 F21: a Source that hands a role to its MUs needs the collision feature
+// as much as a CollisionRole node does — the load prescan activates it before the build.
+registerFieldTypeTrigger('Source', 'CollisionRoleForMUs', 'CollisionRole',
+  (value) => toCollisionRole(value) !== 'None');

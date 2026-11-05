@@ -56,10 +56,26 @@ export function virtualClockInitScript(options) {
       // load/setup fires on wall time in the middle of the take (Codex review 2026-10-27).
       preTimers: new Map(),
       preRafs: new Map(),
+      // plan-2237 Phase 2 — wall mode (time-lapse): page time follows the REAL clock from
+      // `wallBegin` on, a real `setTimeout` pump fires virtual timers and rAF, `markFrame` counts
+      // output frames. `vt` only ever moves forward, so the return to stepping is monotone.
+      wall: false,
+      wallHeld: false,
+      wallVtBase: 0,
+      wallRealBase: 0,
+      wallPump: null,
+      wallPumps: 0,
     };
+
+    /** Wall mode: pull `vt` up to the real instant (never down). */
+    function syncWall() {
+      const v = state.wallVtBase + (realNow() - state.wallRealBase);
+      if (v > state.vt) state.vt = v;
+    }
 
     function virtualNow() {
       if (!state.enabled) return realNow();
+      if (state.wall) syncWall();
       state.creep += state.creepUs / 1000;
       return state.epoch + state.vt + state.creep;
     }
@@ -175,13 +191,84 @@ export function virtualClockInitScript(options) {
       /** Advances page time by `ms` and runs everything that falls due. One call = one video frame. */
       step(ms) {
         if (!state.enabled) throw new Error('__vt.step before __vt.enable');
+        if (state.wall) throw new Error('__vt.step during wall mode (call __vt.wallEnd first)');
         state.vt += Number(ms);
+        // plan-2237 F1 — creep CARRY: the per-call creep of `performance.now()` is absorbed by the
+        // frame's own dt, so page time no longer runs ahead of `vt` (measured: one extra fixed step
+        // per 175..265 frames, the old ~16 s limit). Never a reset: after a long fast-forward the
+        // creep exceeds one frame, and a reset would move `performance.now()` BACKWARDS.
+        state.creep = Math.max(0, state.creep - Number(ms));
         state.steps++;
         fireDue();
         return { frame: state.steps - 1 };
       },
       now() { return virtualNow(); },
-      stats() { return { enabled: state.enabled, epoch: state.epoch, vt: state.vt, steps: state.steps, timers: state.timers.size, rafs: state.rafs.size }; },
+      stats() {
+        return { enabled: state.enabled, epoch: state.epoch, vt: state.vt, steps: state.steps, timers: state.timers.size,
+          rafs: state.rafs.size, creep: state.creep, wall: state.wall, wallPumps: state.wallPumps };
+      },
+      /**
+       * plan-2237 Phase 2: leave deterministic stepping. Page time follows the wall clock from here
+       * on; a real timer pump (`pumpMs`) fires virtual timers and rAF unless `wallHold(true)`.
+       */
+      wallBegin({ pumpMs = 16 } = {}) {
+        if (!state.enabled) throw new Error('__vt.wallBegin before __vt.enable');
+        if (state.wall) throw new Error('__vt.wallBegin: already in wall mode');
+        state.wall = true;
+        state.wallHeld = false;
+        state.wallVtBase = state.vt;
+        state.wallRealBase = realNow();
+        state.wallPumps = 0;
+        const every = Math.max(1, Number(pumpMs) || 16);
+        const pump = () => {
+          if (!state.wall) return;
+          if (!state.wallHeld) {
+            syncWall();
+            state.wallPumps++;
+            fireDue();
+          }
+          state.wallPump = realSetTimeout(pump, every);
+        };
+        state.wallPump = realSetTimeout(pump, 0);
+        return { vt: state.vt, frame: state.steps - 1 };
+      },
+      /** Wall mode only: holds the pump (no timer, no rAF fires) while a grab sequence runs. */
+      wallHold(on) {
+        if (!state.wall) throw new Error('__vt.wallHold outside wall mode');
+        state.wallHeld = Boolean(on);
+        return { held: state.wallHeld };
+      },
+      /**
+       * Wall mode only: counts ONE output frame without stepping. `flush` (default) first brings page
+       * time to the wall instant and runs what is due — the stamp is painted in rAF, so a grab
+       * without the flush shows the previous frame's stamp (spike: 33/33 wrong).
+       */
+      markFrame(flush = true) {
+        if (!state.wall) throw new Error('__vt.markFrame outside wall mode');
+        state.steps++;
+        if (flush) {
+          syncWall();
+          fireDue();
+        }
+        return { frame: state.steps - 1, vt: state.vt };
+      },
+      /** Return to deterministic stepping; `vt` keeps the wall-advanced value (monotone). Idempotent. */
+      wallEnd() {
+        if (!state.wall) return { already: true, vt: state.vt, frame: state.steps - 1 };
+        syncWall();
+        // The creep piled up in wall mode (no `step` absorbs it there; a batch polling
+        // `performance.now()` adds ~100 ms in seconds) is folded into `vt`: page time stays where it
+        // is (monotone), and the stepped frames after wallEnd advance by their full dt again. As a
+        // carry it ate whole frame dts — page time stood still and the viewer ran no fixed step for
+        // several frames (acceptance probe 2026-11-05: frames 845..848, I1 "0 fixed steps").
+        state.vt += state.creep;
+        state.creep = 0;
+        state.wall = false;
+        state.wallHeld = false;
+        if (state.wallPump !== null) realClearTimeout(state.wallPump);
+        state.wallPump = null;
+        return { vt: state.vt, wallMs: state.vt - state.wallVtBase, pumps: state.wallPumps, frame: state.steps - 1 };
+      },
     };
   }
 }

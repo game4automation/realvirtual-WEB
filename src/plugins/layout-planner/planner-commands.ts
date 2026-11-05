@@ -39,7 +39,7 @@ import {
 } from '../../core/hmi/rv-command-registry';
 import { getSceneStore } from '../../core/hmi/scene/scene-store-singleton';
 import { getLibrarySource, listLibrarySources } from '../../core/library/library-source-registry';
-import { LIBRARY_PROJECTS_PROVIDER_ID } from '../../core/library/library-origin';
+import { LIBRARY_PROJECTS_PROVIDER_ID, OPEN_PROJECT_PROVIDER_ID, resolveDocumentRef } from '../../core/library/library-origin';
 import { computeSubtreeAABB } from '../../core/engine/rv-traverse-utils';
 import type { SnapPoint } from '../../core/engine/rv-snap-point-registry';
 import type { SnapPointPlugin } from '../snap-point';
@@ -97,7 +97,14 @@ export const NOTHING_TO_REDO = 'Nothing to redo';
 export const noPlacement = (id: string): string => `No placement "${id}". Use web_query("layout.list", {}).`;
 export const noPlacementOnto = (id: string): string => `No placement "${id}" to place onto. Use web_query("layout.list", {}).`;
 export const noCatalogEntry = (id: string): string =>
-  `No catalog entry "${id}". Use web_query("library.catalogList", {}) or web_document_list (id or "project:<path>").`;
+  `No catalog entry "${id}". Use web_query("library.catalogList", {}) or web_document_list (the document id).`;
+
+/** plan-780 R5: deprecation hint — `project:<path>` is a lookup only, never sent or stored. */
+export function legacyCatalogIdHint(catalogId: string, entry: Pick<LibraryCatalogEntry, 'id' | 'documentId'> | undefined): string | null {
+  if (!catalogId.startsWith('project:') || !entry) return null;
+  const id = entry.documentId ?? entry.id;
+  return `"${catalogId}" is deprecated — address the document by its id "${id}".`;
+}
 export const noPlannerCatalogEntry = (id: string): string => `No catalog entry "${id}". Use web_query("library.catalogList", {}).`;
 const PLANNER_NOT_ATTACHED =
   'Layout planner is not attached to the viewer (no model loaded and planner mode not entered yet) — call web_execute("workspace.setMode", {mode:"planner"}) or web_document_open(<document>) first, then retry';
@@ -142,6 +149,11 @@ export function resolvePlaceEntry(
   }
   const own = findPlannerEntry(planner, catalogId);
   if (own) return own;
+  // plan-780 R5: `project:<path>` lookup shim via THE resolver (one row, never guessed).
+  if (catalogId.startsWith('project:')) {
+    const r = resolveDocumentRef({ catalogId }, null);
+    return 'hit' in r && r.hit.registered.providerId === OPEN_PROJECT_PROVIDER_ID ? r.hit.entry : undefined;
+  }
   for (const { providerId, source } of listLibrarySources()) {
     // A library project that is only resolvable (transitive, or the built-in
     // realvirtual library the project does not list) is not placeable.
@@ -334,8 +346,10 @@ const place: CommandImpl<PlaceArgs, Record<string, unknown>> = {
       if (y !== 0 || ry !== 0) await planner.moveById(placed, [x, y, z], [0, ry, 0]);
       return placed;
     });
+    const deprecated = legacyCatalogIdHint(a.catalogId, entry);
     return {
-      id, catalogId: a.catalogId, position: [x, y, z], placeMs: Math.round(performance.now() - t0),
+      id, catalogId: deprecated ? (entry.documentId ?? entry.id) : a.catalogId, position: [x, y, z], placeMs: Math.round(performance.now() - t0),
+      ...(deprecated ? { deprecation: deprecated } : {}),
       ...(entry.libraryOrigin ? { libraryProjectId: entry.libraryOrigin.sourceId } : {}),
       ...(ry !== 0 ? { rotation: [0, ry, 0] } : {}),
       ...(surface ? { onto: a.onto, surfaceHeight: y, surfaceSource: surface.source } : {}),

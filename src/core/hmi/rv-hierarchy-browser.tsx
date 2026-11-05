@@ -36,8 +36,8 @@ import { readLocalStorage, writeLocalStorage } from '../rv-safe-storage';
  * - Signals sort toolbar lives in `SignalBrowser.tsx`
  */
 
-import { useState, useMemo, useCallback, useRef, useEffect, useSyncExternalStore, useDeferredValue } from 'react';
-import { useEditorPlugin } from '../../hooks/use-editor-plugin';
+import { useState, useMemo, useCallback, useRef, useEffect, useSyncExternalStore, useDeferredValue, type CSSProperties } from 'react';
+import { useEditorPlugin, useEditorPluginInstance } from '../../hooks/use-editor-plugin';
 import { useSelection } from '../../hooks/use-selection';
 import {
   Box,
@@ -83,6 +83,7 @@ import {
   revealExpandKeysFor,
   searchExpandKeys,
   structuralListenTargets,
+  structureChangeMatters,
   subscribeStructure,
   subtreeHasDrawable,
   watchHierarchyFilterValidation,
@@ -231,6 +232,18 @@ function objectOf(node: TreeNode): Object3D | null {
   return (node as Partial<SceneTreeNode>).object ?? null;
 }
 
+// One style object per row position: an inline literal defeated the rows' memo.
+const ROW_STYLES = new Map<string, CSSProperties>();
+function rowStyle(start: number, height: number): CSSProperties {
+  const k = `${start}:${height}`;
+  let s = ROW_STYLES.get(k);
+  if (!s) {
+    if (ROW_STYLES.size > 4096) ROW_STYLES.clear();
+    ROW_STYLES.set(k, s = { position: 'absolute', top: 0, left: 0, width: '100%', height, transform: `translateY(${start}px)` });
+  }
+  return s;
+}
+
 // ─── Main component ──────────────────────────────────────────────────────
 
 export interface HierarchyBrowserProps {
@@ -248,7 +261,7 @@ export interface HierarchyBrowserProps {
  * same hook order.
  */
 export function HierarchyBrowser({ viewer }: HierarchyBrowserProps) {
-  const { plugin } = useEditorPlugin();
+  const plugin = useEditorPluginInstance();
   if (!plugin) return null;
   return <HierarchyBrowserPanel viewer={viewer} plugin={plugin} />;
 }
@@ -298,6 +311,9 @@ function HierarchyBrowserPanel({ viewer, plugin }: HierarchyBrowserProps & { plu
     () => new Set<Object3D>(selection.nodes),
     [selection.nodes],
   );
+  // Lets row callbacks stay stable across selections (row memo).
+  const selRef = useRef({ objects: selectedObjects, paths: selection.selectedPaths });
+  selRef.current = { objects: selectedObjects, paths: selection.selectedPaths };
 
   const [searchTerm, setSearchTerm] = useState('');
   const deferredTerm = useDeferredValue(searchTerm);
@@ -409,11 +425,18 @@ function HierarchyBrowserPanel({ viewer, plugin }: HierarchyBrowserProps & { plu
   // list sixty times a second.
   const [mutationTick, setMutationTick] = useState(0);
   const mutationFrameRef = useRef(0);
-  const bumpMutation = useCallback(() => {
+  // This frame's child events; null = bump unconditionally.
+  const pendingRef = useRef<[Object3D, boolean][] | null>([]);
+  const structRef = useRef<{ hide: boolean; shown: ReadonlySet<Object3D>; getPath: (o: Object3D) => string | null } | null>(null);
+  const bumpMutation = useCallback((child?: Object3D, removed = false) => {
+    if (child && pendingRef.current) pendingRef.current.push([child, removed]);
+    else pendingRef.current = null;
     if (mutationFrameRef.current) return;
     mutationFrameRef.current = requestAnimationFrame(() => {
       mutationFrameRef.current = 0;
-      setMutationTick((t) => t + 1);
+      const p = pendingRef.current, s = structRef.current;
+      pendingRef.current = [];
+      if (!p || !s || p.some(([c, r]) => structureChangeMatters(c, r, s.hide, s.shown, s.getPath))) setMutationTick((t) => t + 1);
     });
   }, []);
   useEffect(() => () => {
@@ -424,9 +447,9 @@ function HierarchyBrowserPanel({ viewer, plugin }: HierarchyBrowserProps & { plu
   // through the plugin's `structureVersion`, so it is deliberately not here.
   useEffect(() => {
     const unsubs = [
-      viewer.on('model-loaded', bumpMutation),
-      viewer.on('model-cleared', bumpMutation),
-      viewer.on('placements-materialized', bumpMutation),
+      viewer.on('model-loaded', () => bumpMutation()),
+      viewer.on('model-cleared', () => bumpMutation()),
+      viewer.on('placements-materialized', () => bumpMutation()),
     ];
     return () => { for (const u of unsubs) u(); };
   }, [viewer, bumpMutation]);
@@ -483,7 +506,7 @@ function HierarchyBrowserPanel({ viewer, plugin }: HierarchyBrowserProps & { plu
     hideBaked,
     revealObjects,
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [viewer, state, modelRootInfo, hideRuntime, hideBaked, revealObjects]);
+  }), [viewer, state.overlay, modelRootInfo, hideRuntime, hideBaked, revealObjects]);
 
   // ── Rows ──
   // A search prunes the graph to matching branches and force-opens them, so a
@@ -503,6 +526,8 @@ function HierarchyBrowserPanel({ viewer, plugin }: HierarchyBrowserProps & { plu
     return flattenSceneRows(rootObject, expanded, rowCtx);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [typeFilter, searchTree, rootObject, expanded, rowCtx, structureTick]);
+  const shownObjects = useMemo(() => new Set(visibleRows.map((r) => objectOf(r.node)!)), [visibleRows]);
+  structRef.current = { hide: hideRuntime, shown: shownObjects, getPath: rowCtx.getPathForNode };
 
   // Flat list ONLY when a type filter is active (Drives/Sensors/Signals/Logic).
   // A plain "All" search stays in TREE mode. Both match with the ONE predicate
@@ -825,10 +850,12 @@ function HierarchyBrowserPanel({ viewer, plugin }: HierarchyBrowserProps & { plu
    *  the editor included. */
   const onOpenReference = useCallback((node: TreeNode) => {
     const object = objectOf(node);
-    const documentId = object ? referencedDocumentId(object, getProjectStore().getProject()) : null;
+    // plan-780 2.3: the reference is read in the scope of the document it is written in.
+    const scope = viewer.currentModelScope ?? null;
+    const documentId = object ? referencedDocumentId(object, getProjectStore().getProject(), scope) : null;
     if (!documentId) {
       // plan-778: a library part is edited through the Inspector's library actions.
-      const library = object ? referencedLibraryDocument(object) : null;
+      const library = object ? referencedLibraryDocument(object, scope) : null;
       showInstruction({
         id: 'hierarchy-open-reference',
         text: library
@@ -1091,14 +1118,13 @@ function HierarchyBrowserPanel({ viewer, plugin }: HierarchyBrowserProps & { plu
     }
     // Dragging a row that is part of a multi-selection moves the whole set;
     // dragging an unselected row moves (and selects) just that row.
-    const paths = selectedObjects.has(object) && selectedObjects.size > 1
-      ? [...selection.selectedPaths]
-      : [node.path];
-    if (!selectedObjects.has(object)) handleSelect(node);
+    const { objects, paths: selPaths } = selRef.current;
+    const paths = objects.has(object) && objects.size > 1 ? [...selPaths] : [node.path];
+    if (!objects.has(object)) handleSelect(node);
     dragPathsRef.current = paths;
     e.dataTransfer.effectAllowed = 'move';
     try { e.dataTransfer.setData('text/plain', paths.join('\n')); } catch { /* jsdom */ }
-  }, [selectedObjects, selection.selectedPaths, handleSelect, viewer]);
+  }, [handleSelect, viewer]);
 
   const handleDoubleClick = useCallback(
     (node: TreeNode) => {
@@ -1488,14 +1514,7 @@ function HierarchyBrowserPanel({ viewer, plugin }: HierarchyBrowserProps & { plu
                     onUnlock={onUnlock}
                     depth={isLogicFilter(typeFilter) ? (flatDepths.get(info.object.uuid) ?? 0) : 0}
                     rowHeight={rowHeight}
-                    virtualStyle={{
-                      position: 'absolute',
-                      top: 0,
-                      left: 0,
-                      width: '100%',
-                      height: virtualRow.size,
-                      transform: `translateY(${virtualRow.start}px)`,
-                    }}
+                    virtualStyle={rowStyle(virtualRow.start, virtualRow.size)}
                   />
                 );
               })}
@@ -1525,14 +1544,7 @@ function HierarchyBrowserPanel({ viewer, plugin }: HierarchyBrowserProps & { plu
                     logicEngine={logicEngine}
                     viewer={viewer}
                     rowHeight={rowHeight}
-                    virtualStyle={{
-                      position: 'absolute',
-                      top: 0,
-                      left: 0,
-                      width: '100%',
-                      height: virtualRow.size,
-                      transform: `translateY(${virtualRow.start}px)`,
-                    }}
+                    virtualStyle={rowStyle(virtualRow.start, virtualRow.size)}
                     getNodeVisible={canToggleVisibility ? getNodeVisible : undefined}
                     getEffectiveVisible={getEffectiveVisible}
                     onToggleVisible={canToggleVisibility ? onToggleVisible : undefined}

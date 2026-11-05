@@ -66,7 +66,7 @@ import {
   NOT_LINKED_CELL,
   authorityExplanation,
 } from './signal-vocabulary';
-import { ACCENT, FS, ICON_SIZE, INK_HIGH, INK_LOW, WARN } from './shared-sx';
+import { ACCENT, ERROR, FS, ICON_SIZE, INK_HIGH, INK_LOW, WARN } from './shared-sx';
 
 // ── Shared row/picker data shapes (moved here from SignalBindPopover) ────────
 
@@ -111,6 +111,8 @@ export interface SlotRow {
   /** Real SignalStore name of the internal signal (for the live chip). */
   targetName?: string;
   mapping?: SignalMapping;
+  /** plan-2233: a component's diagnostic for this slot (shown in red under the row). */
+  issue?: string;
   /** plan-320 Phase 5: current write authority of the slot (bound slots only). */
   authority?: 'component' | 'bound' | 'forced';
   /** plan-320 Phase 5: upstream remote-ownership layer active. */
@@ -746,6 +748,7 @@ export function SignalSlotRow({
       sx={registerDrop ? { ...SIGNAL_DROP_SX } : undefined}
     >
       {rowBody}
+      {row.issue && <Typography role="alert" sx={{ fontSize: ROW_FONT, color: ERROR, pl: 1 }}>{row.issue}</Typography>}
     </Box>
   );
 }

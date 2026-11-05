@@ -35,7 +35,7 @@ import type {
 import { pathGraphRows, type FingerprintInput } from './rv-des-fingerprint';
 import { getDefaultPathNetwork } from '../../core/engine/rv-path-network';
 import { RV_VERSION } from '../../core/rv-version';
-import { DES_MANAGER_COMPONENT, isDesRunConfigField } from '../../core/material-flow/des-manager-settings';
+import { DES_MANAGER_COMPONENT, isDesRunConfigField, isRunConfigOnlyComponents } from '../../core/material-flow/des-manager-settings';
 
 /** Structural viewer surface the collector reads. */
 export interface ModelInputHost {
@@ -179,6 +179,12 @@ function withoutRunConfig(extras: unknown): unknown {
   return { ...(extras as Record<string, unknown>), [DES_MANAGER_COMPONENT]: kept };
 }
 
+/** Drops the des.setEnd holder (leaf, identity). */
+export const withoutRunConfigHolder = (s: FingerprintSceneNode[]) => {
+  const p = new Set(s.map(r => r.parent));
+  return s.filter(r => !(isRunConfigOnlyComponents(r.extras) && !p.has(r.address) && Array.from(r.matrix).every((v, i) => v === +(i % 5 === 0))));
+};
+
 /** Full input, including bound script text and effective run parameters. */
 export function collectFingerprintInput(
   host: ModelInputHost,
@@ -189,7 +195,8 @@ export function collectFingerprintInput(
   },
   opts: { mainDocumentKey: string | null; hashOf?: (key: string) => DocumentHashState; scene?: readonly FingerprintSceneNode[] },
 ): FingerprintInput {
-  return { ...collectModelInput(host, runner, opts),
+  const input = collectModelInput(host, runner, opts);
+  return { ...input, scene: withoutRunConfigHolder(input.scene),
     scripts: runner.fingerprintScripts(), runConfig: runner.fingerprintRunConfig(),
     pathGraph: pathGraphRows(getDefaultPathNetwork()), rngVersion: runner.rngVersion,
     runtimeVersion: RV_VERSION.version };

@@ -413,6 +413,25 @@ the watchdog `scripts/test-lock-watchdog.cjs` (via `NODE_OPTIONS`), which ends i
 wrapper is gone; on Windows the job object libuv puts children into already ends the whole
 non-detached tree (incl. Chromium) when the wrapper is killed.
 
+**Free memory before the lock (plan-2247).** The holding wrapper checks the free commit
+(Windows `FreeVirtualMemory`, Linux `MemAvailable`) BEFORE it takes the lock: check, then lock,
+then start. Thresholds per class: light 8 GB, heavy 10 GB, exclusive 10 GB. Below the threshold the
+run waits WITHOUT holding the lock or any port (re-measured every `RV_TEST_MEMORY_POLL_SECONDS`,
+default 30), so it never blocks another run; after `RV_TEST_MEMORY_WAIT_SECONDS` (default 1800) it
+exits 1 with `waited N s for M GB free, have X GB`. While it waits, `node scripts/test-lock.mjs status`
+lists it as `[test-lock] WAITING for memory: PID … (class …, need N GB, have X GB, since …)` (exit
+code unchanged), read from `<tmp>/rv-test-lock-waiting/<pid>.json` (`RV_TEST_MEMORY_WAIT_DIR`; dead
+PIDs are ignored and cleaned up); the plan board shows "waiting for memory: N". Override:
+`node scripts/with-test-lock.mjs --min-free-gb <n> vitest …` (before the runner) or
+`RV_TEST_MIN_FREE_GB=<n>`; `0` switches the check off. A re-entering wrapper (`RV_TEST_LOCK_HELD`)
+does not check again. After acquisition the wrapper measures again before spawning the child; a
+low or unknown reading releases every acquired port and light mark before returning to the visible
+memory wait. Memory queries are asynchronous and bounded by `RV_TEST_MEMORY_QUERY_TIMEOUT_SECONDS`
+(default 10 seconds) and the remaining memory wait deadline. An unreadable or timed-out query
+keeps waiting; the entry already exists during the first measurement (`have ? GB`), and signals
+cancel the query and clean up the entry. Code: `scripts/test-memory.mjs`; `Tools/mem-gate/mem-gate.mjs` stays for runs
+outside the lock.
+
 | Entry point | Protected? |
 |-------------|-----------|
 | `npm test`, `npm run test:node`, `npm run test:watch`, `npm run test:all` | yes (wrapper) |

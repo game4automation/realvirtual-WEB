@@ -27,6 +27,8 @@ import {
   Mesh,
   InstancedMesh,
   Object3D,
+  Matrix3,
+  Matrix4,
 } from 'three';
 import type { Camera, Intersection, PerspectiveCamera, Scene } from 'three';
 import type { NodeRegistry } from './rv-node-registry';
@@ -41,6 +43,23 @@ import { RV_CHAIN_PROXY } from './rv-traverse-utils';
 /** Ascending-distance comparator (matches three's internal raycast sort). */
 function _byDistance(a: Intersection<Object3D>, b: Intersection<Object3D>): number {
   return a.distance - b.distance;
+}
+
+const _nWorld = new Matrix4();
+const _nInstance = new Matrix4();
+const _nMatrix = new Matrix3();
+
+/** World face normal of a hit: normal matrix of world × instance matrix (zero without a face). */
+export function writeWorldNormal(hit: Intersection<Object3D>, out: Vector3): void {
+  const n = hit.face?.normal;
+  if (!n) { out.set(0, 0, 0); return; }
+  _nWorld.copy(hit.object.matrixWorld);
+  const im = hit.object as InstancedMesh;
+  if (im.isInstancedMesh && hit.instanceId !== undefined) {
+    im.getMatrixAt(hit.instanceId, _nInstance);
+    _nWorld.multiply(_nInstance);
+  }
+  out.copy(n).applyMatrix3(_nMatrix.getNormalMatrix(_nWorld)).normalize();
 }
 
 // ─── Public types ───────────────────────────────────────────────────
@@ -84,6 +103,8 @@ export interface AuxRaycastTargetOptions {
    *  WebLabel billboard): its hit wins over any geometry in front of it, and it
    *  is never a surface for {@link RaycastManager.raycastSurface}. */
   onTop?: boolean;
+  /** Selects its owner but is never a `raycastSurface` surface (EnergyChain hull). */
+  pickOnly?: boolean;
 }
 
 /** Minimal event emitter interface to avoid circular dependency with RVViewer. */
@@ -214,6 +235,8 @@ export interface SurfaceHit {
    * the ray it picked with (no second, slightly different cursor ray).
    */
   ray?: { origin: Vector3; direction: Vector3 };
+  /** Optional, caller-owned: receives the world face normal (zero without a face). */
+  normal?: Vector3;
 }
 
 /** The part of an intersection hit resolution reads (a full `Intersection` satisfies it). */
@@ -302,6 +325,7 @@ export class RaycastManager {
   private _auxOwners = new WeakMap<Object3D, Object3D>();
   /** Aux targets registered `onTop` (see {@link AuxRaycastTargetOptions}). */
   private _auxOnTop = new Set<Object3D>();
+  private _auxPickOnly = new Set<Object3D>();
   private get _auxOnTopCount(): number { return this._auxOnTop.size; }
   /** Pluggable pick backend (instance pick index); null = chunk backend + targets only. */
   private _backend: RaycastBackend | null = null;
@@ -519,6 +543,8 @@ export class RaycastManager {
     this._auxOwners.set(mesh, owner);
     if (opts?.onTop) this._auxOnTop.add(mesh);
     else this._auxOnTop.delete(mesh);
+    if (opts?.pickOnly) this._auxPickOnly.add(mesh);
+    else this._auxPickOnly.delete(mesh);
   }
 
   /** Remove an auxiliary raycast target. Safe to call with an unregistered mesh. */
@@ -529,6 +555,7 @@ export class RaycastManager {
     if (j >= 0) this._targets.splice(j, 1);
     this._auxOwners.delete(mesh);
     this._auxOnTop.delete(mesh);
+    this._auxPickOnly.delete(mesh);
   }
 
   /**
@@ -773,11 +800,24 @@ export class RaycastManager {
    * Writes into the caller-owned `out` (no result allocation of its own; the
    * shared pipeline underneath still allocates — see plan-515 R2-7). Changes
    * no hover state.
+   *
+   * @param ignoreAllowFilter Skips ONLY the allow filter for this call — a
+   *   documented option of the one pipeline (contract-bake-picking rule 15).
+   *   Passed by measurement, annotation and the planner drag; never by
+   *   navigation, hover or click.
+   * @param includePickOnly Pick-only hulls count (planner drag: a chain's only geometry).
    */
-  raycastSurface(clientX: number, clientY: number, out: SurfaceHit): boolean {
+  raycastSurface(clientX: number, clientY: number, out: SurfaceHit, ignoreAllowFilter = false, includePickOnly = false): boolean {
     pointerToNDC(clientX, clientY, this.renderer.domElement, this.pointer);
     this.raycaster.setFromCamera(this.pointer, this.getCamera());
-    return this._surfaceFromCurrentRay(out);
+    if (!ignoreAllowFilter || !this._allowFilter) return this._surfaceFromCurrentRay(out, includePickOnly);
+    const allow = this._allowFilter;
+    this._allowFilter = null;
+    try {
+      return this._surfaceFromCurrentRay(out, includePickOnly);
+    } finally {
+      this._allowFilter = allow;
+    }
   }
 
   /**
@@ -819,7 +859,7 @@ export class RaycastManager {
     return false;
   }
 
-  private _surfaceFromCurrentRay(out: SurfaceHit): boolean {
+  private _surfaceFromCurrentRay(out: SurfaceHit, includePickOnly = false): boolean {
     if (out.ray) {
       out.ray.origin.copy(this.raycaster.ray.origin);
       out.ray.direction.copy(this.raycaster.ray.direction);
@@ -830,14 +870,15 @@ export class RaycastManager {
     for (let i = 0; i < hits.length; i++) {
       const hit = hits[i];
       if (this._isExcluded(hit.object)) continue;
-      // An on-top overlay (WebLabel billboard) is not a surface to orbit about.
-      if (this._auxOnTop.has(hit.object)) continue;
+      // On-top overlays (WebLabel billboard) and pick-only hulls are no surface.
+      if (this._auxOnTop.has(hit.object) || (!includePickOnly && this._auxPickOnly.has(hit.object))) continue;
       const resolved = this._resolveHit(hit);
       if (resolved === RAYCAST_BLOCKED) {
         out.point.copy(hit.point);
         out.distance = hit.distance;
         out.blocked = true;
         out.path = null;
+        if (out.normal) writeWorldNormal(hit, out.normal);
         if (this._metrics) this._reportPick(performance.now() - resolveStart, true);
         return true;
       }
@@ -846,6 +887,7 @@ export class RaycastManager {
       out.distance = hit.distance;
       out.blocked = false;
       out.path = resolved.nodePath;
+      if (out.normal) writeWorldNormal(hit, out.normal);
       if (this._metrics) this._reportPick(performance.now() - resolveStart, true);
       return true;
     }
@@ -1133,13 +1175,13 @@ export class RaycastManager {
       const b = this._extraBackends[i];
       if (!b.resolveHit) continue;
       const node = b.resolveHit(hit);
-      // Occluding but unpickable (plan-756 Q5) — no fall-through.
-      if (node === RAYCAST_BLOCKED) return RAYCAST_BLOCKED;
+      // Occluding but unpickable (plan-756 Q5) — no fall-through (see _blocks).
+      if (node === RAYCAST_BLOCKED) return this._blocks(hit.object);
       if (node) return this._resolveFromNode(node);
     }
     if (this._backend?.resolveHit) {
       const node = this._backend.resolveHit(hit);
-      if (node === RAYCAST_BLOCKED) return RAYCAST_BLOCKED;
+      if (node === RAYCAST_BLOCKED) return this._blocks(hit.object);
       if (node) return this._resolveFromNode(node);
     }
     const backendPath = this._backend?.resolvePath(hit.object);
@@ -1150,6 +1192,11 @@ export class RaycastManager {
     }
     // Not a backend mesh, not an aux target, not an MU pool: nothing answers.
     return null;
+  }
+
+  /** A blocker counts only inside the isolation (chunk and keep alike). */
+  private _blocks(obj: Object3D): typeof RAYCAST_BLOCKED | null {
+    return !this._isolationGate || this._isolationGate(obj) ? RAYCAST_BLOCKED : null;
   }
 
   /**

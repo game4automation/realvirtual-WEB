@@ -156,6 +156,9 @@ export class DESManager implements IDESManagerRef {
    */
   onTimeAdvance: ((time: number) => void) | null = null;
 
+  /** Installed only for cycle scenes; re-check motion started by a model action. */
+  onPostDispatch: (() => void) | null = null;
+
   /**
    * Additional time-advance listeners (plan-260 A2): fired with the SAME
    * once-per-distinct-event-time semantics as `onTimeAdvance`, AFTER it. The
@@ -334,10 +337,14 @@ export class DESManager implements IDESManagerRef {
   get rngVersion(): RngVersion { return this._rngVersion; }
   get rng(): RngStream { return this._rngVersion === 1 ? this._rng : this.stream('__manager__', 'default'); }
 
+  /** Interactive event participants may wait indefinitely for an external signal. */
+  restHold: (() => boolean) | null = null;
+
   get isComplete(): boolean {
     // MODEL events decide completion — pending warmup/checkpoint system events
     // never keeps a finished run alive (identical to a run without autosave).
     const t = this.nextModelEventTime;
+    if (t === Infinity && this._duration === Infinity && this.restHold?.()) return false;
     return t === Number.POSITIVE_INFINITY || t > this._duration;
   }
 
@@ -918,7 +925,10 @@ export class DESManager implements IDESManagerRef {
     // The boundary check includes SYSTEM events (warmup / checkpoint): with the batch budget
     // exhausted a pending one <= maxTime is not processed yet, so the run is not done and the
     // clock must not jump to the target past it.
-    const done = this.queue.peekTime > maxTime;
+    const resting = next === Infinity && this.restHold?.() === true
+      && (this.queue.peekTime === Infinity || this.queue.peekTime > maxTime);
+    const done = resting || this.queue.peekTime > maxTime;
+    if (resting && Number.isFinite(maxTime)) this._currentTime = Math.max(this._currentTime, maxTime);
     // An empty model queue ends at its last event, even if system events remain.
     // Otherwise the requested boundary (or the earlier duration) is exact.
     if (target !== Infinity && done && next !== Infinity) {
@@ -1413,6 +1423,7 @@ export class DESManager implements IDESManagerRef {
         if (this._retireAfterEvent.length > 0) this.flushRetirements();
       }
 
+      this.onPostDispatch?.();
       processed++;
       this._totalEventsProcessed++;
     }

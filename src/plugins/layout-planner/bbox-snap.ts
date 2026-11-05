@@ -186,12 +186,13 @@ const _SEED_POS = (() => {
 
 // ─── Neighbor-distance overlay (4-direction during drag) ──────────────
 
-/** Muted colour so the neighbor lines visually defer to snap guides. */
-const COLOR_NEIGHBOR = 0x9aa8b6;
+/** Dark slate: reads on the light floor (the old light grey 0x9aa8b6 was
+ *  barely visible) and still defers to the coloured snap guides. */
+const COLOR_NEIGHBOR = 0x2b3440;
 /** Slightly thicker than the snap line so the solid dimension reads clearly
  *  against the floor pattern without competing in colour intensity. */
 const NEIGHBOR_LINE_WIDTH_PX = 1.5;
-const NEIGHBOR_OPACITY = 0.9;
+const NEIGHBOR_OPACITY = 1;
 /** Perpendicular half-tick length at each endpoint (metres). Matches snap-guide ticks. */
 const NEIGHBOR_TICK_HALF_M = TICK_HALF_M;
 /**
@@ -427,6 +428,9 @@ export class BboxSnapController {
   private _neighborLabels: Record<NeighborDir, Sprite | null> = {
     xMinus: null, xPlus: null, zMinus: null, zPlus: null,
   };
+  /** Floor rectangle of the dragged bbox, drawn with the neighbor distances. */
+  private _footprint: LineSegments2 | null = null;
+  private readonly _footprintBuf = new Array<number>(24).fill(0);
   /** Reused 3-segment buffer for neighbor-line setPositions() (main + 2 ticks). */
   private readonly _neighborLineBuf = new Array<number>(18).fill(0);
   /** Reused position buffer for setPositions() (3 segments × 6 floats). */
@@ -566,13 +570,9 @@ export class BboxSnapController {
     // continue jittering with the raw pointer while the object visually
     // rests on a snap target.
     if (!this.deps.store.bboxSnapEnabled) {
-      // Snap disabled → no snap resolution to do; update neighbors directly
-      // against the raw position and bail.
-      if (this.deps.store.showNeighborDistances) {
-        this._updateNeighborDistances(movMinX, movMaxX, movMinZ, movMaxZ);
-      } else {
-        this._hideNeighbors();
-      }
+      // Magnetic snap off → no snap guides AND no neighbor distances: the
+      // distance overlay belongs to magnetic snap (its settings live there).
+      this._hideNeighbors();
       this._hideLines();
       return null;
     }
@@ -690,6 +690,13 @@ export class BboxSnapController {
   /** Permanent teardown — disposes line geometry/material. Call from plugin.dispose(). */
   dispose(): void {
     this.disarm();
+    if (this._footprint) {
+      this.deps.unmarkAsFixture(this._footprint);
+      this._footprint.parent?.remove(this._footprint);
+      this._footprint.geometry.dispose();
+      (this._footprint.material as LineMaterial).dispose();
+      this._footprint = null;
+    }
     if (this._xLine) {
       this.deps.unmarkAsFixture(this._xLine);
       this._xLine.parent?.remove(this._xLine);
@@ -765,7 +772,32 @@ export class BboxSnapController {
     if (which === 'z' && this._zLine) this._zLine.visible = false;
   }
 
+  /** The dragged bbox's bottom rectangle on the floor — same thin line as the
+   *  neighbor distances, shown and hidden with them. */
+  private _drawFootprint(minX: number, maxX: number, minZ: number, maxZ: number): void {
+    if (!this._footprint) {
+      this._footprint = makeNeighborLine();
+      this._footprint.name = '_layoutFootprint';
+      this.deps.scene.add(this._footprint);
+      this.deps.markAsFixture(this._footprint);
+    }
+    const y = FLOOR_LIFT_M;
+    const b = this._footprintBuf;
+    let i = 0;
+    const seg = (ax: number, az: number, bx: number, bz: number): void => {
+      b[i++] = ax; b[i++] = y; b[i++] = az; b[i++] = bx; b[i++] = y; b[i++] = bz;
+    };
+    seg(minX, minZ, maxX, minZ);
+    seg(maxX, minZ, maxX, maxZ);
+    seg(maxX, maxZ, minX, maxZ);
+    seg(minX, maxZ, minX, minZ);
+    this._footprint.geometry.setPositions(b);
+    this._syncLineResolution(this._footprint);
+    this._footprint.visible = true;
+  }
+
   private _hideNeighbors(): void {
+    if (this._footprint) this._footprint.visible = false;
     for (const dir of NEIGHBOR_DIRS) {
       const ln = this._neighborLines[dir];
       const lb = this._neighborLabels[dir];
@@ -811,6 +843,7 @@ export class BboxSnapController {
     mMinX: number, mMaxX: number,
     mMinZ: number, mMaxZ: number,
   ): void {
+    this._drawFootprint(mMinX, mMaxX, mMinZ, mMaxZ);
     // Convert the configured max from mm to metres once (world space).
     const maxDistM = this.deps.store.neighborDistanceMaxMm / 1000;
 

@@ -73,6 +73,31 @@ export const problemsList: CommandImpl<ProblemsListArgs> = {
   run: (_ctx, args) => filterProblems(getProblems(), args),
 };
 
+export interface ProblemsAckArgs { id?: string; code?: string }
+/**
+ * `problems.ack` — what closing the Problems panel does: the entries are acknowledged and do not
+ * open the panel again until they change. With `id` (exact) or `code` (prefix, as `problems.list`)
+ * only the matching entries; the panel closes once nothing unacknowledged is left (`hasNews`).
+ */
+export const problemsAck: CommandImpl<ProblemsAckArgs> = {
+  enabled: () => true,
+  run: async (_ctx, args) => {
+    const { id, code } = args ?? {};
+    if (id != null && typeof id !== 'string') throw new CommandError('id must be a string');
+    if (code != null && typeof code !== 'string') throw new CommandError('code must be a string');
+    const panel = await import('../hmi/ProblemsPanel');
+    const all = getProblems();
+    const hit = all.filter(p => (id == null || p.id === id) && (code == null || p.code.startsWith(code)));
+    if ((id != null || code != null) && hit.length === 0) {
+      throw new CommandError('No problem matches', { id, code, ids: all.map(p => p.id).slice(0, 50) });
+    }
+    panel.acknowledgeProblems(hit);
+    const closed = !panel.hasNews();
+    if (closed) panel.setProblemsPanelOpen(false);
+    return { acknowledged: hit.map(p => p.id), closed };
+  },
+};
+
 /** Reader for a viewer without a signal store: every vehicle falls back to its handle. */
 const NO_SIGNALS = { get: () => undefined };
 

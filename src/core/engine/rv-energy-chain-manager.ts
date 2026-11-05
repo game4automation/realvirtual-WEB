@@ -5,6 +5,7 @@ import type { Object3D } from 'three';
 import type { RVEnergyChain } from './rv-energy-chain';
 
 const DEV_WARNING_THRESHOLD = 50;
+const PICK_ONLY = { pickOnly: true } as const;
 
 /**
  * The slice of `RVRaycastManager` the chains need. Structural, not imported —
@@ -12,7 +13,7 @@ const DEV_WARNING_THRESHOLD = 50;
  * import would close a cycle.
  */
 export interface ChainRaycastHost {
-  addAuxRaycastTarget(mesh: Object3D, owner: Object3D): void;
+  addAuxRaycastTarget(mesh: Object3D, owner: Object3D, opts?: { pickOnly?: boolean }): void;
   removeAuxRaycastTarget(mesh: Object3D): void;
 }
 
@@ -46,13 +47,13 @@ export class EnergyChainManager {
     if (!host) return;
     for (const chain of this._chains) {
       const proxy = chain.pickProxy;
-      if (proxy) host.addAuxRaycastTarget(proxy, chain.node);
+      if (proxy) host.addAuxRaycastTarget(proxy, chain.node, PICK_ONLY);
     }
   }
 
   /** Register a chain's picking hull, resolving hits back to the chain node. */
   registerProxy(proxy: Object3D, owner: Object3D): void {
-    this._raycastHost?.addAuxRaycastTarget(proxy, owner);
+    this._raycastHost?.addAuxRaycastTarget(proxy, owner, PICK_ONLY);
   }
 
   /** Drop a picking hull (chain re-rigged or disposed). */

@@ -534,12 +534,16 @@ export class RVDropManager implements DropDetectionRegistrar {
   }
 
   /**
-   * Acknowledge ONE report (the card's OK). A part that is still unsupported is
-   * reported again on the very next tick — same contract as the collision card.
-   * Unknown keys are a no-op.
+   * Acknowledge ONE report (the card's OK): the reported part is removed (Thomas
+   * 2026-11-04) through the sink path of `DeleteUnsupported` — step 7 of the
+   * transport tick disposes it, never here. A part already gone just clears its
+   * card. Unknown keys are a no-op.
    */
   acknowledge(muKey: string): void {
-    if (!this._active.delete(muKey)) return;
+    const drop = this._active.get(muKey);
+    if (!drop) return;
+    this._active.delete(muKey);
+    if (drop.mu) drop.mu.markedForRemoval = true;
     this._rebuildHighlightRoots();
     this._applyHighlight();
     this._publish();

@@ -42,7 +42,7 @@ npm run tutorial:run -- --script scripts/tutorial/storyboards/demo-basics.json \
 ```
 node scripts/tutorial/run.mjs --script <storyboard.json>
   [--dir <output folder>] [--dist <folder>] [--port 5199] [--base <url>] [--overwrite]
-  [--ffmpeg <path>] [--ffprobe <path>] [--gpu-check require|off] [--motion-check require|off]
+  [--ffmpeg <path>] [--ffprobe <path>] [--gpu-check require|off] [--motion-check require|warn|off]
   [--keep-temp] [--epoch-zero-diagnosis] [--burn-cursor] [--stamp proof|inline]
 ```
 
@@ -56,7 +56,7 @@ node scripts/tutorial/run.mjs --script <storyboard.json>
 | `--overwrite` | Replace an existing set. The old set is first moved aside into `<temp>/replaced/`, so an interrupted publication can never leave a new video next to an old trace. |
 | `--ffmpeg` / `--ffprobe` | The encoders. Resolution: `--ffmpeg` > `RV_FFMPEG` > `RV_REMOTION_ROOT` > upward search from the WebViewer repo for `node_modules/@remotion/compositor-*/ffmpeg(.exe)`; `--ffprobe` > `RV_FFPROBE` > next to that ffmpeg. **The upward search does not carry on the dev machines** — `E:/remotion` is a sibling of the workspace — so pass both paths (or set `RV_REMOTION_ROOT`). Without them the run is Exit 2 before anything happens. |
 | `--gpu-check` | `require` (default): no WebGL context, or a software renderer (SwiftShader, llvmpipe) → Exit 1. `off` exists for the canvas-less E2E fixture only. |
-| `--motion-check` | `require` (default). `off` is accepted **only** with `--gpu-check off` **and** a page without a WebGL canvas; anything else is Exit 2 `motion-check-off-with-viewer`. It is never a production switch. |
+| `--motion-check` | `require` (default). `warn`: the policy of every step WITHOUT its own `motion` becomes `warn` (a standing step is reported, not fatal); an explicit `motion: "require"` stays red (plan-2240). `off` is accepted **only** with `--gpu-check off` **and** a page without a WebGL canvas; anything else is Exit 2 `motion-check-off-with-viewer`. It is never a production switch. |
 | `--keep-temp` | Keep the run's temp folder after a successful publication. |
 | `--stamp` | `proof` or `inline`; overrides the storyboard's `stamp` (default `proof`). Anything else is Exit 2 `usage`. |
 | `--epoch-zero-diagnosis` | A measuring mode that **never publishes**: forces virtual-clock epoch 0, records 40 frames anyway, runs Gate C as a measurement (no threshold assertion) and ends with Exit 1 `virtual-clock-epoch`. Needs a viewer (else Exit 2 `epoch-zero-diagnosis-needs-viewer`). The measurement is in the temp folder (`run.log`: `motion`, `motionMadSequence`; `events-failed.json` with `motion`). |
@@ -122,9 +122,11 @@ cut can shorten it without guessing where the AI work started or ended.
    skipped and the log says `skipped-no-viewer`. With `start: running` (default), the simulation
    must be running during this preflight. With `start: paused`, setup must leave the viewer
    paused (else Exit 1 `setup-not-paused`); preflight checks only a positive, finite epoch and a
-   finite, monotonic clock that never falls below it. Simulation progress is checked after the
-   recorded start, using the DES factor at that start: the multiplier in `hybrid`, 1 in `animated`.
-   Expected progress is `factor * frames / fps`, with tolerance `factor / 60 + 1e-4 s`.
+   finite, monotonic clock that never falls below it. **DES (plan-2237 F6):** the preflight reads
+   `sim.clock.get` and measures the DES **render clock** (the DES `simTime` is the event time and
+   stays at 0 for the first frames after Play — a running DES start used to measure 0 s), against
+   `factor · frames / fps` with the factor read from the state. Simulation progress during the take
+   is the segment gate (below), for every start mode.
 5. **Frame clock.** Per frame: due inputs via CDP → `__vt.step(1000/fps)` →
    `Page.captureScreenshot` (JPEG q95) → ffmpeg. Clicks are `down` + `up` in the **same** frame;
    a click never falls into a held drag. Exactly one pointer sample per frame. Before a click the
@@ -133,6 +135,15 @@ cut can shorten it without guessing where the AI work started or ended.
    (`force: true`) because its stability check waits for `requestAnimationFrame`, which only fires
    inside `__vt.step()` — a deadlock under the virtual clock; the own hit test stays.
    Dynamic node and recording targets are re-projected at the click-frame boundary.
+   **Clock reading (plan-2237):** right after every step the runner reads `sim.clock.get` (mode,
+   pause, `simTime`, `fixedStepCount`, the effective factor, the DES render clock and its clamp
+   counters) — the input of the segment gate. **Creep carry (F1):** `performance.now()` creeps by
+   0.5 µs per call so two readings in one frame never divide by zero; `step(dt)` absorbs that creep
+   (`creep = max(0, creep − dt)`). Without it the page ran one fixed step ahead every 175–265 frames
+   (the old ~16 s limit of a take); a hard reset instead would move `performance.now()` backwards
+   after a long fast-forward (measured −29 ms). `wallEnd` folds the creep a time-lapse piled up into `vt`
+   (no step absorbs it in wall mode); as a carry it stalled page time for several frames after a
+   time-lapse (acceptance probe 2026-11-05: four frames without a fixed step).
 6. **Markers and stamp.** A magenta full-area marker for `framesOf(0.2, fps)` frames after a lead
    of `framesOf(0.1, fps)` frames at the start, and again before a tail of `framesOf(0.1, fps)` at
    the end. A 16-bit frame stamp (`320x20` px, top left, LSB first, white = 1) counts the frames.
@@ -151,6 +162,31 @@ cut can shorten it without guessing where the AI work started or ended.
    - Rejected (plan-2043): a stamp band below the app via `captureBeyondViewport`. Chrome sporadically
      reported a transient **1x1** window inside such a capture and the app reacted visibly (a panel jumped
      for the rest of the take) — no resize shield could hide it.
+7. **Time-lapse (plan-2237 F8, Phase 2).** A `command` action with `timelapse: { fps, maxWallSec }`
+   leaves the virtual clock while the command runs (an experiment batch that takes minutes of wall
+   time): `__vt.wallBegin({ pumpMs: 16 })` lets page time follow the wall clock, a real 16-ms pump
+   fires timers and animation frames. The command is dispatched INSIDE wall mode, as its first act (spike
+   order): under the virtual clock `performance.now()` barely moves, so a batch sliced by
+   `performance.now()` deadlines ran to its end in one chunk before a time-lapse could show it
+   (measured: a 3-s batch, one frame). A command already complete right after its dispatch leaves wall
+   mode with no frame. Every `1000/fps` wall ms the runner holds the pump
+   (`wallHold(true)`), counts one output frame with `markFrame(flush)` (page time to the wall
+   instant, due timers and rAF run — the stamp is painted in rAF, so without the flush every stamp is
+   one frame old), grabs A, B (`--burn-cursor`) and P (stamp proof) of that same frame, then releases
+   the pump. A frame counts only after the complete sequence; a grab slower than `2 · 1000/fps` ms
+   re-grabs the same frame once, a second miss is Exit 1 `timelapse-grab-timeout` — never a duplicate.
+   A slot passed while a frame was grabbed is dropped and counted (`droppedSlots`). The section ends
+   when the command completes or after `maxWallSec`; still running then → `experiment.run.cancel`
+   and Exit 1 `timelapse-timeout`. `maxWallSec` is an absolute deadline from `wallBegin`: the command
+   is polled every 20 ms while the section waits for its next slot; no frame starts at or after the
+   deadline, but when the next slot lies beyond it the section keeps waiting for the completion up to
+   the deadline itself; every grab gets at most the time left (a grab miss caused by the deadline is
+   `timelapse-timeout`, not `timelapse-grab-timeout`); a completion first seen at or after the
+   deadline is `timelapse-timeout` too — always with the cancel. Each re-grab starts
+   from a clean page (cursor hidden, proof stamp hidden), so a B or P grab that timed out never
+   leaks into the re-grabbed A. `wallEnd()` always runs (`finally`); page time keeps the
+   wall-advanced value, so the return to stepping is monotone. The video plays the grabbed frames at
+   the take's fps — a time-lapse.
 
 ### The storyboard (`rv-tutorial/1`)
 
@@ -167,9 +203,11 @@ cut can shorten it without guessing where the AI work started or ended.
   "minStepSec": 2,                     // s, lower bound of a step
   "motionRegion": { "x": 760, "y": 500, "w": 400, "h": 400 },  // video px, Gate C region
   "stamp": "proof",                    // "proof" (default): stamp in stamp-proof.mp4; "inline": in the app corner
+  "storage": { "rv-problems-acked": "[]" },  // localStorage seeds, `rv-` keys only (plan-2240)
+  "storageOverride": false,            // true: `storage` may overwrite a recorder seed
   "setup": [ /* actions, not recorded */ ],
   "steps": [
-    { "id": "open-demo", "holdSec": 3, "tailSec": 0.4, "zoom": "auto", "actions": [ /* … */ ] }
+    { "id": "open-demo", "holdSec": 3, "tailSec": 0.4, "zoom": "auto", "motion": "require", "actions": [ /* … */ ] }
   ]
 }
 ```
@@ -181,7 +219,8 @@ Actions: `click` / `doubleClick` / `hover` (`target`: `{ selector }` or `{ x, y 
 `timeoutMs` = 60000), `wait` (`ms`), `camera` (`position`, `target` as `[x, y, z]`,
 `durationSec` = 0.6 — a scripted flight via `viewer.animateCameraTo` with viewer-native `Vector3`s,
 exactly `framesOf(durationSec, fps)` frames long, then `isCameraAnimating` must be false, else
-Exit 1 `camera-animation-not-finished`). **Zoom is a `camera` action**, not the wheel.
+Exit 1 `camera-animation-not-finished`; the flight itself is started 1 ms short so it ends inside its
+last frame — since the creep carry, page time no longer runs ahead and the exact length was a knife edge). **Zoom is a `camera` action**, not the wheel.
 `zoom` on a step is only written through for the cut. `voice` / `say` (plan-676) are tolerated and
 ignored. All defaults are declared schema defaults, not measurements.
 
@@ -192,7 +231,19 @@ ignored. All defaults are declared schema defaults, not measurements.
   Completion is observed through `onExecuted`; if the storyboard supplies `args`, click execution
   checks them against the executed args (Exit 1 `command-args-mismatch`). Direct execution calls
   the recording seam. `waitSec` is the settling wait; `maxWaitSec` bounds command completion.
-  `des.fastForward` with `args.untilSimTime` is allowed only in `setup`.
+  `des.fastForward` with `args.untilSimTime` is allowed in the take too (plan-2237 F7): it is a
+  transition of the segment gate, and the paused frames after it are a hold segment.
+  **`timelapse: { fps, maxWallSec }`** (plan-2237 F8, `fps` 2..8, steps only — not in `setup`)
+  records the command as a time-lapse (see *How a take is made*, 7). During the time-lapse
+  `maxWallSec` is the wait budget and wins over `maxWaitSec`; an explicit `maxWaitSec` below
+  `maxWallSec` is a schema error. `waitSec` runs after the time-lapse in video frames. A command the
+  build does not have (`unavailable`) is Exit 1 `command-unavailable` naming it; in a Community
+  build that is every `des.checkpoint.*`, `experiment.*` and `snapshot.*` command (Commercial,
+  F9; measured on a `VITE_PUBLIC_BUILD=1` dist: `kind: 'commercial-feature'`), on the direct and the
+  click path alike. Before a click-dispatched command looks for its button the recorder asks the
+  registry, read-only (`__rvRecording.commandState`): an unregistered command is
+  `command-unavailable` at once; a missing or disabled button of a command the registry does not
+  enable is `command-unavailable` (Commercial families, with the hint) or `command-disabled`.
 - `pick`: `rule: 'moving-vehicle'`, `among` (path glob), `as` (binding name), `sampleSec` = 0.3.
   Only nodes carrying an `Agv` or `AgvBehavior` component qualify, not their children or MUs.
   The greatest displacement wins, with path order breaking ties; no moving match gives Exit 1
@@ -206,6 +257,32 @@ or `paused`; it declares the expected setup state, rather than pausing the viewe
 
 Each step is held live until `start + framesOf(holdSec) + framesOf(tailSec)` (at least until its
 last action has finished, at least `framesOf(minStepSec)`); the remainder is a `hold` segment.
+
+Step and storyboard options of plan-2240:
+
+- `step.motion`: `"require"` | `"warn"` | `"off"` — the step's Gate C policy (below). The schema
+  does **not** default it: an absent value follows CLI `--motion-check`, an explicit one wins over
+  it. Effective policy per step: explicit step value > `--motion-check warn` > `require`. A
+  storyboard whose steps are all `"off"` is refused (Exit 2 `configuration-error`).
+- `storage`: `{ "rv-…": "…" }`, written to `localStorage` before every document of the take. Only
+  keys starting with `rv-`. Order in the init script: the recorder's fixed seeds
+  (`rv-terms-accepted`, `rv-connect-autoconnect-optout`, `rv-auto-quality-applied`,
+  `rv-welcome-dismissed`), then the panel cleanup (`rv-panel-geo:*`, `rv-panel-collapsed:*`), then
+  `storage` — so an explicit `rv-panel-geo:<id>` entry survives. Overwriting a fixed seed needs
+  `storageOverride: true`, otherwise the storyboard is refused.
+- Target `offset`: `{ "selector": "…", "offset": { "dx": 0, "dy": 0 } }` — CSS pixels from the
+  element's centre, for `click`, `doubleClick`, `hover`, `drag` (`from` and `to`), `wheel` and
+  `type`, in setup **and** in the take (one shared target resolution). Visibility and covering are
+  checked at the offset point: it must lie in the viewport, and the topmost element there must be
+  the target, inside it, or an ancestor of it (a point beside a label is fine, a layer over it is
+  Exit 1 `step-error` "covered at its offset point"). Setup `drag` accepts every target kind at
+  both ends, absolute `{ x, y }` included (a window grip by coordinates).
+
+The recorder opens the page with `?recording=1` — the viewer's recording mode: no toolbar
+tooltips, no Problems panel that opens by itself and no startup dialog that opens by itself
+(manual opening still works; see `doc-webviewer.md` → URL parameters). With `welcome: "show"` it
+also adds `recordingWelcome=1`, so the welcome dialog still opens itself and
+`ready: "#welcome-title"` keeps working.
 
 ### The event trace (`rv-tutorial-events/1`)
 
@@ -221,7 +298,12 @@ bounds frame numbers (`end` exclusive).
   clicked.
 - `keys[]`: `{ t, key, kind: 'press' | 'type' }`.
 - `segments[]`: the **global run segment list**, covering `[0; frames)` without a hole:
-  `{ kind: 'action' | 'command' | 'wait' | 'hold' | 'marker', start, end, stepId, actionIndex?, target?, approach? }`.
+  `{ kind: 'action' | 'command' | 'wait' | 'hold' | 'marker' | 'timelapse', start, end, stepId, actionIndex?, target?, approach? }`.
+  A time-lapse command is THREE disjoint, gapless segments with the same `stepId` and
+  `actionIndex`: `command` (the pointer approach), `timelapse` (from the dispatch on) (`cmd`, `wallFps`, `wallMs[]` — the
+  wall ms since `wallBegin` of every output frame —, `droppedSlots`), `command` (the rest); an empty
+  one is dropped: a direct dispatch has no approach segment, a command that completes at once no
+  `timelapse` segment.
   `marker` ⇔ `stepId === null` (the start window `[0; onset + framesOf(0.2))` and the end window
   `[onset; frames)`, lead and tail included). Segments of a step:
   `segments.filter(s => s.stepId === id)`.
@@ -229,10 +311,28 @@ bounds frame numbers (`end` exclusive).
   segments by Gate A.
 - `sync`: two marker records (`start`, `end`: `onsetFrame`, `expectedFrame`, `offsetFrames`) and
   `driftFrames`.
-- `motion`: Gate C (below), a discriminated union on `verdict`.
+- `motion`: Gate C (below), a discriminated union on `verdict`. Since plan-2240 the measured
+  variant also carries `perStep[]` (additive): `{ stepId, policy, source: 'step' | 'cli' | 'default',
+  start, end, pairs, movedFrames?, movedFraction?, longestStillFrames?, verdict: 'ok' | 'fail' |
+  'warn' | 'skipped', reason?: 'too-short' | 'motion-below-threshold' }`. The whole-take fields
+  (`frames`, `movedFrames`, `movedFraction`, `longestStillFrames`, `verdict`) are unchanged and stay
+  the measurement over the whole video; the gate decision is `perStep`.
 - `frameCheck`: Gate A (`frames`, `probedFrames`, `stampsContiguous`, `traceContiguous`,
   `traceStepBoundsOk`, `traceFirstStart`, `traceLastEnd`, `budget` — reported only —,
-  `waitForActualFrames`, `verdict`).
+  `waitForActualFrames`, `verdict`). The budget counts a time-lapse with at most
+  `ceil(maxWallSec · fps)` output frames; dropped slots are no frames.
+- `simJumps[]` (plan-2237, viewer takes only): `{ frame, cmd, fromSim, toSim }` — one per transition
+  in which the tempo clock jumped (`Δclock < 0` or `|Δclock| > max(1,f)·(ΔfixedStepCount+1)/60`):
+  a fast-forward, a checkpoint/snapshot load (backwards), a DES step, a reset.
+- `simProgress` (plan-2237): `{ verdict, segments[] }` with `{ index, startFrame, endFrame,
+  kind: 'run' | 'hold' | 'jump' | 'timelapse' | 'short', factor, clock: 'simTime' | 'renderClock',
+  i1, i2, verdict: 'pass' | 'fail' | 'clamped' | 'short' | 'skipped', clampedAt?, cmd? }`. The full
+  report (plus `factor`/`clock` of the first run segment and the per-frame `clockSeries`) is
+  `summary.simProgress` in `run.log`. It keeps the fields of the report before plan-2237, now over
+  the first judged run segment (null without one): `sumSimTime` (clock advance), `expectedSimTime`
+  (`factor · frames / fps`), `deviation` (their distance) and `tolerance` (one fixed step at the
+  factor plus the I2 allowance); `windowFrames` is the take's frame count − 1. Judged segments also
+  carry `frames`, `sumClock` and `sumSteps`.
 
 ### Canonical frame conversion
 
@@ -262,10 +362,44 @@ vector in `tests/tutorial-events.node.test.ts` is the coupling.
   `mad = Σ|cur − prev| / 64`; a frame pair counts as moved at `mad ≥ 0.5` (on the 0…255 scale — on
   a 0..1 scale the same constant would fail every run); `movedFraction = movedFrames / (frames − 1)`
   must be **≥ 0.10**, else Exit 1 `motion-below-threshold`. `longestStillFrames` is reported, not
-  gated. The demo scene moves little on its own (24 % moved frames, 45 s longest still stretch) —
+  gated. **Per step (plan-2240):** the threshold is applied to each step on its own, over the frame
+  pairs inside the step (`[start; end − 1)`; a pair across a step boundary belongs to no step), so a
+  moving neighbour never hides a standing step. `require`: red below 0.10; `warn`: a warning on
+  stderr and in `perStep`, no exit code; `off`: not evaluated. A step without any pair (one frame
+  long) is `too-short`: red for `require`, a warning for `warn`. There is no global warn bypass any
+  more: an explicit `require` step is red under `--motion-check warn` too. `--motion-check off`
+  stays the separate canvas-less fixture path (no Gate C at all, only with `--gpu-check off`). The demo scene moves little on its own (24 % moved frames, 45 s longest still stretch) —
   **the storyboard has to bring the motion** (camera flights, orbits). The control frame
   `motion-control.jpg` must differ from black by `mad ≥ 0.5`, else Exit 1 `decoder-blank` (a decoder
   once produced black frames with exit code 0).
+
+- **Sim-progress gate (plan-2237), before the encoders finish.** Viewer takes only (not `start:
+  editor`). The take is cut into segments by the clock state read every frame from `sim.clock.get`
+  (`mode | paused | factor | subMode`): a segment ends BEFORE every time command (`des.setMode`,
+  `des.fastForward`, `des.checkpoint.load`, `des.step`, `snapshot.load`, `experiment.snapshot.load`,
+  `sim.reset`, `sim.speedOverride`, `sim.playPause`) and at every state change, also one from a UI
+  click. Time commands are seen through a take-wide watch of the registry (`armTimeWatch`:
+  dispatch start and completion, whoever dispatched — a command action, a plain click on a button, a
+  shortcut), so a UI reset or a UI `des.step` is a transition too. **Transitions** — a time command's
+  dispatch frame up to its completion plus one frame
+  (`des.checkpoint.load` lands 3 frames after dispatch), a state-change frame, a time-lapse and the
+  first frame after it — are not judged; a jump in them goes to `simJumps`; the next segment rebases
+  on the sample before its first frame. The tempo clock is `simTime` (continuous) or the DES render
+  clock. Per segment, **cumulatively over every prefix k, never reset per block**: run →
+  **I1** `|ΣΔfixedStepCount − (60/fps)·k| ≤ 1` and **I2** `|ΣΔclock − ΣΔfixedStepCount·f/60| ≤ 1e-6 s·k`;
+  hold (paused, DES `step`, factor 0) → the clock must not move; DES `fastforward` (factor null) →
+  `jump`, skipped; fewer than 3 frames → `short` (reported, not red). The factor comes from the
+  STATE — the speed override in [0, 100], DES `animated` 1, `hybrid` max(1, multiplier) — never
+  from the observed rate (that would be circular). **DES clamps** count only with positive proof:
+  `sim.clock.get` reports `des.clampedAt` and monotonic `des.clampCounts` set by the runner's
+  `_advanceTimed` exactly when it pulls the render clock back to the event clock (`budget`) or holds
+  it at the end time (`end`). A frame whose counters grew is `clamped` (not judged, the next segment
+  rebases, so no deficit stays in the sum); `end` keeps the following frames clamped until the next
+  state change. Equal clocks alone are never a clamp. Measured on the spike traces: the creep-carry
+  takes are green; the clock without carry is red at frame 419; a steady loss of one step per 130
+  frames, a 0.97x tempo and one step per 20 frames are red. Exit 1 `sim-progress`;
+  `sim-clock-unavailable` when the page has no `sim.clock.get`; `paused-never-started` when a
+  `start: paused` take never resumes.
 
 ## Contact sheet
 
@@ -293,7 +427,9 @@ path is in the error message. A rerun always starts from scratch.
   `motion-below-threshold`, `decoder-blank`, `ffmpeg-failed`, `server-not-ready`,
   `camera-animation-not-finished`, `trace-not-contiguous`, `publish-incomplete`, `aborted`,
   `command-button-missing`, `command-button-ambiguous`, `command-args-mismatch`, `pick-no-match`,
-  `setup-not-paused`.
+  `setup-not-paused`, `paused-never-started`, `sim-progress`, `sim-clock-unavailable`,
+  `command-failed`, `command-timeout`, `command-unavailable`, `command-disabled`, `timelapse-timeout`,
+  `timelapse-grab-timeout`, `timelapse-frame-mismatch`.
 - **Exit 2** — `usage`, `configuration-error` (missing dist or encoders, an existing set without
   `--overwrite`, no free port), `motion-check-off-with-viewer`, `dir-outside-repo`,
   `epoch-zero-diagnosis-needs-viewer`, `connect-live-needs-base`.
@@ -328,6 +464,16 @@ instead of leaving them alive.
   criteria (2700/2700 frames, gap 0 ms, drift 0 frames, 24/24 clicks at offset exactly 0). CDP
   screencast and `recordVideo` are not used.
 - Momentary push-buttons (operator panels) are not measured; there is no "hold key" action yet.
+- **Time-lapse is wall-clock time, not deterministic.** Two takes of the same batch get different
+  frame counts and dropped slots; only the time-lapse section differs, the rest of the take keeps the
+  virtual clock. The pump hold keeps the 3D view atomic between grabs A and P, but React commits
+  through `MessageChannel` are not held: one of 23 measured frames had a DOM change between A and B.
+  The plan's preferred cursor track B "A plus a composited cursor" is not possible with the stripped
+  ffmpeg (no `overlay` filter, see *Instrument findings*), so B is still grabbed with the DOM cursor
+  and may differ from A by such a commit — a known gap of `--burn-cursor` during a time-lapse only.
+- The time-lapse stamps are checked by Gate A from the decoded proof track like every other frame.
+  The 100-ms clamp of the viewer loop during the held grab gaps (up to ~110 ms measured) is not
+  measured; it lies inside the unjudged time-lapse window.
 
 ## `--burn-cursor`
 

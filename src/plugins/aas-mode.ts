@@ -36,6 +36,10 @@ import type { AasIndexEntry } from '../core/aas/rv-aas-source';
 import { AasModeBadges } from './aas-mode-badges';
 import { tooltipStore } from '../core/hmi/tooltip/tooltip-store';
 
+/** Authoring modes without the AAS mode (Thomas 2026-11-04): its button is hidden there and
+ *  entering one switches the mode off, so no AAS-only pick filter outlives its button. */
+const NO_AAS_MODE_IN: ReadonlySet<string> = new Set(['editor', 'planner', 'des']);
+
 /** Snapshot read by the AAS button (useSyncExternalStore). */
 export interface AasModeState {
   on: boolean;
@@ -91,7 +95,7 @@ export class AasModeController {
     };
     on('layout-content-added', () => this._onSceneChanged());
     on('layout-content-removed', () => this._onSceneChanged());
-    on('mode-changed', (e: { to?: string }) => { if (e?.to === 'editor') this.setOn(false); });
+    on('mode-changed', (e: { to?: string }) => { if (e?.to && NO_AAS_MODE_IN.has(e.to)) this.setOn(false); });
     this._refreshCount();
     this._state = { on: false, count: this._nodes.length };
   }
@@ -116,12 +120,12 @@ export class AasModeController {
 
   // ── Switching ──────────────────────────────────────────────────────
 
-  /** Switch the mode on or off. Ignored (stays off) without any AAS part or in the editor. */
+  /** Switch the mode on or off. Ignored (stays off) without any AAS part or in an authoring mode. */
   setOn(on: boolean): void {
     if (on === this._on) return;
     if (on) {
       this._refreshCount();
-      if (this._nodes.length === 0 || this.viewer.modes?.activeMode === 'editor') { this._emit(); return; }
+      if (this._nodes.length === 0 || NO_AAS_MODE_IN.has(this.viewer.modes?.activeMode ?? '')) { this._emit(); return; }
       this._on = true;
       this._apply();
       this._installPickFilter();

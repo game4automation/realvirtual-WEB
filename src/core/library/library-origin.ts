@@ -26,6 +26,9 @@
  *    realvirtual library project first; any other stored pair is asked first,
  *    as the pre-778 resolver did, and is never required to match.
  *
+ * plan-780: every stored reference resolves through {@link resolveDocumentRef}
+ * in the scope of the document it is written in (hit / pending / missing).
+ *
  * {@link entryOriginOf} is the authoring half: the qualifier a NEW placement
  * stores, read off the catalog entry it was made from (`libraryOrigin`, stamped
  * by the library-projects provider). Every placement-creation site goes
@@ -35,9 +38,11 @@
 import type { LibraryCatalogEntry } from './library-types';
 import {
   getLibrarySource,
+  hasPendingLibrarySources,
   isLibrarySourcePending,
   listLibrarySources,
   subscribeLibrarySources,
+  whenLibrarySourcesSettled,
   type LibrarySource,
   type RegisteredLibrarySource,
 } from './library-source-registry';
@@ -113,6 +118,51 @@ export function originFields(origin: Pick<LibraryOrigin, 'providerId' | 'sourceI
   return origin.providerId && origin.sourceId ? { providerId: origin.providerId, sourceId: origin.sourceId } : {};
 }
 
+/** plan-780 R7: UI-state key of an entry, library-qualified — two libraries may share a document id. */
+export function entryKeyOf(entry: Pick<LibraryCatalogEntry, 'id' | 'libraryOrigin'>): string {
+  const o = entry.libraryOrigin;
+  return o && o.providerId && o.sourceId ? `${o.providerId}/${o.sourceId}/${entry.id}` : entry.id;
+}
+
+/** {@link originInScope}'s answer; `warning` goes to a Problems row. */
+export interface ScopedOrigin extends LibraryOrigin {
+  warning?: string;
+}
+
+/**
+ * plan-780 A1/A2: the origin a new placement from `entry` stores in a document of
+ * `scope` (contract documents-projects 4). Own library → unqualified (A2); other
+ * library or open project A → qualified, warning when B does not list it (A1).
+ */
+export function originInScope(
+  entry: Pick<LibraryCatalogEntry, 'id' | 'libraryOrigin'> | null | undefined,
+  scope: DocumentScope,
+  deps: { openProjectId?: string | null; libraryLists?: (libraryId: string, projectId: string) => boolean | null } = {},
+): ScopedOrigin {
+  const origin = entryOriginOf(entry);
+  if (!scope) return origin;
+  const lists = (x: string): boolean | null => deps.libraryLists?.(scope.sourceId, x) ?? null;
+  if (origin.providerId === scope.providerId && origin.sourceId === scope.sourceId) return { assetId: origin.assetId };
+  if (origin.providerId && origin.sourceId) {
+    if (origin.sourceId !== REALVIRTUAL_LIBRARY_PROJECT_ID && lists(origin.sourceId) === false) {
+      return { ...origin, warning: `"${origin.assetId}" comes from library '${origin.sourceId}', which library '${scope.sourceId}' does not list — it resolves only where both are attached.` };
+    }
+    return origin;
+  }
+  const openId = deps.openProjectId ?? null;
+  const isOpenProjects = !!entry && !!openId && safeSources().some(({ providerId, source }) => {
+    if (providerId !== OPEN_PROJECT_PROVIDER_ID || source.id !== openId) return false;
+    try { return source.getEntry(entry.id) !== null; } catch { return false; }
+  });
+  if (!isOpenProjects || !openId) return origin;
+  const qualified: ScopedOrigin = { assetId: origin.assetId, providerId: LIBRARY_PROJECTS_PROVIDER_ID, sourceId: openId };
+  if (lists(openId) !== true) {
+    qualified.warning = `"${origin.assetId}" is a document of the open project '${openId}', which library '${scope.sourceId}' does not list — the library cannot resolve it on its own.`;
+  }
+  return qualified;
+}
+
+
 // ─── Qualifier ──────────────────────────────────────────────────────────
 
 /** A reference's qualifier fields. */
@@ -132,7 +182,11 @@ export type QualifiedSourceState = 'ready' | 'pending' | 'unavailable';
 /** The state of the ONE source a qualified reference names. `unavailable` = not registered, locked, unknown or error. */
 export function qualifiedSourceState(ref: QualifierLike): QualifiedSourceState {
   if (!isQualifiedRef(ref)) return 'unavailable';
-  const source = safeGetSource(ref.providerId!, ref.sourceId!);
+  return sourceStateOf(ref.providerId!, ref.sourceId!);
+}
+
+function sourceStateOf(providerId: string, sourceId: string): QualifiedSourceState {
+  const source = safeGetSource(providerId, sourceId);
   if (!source) return 'unavailable';
   if (source.loaded) return 'ready';
   return isLibrarySourcePending(source) ? 'pending' : 'unavailable';
@@ -162,21 +216,8 @@ export function findQualifiedOrigin(
  * pending, so this resolves at once.
  */
 export function whenQualifiedSourceSettled(ref: QualifierLike, timeoutMs = 30_000): Promise<void> {
-  if (qualifiedSourceState(ref) !== 'pending') return Promise.resolve();
-  return new Promise<void>((resolve) => {
-    let done = false;
-    const finish = (): void => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      unsubscribe();
-      resolve();
-    };
-    const timer = setTimeout(finish, timeoutMs);
-    const unsubscribe = subscribeLibrarySources(() => {
-      if (qualifiedSourceState(ref) !== 'pending') finish();
-    });
-  });
+  if (!isQualifiedRef(ref)) return Promise.resolve();
+  return whenSourceSettled(ref.providerId!, ref.sourceId!, timeoutMs);
 }
 
 /** find → wait for the ref's ONE source to settle → find again (plan-778 review C8). */
@@ -191,18 +232,279 @@ export function findQualifiedOriginSettled(ref: QualifierLike & { assetId: strin
   return findWhenQualifiedSourceSettled(ref, () => findQualifiedOrigin(ref));
 }
 
-/** A reference inside a document of `library` is that library's (`project:<path>`, a bare id it holds); null = as written. */
-export function qualifyInLibrary(
-  catalogId: string,
-  library: { providerId: string; sourceId: string },
-): { catalogId: string; providerId: string; sourceId: string } | null {
-  const source = safeGetSource(library.providerId, library.sourceId);
-  if (catalogId.startsWith('project:')) {
-    const path = normalizeDocPath(catalogId.slice('project:'.length));
-    const entry = source?.listEntries().find((e) => normalizeDocPath(e.localPath ?? '') === path);
-    return { ...library, catalogId: entry?.id ?? catalogId };
+// ─── Document scope + THE resolver (plan-780 R1) ────────────────────────
+
+/**
+ * The project a document belongs to; its unqualified references resolve there
+ * (contract documents-projects 4). `null` = the open project. Passed as data, never a global.
+ */
+export type DocumentScope = { providerId: string; sourceId: string } | null;
+
+/** How a reference was found — diagnostics and tests. */
+export type ResolvedVia = 'qualified' | 'legacy-path' | 'legacy-hint' | 'realvirtual' | 'scope' | 'open-project' | 'legacy';
+
+/** A reference that resolved to one entry of one registered source. */
+export interface ResolvedRef {
+  registered: RegisteredLibrarySource;
+  entry: LibraryCatalogEntry;
+  /** The id the asset is keyed with in {@link registered} (canonical, or the R3-migrated document id). */
+  assetId: string;
+  /** True = strict hit in one library project, never a fallback. */
+  qualified: boolean;
+  via: ResolvedVia;
+}
+
+/** Why a reference resolved to nothing. */
+export type RefMissingCode =
+  | 'not-in-library'
+  | 'library-unavailable'
+  | 'legacy-path-not-found'
+  | 'legacy-path-ambiguous'
+  | 'not-found';
+
+/**
+ * `pending` = the deciding source still loads (null = registry-wide), recoverable.
+ * `missing.strict` = no fallback to url, manifest or path (contract node-identity 4).
+ */
+export type RefResolution =
+  | { hit: ResolvedRef }
+  | { pending: true; source: { providerId: string; sourceId: string } | null }
+  | { missing: true; reason: string; code: RefMissingCode; strict: boolean };
+
+/** What {@link resolveDocumentRef} reads off a reference. */
+export type DocumentRefLike = QualifierLike & { catalogId: string };
+
+/** A pre-778 non-library-projects qualifier (`global` + URL, …): legacy, resolves registry-wide in any scope. */
+export function hasLegacyHint(ref: QualifierLike | null | undefined): boolean {
+  return !!ref?.providerId && ref.providerId !== LIBRARY_PROJECTS_PROVIDER_ID;
+}
+
+/** Strict = resolves in exactly one library project or not at all: qualified, or an unqualified id in a library scope (D2). */
+export function isStrictDocumentRef(ref: DocumentRefLike, scope: DocumentScope): boolean {
+  if (isQualifiedRef(ref)) return true;
+  return !!scope && !!ref.catalogId && !hasLegacyHint(ref);
+}
+
+/** The scope of an entry's own references: the library project it belongs to, else null (plan-780 2.1). */
+export function scopeOfEntry(entry: Pick<LibraryCatalogEntry, 'libraryOrigin'> | null | undefined): DocumentScope {
+  const o = entry?.libraryOrigin;
+  return o && o.providerId === LIBRARY_PROJECTS_PROVIDER_ID && o.sourceId ? { providerId: o.providerId, sourceId: o.sourceId } : null;
+}
+
+/** The scope a QUALIFIED reference's own nested references resolve in (its library); null otherwise. */
+export function scopeOfQualifiedRef(ref: QualifierLike | null | undefined): DocumentScope {
+  return isQualifiedRef(ref) ? { providerId: ref!.providerId!, sourceId: ref!.sourceId! } : null;
+}
+
+/** Are two scopes the same project? */
+export function sameScope(a: DocumentScope, b: DocumentScope): boolean {
+  if (a === null || b === null) return a === b;
+  return a.providerId === b.providerId && a.sourceId === b.sourceId;
+}
+
+/**
+ * THE resolver of a stored reference written in `scope` (plan-780 R1). Never throws,
+ * never reads a pending source. Order: qualified → legacy forms (`project:<path>`
+ * via the scope's path index, legacy hint, realvirtual id) → library scope strict (D2) → open project.
+ */
+export function resolveDocumentRef(ref: DocumentRefLike, scope: DocumentScope): RefResolution {
+  const id = (ref.catalogId ?? '').trim();
+  if (!id) return missingOf('not-found', 'The reference carries no document id.', false);
+
+  // 1. Qualified: the ONE named source.
+  if (isQualifiedRef(ref)) {
+    const named = { providerId: ref.providerId!, sourceId: ref.sourceId! };
+    return id.startsWith(PROJECT_PATH_PREFIX) ? byLegacyPath(named, id, true) : inLibrary(named, id, 'qualified');
   }
-  return catalogId && source?.getEntry(catalogId) ? { ...library, catalogId } : null;
+
+  // 2a. Legacy `project:<path>` — the scope's path index.
+  if (id.startsWith(PROJECT_PATH_PREFIX)) {
+    if (scope) return byLegacyPath(scope, id, true);
+    const open = openProjectSource();
+    const byPath = open
+      ? byLegacyPath({ providerId: open.providerId, sourceId: open.source.id }, id, false)
+      : missingOf('legacy-path-not-found', `No open project holds "${id}".`, false);
+    if (!('missing' in byPath) || byPath.strict) return byPath;
+    // Pre-780 exact-id answer (canonical key, not a path guess).
+    const origin = findLegacyOrigin(id, null);
+    const entry = origin ? canonicalEntry(origin.source, id) : null;
+    if (origin && entry) return { hit: { registered: origin, entry, assetId: id, qualified: false, via: 'legacy' } };
+    return byPath;
+  }
+
+  // 2b. Legacy hint (`global` + catalog URL, …): registry-wide, as pre-778.
+  if (hasLegacyHint(ref)) {
+    const origin = findLegacyOrigin(id, ref);
+    const entry = origin ? entryOfSource(origin.source, id) : null;
+    if (origin && entry) return { hit: { registered: origin, entry, assetId: id, qualified: false, via: 'legacy-hint' } };
+    return hasPendingLibrarySources() ? pendingOf(null) : missingOf('not-found', `No library holds "${id}".`, false);
+  }
+
+  // 2c. An old realvirtual catalog id → the built-in realvirtual library project (D2 exception).
+  const rv = realvirtualHit(id);
+  if (rv && rv !== 'pending') return rv;
+
+  // 3. Unqualified id inside a library document: strict in that library (D2).
+  if (scope) {
+    const state = sourceStateOf(scope.providerId, scope.sourceId);
+    if (state === 'pending') return pendingOf(scope);
+    if (state === 'unavailable') {
+      return missingOf('library-unavailable', `Library "${scope.sourceId}" is not available — "${id}" cannot be placed.`, true);
+    }
+    const source = safeGetSource(scope.providerId, scope.sourceId)!;
+    const entry = entryOfSource(source, id);
+    if (entry) {
+      return { hit: { registered: { providerId: scope.providerId, source }, entry, assetId: entry.id, qualified: true, via: 'scope' } };
+    }
+    if (rv === 'pending') return pendingOf(realvirtualScope());
+    return missingOf('not-in-library', `"${id}" is missing in library "${labelOf(source)}".`, true);
+  }
+
+  // 4. Unqualified + null scope: the open project first, then the legacy search.
+  const open = openProjectSource();
+  if (open && !isLibrarySourcePending(open.source)) {
+    let entry: LibraryCatalogEntry | null = null;
+    try { entry = open.source.getEntry(id); } catch { entry = null; }
+    if (entry) return { hit: { registered: open, entry, assetId: id, qualified: false, via: 'open-project' } };
+  }
+  const origin = findLegacyOrigin(id, null);
+  const entry = origin ? entryOfSource(origin.source, id) : null;
+  if (origin && entry) return { hit: { registered: origin, entry, assetId: id, qualified: false, via: 'legacy' } };
+  if (rv === 'pending' || hasPendingLibrarySources()) return pendingOf(rv === 'pending' ? realvirtualScope() : null);
+  return missingOf('not-found', `No library or project holds "${id}".`, false);
+}
+
+/** {@link resolveDocumentRef}; on `pending` wait for the deciding source(s) and ask once more. Never rejects. */
+export async function resolveDocumentRefSettled(ref: DocumentRefLike, scope: DocumentScope): Promise<RefResolution> {
+  const first = resolveDocumentRef(ref, scope);
+  if (!('pending' in first)) return first;
+  if (first.source) await whenSourceSettled(first.source.providerId, first.source.sourceId);
+  else await whenLibrarySourcesSettled();
+  return resolveDocumentRef(ref, scope);
+}
+
+/** R3: the document id a `project:<path>` migrated to this session — writers save by id after a rename. */
+export function migratedDocumentIdOf(scope: { providerId: string; sourceId: string }, legacyId: string): string | null {
+  if (!legacyId.startsWith(PROJECT_PATH_PREFIX)) return null;
+  return legacyPathMigrations.get(migrationKey(scope, normalizeDocPath(legacyId.slice(PROJECT_PATH_PREFIX.length)))) ?? null;
+}
+
+/** Test seam: forget every in-memory legacy path migration. */
+export function resetLegacyPathMigrationsForTests(): void {
+  legacyPathMigrations.clear();
+}
+
+const PROJECT_PATH_PREFIX = 'project:';
+
+/** R3: (source, path) → document id on the first unique hit; in memory only, loading never writes. */
+const legacyPathMigrations = new Map<string, string>();
+
+function migrationKey(scope: { providerId: string; sourceId: string }, normPath: string): string {
+  return `${scope.providerId}|${scope.sourceId}|${normPath}`;
+}
+
+function byLegacyPath(target: { providerId: string; sourceId: string }, legacyId: string, strict: boolean): RefResolution {
+  const state = sourceStateOf(target.providerId, target.sourceId);
+  if (state === 'pending') return pendingOf(target);
+  if (state === 'unavailable') {
+    return missingOf('library-unavailable', `Library "${target.sourceId}" is not available — "${legacyId}" cannot be placed.`, strict);
+  }
+  const source = safeGetSource(target.providerId, target.sourceId)!;
+  const registered: RegisteredLibrarySource = { providerId: target.providerId, source };
+  const qualified = target.providerId === LIBRARY_PROJECTS_PROVIDER_ID;
+  const normPath = normalizeDocPath(legacyId.slice(PROJECT_PATH_PREFIX.length));
+  const key = migrationKey(target, normPath);
+  // Migrated earlier this session: the id holds even if the file moved since.
+  const migrated = legacyPathMigrations.get(key);
+  if (migrated) {
+    const entry = canonicalEntry(source, migrated);
+    if (entry) return { hit: { registered, entry, assetId: entry.id, qualified, via: 'legacy-path' } };
+  }
+  let rows: LibraryCatalogEntry[] = [];
+  try {
+    rows = source.listEntries().filter((e) => !!e.localPath && normalizeDocPath(e.localPath) === normPath);
+  } catch { rows = []; }
+  if (rows.length > 1) {
+    // Contract node-identity 4: more than one row answers the path — never guess.
+    return missingOf('legacy-path-ambiguous',
+      `Ambiguous legacy path "${legacyId}": ${rows.length} documents of "${labelOf(source)}" answer to it — kept as written.`, true);
+  }
+  if (rows.length === 0) {
+    return missingOf('legacy-path-not-found',
+      `Legacy path "${legacyId}" names no document of "${labelOf(source)}" — kept as written.`, strict);
+  }
+  const entry = rows[0];
+  const documentId = entry.documentId ?? (entry.id.startsWith(PROJECT_PATH_PREFIX) ? null : entry.id);
+  if (documentId) legacyPathMigrations.set(key, documentId);
+  return { hit: { registered, entry, assetId: documentId ?? entry.id, qualified, via: 'legacy-path' } };
+}
+
+function inLibrary(named: { providerId: string; sourceId: string }, id: string, via: ResolvedVia): RefResolution {
+  const state = sourceStateOf(named.providerId, named.sourceId);
+  if (state === 'pending') return pendingOf(named);
+  if (state === 'unavailable') {
+    return missingOf('library-unavailable', `Library "${named.sourceId}" is not available — "${id}" cannot be placed.`, true);
+  }
+  const source = safeGetSource(named.providerId, named.sourceId)!;
+  const entry = canonicalEntry(source, id);
+  if (!entry) return missingOf('not-in-library', `Document "${id}" is not in library "${named.sourceId}".`, true);
+  return { hit: { registered: { providerId: named.providerId, source }, entry, assetId: entry.id, qualified: true, via } };
+}
+
+/** The realvirtual library's answer for a bare id: a hit, `'pending'` while it loads, null otherwise. */
+function realvirtualHit(id: string): { hit: ResolvedRef } | 'pending' | null {
+  const rvScope = realvirtualScope();
+  const state = sourceStateOf(rvScope.providerId, rvScope.sourceId);
+  if (state === 'pending') return 'pending';
+  if (state !== 'ready') return null;
+  const source = safeGetSource(rvScope.providerId, rvScope.sourceId)!;
+  const entry = entryOfSource(source, id);
+  if (!entry) return null;
+  return { hit: { registered: { providerId: rvScope.providerId, source }, entry, assetId: entry.id, qualified: true, via: 'realvirtual' } };
+}
+
+function realvirtualScope(): { providerId: string; sourceId: string } {
+  return { providerId: LIBRARY_PROJECTS_PROVIDER_ID, sourceId: REALVIRTUAL_LIBRARY_PROJECT_ID };
+}
+
+function openProjectSource(): RegisteredLibrarySource | null {
+  return safeSources().find((s) => s.providerId === OPEN_PROJECT_PROVIDER_ID) ?? null;
+}
+
+function canonicalEntry(source: LibrarySource, id: string): LibraryCatalogEntry | null {
+  try { return source.getEntry(id); } catch { return null; }
+}
+
+function labelOf(source: LibrarySource): string {
+  return source.label || source.id;
+}
+
+function pendingOf(source: { providerId: string; sourceId: string } | null): RefResolution {
+  return { pending: true, source };
+}
+
+function missingOf(code: RefMissingCode, reason: string, strict: boolean): RefResolution {
+  // Ambiguity is never a fallback case, in any scope (contract node-identity 4).
+  return { missing: true, reason, code, strict: strict || code === 'legacy-path-ambiguous' };
+}
+
+/** Resolve when the ONE source `(providerId, sourceId)` is no longer pending — or after `timeoutMs`. */
+function whenSourceSettled(providerId: string, sourceId: string, timeoutMs = 30_000): Promise<void> {
+  if (sourceStateOf(providerId, sourceId) !== 'pending') return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    let done = false;
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      unsubscribe();
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    const unsubscribe = subscribeLibrarySources(() => {
+      if (sourceStateOf(providerId, sourceId) !== 'pending') finish();
+    });
+  });
 }
 
 function normalizeDocPath(p: string): string {
@@ -316,7 +618,8 @@ function appOrigin(): string | null {
  */
 export function findLegacyOrigin(assetId: string, hint?: QualifierLike | null): RegisteredLibrarySource | null {
   if (!assetId) return null;
-  const sources = safeSources();
+  // plan-780 R1: never read a pending source ("nothing yet" ≠ "not there").
+  const sources = safeSources().filter((s) => !isLibrarySourcePending(s.source));
   if (sources.length === 0) return null;
 
   const preferred: RegisteredLibrarySource[] = [];

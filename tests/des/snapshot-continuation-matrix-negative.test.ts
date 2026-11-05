@@ -5,7 +5,6 @@ import { RvDocument } from '../../src/core/ops/rv-document';
 import { RvUnifiedExecutor } from '../../src/core/ops/rv-unified-executors';
 import { clearProblemsOfCode, getProblems } from '../../src/core/hmi/problems-store';
 import { assertContinuation, canonicalJson, ContinuationMismatch } from '../helpers/des-continuation-harness';
-import { assertLogicRefusal } from './continuation-matrix-helpers';
 import { sceneWorld, type Scene, type SceneWorld } from './continuation-scene-world';
 
 async function withWorld(scene: Scene, ctx: TestContext, run: (w: SceneWorld) => void | Promise<void>) {
@@ -104,4 +103,13 @@ describe('P8-2: real scene negative controls', () => {
   }
 });
 
-it('DemoRealvirtualWeb: LogicStep refusal', () => assertLogicRefusal('DemoRealvirtualWeb'), 300_000);
+// plan-2207 Phase 3: the demo's LogicSteps are a snapshot participant now; an undeclared field still refuses.
+it('DemoRealvirtualWeb: undeclared LogicStep state refuses capture', async () => {
+  const w = await sceneWorld('DemoRealvirtualWeb');
+  try {
+    w.step(3);
+    const engine = (w.v as unknown as { logicEngine: { roots: object[] } }).logicEngine;
+    Object.assign(engine.roots[0], { undeclaredRunField: 1 });
+    expect(() => w.runner.fullSnapshot()).toThrow(/des-state-not-declared/);
+  } finally { w.dispose(); }
+}, 300_000);

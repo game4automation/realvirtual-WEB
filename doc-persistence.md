@@ -895,7 +895,7 @@ re-resolves every placement by `catalogId` before the restore places it:
 | *(none — a catalog id)* | The saved `glbUrl` when it is stable, else the current catalog entry. A bundled `library/…` path is re-rooted onto this deploy's `BASE_URL`, so a scene authored on `/` still resolves under `/demo/`. |
 | `local-…` | The catalog entry's FRESH blob URL, produced by the boot-time folder scan. |
 | `unity-cloud:…` | A fresh download through the Asset Manager extension (`cloud.downloadGlb`). |
-| `project:<path>` | The library registry (plan-723). The document has no stable URL at all: the planner loads it under the stable cache key `resolved:<providerId>:<sourceId>:<entryId>`, and `resolvePlacementUrl` only *probes* that it is still readable — it resolves, releases the handle immediately and returns the `catalogId` as a marker. `glbUrl` stays empty for these placements and is never written back. |
+| `project:<path>` | The library registry (plan-723). The document has no stable URL at all: the planner loads it under the stable cache key `resolved:<providerId>:<sourceId>:<entryId>`, and `resolvePlacementUrl` only *probes* that it is still readable — it resolves, releases the handle immediately and returns the `catalogId` as a marker. `glbUrl` stays empty for these placements and is never written back. Since plan-780 a `project:<path>` is a LEGACY form: read through the document scope's path index (exactly one row, else kept + Problems row), keyed by the document id it migrated to, and written as that id on the next save. |
 
 The function **never throws**, whatever a backend does: the first restore loop
 has no `try`/`catch` around the call, so a rejection there would abort the whole

@@ -4,6 +4,7 @@
 /** Priority coordinator that prevents startup dialogs from stacking. */
 
 import { useLayoutEffect, useSyncExternalStore } from 'react';
+import { isRecordingMode } from '../recording-mode';
 
 export type StartupModalId = 'welcome' | 'projects' | 'demo-welcome' | 'opener' | 'autoquality' | 'news';
 
@@ -56,6 +57,8 @@ export function setStartupModalOpen(id: StartupModalId, open: boolean): void {
 
 /** Returns true when no currently visible modal has a higher priority. */
 export function mayShowStartupModal(id: StartupModalId): boolean {
+  // plan-2240: auto-only dialogs stay shut in recording mode (welcome/projects gate at their callers).
+  if (id !== 'welcome' && id !== 'projects' && isRecordingMode()) return false;
   const ownPriority = PRIORITY[id];
   return (Object.keys(PRIORITY) as StartupModalId[])
     .every((candidate) => !openSnapshot[candidate] || PRIORITY[candidate] >= ownPriority);

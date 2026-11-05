@@ -55,6 +55,13 @@ in `run()` using shared validation helpers, so UI and MCP calls use the same che
 - `selection.select {path, frame?}` — select a scene node; `frame:true` also frames it in the camera.
 - `ui.panel {panelId, rect?, collapsed?}` — set panel geometry (`[x, y, width, height]`) and/or
   collapsed state; at least one is required. Geometry uses the same normalization whether open or closed.
+- `ui.panel.list {}` (read, `web_query`) — every known window: `{panelId, title, open, openable}`. Use these
+  ids with `ui.panel`, `ui.panel.open` and `ui.panel.close` (e.g. `stats-hub`, `des-event-queue`, `problems`,
+  `des-experiment-matrix`, `des-matrix-runs`).
+- `ui.panel.open {panelId, target?}` / `ui.panel.close {panelId}` — open or close a window the way its own button
+  does. `target` is what a drill-down opens on: `ui.panel.open {panelId:'des-matrix-runs', target:'Base'}` opens
+  "Runs — Base". A mounted window without an opener can only be closed; the experiment windows answer
+  `kind:'commercial-feature'` without the experiment manager.
 
 FastForward, speed (`des.setMode`, button key `des.speed.<n>`), Follow/Sit, DES Statistics and badges
 buttons bind to these commands through `data-rv-command-id` / `data-rv-button-id`; the commands
@@ -69,6 +76,7 @@ Read-only commands, called with `web_execute(command="<id>", args={...})`:
 - `des.events {limit?, component?, action?}` — next events in dispatch order; default 20, maximum 200 (DES mode only).
 - `fleet.status {vehicle?, state?}` — vehicle state, fault reason, job, position, waiting and battery; vehicle substring and state filters.
 - `problems.list {severity?, code?, node?, limit?}` — problems including quiet entries; severity, code prefix and node substring filters; default 100, maximum 500.
+- `problems.ack {id?, code?}` (**write**) — acknowledge problems like closing the Problems panel: they no longer reopen it until they change. Without arguments all (and the panel closes); `id` exact, `code` prefix; the panel closes when nothing unacknowledged is left. Returns `{acknowledged, closed}`.
 
 - `diag.blockage {}` (readOnly) — on-demand `{findings, coverage, atSec, exempt}`. Each deadlock/stall includes its chain, idle time, budget source and checks. No Problems or signal writes; `exempt` counts excluded subtrees.
 - `diag.waitGraph {}` (readOnly) — `{edges, sources}`; edges include `analysed` and, where analysis is unsupported, `notAnalysedReason`. Such edges are not proof of a deadlock.

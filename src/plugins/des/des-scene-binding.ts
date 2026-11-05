@@ -49,11 +49,12 @@ import {
   type PoseTransferOutcome,
 } from '../../core/material-flow/material-flow-self';
 import type { MaterialFlowDefinition } from '../../core/material-flow/define-material-flow';
-import { resolveNodeMaterialFlows } from '../../core/material-flow/registry';
+import { sceneNodeMaterialFlows } from '../../core/material-flow/scene-flow-discovery';
+import { getDefaultAgvFleet } from '../../core/engine/rv-agv-fleet';
 import { getEngineSourceForNode, type RVSource } from '../../core/engine/rv-source';
-import { RVMovingUnit } from '../../core/engine/rv-mu';
+import { RVMovingUnit, spawnCloneScale } from '../../core/engine/rv-mu';
 import { stripIdentity } from '../../core/engine/rv-decode-identity';
-import { measureMuVisualBugSize, presetMuBugSize } from '../../behaviors/_shared/mu-reference';
+import { presetMuBugSize, templateSizeOf } from '../../behaviors/_shared/mu-reference';
 import { applySchema, type ComponentSchema } from '../../core/engine/rv-component-registry';
 import type { JsonValue } from '../../core/material-flow/material-flow-self';
 import type { DESRunner } from './des-runner';
@@ -117,17 +118,6 @@ function engineSourceFor(root: Object3D): RVSource | null {
   return getEngineSourceForNode(root);
 }
 
-/** True if `node` is the ROOT of a placed LayoutObject (carries the marker). */
-function isLayoutObjectRoot(node: Object3D): boolean {
-  const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
-  return !!(rv && rv.LayoutObject);
-}
-
-/** Asset name to match against: the node name minus the `_N` duplicate suffix. */
-function layoutMatchName(node: Object3D): string {
-  return node.name.replace(/_\d+$/, '');
-}
-
 function sceneRootFor(node: Object3D): Object3D {
   let root = node;
   while (root.parent) root = root.parent;
@@ -139,6 +129,7 @@ function registerMuVisualTemplateFactories(
   componentRoot: Object3D,
   self: MaterialFlowSelf,
   properties: readonly string[],
+  templateSizes: Map<string, readonly [number, number, number] | null>,
 ): void {
   const sceneRoot = sceneRootFor(componentRoot);
   for (const key of properties) {
@@ -146,10 +137,15 @@ function registerMuVisualTemplateFactories(
     if (typeof templateId !== 'string' || !templateId) continue;
     const template = sceneRoot.getObjectByName(templateId);
     if (!template) continue; // the runner provides the visible unknown-id fallback
+    if (!templateSizes.has(templateId)) {
+      const size = templateSizeOf(template, sceneRoot);
+      templateSizes.set(templateId, size ? Object.freeze([...size] as [number, number, number]) : null);
+    }
     runner.registerMuVisualFactory(
       templateId,
       () => {
         const clone = template.clone(true);
+        spawnCloneScale(template, sceneRoot, clone.scale);
         // plan-769 Inventory C: a DES MU visual is a runtime clone — no identity.
         stripIdentity(clone);
         clone.visible = true;
@@ -158,6 +154,7 @@ function registerMuVisualTemplateFactories(
         return new RVMovingUnit(clone, templateId);
       },
       (visual) => { visual.dispose(); },
+      templateSizes.get(templateId) ?? null,
     );
   }
 }
@@ -282,7 +279,7 @@ export function clearSceneBindingProblems(): void {
  * `runner`. Returns the number of instances bound. Idempotent only insofar as it
  * (re)builds instances for the current scene — call once per `start()`.
  *
- * Discovery is `resolveNodeMaterialFlows` (the shared dual discovery in the
+ * Discovery is `sceneNodeMaterialFlows` (the shared dual discovery in the
  * public core): a placement matches by asset NAME, and any node — placement or
  * not — matches by rv_extras PAYLOAD.
  *
@@ -292,6 +289,7 @@ export function clearSceneBindingProblems(): void {
  */
 export function bindSceneToRunner(runner: DESRunner, root: Object3D, host: BindContextHost): number {
   const bound: BoundInstance[] = [];
+  const templateSizes = new Map<string, readonly [number, number, number] | null>();
   clearSceneBindingProblems();
 
   // Payload-detected, not placement-gated (plan-455 F4). A placement still
@@ -301,14 +299,14 @@ export function bindSceneToRunner(runner: DESRunner, root: Object3D, host: BindC
   // instead of being invisible for want of a LayoutObject marker.
   root.traverse((node) => {
     reportLegacyComponent(node);
-    const placed = isLayoutObjectRoot(node);
-    const matchName = placed ? layoutMatchName(node) : '';
-    for (const def of resolveNodeMaterialFlows(node, matchName)) {
+    // The shared scene rule (also read by the experiment Base key): name match for a placed
+    // LayoutObject root, payload for every node.
+    for (const def of sceneNodeMaterialFlows(node)) {
       try {
-        const instance = bindOne(runner, node, host, def);
+        const instance = bindOne(runner, node, host, def, templateSizes);
         if (instance) bound.push(instance);
       } catch (e) {
-        console.error(`[des-binding] '${def.type}' bind error for '${matchName || node.name}':`, e);
+        console.error(`[des-binding] '${def.type}' bind error for '${node.name}':`, e);
       }
     }
   });
@@ -530,18 +528,17 @@ function makePoseBackend(
   getAdapter: () => MaterialFlowAdapter,
   root: Object3D,
   engineSource: RVSource | null,
-  armSpawnSize: (size: readonly [number, number, number] | null) => void,
+  canonicalSize: readonly [number, number, number] | null,
 ): PoseTransferBackend {
   return {
     readiness(): PoseReadiness {
-      armSpawnSize(null); // only a `ready` answer arms the next spawn
       const adapter = getAdapter();
       const target = containedTargetOf(adapter);
       if (!target) return FALLBACK_NOT_CONTAINED;
       const unsupported = target.poseUnsupportedReason();
       if (unsupported) return { state: 'fallback', reason: unsupported };
       if (adapter.defersTransfer) return { state: 'fallback', reason: 'source-processing' };
-      const size = engineSource?.templateSize() ?? null;
+      const size = canonicalSize;
       if (!engineSource || !size) return { state: 'fallback', reason: 'no-template-size' };
       if (!engineSource.canSpawn(true)) {
         return { state: 'blocked', reason: engineSource.Enabled ? 'quantity-limit' : 'source-disabled' };
@@ -563,11 +560,9 @@ function makePoseBackend(
         // → standard transfer instead of waiting forever; it refuses → capacity → wait.
         return downstreamCanAccept(adapter, STANDARD_PROBE) ? FALLBACK_POSE_REFUSED : BLOCKED_TARGET_REFUSED;
       }
-      armSpawnSize(size);
       return { state: 'ready', pose, size };
     },
     transfer(mu: MU, pose: AcceptPose): PoseTransferOutcome {
-      armSpawnSize(null);
       const adapter = getAdapter();
       const target = containedTargetOf(adapter);
       if (!target) return { ok: false, reason: 'no-target' };
@@ -589,6 +584,7 @@ function bindOne(
   root: Object3D,
   host: BindContextHost,
   def: MaterialFlowDefinition,
+  templateSizes: Map<string, readonly [number, number, number] | null>,
 ): BoundInstance | null {
   const accum: KinematicsSpec = {};
   const { ctx, handle } = createBindContext(root, host, accum);
@@ -600,40 +596,16 @@ function bindOne(
   // For a source, reuse the engine RVSource (if present) to clone a real MU mesh
   // per generated MU, so the DES MU has a `visual` the tween registry animates.
   const engineSource = def.kind === 'source' ? engineSourceFor(root) : null;
-  // plan-638: template size of the last `ready` pose pre-check - the NEXT
-  // spawned MU (the pose MU) gets exactly this size, so pre-check and MU agree.
-  // Consumed by that spawn; the standard path never arms it.
-  let poseSpawnSize: readonly [number, number, number] | null = null;
+  // One immutable template size per bind: pose probes, visual and headless MUs
+  // all use the same dimensions, independent of the first live visual's pose.
+  const size = engineSource?.templateSize() ?? null;
+  const canonicalSize = size ? Object.freeze([...size] as [number, number, number]) : null;
   // plan-2059: a snapshot stores the template id of every MU, so it must be reload-stable —
   // the DES component id (plan-769 address), the per-load three uuid only for unaddressed hosts.
   const templateAddresses = (host as { desAddresses?: DesAddressSource | null }).desAddresses
     ?? (host as { registry?: DesAddressSource | null }).registry ?? null;
   const sourceTemplateId = engineSource
     ? `source:${desComponentIdForNode(templateAddresses, root, def.type) ?? root.uuid}` : undefined;
-
-  // Template bug size, cached ONCE per source (plan-262 Phase 3). Visual MUs
-  // used to measure it lazily per MU (identical result — the geometry is
-  // constant per template); a HEADLESS MU (FastForward) has no visual to
-  // measure, so BOTH now draw from this cache → identical bug offsets →
-  // identical tween endpoints and ride times (the headless-vs-visual
-  // determinism gate). Filled from the first spawned visual; a headless-first
-  // run measures a one-off temporary clone (spawn → measure → dispose).
-  let templateBugSize: readonly [number, number, number] | null = null;
-  let templateBugMeasured = false;
-  const templateBugSizeFor = (visual: unknown): readonly [number, number, number] | null => {
-    if (!templateBugMeasured && engineSource) {
-      let probe = visual as { node?: Object3D } | null;
-      let temp: { node?: Object3D; dispose?: () => void } | null = null;
-      if (!probe) {
-        temp = engineSource.spawnMU(true) as { node?: Object3D; dispose?: () => void } | null;
-        probe = temp;
-      }
-      templateBugSize = probe?.node ? measureMuVisualBugSize(probe.node) : null;
-      temp?.dispose?.();
-      templateBugMeasured = true;
-    }
-    return templateBugSize;
-  };
 
   const self = createSelf(ctx, def, {
     mode: 'des',
@@ -662,19 +634,7 @@ function bindOne(
           // RVMovingUnit | InstancedMovingUnit | null — the DESMU.visual slot.
           (mu as unknown as { visual: unknown }).visual = engineSource.spawnMU(true);
         }
-        if (poseSpawnSize) {
-          // plan-638 (Gate R3-1): the pose MU takes the template size its
-          // pre-check used (`templateSize()`); the cache is not consulted.
-          presetMuBugSize(mu as unknown as MU, poseSpawnSize);
-          poseSpawnSize = null;
-        } else {
-          // Pre-set the bug size from the per-template cache for BOTH paths, so
-          // headless and visual MUs deliver identical bug offsets (determinism).
-          presetMuBugSize(
-            mu as unknown as MU,
-            templateBugSizeFor((mu as unknown as { visual?: unknown }).visual ?? null),
-          );
-        }
+        presetMuBugSize(mu as unknown as MU, canonicalSize);
       }
       return mu;
     },
@@ -696,7 +656,7 @@ function bindOne(
     // spawn pose. Every source gets the backend; without a contained target it
     // answers `not-contained` and the source keeps its standard path.
     poseTransfer: def.kind === 'source'
-      ? makePoseBackend(runner, () => adapter, root, engineSource, (size) => { poseSpawnSize = size; })
+      ? makePoseBackend(runner, () => adapter, root, engineSource, canonicalSize)
       : null,
     mus: () => adapter.heldMUs as unknown as ReadonlyArray<MU>,
     reservedLoad: () => adapter.reservedLoad,
@@ -723,13 +683,14 @@ function bindOne(
     return null;
   }
   if (def.muVisualTemplateProperties) {
-    registerMuVisualTemplateFactories(runner, root, self, def.muVisualTemplateProperties);
+    registerMuVisualTemplateFactories(runner, root, self, def.muVisualTemplateProperties, templateSizes);
   }
   if (engineSource && sourceTemplateId) {
     runner.registerMuVisualFactory(
       sourceTemplateId,
       () => engineSource.spawnMU(true) as ReturnType<DESRunner['createMuVisual']>,
       (visual) => { visual.dispose(); },
+      canonicalSize,
     );
   }
 
@@ -740,15 +701,47 @@ function bindOne(
   const registry = (host as { desAddresses?: DesAddressSource | null }).desAddresses
     ?? (host as { registry?: DesAddressSource | null }).registry ?? null;
   const desId = desComponentIdForNode(registry, root, def.type);
+  let offTask: (() => void) | null = null;
   adapter = runner.addInstance(def, self, root, {
-    dispose: () => { handle.dispose(); if (desId) runner.getManager().releaseStreams(desId); },
+    dispose: () => { offTask?.(); handle.dispose(); if (desId) runner.getManager().releaseStreams(desId); },
     signals: (accum.signals ?? []).map((s) => s.name),
   }, { desId });
   adapter.desId = desId;
+  // plan-2241: an Agv is armed while it has a task; assign/clear and task completion reach
+  // it through the fleet (setup and the start task: the runner's start-kick check).
+  if (def.type === 'Agv') offTask = watchAgvTasks(runner, root, adapter);
   if (def.kind !== 'sink') {
     adapter.reconfigureCapacity(capacity);
   }
   return { root, self, adapter };
+}
+
+/** One fleet subscription per runner; a vehicle id resolves to its adapter in O(1) (NF1). */
+interface AgvTaskIndex { byRoot: Map<Object3D, ProgressTarget>; byId: Map<string, ProgressTarget>; off: () => void }
+type ProgressTarget = { _progressCheck(): void };
+const agvTaskIndexes = new WeakMap<object, AgvTaskIndex>();
+
+/** @internal Watch the Agv on `root` for task changes; returns the instance's release. */
+export function watchAgvTasks(runner: object, root: Object3D, adapter: ProgressTarget): () => void {
+  const fleet = getDefaultAgvFleet();
+  let ix = agvTaskIndexes.get(runner);
+  if (!ix) {
+    const byRoot = new Map<Object3D, ProgressTarget>(), byId = new Map<string, ProgressTarget>();
+    const check = (id: string) => { byId.get(id)?._progressCheck(); };
+    const offs = [fleet.onTaskChanged(check), fleet.onIdle(check),
+      fleet.onRegister((h) => { const a = h.node && byRoot.get(h.node); if (a) byId.set(h.id, a); }),
+      fleet.onUnregister((id) => { byId.delete(id); })];
+    ix = { byRoot, byId, off: () => { for (const off of offs) off(); } };
+    agvTaskIndexes.set(runner, ix);
+  }
+  const index = ix;
+  index.byRoot.set(root, adapter);
+  for (const h of fleet.handleList) if (h.node === root) index.byId.set(h.id, adapter);
+  return () => {
+    if (index.byRoot.get(root) === adapter) index.byRoot.delete(root);
+    for (const [id, a] of index.byId) if (a === adapter) index.byId.delete(id);
+    if (index.byRoot.size === 0) { index.off(); if (agvTaskIndexes.get(runner) === index) agvTaskIndexes.delete(runner); }
+  };
 }
 
 /**

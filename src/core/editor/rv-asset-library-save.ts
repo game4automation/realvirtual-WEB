@@ -21,6 +21,7 @@
  * still where the explicit "Save as…" verb places a new asset.
  */
 
+import { whenDocumentSettled } from '../hmi/rv-bind-queue';
 import type { RVViewer } from '../rv-viewer';
 import type { AssetDocument } from './rv-asset-document';
 import { exportAssetGlb } from './rv-asset-glb-export';
@@ -49,7 +50,7 @@ export async function downloadAssetGlb(viewer: RVViewer, doc: AssetDocument, nam
       + 'poses rather than the authored state. Stop the test run first.');
     return false;
   }
-  await doc.whenIdle();
+  await whenDocumentSettled(doc);
   const assetRoot = viewer.currentModelRoot;
   if (!assetRoot) return false;
   try {

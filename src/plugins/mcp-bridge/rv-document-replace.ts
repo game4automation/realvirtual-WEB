@@ -614,7 +614,10 @@ function disposeParsed(root: { traverse(fn: (o: unknown) => void): void }): void
 /** The narrow viewer surface the placement invalidation needs. */
 export interface PlacementHost {
   placements: {
-    sourceOf(ref: { catalogId: string; glbUrl: string; providerId?: string; sourceId?: string }): { key: string } | null;
+    sourceOf(
+      ref: { catalogId: string; glbUrl: string; providerId?: string; sourceId?: string },
+      scope: { providerId: string; sourceId: string } | null,
+    ): { key: string } | null;
     modelCache: { invalidate(cacheKey: string): void };
   };
   bakeRegistry: { instances: ReadonlySet<{ identity?: boolean; baked: { assetId: string; url: string } }> };
@@ -632,22 +635,19 @@ function keyAddressesPath(key: string, relPath: string): boolean {
  * Every cache key a placement of the document can be baked under, and the
  * LIVE placement instances (nested ones included) that show it.
  *
- * Keys come from the ONE derivation, `PlacementInstancer.sourceOf`: the
- * project library answers to `project:<path>` and to the manifest id. A
- * reference that names the file by path (a hand-authored relative reference)
- * is keyed by its url, so live instances whose asset key or url ends in the
- * document's path are matched too.
+ * Keys come from `PlacementInstancer.sourceOf(ref, scope)` by document id in the
+ * document's scope (plan-780 R3, no path key); path-named references are matched
+ * by url suffix.
  */
 export function documentPlacementSources(
   host: PlacementHost,
-  doc: { id: string; path: string },
+  doc: { id: string; path: string; scope?: { providerId: string; sourceId: string } | null },
 ): { keys: Set<string>; urls: Set<string>; instances: number } {
   const keys = new Set<string>();
   const urls = new Set<string>();
-  for (const catalogId of [`project:${doc.path}`, doc.id]) {
-    if (!catalogId) continue;
+  if (doc.id) {
     let source: { key: string } | null = null;
-    try { source = host.placements.sourceOf({ catalogId, glbUrl: '' }); } catch { source = null; }
+    try { source = host.placements.sourceOf({ catalogId: doc.id, glbUrl: '' }, doc.scope ?? null); } catch { source = null; }
     if (source?.key) keys.add(source.key);
   }
   let instances = 0;
@@ -671,7 +671,7 @@ export function documentPlacementSources(
  */
 export async function invalidateDocumentPlacements(
   host: PlacementHost,
-  doc: { id: string; path: string },
+  doc: { id: string; path: string; scope?: { providerId: string; sourceId: string } | null },
 ): Promise<number> {
   const { keys, urls, instances } = documentPlacementSources(host, doc);
   for (const key of keys) host.placements.modelCache.invalidate(key);

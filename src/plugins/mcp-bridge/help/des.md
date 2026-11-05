@@ -44,6 +44,11 @@ FastForward; omitting `on` toggles it.
 
 `des.setEnd {end?, statReset?}` updates the live settings and persists them on the scene DES manager.
 Both use `DD:HH:MM:SS`; `end` also accepts `"inf"`. Either setting can be supplied independently.
+Like the seed they are Base settings: refused while a variant is shown in the scene, and a refused or
+failed scene write leaves the live value unchanged (an error, never a silent success). Called while
+the document loads (right after a load or reset), `des.setEnd` and `des.seed.set` wait for the load
+(at most 30 s) instead of being refused. The settings survive `sim.reset` and an experiment batch, and
+changing them does not make experiment results stale: a column has its own run length and warm-up.
 
 ## Random seed
 

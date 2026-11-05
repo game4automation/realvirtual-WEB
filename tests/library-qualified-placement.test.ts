@@ -54,7 +54,7 @@ import {
   installLibraryProjectsProvider,
   uninstallLibraryProjectsProvider,
 } from '../src/core/library/library-projects-provider';
-import { entryOriginOf } from '../src/core/library/library-origin';
+import { entryOriginOf, resolveDocumentRef, type DocumentScope } from '../src/core/library/library-origin';
 import { placementExtras } from '../src/core/hmi/scene/rv-scene-glb-bake';
 import { readPlacementsFromScene } from '../src/core/hmi/scene/rv-scene-glb-read';
 import { deserializeLayout, serializeLayout, type PlacedComponent } from '../src/plugins/layout-planner/rv-layout-store';
@@ -288,7 +288,7 @@ describe('plan-778 9.5 — the real instancer', () => {
     expect(w.instancer.unresolvedCount).toBe(0);
   });
 
-  it('nested references INSIDE a library document are that library\'s: project:<path> and a bare id get its qualifier', async () => {
+  it('nested references INSIDE a library document carry its scope and resolve THERE (plan-780 D2) — never in the open project', async () => {
     const w = await world();
     const ref = (id: string, assetId: string): Object3D => {
       const n = new Object3D(); n.name = id; setNodeId(n, id); setAssetReference(n, { assetId }); return n;
@@ -296,23 +296,44 @@ describe('plan-778 9.5 — the real instancer', () => {
     const nodes = [
       ref('byPath', 'project:models/pump.glb'),   // the library's document at that path → its id
       ref('byId', PUMP),                          // a bare id the library holds
-      ref('foreign', 'realvirtual-conveyor-glb'),  // not the library's → as written
+      ref('foreign', 'realvirtual-conveyor-glb'),  // not the library's, not a realvirtual id → missing IN the library (D2)
       ref('unknownPath', 'project:nope.glb'),     // still the library's: the error must name it, not the open project
     ];
-    const lib = { providerId: LIBRARY_PROJECTS_PROVIDER_ID, sourceId: 'prj_c' };
-    const scan = (parentLibrary?: typeof lib) => collectNestedReferences(
+    const lib: DocumentScope = { providerId: LIBRARY_PROJECTS_PROVIDER_ID, sourceId: 'prj_c' };
+    const scan = (scope?: DocumentScope) => collectNestedReferences(
       { node: new Group(), id: 'p', occurrence: 'p' },
-      { parentKey: 'k', parentUrl: '', parentState: 'none', keyOf: (r) => r.catalogId, nodes, ...(parentLibrary ? { parentLibrary } : {}) },
-    ).entries.map((e) => ({ catalogId: e.ref.catalogId, sourceId: e.ref.sourceId ?? null }));
-    expect(scan(lib)).toEqual([
-      { catalogId: PUMP, sourceId: 'prj_c' },
-      { catalogId: PUMP, sourceId: 'prj_c' },
-      { catalogId: 'realvirtual-conveyor-glb', sourceId: null },
-      { catalogId: 'project:nope.glb', sourceId: 'prj_c' },
+      { parentKey: 'k', parentUrl: '', parentState: 'none', keyOf: (r) => w.instancer.keyOf(r, scope ?? null), nodes, ...(scope ? { scope } : {}) },
+    ).entries;
+    const inLib = scan(lib);
+    // Kept AS WRITTEN; the parent's scope travels with every entry (scope is data).
+    expect(inLib.map((e) => e.ref.catalogId)).toEqual(['project:models/pump.glb', PUMP, 'realvirtual-conveyor-glb', 'project:nope.glb']);
+    expect(inLib.map((e) => e.scope)).toEqual([lib, lib, lib, lib]);
+    // The ONE resolver decides, in that scope.
+    const verdict = (e: (typeof inLib)[number]): string => {
+      const r = resolveDocumentRef(e.ref, e.scope ?? null);
+      return 'hit' in r ? `hit:${r.hit.registered.source.id}:${r.hit.assetId}` : 'missing' in r ? `missing:${r.code}` : 'pending';
+    };
+    expect(inLib.map(verdict)).toEqual([
+      `hit:prj_c:${PUMP}`,
+      `hit:prj_c:${PUMP}`,
+      'missing:not-in-library',
+      'missing:legacy-path-not-found',
     ]);
-    // A document of the open project (no parent library) keeps every reference as written.
-    expect(scan().map((e) => e.sourceId)).toEqual([null, null, null, null]);
-    void w;
+    // The cycle key of a library-scoped reference names the library (two libraries' equal ids are two assets).
+    expect(inLib[1].ref.catalogId).toBe(PUMP);
+    expect(w.instancer.keyOf(inLib[1].ref, lib)).toBe(w.instancer.keyOf({ ...QUAL('prj_c'), catalogId: PUMP, glbUrl: '' }, null));
+    // A document of the open project (no scope) keeps every reference in the open project.
+    expect(scan().map((e) => e.scope ?? null)).toEqual([null, null, null, null]);
+  });
+
+  it('Edit in library: a library DOCUMENT loaded as the document places its own project:<path> parts from that library', async () => {
+    const w = await world();
+    const root = documentWith([{ id: 'part', ref: { assetId: 'project:models/pump.glb' } }]);
+    // plan-780 R2: the scope is captured on the entries at queue time (no instancer state).
+    w.instancer.materializeDeferred(collectDeferredPlacements(root, { providerId: LIBRARY_PROJECTS_PROVIDER_ID, sourceId: 'prj_c' }));
+    await w.instancer.whenMaterialized();
+    expect(bakedName(w, root.children[0])).toBe('c:pump');
+    expect(root.children[0].children.some(isMissingReferencePlaceholder)).toBe(false);
   });
 
   it('Phase 3 residual: a placement whose values live only in the host record is restored with THOSE overrides, not the standard variant', async () => {

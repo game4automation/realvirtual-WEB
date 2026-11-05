@@ -55,6 +55,7 @@ export interface MaterialFlowInstance {
  * implement this so the kernel is mode-agnostic.
  */
 export interface SimulationExecutor {
+  readonly simEvents?: import('../sim-event-facade').SimEventFacade;
   /** Mode tag for the kernel/UI ('continuous' | 'des'). */
   readonly mode: 'continuous' | 'des';
 

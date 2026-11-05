@@ -23,9 +23,10 @@ import {
 } from '../src/plugins/usd-live-link/live-link-store';
 import { USD_LIVE_LINK_SETTINGS_KEY } from '../src/core/hmi/rv-storage-keys';
 import { describeLiveLink, describeTextureNotice, showsTroubleshooting } from '../src/plugins/usd-live-link/UsdToolMenu';
-import type { RuntimeStageSnapshot } from '../src/plugins/usd-live-link/runtime-stage-export';
+import type { RuntimeStageSnapshot } from '../src/core/usd/runtime-stage-export';
 import type { LoadResult } from '../src/core/engine/rv-scene-loader';
 import type { RVViewer } from '../src/core/rv-viewer';
+import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 
 let fake: FakeWebSocketInstall;
 beforeEach(() => { fake = installFakeWebSocket(); });
@@ -147,6 +148,7 @@ function fakeModel(): LiveLinkModel {
   scene.add(root); root.add(axis);
   return {
     root,
+    registry: new NodeRegistry(),
     drives: [{ node: axis }],
     transportManager: { sources: [], mus: [], preplacedMUs: [] },
   } as unknown as LiveLinkModel;
@@ -160,6 +162,9 @@ function snapshotOf(model: LiveLinkModel, texturesSkipped = 0): RuntimeStageSnap
     primPaths: ['/Root/Scenes/Scene/Root', '/Root/Scenes/Scene/Root/Axis'],
     indexOf: new Map(nodes.map((n, i) => [n, i])),
     templates: [],
+    identities: nodes.map(() => undefined),
+    addresses: nodes.map(() => null),
+    templateAddresses: [],
     preplaced: [],
     exporterWarnings: 0,
     texturesConverted: 0,
@@ -184,7 +189,10 @@ describe('usd-live-link plugin over the client', () => {
     const plugin = new UsdLiveLinkPlugin({
       store,
       sessionModule,
-      exportStage: async () => snapshotOf(model),
+      exportStage: async (input) => {
+        expect(input.registry).toBe(model.registry);
+        return snapshotOf(model);
+      },
       compress: async (b) => ({ bytes: b, encoding: 'identity' }),
       createClient: (o) => new KitLinkClient({ ...o, retryDelay: () => 0, fetch: nothingListens }),
     });

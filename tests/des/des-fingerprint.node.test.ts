@@ -28,6 +28,7 @@ import {
 import { collectModelInput, type ModelInputHost, type ModelInputRunner } from '../../src/plugins/des/rv-des-model-input';
 import { parsePathExtras } from '../../src/core/engine/rv-path';
 import { RVPathNetwork } from '../../src/core/engine/rv-path-network';
+import { findDesManager, isDesRunConfigField } from '../../src/core/material-flow/des-manager-settings';
 
 const ID = [
   1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
@@ -59,6 +60,28 @@ function fp(input: FingerprintInput): DesFingerprint {
 }
 
 describe('plan-2059 P1: strict fingerprint', () => {
+  it('reads CycleTime without injecting defaults, and hashes an explicit motion step as model content', () => {
+    const root = new Object3D(); root.name = 'Simulation';
+    const extras = { DESManager: { EndTime: 100 } };
+    root.userData.realvirtual = extras;
+    const before = JSON.stringify(root.userData);
+    const input: FingerprintInput = { ...base(), scene: [{ address: '#simulation', parent: '', matrix: ID, extras }] };
+    const originalHash = fp(input).modelHash;
+    expect(findDesManager(root)?.cycleTime).toBe(1 / 60);
+    expect(JSON.stringify(root.userData)).toBe(before);
+    expect(fp(input).modelHash).toBe(originalHash);
+    expect(isDesRunConfigField('DESManager', 'CycleTime')).toBe(false);
+    const changed: FingerprintInput = { ...base(),
+      scene: [{ ...input.scene[0], extras: { DESManager: { EndTime: 100, CycleTime: 0.01 } } }] };
+    expect(fp(changed).modelHash).not.toBe(originalHash);
+  });
+
+  it.each([[0.0001, 0.001], [0.5, 0.1], [0.01, 0.01], [NaN, 1 / 60], [Infinity, 1 / 60]])(
+    'clamps CycleTime %s to %s without changing authored extras', (raw, expected) => {
+      const root = new Object3D(); root.userData.realvirtual = { DESManager: { CycleTime: raw } };
+      expect(findDesManager(root)).toMatchObject({ cycleTime: expected, rawCycleTime: raw });
+      expect(root.userData.realvirtual.DESManager.CycleTime).toBe(raw);
+    });
   it('equal input in any order → equal hash; carries {id,type} + versions', () => {
     const a = fp(base());
     const b0 = base();

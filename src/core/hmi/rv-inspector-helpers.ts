@@ -19,6 +19,7 @@ import type { FieldDescriptor } from '../engine/rv-component-registry';
 import type { SignalStore } from '../engine/rv-signal-store';
 import { readSignalValue, formatValue } from './rv-value-resolver';
 import { formatDecimal } from './rv-number-format';
+import { LINK } from './shared-sx';
 import { FMU_STATE_COLORS, FMU_TYPE, type FmuState } from '../engine/rv-fmu-constants';
 import { isComponentReference } from '../engine/rv-node-path-rewrite.mjs';
 import {
@@ -366,6 +367,8 @@ export const BADGE_COLORS: Record<string, string> = {
   ReplayRecording: '#26a69a',
   Metadata: '#ffb74d',
   RuntimeMetadata: '#ffb74d',
+  // Same link blue as the reference row name in the hierarchy.
+  LayoutObject: LINK,
 };
 
 export function componentColor(type: string): string {

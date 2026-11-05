@@ -44,6 +44,9 @@ export interface DocumentExportContext {
   documentRevision(): string | null;
   /** The authored document bytes (non-embedding export). Export source and apply target. */
   documentGlb(): Promise<Uint8Array>;
+  /** Cheap JSON-only source for preflight. Never bakes or invokes an exporter.
+   * Throws when current edits cannot be represented without serialising the authored tree. */
+  documentJson?(): Promise<Record<string, unknown>>;
   /** True when the document carries `rvUsdPrimPath` stamps from a USD import (overlay export). */
   hasUsdPrimPaths(): boolean;
   /**
@@ -66,6 +69,10 @@ export interface DocumentExportContext {
 export interface DocumentExportMode {
   id: string;
   label: string;
+  /** Visible explanation of the file's contents and limitations. */
+  description?: string;
+  /** When set, this mode cannot run; UI and MCP show this same reason. */
+  disabledReason?: string;
   /** Suggested download / project file name, extension included. */
   fileName: string;
   /** MIME type of the produced bytes. */
@@ -83,6 +90,11 @@ export interface DocumentExportResult {
    * `colorsApproximated` (colours the target format can only approximate).
    */
   stats: Record<string, number>;
+}
+
+/** Cheap counters available before a user starts the actual export. */
+export interface DocumentExportPreflight {
+  referencesWithoutGeometry: number;
 }
 
 /** Preview of a re-import (plan-764 Phase 2, F7) — nothing is changed by it. */
@@ -123,6 +135,8 @@ export interface DocumentExportProvider {
   order?: number;
   /** The modes this document offers right now (may depend on the context, e.g. overlay). */
   modes(ctx: DocumentExportContext): DocumentExportMode[];
+  /** Optional, read-only check. Must not parse geometry, bake, or invoke an exporter. */
+  preflight?(ctx: DocumentExportContext, modeId: string): Promise<DocumentExportPreflight>;
   /** Produce the bytes for one mode. Throws with a user-facing message. */
   run(ctx: DocumentExportContext, modeId: string): Promise<DocumentExportResult>;
   /**

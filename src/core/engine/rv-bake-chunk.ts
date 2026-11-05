@@ -168,8 +168,8 @@ export interface BakedChunk {
    *
    * It addresses the FINAL index of {@link geometry}: the build permutes
    * triangles inside every segment, and nothing may reorder the index
-   * afterwards (plan §2.4a.10 — the collision manager therefore builds
-   * `indirect` trees on chunk geometries).
+   * afterwards (plan §2.4a.10). Collision READS this structure for its bodies
+   * and builds no tree of its own (plan-781, contract rule 15).
    */
   pick: ChunkPickData;
   /**
@@ -307,8 +307,7 @@ export interface BakedAsset {
 
 /**
  * Chunk metadata by geometry — the O(1) lookup geometry → chunk that the
- * `.raycast` override and the collision manager's `indirect` rule need, and the
- * dispose guard's membership test. A `WeakMap`, never `userData` (see file
+ * `.raycast` override needs, and the dispose guard's membership test. A `WeakMap`, never `userData` (see file
  * header).
  */
 export const chunkMetaOf = new WeakMap<BufferGeometry, { chunk: BakedChunk; asset: BakedAsset }>();

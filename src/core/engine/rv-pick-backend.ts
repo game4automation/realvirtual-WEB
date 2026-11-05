@@ -125,8 +125,14 @@ const _ab = new Vector3();
 
 type PickMode = 'pick' | 'surface';
 
-/** Effective `.visible` of `node` and every ancestor. */
-function effectivelyVisible(node: Object3D): boolean {
+/**
+ * Effective `.visible` of `node` and every ancestor.
+ *
+ * @internal Exported for the collision bodies (plan-781 F12: the same hidden-owner
+ * rule as {@link PickBackend}'s `_skipSegment`). Not re-exported through any
+ * plugin or public barrel.
+ */
+export function effectivelyVisible(node: Object3D): boolean {
   for (let c: Object3D | null = node; c; c = c.parent) {
     if (!c.visible) return false;
   }
@@ -212,7 +218,13 @@ function intersectStructure(
 
 // ─── Keep meshes ────────────────────────────────────────────────────
 
-interface KeepPick {
+/**
+ * A keep mesh's lazily built structure (one per geometry).
+ *
+ * @internal Exported for the collision bodies (plan-781 F8), which READ it and
+ * build no structure of their own (contract rule 15). Not re-exported.
+ */
+export interface KeepPick {
   /** `null` = brute force (too small, or dynamic geometry). */
   data: ChunkPickData | null;
   /** Guards the cache against a geometry rewrite. */
@@ -253,8 +265,12 @@ function isDynamicKeepMesh(mesh: Mesh): boolean {
  * size `buildPickStructure` leaves unsorted, so the authored index is provably
  * not permuted (the whole reason keep meshes are not staged through the bake's
  * pool).
+ *
+ * @internal Exported for the collision bodies (plan-781 F8): the collision
+ * narrowphase walks this SAME cached structure — one structure, one cache, no
+ * second copy. Not re-exported through any plugin or public barrel.
  */
-function keepStructure(mesh: Mesh): KeepPick | null {
+export function keepStructure(mesh: Mesh): KeepPick | null {
   const geometry = mesh.geometry as BufferGeometry;
   const positionAttr = geometry.getAttribute('position') as BufferAttribute | undefined;
   const indexAttr = geometry.getIndex();
@@ -367,9 +383,9 @@ function intersectKeep(
  * The override every chunk and keep mesh gets as an INSTANCE property.
  *
  * `Mesh.prototype.raycast` stays exactly as three-mesh-bvh patched it
- * (`acceleratedRaycast`) — an instance property simply shadows it, which is the
- * whole reason a collision `boundsTree` on a chunk geometry can never change a
- * pick result (plan §2.4a.10 / R6). `Object3D.clone()` does NOT copy own
+ * (`acceleratedRaycast`) — an instance property simply shadows it, so a stray
+ * `boundsTree` some caller puts on a chunk geometry can never change a pick
+ * result (plan §2.4a.10 / R6). Collision builds none since plan-781. `Object3D.clone()` does NOT copy own
  * properties, so every path that creates a mesh assigns it explicitly: the
  * bake's template meshes, `BakeRegistry.instantiate`'s `new Mesh(...)` and the
  * `clone(false)` keep clones.
@@ -488,6 +504,6 @@ export class PickBackend implements RaycastBackend {
    * unowned, which is the conservative answer.
    */
   resolveHit(hit: PickHit): BackendHitResolution {
-    return this.registry.resolveHit(hit.object, (hit as Partial<ChunkIntersection>).rvOwner ?? -1);
+    return this.registry.resolveHit(hit.object, (hit as Partial<ChunkIntersection>).rvOwner ?? -1, hit.faceIndex ?? -1);
   }
 }

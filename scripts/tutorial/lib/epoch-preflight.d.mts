@@ -10,6 +10,9 @@ export interface PreflightSample {
   now?: number;
   /** (ii): `performance.now() >= epoch` right after this reading's step; absent for samples[0]. */
   nowAtLeastEpoch?: boolean;
+  /** plan-2237 F6: DES sample — the preflight measures `renderClock` instead of `simTime`. */
+  des?: boolean;
+  renderClock?: number | null;
 }
 
 export interface PreflightReport {
@@ -77,4 +80,76 @@ export function preflightVerdict(input: {
   warmupMaxFrames: number;
   epoch?: number;
   windowFrames?: number;
+  /** plan-2237 F6: effective factor from `sim.clock.get` (default 1). */
+  factor?: number;
 }): PreflightReport;
+
+// ─── plan-2237: segment gate ───
+
+export const FIXED_STEP_HZ: number;
+export const I1_TOLERANCE_STEPS: number;
+export const I2_TOLERANCE_PER_FRAME_SEC: number;
+export const MIN_SEGMENT_FRAMES: number;
+export const TIME_COMMANDS: readonly string[];
+
+/** One normalised `sim.clock.get` reading per output frame. */
+export interface GateSample {
+  mode: 'continuous' | 'des';
+  paused: boolean;
+  simTime: number;
+  fixedStepCount: number;
+  factor: number | null;
+  subMode: string | null;
+  renderClock: number | null;
+  endTime: number | null;
+  clampBudget: number;
+  clampEnd: number;
+}
+
+export interface GateWindow { start: number; end: number; cmd: string; kind?: 'transition' | 'timelapse' }
+
+export interface GateSegment {
+  index: number;
+  startFrame: number;
+  endFrame: number;
+  kind: 'run' | 'hold' | 'jump' | 'timelapse' | 'short';
+  factor: number | null;
+  clock: 'simTime' | 'renderClock';
+  i1: number;
+  i2: number;
+  verdict: 'pass' | 'fail' | 'clamped' | 'short' | 'skipped';
+  clampedAt?: 'budget' | 'end';
+  cmd?: string;
+  /** Judged segments: evaluated frames, clock advance (s) and fixed steps over the segment. */
+  frames?: number;
+  sumClock?: number;
+  sumSteps?: number;
+}
+
+export interface SimJump { frame: number; cmd: string; fromSim: number; toSim: number }
+
+export interface SegmentGateReport {
+  verdict: 'ok' | 'fail';
+  diagnosis: 'sim-progress' | null;
+  reason: string | null;
+  segments: GateSegment[];
+  simJumps: SimJump[];
+  /** Factor and clock of the first evaluated run segment (compatibility with the old report). */
+  factor: number | null;
+  clock: 'simTime' | 'renderClock' | null;
+  /** The pre-plan-2237 report fields, over the first judged run segment (null without one): clock
+   *  advance, `factor · frames / fps`, their distance, one fixed step at the factor + the I2 allowance. */
+  sumSimTime: number | null;
+  expectedSimTime: number | null;
+  deviation: number | null;
+  tolerance: number | null;
+}
+
+export function clockSampleOf(value: unknown): GateSample | null;
+export function gateClockOf(sample: GateSample): number;
+export function gateStateKey(sample: GateSample): string;
+export function segmentGate(input: { samples: readonly (GateSample | null)[]; fps: number; windows?: readonly GateWindow[] }): SegmentGateReport;
+
+/** plan-2237: a take-wide time-command watch event (`__rvRecording.takeTimeWatch()`). */
+export interface TimeWatchEvent { id: string; phase: 'dispatch' | 'done'; ok?: boolean }
+export function timeCommandWindows(eventsAt: readonly (readonly TimeWatchEvent[] | undefined)[], lastFrame: number): GateWindow[];

@@ -9,6 +9,7 @@
  * Usage:
  *   const { plugin, state } = useEditorPlugin();          // full state (legacy)
  *   const panelOpen = useEditorState(s => s.panelOpen);   // selective subscription
+ * Shell components never use useEditorPlugin() (doc-extending-webviewer.md §6).
  */
 
 import { useSyncExternalStore, useRef, useCallback } from 'react';
@@ -53,15 +54,17 @@ export function useEditorPlugin() {
   return { plugin, state };
 }
 
+/** The editor plugin itself, without subscribing to its state. */
+export function useEditorPluginInstance() {
+  return useViewer().getPlugin<RvExtrasEditorPlugin>('rv-extras-editor');
+}
+
 /**
  * Selective subscription — only re-renders when the selected slice changes.
+ * The selector must return a primitive (Object.is comparison).
  *
  * ```ts
  * const panelOpen = useEditorState(s => s.panelOpen);
- * const { structureVersion, overlay } = useEditorState(s => ({
- *   structureVersion: s.structureVersion,
- *   overlay: s.overlay,
- * }));
  * ```
  */
 export function useEditorState<T>(selector: (state: ExtrasEditorState) => T): T {

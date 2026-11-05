@@ -129,15 +129,29 @@ describe('plan-682 AAS mode', () => {
     expect(v.getAllow()).toBe(prior);
   });
 
-  it('should switch off when the editor mode is entered and refuse to switch on there', () => {
-    const v = fakeViewer([aasPart('A')]);
-    const mode = new AasModeController(v as never);
-    mode.setOn(true);
-    v.emit('mode-changed', { from: 'hmi', to: 'editor' });
-    expect(mode.isOn).toBe(false);
-    v.modes.activeMode = 'editor';
-    mode.setOn(true);
-    expect(mode.isOn).toBe(false);
+  it('should switch off when an authoring mode (editor, planner, DES) is entered and refuse to switch on there', () => {
+    for (const authoring of ['editor', 'planner', 'des']) {
+      const v = fakeViewer([aasPart('A')]);
+      const mode = new AasModeController(v as never);
+      mode.setOn(true);
+      v.emit('mode-changed', { from: 'hmi', to: authoring });
+      expect(mode.isOn, authoring).toBe(false);
+      v.modes.activeMode = authoring;
+      mode.setOn(true);
+      expect(mode.isOn, authoring).toBe(false);
+    }
+  });
+
+  it('stays switchable in the operating modes (HMI, commissioning)', () => {
+    for (const operating of ['hmi', 'commissioning']) {
+      const v = fakeViewer([aasPart('A')]);
+      const mode = new AasModeController(v as never);
+      v.modes.activeMode = operating;
+      mode.setOn(true);
+      expect(mode.isOn, operating).toBe(true);
+      v.emit('mode-changed', { from: 'hmi', to: operating });
+      expect(mode.isOn, operating).toBe(true);
+    }
   });
 
   it('should put badges on the overlay layer next to the part and show the type code', () => {

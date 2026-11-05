@@ -35,7 +35,7 @@ async function requireScene(scene: Scene, ctx: TestContext): Promise<void> {
   } finally { w.dispose(); }
 }
 
-async function runCase(scene: Scene, mode: typeof MODES[number], cut: Cut, opts: SceneOptions = {}) {
+export async function runCase(scene: Scene, mode: typeof MODES[number], cut: Cut, opts: SceneOptions = {}) {
   let last: DESSnapshotV4 | undefined;
   try {
     await assertContinuation({ ...cut, mode, buildWorld: async () => {
@@ -230,4 +230,26 @@ export async function assertLogicRefusal(scene: Scene) {
     expect(getProblems().some(p => p.code === code)).toBe(true);
     console.info(`MATRIX_REFUSED ${JSON.stringify({ scene, reason: 'active LogicStep/PLC' })}`);
   } finally { w.dispose(); }
+}
+
+/** plan-2207 Phase 3: LogicStep scenes without DES components continue bit-exactly (no requireScene skip). */
+export function registerLogicMatrix(scenes: readonly Scene[], batchReady: readonly Scene[]) {
+  describe('plan-2207 P3: event-driven LogicStep continuation', () => {
+    for (const scene of scenes) for (const mode of MODES) {
+      it(`${scene}: ${mode}, early / mid / after warm-up`, async () => {
+        for (const cut of CUTS[scene]) await runCase(scene, mode, cut);
+      }, 300_000);
+    }
+    for (const scene of scenes) it(`${scene}: LogicStep batch guard follows the DES check`, async () => {
+      const w = await sceneWorld(scene);
+      try {
+        w.step(3);
+        const hazards = (w.runner as unknown as { _logicHazards(): readonly { system: string; nodes: readonly string[] }[] })._logicHazards();
+        console.info(`MATRIX_LOGIC_HAZARDS ${JSON.stringify({ scene, hazards })}`);
+        if (batchReady.includes(scene)) expect(hazards.filter(h => h.system === 'LogicStep')).toEqual([]);
+        const s = w.runner.fullSnapshot();
+        expect(s.parts.map(p => p.key)).toContain('core.logic');
+      } finally { w.dispose(); }
+    }, 300_000);
+  });
 }

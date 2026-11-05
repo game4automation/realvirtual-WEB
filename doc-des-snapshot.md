@@ -163,7 +163,7 @@ Keys verified in code.
 
 | Item | Where / rule |
 |---|---|
-| Snapshot blockers | `src/core/material-flow/des-snapshot-blockers.ts` (`DesSnapshotBlockers`, one instance per viewer: `viewer.snapshotBlockers`, read by the DES runner of that viewer - a second viewer on the page is not coupled). Subsystems that tick in DES mode but have no participant refuse capture AND restore with `des-snapshot-unsupported-component`: running LogicStep roots, active IK paths, playback, replay recordings (`CoreSubsystems`), running PLC programs (Private PlcPlugin) |
+| Snapshot blockers | `src/core/material-flow/des-snapshot-blockers.ts` (`DesSnapshotBlockers`, one instance per viewer: `viewer.snapshotBlockers`, read by the DES runner of that viewer - a second viewer on the page is not coupled). Subsystems that tick in DES mode but have no participant refuse capture AND restore with `des-snapshot-unsupported-component`: LogicStep roots without a DES mapping, active IK paths, playback, replay recordings (`CoreSubsystems`), grippers/zones holding MUs, and the narrow PLC cases of the Private PlcPlugin (program in error, deployed code differs from the model, manually deployed, live program without a model node) |
 | Unclaimed drives | `DESRunner` refuses capture and restore (`des-state-not-declared`) when a viewer drive outside `des.drives` and not claimed by a participant (`Snapshottable.claimsDrives`) moves or rests away from its start position. Follower drives (`Drive_Gear`, `Drive_FollowPosition`) are derived and exempt |
 | Lift positions | `fleet.lift` carries `positions` of the fork-lift drives and claims them |
 | Drive tween windows | `des.tweens` also holds running DES drive windows (drive address, t0, t1, from, to) linked to their queue event; Turntable rotation continues with the same window |
@@ -186,4 +186,5 @@ Keys verified in code.
 | Script statistics | `src/plugins/web-component-plugin.ts` uses `statisticsManager`; Script StateStatistics are outside the snapshot |
 | Guest callbacks | Dynamically registered `_cbs` in `src/core/sdk/rv-sdk-self.ts` are not stored |
 | `stats.flushMs` | Wall-clock diagnostic timing is not stored |
-| LogicSteps, PLC programs, IK paths | No participant yet: scenes running them (standard demo `DemoRealvirtualWeb`, `LaserWeldingAssemblyStation`) refuse snapshots visibly (blockers above) |
+| LogicSteps, PLC programs | Participants `core.logic` (event-driven LogicSteps) and `plc.programs` (ST programs; their timer deadlines, process images and write batches live in `core.settle`). Still refused visibly: LogicStep types without a DES mapping, a PLC program in error, a program whose deployed code differs from the model code, a manually deployed program (`Active = false`), the live editor program without a model node, and a program that is still deploying (`des-snapshot-plc-pending`) |
+| IK paths, grippers holding MUs | No participant yet: an active IK path, and a gripper or zone holding MUs, refuse snapshots visibly (blockers above) |

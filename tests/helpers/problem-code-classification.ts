@@ -33,12 +33,13 @@ export interface ProblemCodeClassification {
    * (plan-2211: the DES experiment manager). The scan finds it there when the private
    * sibling is present; a community checkout does not carry the module.
    */
-  readonly module?: 'des-experiments';
+  readonly module?: 'des-experiments' | 'display-wall';
 }
 
 export const PROBLEM_CODE_CLASSIFICATION: Readonly<Record<string, ProblemCodeClassification>> = Object.freeze({
   // ─── clear-model ───────────────────────────────────────────────────────
   'logic-gated': { retire: 'clear-model', retiredBy: 'clearLogicGatedProblems()' },
+  'logic-instant-loop': { retire: 'clear-model', retiredBy: 'clearLogicGatedProblems() (plan-2207 Phase 3)' },
   'override-orphaned': { retire: 'clear-model', retiredBy: 'clearOverrideOrphanedProblems()' },
   'override-transforms-dropped': { retire: 'clear-model', retiredBy: 'clearOverrideOrphanedProblems() (plan-769 F14)' },
   'nested-transform-refused': { retire: 'clear-model', retiredBy: 'clearOverrideOrphanedProblems() + every bakeIntoGlb() start (plan-769 D11)' },
@@ -106,6 +107,10 @@ export const PROBLEM_CODE_CLASSIFICATION: Readonly<Record<string, ProblemCodeCla
   'drop-detection-duplicate': { retire: 'clear-model', retiredBy: 'dropManager.clear() inside clearModel' },
 
   // ─── owner-teardown ────────────────────────────────────────────────────
+  'collision-authored-overlap': { retire: 'owner-teardown', retiredBy: 'CollisionManager.clear() (called from RVViewer.clearModel) runs clearCollisionOverlapProblems; an empty pair list clears the entry (plan-781)' },
+  'collision-start-overlap': { retire: 'owner-teardown', retiredBy: 'CollisionManager.clear() (called from RVViewer.clearModel) runs clearCollisionOverlapProblems; an empty pair list clears the entry (plan-781)' },
+  'signal-binding-unresolved': { retire: 'owner-teardown', retiredBy: 'SignalBindingManager retires the entries of an element on every applyMappings (retire-then-report), unbindAll and dispose() — clearModel disposes the manager (contract-node-identity R4/R10)' },
+  'wall-tracking-prefix-ignored': { retire: 'owner-teardown', retiredBy: 'RVDisplayWall.dispose() clears its entry; every reapplyConfig retires or re-reports it (plan-2233 F8)', module: 'display-wall' },
   'signal-connector-unresolved': { retire: 'owner-teardown', retiredBy: 'RVSignalConnector.dispose() → SignalConnectorNetwork.remove() clears every code of that connector (plan-2227); the network re-checks on every config change' },
   'signal-connector-slot-mismatch': { retire: 'owner-teardown', retiredBy: 'RVSignalConnector.dispose() → SignalConnectorNetwork.remove() clears every code of that connector (plan-2227); the network re-checks on every config change' },
   'signal-connector-direction': { retire: 'owner-teardown', retiredBy: 'RVSignalConnector.dispose() → SignalConnectorNetwork.remove() clears every code of that connector (plan-2227); the network re-checks on every config change' },
@@ -159,6 +164,8 @@ export const PROBLEM_CODE_CLASSIFICATION: Readonly<Record<string, ProblemCodeCla
   'planning-scenario-block-invalid': { retire: 'owner-teardown', retiredBy: 'PlanningParametersPlugin.onModelCleared() (plan-630 Phase 3)' },
   'planning-apply-failed': { retire: 'owner-teardown', retiredBy: 'PlanningParametersPlugin.onModelCleared(); also cleared by the next successful apply (plan-630 Phase 2)' },
   'planning-apply-rollback-failed': { retire: 'owner-teardown', retiredBy: 'PlanningParametersPlugin.onModelCleared() (plan-630 Phase 2)' },
+  'planning-committed-recovered': { retire: 'owner-teardown', retiredBy: 'PlanningParametersPlugin.onModelCleared(); also cleared on owner retire and the next successful apply (plan-681 F2/F5)' },
+  'planning-committed-recovery-failed': { retire: 'owner-teardown', retiredBy: 'PlanningParametersPlugin.onModelCleared(); also cleared on owner retire and the next successful apply (plan-681 F2/F5)' },
   'param-apply-rollback-failed': { retire: 'owner-teardown', retiredBy: 'VariantsRuntime.unbindDocument() on every document change; also cleared by the next successful rollback (plan-2013 Phase 1)' },
   'variant-target-missing': { retire: 'owner-teardown', retiredBy: 'VariantsRuntime.unbindDocument() + every activation (plan-2013 Phase 1)' },
   'variant-apply-warning': { retire: 'owner-teardown', retiredBy: 'VariantsRuntime.unbindDocument() (plan-2013 Phase 1)' },
@@ -179,6 +186,13 @@ export const PROBLEM_CODE_CLASSIFICATION: Readonly<Record<string, ProblemCodeCla
   'des-action-failed': { retire: 'owner-teardown', retiredBy: 'DESRunner.dispose() via SimulationKernel.dispose() in RVViewer.clearModel() (plan-2005)' },
   'des-legacy-component': { retire: 'owner-teardown', retiredBy: 'DESRunner.dispose() → clearSceneBindingProblems() via SimulationKernel.dispose() in RVViewer.clearModel(); also at every bindSceneToRunner() (plan-2005)' },
   'des-invalid-capacity': { retire: 'owner-teardown', retiredBy: 'DESRunner.dispose() → clearSceneBindingProblems() via SimulationKernel.dispose() in RVViewer.clearModel(); also at every bindSceneToRunner() (plan-2005)' },
+  // plan-2207 Phase 1: both belong to one DES run of this model.
+  'des-tick-ownership-conflict': { retire: 'owner-teardown', retiredBy: 'DESRunner._clearTickOwnership() on rebind/reset/clearMUs and DESRunner.dispose() via SimulationKernel.dispose() in RVViewer.clearModel() (plan-2207)' },
+  'des-settle-overflow': { retire: 'owner-teardown', retiredBy: 'SettleController.reset()/dispose() (DESRunner reset and dispose via SimulationKernel.dispose() in RVViewer.clearModel(), plan-2207)' },
+  'des-logic-not-event-suitable': { retire: 'owner-teardown', retiredBy: 'DESRunner._detachLogicOwner() on re-register/reset/clearMUs/dispose (SimulationKernel.dispose() in RVViewer.clearModel(), plan-2207 Phase 3)' },
+  'des-plc-not-event-suitable': { retire: 'owner-teardown', retiredBy: 'DESRunner unsuitable-problem teardown on reset/clearMUs/dispose (SimulationKernel.dispose() in RVViewer.clearModel(), plan-2207 Phase 5b)' },
+  'des-logic-poll-hint': { retire: 'owner-teardown', retiredBy: 'DESRunner._detachLogicOwner() on re-register/reset/clearMUs/dispose (SimulationKernel.dispose() in RVViewer.clearModel(), plan-2207 Phase 3)' },
+  'des-zero-time-pulse': { retire: 'owner-teardown', retiredBy: 'DESRunner.clearMUs() and DESRunner.dispose() call offPulseWatch() beside offButtonBlocker; _bindEventOwners() detaches before rebinding (plan-2207 Phase 4)' },
   'muswitcher-no-sensor': { retire: 'owner-teardown', retiredBy: 'MUSwitcher.dispose()' },
 
   // ─── next-load ─────────────────────────────────────────────────────────
@@ -213,6 +227,7 @@ export const PROBLEM_CODE_CLASSIFICATION: Readonly<Record<string, ProblemCodeCla
   'agv-service-stop-missed-no-return': { retire: 'known-gap', retiredBy: 'Agv runtime finding; no clear' },
   'agv-turn-point-overshoot': { retire: 'known-gap', retiredBy: 'Agv runtime finding; no clear' },
   'placement-name-collision': { retire: 'known-gap', retiredBy: 'layout-planner scene mutation; no clear' },
+  'library-scope-placement': { retire: 'known-gap', retiredBy: 'plan-780: layout-planner warns about a placement in the edited library document; neither onModelCleared nor dispose clears it' },
   'placement-name-empty': { retire: 'known-gap', retiredBy: 'scene GLB bake (save); no clear' },
   'aasx-import-refused': { retire: 'known-gap', retiredBy: 'AAS link field: cleared on the next attempt only' },
   'fmu-attach-refused': { retire: 'known-gap', retiredBy: 'FMU attach action: cleared on the next attempt only' },
@@ -246,6 +261,7 @@ export const PROBLEM_CODE_CLASSIFICATION: Readonly<Record<string, ProblemCodeCla
   // plan-778: the saved library file is fine; only B's manifest row is stale. Retired by a successful row refresh (Retry action) — a library project is not the loaded document.
   'library-row-stale': { retire: 'not-document', retiredBy: 'library project manifest row; the Retry action (library.refreshDocumentRow) or the next successful save of that document retires it' },
   'save-reference-loss': { retire: 'not-document', retiredBy: 'describes a written FILE; the next save of that document retires it' },
+  'reference-not-upgraded': { retire: 'not-document', retiredBy: 'plan-780 R4a: describes a legacy reference preserved in a written file; survives model changes, no explicit clear today' },
   'duplicate-asset-id': { retire: 'not-document', retiredBy: 'project manifest scope (reportDocumentIdCollisions)' },
   'library-unavailable': { retire: 'not-document', retiredBy: 'project scope: installLibraryAvailability mirrors the library-project loader — cleared when the library is ready or the project is closed / switched (plan-778)' },
   'library-reference-update': { retire: 'not-document', retiredBy: 'project scope: installLibraryReferenceUpdate mirrors the open project — cleared when the reference is migrated (Update) or the project is closed / switched (plan-778 Decision B)' },

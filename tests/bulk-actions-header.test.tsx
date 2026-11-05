@@ -61,7 +61,7 @@ describe('bulk header actions (plan-325 9.8)', () => {
       .not.toContain('signal-auto-assign');
   });
 
-  it('Auto-assign arms with confident matches on the first click and applies on the second', () => {
+  it('Auto-assign arms with confident matches on the first click and applies on the second', async () => {
     withConnectSignals(['Forward', 'TotallyUnrelatedXyz']);
     const f = makeInlineSlotFixture();
     const ctx = ctxFor(f);
@@ -80,6 +80,8 @@ describe('bulk header actions (plan-325 9.8)', () => {
     // Second click: applies the exact 'Forward' match (weak matches dropped).
     auto.onClick(ctx);
     expect(auto.isActive?.(ctx)).toBe(false);
+    // plan-2233: the write is one entry of the bind queue (never inside another edit).
+    await vi.waitFor(() => expect(f.mgr.getLinkedSourceNames().has('Forward')).toBe(true));
     f.mgr.tick(0.02);
     expect(f.mgr.getBindingLiveness(f.nodePath, 'Forward', '.')).toBeDefined();
     const links = f.mgr.getLinkedSourceNames();
@@ -87,7 +89,7 @@ describe('bulk header actions (plan-325 9.8)', () => {
     expect(links.has('TotallyUnrelatedXyz')).toBe(false);
   });
 
-  it('Unbind all requires the two-click confirm and then clears the section mappings', () => {
+  it('Unbind all requires the two-click confirm and then clears the section mappings', async () => {
     withConnectSignals([]);
     const f = makeInlineSlotFixture();
     const applied = f.mgr.applyMappings(f.nodePath, f.node, [{
@@ -109,7 +111,8 @@ describe('bulk header actions (plan-325 9.8)', () => {
 
     // Second click executes.
     unbind.onClick(ctx);
-    expect(f.mgr.getLinkedSourceNames().size).toBe(0);
+    // plan-2233: queued like every bind.
+    await vi.waitFor(() => expect(f.mgr.getLinkedSourceNames().size).toBe(0));
   });
 
   it('the old inspector SignalBindSection no longer exists in the codebase', () => {

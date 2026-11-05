@@ -17,13 +17,13 @@ import { planMove } from './lib/cursor-path.mjs';
 import {
   DEFAULT_FPS, DEFAULT_MOTION_REGION, MARKER_LEAD_SEC, MARKER_SEC, MARKER_TAIL_SEC, MIN_MOVED_FRACTION, MOTION_DOWNSCALE,
   MOTION_METRIC, MOTION_SCALE, STILL_THRESHOLD, controlFrameVerdict, frameAtStart, frameBudget,
-  frameCountVerdict, frameToSec, framesOf, motionShapeVerdict, motionVerdict, syncVerdict,
-  traceCoverageVerdict, segmentKindOf,
+  frameCountVerdict, frameToSec, framesOf, motionShapeVerdict, motionVerdict, resolveMotionPolicy, stepMotionVerdicts,
+  syncVerdict, traceCoverageVerdict, segmentKindOf,
 } from './lib/tutorial-events.mjs';
 import { gpuVerdict, sceneVerdict } from './lib/scene-probe.mjs';
 import {
   PREFLIGHT_WARMUP_SEC, PREFLIGHT_WINDOW_FRAMES, preflightVerdict, warmupEndIndex,
-  clockOnlyVerdict, simProgressVerdict,
+  clockOnlyVerdict, clockSampleOf, segmentGate, TIME_COMMANDS, timeCommandWindows,
 } from './lib/epoch-preflight.mjs';
 import { parseTutorial } from './lib/tutorial-schema.mjs';
 import { virtualClockInitScript } from './lib/virtual-clock.mjs';
@@ -39,7 +39,7 @@ const SYNOPSIS = `Usage:
   node scripts/tutorial/run.mjs --script scripts/tutorial/storyboards/demo-basics.json \\
     [--dir <output folder>] [--dist <folder>] [--port 5199] [--base <url>] [--overwrite] \\
     [--ffmpeg <path>] [--ffprobe <path>] [--gpu-check require|off] \\
-    [--motion-check require|off] [--keep-temp] [--epoch-zero-diagnosis] [--burn-cursor] \\
+    [--motion-check require|warn|off] [--keep-temp] [--epoch-zero-diagnosis] [--burn-cursor] \\
     [--stamp proof|inline] [--profile <dir>] [--save-profile <dir>]
   node scripts/tutorial/run.mjs --prepare-profile <dir> --base <url>`;
 const GPU_ARGS = Object.freeze([
@@ -280,6 +280,12 @@ async function waitForServer(base) {
   fail(1, 'server-not-ready', `GET / was not ready within 5 s at ${base}: ${last}`);
 }
 
+/**
+ * Runs before every document of the take. Order (plan-2240 F7): the recorder's fixed seeds
+ * (`RECORDER_SEED_KEYS`), then the panel cleanup, then the storyboard's `storage` — so a storyboard
+ * that sets an `rv-panel-geo:*` key keeps it, and a fixed seed changes only with `storageOverride`
+ * (checked by the schema).
+ */
 function pagePreparationInitScript(options) {
   try {
     localStorage.setItem('rv-terms-accepted', '1');
@@ -289,6 +295,7 @@ function pagePreparationInitScript(options) {
     for (const key of Object.keys(localStorage)) {
       if (key.startsWith('rv-panel-geo:') || key.startsWith('rv-panel-collapsed:')) localStorage.removeItem(key);
     }
+    for (const [key, value] of Object.entries(options.storage ?? {})) localStorage.setItem(key, value);
   } catch { /* opaque origin */ }
   const dismissed = new WeakSet();
   const closeBanner = () => {
@@ -343,10 +350,6 @@ function buttonName(button) {
   return button ?? 'left';
 }
 
-function centerOf(box) {
-  return { x: box.x + box.w / 2, y: box.y + box.h / 2 };
-}
-
 function movedMoreThanTwo(a, b) {
   return Math.hypot(a.x - b.x, a.y - b.y) > 2;
 }
@@ -391,8 +394,66 @@ function matchingCommand(events, action) {
   if (action.via !== 'direct' && action.args !== undefined && !isDeepStrictEqual(event.args, action.args)) {
     fail(1, 'command-args-mismatch', `${action.id}: expected ${JSON.stringify(action.args)}, actual ${JSON.stringify(event.args)}`);
   }
-  if (event.ok === false) fail(1, 'command-failed', `${action.id}: command execution failed`);
+  // plan-2237 F9 (review): the click path keeps the structured cause (`kind`, `reason`).
+  if (event.ok === false) failCommand(action, event);
   return true;
+}
+
+/** plan-2237 Phase 2: what `timelapse-timeout` dispatches when the command is still running. */
+const TIMELAPSE_CANCEL_COMMAND = 'experiment.run.cancel';
+
+/** plan-2237: how often a time-lapse section polls its command while it waits for the next slot (ms). */
+const TIMELAPSE_POLL_MS = 20;
+
+/** plan-2237 F9 (contract-tier-boundary rules 5/6): command families that are Commercial. */
+const COMMERCIAL_COMMAND_PREFIXES = Object.freeze(['des.checkpoint.', 'experiment.', 'snapshot.']);
+
+/**
+ * A failed command dispatch. A command the build does not have (`unavailable`, `commercial-feature`,
+ * `unknown`) is a storyboard diagnosis naming the command — in a Community build the Commercial
+ * families answer "unavailable" (F9) — never a crash.
+ */
+function failCommand(action, result) {
+  const kind = result?.kind;
+  if (kind === 'unavailable' || kind === 'commercial-feature' || kind === 'unknown') {
+    const commercial = COMMERCIAL_COMMAND_PREFIXES.some((prefix) => action.id.startsWith(prefix));
+    fail(1, 'command-unavailable', `storyboard command '${action.id}' is not available in this build (${kind}: ${result.reason})`
+      + (commercial ? ` — ${action.id} is a Commercial command (${COMMERCIAL_COMMAND_PREFIXES.map((p) => `${p}*`).join(', ')}); record this storyboard with the Commercial build` : ''));
+  }
+  fail(1, 'command-failed', `${action.id}: ${result?.reason ?? 'execution failed'}`);
+}
+
+const isCommercialCommand = (id) => COMMERCIAL_COMMAND_PREFIXES.some((prefix) => id.startsWith(prefix));
+
+/** A click-dispatched command that cannot run: Commercial -> command-unavailable, else command-disabled. */
+function failNotRunnable(action, reason) {
+  if (isCommercialCommand(action.id)) failCommand(action, { kind: 'unavailable', reason });
+  fail(1, 'command-disabled', `${action.id}: ${reason}`);
+}
+
+/**
+ * plan-2237 F9 (review round 2): before a CLICK-dispatched command looks for its button, ask the
+ * registry — read-only, nothing is executed (`__rvRecording.commandState`). An unknown command
+ * (a Commercial one in the Community build) is `command-unavailable` at once; a missing or disabled
+ * button of a command the registry does not enable says why, instead of a bare
+ * `command-button-missing` or a click that never dispatches (`command-timeout`).
+ */
+async function checkClickCommand(page, action) {
+  const state = await page.evaluate(({ id, args }) => window.__rvRecording?.commandState?.(id, args) ?? null,
+    { id: action.id, args: action.args });
+  if (state && state.known === false) {
+    const commercial = isCommercialCommand(action.id);
+    failCommand(action, { kind: commercial ? 'commercial-feature' : 'unknown', reason: 'the command is not registered in this build' });
+  }
+  let locator;
+  try {
+    locator = await commandButtonLocator(page, { command: action.id, buttonKey: action.buttonKey });
+  } catch (error) {
+    if (error instanceof TutorialRunError && error.diagnosis === 'command-button-missing' && state?.enabled === false) failNotRunnable(action, state.reason);
+    throw error;
+  }
+  const disabled = await locator.evaluate((element) => element.disabled === true || element.getAttribute('aria-disabled') === 'true');
+  if (disabled) failNotRunnable(action, state?.enabled === false && state.reason ? state.reason : 'its button is disabled');
 }
 
 function bindPick(action, result, bindings) {
@@ -400,7 +461,22 @@ function bindPick(action, result, bindings) {
   bindings.set(action.as, result.path);
 }
 
-async function inspectTarget(page, target, { requireHit = false } = {}) {
+/** plan-2240: a selector target with an `offset` (CSS pixels from the element's centre). */
+function hasOffset(target) {
+  return Boolean(target && typeof target === 'object' && 'selector' in target && target.offset);
+}
+
+/**
+ * The ONE target resolution of setup and take (plan-2240 F8).
+ *
+ * `requireHit`: the element (or, for an offset target, whatever is under the offset point) must
+ * not be covered. An offset target is ALWAYS checked at its offset point: the point must lie in
+ * the viewport and the topmost element there must be the target, inside it, or one of its
+ * ancestors (the point beside a label is fine, an unrelated layer over it is not).
+ * `lenient` (setup): a non-unique selector takes the first match and a target without offset is
+ * not checked for visibility — the setup's behaviour before plan-2240.
+ */
+async function inspectTarget(page, target, { requireHit = false, lenient = false } = {}) {
   if ('node' in target || 'recordingTarget' in target) {
     await requireRecordingSeam(page);
     const point = await page.evaluate((value) => 'node' in value
@@ -418,31 +494,37 @@ async function inspectTarget(page, target, { requireHit = false } = {}) {
   const candidates = 'command' in target ? await commandButtonLocator(page, target) : page.locator(target.selector);
   const matches = await candidates.count();
   if (matches === 0) throw new Error(`target '${target.selector}' does not exist`);
-  if (matches > 1) throw new Error(`target '${target.selector}' matches ${matches} elements; a storyboard target must be unique`);
+  if (matches > 1 && !lenient) throw new Error(`target '${target.selector}' matches ${matches} elements; a storyboard target must be unique`);
+  const offset = hasOffset(target) ? target.offset : null;
   const locator = candidates.first();
   await locator.evaluate((element) => element.scrollIntoView({ block: 'center', inline: 'center' }));
-  const raw = await locator.evaluate((element, checkHit) => {
+  const raw = await locator.evaluate((element, { checkHit, shift }) => {
     const rect = element.getBoundingClientRect();
     const style = getComputedStyle(element);
-    const x = rect.x + rect.width / 2;
-    const y = rect.y + rect.height / 2;
-    const hit = document.elementFromPoint(x, y);
+    const x = rect.x + rect.width / 2 + (shift ? shift.dx : 0);
+    const y = rect.y + rect.height / 2 + (shift ? shift.dy : 0);
+    const inViewport = x >= 0 && y >= 0 && x < window.innerWidth && y < window.innerHeight;
+    const hit = inViewport ? document.elementFromPoint(x, y) : null;
+    const owned = hit !== null && (hit === element || element.contains(hit) || (shift !== null && hit.contains(element)));
     return {
       rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
+      point: { x, y },
       borderLeft: Number.parseFloat(style.borderLeftWidth) || 0,
       borderTop: Number.parseFloat(style.borderTopWidth) || 0,
       visible: rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden'
-        && style.display !== 'none' && Number.parseFloat(style.opacity || '1') > 0,
-      hit: !checkHit || hit === element || element.contains(hit),
+        && style.display !== 'none' && Number.parseFloat(style.opacity || '1') > 0
+        && (shift === null || inViewport),
+      hit: !checkHit || owned,
     };
-  }, requireHit);
-  if (!raw.visible) throw new Error(`target '${target.selector}' is not visible`);
-  if (!raw.hit) throw new Error(`target '${target.selector}' is covered at its click point`);
-  const point = centerOf(raw.rect);
+  }, { checkHit: requireHit || offset !== null, shift: offset });
+  if (!raw.visible && !(lenient && !offset)) throw new Error(`target '${target.selector}' is not visible${offset ? ' at its offset point' : ''}`);
+  if (!raw.hit) throw new Error(`target '${target.selector}' is covered at its ${offset ? 'offset point' : 'click point'}`);
+  const point = raw.point;
   return {
     box: raw.rect,
     point,
     locator,
+    offset,
     position: { x: point.x - (raw.rect.x + raw.borderLeft), y: point.y - (raw.rect.y + raw.borderTop) },
   };
 }
@@ -455,14 +537,12 @@ function seedOf(stepId, actionIndex, attempt) {
 
 async function performSetupAction(page, action, bindings) {
   action = substituteAction(action, bindings);
-  const targetLocator = async (target) => {
-    if ('command' in target) return commandButtonLocator(page, target);
-    if (!('selector' in target)) return null;
-    const locator = page.locator(target.selector).first();
-    if (await locator.count() === 0) throw new Error(`setup target '${target.selector}' does not exist`);
-    await locator.evaluate((element) => element.scrollIntoView({ block: 'center', inline: 'center' }));
-    return locator;
-  };
+  // plan-2240 F8: the setup resolves targets through the SAME `inspectTarget` as the take
+  // (`lenient`: first match, no visibility check without offset — the setup's old behaviour).
+  const resolveTarget = (target) => inspectTarget(page, target, { lenient: true });
+  // A locator click without `position` keeps Playwright's own centre; an offset target clicks at
+  // its offset point.
+  const at = (resolved, options) => (resolved.offset ? { ...options, position: resolved.position } : options);
   switch (action.type) {
     case 'command': {
       await requireRecordingSeam(page);
@@ -482,8 +562,9 @@ async function performSetupAction(page, action, bindings) {
             ]);
           } finally { clearTimeout(timer); }
           if (result === null) fail(1, 'command-timeout', `${action.id} exceeded ${action.maxWaitSec} s`);
-          if (!result?.ok) fail(1, 'command-failed', `${action.id}: ${result?.reason ?? 'execution failed'}`);
+          if (!result?.ok) failCommand(action, result);
         } else {
+          await checkClickCommand(page, action);
           const locator = await commandButtonLocator(page, { command: action.id, buttonKey: action.buttonKey });
           await locator.click({ force: true });
         }
@@ -509,58 +590,51 @@ async function performSetupAction(page, action, bindings) {
       break;
     }
     case 'click': {
-      const target = await targetLocator(action.target);
-      if (target) await target.click({ button: action.button, force: true });
-      else {
-        const { point } = await inspectTarget(page, action.target);
-        await page.mouse.click(point.x, point.y, { button: action.button });
-      }
+      const target = await resolveTarget(action.target);
+      if (target.locator) await target.locator.click(at(target, { button: action.button, force: true }));
+      else await page.mouse.click(target.point.x, target.point.y, { button: action.button });
       break;
     }
     case 'doubleClick': {
-      const target = await targetLocator(action.target);
-      if (target) await target.dblclick({ button: action.button, force: true });
-      else {
-        const { point } = await inspectTarget(page, action.target);
-        await page.mouse.dblclick(point.x, point.y, { button: action.button });
-      }
+      const target = await resolveTarget(action.target);
+      if (target.locator) await target.locator.dblclick(at(target, { button: action.button, force: true }));
+      else await page.mouse.dblclick(target.point.x, target.point.y, { button: action.button });
       break;
     }
     case 'hover': {
-      const target = await targetLocator(action.target);
-      if (target) await target.hover({ force: true });
-      else {
-        const { point } = await inspectTarget(page, action.target);
-        await page.mouse.move(point.x, point.y);
-      }
+      const target = await resolveTarget(action.target);
+      if (target.locator) await target.locator.hover(at(target, { force: true }));
+      else await page.mouse.move(target.point.x, target.point.y);
       break;
     }
     case 'drag': {
-      const from = await targetLocator(action.from);
-      const to = await targetLocator(action.to);
-      if (!from || !to) throw new Error('setup drag needs selector targets');
-      await from.dragTo(to, { force: true });
+      // Any target kind at both ends (selector, selector + offset, absolute {x, y}, node,
+      // recording target) — a window grip can be dragged by coordinates (plan-2240, gap 20).
+      // The end is resolved after the press, so a scroll it needs cannot move the start.
+      const button = action.button ?? 'left';
+      const from = await resolveTarget(action.from);
+      await page.mouse.move(from.point.x, from.point.y);
+      await page.mouse.down({ button });
+      const to = await resolveTarget(action.to);
+      await page.mouse.move(to.point.x, to.point.y, { steps: 10 });
+      await page.mouse.up({ button });
       break;
     }
     case 'wheel': {
-      const at = await targetLocator(action.at);
-      if (at) await at.hover({ force: true });
-      else {
-        const { point } = await inspectTarget(page, action.at);
-        await page.mouse.move(point.x, point.y);
-      }
+      const target = await resolveTarget(action.at);
+      if (target.locator) await target.locator.hover(at(target, { force: true }));
+      else await page.mouse.move(target.point.x, target.point.y);
       await page.mouse.wheel(0, action.deltaY);
       break;
     }
     case 'press': await page.keyboard.press(action.key); break;
     case 'type': {
-      const target = await targetLocator(action.target);
-      if (target) {
-        await target.click({ force: true });
-        await target.pressSequentially(action.text, { delay: action.delayMs });
+      const target = await resolveTarget(action.target);
+      if (target.locator) {
+        await target.locator.click(at(target, { force: true }));
+        await target.locator.pressSequentially(action.text, { delay: action.delayMs });
       } else {
-        const { point } = await inspectTarget(page, action.target);
-        await page.mouse.click(point.x, point.y);
+        await page.mouse.click(target.point.x, target.point.y);
         await page.keyboard.type(action.text, { delay: action.delayMs });
       }
       break;
@@ -635,6 +709,8 @@ async function performSetupAction(page, action, bindings) {
 }
 
 const CURSOR_PRESS_SEC = 0.15;
+/** plan-2237: a recorded camera flight ends this much before its last frame (see the camera action). */
+const CAMERA_END_MARGIN_SEC = 0.001;
 
 /**
  * The proof grab (plan-2043, `stamp: 'proof'`): ONLY the stamp region, inside the viewport — no
@@ -648,7 +724,47 @@ function proofGrab(scroll) {
   };
 }
 
-function createCaptureState({ page, cdp, encoder, encoder2 = null, proofEncoder = null, fps, trace }) {
+/**
+ * plan-2237 F2/F3: the clock reading of one output frame, taken in the page right after its step
+ * (or its `markFrame` in a time-lapse). `sim.clock.get` is a read-only registry command
+ * (contract-commands-mcp rule 5): the factor comes from the STATE, never from an observed rate.
+ * Serialised into the page — no outside references.
+ */
+async function readClockInPage() {
+  const viewer = window.viewer;
+  let clock = null;
+  let clockError = null;
+  try {
+    const result = await window.__rvRecording?.execute?.('sim.clock.get', {});
+    if (result?.ok) clock = result.value;
+    else clockError = result?.reason ?? 'sim.clock.get unavailable';
+  } catch (error) { clockError = String(error); }
+  return {
+    paused: viewer?.isSimulationPaused ?? null,
+    simTime: viewer?.simTime ?? null,
+    fixedStepCount: viewer?.fixedStepCount ?? null,
+    ...(clock?.des ? { des: true, renderClock: clock.des.renderClock, desSubMode: clock.des.subMode } : {}),
+    clock,
+    clockError,
+    // plan-2237 F3 (review): time commands seen since the last frame, whoever dispatched them.
+    timeEvents: window.__rvRecording?.takeTimeWatch?.() ?? null,
+  };
+}
+
+/** Resolves with the grab, or with null once `ms` passed (the grab itself is not cancelled). */
+async function grabWithin(cdp, params, ms) {
+  let timer;
+  try {
+    return await Promise.race([
+      cdp.send('Page.captureScreenshot', params),
+      new Promise((done) => { timer = setTimeout(() => done(null), ms); }),
+    ]);
+  } finally { clearTimeout(timer); }
+}
+
+const APP_GRAB = Object.freeze({ format: 'jpeg', quality: 95, captureBeyondViewport: false, fromSurface: true });
+
+function createCaptureState({ page, cdp, encoder, encoder2 = null, proofEncoder = null, fps, trace, readClock = false, deps = {} }) {
   let frame = 0;
   let ring = null; // { start, x, y } of the latest left press (burn-cursor only)
   let cursor = { x: 0, y: 0 };
@@ -661,32 +777,21 @@ function createCaptureState({ page, cdp, encoder, encoder2 = null, proofEncoder 
       const press = trace.buttons.slice(buttonsBefore).find((event) => event.type === 'down' && event.button === 'left');
       if (press) ring = { start: frame, x: press.x, y: press.y };
     }
-    const timing = await page.evaluate(async ({ dt, wasPaused, proof }) => {
+    const timing = await page.evaluate(async ({ dt, proof, readClock: withClock }) => {
       // Proof mode: the stamp shown for the previous frame's proof grab is hidden again BEFORE this
       // frame's app grab — recording.mp4 never contains a stamp pixel.
       if (proof) window.__tutorialOverlay?.stamp(false);
-      // Read the effective speed at resume, after the action and before its first step.
-      let factor;
-      if (wasPaused === true && window.viewer?.isSimulationPaused === false) {
-        const result = await window.__rvRecording?.execute('des.status', {});
-        factor = result?.ok && result.value?.subMode === 'hybrid' ? result.value.multiplier : 1;
-      }
       const stepped = window.__vt.step(dt);
+      const read = withClock ? await window.__rvTutorialReadClock() : null;
       const viewer = window.viewer;
-      // DES clocks (read-only seam accessor): renderClock is continuous, simTime jumps per event.
-      const desFields = () => {
-        const clock = window.__rvRecording?.desClock?.();
-        return clock ? { des: true, renderClock: clock.renderClock, desSubMode: clock.subMode } : {};
-      };
       return {
         frame: stepped.frame,
         paused: viewer?.isSimulationPaused ?? null,
         simTime: viewer?.simTime ?? null,
         fixedStepCount: viewer?.fixedStepCount ?? null,
-        factor,
-        ...desFields(),
+        ...(read ?? {}),
       };
-    }, { dt: 1000 / fps, wasPaused: timings.at(-1)?.paused, proof: proofEncoder !== null });
+    }, { dt: 1000 / fps, proof: proofEncoder !== null, readClock });
     const shot = await cdp.send('Page.captureScreenshot', {
       format: 'jpeg', quality: 95, captureBeyondViewport: false, fromSurface: true,
     });
@@ -729,6 +834,160 @@ function createCaptureState({ page, cdp, encoder, encoder2 = null, proofEncoder 
     return timing;
   }
 
+  /**
+   * plan-2237 Phase 2 — ONE time-lapse output frame in wall mode: hold the pump, `markFrame(flush)`
+   * (page time to the wall instant, timers and rAF run, the stamp is painted), then grab A, B
+   * (cursor, `--burn-cursor`) and P (stamp proof) of that same frame, then release the pump. The
+   * frame counts only after the COMPLETE sequence; a grab over `deadlineMs` re-grabs the same frame
+   * once, a second miss is Exit 1 `timelapse-grab-timeout` — never a duplicate (it would carry the
+   * previous stamp and break Gate A).
+   */
+  async function captureWallFrame(budgetMs) {
+    const realGrab = (params, ms) => grabWithin(cdp, params, ms);
+    // Test seam: `deps.timelapseGrab(params, ms, realGrab)` may delay or drop a grab.
+    const rawGrab = deps.timelapseGrab ? (params, ms) => deps.timelapseGrab(params, ms, realGrab) : realGrab;
+    // Each grab gets what is left of its budget NOW (the slot allowance, cut by the section deadline);
+    // nothing left is a miss without a grab.
+    const grab = (params) => {
+      const ms = budgetMs();
+      return ms > 0 ? rawGrab(params, ms) : Promise.resolve(null);
+    };
+    // Every attempt starts from a clean page: no cursor, no proof stamp. A B or P grab that timed out
+    // leaves them shown, and the re-grabbed A must never contain either (Codex review 2026-11-04).
+    const resetOverlay = () => page.evaluate((proof) => {
+      window.__tutorialOverlay?.cursor(null);
+      if (proof) window.__tutorialOverlay?.stamp(false);
+    }, proofEncoder !== null);
+    const marked = await page.evaluate(async ({ proof, readClock: withClock }) => {
+      window.__vt.wallHold(true);
+      if (proof) window.__tutorialOverlay?.stamp(false);
+      const m = window.__vt.markFrame(true);
+      const read = withClock ? await window.__rvTutorialReadClock() : null;
+      return { frame: m.frame, ...(read ?? {}) };
+    }, { proof: proofEncoder !== null, readClock });
+    if (marked.frame !== frame) fail(1, 'timelapse-frame-mismatch', `time-lapse frame ${marked.frame} != runner frame ${frame}`);
+    try {
+      let shots = null;
+      for (let attempt = 0; attempt < 2 && shots === null; attempt++) {
+        if (attempt > 0) await resetOverlay();
+        const shotA = await grab(APP_GRAB);
+        if (!shotA) continue;
+        let shotB = null;
+        let shownAt = null;
+        if (encoder2) {
+          const last = trace.pointer.at(-1);
+          if (last) {
+            await page.evaluate((state) => window.__tutorialOverlay.cursor(state), { x: last.x, y: last.y, pressed: false });
+            shotB = await grab(APP_GRAB);
+            shownAt = await page.evaluate((proof) => {
+              window.__tutorialOverlay.cursor(null);
+              return proof ? window.__tutorialOverlay.stamp(true) : null;
+            }, proofEncoder !== null);
+            if (!shotB) continue;
+          } else shotB = shotA;
+        }
+        let shotP = null;
+        if (proofEncoder) {
+          shownAt ??= await page.evaluate(() => window.__tutorialOverlay.stamp(true));
+          shotP = await grab(proofGrab(shownAt));
+          if (!shotP) continue;
+        }
+        shots = { shotA, shotB, shotP };
+      }
+      if (shots === null) {
+        fail(1, 'timelapse-grab-timeout', `time-lapse frame ${frame}: a grab missed its budget twice`);
+      }
+      try {
+        await encoder.write(Buffer.from(shots.shotA.data, 'base64'));
+        if (encoder2) await encoder2.write(Buffer.from(shots.shotB.data, 'base64'));
+        if (proofEncoder) await proofEncoder.write(Buffer.from(shots.shotP.data, 'base64'));
+      } catch (error) { fail(1, 'ffmpeg-failed', `ffmpeg time-lapse frame stream failed: ${errorText(error)}`); }
+    } finally {
+      await page.evaluate(() => window.__vt.wallHold(false)).catch(() => {});
+    }
+    // The next app grab (time-lapse or stepped) hides the stamp itself; the cursor is hidden after B.
+    const { frame: _ignored, ...rest } = marked;
+    const timing = { frame, wall: true, ...rest };
+    timings.push(timing);
+    frame++;
+    return timing;
+  }
+
+  /**
+   * plan-2237 Phase 2 — the time-lapse section: wall mode from `wallBegin` to `wallEnd` (ALWAYS in
+   * `finally`), one output frame per wall slot of `1000/fps` ms while `isDone()` is false and at
+   * most `maxWallSec`. A slot passed while a frame was being grabbed is dropped and counted.
+   *
+   * `dispatch` runs INSIDE wall mode, before the first frame — the order the spike measured. Under
+   * the virtual clock `performance.now()` barely moves, so a batch whose loop is sliced by
+   * `performance.now()` deadlines and yields through real macrotasks runs to its end in one chunk
+   * before the time-lapse could show it (measured 2026-11-04: a 3-s batch, one frame). A command
+   * already complete right after its dispatch leaves wall mode at once with no frame.
+   *
+   * `maxWallSec` is an ABSOLUTE deadline from `wallBegin` (Codex review 2026-11-04, rounds 1-2):
+   *  - the command is polled every `TIMELAPSE_POLL_MS` while the section waits for its next slot, so
+   *    a completion is seen when it happens, not at the next frame;
+   *  - no frame starts at or after the deadline; when the next slot lies beyond it, the section keeps
+   *    waiting for the completion up to the deadline itself, without further frames;
+   *  - every grab gets at most the time left until the deadline, so no async step outlives it; a
+   *    grab that misses because the deadline cut its budget makes the section `timedOut`;
+   *  - a completion first seen at or after the deadline is `timedOut` like a command still running.
+   */
+  async function timelapse({ wallFps, maxWallSec, isDone, dispatch }) {
+    const interval = 1000 / wallFps;
+    const start = frame;
+    const wallMs = [];
+    let droppedSlots = 0;
+    let done = false;
+    let timedOut = false;
+    await page.evaluate(() => window.__vt.wallBegin({ pumpMs: 16 }));
+    const began = Date.now();
+    const deadline = began + maxWallSec * 1000;
+    const late = () => Date.now() >= deadline;
+    // Waits until `until` (never past the deadline), polling the command: true once it completed.
+    const waitPolling = async (until) => {
+      for (;;) {
+        if (late()) return false;
+        if (await isDone()) return !late();
+        const left = Math.min(until, deadline) - Date.now();
+        if (left <= 0) return false;
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, Math.min(TIMELAPSE_POLL_MS, left)));
+      }
+    };
+    let ended = null;
+    try {
+      if (dispatch) await dispatch(frame);
+      let slot = 0;
+      for (;;) {
+        const slotAt = began + slot * interval;
+        if (slotAt >= deadline) {
+          // No further frame fits before the deadline: wait for the completion up to it, frame-less.
+          done = await waitPolling(deadline);
+          if (!done) timedOut = true;
+          break;
+        }
+        done = await waitPolling(slotAt);
+        if (done) break;
+        if (late()) { timedOut = true; break; }
+        wallMs.push(Date.now() - began);
+        try {
+          await captureWallFrame(() => Math.min(2 * interval, deadline - Date.now()));
+        } catch (error) {
+          // A grab whose budget the deadline cut is the section's timeout, not a grab failure.
+          if (error instanceof TutorialRunError && error.diagnosis === 'timelapse-grab-timeout' && late()) { timedOut = true; break; }
+          throw error;
+        }
+        const next = Math.floor((Date.now() - began) / interval) + 1;
+        droppedSlots += Math.max(0, next - slot - 1);
+        slot = next;
+      }
+    } finally {
+      ended = await page.evaluate(() => window.__vt.wallEnd()).catch(() => null);
+      trace.timelapses.push({ start, end: frame, wallEnd: ended });
+    }
+    return { start, end: frame, wallFps, wallMs, droppedSlots, done, timedOut, wallEnd: ended };
+  }
+
   async function moveTo(target, stepId, actionIndex) {
     let initialBox = null;
     for (let attempt = 0; attempt <= 2; attempt++) {
@@ -755,7 +1014,7 @@ function createCaptureState({ page, cdp, encoder, encoder2 = null, proofEncoder 
     throw new Error('unreachable re-approach state');
   }
 
-  return { capture, moveTo, timings, get frame() { return frame; }, get cursor() { return cursor; }, set cursor(value) { cursor = value; } };
+  return { capture, timelapse, moveTo, timings, get frame() { return frame; }, get cursor() { return cursor; }, set cursor(value) { cursor = value; } };
 }
 
 async function dispatchClick({ capture, cdp, page, inspected, target, button, clickCount, trace, fps }) {
@@ -805,6 +1064,8 @@ async function runRecordedAction(ctx, action, step, actionIndex) {
   const { capture, trace, fps, page, cdp, bindings } = ctx;
   action = substituteAction(action, bindings);
   const start = capture.frame;
+  const ownSegments = []; // plan-2237: filled only by a time-lapse command
+  let tailStart = null;
   let targetBox;
   let approachBox;
   // `camera.target` is the look-at VECTOR ([x, y, z]), not a pointer target — the two fields
@@ -815,6 +1076,10 @@ async function runRecordedAction(ctx, action, step, actionIndex) {
     ? (action.via === 'direct' ? undefined : { command: action.id, buttonKey: action.buttonKey })
     : action.type === 'camera' || action.type === 'pick' ? undefined : (action.target ?? action.from ?? action.at);
   let inspected = null;
+  if (action.type === 'command' && action.via !== 'direct') {
+    await requireRecordingSeam(page);
+    await checkClickCommand(page, action);
+  }
   if (pointerTarget) {
     inspected = await capture.moveTo(pointerTarget, step.id, actionIndex);
     targetBox = inspected.box;
@@ -828,14 +1093,17 @@ async function runRecordedAction(ctx, action, step, actionIndex) {
       try {
         const commandStart = capture.frame;
         const budget = framesOf(action.maxWaitSec, fps);
-        if (action.via === 'direct') {
-          await capture.capture(() => page.evaluate(({ id, args }) => {
-            window.__tutorialCommandResult = null;
-            window.__tutorialCommandPromise = Promise.resolve().then(() => window.__rvRecording.execute(id, args)).then(
-              (result) => { window.__tutorialCommandResult = result; },
-              (error) => { window.__tutorialCommandResult = { ok: false, reason: String(error) }; },
-            );
-          }, action));
+        const kickDirect = () => page.evaluate(({ id, args }) => {
+          window.__tutorialCommandResult = null;
+          window.__tutorialCommandPromise = Promise.resolve().then(() => window.__rvRecording.execute(id, args)).then(
+            (result) => { window.__tutorialCommandResult = result; },
+            (error) => { window.__tutorialCommandResult = { ok: false, reason: String(error) }; },
+          );
+        }, action);
+        if (action.timelapse) {
+          // plan-2237 Phase 2: the dispatch happens inside wall mode (below), not in a stepped frame.
+        } else if (action.via === 'direct') {
+          await capture.capture(kickDirect);
         } else {
           const clicked = await dispatchClick({ capture, cdp, page, inspected, target: pointerTarget,
             button: 'left', clickCount: 1, trace, fps });
@@ -846,13 +1114,48 @@ async function runRecordedAction(ctx, action, step, actionIndex) {
         const poll = async () => {
           if (action.via === 'direct') {
             const result = await page.evaluate(() => window.__tutorialCommandResult);
-            if (result && !result.ok) fail(1, 'command-failed', `${action.id}: ${result.reason}`);
+            if (result && !result.ok) failCommand(action, result);
           }
           events.push(...await page.evaluate(() => window.__rvRecording.takeCommandWatch()));
           completed = matchingCommand(events, action);
         };
-        // Read even the dispatch frame: a synchronous command may already be complete.
-        await poll();
+        if (!action.timelapse) {
+          // Read even the dispatch frame: a synchronous command may already be complete.
+          await poll();
+        } else {
+          // plan-2237 Phase 2: three disjoint segments of the SAME action — command (the approach),
+          // timelapse (wallBegin..wallEnd, the dispatch is its first act), command (rest). Empty ones
+          // are dropped: a direct command has no approach, a command complete at once no wall frame.
+          const head = { kind: 'command', id: action.id, start, end: capture.frame, stepId: step.id, actionIndex };
+          const clickInWallMode = async () => {
+            const fresh = await inspectTarget(page, pointerTarget, { requireHit: true });
+            const t = frameToSec(capture.frame, fps);
+            await fresh.locator.click({ button: 'left', position: fresh.position, force: true });
+            trace.buttons.push({ t, type: 'down', button: 'left', x: fresh.point.x, y: fresh.point.y });
+            trace.buttons.push({ t, type: 'up', button: 'left', x: fresh.point.x, y: fresh.point.y });
+            targetBox = fresh.box;
+          };
+          const tl = await capture.timelapse({
+            wallFps: action.timelapse.fps, maxWallSec: action.timelapse.maxWallSec,
+            dispatch: action.via === 'direct' ? kickDirect : clickInWallMode,
+            isDone: async () => { await poll(); return completed; },
+          });
+          ownSegments.push(head);
+          if (tl.end > tl.start) {
+            ownSegments.push({ kind: 'timelapse', cmd: action.id, start: tl.start, end: tl.end, stepId: step.id, actionIndex,
+              wallFps: tl.wallFps, wallMs: tl.wallMs, droppedSlots: tl.droppedSlots });
+          }
+          // The wall frames and the first frame after wallEnd (page time moved on the wall clock,
+          // its rest steps land there) are not judged.
+          ctx.clockWindows.push({ start: tl.start, end: tl.end, cmd: action.id, kind: tl.end > tl.start ? 'timelapse' : 'transition' });
+          if (!completed || tl.timedOut) {
+            const cancel = await page.evaluate(async (id) => {
+              try { return await window.__rvRecording.execute(id, {}); } catch (error) { return { ok: false, reason: String(error) }; }
+            }, TIMELAPSE_CANCEL_COMMAND).catch((error) => ({ ok: false, reason: errorText(error) }));
+            fail(1, 'timelapse-timeout', `${action.id} ${completed ? 'completed only after' : 'still running after'} timelapse.maxWallSec ${action.timelapse.maxWallSec} s; ${TIMELAPSE_CANCEL_COMMAND}: ${cancel?.ok ? 'ok' : cancel?.reason ?? 'failed'}`);
+          }
+          tailStart = capture.frame;
+        }
         const waitFrames = Math.max(1, framesOf(action.waitSec, fps));
         for (let i = 0; i < waitFrames; i++) {
           if (!completed && capture.frame - commandStart >= budget) fail(1, 'command-timeout', `${action.id} exceeded ${action.maxWaitSec} s`);
@@ -864,6 +1167,8 @@ async function runRecordedAction(ctx, action, step, actionIndex) {
           await capture.capture();
           await poll();
         }
+        // plan-2237 F5: the transition window of a time command comes from the take-wide time
+        // watch (any dispatcher), not from this action — see `timeCommandWindows`.
       } finally {
         await page.evaluate(() => window.__rvRecording.stopCommandWatch());
       }
@@ -1023,12 +1328,15 @@ async function runRecordedAction(ctx, action, step, actionIndex) {
       break;
     }
     case 'camera': {
+      // plan-2237: the flight is started CAMERA_END_MARGIN_SEC short of its frames. With the creep carry
+      // (F1) page time no longer runs ahead, so a flight of exactly framesOf(durationSec) frames ended
+      // on a knife edge (± a few µs of per-frame creep) — the never-reset creep used to pad it by ~1.5 ms.
       await page.evaluate(({ position, target, durationSec }) => {
         const viewer = window.viewer;
         if (!viewer?.camera) throw new Error('camera action needs window.viewer.camera');
         const V = viewer.camera.position.constructor;
         viewer.animateCameraTo(new V(...position), new V(...target), durationSec, 'easeInOut', 'tutorial');
-      }, action);
+      }, { ...action, durationSec: Math.max(0, action.durationSec - CAMERA_END_MARGIN_SEC) });
       const count = framesOf(action.durationSec, fps);
       for (let i = 0; i < count; i++) await capture.capture();
       const animating = await page.evaluate(() => window.viewer?.isCameraAnimating === true);
@@ -1045,6 +1353,16 @@ async function runRecordedAction(ctx, action, step, actionIndex) {
     ...(targetBox ? { target: targetBox } : {}),
     ...(approachBox ? { approach: approachBox } : {}),
   };
+  if (ownSegments.length > 0) {
+    // plan-2237 Phase 2 (Gate A): a time-lapse command is three disjoint, gapless segments with the
+    // same stepId and command — head command, timelapse, tail command; an empty one is dropped.
+    const [head, ...rest] = ownSegments;
+    const tail = { ...segment, start: tailStart };
+    for (const part of [{ ...segment, start: head.start, end: head.end }, ...rest, tail]) {
+      if (part.end > part.start) trace.segments.push(part);
+    }
+    return;
+  }
   if (segment.end <= segment.start) throw new Error(`action ${step.id}[${actionIndex}] produced no frame`);
   trace.segments.push(segment);
 }
@@ -1300,7 +1618,7 @@ export async function runTutorial(opts, deps = {}) {
       context = await browser.newContext({ viewport: script.viewport, deviceScaleFactor: 1 });
     }
     checkAborted();
-    await context.addInitScript(pagePreparationInitScript, { welcome: script.welcome });
+    await context.addInitScript(pagePreparationInitScript, { welcome: script.welcome, storage: script.storage });
     await context.addInitScript(virtualClockInitScript, { forceEpochZero: epochZeroDiagnosis });
     const page = await context.newPage();
     // Browser errors next to the take (`<id>.console.log`, outside the published set): a crash in
@@ -1316,6 +1634,9 @@ export async function runTutorial(opts, deps = {}) {
     page.on('pageerror', (error) => logBrowser(`[pageerror] ${error.stack ?? error.message}`));
     const targetUrl = new URL(script.url, `${base}/`);
     targetUrl.searchParams.set('recording', '1');
+    // plan-2240: `?recording=1` keeps startup dialogs shut; a storyboard that waits for the
+    // welcome dialog asks for it explicitly.
+    if (script.welcome === 'show') targetUrl.searchParams.set('recordingWelcome', '1');
     if (script.connect === 'off') {
       targetUrl.searchParams.set('consent', 'decline');
       targetUrl.searchParams.set('mcpPort', '1');
@@ -1349,13 +1670,23 @@ export async function runTutorial(opts, deps = {}) {
       // burst stays inside it), then the N-frame window. `epoch-preflight.mjs` decides over the
       // complete reading sequence; this loop only steps and reads.
       const warmupMaxFrames = framesOf(PREFLIGHT_WARMUP_SEC, fps);
-      const readAfterStep = () => page.evaluate(({ dt, epochValue }) => {
+      const readAfterStep = () => page.evaluate(async ({ dt, epochValue }) => {
         window.__vt.step(dt);
+        const now = performance.now();
+        // plan-2237 F6: the DES tempo clock is the render clock; `sim.clock.get` supplies it and the
+        // effective factor. A page without the command keeps the old simTime reading.
+        let clock = null;
+        try {
+          const result = await window.__rvRecording?.execute?.('sim.clock.get', {});
+          if (result?.ok) clock = result.value;
+        } catch { /* no recording seam: simTime only */ }
         return {
-          now: performance.now(),
-          nowAtLeastEpoch: performance.now() >= epochValue,
+          now,
+          nowAtLeastEpoch: now >= epochValue,
           simTime: window.viewer?.simTime ?? null,
           fixedStepCount: window.viewer?.fixedStepCount ?? null,
+          ...(clock?.des ? { des: true, renderClock: clock.des.renderClock } : {}),
+          factor: clock ? clock.factor : undefined,
         };
       }, { dt: 1000 / fps, epochValue: epoch });
       const samples = [await page.evaluate(() => ({
@@ -1371,7 +1702,9 @@ export async function runTutorial(opts, deps = {}) {
         if (warmupEndIndex(samples, warmupMaxFrames) > 0) {
           for (let k = 0; k < PREFLIGHT_WINDOW_FRAMES; k++) samples.push(await readAfterStep());
         }
-        preflight = preflightVerdict({ samples, fps, warmupMaxFrames, epoch: enabled.epoch });
+        const lastFactor = samples.at(-1)?.factor;
+        preflight = preflightVerdict({ samples, fps, warmupMaxFrames, epoch: enabled.epoch,
+          factor: Number.isFinite(lastFactor) ? lastFactor : 1 });
       }
       summary.virtualClockPreflight = preflight;
       if (preflight.verdict !== 'ok' && !epochZeroDiagnosis) {
@@ -1409,8 +1742,25 @@ export async function runTutorial(opts, deps = {}) {
       mp4Proof = join(tempDir, 'stamp-proof.mp4');
       proofEncoder = createEncoder({ ffmpeg: encoders.ffmpeg, fps, out: mp4Proof });
     }
-    trace = { pointer: [], buttons: [], keys: [], segments: [], steps: [], waitForActualFrames: [] };
-    capture = createCaptureState({ page, cdp, encoder, encoder2, proofEncoder, fps, trace });
+    trace = { pointer: [], buttons: [], keys: [], segments: [], steps: [], waitForActualFrames: [], timelapses: [] };
+    summary.timelapses = trace.timelapses; // plan-2237: wallEnd evidence also in a failed run's run.log
+    // plan-2237: the per-frame clock reader, installed once (`readClockInPage`, serialised source).
+    // Every viewer take reads `sim.clock.get` each frame; an editor take holds the sim by design.
+    const gateClock = hasViewer && script.start !== 'editor' && !epochZeroDiagnosis;
+    if (hasViewer) await page.evaluate(`window.__rvTutorialReadClock = ${readClockInPage.toString()};`);
+    capture = createCaptureState({ page, cdp, encoder, encoder2, proofEncoder, fps, trace, readClock: hasViewer, deps });
+    const clockWindows = [];
+    // plan-2237 F3 (review 2026-11-04): watch the time commands for the WHOLE take, whoever dispatches
+    // them (a recorder action, a UI click, a shortcut) — start and completion, frame-attributed.
+    if (gateClock) {
+      const armed = await page.evaluate((ids) => {
+        const seam = window.__rvRecording;
+        if (typeof seam?.armTimeWatch !== 'function') return false;
+        seam.armTimeWatch(ids);
+        return true;
+      }, [...TIME_COMMANDS]);
+      if (!armed) fail(1, 'sim-clock-unavailable', 'the recording seam has no armTimeWatch — the recorder needs a viewer build with plan-2237');
+    }
     const takeStartedMs = Date.now();
 
     if (epochZeroDiagnosis) {
@@ -1432,7 +1782,7 @@ export async function runTutorial(opts, deps = {}) {
         trace.steps.push(record);
         try {
           for (let actionIndex = 0; actionIndex < step.actions.length; actionIndex++) {
-            await runRecordedAction({ capture, trace, fps, page, cdp, bindings }, step.actions[actionIndex], step, actionIndex);
+            await runRecordedAction({ capture, trace, fps, page, cdp, bindings, clockWindows }, step.actions[actionIndex], step, actionIndex);
           }
           const declaredEnd = frameAtStart(frameToSec(stepStart, fps), fps)
             + Math.max(framesOf(script.minStepSec, fps), framesOf(step.holdSec, fps) + framesOf(step.tailSec, fps));
@@ -1466,15 +1816,34 @@ export async function runTutorial(opts, deps = {}) {
       const resumed = timings.findIndex((timing, index) => index > 0
         && timing.paused === false && timings[index - 1].paused === true);
       if (resumed < 0) fail(1, 'paused-never-started', 'the viewer never resumed during capture');
-      const desRun = timings[resumed].des === true;
-      const samples = timings.slice(resumed - 1, resumed + (desRun ? timings.length - resumed : Math.min(10, timings.length - resumed)));
-      const progress = simProgressVerdict({ samples, fps, factor: timings[resumed].factor, windowFrames: samples.length - 1 });
-      summary.simProgress = progress;
+    }
+    let simGate = null;
+    if (gateClock) {
+      // plan-2237 F3-F6: the segment gate over the WHOLE take, every start mode (paused, running,
+      // DES running). Each frame's state comes from `sim.clock.get`; time commands and time-lapses
+      // are transitions (`clockWindows`), state changes and proven DES clamps end a segment.
+      const timings = capture.timings;
+      const missing = timings.findIndex((timing) => !timing.wall && clockSampleOf(timing.clock) === null);
+      if (missing >= 0) {
+        fail(1, 'sim-clock-unavailable', `sim.clock.get unreadable at frame ${missing}: ${timings[missing].clockError ?? 'no value'} — the recorder needs a viewer build with sim.clock.get (plan-2237)`);
+      }
+      // A time-lapse frame without a reading keeps its neighbour's: it lies inside its window anyway.
+      let last = null;
+      const samples = timings.map((timing) => (last = clockSampleOf(timing.clock) ?? last));
+      // Time-lapse windows first: their frames belong to the time-lapse, the rest of a time command
+      // to its transition window.
+      const windows = [
+        ...clockWindows.filter((w) => w.kind === 'timelapse'),
+        ...clockWindows.filter((w) => w.kind !== 'timelapse'),
+        ...timeCommandWindows(timings.map((timing) => timing.timeEvents ?? []), timings.length - 1),
+      ];
+      simGate = segmentGate({ samples, fps, windows });
+      summary.simProgress = { ...simGate, windowFrames: timings.length - 1 };
       // Determinism evidence: the per-frame clock series of the whole take goes to the run log.
       summary.clockSeries = timings.map((t, i) => [i, t.simTime, t.renderClock ?? null]);
-      console.log(`[rv-tutorial] sim-progress ${progress.verdict} on ${progress.clock}: advanced ${progress.sumSimTime} of ${progress.expectedSimTime} s (+/- ${progress.tolerance})`);
-      console.log(`[rv-tutorial] clock-series ${JSON.stringify(summary.clockSeries)}`);
-      if (progress.verdict !== 'ok') fail(1, 'sim-progress', progress.reason);
+      const judged = simGate.segments.filter((segment) => segment.verdict === 'pass' || segment.verdict === 'fail');
+      console.log(`[rv-tutorial] sim-progress ${simGate.verdict}: ${simGate.segments.length} segments (${judged.length} judged), ${simGate.simJumps.length} jumps`);
+      if (simGate.verdict !== 'ok') fail(1, 'sim-progress', simGate.reason);
     }
 
     // Wall time of the take (all grabs incl. the proof grab), for the cost of a stamp mode.
@@ -1517,6 +1886,12 @@ export async function runTutorial(opts, deps = {}) {
         : { method: 'virtual-clock', offsetSec: 0, markers: [], driftFrames: 0 },
       pointer: trace.pointer, buttons: trace.buttons, keys: trace.keys,
       segments: trace.segments, steps: trace.steps,
+      // plan-2237 (additive): jumps of the simulation time inside transitions, and the per-segment
+      // gate verdicts. Absent on takes without a viewer.
+      ...(simGate ? {
+        simJumps: simGate.simJumps,
+        simProgress: { verdict: simGate.verdict, segments: simGate.segments },
+      } : {}),
     };
     events = await buildTrace(rawEvents);
     if (!events || typeof events !== 'object') fail(1, 'trace-not-contiguous', 'buildTrace did not return an events object');
@@ -1615,12 +1990,25 @@ export async function runTutorial(opts, deps = {}) {
         longestStillFrames: motion.longestStillFrames, controlFrame: 'motion-control.jpg',
         controlMad: control.controlMad,
       };
+      // plan-2240: Gate C decides PER STEP (effective policy: step.motion > --motion-check >
+      // require). The whole-take numbers above stay as they were (additive change only); the
+      // decision is `perStep`. There is no global warn bypass any more: an explicit `require` step
+      // is red even under `--motion-check warn`.
+      const policies = Object.fromEntries(script.steps.map((step) => [step.id, resolveMotionPolicy(step.motion, motionCheck)]));
+      const perStep = stepMotionVerdicts(measured.diffs, events.steps, policies, STILL_THRESHOLD, MIN_MOVED_FRACTION);
+      events.motion.perStep = perStep.perStep;
       if (epochZeroDiagnosis) motionMadSequence = measured.diffs;
       if (!epochZeroDiagnosis && control.verdict !== 'ok') fail(1, 'decoder-blank', `decoder control frame is black (mad ${control.controlMad})`);
-      if (!epochZeroDiagnosis && motion.verdict !== 'ok') {
-        const text = `Gate C: movedFraction ${motion.movedFraction} < ${MIN_MOVED_FRACTION}`;
-        if (motionCheck === 'warn') console.error(`[rv-tutorial] warning: ${text} (accepted, --motion-check warn)`);
-        else fail(1, 'motion-below-threshold', `${text.replace('Gate C:', 'Gate C failed:')}`);
+      if (!epochZeroDiagnosis) {
+        const describe = (entry) => `step '${entry.stepId}' (${entry.policy}): ${entry.reason === 'too-short'
+          ? 'too short, no frame pair inside the step'
+          : `movedFraction ${entry.movedFraction} < ${MIN_MOVED_FRACTION}`}`;
+        for (const entry of perStep.perStep.filter((candidate) => candidate.verdict === 'warn')) {
+          console.error(`[rv-tutorial] warning: Gate C ${describe(entry)} (accepted, motion 'warn')`);
+        }
+        if (perStep.verdict !== 'ok') {
+          fail(1, 'motion-below-threshold', `Gate C failed: ${perStep.perStep.filter((entry) => entry.verdict === 'fail').map(describe).join('; ')}`);
+        }
       }
     }
     const motionShape = motionShapeVerdict(events.motion);

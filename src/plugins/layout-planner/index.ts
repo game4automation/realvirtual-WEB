@@ -128,9 +128,13 @@ import {
   waitForCloudReady as plWaitForCloudReady,
   refreshCloudGlbUrl as plRefreshCloudGlbUrl,
   findRegistryOrigin,
+  isProjectDocumentId,
   PROJECT_PLACEMENT_PREFIX,
 } from './planner-persistence';
-import { entryOriginOf, isQualifiedRef, originFields } from '../../core/library/library-origin';
+import { entryKeyOf, entryOriginOf, isQualifiedRef, originFields, originInScope, type DocumentScope, type LibraryOrigin } from '../../core/library/library-origin';
+import { getLibraryProjectLoader } from '../../core/library/library-project-loader';
+import { getProjectStore } from '../../core/project/project-store';
+import { reportProblem } from '../../core/hmi/problems-store';
 
 /**
  * The placement reference of a catalog entry — with the library qualifier the
@@ -947,7 +951,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     const rec = this.store.getSnapshot().placed.find((c) => c.id === id);
     const old = this._objectMap.get(id);
     if (!rec || !old || rec.splatUrl) return false;
-    await this._placements.resolveBaked(refOfRecord(rec), { overrides });
+    await this._placements.resolveBaked(refOfRecord(rec), { overrides, scope: this._documentScope() });
     if (!isCurrent() || this._objectMap.get(id) !== old) return false;
     // The saved overrides of a reloaded reference node (its extras) travel with the placement.
     const saved = getAssetOverrides(old);
@@ -2624,17 +2628,20 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
    * cold drag), so joining it here never starts work of its own.
    */
   private _trackPreparing(entry: LibraryCatalogEntry, ref: PlacementRef): void {
-    if (this._preparing.has(entry.id)) return;
-    if (this._placements.peekBaked(ref)) return;
-    if (!this._placements.sourceOf(ref)) return; // nothing was started for it
-    const job = this._placements.resolveBaked(ref)
+    // plan-780 R7: keyed by the QUALIFIED entry key — two libraries may share a bare id.
+    const preparingKey = entryKeyOf(entry);
+    if (this._preparing.has(preparingKey)) return;
+    const scope = this._documentScope();
+    if (this._placements.peekBaked(ref, scope)) return;
+    if (!this._placements.sourceOf(ref, scope)) return; // nothing was started for it
+    const job = this._placements.resolveBaked(ref, { scope })
       .catch(() => { /* the placement's own load reports failures */ })
       .finally(() => {
-        if (this._preparing.get(entry.id) !== job) return;
-        this._preparing.delete(entry.id);
+        if (this._preparing.get(preparingKey) !== job) return;
+        this._preparing.delete(preparingKey);
         this.store.setPreparingEntries([...this._preparing.keys()]);
       });
-    this._preparing.set(entry.id, job);
+    this._preparing.set(preparingKey, job);
     this.store.setPreparingEntries([...this._preparing.keys()]);
   }
 
@@ -2877,7 +2884,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       catalogId: entry.id,
       glbUrl: entry.glbUrl ?? '',
       // plan-778 F4: the library qualifier of the entry (`entryOriginOf`); empty for a legacy entry.
-      ...originFields(entryOriginOf(entry)),
+      ...originFields(this._originOf(entry)),
       // The ONE name (plan-758): registration already gave the root its
       // sibling-unique name; the record carries exactly that.
       label: node.name,
@@ -3034,7 +3041,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       catalogId: entry.id,
       glbUrl: entry.glbUrl ?? '',
       // plan-778 F4: the library qualifier of the entry (`entryOriginOf`); empty for a legacy entry.
-      ...originFields(entryOriginOf(entry)),
+      ...originFields(this._originOf(entry)),
       // The ONE name (plan-758): `label === node.name` on every creation path.
       label: node.name,
       position: [node.position.x, node.position.y, node.position.z],
@@ -3349,15 +3356,16 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
         // would be a blob URL the cache revoked after the original decode), a
         // classic record off its (re-rooted) `glbUrl` — the very bake the
         // original placement is an instance of.
-        if (!this._placements.sourceOf(comp)) {
-          console.warn(comp.catalogId.startsWith(PROJECT_PLACEMENT_PREFIX)
+        const scope = this._documentScope();
+        if (!this._placements.sourceOf(comp, scope)) {
+          console.warn(isProjectDocumentId(comp.catalogId)
             ? `[LayoutPlanner] Cannot copy "${comp.label}" — ${comp.catalogId} is not in the active project.`
             : `[LayoutPlanner] Cannot copy "${comp.label}" — no glbUrl and no virtual catalog entry.`);
           return null;
         }
         copyOverrides = await this._parametricOverridesForCopy(comp);
         node = this._materializeNew(
-          await this._placements.resolveBaked(comp, { overrides: copyOverrides }), newId, label, comp.catalogId,
+          await this._placements.resolveBaked(comp, { overrides: copyOverrides, scope }), newId, label, comp.catalogId,
           { overrides: copyOverrides },
         );
       }
@@ -3676,6 +3684,8 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
           node, id: placement.id, label: placement.label,
           occurrence: mark.occurrence || placement.id,
           ref: refOfRecord(placement),
+          // plan-780 R2: the project of the document these placements are written in.
+          scope: this._documentScope(),
         });
         continue;
       }
@@ -3711,6 +3721,35 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
    */
   whenPlacementsMaterialized(): Promise<void> {
     return this._placements.whenMaterialized();
+  }
+
+  /** plan-780 R2: the edited document's project (`viewer.currentModelScope`); its records resolve there. */
+  private _documentScope(): DocumentScope {
+    return this._viewer?.currentModelScope ?? null;
+  }
+
+  /** plan-780 A1/A2: origin of a new placement in this document; unresolvable-by-B is kept + Problems warning. */
+  private _originOf(entry: LibraryCatalogEntry): LibraryOrigin {
+    const scope = this._documentScope();
+    if (!scope) return entryOriginOf(entry);
+    const origin = originInScope(entry, scope, {
+      openProjectId: getProjectStore().getProject()?.id ?? null,
+      libraryLists: (libraryId, projectId) => {
+        const state = getLibraryProjectLoader()?.getNode(libraryId)?.state;
+        if (state?.kind !== 'ready' || !state.project) return null;
+        return (state.project.libraries ?? []).some((r) => !!r && typeof r === 'object' && (r as { projectId?: unknown }).projectId === projectId);
+      },
+    });
+    if (origin.warning) {
+      reportProblem({
+        id: `library-scope-placement:${scope.sourceId}:${entry.id}`,
+        severity: 'warning',
+        code: 'library-scope-placement',
+        title: `Placed outside library '${scope.sourceId}'`,
+        detail: origin.warning,
+      });
+    }
+    return { assetId: origin.assetId, ...originFields(origin) };
   }
 
   /**
@@ -3849,7 +3888,8 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     // ran — same key derivation as the deferred reload path and a live drop.
     // plan-650: the record's parametric overrides pick the SAME variant on undo / redo.
     const overrides = p.assetOverrides ?? null;
-    const baked = await this._placements.resolveBaked(refOfRecord(p, url), { overrides });
+    // plan-780 R2: undo / redo / restore resolve in the edited document's scope.
+    const baked = await this._placements.resolveBaked(refOfRecord(p, url), { overrides, scope: this._documentScope() });
     return this._materializeNew(baked, p.id, p.label, p.catalogId, { overrides });
   }
 
@@ -4146,13 +4186,14 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     // and decode the same asset a second time.
     const warmable = resolved.filter(r => !r.isSplat && r.url != null);
     const warmRefs = new Map<string, PlacementRef>();
+    const warmScope = this._documentScope();
     for (const r of warmable) {
       const ref: PlacementRef = refOfRecord(r.comp, r.url as string);
-      const source = this._placements.sourceOf(ref);
+      const source = this._placements.sourceOf(ref, warmScope);
       if (source && !warmRefs.has(source.key)) warmRefs.set(source.key, ref);
     }
     // Warms the BASE bake; a parametric record bakes its variant in `_loadPlacementGeometry`.
-    await Promise.all([...warmRefs.values()].map(ref => this._placements.resolveBaked(ref).catch(() => null)));
+    await Promise.all([...warmRefs.values()].map(ref => this._placements.resolveBaked(ref, { scope: warmScope }).catch(() => null)));
     // Per-item `try/catch` is FAILURE ISOLATION, not placement code: without
     // it a single rejected promise aborts the whole restore loop and every
     // later placement silently disappears. It stays here even though the
@@ -4193,7 +4234,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
         // not an address, and writing it into `glbUrl` would persist a string
         // no loader can read.
         if (!isSplat && url && url !== comp.glbUrl
-            && !comp.catalogId.startsWith(PROJECT_PLACEMENT_PREFIX) && !isQualifiedRef(comp)) {
+            && !isProjectDocumentId(comp.catalogId) && !isQualifiedRef(comp)) {
           this.store.updateGlbUrl(comp.id, url);
         }
       } catch (e) {
@@ -4422,7 +4463,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     // null for every project document, which read as "the snap picker does
     // nothing". `loadEntryModel` resolves those; a genuinely unloadable entry
     // throws and surfaces to the caller instead of vanishing.
-    if (!this._placements.sourceOf(refOfEntry(entry))) return null;
+    if (!this._placements.sourceOf(refOfEntry(entry), this._documentScope())) return null;
 
     const snapPlugin = this._viewer.getPlugin<SnapPointPlugin>('snap-point');
     const snapRegistry = snapPlugin?.getRegistry();
@@ -4458,7 +4499,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       // identity of such a placement is its `catalogId`, never a URL.
       glbUrl: entry.glbUrl ?? '',
       // plan-778 F4: the library qualifier of the entry (`entryOriginOf`); empty for a legacy entry.
-      ...originFields(entryOriginOf(entry)),
+      ...originFields(this._originOf(entry)),
       // The ONE name (plan-758): the snap registration above already named the root.
       label: node.name,
       position: [node.position.x, node.position.y, node.position.z],

@@ -15,11 +15,11 @@ import { closeSignalBindPopover, openSignalBindPopover } from './signal-bind-sto
 import { findSignalBindTarget, signalBindEligibility, signalBindTargetId } from './signal-bind-target';
 import './SignalBindPopover';
 import { createSignalBindingPersistence } from './signal-binding-persistence';
+import { mergeAppliedMappings } from './binding-inventory';
 import { DropTargetOverlayController } from './drop-target-overlay';
 import { SignalLinkModeButton } from './SignalLinkModeButton';
 import { BindingsOverviewButton } from './BindingsOverviewButton';
 import { isSignalLinkModeActive, setSignalLinkModeSuspended } from './signal-link-mode-store';
-import { isDuplicateSignalName } from '../../core/engine/rv-signal-construction';
 import { registerSignalBulkActions } from './component-bulk-actions';
 import type { SignalBindingManager } from '../../core/engine/rv-signal-binding-manager';
 import { clearUnitProblems } from '../../core/hmi/problems-store';
@@ -122,8 +122,10 @@ export class SignalBindPlugin implements RVViewerPlugin {
         if (root && placed.signalMappings) {
           const target = { kind: 'placed' as const, placedId: placed.id, node: root };
           const applied = viewer.signalBindingManager.applyMappings(placed.id, root, placed.signalMappings);
-          if (placed.signalMappings.some((mapping, i) => !mapping.interfaceId && !!applied[i]?.interfaceId)) {
-            createSignalBindingPersistence(viewer, target).write(applied);
+          // Unresolved links are kept (merged back), never dropped by this write.
+          const merged = mergeAppliedMappings(placed.signalMappings, applied);
+          if (placed.signalMappings.some((mapping, i) => !mapping.interfaceId && !!merged[i]?.interfaceId)) {
+            createSignalBindingPersistence(viewer, target).write(merged);
           }
         }
       }
@@ -151,8 +153,9 @@ export class SignalBindPlugin implements RVViewerPlugin {
       if (!target || target.kind !== 'node') return;
       const mappings = (raw as SignalMapping[]).map((mapping) => ({ ...mapping }));
       const applied = viewer.signalBindingManager?.applyMappings(signalBindTargetId(target), target.node, mappings);
-      if (applied && mappings.some((mapping, i) => !mapping.interfaceId && !!applied[i]?.interfaceId)) {
-        createSignalBindingPersistence(viewer, target).write(applied);
+      const merged = applied ? mergeAppliedMappings(mappings, applied) : null;
+      if (merged && mappings.some((mapping, i) => !mapping.interfaceId && !!merged[i]?.interfaceId)) {
+        createSignalBindingPersistence(viewer, target).write(merged);
       }
     });
 
@@ -164,26 +167,17 @@ export class SignalBindPlugin implements RVViewerPlugin {
   }
 
   /**
-   * Self-heal what can be healed, then one `orphaned-bindings` notice for the
-   * rest — or silence.
+   * One `orphaned-bindings` notice for every carrier that is gone — or silence.
+   * Nothing is moved or written (plan-2234: no carrier migration by signal name).
    *
    * Dynamically imported so a viewer that never edits a scene does not pull the
    * scene store into its bundle, and deliberately fail-quiet: a diagnostic that
    * throws during model load would cost more than the diagnosis is worth.
-   *
-   * ## Why the case-A repair happens HERE and not in the restore traverse
-   *
-   * The traverse in `onModelLoaded` walks the nodes of the LOADED model. An op
-   * addressed to a path this model does not have is never materialised onto any
-   * node, so the traverse cannot read the `carrierSignalName` inside it — the
-   * anchor would be unreachable in precisely the case it exists for (plan-425
-   * F2, review round 1). The overlay is the one place that payload is still
-   * legible, and this scan is already reading it.
    */
   private async _reportOrphanedBindings(viewer: RVViewer, result: LoadResult): Promise<void> {
     try {
       const [
-        { findOrphanedBindingCarriers, planCarrierMigrations },
+        { findOrphanedBindingCarriers },
         { getSceneStore },
         { materialise },
         { reportOrphanedBindings },
@@ -198,7 +192,7 @@ export class SignalBindPlugin implements RVViewerPlugin {
       // The check is "does this path resolve" — and the placed references of a
       // layout document reach the registry only AFTER `model-loaded` (plan-753).
       // Judged earlier, every op addressed into a placement reads as orphaned,
-      // and the self-heal below would MIGRATE a carrier that is merely late.
+      // a carrier that is merely late.
       // Optional call: narrow test hosts do not carry the scene-ready contract.
       await viewer.whenSceneReady?.();
       if ('lastLoadResult' in viewer && viewer.lastLoadResult !== result) return; // document changed meanwhile
@@ -224,60 +218,14 @@ export class SignalBindPlugin implements RVViewerPlugin {
         return;
       }
 
-      const store = viewer.signalStore;
-      const { migrations, stillOrphaned } = store
-        ? planCarrierMigrations(
-          carriers,
-          {
-            getPath: (name) => store.getPath(name),
-            isDuplicate: (name) => isDuplicateSignalName(store, name),
-          },
-          registry,
-          new Set(Object.keys(overlay?.nodes ?? {})),
-        )
-        : { migrations: [], stillOrphaned: carriers.map((c) => c.nodePath) };
-
-      for (const migration of migrations) await this._migrateCarrier(viewer, migration);
+      // plan-2234: an orphan stays an orphan — no move by `carrierSignalName`, no write.
+      const stillOrphaned = carriers.map((c) => c.nodePath);
       if (stillOrphaned.length === 0 && repairable === 0) return;
       reportOrphanedBindings(
         viewer.currentModelUrl ?? result.root.name ?? 'model', stillOrphaned, repairable);
     } catch {
       /* a diagnostic must never be the reason a model fails to open */
     }
-  }
-
-  /**
-   * Move one carrier's mappings from a dead path onto the live one, then bind.
-   *
-   * The two ops are ONE transaction, and the `unsetField` half is not optional
-   * bookkeeping (plan-425, review round 2): writing only the new path leaves the
-   * old op in the log, so the very next load finds the same dead carrier again
-   * and reports an orphan the user has already had repaired. The pair is what
-   * makes the repair stick.
-   */
-  private async _migrateCarrier(
-    viewer: RVViewer,
-    migration: { from: string; to: string; mappings: SignalMapping[] },
-  ): Promise<void> {
-    const [{ getActiveEditTarget }, { syncNodeSignalBindingPersistence }] = await Promise.all([
-      import('../../core/hmi/rv-edit-target'),
-      import('./signal-binding-persistence'),
-    ]);
-    const target = getActiveEditTarget();
-    if (!target.available) return;
-    const node = viewer.registry?.getNode(migration.to);
-    if (!node) return;
-
-    await target.withTransaction('Reconnect moved signal links', async () => {
-      target.setField(migration.to, 'SignalLinks', 'Mappings', migration.mappings, undefined);
-      target.unsetField(migration.from, 'SignalLinks', 'Mappings', migration.mappings);
-    });
-
-    const bindTarget = findSignalBindTarget(viewer, node);
-    if (!bindTarget || bindTarget.kind !== 'node') return;
-    syncNodeSignalBindingPersistence(bindTarget.node, migration.mappings);
-    viewer.signalBindingManager?.applyMappings(
-      signalBindTargetId(bindTarget), bindTarget.node, migration.mappings);
   }
 
   onModelCleared(): void {

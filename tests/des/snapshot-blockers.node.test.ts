@@ -3,9 +3,12 @@ import { expect, it } from 'vitest';
 import { CoreSubsystems, type CoreSubsystemsHost } from '../../src/core/engine/rv-core-subsystems';
 import { RVLogicEngine } from '../../src/core/engine/rv-logic-engine';
 import { RVDelay, RVSerialContainer } from '../../src/core/engine/rv-logic-step';
+import { Object3D } from 'three';
+import { NodeRegistry } from '../../src/core/engine/rv-node-registry';
 import { DesSnapshotBlockers } from '../../src/core/material-flow/des-snapshot-blockers';
 import { getProblems } from '../../src/core/hmi/problems-store';
 import { lineFixture as rawLineFixture } from './runner-fixture';
+import { cycleRunnerFixture } from './cycle-runner-fixture';
 
 // Every fixture viewer owns a blocker registry, like `RVViewer.snapshotBlockers`.
 function lineFixture() {
@@ -30,7 +33,7 @@ it('lists all reasons, checks restore before mutation, and unregisters independe
   expect(f.snapshot()).toEqual(before);
 });
 
-it('started LogicStep roots refuse with their name; idle roots allow capture', () => {
+it('Continuous LogicStep roots retain their blocker until the DES participant is attached', () => {
   const engine = new RVLogicEngine();
   const root = new RVSerialContainer([new RVDelay(20)]);
   root.name = 'WeldingSequence'; engine.roots.push(root);
@@ -43,6 +46,20 @@ it('started LogicStep roots refuse with their name; idle roots allow capture', (
     engine.reset();
     expect(() => f.snapshot()).not.toThrow();
   } finally { core.dispose(); }
+});
+
+it.each(['Delay', 'JavaScript'])('DES %s uses the participant and narrow blocker', type => {
+  const f = cycleRunnerFixture();
+  const node = new Object3D(); node.name = 'Sequence';
+  node.userData.realvirtual = { LogicStep_SerialContainer: {} }; f.scene.add(node);
+  const child = new Object3D(); child.name = 'Subject';
+  child.userData.realvirtual = { [`LogicStep_${type}`]: { Duration: 20 } }; node.add(child);
+  const registry = new NodeRegistry();
+  f.scene.traverse(n => registry.registerNode(n === f.scene ? 'Root' : `Root/${NodeRegistry.computeNodePath(n)}`, n));
+  const engine = RVLogicEngine.build(f.scene, registry, f.signalStore);
+  f.host.logicEngine = engine; f.start(); engine.start();
+  if (type === 'Delay') expect(f.runner.fullSnapshot().parts.some(p => p.key === 'core.logic')).toBe(true);
+  else expect(() => f.runner.fullSnapshot()).toThrow('LogicStep JavaScriptStep has no snapshot participant');
 });
 
 it.each(['IK', 'playback', 'replay'] as const)('blocks active %s and releases on disposal', component => {
@@ -64,9 +81,9 @@ it.each(['IK', 'playback', 'replay'] as const)('blocks active %s and releases on
 it('a blocker of one viewer does not couple to a second viewer on the same page', () => {
   const one = lineFixture();
   const two = lineFixture();
-  const off = one.blockers.register('plc', () => 'PLC programs running: Main');
+  const off = one.blockers.register('plc', () => 'plc live program without model node');
   try {
-    expect(() => one.snapshot()).toThrow(/PLC programs running/);
+    expect(() => one.snapshot()).toThrow(/plc live program without model node/);
     expect(() => two.snapshot()).not.toThrow();
     expect(two.blockers.reasons()).toEqual([]);
     const before = two.snapshot();

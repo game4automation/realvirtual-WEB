@@ -24,6 +24,7 @@
 
 import {
   getOrCreateSubfolder,
+  writeAborted,
 } from '../../engine/rv-local-filesystem';
 import { emitSceneMutation } from '../../hmi/scene/rv-scene-mutations';
 import {
@@ -494,6 +495,9 @@ export class FolderBackend implements ProjectBackend {
     const expected = preconditionOf(opts.expectedRevision);
 
     return this._writes.run(async () => {
+      // plan-2229: a write aborted while it waited in the queue touches
+      // nothing — not even the precondition read or `_createDir` below.
+      if (opts.signal?.aborted) throw writeAborted();
       // Read-before-write: the stored revision is the only thing that can tell
       // us somebody edited this file in the folder since we last looked. On the
       // queue, so a write already accepted cannot land between this read and
@@ -519,6 +523,8 @@ export class FolderBackend implements ProjectBackend {
         dir,
         filename,
         new Blob([bytes as unknown as BlobPart], { type: 'model/gltf-binary' }),
+        // Checked once more right before the swap file commits (see writeBlobFile).
+        opts.signal,
       );
       return { revision: await revisionOfBytes(bytes) };
     });

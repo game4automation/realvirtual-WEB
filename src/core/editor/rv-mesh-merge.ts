@@ -40,6 +40,7 @@ import {
 } from './rv-mesh-separator';
 import { unsupportedMeshShapeReason } from '../engine/rv-mesh-guards';
 import { GROUP_KEY_RE } from '../engine/rv-group-sync';
+import { isRuntimeHelperNode } from './rv-runtime-helper-node';
 import {
   isCarrierName,
   isSensorName,
@@ -396,6 +397,11 @@ type NodePathFn = (node: Object3D) => string;
  *
  * Traversal rules, in order:
  *
+ * 0. A RUNTIME HELPER by marker ({@link isRuntimeHelperNode} - a Sensor's
+ *    `_sensorViz` / `_sensorRay`, overlays, gizmos) is not file content: skipped with its
+ *    subtree, neither candidate nor kept. An authored node that merely carries such a name
+ *    is classified normally (rule 1). The rebuilt component draws it again on the output; the original stays with the
+ *    parked subtree for undo.
  * 1. A PROTECTED node stops the descent — its whole subtree is untouched.
  * 2. An ANCHOR node survives but opens a new owner zone; the descent continues with that
  *    anchor as owner, so its geometry merges into an output that stays its child.
@@ -429,6 +435,7 @@ export function classifySubtree(root: Object3D, pathOf: NodePathFn): MergeClassi
 
   const visit = (node: Object3D, owner: Object3D): void => {
     if (node !== root) {
+      if (isRuntimeHelperNode(node)) return; // rule 0 - whole subtree, not a source
       const reason = protectedReason(node);
       if (reason) {
         kept.push({ node, role: 'protected', reason, owner });

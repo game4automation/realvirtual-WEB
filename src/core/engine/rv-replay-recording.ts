@@ -29,6 +29,7 @@ export class RVReplayRecording {
   private signalWriter: SignalWriter;
   private isReplaying = false;
   get isActive(): boolean { return this.isReplaying; }
+  get waitingForStart(): boolean { return !this.isReplaying && this.startOnSignalAddr !== null; }
   private oldStartOnSignal = false;
 
   constructor(
@@ -44,6 +45,12 @@ export class RVReplayRecording {
     this.playback = playback;
     this.signalStore = signalStore;
     this.signalWriter = createSignalWriter(signalStore, `replay:${sequenceName}`, 'replay');
+  }
+
+  reset(): void {
+    this.isReplaying = false;
+    this.oldStartOnSignal = false;
+    if (this.isReplayingSignalAddr) this.signalWriter.setByPath(this.isReplayingSignalAddr, false);
   }
 
   fixedUpdate(_dt: number): void {

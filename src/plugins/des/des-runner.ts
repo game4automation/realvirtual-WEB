@@ -3,9 +3,15 @@
 
 
 import { describeLogicPresence, type DesLogicPresence, type DesSnapshotBlockers } from '../../core/material-flow/des-snapshot-blockers';
+import type { DesUnsuitableEntry } from '../../core/material-flow/des-unsuitable-entry';
 import { snapshotUserMessage } from '../../core/sdk/rv-des-snapshot-messages';
 import { scriptTimerHandleRefs, scriptTimerQueueProblems, type ScriptSnapshotState } from './rv-des-script-participant';
-import { scriptSeed32 } from '../../core/rv-rng-streams';
+import { SFC32Legacy, type RngStream } from '../../core/rv-rng-distribution';
+import { RVErraticDriver } from '../../core/engine/rv-erratic';
+import { getDefaultAgvFleet } from '../../core/engine/rv-agv-fleet';
+import { behaviorSnapshotType, driveStateOwners } from './rv-des-drive-state';
+import { publishFeedbackNow, subscribeDriveInputs } from './rv-des-drive-feedback';
+import { seedKey64, scriptSeed32 } from '../../core/rv-rng-streams';
 import { makeScriptHookScheduler } from './rv-des-script-hook';
 import type { ScriptHookDispatcher, SdkScheduler } from '../../core/sdk/rv-script-hook';
 import { DES_SCRIPTS_UNAVAILABLE_CODE, type WebComponentDesBinding, type WebComponentDesSinkRef, type WebComponentDesSinks } from '../../core/engine/rv-web-component-registry';
@@ -23,6 +29,7 @@ import { buildDesFingerprint, type FingerprintInput, type FingerprintResult, typ
 import { documentHashOf, whenDocumentHashesSettled } from '../../core/engine/rv-model-content-ledger';
 import { modelEditEpoch } from '../../core/engine/rv-model-edit-epoch';
 import type { ProgressLedger } from '../../core/diagnostics/rv-progress-ledger';
+import { ProgressHandle, claimProgress, pushArm, pushBump, pushInactive } from '../../core/diagnostics/rv-progress-handle';
 import type { WaitRegistry } from '../../core/diagnostics/rv-wait-registry';
 /**
  * des-runner.ts -- `DESRunner implements SimulationExecutor` (Plan 194 §2.6 P5).
@@ -102,12 +109,27 @@ import type { SnapshotProvider, SnapshotComponentProvider } from './rv-des-snaps
 import { getEngineSourceForNode } from '../../core/engine/rv-source';
 import type { SimKpiSnapshot, SimEventStats, SimDesComponentState, SimDesStatistics, SimDesComponentStat, DesLifecycleEvent, DesLifecycleEventType, DesLifecycleListener, DesCallbackHandle } from '../../core/material-flow/simulation-kernel';
 import type { DesRunCompleteReason, DesPeekResult } from '../../core/material-flow/simulation-kernel';
-import type { CoreSubsystems } from '../../core/engine/rv-core-subsystems';
+import type { CoreSubsystems, DriveLike } from '../../core/engine/rv-core-subsystems';
+import { collectTaktDrives, commandedDrives, cycleAlive, followsNonTaktMaster, hasDriveBehavior, hasTaktSubsystems, resetCycleOwners, taktDrives } from './rv-des-core-takt';
+import { sceneButtonsParticipant } from './rv-des-scene-buttons';
+import { RVLogicEngine } from '../../core/engine/rv-logic-engine';
+import type { RVLogicStep } from '../../core/engine/rv-logic-step';
+import { logicEventParticipant, type LogicEventParticipant } from './rv-des-logic';
+import { logicSnapshotParticipant } from './rv-des-logic-snapshot';
+import { gripSnapshotParticipant, gripSnapshotBlockerReason, resetGripOwners, type GripSnapshotHost } from './rv-des-grip-snapshot';
+import { watchDesZeroTimePulses } from './rv-des-pulse-watch';
+import { logicDesFindings, logicSnapshotBlockerReason } from './rv-des-logic-check';
+import type { SimEventFacade, EventParticipant, CycleParticipant, SnapshotGate } from '../../core/sim-event-facade';
+import { withSpeedOverrideNeutral } from '../../core/engine/rv-speed-override';
+import { DES_DEFAULT_CYCLE_TIME, normalizeDesCycleTime } from '../../core/material-flow/des-manager-settings';
+import { CycleController, cycleSnapshotParticipant } from './rv-des-cycle';
+import { SettleController, settleSnapshotParticipant, startPassOf } from './rv-des-settle';
+import { slotCommandListeners } from '../../core/engine/rv-slot-io';
 import { findDesManager } from '../../core/material-flow/des-manager-node';
 import { yieldToBrowser, yieldToTimers } from '../../core/engine/rv-des-yield';
 import { beginDesRestore, endDesRestore } from '../../core/material-flow/des-restore-guard';
 import { reportProblem, clearProblem, clearProblemsOfCode } from '../../core/hmi/problems-store';
-import { applyMuForwardToVisual } from '../../behaviors/_shared/mu-reference';
+import { applyMuForwardToVisual, presetMuBugSize } from '../../behaviors/_shared/mu-reference';
 import { kindOf, sortByMaterialFlow } from './des-flow-order';
 import type { SignalStore } from '../../core/engine/rv-signal-store';
 import type { RVDrive } from '../../core/engine/rv-drive';
@@ -124,6 +146,7 @@ import type { DESMU } from './rv-des-mu';
 import { bindSceneToRunner, bindLoopSaturation, clearSceneBindingProblems, reconfigureInstancesFromExtras, releaseUnownedSignals } from './des-scene-binding';
 import { findUnaddressable, type DesIdentityEntry, type DesUnaddressable } from './rv-des-identity';
 import type { DESComponent } from './rv-des-component';
+import { beginProgressSilence, endProgressSilence } from './rv-des-component';
 import { createDESGizmoBox } from './rv-des-gizmo-helpers';
 import { isParamApplyBusy } from '../../core/params/rv-param-apply';
 import { getDesRunSettings, updateDesRunSettings } from '../../core/hmi/des-run-settings-store';
@@ -420,8 +443,10 @@ export class DESRunner implements SimulationExecutor {
       setSubMode: (...args: Parameters<DESRunner["_setSubMode"]>) => runner._setSubMode(...args),
       snapshotFailure: (...args: Parameters<DESRunner["_snapshotFailure"]>) => runner._snapshotFailure(...args),
       logicHazards: (...args: Parameters<DESRunner["_logicHazards"]>) => runner._logicHazards(...args),
+      desUnsuitable: () => runner._desUnsuitable(),
       reportLogicProblem: (...args: Parameters<DESRunner["_reportLogicProblem"]>) => runner._reportLogicProblem(...args),
       reset: (...args: Parameters<DESRunner["reset"]>) => runner.reset(...args), clearMUs: (...args: Parameters<DESRunner["clearMUs"]>) => runner.clearMUs(...args),
+      whenCycleOwnersReady: () => runner.whenCycleOwnersReady(),
       cancelFastForward: (...args: Parameters<DESRunner["cancelFastForward"]>) => runner.cancelFastForward(...args), runFastForward: (opts?: { untilSimTime?: number }) => runner.runFastForward(opts),
       setMasterSeed: (...args: Parameters<DESRunner["setMasterSeed"]>) => runner.setMasterSeed(...args), setRngVersion: (...args: Parameters<DESRunner["setRngVersion"]>) => runner.setRngVersion(...args),
       fingerprintNow: (...args: Parameters<DESRunner["fingerprintNow"]>) => runner.fingerprintNow(...args), fullSnapshot: () => runner.fullSnapshot(),
@@ -545,6 +570,7 @@ export class DESRunner implements SimulationExecutor {
   private readonly _muVisualFactories = new Map<string, {
     factory: MuVisualFactory;
     dispose: MuVisualDisposer;
+    bugSize: readonly [number, number, number] | null;
   }>();
   private readonly _ownedMuVisuals = new Map<object, MuVisualDisposer>();
   private readonly _warnedUnknownVisualTemplates = new Set<string>();
@@ -582,11 +608,367 @@ export class DESRunner implements SimulationExecutor {
    * position while a Hybrid batch is being spread across frames (B4).
    */
   private _renderClock = 0;
+  /** plan-2237: last render-clock clamp + monotonic counts (read by sim.clock.get). */
+  readonly clampReport = { at: null as 'budget' | 'end' | null, budget: 0, end: 0 };
   /** Render clock at the last `lateTick` — FastForward marks the frame dirty when it moved. */
   private _lastDirtyClock = 0;
 
   /** Core subsystem pipeline (drive loop / visuals / early stage) — see DESRunnerOptions.core. */
   private readonly core: CoreSubsystems | null;
+  private readonly settle: SettleController;
+  private cycle: CycleController | null = null;
+  private offSlotCommands: (() => void) | null = null;
+  private lastCycleConnection = false;
+  private logicOwner: { engine: RVLogicEngine; roots: readonly RVLogicStep[]; participant: LogicEventParticipant; off(): void } | null = null;
+  private syncingLogic = false;
+  private readonly logicProblems = new Set<string>();
+  private readonly unsuitableProblems = new Set<string>();
+  private offUnsuitable: (() => void) | null = null;
+  private dormantCycle: { lastK: number; cycleTime: number } | null = null;
+  private _cycleTime = DES_DEFAULT_CYCLE_TIME;
+  private readonly takt = new Set<DriveLike>();
+  private readonly feedbackDrives = new Set<RVDrive>();
+  private readonly driveInputSubscriptions: (() => void)[] = [];
+  private readonly rngOwners = new Map<string, RngStream>();
+  private readonly erraticOwners = new Map<RVErraticDriver, string>();
+  private offDriveStateBlocker: (() => void) | null = null;
+
+  /** Independent owner streams never draw from the frozen v1 manager RNG. */
+  registerRngOwner(key: string): RngStream {
+    if (!key) throw new Error('des-rng-id-missing');
+    let stream = this.rngOwners.get(key);
+    if (!stream) {
+      stream = this.manager.rngVersion === 2 ? this.manager.stream(key, 'erratic') : this._legacyOwnerRng(key);
+      this.rngOwners.set(key, stream);
+    }
+    return stream;
+  }
+
+  private _legacyOwnerRng(key: string): SFC32Legacy {
+    // Low unsigned 32 bits of the framed owner seed, including zero.
+    return new SFC32Legacy(Number(seedKey64(this.manager.masterSeed, key, 'erratic') & 0xffffffffn));
+  }
+
+  private _reseedRngOwners(): void {
+    for (const [key, stream] of this.rngOwners) {
+      if (this.manager.rngVersion === 1) stream.setState(this._legacyOwnerRng(key).getState());
+    }
+  }
+
+  private _clearCycleDriveServices(): void {
+    for (const drive of this.feedbackDrives) { drive.eventDrivenFeedback = false; drive.onCommand = null; }
+    this.feedbackDrives.clear();
+    for (const off of this.driveInputSubscriptions.splice(0)) off();
+    // Cycle reconfiguration keeps owner identities and RNG cursors until resync.
+    for (const behavior of this.erraticOwners.keys()) behavior.random = null;
+  }
+
+  private _syncCycleDriveServices(): void {
+    const active = new Map<RVErraticDriver, string>();
+    for (const drive of this.feedbackDrives) { drive.eventDrivenFeedback = false; drive.onCommand = null; }
+    this.feedbackDrives.clear();
+    for (const off of this.driveInputSubscriptions.splice(0)) off();
+    for (const object of this.cycle?.claimsDrives() ?? []) {
+      const drive = object as RVDrive;
+      drive.eventDrivenFeedback = true;
+      drive.onCommand = owner => publishFeedbackNow(drive, owner);
+      this.feedbackDrives.add(drive);
+      this.driveInputSubscriptions.push(subscribeDriveInputs(drive, this.resolveSignalStore()));
+      for (const behavior of driveStateOwners(drive)) if (behavior instanceof RVErraticDriver) {
+        const address = this._driveAddress(drive.node);
+        if (!address) this._snapshotFailure('des-snapshot-unaddressable', `Drive: ${drive.node.name}`);
+        active.set(behavior, `${address}@ErraticPosition`);
+      }
+    }
+    for (const [behavior, key] of this.erraticOwners) if (active.get(behavior) !== key) {
+      behavior.random = null; this.erraticOwners.delete(behavior);
+      this.rngOwners.delete(key); this.manager.releaseStreams(key);
+    }
+    for (const [behavior, key] of active) {
+      this.registerRngOwner(key);
+      this.erraticOwners.set(behavior, key);
+      behavior.random = () => this.rngOwners.get(key)!.next();
+    }
+  }
+
+  private _driveSnapshotBlockerReasons(): string[] {
+    const drives = new Set([...this.collectDrives(), ...(this.cycle?.claimsDrives() ?? []) as RVDrive[]]);
+    return [...drives].flatMap(drive => {
+      const address = this._driveAddress(drive.node) ?? drive.node.name;
+      const reasons = drive.usesSmoothCore() ? [`smooth-motion drive ${address}`] : [];
+      for (const behavior of driveStateOwners(drive))
+        if (!behaviorSnapshotType(behavior))
+          reasons.push(`drive behavior ${behavior.constructor.name} without snapshot state: ${address}`);
+      return reasons;
+    });
+  }
+  private readonly isTakt = (drive: DriveLike): boolean => this.takt.has(drive);
+  private readonly eventOwners = new Map<string, { order: number; p: EventParticipant; off?: () => void }>();
+  private readonly cycleOwners = new Map<string, { order: number; p: CycleParticipant; off?: () => void }>();
+  private readonly resetHooks = new Map<string, () => void | Promise<void>>();
+  private readonly snapshotGates = new Map<string, SnapshotGate>();
+  private _cycleOwnersBarrier: Promise<void> | null = null;
+  private _cycleOwnersGeneration = 0;
+  private offButtons: (() => void) | null = null;
+  private offButtonBlocker: (() => void) | null = null;
+  private offPulseWatch: (() => void) | null = null;
+  private offGripBlocker: (() => void) | null = null;
+  private gripSnapshot: ReturnType<typeof gripSnapshotParticipant> | null = null;
+  private buttons: import('../../core/engine/rv-scene-button-manager').SceneButtonManager | null = null;
+  private offRenderWrites: (() => void) | null = null;
+  private renderPhase = false;
+  renderPhaseSignalWrites = 0;
+  private readonly pendingWakes = new Set<string>();
+  private offOwnershipBlocker: (() => void) | null = null;
+  private ownershipConflicts: string[] = [];
+  readonly simEvents: SimEventFacade & { refreshEventParticipant(id: string, p: EventParticipant): void };
+
+  get cycleTime(): number { return this._cycleTime; }
+  get cycleMode(): boolean { return this.cycle !== null; }
+  setCycleTime(seconds: number): void {
+    this._cycleTime = normalizeDesCycleTime(seconds);
+    if (this._started) this._syncCycleOwners();
+  }
+
+  private _syncCycleOwners(): void {
+    this._syncGripOwner();
+    this._syncLogicOwner();
+    this._clearTickOwnership();
+    const own = this._desOwnDrives();
+    const commanded = this.core ? commandedDrives(this.core.desHost) : new Set<object>();
+    this.takt.clear();
+    if (this.core) for (const drive of collectTaktDrives(this.core.desHost, own)) this.takt.add(drive);
+    this.ownershipConflicts = [...own].filter(d =>
+      hasDriveBehavior(d as DriveLike) && !followsNonTaktMaster(d as DriveLike, this.isTakt) || commanded.has(d))
+      .map(d => this._driveAddress((d as RVDrive).node) ?? (d as RVDrive).node.name);
+    for (const address of this.ownershipConflicts) reportProblem({
+      id: `des-tick-ownership-conflict:${this.runnerId}:${address}`, code: 'des-tick-ownership-conflict', severity: 'error',
+      title: 'Drive has two DES tick owners', detail: `tick ownership conflict: ${address}`, nodePath: address,
+    });
+    this.offOwnershipBlocker = (this._topology?.host as { snapshotBlockers?: DesSnapshotBlockers } | undefined)
+      ?.snapshotBlockers?.register('des.tick-ownership', () => this.ownershipConflicts.length
+        ? this.ownershipConflicts.map(a => `tick ownership conflict: ${a}`).join('; ') : null) ?? null;
+    const needed = !!this.core && (hasTaktSubsystems(this.core.desHost, this.isTakt) || this.cycleOwners.size > 0);
+    if (this.cycle && (!needed || this.cycle.cycleTime !== this._cycleTime)) this._detachCycle();
+    if (needed && !this.cycle) {
+      this.cycle = new CycleController(this.manager, {
+        motion: dt => this.core!.motion(dt), taktDrives: dt => taktDrives(this.core!.desHost, dt, this.isTakt),
+        alive: () => cycleAlive(this.core!.desHost, this.isTakt),
+      }, this._cycleTime, this.resolveSignalStore() ?? undefined, this.settle);
+      this.lastCycleConnection = this.core!.desHost.isConnected;
+      const wake = (): void => { this.cycle?.arm(); };
+      slotCommandListeners.add(wake);
+      this.offSlotCommands = () => { slotCommandListeners.delete(wake); };
+      if (this.dormantCycle?.cycleTime === this._cycleTime) this.cycle.run.lastK = this.dormantCycle.lastK;
+      for (const [id, entry] of this.cycleOwners)
+        entry.off = this.cycle.registerCycleParticipant(id, entry.order, entry.p);
+      this.manager.onPostDispatch = () => {
+        if (this.cycle && !this.cycle.run.armed) this.cycle.armIfAlive();
+      };
+      // Idle behaviors may start authored motion only on their first update.
+      this.cycle.arm();
+    }
+    this.cycle?.setClaimedDrives([...this.takt]);
+    this._syncCycleDriveServices();
+    this.offDriveStateBlocker?.();
+    this.offDriveStateBlocker = (this._topology?.host as { snapshotBlockers?: DesSnapshotBlockers } | undefined)
+      ?.snapshotBlockers?.register('des.drive-state', () => this._driveSnapshotBlockerReasons().join('; ') || null,
+        () => { const nodes = this._driveSnapshotBlockerReasons(); return nodes.length ? [{ system: 'Drive snapshot', nodes }] : []; }) ?? null;
+    this.cycle?.armIfAlive();
+    this._recomputeSettleRequired();
+  }
+
+  private _detachCycle(): void {
+    this._clearCycleDriveServices();
+    this.offSlotCommands?.(); this.offSlotCommands = null;
+    this.manager.onPostDispatch = null;
+    if (this.cycle) this.dormantCycle = { lastK: this.cycle.run.lastK, cycleTime: this.cycle.cycleTime };
+    this.cycle?.dispose(); this.cycle = null;
+    for (const entry of this.cycleOwners.values()) entry.off = undefined;
+  }
+
+  private _clearTickOwnership(): void {
+    this.offDriveStateBlocker?.(); this.offDriveStateBlocker = null;
+    this.offOwnershipBlocker?.(); this.offOwnershipBlocker = null;
+    for (const address of this.ownershipConflicts) clearProblem(`des-tick-ownership-conflict:${this.runnerId}:${address}`);
+    this.ownershipConflicts = [];
+  }
+
+  private _bindEventOwners(): void {
+    this.settle.bindStore(this.resolveSignalStore() ?? undefined);
+    this._syncGripOwner();
+    this._syncLogicOwner();
+    this._detachUnsuitableProblems();
+    this._syncUnsuitableProblems();
+    this.offUnsuitable = (this._topology?.host as { snapshotBlockers?: DesSnapshotBlockers } | undefined)
+      ?.snapshotBlockers?.onChanged(() => this._syncUnsuitableProblems()) ?? null;
+    this.offPulseWatch?.(); this.offPulseWatch = null;
+    const store = this.resolveSignalStore();
+    const transport = (this.core?.desHost.transportManager
+      ?? (this._topology?.host as { transportManager?: unknown } | undefined)?.transportManager) as Partial<{
+        grips: import('../../core/engine/rv-grip').RVGrip[];
+        sources: import('../../core/engine/rv-source').RVSource[];
+      }> | null | undefined;
+    if (store) this.offPulseWatch = watchDesZeroTimePulses({
+      runnerId: this.runnerId, manager: this.manager, store,
+      grips: transport?.grips ?? [], sources: transport?.sources ?? [],
+      addressOf: node => this._driveAddress(node),
+      writer: () => this.settle.currentParticipant,
+    });
+    this.offRenderWrites?.();
+    this.offRenderWrites = this.resolveSignalStore()?.observeWrites(() => {
+      if (this.renderPhase) this.renderPhaseSignalWrites++;
+    }) ?? null;
+    const buttons = (this.core?.desHost.sceneButtonManager ?? (this._topology?.host as unknown as {
+      sceneButtonManager?: import('../../core/engine/rv-scene-button-manager').SceneButtonManager;
+    } | undefined)?.sceneButtonManager) as import('../../core/engine/rv-scene-button-manager').SceneButtonManager | undefined;
+    if (typeof buttons?.setEventClock === 'function' && buttons.size > 0 && !this.offButtons) {
+      this.buttons = buttons;
+      buttons.setEventClock(this.simEvents);
+      const participant = sceneButtonsParticipant(buttons);
+      this.offButtons = this.simEvents.registerEventParticipant('core.buttons', 0, participant);
+      this.offButtonBlocker = (this._topology?.host as { snapshotBlockers?: DesSnapshotBlockers } | undefined)
+        ?.snapshotBlockers?.register('core.buttons', () => participant.pulseBlocker()) ?? null;
+    }
+    for (const [id, entry] of this.eventOwners) if (!entry.off)
+      entry.off = this.settle.registerEventParticipant(id, entry.order, entry.p);
+    // Every start explicitly evaluates all owners, even with unchanged inputs.
+    for (const [id, entry] of this.eventOwners) if (startPassOf(entry.p)) this.settle.wake(id);
+    for (const id of this.pendingWakes) this.settle.wake(id);
+    this.pendingWakes.clear();
+    this._syncCycleOwners();
+  }
+
+  async whenCycleOwnersReady(): Promise<void> {
+    for (;;) {
+      while (this._cycleOwnersBarrier) await this._cycleOwnersBarrier;
+      const gates = [...this.snapshotGates.values()].filter(g => g.check() !== null);
+      if (!gates.length) return;
+      await Promise.all(gates.map(g => g.whenClear().catch(() => undefined)));
+    }
+  }
+
+  private _gripHost(): GripSnapshotHost {
+    const transport = () => (this.core?.desHost.transportManager
+      ?? (this._topology?.host as { transportManager?: unknown } | undefined)?.transportManager) as Partial<{
+        grips: import('../../core/engine/rv-grip').RVGrip[];
+        zones: Set<import('../../core/engine/rv-zone').RVZone>;
+      }> | null | undefined;
+    return { grips: () => transport()?.grips ?? [], zones: () => [...transport()?.zones ?? []] };
+  }
+
+  private _syncGripOwner(): void {
+    if (!this._started) return;
+    const host = this._gripHost();
+    if (!host.grips().length && !host.zones().length) {
+      this.offGripBlocker?.(); this.offGripBlocker = null;
+      this.gripSnapshot = null;
+    } else if (!this.gripSnapshot) {
+      const addressOf = (node: Object3D) => this._driveAddress(node);
+      this.gripSnapshot = gripSnapshotParticipant(host, addressOf);
+      this.offGripBlocker = (this._topology?.host as { snapshotBlockers?: DesSnapshotBlockers } | undefined)
+        ?.snapshotBlockers?.register('core.grip', () => gripSnapshotBlockerReason(host, addressOf), () => []) ?? null;
+    }
+  }
+
+  private _detachUnsuitableProblems(): void {
+    this.offUnsuitable?.(); this.offUnsuitable = null;
+    for (const id of this.unsuitableProblems) clearProblem(id);
+    this.unsuitableProblems.clear();
+  }
+
+  private _syncUnsuitableProblems(): void {
+    for (const id of this.unsuitableProblems) clearProblem(id);
+    this.unsuitableProblems.clear();
+    for (const entry of this._desUnsuitable()) {
+      const { node, line, rule, message } = entry;
+      const id = `${entry.code}:${this.runnerId}:${node}:${line ?? 0}:${rule}`;
+      this.unsuitableProblems.add(id);
+      reportProblem({ id, code: entry.code, severity: 'error', title: snapshotUserMessage(entry.code).title,
+        detail: `${node}${line === undefined ? '' : ` line ${line}`}: ${message} [${rule}]`, nodePath: node, at: this.manager.currentTime * 1000 });
+    }
+  }
+
+  private _detachLogicOwner(): void {
+    const owner = this.logicOwner;
+    this.logicOwner = null;
+    if (owner) {
+      owner.engine.desHooks = null;
+      owner.off();
+      owner.participant.dispose();
+    }
+    for (const id of this.logicProblems) clearProblem(id);
+    this.logicProblems.clear();
+  }
+
+  private _syncLogicOwner(): void {
+    if (this.syncingLogic || !this._started) return;
+    const engine = this.core?.desHost.logicEngine;
+    const store = this.resolveSignalStore();
+    const owner = this.logicOwner;
+    if (owner && engine === owner.engine && owner.engine.roots.length === owner.roots.length
+      && owner.engine.roots.every((root, i) => root === owner.roots[i])) return;
+    this.syncingLogic = true;
+    try {
+      const refresh = owner && engine instanceof RVLogicEngine && engine === owner.engine && engine.roots.length > 0 && !!store;
+      if (!refresh) this._detachLogicOwner();
+      else {
+        owner.participant.dispose();
+        for (const id of this.logicProblems) clearProblem(id);
+        this.logicProblems.clear();
+      }
+      if (!(engine instanceof RVLogicEngine) || !engine.roots.length || !store) return;
+      const participant = logicEventParticipant(engine, this.core!.desHost,
+        { store, events: this.simEvents, existingRoots: new Set(engine === owner?.engine ? engine.roots : []) });
+      if (refresh) {
+        participant.run.lastEval = owner.participant.run.lastEval;
+        this.simEvents.refreshEventParticipant('core.logic', participant);
+      }
+      const off = refresh ? owner.off : this.simEvents.registerEventParticipant('core.logic', 10, participant);
+      this.logicOwner = { engine, roots: [...engine.roots], participant, off };
+      engine.desHooks = {
+        blockerReason: () => logicSnapshotBlockerReason(engine),
+        now: () => this.simEvents.now,
+        wake: () => this.simEvents.wake('core.logic'),
+      };
+      for (const finding of logicDesFindings(engine)) {
+        const code = finding.severity === 'error' ? 'des-logic-not-event-suitable' : 'des-logic-poll-hint';
+        const id = `${code}:${this.runnerId}:${finding.path}:${finding.rule}`;
+        this.logicProblems.add(id);
+        reportProblem({ id, code: finding.severity === 'error' ? 'des-logic-not-event-suitable' : 'des-logic-poll-hint', severity: finding.severity, title: finding.severity === 'error' ? 'Logic cannot run on events' : 'Logic polls frequently',
+          detail: finding.message, nodePath: finding.path, at: this.manager.currentTime * 1000 });
+      }
+      this.simEvents.wake('core.logic');
+    } finally { this.syncingLogic = false; }
+  }
+
+  private _resetCycleOwners(): void {
+    const generation = ++this._cycleOwnersGeneration;
+    const finish = (): void => {
+      if (generation !== this._cycleOwnersGeneration || !this._started) return;
+      withSpeedOverrideNeutral(() => {
+        this._syncCycleOwners();
+        this.settle.reset();
+        this.cycle?.reset();
+      });
+    };
+    const pending: Promise<void>[] = [];
+    for (const hook of this.resetHooks.values()) {
+      try {
+        const result = hook();
+        if (result) pending.push(Promise.resolve(result));
+      } catch (error) { pending.push(Promise.reject(error)); }
+    }
+    if (!pending.length && !this._cycleOwnersBarrier) { finish(); return; }
+    const barrier = Promise.all([this._cycleOwnersBarrier?.catch(() => {}), ...pending]).then(finish);
+    this._cycleOwnersBarrier = barrier;
+    void barrier.then(() => {
+      if (this._cycleOwnersBarrier === barrier) this._cycleOwnersBarrier = null;
+    }, error => {
+      // Keep a failed reset closed to event processing until the next reset.
+      if (generation === this._cycleOwnersGeneration) this._actionFailed(error);
+    });
+  }
 
   /**
    * Number of live settle consumers (plan-262 Phase 2): instances whose
@@ -658,6 +1040,69 @@ export class DESRunner implements SimulationExecutor {
       }
     };
     this.core = opts.core ?? null;
+    this.settle = new SettleController(this.manager);
+    this.manager.restHold = () => this.settle.isResting();
+    const runner = this;
+    this.simEvents = {
+      isEventDriven: () => runner._started,
+      get now() { return runner.manager.currentTime; },
+      get cycleTime() { return runner._cycleTime; },
+      registerEventParticipant: (id, order, p) => {
+        if (!id || this.eventOwners.has(id)) throw new Error(`duplicate or empty event participant '${id}'`);
+        const entry = { order, p, off: this._started ? this.settle.registerEventParticipant(id, order, p) : undefined };
+        this.eventOwners.set(id, entry);
+        return () => {
+          if (this.eventOwners.get(id) !== entry) return;
+          entry.off?.(); this.eventOwners.delete(id); this.pendingWakes.delete(id);
+        };
+      },
+      reorderEventParticipant: (id, order) => {
+        const entry = this.eventOwners.get(id);
+        if (!entry) throw new Error(`unknown event participant '${id}'`);
+        entry.order = order;
+        if (entry.off) this.settle.reorderEventParticipant(id, order);
+      },
+      refreshEventParticipant: (id, p) => {
+        const entry = this.eventOwners.get(id);
+        if (!entry) throw new Error(`unknown event participant '${id}'`);
+        if (entry.off) this.settle.refreshEventParticipant(id, p);
+        entry.p = p;
+      },
+      wake: id => { if (this._started) this.settle.wake(id); else this.pendingWakes.add(id); },
+      registerCycleParticipant: (id, order, p) => {
+        if (!id || this.cycleOwners.has(id)) throw new Error(`duplicate or empty cycle participant '${id}'`);
+        const entry: { order: number; p: CycleParticipant; off?: () => void } = { order, p };
+        this.cycleOwners.set(id, entry);
+        if (this._started) {
+          entry.off = this.cycle?.registerCycleParticipant(id, order, p);
+          this._syncCycleOwners();
+        }
+        return () => {
+          if (this.cycleOwners.get(id) !== entry) return;
+          entry.off?.(); this.cycleOwners.delete(id);
+          if (this._started) this._syncCycleOwners();
+        };
+      },
+      registerSnapshotProvider: (id, provider) => this.registerSnapshotProvider(id, provider),
+      registerResetHook: (id, fn) => {
+        if (!id || this.resetHooks.has(id)) throw new Error(`duplicate or empty reset hook '${id}'`);
+        this.resetHooks.set(id, fn);
+        return () => { if (this.resetHooks.get(id) === fn) this.resetHooks.delete(id); };
+      },
+      registerSnapshotGate: (id, gate) => {
+        if (!id || this.snapshotGates.has(id)) throw new Error(`duplicate or empty snapshot gate '${id}'`);
+        this.snapshotGates.set(id, gate);
+        return () => { if (this.snapshotGates.get(id) === gate) this.snapshotGates.delete(id); };
+      },
+      holdProgress: (until) => {
+        const barrier: Promise<void> = Promise.all([this._cycleOwnersBarrier?.catch(() => {}), until.catch(() => {})])
+          .then(() => undefined);
+        this._cycleOwnersBarrier = barrier;
+        void barrier.then(() => {
+          if (this._cycleOwnersBarrier === barrier) this._cycleOwnersBarrier = null;
+        });
+      },
+    };
     this.frameEventBudget = Math.max(1, opts.frameEventBudget ?? DEFAULT_FRAME_EVENT_BUDGET);
     this._subMode = opts.subMode ?? 'animated';
     this._multiplier = Math.max(1, opts.multiplier ?? 1);
@@ -904,14 +1349,18 @@ export class DESRunner implements SimulationExecutor {
     return this.manager;
   }
 
-  /** Register one template-keyed MU visual factory. The registry owns disposal. */
+  /** Register a visual factory and canonical size. The registry owns disposal. */
   registerMuVisualFactory(
     templateId: string,
     factory: MuVisualFactory,
     dispose: MuVisualDisposer = (visual) => { visual.dispose(); },
+    bugSize: readonly [number, number, number] | null = null,
   ): void {
     if (!templateId) throw new Error('DES: visual template id must not be empty');
-    this._muVisualFactories.set(templateId, { factory, dispose });
+    this._muVisualFactories.set(templateId, {
+      factory, dispose,
+      bugSize: bugSize ? Object.freeze([...bugSize] as [number, number, number]) : null,
+    });
   }
 
   /** Create a registered visual immediately (scene binding and tests). */
@@ -1319,7 +1768,7 @@ export class DESRunner implements SimulationExecutor {
       let done = false;
       try {
         do {
-          ({ done } = this.manager.runBatch(FF_INNER_BATCH));
+          ({ done } = withSpeedOverrideNeutral(() => this.manager.runBatch(FF_INNER_BATCH)));
           // Retire consumed MUs before another batch can allocate their slots.
           this._sweepConsumedVisuals();
         } while (!done && performance.now() < deadline);
@@ -1340,7 +1789,8 @@ export class DESRunner implements SimulationExecutor {
       const end = Math.min(this._ffTarget?.time ?? Infinity, this.manager.duration);
       this._ffProgress = Math.min(1, this.manager.currentTime / (end || 1));
       if (done) {
-        this._finishFf(true);
+        this._finishFf(!(this._ffTarget === null && this.manager.duration === Infinity && this.settle.isResting()
+          && this.manager.nextModelEventTime === Infinity));
         return;
       }
       if (performance.now() - lastTimerYield >= FF_TIMER_YIELD_MS) {
@@ -1438,6 +1888,7 @@ export class DESRunner implements SimulationExecutor {
   setEndTime(seconds: number): void {
     this._continueBaseEnd = null;   // an explicit end is the new "original" end
     this.manager.duration = Number.isFinite(seconds) ? Math.max(0, seconds) : Infinity;
+    this._backend?.onClockSet?.('end');
     this._refreshRunComplete();
   }
 
@@ -1508,7 +1959,10 @@ export class DESRunner implements SimulationExecutor {
   }
   /** Sim time at which component statistics reset (warmup); 0 = off. */
   get statResetTime(): number { return this.manager.statResetTime; }
-  setStatResetTime(seconds: number): void { this.manager.statResetTime = Math.max(0, seconds) || 0; }
+  setStatResetTime(seconds: number): void {
+    this.manager.statResetTime = Math.max(0, seconds) || 0;
+    this._backend?.onClockSet?.('warmup');
+  }
 
   /**
    * Per-component runtime states for inspection / debugging (MCP `web_des_*`).
@@ -1625,8 +2079,19 @@ export class DESRunner implements SimulationExecutor {
     if (this._snapshotProviders.has(id)) throw new Error(`duplicate snapshot provider '${id}'`);
     const providers = this._snapshotProviders;
     providers.set(id, provider);
+    if (this._started && this.cycle) this._syncCycleOwners(); // its drive claims leave the takt set
     let registered = true;
     return () => { if (registered) { providers.delete(id); registered = false; } };
+  }
+
+  /** DES-owned drives: material-flow drives plus every drive a snapshot participant claims (e.g. the fleet lift). */
+  private _desOwnDrives(): Set<object> {
+    const own = new Set<object>(this.collectDrives());
+    for (const provider of this._snapshotProviders.values()) {
+      try { for (const p of provider({ restoring: false })) for (const d of p.claimsDrives?.() ?? []) own.add(d); }
+      catch { /* a provider that cannot build outside a snapshot claims nothing here */ }
+    }
+    return own;
   }
 
   private _snapshotParticipants(raw?: DESSnapshotV4, restoring = false) {
@@ -1656,6 +2121,16 @@ export class DESRunner implements SimulationExecutor {
       if (!id || (drives.has(id) && drives.get(id) !== drive)) this._snapshotFailure('des-snapshot-unaddressable', `Drive: ${drive.node.name}`);
       drives.set(id, drive);
     }
+    const taktDrives = new Map<string, RVDrive>();
+    for (const object of this.cycle?.claimsDrives() ?? []) {
+      const drive = object as RVDrive;
+      const id = this._driveAddress(drive.node);
+      if (!id || taktDrives.has(id) && taktDrives.get(id) !== drive)
+        this._snapshotFailure('des-snapshot-unaddressable', `Drive: ${drive.node.name}`);
+      if (drives.has(id) || [...drives.values()].includes(drive))
+        this._snapshotFailure('des-snapshot-contract', `duplicate drive '${id}'`);
+      taktDrives.set(id, drive);
+    }
     // uuid <-> address map for `Flow.Occupied@<uuid>` signal keys, built only when such a key occurs
     // (a full scene walk costs hundreds of ms on large scenes).
     let signalMaps: { ids: Map<string, string>; live: Map<string, string> } | null = null;
@@ -1668,7 +2143,8 @@ export class DESRunner implements SimulationExecutor {
       });
       return (signalMaps = { ids, live: new Map([...ids].map(([uuid, address]) => [address, uuid])) });
     };
-    const frame = runnerParticipants({ scripts: this.resolveScriptComponents(), manager: this.manager, components: sortedComponents, componentExtraServices, drives, blockageWatch: host?.blockageWatch, progressWiring: host?.progressWiring,
+    const frame = runnerParticipants({ scripts: this.resolveScriptComponents(), manager: this.manager, components: sortedComponents, componentExtraServices, drives, taktDrives, rngOwners: this.rngOwners, blockageWatch: host?.blockageWatch, progressWiring: host?.progressWiring,
+      ...(this._diagnosticsUnits ? { progressUnits: this._diagnosticsUnits } : {}),
       signalKey: (key, restoring) => {
         const at = key.indexOf('Flow.Occupied@');
         if (at < 0) return key;
@@ -1686,6 +2162,16 @@ export class DESRunner implements SimulationExecutor {
       pathExists: id => !!getDefaultPathNetwork().get(id), jsonPayload: data => this._jsonHookPayload(data, true),
       replanOnRestore: this.replanOnRestore }, raw, restoring);
     try {
+      const coreParts = [
+        ...(this.eventOwners.size ? [settleSnapshotParticipant(this.settle, raw)] : []),
+        ...(this.cycle ? [cycleSnapshotParticipant(this.cycle, raw)] : []),
+        ...(this.logicOwner ? [logicSnapshotParticipant(this.logicOwner.engine, this.logicOwner.participant,
+          node => this._driveAddress(node))] : []),
+        ...(this.gripSnapshot ? [this.gripSnapshot] : []),
+      ];
+      for (const part of coreParts) {
+        frame.registry.register(part); frame.queueContext.participants.add(part.key);
+      }
       for (const provider of this._snapshotProviders.values()) for (const part of provider({ raw, restoring })) {
         frame.registry.register(part);
         frame.queueContext.participants.add(part.key);
@@ -1712,8 +2198,10 @@ export class DESRunner implements SimulationExecutor {
   }
 
   private _checkSnapshotBlockers(): void {
+    this._syncGripOwner();
     const reasons = (this._topology?.host as { snapshotBlockers?: DesSnapshotBlockers } | undefined)?.snapshotBlockers?.reasons() ?? [];
-    if (reasons.length) this._snapshotFailure('des-snapshot-unsupported-component', reasons.join('; '));
+    const driveReasons = this._driveSnapshotBlockerReasons();
+    if (reasons.length || driveReasons.length) this._snapshotFailure('des-snapshot-unsupported-component', [...new Set([...reasons, ...driveReasons])].join('; '));
   }
 
   /**
@@ -1723,6 +2211,15 @@ export class DESRunner implements SimulationExecutor {
    * startup when the barrier opens (state reset, generator events twice).
    */
   private _refuseWhileStartupPending(): void {
+    for (const gate of this.snapshotGates.values()) {
+      const refusal = gate.check();
+      if (refusal) {
+        // A transient refusal (e.g. a deploy in progress) leaves Problems once its gate clears.
+        gate.whenClear().then(() => { if (!gate.check()) clearProblem(refusal.code); }, () => undefined);
+        this._snapshotFailure(refusal.code, refusal.detail);
+      }
+    }
+    if (this._cycleOwnersBarrier) this._snapshotFailure('des-snapshot-contract', 'cycle owner reset pending');
     if (this._pendingMaterialStart) {
       this._snapshotFailure('des-snapshot-scripts-pending', 'the run waits for its scripts; material startup pending');
     }
@@ -1784,76 +2281,91 @@ export class DESRunner implements SimulationExecutor {
     const frame = this._snapshotParticipants(snapshot?.version === 4 ? snapshot : undefined, true);
     const deferred = createDeferredReactions();
     let bracket = false;
-    const result = restoreTransaction(raw, { registry: frame.registry, deferred,
-      preflight: { fingerprint, componentTypeOf: frame.queueContext.componentTypeOf,
-        getActionSchema, desOwners: frame.queueContext.desOwners, replanOnRestore: this.replanOnRestore,
-        queueChecks: (events, parts) => scriptTimerQueueProblems(events, parts, new Set(this.resolveScriptComponents().map(s => s.desId!))),
-        handleRefs: parts => {
-          const refs: import('./rv-des-preflight').SnapshotHandleRef[] = [];
-          const actions = ACTION_SCHEMA.keys();
-          for (const action of actions) {
-            const schema = getActionSchema(action);
-            if (!schema || schema === 'non-persistent') continue;
-            for (const part of parts) {
-              if (schema.owner !== 'component' && schema.owner !== part.key) continue;
-              if (schema.owner === 'component' && !fingerprint.components.some(c => c.id === part.key
-                && (!schema.targetType || schema.targetType === c.type))) continue;
-              for (const path of schema.handleFields ?? []) {
-                let value: unknown = part.state;
-                for (const segment of path.split('.')) value = value && typeof value === 'object'
-                  ? (value as Record<string, unknown>)[segment] : undefined;
-                refs.push({ participant: part.key, path, eventId: value as number, action,
-                  owner: schema.owner === 'component' ? part.key : schema.owner });
+    this.settle.beginRestore();
+    this.cycle?.beginRestore();
+    try {
+      const result = restoreTransaction(raw, { registry: frame.registry, deferred,
+        // plan-2241 F12: participant commits (fleet swapState, handover rewiring) already
+        // mutate; the progress lifecycle is silent from the first commit, not only in des.apply.
+        beginCommit: beginProgressSilence, endCommit: endProgressSilence,
+        preflight: { fingerprint, componentTypeOf: frame.queueContext.componentTypeOf,
+          getActionSchema, desOwners: frame.queueContext.desOwners, replanOnRestore: this.replanOnRestore,
+          queueChecks: (events, parts) => scriptTimerQueueProblems(events, parts, new Set(this.resolveScriptComponents().map(s => s.desId!))),
+          handleRefs: parts => {
+            const refs: import('./rv-des-preflight').SnapshotHandleRef[] = [];
+            const actions = ACTION_SCHEMA.keys();
+            for (const action of actions) {
+              const schema = getActionSchema(action);
+              if (!schema || schema === 'non-persistent') continue;
+              // Per-due handles bind payload participant and time in the settle
+              // validator; they cannot be read as static object paths.
+              if (schema.owner === 'core.settle') continue;
+              for (const part of parts) {
+                if (schema.owner !== 'component' && schema.owner !== part.key) continue;
+                if (schema.owner === 'component' && !fingerprint.components.some(c => c.id === part.key
+                  && (!schema.targetType || schema.targetType === c.type))) continue;
+                for (const path of schema.handleFields ?? []) {
+                  let value: unknown = part.state;
+                  for (const segment of path.split('.')) value = value && typeof value === 'object'
+                    ? (value as Record<string, unknown>)[segment] : undefined;
+                  refs.push({ participant: part.key, path, eventId: value as number, action,
+                    owner: schema.owner === 'component' ? part.key : schema.owner });
+                }
               }
             }
+            return refs.concat(scriptTimerHandleRefs(parts, new Set(this.resolveScriptComponents().map(s => s.desId!))));
+          } },
+        hooks: [{ label: 'des.apply', run: () => {
+          this.identity.beginRestore();
+          beginDesRestore(); bracket = true;
+          this._prepareSnapshotApply();
+          const tweens = frame.apply(snapshot.simTime);
+          if (!this.headlessSpawnActive) this._materializeHeadlessMUs();
+          frame.restoreSampler();
+          const handles = this.tweens.fromSnapshot(tweens,
+            id => (this.manager.getMU(id) as DESMU | null)?.visual as unknown as PositionTweenTarget | null,
+            id => getDefaultPathNetwork().get(id),
+            ref => { const drive = this._driveByAddress(ref); return drive ? this._axisTweenTarget(drive) : null; });
+          this._relinkRestoredTweens(tweens, handles);
+          // Leg windows are owned by queued events, not MU tween snapshots.
+          // Reattach once after fromSnapshot (which clears the registry), retaining
+          // original clocks and the event->handle link used by cancellation.
+          for (const [eventId, payload] of frame.restoredHookPayloads()) {
+            const data = (payload as { data?: unknown } | null)?.data;
+            const window = legTweenWindow(data);
+            if (!window) continue;
+            const attached = this._attachTweenFromData(data, window.duration, window.t0);
+            this._eventTweens.set(eventId, attached);
+            for (const tween of attached) this.tweens.samplePathAt(tween.handle, window.renderT ?? snapshot.simTime);
           }
-          return refs.concat(scriptTimerHandleRefs(parts, new Set(this.resolveScriptComponents().map(s => s.desId!))));
-        } },
-      hooks: [{ label: 'des.apply', run: () => {
-        this.identity.beginRestore();
-        beginDesRestore(); bracket = true;
-        this._prepareSnapshotApply();
-        const tweens = frame.apply(snapshot.simTime);
-        if (!this.headlessSpawnActive) this._materializeHeadlessMUs();
-        frame.restoreSampler();
-        const handles = this.tweens.fromSnapshot(tweens,
-          id => (this.manager.getMU(id) as DESMU | null)?.visual as unknown as PositionTweenTarget | null,
-          id => getDefaultPathNetwork().get(id),
-          ref => { const drive = this._driveByAddress(ref); return drive ? this._axisTweenTarget(drive) : null; });
-        this._relinkRestoredTweens(tweens, handles);
-        // Leg windows are owned by queued events, not MU tween snapshots.
-        // Reattach once after fromSnapshot (which clears the registry), retaining
-        // original clocks and the event->handle link used by cancellation.
-        for (const [eventId, payload] of frame.restoredHookPayloads()) {
-          const data = (payload as { data?: unknown } | null)?.data;
-          const window = legTweenWindow(data);
-          if (!window) continue;
-          const attached = this._attachTweenFromData(data, window.duration, window.t0);
-          this._eventTweens.set(eventId, attached);
-          for (const tween of attached) this.tweens.samplePathAt(tween.handle, window.renderT ?? snapshot.simTime);
-        }
-        // The render clock may run ahead of the last processed event (animated mode): restore both.
-        this._renderClock = typeof snapshot.renderClock === 'number' ? snapshot.renderClock : this.manager.currentTime;
-        if (this._instances.length > 0) this._started = true;
-        for (const reaction of finishDesRestore(true)) deferred.defer(reaction);
-        bracket = false;
-        this.identity.endRestore();
-      } }],
-      onCorrupt: () => {
-        if (bracket) { finishDesRestore(false); bracket = false; }
-        this.identity.endRestore();
-        reportProblem({ id: 'des-restore-commit-failed', code: 'des-restore-commit-failed', severity: 'error',
-          title: snapshotUserMessage('des-restore-commit-failed').title, detail: `${snapshotUserMessage('des-restore-commit-failed').text} [des-restore-commit-failed] Apply or finalization failed.` });
-        this.reset();
-      },
-    });
-    if (!result.ok) {
-      if (bracket) { finishDesRestore(false); this.identity.endRestore(); }
-      this._snapshotFailure(result.status === 'corrupt' ? 'des-restore-commit-failed'
-        : result.problems?.[0]?.code ?? 'des-snapshot-contract', result.problems?.map(p => p.reason).join('; ') ?? String(result.cause), { status: result.status, stage: result.stage });
+          // The render clock may run ahead of the last processed event (animated mode): restore both.
+          this._renderClock = typeof snapshot.renderClock === 'number' ? snapshot.renderClock : this.manager.currentTime;
+          if (this._instances.length > 0) this._started = true;
+          for (const reaction of finishDesRestore(true)) deferred.defer(reaction);
+          bracket = false;
+          this.identity.endRestore();
+        } }],
+        onCorrupt: () => {
+          if (bracket) { finishDesRestore(false); bracket = false; }
+          this.identity.endRestore();
+          this.settle.endRestore();
+          this.cycle?.endRestore();
+          reportProblem({ id: 'des-restore-commit-failed', code: 'des-restore-commit-failed', severity: 'error',
+            title: snapshotUserMessage('des-restore-commit-failed').title, detail: `${snapshotUserMessage('des-restore-commit-failed').text} [des-restore-commit-failed] Apply or finalization failed.` });
+          this.reset();
+        },
+      });
+      if (!result.ok) {
+        if (bracket) { finishDesRestore(false); this.identity.endRestore(); }
+        this._snapshotFailure(result.status === 'corrupt' ? 'des-restore-commit-failed'
+          : result.problems?.[0]?.code ?? 'des-snapshot-contract', result.problems?.map(p => p.reason).join('; ') ?? String(result.cause), { status: result.status, stage: result.stage });
+      }
+      this._refreshRunComplete();
+      this._lcRestored();
+    } finally {
+      this.settle.endRestore();
+      this.cycle?.endRestore();
     }
-    this._refreshRunComplete();
-    this._lcRestored();
   }
 
   /** plan-645 R2-2: throws (and reports) when the scene changed since the last bind. */
@@ -2116,7 +2628,7 @@ export class DESRunner implements SimulationExecutor {
 
   /** What the simulation clock must wait for: the run's scripts (plan-2212), then its KPI sources (plan-2211). */
   private _progressBarrier(): Promise<void> | null {
-    return this._scriptBarrier ?? this.identity.kpiSourcesPending;
+    return this._cycleOwnersBarrier ?? this._scriptBarrier ?? this.identity.kpiSourcesPending;
   }
 
   /**
@@ -2157,7 +2669,7 @@ export class DESRunner implements SimulationExecutor {
    * separate mechanism and is never touched here.
    */
   private _recomputeSettleRequired(): void {
-    let n = 0;
+    let n = this.cycle ? 1 : 0;
     for (const inst of this._instances) {
       if (inst.def.des?.samplesLiveGeometry === true) n++;
     }
@@ -2234,18 +2746,43 @@ export class DESRunner implements SimulationExecutor {
   }
 
   setRngVersion(v: number): void {
+    const previous = this.manager.rngVersion;
     this.manager.setRngVersion(v);
+    if (previous === v) return;
+    const keys = [...this.rngOwners.keys()];
+    this.rngOwners.clear();
+    for (const key of keys) this.registerRngOwner(key);
   }
 
   /** Set the master seed (RNG streams re-derive from the next reset/start). */
   setMasterSeed(seed: number): void {
     this._seedOverride = seed;
     this.manager.setMasterSeed(seed);
+    this._reseedRngOwners();
   }
 
-  /** LogicSteps, PLC programs and IK paths present in the model (viewer's blocker registry); they do not advance in a batch. */
+  private _desUnsuitable(): readonly DesUnsuitableEntry[] {
+    return (this._topology?.host as { snapshotBlockers?: DesSnapshotBlockers } | undefined)?.snapshotBlockers?.desUnsuitable() ?? [];
+  }
+
+  /** Only unsuitable logic roots retain the LogicStep batch guard; registry findings also name their lines. */
   private _logicHazards(): readonly DesLogicPresence[] {
-    return (this._topology?.host as { snapshotBlockers?: DesSnapshotBlockers } | undefined)?.snapshotBlockers?.batchHazards() ?? [];
+    const hazards = ((this._topology?.host as { snapshotBlockers?: DesSnapshotBlockers } | undefined)
+      ?.snapshotBlockers?.batchHazards() ?? []).filter(entry => entry.system !== 'LogicStep');
+    const engine = this.core?.desHost.logicEngine;
+    if (engine instanceof RVLogicEngine) {
+      const nodes = [...new Set(logicDesFindings(engine).filter(f => f.severity === 'error')
+        .map(f => f.path || f.root.name))];
+      if (nodes.length) hazards.push({ system: 'LogicStep', nodes });
+    }
+    const unsuitable = new Map<string, string[]>();
+    for (const entry of this._desUnsuitable()) {
+      const nodes = unsuitable.get(entry.system) ?? [];
+      nodes.push(`${entry.node} (line ${entry.line}, ${entry.rule})`);
+      unsuitable.set(entry.system, nodes);
+    }
+    for (const [system, nodes] of unsuitable) hazards.push({ system, nodes });
+    return hazards;
   }
 
   private _reportLogicProblem(code: 'des-batch-logic-unsupported' | 'des-fastforward-logic-warning', severity: 'error' | 'warning', detail: string): void {
@@ -2285,9 +2822,19 @@ export class DESRunner implements SimulationExecutor {
   get hasSceneBinding(): boolean { return this._hasSceneBinding; }
 
   private _diagnosticsOff: (() => void) | null = null;
+  /** Attaches a late `addInstance` to the bound ledger (null while unbound). */
+  private _diagnosticsAttach: ((a: MaterialFlowAdapter) => void) | null = null;
+  /** The bound DES unit ids (snapshot completeness check; null while unbound). */
+  private _diagnosticsUnits: (() => readonly string[]) | null = null;
   private _diagnosticsHookBound = false;
 
-  /** The topology host supplies core services structurally; core never imports DES. */
+  /**
+   * The topology host supplies core services structurally; core never imports DES.
+   * plan-2241 F5/F13: every unit is registered at bind (every start re-binds, so a replaced
+   * ledger is picked up there), seeded from both lifecycle stamps and fed only by its
+   * `onProgress` push - no sampling adapter. A ledger reset re-seeds through the population.
+   * Edges of DES-bound vehicles name their fleet id; `unitOf` maps it onto `des:<path>`.
+   */
   private _bindDiagnostics(topology: SimulationTopology): void {
     this._diagnosticsOff?.();
     this._diagnosticsOff = null;
@@ -2297,35 +2844,49 @@ export class DESRunner implements SimulationExecutor {
     } | undefined;
     const ledger = host?.progressLedger, registry = host?.waitRegistry;
     if (!ledger || !registry) return;
-    const tracked = new Map<MaterialFlowAdapter, { off(): void; count: number; credited: number }>();
-    const sample = (): void => {
-      for (const inst of this.liveInstances) {
-        const a = inst.adapter, id = a.progressUnitId;
-        let state = tracked.get(a);
-        if (!state) {
-          state = { off: () => {}, count: 0, credited: 0 };
-          const counter = state;
-          state.off = a.subscribeCompletions(n => {
-            counter.count += n;
-            ledger.register(id, 'des', 'des');
-            ledger.bump(id, 'des', counter.count - counter.credited);
-            counter.credited = counter.count;
-          });
-          tracked.set(a, state);
-        }
-        ledger.register(id, 'des', 'des');
-        if (a.progressArmed) ledger.arm(id); else ledger.inactive(id);
-      }
+    // Ids are captured once per bind (a path read allocates; never per event).
+    const units = new Map<MaterialFlowAdapter, string>(), byNode = new Map<object, string>();
+    const seed = (a: MaterialFlowAdapter, id: string): void => {
+      ledger.register(id, 'des', 'des');
+      ledger.inactive(id);
+      if (a.progressArmedSince === a.progressArmedSince) ledger.arm(id, a.lastProgressSec);
+    };
+    const attach = (a: MaterialFlowAdapter): void => {
+      const id = a.progressUnitId;
+      units.set(a, id); byNode.set(a.node, id);
+      const h = new ProgressHandle(ledger, id, 'des', 'des');
+      a.onProgress = (kind, atSec, n) => {
+        // A unit a ledger reset or restore dropped is registered on demand, seeded from the stamps
+        // the component already updated - a push never goes nowhere. The handle needs no lookup
+        // until the ledger generation changes (reset / restore / removal), plan-2241a P3.
+        if (claimProgress(h)) seed(a, id);
+        if (kind === 'bump') pushBump(h, n, atSec);
+        else if (kind === 'arm') pushArm(h, atSec);
+        else pushInactive(h);
+      };
+      seed(a, id);
+    };
+    const fleet = getDefaultAgvFleet();
+    const unitOf = (id: string): string => {
+      const h = fleet.get(id);
+      return (h?.kernel === 'des' && h.node && byNode.get(h.node)) || id;
     };
     const offPopulation = ledger.addPopulation({ id: 'des', kind: 'des',
-      expected: () => this.liveInstances.map(i => i.adapter.progressUnitId).sort() });
-    const offAdapter = ledger.addAdapter({ id: 'des', sample });
+      expected: () => this.liveInstances.map(i => units.get(i.adapter) ?? i.adapter.progressUnitId).sort(),
+      seed: () => { for (const i of this.liveInstances) { const id = units.get(i.adapter); if (id !== undefined) seed(i.adapter, id); } } });
     const offEdges = registry.addSource({ id: 'des', edges: now =>
       this.liveInstances.flatMap(i => i.adapter.waitEdges(now)) });
+    registry.unitOf = unitOf;
+    this._diagnosticsAttach = attach;
+    const boundUnits = (): readonly string[] => [...new Set(units.values())];
+    this._diagnosticsUnits = boundUnits;
     this._diagnosticsOff = () => {
-      offPopulation(); offAdapter(); offEdges();
-      for (const [a, state] of tracked) { state.off(); ledger.unregister(a.progressUnitId); }
-      tracked.clear();
+      offPopulation(); offEdges();
+      if (registry.unitOf === unitOf) registry.unitOf = id => id;
+      for (const [a, id] of units) { a.onProgress = null; ledger.unregister(id); }
+      units.clear(); byNode.clear();
+      if (this._diagnosticsAttach === attach) this._diagnosticsAttach = null;
+      if (this._diagnosticsUnits === boundUnits) this._diagnosticsUnits = null;
     };
     if (!this._diagnosticsHookBound) {
       this._diagnosticsHookBound = true;
@@ -2333,7 +2894,7 @@ export class DESRunner implements SimulationExecutor {
         this._diagnosticsOff?.(); this._diagnosticsOff = null; this._diagnosticsHookBound = false;
       });
     }
-    sample();
+    for (const inst of this.liveInstances) attach(inst.adapter);
   }
 
   private _startWith(defs: MaterialFlowDefinition[], topology: SimulationTopology, rediscover: boolean): void {
@@ -2379,10 +2940,13 @@ export class DESRunner implements SimulationExecutor {
       if (ds) {
         this.manager.duration = ds.endTime;
         this.manager.statResetTime = ds.statResetTime;
+        this._backend?.onClockSet?.('end');
+        this._backend?.onClockSet?.('warmup');
       }
     }
     this._backend?.beforeStart();
     this.manager.setMasterSeed(this._nextRunSeed());
+    this._reseedRngOwners();
 
     // Register the adapters with the manager (assigns entityIds) and run the
     // shared setup + scheduler wiring. Every start registers ALL instances, so
@@ -2417,11 +2981,14 @@ export class DESRunner implements SimulationExecutor {
         : null;
       // plan-2059: reload-stable (stored per MU in snapshots) — same id as des-scene-binding.
       const sourceTemplateId = engineSource ? `source:${inst.desId ?? inst.adapter.node.uuid}` : undefined;
-      if (engineSource && sourceTemplateId) {
+      // Scene binding already captured the canonical size. Register only the
+      // programmatic sources here so startup/reset cannot discard that size.
+      if (engineSource && sourceTemplateId && !this._muVisualFactories.has(sourceTemplateId)) {
         this.registerMuVisualFactory(
           sourceTemplateId,
           () => engineSource.spawnMU(true) as ReturnType<DESRunner['createMuVisual']>,
           (visual) => { visual.dispose(); },
+          engineSource.templateSize?.() ?? null,
         );
       }
       inst.adapter.beforeHookDispatch = () => {
@@ -2458,6 +3025,8 @@ export class DESRunner implements SimulationExecutor {
       for (const inst of instances) {
         if (inst.self.disabled) continue; // takes no part in the run (reported above)
         inst.def.des?.onGenerate?.(inst.self);
+        // plan-2241: a direct hook call, not dispatchHook — a Source may hold `pending` now.
+        inst.adapter._progressCheck();
       }
     };
     if (this._scriptBarrier) {
@@ -2473,6 +3042,8 @@ export class DESRunner implements SimulationExecutor {
     this._recomputeSettleRequired();
 
     this._started = true;
+    this._cycleTime = findDesManager(topology.root)?.cycleTime ?? DES_DEFAULT_CYCLE_TIME;
+    this._bindEventOwners();
 
     // Plan-260: a start with LIVE material-flow instances opens a new run
     // (fresh run id at the current master seed). Empty engines never open a
@@ -2491,7 +3062,7 @@ export class DESRunner implements SimulationExecutor {
    * subsystems always ticked regardless of the DES engine state.
    */
   earlyTick(dt: number): void {
-    this.core?.early(dt);
+    if (!this.cycle) withSpeedOverrideNeutral(() => this.core?.early(dt));
   }
 
   /**
@@ -2505,11 +3076,25 @@ export class DESRunner implements SimulationExecutor {
    * (drives/gizmos are viewer-level, not DES-level).
    */
   tick(dt: number): void {
+    withSpeedOverrideNeutral(() => this._tick(dt));
+  }
+
+  private _tick(dt: number): void {
     if (this._heldByFf) {
       this._heldByFf = false;
       if (!this._actionFailure) this.manager.resume();
     }
-    this.core?.drives(dt);
+    this._syncLogicOwner();
+    if (this.cycle) {
+      const connected = this.core!.desHost.isConnected;
+      if (connected !== this.lastCycleConnection) {
+        if (!this.cycle.run.armed) this.cycle.arm();
+        this.simEvents.wake('core.logic');
+      }
+      this.lastCycleConnection = connected;
+      this.cycle.armIfAlive();
+    }
+    this.core?.drives(dt, this.cycle ? this.isTakt : undefined);
 
     // plan-2212 R2-3: no event runs before the scripts present at run start exist.
     if (this._started && this._progressBarrier() === null) {
@@ -2559,7 +3144,9 @@ export class DESRunner implements SimulationExecutor {
       this._checkRunComplete();
     }
 
-    this.core?.visuals(dt);
+    this.renderPhase = true;
+    try { this.core?.visuals(dt); }
+    finally { this.renderPhase = false; }
   }
 
   /** Completion edge detection (plan-260): close the run ONCE when the sim
@@ -2567,8 +3154,13 @@ export class DESRunner implements SimulationExecutor {
    *  manager's once-per-run guard, re-armed by `manager.reset()`. */
   private _checkRunComplete(): void {
     if (this._actionFailure) return;
+    if (this.settle.isResting() && this.manager.nextModelEventTime === Infinity
+      && Number.isFinite(this.manager.duration) && this.manager.currentTime < this.manager.duration) {
+      withSpeedOverrideNeutral(() => this.manager.processAnimated(this.manager.duration - this.manager.currentTime));
+      this._renderClock = this.manager.currentTime;
+    }
     if (
-      this.manager.totalEventsProcessed > 0
+      (this.manager.totalEventsProcessed > 0 || this.eventOwners.size > 0)
       && this.manager.isComplete
       && this.manager.markCompleteNotified()
     ) {
@@ -2586,6 +3178,12 @@ export class DESRunner implements SimulationExecutor {
    *  meshes of MUs a sink consumed this step (sink sets `visual.markedForRemoval`;
    *  the DES path owns the visual lifecycle, so we dispose it here). */
   lateTick(_dt: number): void {
+    this.renderPhase = true;
+    try { this._lateTick(_dt); }
+    finally { this.renderPhase = false; }
+  }
+
+  private _lateTick(_dt: number): void {
     if (!this._started) return;
     // FastForward: no per-frame INTERPOLATION here (the 'fastforward' sub is
     // noWrite) — part positions are maintained by the event-time settle instead
@@ -2625,7 +3223,7 @@ export class DESRunner implements SimulationExecutor {
     if (!this._started || this._progressBarrier() !== null) return false;
     let ok: boolean;
     try {
-      ok = this.manager.processStep();
+      ok = withSpeedOverrideNeutral(() => this.manager.processStep());
     } catch (error) {
       this._actionFailed(error);
       return false;
@@ -2642,8 +3240,24 @@ export class DESRunner implements SimulationExecutor {
    * restart is reproducible. Components (adapters) stay registered.
    */
   clearMUs(): void {
+    this._cycleOwnersGeneration++;
     this._lcEnd();              // plan-645: `reset` BEFORE anything is torn down
     this.cancelFastForward();   // abort any in-flight FF drain before resetting
+    this.syncingLogic = true;
+    try { this._detachLogicOwner(); } finally { this.syncingLogic = false; }
+    this._detachUnsuitableProblems();
+    this._detachCycle();
+    this.dormantCycle = null;
+    this.offButtons?.(); this.offButtons = null;
+    this.offButtonBlocker?.(); this.offButtonBlocker = null;
+    this.offPulseWatch?.(); this.offPulseWatch = null;
+    this.offGripBlocker?.(); this.offGripBlocker = null; this.gripSnapshot = null;
+    this.buttons?.setEventClock(null); this.buttons = null;
+    this.offRenderWrites?.(); this.offRenderWrites = null;
+    for (const entry of this.eventOwners.values()) { entry.off?.(); entry.off = undefined; }
+    this.settle.reset();
+    this.settle.bindStore(undefined);
+    this._clearTickOwnership();
     releaseAllAxes();
     // Release the whole previous fleet before setup registers any start pose.
     // Sequential setup otherwise plans against vehicles still at their old poses.
@@ -2654,6 +3268,7 @@ export class DESRunner implements SimulationExecutor {
     this._tearingDownMUs = true;
     try {
       this.manager.reset();    // recursively retires MUs + disposes owned visuals
+      this._reseedRngOwners();
       this._runComplete = null;
       this._restoreBaseEnd();
     } finally {
@@ -2709,7 +3324,32 @@ export class DESRunner implements SimulationExecutor {
   reset(): void {
     this.clearMUs();
     clearProblemsOfCode(ACTION_FAILED_PROBLEM_CODE);   // a reset starts a fresh run: old action failures are stale
-    if (this._topology) this.start(this._defs, this._topology);
+    if (this._topology) {
+      this._resetCoreOwnersBeforeStart();
+      this.start(this._defs, this._topology);
+      this._resetCycleOwners();
+    }
+  }
+
+  /** Startup may command motion; cold-reset core owners before replaying it (skipped inside the viewer's own reset). */
+  private _resetCoreOwnersBeforeStart(): void {
+    const host = this._topology?.host as unknown as {
+      inViewerReset?: boolean;
+      sceneButtonManager?: import('../../core/engine/rv-scene-button-manager').SceneButtonManager;
+    } | undefined;
+    // Grip/zone history is cleared BEFORE startup, so commands issued by setup survive (later writes use the setters).
+    resetGripOwners(this._gripHost(), this.resolveSignalStore());
+    if (host?.inViewerReset) return;
+    withSpeedOverrideNeutral(() => {
+      const own = this._desOwnDrives();
+      if (this.core) {
+        const takt = collectTaktDrives(this.core.desHost, own);
+        const logic = this.core.desHost.logicEngine;
+        // Event logic cold-resets and restarts in its reset hook after core owners.
+        resetCycleOwners(this.core.desHost, drive => takt.has(drive), !(logic instanceof RVLogicEngine && logic.roots.length));
+      }
+      if (!this.core) host?.sceneButtonManager?.resetAll();
+    });
   }
 
   /**
@@ -2753,8 +3393,10 @@ export class DESRunner implements SimulationExecutor {
     this._instances = this._instances.filter((i) => !i.scene);
     this._runSceneHooks();
     this.manager.clearComponents();              // start() re-registers the survivors
-    // 2. Bind the scene again and restart (same seed, like reset()).
+    // 2. Bind the scene again and restart (same seed, like reset(), incl. the cycle-owner reset stage).
+    this._resetCoreOwnersBeforeStart();
     this._startWith(this._defs, topology, true);
+    this._resetCycleOwners();
     // 3. Release names only the dropped instances declared (e.g. an unscoped
     //    `Agv.Run` from a bind before the placement scope stamp existed).
     const declared = new Set<string>();
@@ -2862,7 +3504,31 @@ export class DESRunner implements SimulationExecutor {
       step('tweens', () => { this.tweens.clear(); this._eventTweens.clear(); });
 
       this._tearingDownMUs = true;
+      this._cycleOwnersGeneration++;
+      step('logic', () => {
+        this.syncingLogic = true;
+        try { this._detachLogicOwner(); } finally { this.syncingLogic = false; }
+      });
+      step('unsuitable problems', () => this._detachUnsuitableProblems());
+      step('buttons', () => {
+        this.offButtons?.(); this.offButtons = null;
+        this.offButtonBlocker?.(); this.offButtonBlocker = null;
+        this.offPulseWatch?.(); this.offPulseWatch = null;
+        this.offGripBlocker?.(); this.offGripBlocker = null; this.gripSnapshot = null;
+        this.buttons?.setEventClock(null); this.buttons = null;
+        this.offRenderWrites?.(); this.offRenderWrites = null;
+      });
+      step('cycle', () => this._detachCycle());
+      step('RNG owners', () => {
+        for (const key of this.rngOwners.keys()) this.manager.releaseStreams(key);
+        this.rngOwners.clear(); this.erraticOwners.clear();
+      });
+      step('settle', () => this.settle.dispose());
+      step('ownership blocker', () => this._clearTickOwnership());
       step('manager', () => this.manager.dispose()); // archives an open run via the reset hook first
+      this._started = false;
+      this.eventOwners.clear(); this.cycleOwners.clear(); this.resetHooks.clear(); this.pendingWakes.clear();
+      this.dormantCycle = null;
       this._tearingDownMUs = false;
       // plan-2212 R2-2: after the archive - Model-Scripts back to the frame clock.
       step('script binding', () => this._unbindScripts());
@@ -3075,9 +3741,10 @@ export class DESRunner implements SimulationExecutor {
     const bindPose = localPoseOf(node);
     const bindPoses = new Map((def.des?.movedNodes?.(self) ?? []).map(n => [n, localPoseOf(n)] as const));
     this._instances.push(scene ? { def, self, adapter, scene, desId, bindPose, bindPoses } : { def, self, adapter, desId, bindPose, bindPoses });
+    this._diagnosticsAttach?.(adapter);
     if (def.type === 'Agv' && !this._snapshotProviders.has('fleet.authority')) this.registerSnapshotProvider('fleet.authority', movementSnapshotProvider({ agvs: () => this._instances.filter(i => i.def.type === 'Agv' && i.desId !== null).map(i => ({ desId: i.desId!, vehicleId: scopedInstanceId(i.self.root, i.self.root.name || 'Agv'), self: agvSelfForSnapshot(i.self) })) }));
-    // A dynamically added live-geometry sampler re-arms the settle immediately.
-    this._recomputeSettleRequired();
+    if (this._started) this._syncCycleOwners();
+    else this._recomputeSettleRequired();
     return adapter;
   }
 
@@ -3242,6 +3909,7 @@ export class DESRunner implements SimulationExecutor {
     this.manager.registerMU(mu);
     if (effectiveTemplateId) {
       mu.visualTemplateId = effectiveTemplateId;
+      presetMuBugSize(mu as unknown as MU, this._muVisualFactories.get(effectiveTemplateId)?.bugSize ?? null);
       if (!this.headlessSpawnActive) mu.visual = this._createMuVisual(effectiveTemplateId);
     }
     return mu;
@@ -3433,7 +4101,7 @@ export class DESRunner implements SimulationExecutor {
   /** Align event time with the already-rendered simulation clock before persistence/freeze. */
   private _synchronizeManagerClock(): void {
     const delta = this._renderClock - this.manager.currentTime;
-    if (delta > 0) this.manager.processAnimated(delta);
+    if (delta > 0) withSpeedOverrideNeutral(() => this.manager.processAnimated(delta));
   }
 
   /**
@@ -3729,10 +4397,13 @@ export class DESRunner implements SimulationExecutor {
 
     // Clamp to the end time; never below the real sim position (lowering the
     // end mid-run must not pull rendered tweens backwards).
+    const wanted = this._renderClock + dt * Math.max(1, multiplier);
     this._renderClock = Math.max(
       this.manager.currentTime,
-      Math.min(this._renderClock + dt * Math.max(1, multiplier), this.manager.duration),
+      Math.min(wanted, this.manager.duration),
     );
+    const r = this.clampReport;
+    r.at = null;
     let hitBudget: boolean;
     try {
       ({ hitBudget } = this.manager.processUpTo(this._renderClock, this.frameEventBudget));
@@ -3746,6 +4417,8 @@ export class DESRunner implements SimulationExecutor {
       // continues processing the backlog from here (B4 spread, no drop).
       this._renderClock = this.manager.currentTime;
     }
+    r.at = hitBudget ? 'budget' : wanted > this.manager.duration ? 'end' : null;
+    if (r.at) r[r.at]++;
   }
 
   /** Map a sub-mode to the native DESMode enum the existing HMI windows read. */

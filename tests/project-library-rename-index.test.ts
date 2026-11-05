@@ -104,7 +104,10 @@ describe('plan-655 F5 — index after rename / move', () => {
     w.rename('library/RM8320.glb', 'library/Interroll/RM8320.glb');
     await refreshProjectLibrary();
     const entry = source().getEntry('doc-8')!;
-    expect(entry.id).toBe('project:library/Interroll/RM8320.glb');
+    // plan-778/780 (contract documents-projects 4): the entry is keyed by its document
+    // id — a rename / move changes the path, never the id a placement stores.
+    expect(entry.id).toBe('doc-8');
+    expect(entry.localPath).toBe('library/Interroll/RM8320.glb');
     expect((await source().resolveAsset(entry.id, 'place')).url).toBe('blob:library/Interroll/RM8320.glb');
   });
 });

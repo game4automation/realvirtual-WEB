@@ -182,6 +182,23 @@ export type WriteExpectation = SceneRevision | 'any' | 'create';
 export interface WriteDocumentOptions {
   /** See {@link WriteExpectation}. Required — that is the point. */
   expectedRevision: WriteExpectation;
+  /**
+   * plan-2229 — optional cooperative cancellation, up to the write's commit
+   * point. Aborted before the commit, the write rejects with
+   * `writeAborted()` (`name: 'AbortError'`, `committed: false`): nothing was
+   * written and an existing document is untouched. Once committed, an abort
+   * changes nothing and the write resolves as usual.
+   *
+   * - `FolderBackend`: checked when the queued write starts (before the
+   *   precondition read and any directory creation) and again before the swap
+   *   file commits (`close()`).
+   * - `BrowserBackend`: checked when the queued write starts and again right
+   *   before the index / scene-store update that makes the bytes the document.
+   * - `BundledBackend`: read-only, never writes.
+   *
+   * Callers without a signal see exactly the old behaviour.
+   */
+  signal?: AbortSignal;
 }
 
 /**

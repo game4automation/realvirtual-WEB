@@ -5,8 +5,14 @@
  * Test lock wrapper (plan-606): holds the machine-wide test lock for the whole
  * lifetime of one test runner (heavy on H0, light on a shared slot, exclusive on all).
  *
- *   node scripts/with-test-lock.mjs [--] <vitest|playwright|path/to/script.mjs> [args…]
+ *   node scripts/with-test-lock.mjs [--min-free-gb <n>] [--] <vitest|playwright|path/to/script.mjs> [args…]
  *
+ * 0. (plan-2247) checks the free commit against the class threshold (light 8, heavy 10, exclusive
+ *    10 GB; `--min-free-gb <n>` before the runner or `RV_TEST_MIN_FREE_GB`, `0` = off) and, below
+ *    it, waits WITHOUT the lock or any port — visible in `test-lock.mjs status` as `WAITING for
+ *    memory`; gives up with exit 1 after `RV_TEST_MEMORY_WAIT_SECONDS` (default 1800). The
+ *    second check after acquisition releases the whole lock and retries if memory has fallen.
+ *    A re-entering wrapper does not check again. See `scripts/test-memory.mjs`;
  * 1. acquires `127.0.0.1:<RV_TEST_LOCK_PORT|47177>` (`scripts/test-lock.mjs`), waiting
  *    while its class is blocked; `RV_TEST_LOCK_TIMEOUT_SECONDS` defaults to 1800 s
  *    (exclusive: `RV_TEST_LOCK_EXCLUSIVE_TIMEOUT_SECONDS`, default 3600 s);
@@ -136,6 +142,7 @@ import { fileURLToPath } from 'node:url';
 import { acquireClass, holderInfo, isEntryScript, isProcessAlive, lockConfig, LOCK_HOST } from './test-lock.mjs';
 import { capacityMode, childEnvFor, classifyRun, reentryEnvFor } from './test-capacity.mjs';
 import { PROGRESS_ENV, WRAPPER_SPAWN_ENV, writeProgress } from './test-progress-reporter.mjs';
+import { memoryConfig, minFreeGbFor, readFreeGb, waitForMemory } from './test-memory.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
@@ -705,18 +712,26 @@ export function readProgress(file, offset = 0) {
   }
 }
 
-/** Strips one leading `--` (`with-test-lock -- vitest run`). */
+/**
+ * Wrapper options BEFORE the runner (`--min-free-gb <n>` / `--min-free-gb=<n>`, plan-2247), then
+ * one leading `--` (`with-test-lock -- vitest run`). Everything after the runner is passed on.
+ */
 export function parseArgs(argv) {
   const args = [...argv];
+  let minFreeGb;
+  while (args.length && String(args[0]).startsWith('--min-free-gb')) {
+    const arg = args.shift();
+    minFreeGb = arg.includes('=') ? arg.slice(arg.indexOf('=') + 1) : args.shift();
+  }
   if (args[0] === '--') args.shift();
   const [runner, ...rest] = args;
-  return { runner, args: rest };
+  return minFreeGb === undefined ? { runner, args: rest } : { runner, args: rest, minFreeGb };
 }
 
 async function main() {
-  const { runner, args } = parseArgs(process.argv.slice(2));
+  const { runner, args, minFreeGb } = parseArgs(process.argv.slice(2));
   if (!runner) {
-    say('usage: node scripts/with-test-lock.mjs [--] <vitest|playwright|path/to/script.mjs> [args…]');
+    say('usage: node scripts/with-test-lock.mjs [--min-free-gb <n>] [--] <vitest|playwright|path/to/script.mjs> [args…]');
     return 2;
   }
 
@@ -746,12 +761,63 @@ async function main() {
     if (isVitestRunner(runner, cli)) writeProgress(process.env[PROGRESS_ENV], 'expect');
   } else {
     const klass = classifyRun(runner, args, process.env);
-    try {
-      lock = await acquireClass({ klass, info: holderInfo([runner, ...args], { class: klass }), port: config.port });
-    } catch (error) {
-      say(error instanceof Error ? error.message.replace(/^\[test-lock\] /, '') : String(error));
-      return 1;
+    // plan-2247: CHECK, THEN LOCK, THEN START. While waiting for memory this process holds no lock
+    // and no port - it only has a file in the wait directory (`test-lock.mjs status` lists it).
+    // A reading taken before a long wait for the lock is stale, so recheck after acquisition.
+    // Only synchronous child setup follows a successful recheck, before spawn.
+    // Too little (or unknown) -> release EVERY acquired port/mark, wait for memory again (visible),
+    // then retry. One overall memory wait budget (`deadline`) spans all rounds.
+    const needGb = minFreeGbFor(klass, { option: minFreeGb });
+    const memEnv = memoryConfig();
+    const memDeadline = Date.now() + memEnv.waitSeconds * 1000;
+    const abort = new AbortController();
+    const stop = (signal) => {
+      abort.abort();
+      say(`${signal} before the run started - exiting${lock ? ' (the OS frees the lock ports)' : ', no lock held'}`);
+      process.exit(130); // the 'exit' hook of waitForMemory removes the wait entry
+    };
+    const waitSignals = process.platform === 'win32' ? ['SIGINT', 'SIGBREAK', 'SIGTERM', 'SIGHUP'] : ['SIGINT', 'SIGTERM', 'SIGHUP'];
+    const waitHandlers = waitSignals.map((signal) => [signal, () => stop(signal)]);
+    const removeWaitHandlers = () => {
+      for (const [signal, handler] of waitHandlers) process.removeListener(signal, handler);
+    };
+    if (needGb > 0) for (const [signal, handler] of waitHandlers) process.on(signal, handler);
+    let reason = '';
+    for (;;) {
+      if (needGb > 0) {
+        const memory = await waitForMemory({ klass, needGb, argv: [runner, ...args], signal: abort.signal, deadline: memDeadline, reason });
+        if (!memory.ok) {
+          removeWaitHandlers();
+          say(`FAILED (exit 1): ${memory.message}`);
+          return 1;
+        }
+        say(`memory ok: ${memory.haveGb.toFixed(1)} GB free >= ${needGb} GB (class ${klass}${memory.waitedMs ? `, waited ${Math.round(memory.waitedMs / 1000)} s` : ''})`);
+      }
+      try {
+        lock = await acquireClass({ klass, info: holderInfo([runner, ...args], { class: klass }), port: config.port });
+      } catch (error) {
+        removeWaitHandlers();
+        say(error instanceof Error ? error.message.replace(/^\[test-lock\] /, '') : String(error));
+        return 1;
+      }
+      if (!(needGb > 0)) break;
+      const recheck = await readFreeGb(process.env, {
+        signal: abort.signal,
+        timeoutMs: Math.max(1, Math.min(memEnv.queryTimeoutMs, memDeadline - Date.now())),
+      });
+      if (Number.isFinite(recheck) && recheck >= needGb) break;
+      const have = Number.isFinite(recheck) ? `${recheck.toFixed(1)} GB` : 'unknown';
+      await lock.release(); // every port of this class (H0 and/or the marks) is free again for others
+      lock = null;
+      reason = `memory fell to ${have} while waiting for the lock`;
+      say(`memory re-check after taking the lock: ${have} < ${needGb} GB (class ${klass}) - released the lock again, waiting for memory before the next attempt`);
+      if (Date.now() >= memDeadline) {
+        removeWaitHandlers();
+        say(`FAILED (exit 1): memory fell to ${have} < ${needGb} GB after the lock was taken and the memory wait budget (RV_TEST_MEMORY_WAIT_SECONDS=${memEnv.waitSeconds}) is used up`);
+        return 1;
+      }
     }
+    removeWaitHandlers();
     say(`acquired ${LOCK_HOST}:${lock.port} (PID ${process.pid})`);
     const patch = childEnvFor(klass, process.env);
     Object.assign(env, patch.set);

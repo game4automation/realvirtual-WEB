@@ -61,7 +61,7 @@ export interface WireResult {
   /** Resolved signal address, or null if wiring was skipped */
   addr: string | null;
   /** Call to drop BOTH the store subscription and the re-apply registry slot */
-  unsubscribe: () => void;
+  unsubscribe: (() => void) & { replayArmed?: boolean };
 }
 
 const EMPTY: WireResult = { addr: null, unsubscribe: NOOP };
@@ -196,6 +196,20 @@ export function wireValueSignal(
   return wireRawSignal(store, addr, setter, label, reapply, /* readInitial */ true, slot);
 }
 
+/** Refresh display levels after silent restore; excludes command inputs and simulation owners. */
+export function wireDisplaySignal(
+  ...args: Parameters<typeof wireValueSignal>
+): WireResult {
+  const [store, addr, setter] = args;
+  const wired = wireValueSignal(...args);
+  if (!addr || typeof addr !== 'string') return wired;
+  const offRestore = store.onValuesRestored(() => {
+    const value = store.getByPath(addr);
+    if (value !== undefined) setter(value);
+  });
+  return { addr: wired.addr, unsubscribe: combine(wired.unsubscribe, offRestore) };
+}
+
 /**
  * Shared body of {@link wireValueSignal} and {@link wireNumberSignal}.
  *
@@ -241,7 +255,11 @@ function wireRawSignal(
 
   if (label) debug('loader', `  ${label}="${addr}"`);
 
-  return { addr, unsubscribe: combine(unsub, unsubReapply) };
+  // The retained handle exposes delivery state for silent snapshot capture/restore.
+  const unsubscribe = Object.defineProperty(combine(unsub, unsubReapply), 'replayArmed', {
+    get: () => armed, set: (value: boolean) => { armed = value; },
+  });
+  return { addr, unsubscribe };
 }
 
 /**

@@ -4,9 +4,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Group } from 'three';
 import { YardPlanning } from '../../src/plugins/models/PalletYard/yard-planning';
-import { SIZE_KEY, PALLET_YARD_OWNER } from '../../src/plugins/models/PalletYard/parameters';
+import { SIZE_KEY, VEHICLES_KEY, PALLET_YARD_OWNER, stationActiveKeyOf, validatePalletYard } from '../../src/plugins/models/PalletYard/parameters';
 import type { PlantParameterContext } from '../../src/core/fleet/define-plant-plugin';
 import type { StructuralResetContext } from '../../src/core/planning/rv-planning-params';
+import { createPlanningRegistry, type PlanningRegistry } from '../../src/core/planning/rv-planning-registry';
 
 const mocks = vi.hoisted(() => ({ materialize: vi.fn(), learn: vi.fn(() => new Map()), live: vi.fn() }));
 vi.mock('../../src/plugins/planning-parameters', () => ({ getPlanningPlugin: (viewer: { planning: unknown }) => viewer.planning }));
@@ -28,7 +29,7 @@ function fixture(committedSize = 2) {
   root.userData.realvirtual = { PalletYard: { Size: 2 } };
   let ready!: () => void;
   const sceneReady = new Promise<void>(r => { ready = r; });
-  const handle = { get: () => committedSize, values: () => ({ [SIZE_KEY]: committedSize }), redeclare: vi.fn() };
+  const handle = { get: () => committedSize, values: () => ({ [SIZE_KEY]: committedSize }), redeclare: vi.fn(), recoverCommitted: vi.fn(() => ({ ok: true, reset: [] })) };
   const registry = { list: () => [], reconcileStructure: vi.fn(async () => ({ ok: true })) };
   const off = vi.fn();
   const viewer = {
@@ -97,6 +98,102 @@ describe('extracted yard planning', () => {
     expect(mocks.materialize.mock.calls.map(call => call[2].size)).toEqual([4, 2]);
     expect(f.planning.yard.size).toBe(2);
     expect(f.log.at(-1)).toBe('release');
+  });
+
+  /** The fixture on a REAL registry whose session carries a saved size of 4 (document: 2). */
+  function withRegistry(scenario: Record<string, unknown> = {}) {
+    const f = fixture();
+    const problems = { report: vi.fn(), clear: vi.fn() };
+    const registry: PlanningRegistry = createPlanningRegistry({ problems });
+    (f.viewer.planning as { registry: unknown }).registry = registry;
+    f.planning.adoptDocument(f.root, f.ctx);
+    // As fleet-plugin.ts declares it: the owner's reset runs with the plant context.
+    const handle = registry.declare({
+      ...f.planning.declare(f.root)!,
+      onStructuralReset: (req, ctx) => f.planning.onStructuralReset(req, { ...f.ctx, ...ctx }),
+    });
+    (f.ctx as unknown as { planning: unknown }).planning = handle;
+    registry.loadScenario({ [`${PALLET_YARD_OWNER}.${SIZE_KEY}`]: 4, ...scenario });
+    const rowOf = (key: string) => registry.list().find(p => p.key === `${PALLET_YARD_OWNER}.${key}`)!;
+    const row = () => rowOf(SIZE_KEY);
+    return { ...f, problems, registry, handle, row, rowOf };
+  }
+
+  it('leaves committed at the document size when the load reconcile fails (plan-681 F2)', async () => {
+    const f = withRegistry();
+    expect(f.handle.get(SIZE_KEY)).toBe(4);
+    mocks.materialize.mockRejectedValueOnce(new Error('placement failed'));
+    f.planning.afterDeclare(f.ctx); f.ready(); await settle();
+    expect(mocks.materialize.mock.calls.map(call => call[2].size)).toEqual([4, 2]);
+    expect(f.planning.yard.size).toBe(2);
+    expect(f.handle.get(SIZE_KEY)).toBe(2);
+    expect(f.row().value).toBe(2);
+    expect(f.row().pending, 'nothing left half-applied').toBeUndefined();
+    expect(f.problems.report).toHaveBeenCalledWith(expect.objectContaining({ code: 'planning-apply-failed' }));
+    expect(f.problems.report).toHaveBeenCalledWith(expect.objectContaining({ code: 'planning-committed-recovered' }));
+  });
+
+  it('a vehicle change during the rollback stays pending and the next apply builds it', async () => {
+    const f = withRegistry();
+    const want = f.rowOf(VEHICLES_KEY).value as number + 1;
+    mocks.materialize.mockRejectedValueOnce(new Error('placement failed'));
+    mocks.materialize.mockImplementationOnce(async (_v, _r, yard) => {
+      expect(f.registry.set(`${PALLET_YARD_OWNER}.${VEHICLES_KEY}`, want, 'ui').applied).toBe('pending');
+      f.log.push(`materialize:${yard.size}:${yard.counts.vehicles}`);
+      return { pathsReplaced: true };
+    });
+    f.planning.afterDeclare(f.ctx); f.ready(); await settle();
+    expect(f.handle.get(SIZE_KEY)).toBe(2);
+    expect(f.rowOf(VEHICLES_KEY).pending, 'not committed without being built').toBe(want);
+    expect(f.handle.get(VEHICLES_KEY)).toBe(want - 1);
+    expect((await f.registry.applyPendingAndReset()).ok).toBe(true);
+    expect(f.handle.get(VEHICLES_KEY)).toBe(want);
+    expect(f.planning.yard.counts.vehicles).toBe(want);
+    expect(f.log.at(-1)).toBe(`materialize:2:${want}`);
+  });
+
+  it('an edit during the fallback that the recovered values make invalid is refused by the next apply (Codex r2 #1)', async () => {
+    const f = withRegistry({ [`${PALLET_YARD_OWNER}.${stationActiveKeyOf('A2')}`]: false });
+    const a1 = `${PALLET_YARD_OWNER}.${stationActiveKeyOf('A1')}`;
+    mocks.materialize.mockRejectedValueOnce(new Error('placement failed'));
+    mocks.materialize.mockImplementationOnce(async () => {
+      // Valid at size 4 (A3/A4 still active), so the write is accepted as pending.
+      expect(f.registry.set(a1, false, 'ui').applied).toBe('pending');
+      return { pathsReplaced: true };
+    });
+    f.planning.afterDeclare(f.ctx); f.ready(); await settle();
+    expect(f.handle.get(SIZE_KEY)).toBe(2);
+    expect(f.rowOf(stationActiveKeyOf('A1')).pending).toBe(false);
+    f.problems.report.mockClear();
+    const r = await f.registry.applyPendingAndReset();
+    expect(r).toMatchObject({ ok: false, error: 'invalid-values' });
+    expect(f.handle.get(stationActiveKeyOf('A1')), 'nothing committed').toBe(true);
+    expect(f.rowOf(stationActiveKeyOf('A1')).pending, 'the edit is kept').toBe(false);
+    expect(validatePalletYard(f.handle.values())).toEqual({});
+    expect(f.problems.report).toHaveBeenCalledWith(expect.objectContaining({ code: 'planning-apply-failed' }));
+    expect(f.problems.clear).not.toHaveBeenCalledWith(`planning-committed-recovered:${PALLET_YARD_OWNER}`);
+  });
+
+  it('a saved size-4 scenario with A1/A2 off recovers onto a size-2 document with an active output', async () => {
+    const f = withRegistry({ [`${PALLET_YARD_OWNER}.${stationActiveKeyOf('A1')}`]: false, [`${PALLET_YARD_OWNER}.${stationActiveKeyOf('A2')}`]: false });
+    expect(f.handle.get(stationActiveKeyOf('A1'))).toBe(false);
+    mocks.materialize.mockRejectedValueOnce(new Error('placement failed'));
+    f.planning.afterDeclare(f.ctx); f.ready(); await settle();
+    expect(f.handle.get(SIZE_KEY)).toBe(2);
+    expect(validatePalletYard(f.handle.values())).toEqual({});
+    expect([1, 2].some(i => f.handle.get(stationActiveKeyOf(`A${i}`)) !== false)).toBe(true);
+    expect(f.problems.report).toHaveBeenCalledWith(expect.objectContaining({
+      code: 'planning-committed-recovered', detail: expect.stringContaining(stationActiveKeyOf('A1')),
+    }));
+  });
+
+  it('keeps committed at the target when the load reconcile succeeds', async () => {
+    const f = withRegistry();
+    f.planning.afterDeclare(f.ctx); f.ready(); await settle();
+    expect(mocks.materialize.mock.calls.map(call => call[2].size)).toEqual([4]);
+    expect(f.planning.yard.size).toBe(4);
+    expect(f.handle.get(SIZE_KEY)).toBe(4);
+    expect(f.row().pending).toBeUndefined();
   });
 
   it('retries a half-built structure even when rollback requests its original size', async () => {

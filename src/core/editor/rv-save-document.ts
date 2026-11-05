@@ -97,6 +97,7 @@ import { assertNoDocumentIdCollisions } from '../project/rv-asset-identity';
 import { macrosForEmbed } from './rv-macro-store';
 import { finishDocumentSave } from './rv-finish-document-save';
 import { libraryLabelOf, librarySaveBackend } from '../library/library-save-target';
+import { whenDocumentSettled } from '../hmi/rv-bind-queue';
 
 // ─── The verb, before the click (§2.2.1-6) ──────────────────────────────
 
@@ -504,6 +505,7 @@ function noteSaveActivity(): void {
  */
 export interface PlannerSaveFacade {
   readonly lineage: 'planner';
+  readonly document?: { whenIdle(): Promise<void> };
   getSnapshot(): {
     draft: { name: string } | null;
     saved: { id: string } | null;
@@ -577,6 +579,7 @@ async function savePlannerDocument(
   store: PlannerSaveFacade,
   opts: SaveDocumentOptions,
 ): Promise<SavePlannerResult> {
+  if (store.document) await whenDocumentSettled(store.document);
   const snap = store.getSnapshot();
   const backend = getProjectStore().getBackend();
   const decision = decideSaveVerb(
@@ -862,13 +865,15 @@ async function saveEditorDocumentLocked(
   // §2.2.1-4: a clean document that already lives somewhere is a true no-op.
   // Notably it does NOT mint a new identity, which is what made a stray second
   // click on an untouched document produce a second file.
-  if (!doc.dirty && !decision.copies && name === doc.name) {
-    return { kind: 'no-op' };
-  }
-
+  // Reserve before draining: a second click must not join the blocked save.
   saving.add(doc);
   noteSaveActivity();
   try {
+    await whenDocumentSettled(doc);
+    if (!doc.dirty && !decision.copies && name === doc.name) {
+      return { kind: 'no-op' };
+    }
+
     // §2.2.1-2: the whole transaction holds the op queue. `runExclusive` is
     // what makes "the floor captured before the bake" a fact rather than a
     // hope — no op can be recorded between the two.
@@ -965,7 +970,9 @@ async function saveEditorDocumentLocked(
       // nothing of A (thumbnail, announce, rescan) describes it.
       if (library) {
         await (await import('../library/library-document-edit')).finishLibraryDocumentSave(
-          library.libraryProjectId, backend, relPath, bytes);
+          library.libraryProjectId, backend, relPath, bytes,
+          // plan-780 R6: the library card shows the new picture (rendered into B).
+          { viewer, documentId: library.documentId });
       } else {
         await finishDocumentSave({
           viewer, store, backend, documentId: nextBase.documentId, relPath,

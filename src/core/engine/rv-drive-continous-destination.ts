@@ -2,7 +2,7 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import type { Object3D } from 'three';
-import { RVDrive, type IDriveBehavior } from './rv-drive';
+import { RVDrive, setDriveBehaviorLiveField, type IDriveBehavior } from './rv-drive';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
 import { registerComponentSchema, loadSchemaFromSpec } from './rv-component-registry';
 import { NodeRegistry } from './rv-node-registry';
@@ -43,6 +43,15 @@ import { slotDeclare, slotUndeclare, slotWrite } from './rv-slot-io';
 export class RVDriveContinousDestination implements IDriveBehavior, RVComponent {
   // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
   static readonly schema: ComponentSchema = loadSchemaFromSpec('Drive_ContinousDestination');
+
+  private initialRunState = { Destination: 0, TargetSpeed: 100, Acceleration: 100 };
+  resetRunState(): void { Object.assign(this, this.initialRunState); this.destinationBefore = 0; }
+  setLiveField(field: string, value: unknown): boolean { return setDriveBehaviorLiveField(this, this.initialRunState, field, value); }
+  reapplyConfig(field?: string): void {
+    if (field === undefined || field === 'Destination') this.initialRunState.Destination = this.Destination;
+    if (field === undefined || field === 'TargetSpeed') this.initialRunState.TargetSpeed = this.TargetSpeed;
+    if (field === undefined || field === 'Acceleration') this.initialRunState.Acceleration = this.Acceleration;
+  }
 
   readonly node: Object3D;
   isOwner = true;
@@ -97,24 +106,22 @@ export class RVDriveContinousDestination implements IDriveBehavior, RVComponent 
     drive.driveBehaviors.push(this);
     // Unwired slots stay bindable in the viewer (SlotIO, rv-slot-io.ts).
     // A direct command overrides the property; neutralize restores the authored value.
-    const authoredDestination = this.Destination;
-    const authoredTargetSpeed = this.TargetSpeed;
-    const authoredAcceleration = this.Acceleration;
+    this.reapplyConfig();
     slotDeclare(this, 'SignalDestination', 'setter', {
       apply: (value) => {
         this.Destination = Number(value) * this.CurrentPositionScale + this.CurrentPositionOffset;
       },
-      neutral: () => { this.Destination = authoredDestination; },
+      neutral: () => { this.Destination = this.initialRunState.Destination; },
       reapply: context.reapply,
     });
     slotDeclare(this, 'SignalTargetSpeed', 'setter', {
       apply: (value) => { this.TargetSpeed = Number(value); },
-      neutral: () => { this.TargetSpeed = authoredTargetSpeed; },
+      neutral: () => { this.TargetSpeed = this.initialRunState.TargetSpeed; },
       reapply: context.reapply,
     });
     slotDeclare(this, 'SignalAcceleration', 'setter', {
       apply: (value) => { this.Acceleration = Number(value); },
-      neutral: () => { this.Acceleration = authoredAcceleration; },
+      neutral: () => { this.Acceleration = this.initialRunState.Acceleration; },
       reapply: context.reapply,
     });
     slotDeclare(this, 'SignalIsAtPosition', 'feedback');

@@ -45,7 +45,7 @@ import {
   createStatusHighlightGizmos,
 } from './rv-error-visual';
 import { showStatusOutline, hideStatusOutline } from './rv-status-outline';
-import { wireValueSignal } from './rv-signal-wiring';
+import { wireDisplaySignal } from './rv-signal-wiring';
 import { reportProblem, UNRESOLVED_INSTRUCTION_TARGET_CODE } from '../hmi/problems-store';
 import type { InstructionEntry, InstructionStep } from './rv-instruction-runtime-store';
 import { storedRefString } from './rv-stored-ref-label';
@@ -263,7 +263,7 @@ export class RVCustomRuntimeInstruction implements RVComponent {
       // yet, so the level is only recorded and `onSceneReady()` applies it (the
       // no-flicker contract the hand-written initial read had).
       let deferInitial = true;
-      this._unsubscribe = wireValueSignal(ctx.signalStore, this.signal, (v) => {
+      this._unsubscribe = wireDisplaySignal(ctx.signalStore, this.signal, (v) => {
         if (deferInitial) { deferInitial = false; this._signalHigh = !!v; return; }
         this._onSignal(!!v);
       }, undefined, ctx.reapply).unsubscribe;

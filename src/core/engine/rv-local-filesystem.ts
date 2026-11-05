@@ -437,17 +437,39 @@ export async function getOrCreateSubfolder(
 /**
  * Write a Blob into a directory as `filename`, overwriting if it exists.
  * Caller must hold readwrite permission on `dir`.
+ *
+ * `signal` (plan-2229, optional): the File System Access API buffers the
+ * stream into a swap file and commits it only in `close()`. The signal is
+ * checked after the bytes are staged and BEFORE `close()`: aborted, the swap
+ * file is discarded with `abort()` — an existing file keeps its bytes — and
+ * the call rejects with {@link writeAborted} (`committed: false`). Once
+ * `close()` has started the write is committed; a later abort changes nothing.
+ * Note that `getFileHandle({ create: true })` has already created an EMPTY
+ * entry for a new file by then — removing it is the caller's rollback
+ * (`atomicReplaceFile` does).
  */
 export async function writeBlobFile(
   dir: FileSystemDirectoryHandle,
   filename: string,
   blob: Blob,
+  signal?: AbortSignal,
 ): Promise<void> {
   const fileHandle = await dir.getFileHandle(filename, { create: true });
   const writable = await fileHandle.createWritable();
   await writable.write(blob);
+  // Last check before the commit point: close() turns the swap file into the file.
+  if (signal?.aborted) { await writable.abort(); throw writeAborted(); }
   await writable.close();
 }
+
+/**
+ * The error of a project write aborted through its `signal` BEFORE its commit
+ * point (plan-2229): `name: 'AbortError'`, `committed: false` — nothing was
+ * written, an existing destination is untouched. Shared by the folder and the
+ * browser backend so a caller can tell "aborted, nothing written" from every
+ * other failure without importing a backend.
+ */
+export const writeAborted = () => Object.assign(new Error('The write was aborted before its commit'), { name: 'AbortError', committed: false });
 
 /**
  * Read a UTF-8 text file from a directory. Returns null when the file does

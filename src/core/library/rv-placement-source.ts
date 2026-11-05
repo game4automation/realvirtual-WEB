@@ -18,13 +18,34 @@
  */
 
 import type { RegisteredLibrarySource } from './library-source-registry';
-import { findLegacyOrigin, type QualifierLike } from './library-origin';
+import { findLegacyOrigin, OPEN_PROJECT_PROVIDER_ID, resolveDocumentRef, type QualifierLike } from './library-origin';
 
 /**
  * Prefix of a project-document catalog id (`project:<path>`, minted by
  * `project-library-provider.ts`) — and therefore of a placement made from one.
  */
 export const PROJECT_PLACEMENT_PREFIX = 'project:';
+
+/**
+ * Is `catalogId` a document of the OPEN project — its manifest id, or the
+ * legacy `project:<path>` form old files still carry (contract
+ * documents-projects 4: references hang off the id, a path is only read).
+ */
+export function isProjectDocumentId(catalogId: string): boolean {
+  if (catalogId.startsWith(PROJECT_PLACEMENT_PREFIX)) return true;
+  return !!catalogId && findLegacyOrigin(catalogId)?.providerId === OPEN_PROJECT_PROVIDER_ID;
+}
+
+/**
+ * The id a reference to `catalogId` is written with: a legacy `project:<path>`
+ * becomes its document id via the ONE resolver (R3); ambiguous / unknown = as written.
+ */
+export function documentIdForWrite(catalogId: string): string {
+  if (!catalogId.startsWith(PROJECT_PLACEMENT_PREFIX)) return catalogId;
+  const r = resolveDocumentRef({ catalogId }, null);
+  if (!('hit' in r) || r.hit.registered.providerId !== OPEN_PROJECT_PROVIDER_ID) return catalogId;
+  return r.hit.entry.documentId ?? (r.hit.assetId.startsWith(PROJECT_PLACEMENT_PREFIX) ? catalogId : r.hit.assetId);
+}
 
 /**
  * Which registered library source owns `assetId` — the origin lookup the whole

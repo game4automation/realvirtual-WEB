@@ -29,6 +29,7 @@ import { InspectorRow } from './rv-inspector-row';
 import { ERROR, FS, INK_HIGH, INK_MID } from './shared-sx';
 import { getAssetReference } from '../engine/rv-asset-reference';
 import { isQualifiedRef } from '../library/library-origin';
+import { planReferencedAssetOpen } from '../project/rv-referenced-asset-open';
 import { LIBRARY_PROJECTS_PROVIDER_ID } from '../library/library-projects-provider';
 import { getLibrarySourcesSnapshot, subscribeLibrarySources } from '../library/library-source-registry';
 import {
@@ -75,6 +76,14 @@ export function placementLibraryOrigin(viewer: RVViewer | null, node: Object3D |
   const ref = getAssetReference(node);
   if (ref && isQualifiedRef(ref) && ref.sourceId && ref.assetId) {
     return { placementId, libraryProjectId: ref.sourceId, documentId: ref.assetId };
+  }
+  // plan-780 2.3 / D2: read in the document's scope, never the open project.
+  const scope = viewer?.currentModelScope ?? null;
+  if (scope) {
+    const rec = placementId ? planner?.store?.getSnapshot().placed.find((p) => p.id === placementId) : undefined;
+    const assetId = ref?.assetId || rec?.catalogId || '';
+    const plan = assetId ? planReferencedAssetOpen({ ...(ref ?? {}), assetId }, null, null, scope) : null;
+    if (plan?.via === 'library') return { placementId, libraryProjectId: plan.libraryProjectId, documentId: plan.documentId };
   }
   return null;
 }

@@ -99,7 +99,7 @@ class LogicRootRuntime implements LogicRootContext {
   constructor(
     readonly root: RVLogicStep,
     readonly activeOnly: ActiveOnly,
-    private readonly engine: RVLogicEngine,
+    readonly engine: RVLogicEngine,
   ) {}
 
   noteDriveCommand(drive: RVDrive): void {
@@ -137,6 +137,9 @@ class LogicRootRuntime implements LogicRootContext {
  * - activation restarts the root from step 0.
  */
 export class RVLogicEngine {
+  eventTime: number | null = null;
+  eventImage: ReadonlyMap<string, boolean | number> | null = null;
+  desHooks: { blockerReason(): string | null; now(): number; wake(): void } | null = null;
   /** All top-level containers that run independently */
   readonly roots: RVLogicStep[] = [];
 
@@ -374,6 +377,7 @@ export class RVLogicEngine {
    * never starts logic a gate (signature, plan-757 F6) still holds.
    */
   snapshotBlockerReason(): string | null {
+    if (this.desHooks) return this.desHooks.blockerReason();
     if (!this.started) return null;
     const roots = this.roots.filter(root => this.runtimeOf(root).active
       && (root.state === StepState.Active || root.state === StepState.Waiting));
@@ -386,6 +390,24 @@ export class RVLogicEngine {
   }
 
   get isStarted(): boolean { return this.started; }
+
+  isRunning(): boolean {
+    return this.roots.some(root => {
+      const rt = this.runtimeOf(root);
+      return rt.active && (root.state === StepState.Active || root.state === StepState.Waiting);
+    });
+  }
+
+  haltRoot(root: RVLogicStep, _reason: string): void {
+    walkSteps(root, step => { step.cancel?.(); });
+    root.reset();
+    root.state = StepState.Finished;
+    root.reason = undefined;
+  }
+
+  commandedDrives(): readonly RVDrive[] {
+    return [...new Set(this.roots.flatMap(root => this.runtimeOf(root).drives))];
+  }
 
   /** The connection state the roots are evaluated against (plan-538). */
   get isConnected(): boolean { return this.connected; }
@@ -414,6 +436,7 @@ export class RVLogicEngine {
       rt.active = true;
       debug('logic', `  After start: "${root.name}" state=${root.state}`);
     }
+    this.desHooks?.wake();
   }
 
   /**
@@ -442,6 +465,7 @@ export class RVLogicEngine {
       const rt = this.runtimeOf(this.roots[i]);
       if (!rt.active && rt.want) this.activateRoot(rt);
     }
+    this.desHooks?.wake();
   }
 
   /**
@@ -562,6 +586,7 @@ export class RVLogicEngine {
     rt.root.reset();
     rt.root.start();
     rt.active = true;
+    this.desHooks?.wake();
     debug('logic', `Root "${rt.root.name}" activated (Active=${rt.activeOnly}, connected=${this.connected})`);
   }
 
@@ -664,10 +689,12 @@ export class RVLogicEngine {
     if (stepType === 'LogicStep_Delay' && step instanceof RVDelay) {
       const d = data['Duration'];
       step.duration = typeof d === 'number' && Number.isFinite(d) && d >= 0 ? d : 1;
+      this.desHooks?.wake();
       return true;
     }
     if (stepType === 'LogicStep_SetSignalBool' && step instanceof RVSetSignalBool) {
       step.value = (data['SetToTrue'] as boolean | undefined) ?? true;
+      this.desHooks?.wake();
       return true;
     }
     return false;

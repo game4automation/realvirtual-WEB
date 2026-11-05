@@ -21,6 +21,8 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { enqueueBind, writeQueued } from '../../core/hmi/rv-bind-queue';
+import { getActiveEditTarget } from '../../core/hmi/rv-edit-target';
 import { useSyncExternalStore } from 'react';
 import { Box, Typography } from '@mui/material';
 import type { RVViewer } from '../../core/rv-viewer';
@@ -331,11 +333,13 @@ function SignalBindPopoverConnected({ viewer }: { viewer: RVViewer }) {
     ...(viewer.signalStore ? collectInternalSignals(viewer.signalStore) : []),
   ];
 
-  const persist = (next: SignalMapping[]) => {
+  // Queued like every bind (plan-2233); `change` reads the mappings INSIDE the queue job.
+  const persist = (change: (m: SignalMapping[]) => SignalMapping[]) => { const et = getActiveEditTarget(); return void enqueueBind(et, async () => {
+    const next = change(persistence.read());
     const applied = mgr.applyMappings(targetId, target.node, next);
     // Broken links of the same target survive an unrelated change (plan-425).
-    persistence.write(mergeAppliedMappings(next, applied));
-  };
+    await writeQueued(persistence, et, mergeAppliedMappings(next, applied));
+  }); };
 
   const setMapping = (
     slot: string,
@@ -377,7 +381,7 @@ function SignalBindPopoverConnected({ viewer }: { viewer: RVViewer }) {
       state={mgr.getElementState(targetId)}
       onBind={setMapping}
       onUnbind={(slot, componentPath, kind) =>
-        persist(removeMappingForRow(mappings, { slot, componentPath, kind }))}
+        persist((m) => removeMappingForRow(m, { slot, componentPath, kind }))}
       onClose={() => signalBindStore.clear()}
     />
   );

@@ -10,6 +10,8 @@ export const EXPERIMENT_METHODS = ["setExperimentStore", "listExperiments", "rea
 export type ExperimentBackend = Partial<Pick<SimDesControl, 'listExperiments' | 'readManifestJson' | 'readColumnSeriesJson' | 'saveSnapshot' | 'loadSnapshot' | 'deleteSnapshot' | 'deleteReplication' | 'deleteExperiment' | 'renameExperiment' | 'exportExperiment' | 'importExperiment' | 'estimateStorage' | 'activeRunInfoJson' | 'patchExperimentMetaJson' | 'batchBlockReason' | 'runExperimentBatch' | 'runAllExperiments' | 'cancelBatch' | 'batchOutcomeJson' | 'batchProgressJson'>> & {
   setExperimentStore?(store: unknown): void;
   beforeStart(): void; dispose(): void;
+  /** The live end or warm-up was set (clock window, des.setEnd, the scene's DESManager on start). */
+  onClockSet?(field: 'end' | 'warmup'): void;
 };
 type Factory = (host: DesRunnerExperimentHost, identity: RunIdentity) => ExperimentBackend;
 let factory: Factory | null = null;

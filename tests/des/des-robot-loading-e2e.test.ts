@@ -146,4 +146,30 @@ describe('DES robot-loading reference layout (plan-297 Phase 7)', () => {
       + `${a.result.partThroughput} parts consumed`,
     );
   }, 120_000);
+
+  it('counts each RobotHandling hand-over exactly once in the DES statistics', async () => {
+    // Regression: the transactional commit (MaterialFlowAdapter.commitReservation)
+    // already counts n outputs; RobotHandling's self.statOutput(n) was forwarded
+    // through the DES bind (onStatOutput → recordOutput) and counted them again.
+    const runtime = createRobotLoadingDemoRuntime(host(), {
+      palletCount: 2,
+      blistersPerPallet: 2,
+      partsPerBlister: 4,
+      masterSeed: 297,
+      durationSeconds: 600,
+    });
+    try {
+      expect(await runtime.runner.runFastForward()).toBe(true);
+      const result = robotLoadingDemoResult(runtime);
+      const byName = (name: string) => runtime.runner.liveInstances
+        .find((instance) => instance.self.root.name === name)!.adapter;
+      // Everything the robot handed over: parts on 'out', empty carriers on 'empty'.
+      const handedOver = byName('IndexingConveyor').totalProcessed + byName('EmptyCarrierBuffer').totalProcessed;
+      expect(handedOver).toBe(result.partThroughput + result.emptyCarrierThroughput);
+      expect(byName('RobotHandling').getStatistics().totalProcessed).toBe(handedOver);
+    } finally {
+      runtime.runner.dispose();
+      getDefaultPathNetwork().clear();
+    }
+  }, 120_000);
 });

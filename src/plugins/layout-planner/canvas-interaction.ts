@@ -9,10 +9,11 @@
  * that operate on the 3D canvas while the planner is active.
  */
 
-import { Raycaster, Vector2 } from 'three';
+import { Raycaster, Vector2, Vector3 } from 'three';
 import type { Object3D, Mesh } from 'three';
 
 import type { RVViewer } from '../../core/rv-viewer';
+import type { SurfaceHit } from '../../core/engine/rv-raycast-manager';
 import { DRAG_THRESHOLD_PX } from '../../core/engine/rv-constants';
 import { pointerToNDC } from '../../core/engine/rv-pointer-utils';
 import { type LibraryCatalogEntry, type LayoutStore } from './rv-layout-store';
@@ -78,9 +79,12 @@ interface DragCandidate {
 export class CanvasInteractionManager {
   private _unsubs: (() => void)[] = [];
 
-  // Own pre-allocated vectors — NOT shared with MultiSelectPivot
+  // Own pre-allocated vectors — NOT shared with MultiSelectPivot. The raw
+  // raycaster only ever hits the planner's floor plane (a helper, not render
+  // content); placements are picked through the pick pipeline into `_surf`.
   private _raycaster = new Raycaster();
   private _mouse = new Vector2();
+  private readonly _surf: SurfaceHit = { point: new Vector3(), distance: 0, blocked: false, path: null };
   // dragCandidate migrated from _wireCanvasEvents closure scope to instance field
   private _dragCandidate: DragCandidate | null = null;
 
@@ -136,22 +140,22 @@ export class CanvasInteractionManager {
         : undefined;
       if (pathViz?.isDragging) return;
 
-      const layoutObjs = [...this.deps.objectMap.values()];
-
       // Resolve a layout-instance hit (if any) up front. The result determines
-      // whether we arm direct-drag OR start a marquee.
+      // whether we arm direct-drag OR start a marquee. The pick goes through the
+      // ONE pick pipeline (contract-bake-picking rules 15/17), with the planner's
+      // allow filter skipped so the FRONTMOST thing decides: a locked placement
+      // or any main-model part in front stops the drag (marquee instead), as an
+      // opaque housing does — the user never drags something hidden behind.
+      // Pick-only hulls count: an EnergyChain's hull is its only pick geometry.
       let hitRoot: Object3D | null = null;
       let hitPath: string | null = null;
-      if (layoutObjs.length > 0) {
-        pointerToNDC(e.clientX, e.clientY, canvas, this._mouse);
-        this._raycaster.setFromCamera(this._mouse, viewer.camera);
-        const hits = this._raycaster.intersectObjects(layoutObjs, true);
-        if (hits.length > 0) {
-          const root = findLayoutAncestor(hits[0].object);
-          if (root && !isLockedLayoutInstance(root)) {
-            const p = viewer.registry?.getPathForNode(root) ?? null;
-            if (p) { hitRoot = root; hitPath = p; }
-          }
+      const rm = viewer.raycastManager;
+      if (this.deps.objectMap.size > 0 && rm && rm.raycastSurface(e.clientX, e.clientY, this._surf, true, true) && this._surf.path) {
+        const node = viewer.registry?.getNode(this._surf.path) ?? null;
+        const root = node ? findLayoutAncestor(node) : null;
+        if (root && !isLockedLayoutInstance(root) && this.deps.objectMap.get(root.userData._layoutId) === root) {
+          const p = viewer.registry?.getPathForNode(root) ?? null;
+          if (p) { hitRoot = root; hitPath = p; }
         }
       }
 

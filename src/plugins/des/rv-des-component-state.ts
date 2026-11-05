@@ -13,8 +13,10 @@ export const componentStateKeys = [
   'state', '_currentLoad', 'isBlocked', 'isWorking', 'isFailure', 'exitBlocked',
   'totalProcessed', 'prop', 'mus', 'stateTimings', 'currentStateName', 'stateStartTime',
   'statBaselineTime', 'processedBaseline', '_pendingTransferCommits',
-  // Captured as DES-id/MU-id tuples by the component participant.
-  'blockedMUs',
+  // plan-2241: progress lifecycle + own wait/category begin stamps (diagnosis state).
+  'progressArmedSince', 'lastProgressSec', 'categorySince',
+  // Captured as DES-id/MU-id tuples (with their wait start) by the component participant.
+  'blockedMUs', 'blockedSince',
   // Captured by MaterialFlowAdapter.toSnapshot; snapshotState is the staged
   // onRestore argument, refreshed by the next behaviour onSnapshot call.
   'frozen',
@@ -24,7 +26,7 @@ export const componentServices = [
   // References: model/configuration, fixed for a bound run (fingerprint guarded).
   'node', 'isOwner', 'ProcessingTime', 'MaxCapacity', 'LinkedNode', 'EntryNode',
   'ExitNode', 'autoConnect', 'freeStates', 'def', 'processingAttachmentTime',
-  'processingAttachmentSource',
+  'processingAttachmentSource', '_progressKind',
   // Wiring: registration ids, topology, infrastructure and subscriptions survive restore.
   // Identity: plan-769 address + type, fixed for a bound run (the fingerprint covers it); named RNG streams
   // hang off it (plan-2061) and are snapshot-pending under RNG v2.
@@ -37,7 +39,7 @@ export const componentServices = [
   'visualNode', 'entryNodeRef', 'exitNodeRef', 'inputPoints', 'outputPoints',
   'defaultInPosition', 'defaultOutPosition',
   // Hooks: external observers and runner-owned dispatch/scheduling seams.
-  'onLoadChanged', 'completionListeners', 'onSelectNext', 'onCanAccept',
+  'onLoadChanged', 'completionListeners', 'onProgress', 'onSelectNext', 'onCanAccept',
   'onMUEnter', 'onMUExit', 'onFailure', 'onRepaired', 'onSignalChange', 'onRestored',
   'onMUConsumed', 'materializeMu', 'devSettleGuard', 'beforeHookDispatch',
   // plan-2212 Phase 2: sink-arrival listeners of Model-Scripts - each belongs to a
@@ -46,6 +48,8 @@ export const componentServices = [
   'synchronizeScheduledClock', 'freezeScheduledWork', 'resumeScheduledWork',
   // Scratch: synchronous call stacks, cleared in finally; never continuation state.
   'tentativeReleases', 'pendingPoses', 'savedAccept',
+  // Scratch: plan-2241 commit accounting of the running synchronous attempt (F11).
+  '_attemptDepth', '_heldMUs', '_heldBumps',
   // Scratch: moveAll writes these legacy slots but never reads them; the queued
   // named action contains the actual continuation (including component and MU).
   '_moveAllPending', '_moveAllAction', '_moveAllComp', '_moveAllMu',

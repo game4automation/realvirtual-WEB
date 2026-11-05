@@ -75,8 +75,13 @@ describe('component command methods', () => {
         expect(typeof instance[`command${slot}`], `${type}.${slot} command`).toBe('function');
         expect(typeof instance[`neutralize${slot}`], `${type}.${slot} neutralize`).toBe('function');
       }
-      const commandSlots = Object.getOwnPropertyNames(Object.getPrototypeOf(instance))
-        .filter((name) => name.startsWith('command'))
+      // Only METHODS are command slots. An accessor with the prefix (e.g. the
+      // `commandFeedbackWriter` getter the DES feedback dispatch reads) is no
+      // slot: the resolver looks up `command${slot}` only for schema slots.
+      const proto = Object.getPrototypeOf(instance);
+      const commandSlots = Object.getOwnPropertyNames(proto)
+        .filter((name) => name.startsWith('command')
+          && typeof Object.getOwnPropertyDescriptor(proto, name)?.value === 'function')
         .map((name) => name.slice('command'.length));
       expect(new Set(commandSlots)).toEqual(new Set(controlSlots));
     }

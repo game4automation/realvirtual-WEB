@@ -42,8 +42,9 @@ import { NodeRegistry } from './rv-node-registry';
 import { createSignalWriter, type SignalWriter } from './rv-signal-store';
 import type { SceneButtonManager } from './rv-scene-button-manager';
 import type { RVSceneButtonMoveable } from './rv-scene-button-moveable';
-import { wireValueSignal } from './rv-signal-wiring';
+import { wireDisplaySignal } from './rv-signal-wiring';
 import { slotWrite } from './rv-slot-io';
+import { ceilEventTimeFor } from '../sim-event-facade';
 
 /** Who caused a state change — decides whether `liveControlled` may gate it. */
 export type SceneButtonClickSource = 'operator' | 'auto';
@@ -83,6 +84,41 @@ export class RVSceneButtonBase implements RVComponent {
   private _active = false;
   private _timerRemaining = 0;
   private _timerRunning = false;
+  private _pulseEnd: number | null = null;
+
+  pulseDeadline(now: number): number | null {
+    if (!this._timerRunning) return null;
+    if (this._pulseEnd === null) {
+      const startMs = now * 1000, durationMs = this._timerRemaining * 1000;
+      this._pulseEnd = ceilEventTimeFor(startMs + durationMs, ms => ms - startMs >= durationMs);
+    }
+    return this._pulseEnd;
+  }
+
+  releasePulse(now: number): boolean {
+    const end = this.pulseDeadline(now);
+    if (end === null || now < end) return false;
+    this._timerRunning = false;
+    this._timerRemaining = 0;
+    this._pulseEnd = null;
+    this._manager?.setActive(this, false);
+    if (this._active) this._toggle(this._timerSource);
+    return true;
+  }
+
+  leaveEventClock(now: number): void {
+    if (this._pulseEnd !== null) this._timerRemaining = Math.max(0, this._pulseEnd - now);
+    this._pulseEnd = null;
+  }
+
+  resetButton(): void {
+    this._timerRunning = false;
+    this._timerRemaining = 0;
+    this._pulseEnd = null;
+    this._manager?.setActive(this, false);
+    this._applyActive(false, 'auto');
+    this._writeState(false, 'auto');
+  }
   /** Source of the click that armed the running timer — the release flank
    *  belongs to the same interaction and must be written the same way. */
   private _timerSource: SceneButtonClickSource = 'operator';
@@ -112,6 +148,8 @@ export class RVSceneButtonBase implements RVComponent {
 
   /** Remaining hold time of a running momentary click, in seconds. */
   get timerRemaining(): number {
+    if (this._timerRunning && this._manager?.eventClock && this._pulseEnd !== null)
+      return Math.max(0, this._pulseEnd - this._manager.eventClock.now);
     return this._timerRunning ? this._timerRemaining : 0;
   }
 
@@ -150,7 +188,8 @@ export class RVSceneButtonBase implements RVComponent {
     // matches, so a replay of the button's own last write is a pure no-op; what
     // it does buy is resynchronisation after a reset or a reconnect, where the
     // store may hold a state the optics no longer reflect.
-    this._unsubState = wireValueSignal(this._ctx.signalStore, address, (value) => {
+    const store = this._ctx.signalStore;
+    this._unsubState = wireDisplaySignal(store, address, (value) => {
       this._syncFromSignal(Boolean(value));
     }, undefined, this._ctx.reapply).unsubscribe;
   }
@@ -195,6 +234,7 @@ export class RVSceneButtonBase implements RVComponent {
   // ── Per-frame timer (driven by SceneButtonManager) ───────────────
 
   updateButton(dt: number): boolean {
+    if (this._manager?.eventClock) return false;
     if (!this._timerRunning) return false;
     this._timerRemaining -= Math.max(0, dt);
     if (this._timerRemaining > 0) return false;
@@ -222,6 +262,11 @@ export class RVSceneButtonBase implements RVComponent {
     }
     this._timerRunning = true;
     this._manager?.setActive(this, true);
+    if (this._manager?.eventClock) {
+      this._pulseEnd = null;
+      this.pulseDeadline(this._manager.eventClock.now);
+      this._manager.eventClock.wake('core.buttons');
+    }
   }
 
   /** Unity `ToggleClick()` — flip state, animate, write the signal, light. */

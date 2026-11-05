@@ -36,6 +36,9 @@ const srcDir = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'src');
 // community clone runs this test without it.
 const privateModuleDir = resolve(PRIVATE_SRC, 'plugins', 'des-experiments');
 const hasPrivateModule = existsSync(privateModuleDir);
+// plan-2233: the commercial display wall reports its own code (old prefix lists ignored).
+const privateWallDir = resolve(PRIVATE_SRC, 'display-wall');
+const hasPrivateWall = existsSync(privateWallDir);
 const KEBAB = /^[a-z0-9]+(?:-[a-z0-9]+)+$/;
 
 /**
@@ -64,6 +67,8 @@ const UNION_CODE_EXPRESSIONS: ReadonlyArray<readonly [string, string, string, st
   // plan-2013 V1: variant restoration forwards each `RecoveryProblem`; plan-2211: it lives in the
   // commercial experiment module of the private sibling (the column migration was removed, G7).
   ['private:des-experiments/backend/experiment-project-manager.ts', 'p.code', 'private:des-experiments/des/des-column-recovery.ts', 'RecoveryProblemCode'],
+  // plan-2207 Phase 5b: the DES runner reports each registered DES-unsuitable entry (PLC D1/D2) under its code.
+  ['plugins/des/des-runner.ts', 'entry.code', 'core/material-flow/des-unsuitable-entry.ts', 'DesUnsuitableCode'],
 ];
 
 /** Comments out, string contents kept — doc comments mention `code:` in prose. */
@@ -155,7 +160,8 @@ function scan(): ScanResult {
     })(root);
     return files.map((f) => ({ file: prefix + relative(root, f).split(sep).join('/'), text: stripComments(readFileSync(f, 'utf8')) }));
   };
-  const texts = [...walk(srcDir, ''), ...(hasPrivateModule ? walk(privateModuleDir, 'private:des-experiments/') : [])];
+  const texts = [...walk(srcDir, ''), ...(hasPrivateModule ? walk(privateModuleDir, 'private:des-experiments/') : []),
+    ...(hasPrivateWall ? walk(privateWallDir, 'private:display-wall/') : [])];
 
   const strConst = new Map<string, string>();
   const objConst = new Map<string, string[]>();
@@ -211,7 +217,7 @@ describe('plan-769 9.12 — every Problems code has a lifecycle classification',
   beforeAll(() => { result = scan(); });
 
   it('the scan finds the known anchor codes (scanner sanity)', () => {
-    for (const c of ['unresolved-instruction-target', 'signal-name-collision', 'reference-unresolved', 'unit-scale-not-applied', 'web-operator-panel-config']) {
+    for (const c of ['unresolved-instruction-target', 'signal-name-collision', 'reference-unresolved', 'unit-scale-not-applied', 'web-operator-panel-config', 'des-zero-time-pulse']) {
       expect(result.codes.has(c), c).toBe(true);
     }
     expect(result.codes.size).toBeGreaterThanOrEqual(50);
@@ -231,7 +237,8 @@ describe('plan-769 9.12 — every Problems code has a lifecycle classification',
 
   it('every classified code still exists in src/', () => {
     const stale = Object.entries(PROBLEM_CODE_CLASSIFICATION)
-      .filter(([c, k]) => !result.codes.has(c) && (hasPrivateModule || !k.module)).map(([c]) => c);
+      .filter(([c, k]) => !result.codes.has(c)
+        && (k.module === 'display-wall' ? hasPrivateWall : hasPrivateModule || !k.module)).map(([c]) => c);
     expect(stale, 'remove these from tests/helpers/problem-code-classification.ts').toEqual([]);
   });
 

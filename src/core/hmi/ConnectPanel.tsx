@@ -87,6 +87,7 @@ import {
   getStoredConnectPanelWidth,
 } from './layout-constants';
 import { RV_SCROLL_CLASS } from './shared-sx';
+import { MappingOptionsFields, mappingConversionLabel, mappingDraftProblem, mappingForSave } from './connect-mapping-options';
 import {
   subscribeConnectStore,
   getConnectSnapshot,
@@ -727,7 +728,7 @@ export function ConnectPanel() {
   // plan-2024 F3: a push arrived while an edit was open - the new config is held, not applied.
   const configNotice = useSyncExternalStore(subscribeConnectConfigNotice, getConnectConfigNotice);
   // Open the Add-Mapping dialog; a string pre-fills the source signal (signal-row bridge action).
-  const [mappingDialog, setMappingDialog] = useState<{ sourceSignal: string } | null>(null);
+  const [mappingDialog, setMappingDialog] = useState<{ sourceSignal: string; initial?: ConnectSignalMapping } | null>(null);
   // Pending destructive action awaiting confirmation (interface delete).
   const [confirmAction, setConfirmAction] = useState<ConfirmAction | null>(null);
   // plan-562 F8: a "Read only, don't ask again" is not part of the gateway
@@ -1220,6 +1221,7 @@ export function ConnectPanel() {
                 interfaces={snap.interfaces}
                 bridges={bridges}
                 onAddMapping={() => setMappingDialog({ sourceSignal: '' })}
+                onEditMapping={(m) => setMappingDialog({ sourceSignal: m.sourceSignal, initial: m })}
               />
             )}
           </Box>
@@ -1232,6 +1234,8 @@ export function ConnectPanel() {
         <AddMappingDialog
           open
           sourceSignal={mappingDialog.sourceSignal}
+          initial={mappingDialog.initial}
+          conversionSupported={snap.mappingConversion === true}
           interfaces={snap.interfaces}
           bridges={bridges}
           onClose={() => setMappingDialog(null)}
@@ -6509,7 +6513,7 @@ export function ImportTagTableDialog({
 // interfaces (config fields stay `Mirrors`/`Mappings`): out stays out, in stays
 // in — a protocol converter, never a direction flip.
 
-interface BridgesApi {
+export interface BridgesApi {
   /** null while loading; [] when loaded and empty. */
   mirrors: ConnectMirrorRule[] | null;
   mappings: ConnectSignalMapping[] | null;
@@ -6615,10 +6619,13 @@ function BridgeSection({
   interfaces,
   bridges,
   onAddMapping,
+  onEditMapping,
 }: {
   interfaces: ConnectInterface[];
   bridges: BridgesApi;
   onAddMapping: () => void;
+  /** Opens the bridge dialog on an existing mapping (mode and options, plan-2227). */
+  onEditMapping: (m: ConnectSignalMapping) => void;
 }) {
   const [addOpen, setAddOpen] = useState(false);
   useConfigEditHold(addOpen);
@@ -6770,7 +6777,15 @@ function BridgeSection({
           <Typography sx={{ fontSize: 10, fontFamily: 'monospace', color: 'rgba(255,255,255,0.8)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {m.sourceSignal} → {m.destSignal}
           </Typography>
-          <Chip label={m.coercion === 'Coerce' ? '1:1 coerce' : '1:1'} size="small" sx={{ height: 14, fontSize: 9, bgcolor: 'rgba(102,187,106,0.15)', color: ISA_GREEN }} />
+          <Chip label={mappingConversionLabel(m)} size="small" sx={{ height: 14, fontSize: 9, bgcolor: 'rgba(102,187,106,0.15)', color: ISA_GREEN }} />
+          <IconButton
+            size="small"
+            aria-label={`Edit mapping ${m.sourceSignal} to ${m.destSignal}`}
+            onClick={() => onEditMapping(m)}
+            sx={{ p: 0.2, color: 'rgba(255,255,255,0.5)', '&:hover': { color: 'primary.main' } }}
+          >
+            <Edit sx={{ fontSize: 12 }} />
+          </IconButton>
           <IconButton
             size="small"
             aria-label={`Delete mapping ${m.sourceSignal} to ${m.destSignal}`}
@@ -6792,24 +6807,47 @@ function BridgeSection({
  * Dialog to create a 1:1 signal mapping (bridge): source signal → destination signal of another
  * interface. Opened from a signal row's bridge action (source pre-filled) or the Bridges header.
  */
-function AddMappingDialog({
+export function AddMappingDialog({
   open,
   sourceSignal,
+  initial,
+  conversionSupported,
   interfaces,
   bridges,
   onClose,
 }: {
   open: boolean;
   sourceSignal: string;
+  /** Edit this mapping (same pair = replaced on save, plan-2227); absent = a new mapping. */
+  initial?: ConnectSignalMapping;
+  /** The gateway takes conversion modes (`/health` `mappingConversion`); an older one would drop `mode` silently. */
+  conversionSupported: boolean;
   interfaces: ConnectInterface[];
   bridges: BridgesApi;
   onClose: () => void;
 }) {
   useConfigEditHold(open);
-  const [source, setSource] = useState(sourceSignal);
-  const [dest, setDest] = useState('');
-  const [coerce, setCoerce] = useState(false);
+  const [source, setSource] = useState(initial?.sourceSignal ?? sourceSignal);
+  const [dest, setDest] = useState(initial?.destSignal ?? '');
+  // plan-2227 Phase 5: conversion mode + the options it reads (legacy coercion without a mode).
+  const [options, setOptions] = useState<ConnectSignalMapping>(
+    () => initial ?? { enabled: true, sourceSignal: '', destSignal: '', coercion: 'Strict' });
   const [error, setError] = useState<string | null>(null);
+  // Number fields whose text is not a valid number (Codex review: never save a silent default).
+  const [invalidFields, setInvalidFields] = useState<ReadonlySet<string>>(() => new Set());
+  const onInvalid = useCallback((field: string, invalid: boolean) => {
+    setInvalidFields((prev) => {
+      if (prev.has(field) === invalid) return prev;
+      const next = new Set(prev);
+      if (invalid) next.add(field); else next.delete(field);
+      return next;
+    });
+  }, []);
+  const problem = invalidFields.size > 0
+    ? `${[...invalidFields].join(', ')}: enter a valid number`
+    : options.mode && !conversionSupported
+      ? 'This CONNECT version cannot convert; update CONNECT or choose 1:1'
+      : mappingDraftProblem(options);
 
   // All known signal names for the datalist suggestions.
   const allNames = useMemo(
@@ -6819,19 +6857,21 @@ function AddMappingDialog({
   const handleAdd = useCallback(async () => {
     const src = source.trim();
     const dst = dest.trim();
-    if (!src || !dst || src === dst) return;
+    if (!src || !dst || src === dst || problem) return;
+    const next = mappingForSave({ ...options, enabled: initial?.enabled ?? true, sourceSignal: src, destSignal: dst });
+    // The pair is the identity: an edited or re-added pair replaces the old entry in place.
+    const same = (m: ConnectSignalMapping, a: string, b: string) => m.sourceSignal === a && m.destSignal === b;
+    const list = bridges.mappings ?? [];
+    const at = list.findIndex(m => same(m, initial?.sourceSignal ?? src, initial?.destSignal ?? dst));
+    const kept = list.filter((m, i) => i !== at && !same(m, src, dst));
+    if (at >= 0) kept.splice(Math.min(at, kept.length), 0, next); else kept.push(next);
     try {
-      await bridges.saveMappings([...(bridges.mappings ?? []), {
-        enabled: true,
-        sourceSignal: src,
-        destSignal: dst,
-        coercion: coerce ? 'Coerce' : 'Strict',
-      }]);
+      await bridges.saveMappings(kept);
       onClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to add mapping.');
+      setError(err instanceof Error ? err.message : 'Failed to save mapping.');
     }
-  }, [bridges, source, dest, coerce, onClose]);
+  }, [bridges, source, dest, options, initial, problem, onClose]);
 
   return (
     <Dialog open={open} onClose={onClose} maxWidth="xs" fullWidth>
@@ -6860,20 +6900,18 @@ function AddMappingDialog({
         <datalist id="rv-bridge-signal-names">
           {allNames.map(n => <option key={n} value={n} />)}
         </datalist>
-        <FormControlLabel
-          control={<Checkbox size="small" checked={coerce} onChange={(e) => setCoerce(e.target.checked)} />}
-          label={<Typography sx={{ fontSize: 11 }}>Allow type coercion (bool↔int, int→float)</Typography>}
-        />
+        <MappingOptionsFields value={options} onChange={setOptions} onInvalid={onInvalid} conversionSupported={conversionSupported} />
+        {problem && <Typography sx={{ fontSize: 11, color: ISA_RED, mt: 0.5 }}>{problem}</Typography>}
       </DialogContent>
       <DialogActions>
         <Button onClick={onClose} sx={{ textTransform: 'none' }}>Cancel</Button>
         <Button
           variant="contained"
-          disabled={!source.trim() || !dest.trim() || source.trim() === dest.trim()}
+          disabled={!source.trim() || !dest.trim() || source.trim() === dest.trim() || problem !== null}
           onClick={() => void handleAdd()}
           sx={{ textTransform: 'none' }}
         >
-          Add Bridge
+          {initial ? 'Save Bridge' : 'Add Bridge'}
         </Button>
       </DialogActions>
     </Dialog>

@@ -295,7 +295,8 @@ describe('main.ts wiring of the deep-link start (plan-2018 9.9 / 9.10)', () => {
     expect(at).toBeGreaterThan(0);
     const slice = mainSource.slice(at, at + 400);
     expect(slice).toContain('!await guardHeavyRestore(hostedBoot.docId, hostedBoot.docName)');
-    expect(slice).toContain('openProjectsDashboard();');
+    // Boot-time openings go through autoOpenProjectsDashboard() (none in recording mode, plan-2240).
+    expect(slice).toContain('autoOpenProjectsDashboard();');
     expect(mainSource).toContain("'projecturl-start-unresolved'");
   });
 });
@@ -335,7 +336,7 @@ describe('main.ts wiring of the hosted start document (plan-640 §9.3 / §9.3b)'
     expect(branch).toContain('showLoadingError(');
     expect(branch).toContain("code: 'hosted-start-failed'");
     expect(branch).toContain('sceneRouted = true;');
-    const dashboard = mainSource.slice(branchEnd, mainSource.indexOf('openProjectsDashboard();', branchEnd));
+    const dashboard = mainSource.slice(branchEnd, mainSource.indexOf('autoOpenProjectsDashboard();', branchEnd));
     expect(dashboard).toContain("'hosted-start-unresolved'");
   });
 

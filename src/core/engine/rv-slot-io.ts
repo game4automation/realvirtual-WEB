@@ -79,6 +79,7 @@ interface SlotEntry {
 }
 
 const slots = new WeakMap<object, Map<string, SlotEntry>>();
+export const slotCommandListeners = new Set<() => void>();
 /** Fields a component deliberately leaves unbindable, with the reason the resolver reports. */
 const refusals = new WeakMap<object, Map<string, string>>();
 
@@ -185,9 +186,11 @@ export function slotCommand(instance: object, field: string, value: boolean | nu
   const entry = entryOf(instance, field);
   if (!entry || entry.access === 'feedback') return;
   entry.direct = value;
-  if (entry.access !== 'setter') return;
-  entry.apply?.(value);
-  armReplay(entry, field);
+  if (entry.access === 'setter') {
+    entry.apply?.(value);
+    armReplay(entry, field);
+  }
+  for (const cb of slotCommandListeners) cb();
 }
 
 /** Register the setter slot's replay of its last direct value (once). */
@@ -207,6 +210,7 @@ export function slotNeutralize(instance: object, field: string): void {
   entry.unregisterReplay?.();
   entry.unregisterReplay = null;
   entry.neutral?.();
+  for (const cb of slotCommandListeners) cb();
 }
 
 /**
@@ -288,6 +292,12 @@ export function slotWrite(
 export function slotFeedbackValue(instance: object, field: string): boolean | number | undefined {
   const entry = entryOf(instance, field);
   return entry && entry.access === 'feedback' ? entry.value : undefined;
+}
+
+/** Cache access for silent feedback restore. */
+export function slotFeedbackState(instance: object): ReadonlyMap<string,
+  { readonly access: SlotAccess; value: boolean | number }> | undefined {
+  return slots.get(instance);
 }
 
 /**

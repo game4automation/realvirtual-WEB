@@ -513,7 +513,7 @@ export class PerfTestPlugin implements RVViewerPlugin {
     if (tm) {
       for (let i = tm.mus.length - 1; i >= 0; i--) tm.removeMU(tm.mus[i]);
       tm.surfaces.length = 0;
-      tm.sensors.length = 0;
+      tm.clearSensors();
       tm.sources.length = 0;
       tm.sinks.length = 0;
       tm.notifyTopologyChanged();

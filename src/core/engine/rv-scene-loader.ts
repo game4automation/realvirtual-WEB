@@ -19,6 +19,7 @@ import {
   type ComposeResult, type ComposedFrame, type DeferredReference, type GlbTemplateCache, type ReferenceResolver,
 } from './rv-glb-compose';
 import { createReferenceResolver } from './rv-glb-reference-resolver';
+import type { DocumentScope } from '../library/library-origin';
 import {
   reportBakeFailed, reportIdVersionNewer, reportMissingReferences, reportOverrideOrphaned, reportOverrideTransformsDropped, reportReferenceMigrationProblems,
   reportReferenceContentDiscarded,
@@ -82,6 +83,7 @@ import './rv-machining-tool';
 import './rv-web-sensor';
 import './rv-web-label';
 import './rv-fmu';
+import { FMU_TYPE } from './rv-fmu-constants';
 import './rv-web-diagnostics';
 import './rv-web-error';
 import './rv-web-visibility';
@@ -163,7 +165,7 @@ import { registerBuiltInPreBakeHooks } from './rv-pre-bake-hooks';
 import { isMetadataLoadingEnabled } from './rv-dev-load-flags';
 import { freezeStaticMatrices } from './rv-freeze-static';
 import { assertBakeAllowed, BakeAbortedError } from './rv-bake-pipeline';
-import { prepareAndBake, preparedMaterialsOf } from './rv-prepare-and-bake';
+import { prepareAndBake, preparedMaterialsOf, stripPersistedSensorViz } from './rv-prepare-and-bake';
 import { buildInitContext, subsystemsOf, type InitContextBase, type InitSubsystems } from './rv-init-context';
 import type { BakeClaim } from './rv-bake-survival';
 import type { BakedAsset } from './rv-bake-chunk';
@@ -591,6 +593,8 @@ export interface LoadGLBOptions extends InitSubsystems {
    * composition can be exercised without a network.
    */
   referenceResolver?: ReferenceResolver;
+  /** plan-780 R1: the loaded document's project; composition resolves its references there. Null = open project. */
+  documentScope?: DocumentScope;
   /**
    * Reuse a parse-template cache across loads. Omit and the composition owns a
    * fresh one that is freed with the model — see `rv-glb-compose.ts` on why
@@ -1748,9 +1752,8 @@ export function reconcileOverlayOverrides(
       const schema = getRegisteredFactories().get(componentType)?.schema
         ?? (instance.constructor as { schema?: ComponentSchema }).schema;
       if (schema) applySchema(instance as unknown as Record<string, unknown>, schema, data);
-      // Drives have a config→runtime split (TargetSpeed/Direction → targetSpeed/
-      // axis); re-derive them safely without re-caching the base transform.
-      if (instance instanceof RVDrive) instance.reapplyConfig();
+      // Drives re-derive their config->runtime split; drive behaviors refresh reset baselines.
+      if (instance instanceof RVDrive || componentType.startsWith('Drive_')) instance.reapplyConfig?.();
     }
     debug('loader', `[overlay] reconciled missed override at "${nodePath}"`);
   }
@@ -1875,7 +1878,9 @@ export function initializeComponents(
 ): { initialized: number; failed: number } {
   let initialized = 0;
   let failed = 0;
-  for (const { component, type, path } of pending) {
+  // Fmu first: its init() creates the signal leaves other references resolve to.
+  const ordered = [...pending.filter((p) => p.type === FMU_TYPE), ...pending.filter((p) => p.type !== FMU_TYPE)];
+  for (const { component, type, path } of ordered) {
     // Isolate each component: a single component's resolve/init throwing must not
     // abort the whole model load (which would leave the scene/hierarchy unbuilt).
     try {
@@ -2352,7 +2357,8 @@ export function createRuntimeNode(deps: RuntimeNodeDeps, spec: RuntimeNodeSpec, 
     applySchema(inst as unknown as Record<string, unknown>, factory.schema, data);
     if (factory.afterCreate) factory.afterCreate(inst, node);
     deps.registry.register(type, path, inst);
-    constructed.push(inst);
+    // Fmu first (see initializeComponents).
+    if (type === FMU_TYPE) constructed.unshift(inst); else constructed.push(inst);
   }
 
   const context: ComponentContext = {
@@ -2888,8 +2894,8 @@ export async function computeBVHAsync(
     if (node.userData?._rvSkipBVH) return;
     // A baked chunk is never given a tree here: it has its own pick structure
     // (plan-756), and a non-indirect MeshBVH would REORDER the index that
-    // structure's segments address (§2.4a.10). Only the collision manager may
-    // build one, and only `{ indirect: true }`.
+    // structure's segments address (§2.4a.10). Nothing builds one on a chunk —
+    // collision reads the pick structure (plan-781).
     if (node.userData?._rvBakeChunk) return;
     if (seen.has(geo) || geo.boundsTree) return;
     seen.add(geo);
@@ -3225,6 +3231,7 @@ export async function loadGLB(url: string, scene: Scene, options?: LoadGLBOption
       gltfNodeIndices,
       signatureState,
       signaturePresent,
+      scope: options?.documentScope ?? null,
       resolve: options?.referenceResolver ?? createReferenceResolver(),
       cache: options?.composeCache,
       shouldAbort: options?.shouldAbort,
@@ -3289,6 +3296,8 @@ export async function loadGLB(url: string, scene: Scene, options?: LoadGLBOption
   // destructive path, so for an authoring load (`preserveHierarchy` — the asset
   // editor), a load without a `BakeRegistry`, a model that draws nothing or a
   // composition that GRAFTED a frame, this call is the ONLY scan.
+  // Legacy sensor viz, every load path, before the scan (see the function).
+  stripPersistedSensorViz(root);
   applyNamingScan(root);
 
   // plan-652 Phase 3 (§2.4.3): activate the on-demand features this model's

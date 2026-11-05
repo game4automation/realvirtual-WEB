@@ -46,6 +46,7 @@ import { syncSignalSubtree } from './rv-signal-editor-sync';
 import { buildInitContext, subsystemsOf, type InitContextBase, type InitSubsystems } from './rv-init-context';
 import type { SignalStore } from './rv-signal-store';
 import type { RVTransportManager } from './rv-transport-manager';
+import { removeSensorsFrom } from './rv-sensor-registration';
 import type { RVDrive } from './rv-drive';
 import type { RVUberMaterial } from './rv-uber-material';
 import type { BakeRegistry } from './rv-bake-registry';
@@ -399,7 +400,7 @@ export function disposePlacedRoot(viewer: PlacedRootDisposeHost, root: Object3D,
       const tm = viewer.transportManager;
       if (tm) {
         const isRemoved = (c: { node: Object3D }): boolean => removedPaths.has(NodeRegistry.computeNodePath(c.node));
-        tm.sensors = tm.sensors.filter((s) => !isRemoved(s));
+        removeSensorsFrom(tm, isRemoved);
         tm.surfaces = tm.surfaces.filter((s) => !isRemoved(s));
         for (const s of tm.sources) if (isRemoved(s) && !disposed.has(s)) s.dispose?.();
         tm.sources = tm.sources.filter((s) => !isRemoved(s));

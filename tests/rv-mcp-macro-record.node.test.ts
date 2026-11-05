@@ -33,6 +33,8 @@ import {
   type RvMacroCommandStep,
 } from '../src/plugins/mcp-bridge/rv-mcp-macro';
 import { runCommandStep } from '../src/plugins/mcp-bridge/rv-mcp-command-tools';
+import { enqueueBind } from '../src/core/hmi/rv-bind-queue';
+import type { EditTarget } from '../src/core/hmi/rv-edit-target';
 
 // ─── Fixture ────────────────────────────────────────────────────────────
 
@@ -152,6 +154,30 @@ afterEach(() => { env.recorder._resetForTest(); env.doc.dispose(); });
 // ─── 9.1 recording ──────────────────────────────────────────────────────
 
 describe('plan-641 §9.1 — recording through runCommandStep', () => {
+  it.each([false, true])('waits for a queued unbind before reporting and recording (record=%s)', async (record) => {
+    if (record) start();
+    let unbind: Promise<void> | undefined;
+    env.registry.register(desc('t.unbindQueued', {
+      enabled: () => true,
+      async run() {
+        unbind = enqueueBind({ documentKey: { document: env.doc } } as EditTarget, async () => {
+          await new Promise<void>((resolve) => setTimeout(resolve, 40));
+          await env.doc.applyOp({ ...setFieldOp('Carrier', [], 'Mappings'), componentType: 'SignalLinks' } as RvOp);
+        });
+        return { ok: true };
+      },
+    }));
+    const result = await step('t.unbindQueued', {});
+    const countAtReport = env.doc.opCount;
+    await unbind;
+    expect(countAtReport).toBe(1);
+    expect(result.outcome.status).toBe('ok');
+    if (record) {
+      expect(env.recorder.active).not.toBeNull();
+      expect(lines()[0].result.status).toBe('ok');
+    }
+  });
+
   it('without a recording a call runs with its raw args and records nothing', async () => {
     const o = await step('t.set', { path: 'A/B', value: 5 });
     expect(o.recorded).toBe(false);

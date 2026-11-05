@@ -11,13 +11,17 @@ export interface WaitEdge {
   readonly analysed: boolean;
   readonly notAnalysedReason?: 'capacity>1' | 'external-holder' | 'holder-only' | 'shared-unit' | 'alternative-outputs';
   readonly nodePath?: string;
+  readonly ownerMUs?: boolean;
 }
 export interface WaitEdgeSource {
   readonly id: string;
   edges(now: number): readonly WaitEdge[];
   /** Optional vocabulary; exposing it does not collect the wait graph. */
   kinds?(): readonly string[];
+  readonly vehicles?: boolean;
 }
+
+const same = (id: string): string => id;
 
 /** Pull-only diagnostics: registration never samples a source or schedules work. */
 export class WaitRegistry {
@@ -31,12 +35,14 @@ export class WaitRegistry {
     this.registered.add(src);
     return () => { this.registered.delete(src); };
   }
+  unitOf = same;
   collect(now: number, readOnly = false): readonly WaitEdge[] {
     const edges: WaitEdge[] = [];
     const sources = [...this.registered].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
     for (const source of sources) for (const edge of source.edges(now)) {
+      const u = source.vehicles ? this.unitOf : same;
       if (!readOnly) this.kinds.add(edge.kind);
-      edges.push({ ...edge, ownerIds: [...edge.ownerIds].sort() });
+      edges.push({ ...edge, waiterId: u(edge.waiterId), ownerIds: edge.ownerIds.map(edge.ownerMUs ? same : u).sort() });
     }
     const key = (e: WaitEdge): string => JSON.stringify([
       e.waiterId, e.resourceId, e.kind, e.ownerIds, e.analysed, String(e.sinceSimSec), e.nodePath ?? '',
@@ -52,7 +58,7 @@ export function zoneWaitSource(authority: () => {
   zoneWaitEdges(opts: { holders: 'all' }): WaitEdge[];
   followWaitEdges?(): WaitEdge[];
 }): WaitEdgeSource {
-  return { id: 'zones', kinds: () => ['zone-holder', 'zone-fifo', 'follow'], edges: () => {
+  return { id: 'zones', vehicles: true, kinds: () => ['zone-holder', 'zone-fifo', 'follow'], edges: () => {
     const current = authority();
     return [...current.zoneWaitEdges({ holders: 'all' }), ...(current.followWaitEdges?.() ?? [])];
   } };

@@ -201,6 +201,34 @@ entry. It defaults to `true` for GLB entries and `false` for Gaussian
 splats (splats don't have a meaningful AABB-floor concept). The WebPivot
 marker takes precedence regardless of this flag.
 
+### 4.2 Texture budget of library objects
+
+A library object is downloaded, decoded and uploaded to the GPU on its first drop, so its
+textures decide how long that first drop takes. Every image embedded in a GLB under
+`public/library/` stays within **2048 px per side and 2 MB encoded**;
+`tests/library-texture-budget.node.test.ts` fails otherwise.
+
+Why: until 2026-11-05 `CartonBox.glb` (324 triangles) embedded a 4096×4096 PNG of 15.6 MB,
+and `EuropalletLoaded.glb` carried the same image. The first carton drop spent 349 ms parsing
+that PNG, and the texture took about 85 MB of GPU memory with mipmaps. Both files now embed
+it as a 2048×2048 JPEG (195 KB). The material is opaque, so dropping the alpha channel does
+not change the look:
+
+| File | Before | After | GLB load (three.js, headless Chrome) |
+|---|---|---|---|
+| `CartonBox.glb` | 15.6 MB | 0.24 MB | 567 → 62 ms |
+| `EuropalletLoaded.glb` | 17.4 MB | 2.0 MB | 863 → 97 ms |
+
+When exporting a library object from Unity:
+
+- Keep textures at 2048 px or less; 1024 px is enough for most parts. Barcodes and small
+  print are the reason this one stays at 2048.
+- Use JPEG for opaque materials. PNG only where the material really uses alpha
+  (`alphaMode` `MASK` or `BLEND`).
+- After replacing a GLB, run `node scripts/build-local-library-catalog.mjs`. The catalog
+  stores each file's SHA-256 and size, and the browser cache verifies every download
+  against them.
+
 ---
 
 ## 5. Drop, snap, gizmo
@@ -701,6 +729,14 @@ carries the *content*:
 - `gridSizeMm` — grid size, in `edits.settings`.
 - `placed` — list of `PlacedComponent` records, materialized from the
   `addPlacement` / `removePlacement` / `transformPlacement` ops.
+  A record is read and written in the scope of the planner's document
+  (`viewer.currentModelScope`, plan-780): in Edit in library an unqualified
+  record is the library's document, a new placement of the library's own
+  document is written unqualified, one of another project qualified (a
+  placement the library cannot resolve on its own is kept and named in a
+  Problems warning). The library card's "preparing" state is keyed by the
+  qualified entry key, so two libraries sharing a document id never mark each
+  other.
 
 **2. localStorage** carries the *UI preferences* — they follow the browser
 profile, not the scene. Fourteen keys are declared in

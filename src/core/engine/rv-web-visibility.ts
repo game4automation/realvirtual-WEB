@@ -29,7 +29,7 @@ import { registerComponent, setComponentInstance, loadSchemaFromSpec } from './r
 import type { GizmoHandle } from './rv-gizmo-manager';
 import { NodeRegistry } from './rv-node-registry';
 import { storedReferenceValue } from './rv-node-path-rewrite.mjs';
-import { wireValueSignal } from './rv-signal-wiring';
+import { wireDisplaySignal } from './rv-signal-wiring';
 import {
   ERROR_COLOR,
   ERROR_BLINK_HZ,
@@ -109,7 +109,7 @@ export class RVWebVisibility implements RVComponent {
     this._visible = this.DefaultVisible;
     if (this.SignalVisible) {
       let deferInitial = true;
-      this._unsubVisible = wireValueSignal(ctx.signalStore, this.SignalVisible, (v) => {
+      this._unsubVisible = wireDisplaySignal(ctx.signalStore, this.SignalVisible, (v) => {
         if (deferInitial) { deferInitial = false; this._visible = !!v !== this.InvertSignal; return; }
         this._onVisibleChange(!!v);
       }, undefined, ctx.reapply).unsubscribe;
@@ -119,7 +119,7 @@ export class RVWebVisibility implements RVComponent {
     // ── Error signal ──
     if (this.SignalError) {
       let deferInitial = true;
-      this._unsubError = wireValueSignal(ctx.signalStore, this.SignalError, (v) => {
+      this._unsubError = wireDisplaySignal(ctx.signalStore, this.SignalError, (v) => {
         if (deferInitial) { deferInitial = false; this._error = !!v; return; }
         this._onErrorChange(!!v);
       }, undefined, ctx.reapply).unsubscribe;

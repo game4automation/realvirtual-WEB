@@ -223,6 +223,7 @@ describe('capacity through the wrapper', { timeout: 90_000 }, () => {
     e.RV_TEST_UNATTENDED = '1';
     e.RV_TEST_LOCK_PORT = String(base);
     e.RV_TEST_LOCK_POLL_SECONDS = '0.05';
+    e.RV_TEST_MIN_FREE_GB = '0'; // plan-2247: not about the machine's free memory
     for (const [k, v] of Object.entries(extra)) { if (v === undefined) delete e[k]; else e[k] = v; }
     return e;
   }

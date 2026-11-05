@@ -1168,8 +1168,36 @@ export class NodeRegistry {
       out.resolvedVia = chain.via;
       return out;
     }
+    if (!hit && (addressForm || chain.final) && this._chainKind(chain.ct) === 'signal') {
+      // Unbound, no raw path (doc-node-paths.md § 5.4) — unless an FMU leaf matches exactly.
+      const leaf = this.runtimeSignalLeafFor(referrer ?? null, ref);
+      return leaf ? { signalAddress: this.nodePaths.get(leaf)! } : {};
+    }
     if (addressForm && !hit) return {};
     return this._resolveOutcome(ref, chain);
+  }
+
+  /**
+   * An Fmu's runtime signal leaf (`_rvFmuSignal`, never saved) named EXACTLY by a
+   * stored ref whose file verdict is `missing` — same document, as written or
+   * root-prefixed; no suffix, no name, no address (contract-node-identity R4).
+   */
+  runtimeSignalLeafFor(referrer: Object3D | null, ref: unknown): Object3D | null {
+    const r = (ref ?? {}) as { path?: unknown; unresolvedPath?: unknown; address?: unknown };
+    const w = r.unresolvedPath ?? r.path;
+    if (!referrer || typeof w !== 'string' || typeof r.address === 'string'
+      || (this.readStoredRef(referrer, ref as StoredReferenceLike) as { reason?: string }).reason !== 'missing') return null;
+    const occ = this.docOccurrenceOf(referrer);
+    const root = occ === null ? null : this.rootOfOccurrence(occ);
+    if (!root) return null;
+    const base = this.nodePaths.get(root) ? this.nodePaths.get(root) + '/' : '';
+    const n = root.name + '/';
+    for (const p of [base + w, base + (w.startsWith(n) ? w.slice(n.length) : w)]) {
+      const leaf = this.nodes.get(p);
+      if (leaf?.userData._rvFmuSignal === true && !leaf.children.length && this.nodePaths.get(leaf) === p
+        && this.docOccurrenceOf(leaf) === occ) return leaf;
+    }
+    return null;
   }
 
   /** The typed result of {@link resolve} for one chain outcome. */
@@ -1285,6 +1313,8 @@ export class NodeRegistry {
     /** plan-769: set when the address index named the node ({@link addressed}). */
     via?: 'address' | 'migrated';
     addressed?: Object3D;
+    /** The file's verdict on a stored reference was a miss. */
+    final?: boolean;
   } {
     // Unity writes the componentType NAMESPACED (`realvirtual.MachiningTool`), and
     // every lookup below compares against the bare TypeScript component name. The
@@ -1313,7 +1343,7 @@ export class NodeRegistry {
       if (r.status === 'resolved') { scopedNode = r.node; via = r.via; }
       else if (r.status !== 'legacy' || addressOnly) {
         // A stored reference that names no node is unresolved — never guessed.
-        return { kind: addressOnly ? 'unknown' : this._chainKind(ct), ct, hit: null };
+        return { kind: addressOnly ? 'unknown' : this._chainKind(ct), ct, hit: null, final: true };
       }
     }
     if (refScope && !scopedNode) {

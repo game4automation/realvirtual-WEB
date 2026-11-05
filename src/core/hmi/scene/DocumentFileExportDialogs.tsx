@@ -21,7 +21,7 @@
  * this module never imports the card back.
  */
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Box,
   Button,
@@ -35,7 +35,7 @@ import {
   Typography,
 } from '@mui/material';
 import type { ActiveDocumentFileExport } from '../../editor/active-document-view';
-import type { ApplyCommitResult, ApplyPreview, DocumentExportMode } from '../../export/rv-export-provider';
+import type { ApplyCommitResult, ApplyPreview, DocumentExportMode, DocumentExportPreflight } from '../../export/rv-export-provider';
 import { FS, INK_LOW, INK_MID, MONO, WARN } from '../shared-sx';
 
 /** How many entries of a list the apply dialog shows before "… and N more". */
@@ -118,11 +118,29 @@ export interface DocumentFileExportDialogProps {
 
 /** Non-GLB export (plan-764): one mode choice, the provider decides the rest. */
 export function DocumentFileExportDialog({ exp, modes, onClose, onMessage, download }: DocumentFileExportDialogProps) {
-  const [modeId, setModeId] = useState(modes[0]?.id ?? '');
+  const [modeId, setModeId] = useState(modes.find((m) => !m.disabledReason)?.id ?? '');
   const [exporting, setExporting] = useState(false);
+  const selectedMode = modes.find((m) => m.id === modeId);
+  const [check, setCheck] = useState<{ modeId: string; result?: DocumentExportPreflight; error?: string } | null>(null);
+  const needsPreflight = !!exp.preflight && !!selectedMode && !selectedMode.disabledReason;
+  const currentCheck = check?.modeId === modeId ? check : null;
+  const checking = needsPreflight && !currentCheck;
+  // Only cheap counters belong on open or mode change. Export bytes are produced on click.
+  useEffect(() => {
+    let cancelled = false;
+    setCheck(null);
+    if (exp.preflight && selectedMode && !selectedMode.disabledReason) {
+      void exp.preflight(selectedMode.id).then((result) => {
+        if (!cancelled) setCheck({ modeId: selectedMode.id, result });
+      }).catch((e: unknown) => {
+        if (!cancelled) setCheck({ modeId: selectedMode.id, error: errorText(e) });
+      });
+    }
+    return () => { cancelled = true; };
+  }, [exp, selectedMode]);
 
   const run = async () => {
-    if (!modeId || exporting) return;
+    if (!selectedMode || selectedMode.disabledReason || exporting || checking) return;
     setExporting(true);
     try {
       const result = await exp.run(modeId);
@@ -144,21 +162,40 @@ export function DocumentFileExportDialog({ exp, modes, onClose, onMessage, downl
         {exp.label.replace(/…$/, '')}
       </DialogTitle>
       <DialogContent>
+        {exp.id === 'usd' && (
+          <Typography sx={{ fontSize: FS.body, mb: 1 }}>
+            Export this document for Isaac Sim, Omniverse, Blender or usdview.
+          </Typography>
+        )}
         <RadioGroup value={modeId} onChange={(e) => setModeId(e.target.value)}>
           {modes.map((mode) => (
             <FormControlLabel
               key={mode.id}
               value={mode.id}
+              disabled={exporting || !!mode.disabledReason}
               control={<Radio size="small" inputProps={{ 'data-testid': `document-card-export-mode-${mode.id}` } as Record<string, string>} />}
               label={(
                 <Box>
-                  <Typography sx={{ fontSize: 13 }}>{mode.label}</Typography>
+                  <Typography sx={{ fontSize: FS.body }}>{mode.label}</Typography>
+                  {mode.description && <Typography sx={{ fontSize: FS.label, color: INK_MID }}>{mode.description}</Typography>}
+                  {mode.disabledReason && <Typography sx={{ fontSize: FS.label, color: INK_MID }}>{mode.disabledReason}</Typography>}
                   <Typography sx={{ fontSize: FS.label, opacity: 0.7 }}>{mode.fileName}</Typography>
                 </Box>
               )}
             />
           ))}
         </RadioGroup>
+        {currentCheck?.result && currentCheck.result.referencesWithoutGeometry > 0 && (
+          <Typography sx={{ fontSize: FS.body, color: WARN, mt: 1 }}>
+            {`${currentCheck.result.referencesWithoutGeometry} placements will be exported without geometry.`}
+          </Typography>
+        )}
+        {currentCheck?.error && <Typography role="status" sx={{ fontSize: FS.body, mt: 1 }}>{currentCheck.error}</Typography>}
+        {checking && (
+          <Typography role="status" sx={{ fontSize: FS.body, color: INK_MID, mt: 1 }}>
+            Checking placements…
+          </Typography>
+        )}
         {exporting && (
           <Typography sx={{ fontSize: FS.body, opacity: 0.75, mt: 1 }}>
             Exporting. Large documents take a few seconds.
@@ -172,7 +209,7 @@ export function DocumentFileExportDialog({ exp, modes, onClose, onMessage, downl
         <Button
           size="small"
           variant="contained"
-          disabled={exporting || !modeId}
+          disabled={exporting || checking || !selectedMode || !!selectedMode.disabledReason}
           data-testid="document-card-export-run"
           onClick={() => { void run(); }}
           sx={{ textTransform: 'none' }}
@@ -199,7 +236,7 @@ export interface DocumentApplyDialogProps {
  */
 export function DocumentApplyDialog({ exp, preview, onClose, onMessage }: DocumentApplyDialogProps) {
   const [committing, setCommitting] = useState(false);
-  const title = (exp.apply?.label ?? 'Apply').replace(/…$/, '');
+  const title = exp.id === 'usd' ? 'Apply realvirtual data from USD' : (exp.apply?.label ?? 'Apply').replace(/…$/, '');
   const fileName = preview.fileName ?? 'The file';
   const blocked = preview.blocked;
 
@@ -225,6 +262,9 @@ export function DocumentApplyDialog({ exp, preview, onClose, onMessage }: Docume
         {blocked ? `${title} — blocked` : title}
       </DialogTitle>
       <DialogContent data-testid="document-card-apply-dialog">
+        <Typography sx={{ fontSize: FS.body, mb: 1 }}>
+          Review the realvirtual data matched to this document. Applying replaces its realvirtual data; geometry stays unchanged.
+        </Typography>
         <Typography sx={{ fontSize: FS.label, color: INK_LOW, fontFamily: MONO }}>
           {fileName}{preview.schemaVersion !== undefined ? `  ·  rvSchemaVersion ${preview.schemaVersion}` : ''}
         </Typography>
@@ -297,7 +337,7 @@ export function DocumentApplyDialog({ exp, preview, onClose, onMessage }: Docume
             onClick={() => { void commit(); }}
             sx={{ textTransform: 'none' }}
           >
-            {committing ? 'Applying…' : blocked === 'extras-wipe' ? 'Apply anyway' : 'Apply'}
+            {committing ? 'Applying…' : blocked === 'extras-wipe' || preview.extrasLost.length > 0 ? 'Apply and remove missing data' : 'Apply data'}
           </Button>
         )}
       </DialogActions>

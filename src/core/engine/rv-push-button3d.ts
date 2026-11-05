@@ -20,7 +20,7 @@ import {
 } from './rv-component-registry';
 import type { RVSceneButtonBase } from './rv-scene-button-base';
 import { RVSceneButtonWrapper } from './rv-scene-button-wrapper';
-import { wireValueSignal } from './rv-signal-wiring';
+import { wireDisplaySignal } from './rv-signal-wiring';
 import { slotBound } from './rv-slot-io';
 
 /** Browser runtime counterpart of Unity's PushButton3D component. */
@@ -53,7 +53,7 @@ export class RVPushButton3D extends RVSceneButtonWrapper {
     // re-confirms the lamp state the PLC still holds. Unwired, the slot is
     // bound directly (SlotIO): binding takes the light away from the button
     // state, neutralize hands it back — `autoLight` is re-evaluated per call.
-    this._unsubLight = wireValueSignal(ctx.signalStore, address, (value) => {
+    this._unsubLight = wireDisplaySignal(ctx.signalStore, address, (value) => {
       const bound = slotBound(this, 'lightSignal', address);
       base.autoLight = !bound;
       base.setLight(bound ? Boolean(value) : base.active);

@@ -171,7 +171,7 @@ export const MOVED_TOOLS: readonly MovedTool[] = [
   { tool: 'web_part_lookup', movedTo: ['part.lookup'], door: 'web_query', example: 'web_query("part.lookup", {"name":"DFM-6-5"})' },
   { tool: 'web_prompt_list', movedTo: ['prompt.list'], door: 'web_query', example: 'web_query("prompt.list", {"includeClaimed":false})' },
 ];
-export const MOVED_TOOLS_REMOVE_AT = '6.7.0';
+export const MOVED_TOOLS_REMOVE_AT = '6.8.0';
 
 export function movedToolSchemas(table: readonly MovedTool[] = MOVED_TOOLS): ToolSchema[] {
   return table.map((m) => ({

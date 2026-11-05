@@ -56,7 +56,7 @@ import { NodeRegistry } from './rv-node-registry';
 import { resolveReferencePath, scopeOf } from './rv-reference-resolver';
 import { reportOverrideOrphaned, reportOverrideTransformsDropped } from '../hmi/problems-store';
 import { classifyShadows } from './rv-mesh-classifier';
-import { isPickableMesh } from './rv-pick-utils';
+import { faceMaterial, isPickableMesh, materialBlocks } from './rv-pick-utils';
 import { isSegmentOnly, nodeTableBytes, pickStructureBytes, segmentBoxUnion, segmentRange, type ChunkRange } from './rv-pick-structure';
 import { installPickRaycast } from './rv-pick-backend';
 import { RAYCAST_BLOCKED } from './rv-raycast-manager';
@@ -647,14 +647,16 @@ export class BakeRegistry implements ChunkHighlightSource {
    *
    * `ownerOrdinal` is the hit segment's `segOwner` — the pre-order ordinal of the
    * segment's pick owner, or -1 when the triangles belong to geometry with no
-   * pickable node at all. Allocation-free, one array index and one map lookup;
+   * pickable node at all; `faceIndex` picks a keep mesh's face material.
+   * Allocation-free, one array index and one map lookup;
    * no binary search and no window table any more.
    *
    * The three answers:
    *  - a NODE: the instance node of the owner (the template itself for an
    *    identity placement);
    *  - {@link RAYCAST_BLOCKED}: an IDENTITY placement hit an unowned face of an
-   *    OPAQUE chunk — real geometry that occludes but selects nothing (plan Q5);
+   *    OPAQUE chunk, or an ownerless opaque keep mesh — real geometry that
+   *    occludes but selects nothing (plan Q5);
    *  - `null`: not our mesh, or an unowned face of a TRANSPARENT chunk (the ray
    *    passes on, which is what keeps a guard behind safety glass selectable).
    *
@@ -663,7 +665,7 @@ export class BakeRegistry implements ChunkHighlightSource {
    * stay selectable as a whole, including a saved placement reloaded through a
    * forced split at its `PlacementMeta` root (plan-753 Phase 4b).
    */
-  resolveHit(mesh: Object3D, ownerOrdinal: number): Object3D | null | typeof RAYCAST_BLOCKED {
+  resolveHit(mesh: Object3D, ownerOrdinal: number, faceIndex = -1): Object3D | null | typeof RAYCAST_BLOCKED {
     const inst = this._byMesh.get(mesh);
     if (!inst) return null;
     const chunk = inst.chunkOf.get(mesh as Mesh);
@@ -678,13 +680,15 @@ export class BakeRegistry implements ChunkHighlightSource {
       return inst.nodeOf.get(template) ?? inst.root;
     }
     // keep mesh: nearest pickable ancestor-or-self inside the instance
-    // (identity: none → transparent, same rule as above — except under a
-    // loaded placement root, which resolves like a session placement).
+    // (identity: none → as an unowned chunk face — except under a loaded
+    // placement root, which resolves like a session placement).
     for (let c: Object3D | null = mesh; c && c !== inst.root; c = c.parent) {
       if (pickModeOf(c) !== 'none') return c;
       if (inst.identity && getPlacementMeta(c)) return c;
     }
-    return inst.identity ? null : inst.root;
+    if (!inst.identity) return inst.root;
+    const m = mesh as Mesh;
+    return materialBlocks(faceMaterial(m.material, m.geometry.groups, faceIndex)) ? RAYCAST_BLOCKED : null;
   }
 
   // ─── Highlight seam ────────────────────────────────────────────────

@@ -34,6 +34,9 @@ import { isActiveForState, type ActiveOnly } from './rv-active-only';
 
 /** Slice of RVDrivesPlayback the pipeline drives. */
 export interface PlaybackLike {
+  stop?(): void;
+  readonly hasRecording?: boolean;
+  readonly hasPendingWork?: boolean;
   readonly isPlaying: boolean;
   readonly activeOnly: ActiveOnly;
   syncLiveControl(): void;
@@ -42,6 +45,13 @@ export interface PlaybackLike {
 
 /** Slice of RVLogicEngine the pipeline drives. */
 export interface LogicEngineLike {
+  readonly isStarted?: boolean;
+  reset?(): void;
+  resetOwnedOutputs?(): unknown;
+  start?(connected?: boolean): void;
+  readonly roots?: readonly unknown[];
+  isRunning?(): boolean;
+  commandedDrives?(): readonly object[];
   snapshotBlockerReason?(): string | null;
   /** Names of the root containers that exist and are active for the current connection state (DES batch guard). */
   batchPresence?(): string[];
@@ -54,6 +64,9 @@ export interface LogicEngineLike {
 
 /** Slice of RVIKPath the pipeline drives. */
 export interface IKPathLike {
+  reset?(): void;
+  readonly hasPendingWork?: boolean;
+  readonly robot?: { getAxisDrives(): readonly object[] } | null;
   readonly PathIsActive?: boolean;
   readonly node?: { readonly name: string };
   fixedUpdate(dt: number): void;
@@ -61,6 +74,8 @@ export interface IKPathLike {
 
 /** Slice of RVReplayRecording the pipeline drives. */
 export interface ReplayRecordingLike {
+  reset?(): void;
+  readonly waitingForStart?: boolean;
   readonly isActive?: boolean;
   readonly activeOnly: ActiveOnly;
   fixedUpdate(dt: number): void;
@@ -68,6 +83,11 @@ export interface ReplayRecordingLike {
 
 /** Slice of RVDrive the pipeline drives (motion + dirty-flag inputs). */
 export interface DriveLike {
+  reset?(): void;
+  readonly isAtTarget?: boolean;
+  readonly Behaviors?: readonly string[];
+  readonly BehaviorExtras?: Readonly<Record<string, unknown>>;
+  readonly driveBehaviors?: readonly { readonly cycleAlive?: boolean }[];
   readonly isRunning: boolean;
   readonly positionOverwrite: boolean;
   readonly jogForward: boolean;
@@ -111,7 +131,8 @@ export interface CoreSubsystemsHost {
    *
    *  OPTIONAL like `machiningManager`: hosts without interactive buttons (the
    *  embed runtime, unit-test fakes) simply omit it. */
-  readonly sceneButtonManager?: { update(dt: number): boolean } | null;
+  readonly sceneButtonManager?: import('./rv-scene-button-manager').SceneButtonManager | { update(dt: number): boolean; resetAll?(): void } | null;
+  readonly signalReapply?: { reapplyAll(): void };
   /** EnergyChain bone update. A true return means BOTH render and shadow dirty. */
   readonly energyChainManager: { update(dt: number): boolean } | null;
   /** Chain element poses (plan-733). A true return means BOTH render and shadow
@@ -162,6 +183,9 @@ export class CoreSubsystems {
   private readonly host: CoreSubsystemsHost;
   /** Last-seen MU count for the spawn/despawn dirty diff (was RVViewer._prevMuCount). */
   private _prevMuCount = 0;
+  get desHost(): CoreSubsystemsHost { return this.host; }
+
+  motion(dt: number): void { this.motionStage(dt, true); }
 
   private readonly offSnapshotBlocker: (() => void) | null;
   dispose(): void { this.offSnapshotBlocker?.(); }
@@ -199,12 +223,16 @@ export class CoreSubsystems {
    * flush incoming PLC signals there), exactly as the legacy fixedUpdate did.
    */
   early(dt: number): void {
+    this.motionStage(dt, false);
+  }
+
+  private motionStage(dt: number, cycle: boolean): void {
     const h = this.host;
     const isConnected = h.isConnected;
 
     h.playback?.syncLiveControl();
     // Recording playback — guarded by DrivesRecorder.Active
-    if (h.playback && h.playback.isPlaying && isActiveForState(h.playback.activeOnly, isConnected)) {
+    if (h.playback && (h.playback.isPlaying || cycle && h.playback.hasPendingWork) && isActiveForState(h.playback.activeOnly, isConnected)) {
       h.playback.update(dt);
     }
 
@@ -213,7 +241,7 @@ export class CoreSubsystems {
     // independently of the engine-wide guard — a closed guard must not hide a
     // transition. Only the tick itself is guarded.
     const logic = h.logicEngine;
-    if (logic) {
+    if (logic && !cycle) {
       logic.updateConnection?.(isConnected);
       if (isActiveForState(logic.activeOnly, isConnected)) logic.fixedUpdate(dt);
     }
@@ -238,10 +266,11 @@ export class CoreSubsystems {
    * sorted) plus the render/shadow dirty flags and the MU-count spawn/despawn
    * diff. Runs at the head of the executor `tick`, BEFORE transport.
    */
-  drives(dt: number): void {
+  drives(dt: number, skip?: (drive: DriveLike) => boolean): void {
     const h = this.host;
 
     for (const drive of h.drives) {
+      if (skip?.(drive)) continue;
       drive.update(dt);
       // `claimedMoveThisTick`: a behavior (Drive_FollowPosition) wrote the
       // position without arming physics — only true on ticks where it moved.

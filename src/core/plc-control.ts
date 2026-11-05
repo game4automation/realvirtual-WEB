@@ -103,6 +103,8 @@ export interface PlcProgramInfo {
   order: number;
   /** True for the program the editor and the single-program API (getPlcControl) address. */
   selected: boolean;
+  /** Blocking DES findings of the deployed code. */
+  desBlocking: number;
   state: PlcRunState;
   scanTimeMs: number;
   lastError: string | null;

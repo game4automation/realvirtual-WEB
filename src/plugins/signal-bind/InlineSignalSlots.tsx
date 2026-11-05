@@ -63,6 +63,8 @@ import {
 import { createSignalBindingPersistence } from './signal-binding-persistence';
 import { emitSignalBindingApplied } from './binding-applied-pulse';
 import { mergeAppliedMappings } from './binding-inventory';
+import { enqueueBind, writeQueued } from '../../core/hmi/rv-bind-queue';
+import { getActiveEditTarget } from '../../core/hmi/rv-edit-target';
 import { bindWithUnitScale, getBindPendingVersion, isBindPending, subscribeBindPending } from './unit-scale';
 import {
   findSignalBindTarget,
@@ -188,11 +190,14 @@ function BindableSlotRows({ viewer, target, buildRows, disabledReason }: {
   if (!mgr) return null;
   const targetId = signalBindTargetId(target);
 
-  const persist = (next: import('../layout-planner/rv-layout-store').SignalMapping[]): void => {
+  // Queued like every bind (plan-2233); `change` reads the mappings INSIDE the queue job.
+  type M = ReturnType<typeof persistence.read>;
+  const persist = (change: (m: M) => M): void => { const et = getActiveEditTarget(); void enqueueBind(et, async () => {
+    const next = change(persistence.read());
     const applied = mgr.applyMappings(targetId, target.node, next);
     // Broken links of the same target survive an unrelated change (plan-425).
-    persistence.write(mergeAppliedMappings(next, applied));
-  };
+    await writeQueued(persistence, et, mergeAppliedMappings(next, applied));
+  }); };
 
   const bindRow = (row: SlotRow, source: PickerSignal): void => {
     if (!upsertMappingForRow(persistence.read(), row, source)) return;
@@ -227,7 +232,7 @@ function BindableSlotRows({ viewer, target, buildRows, disabledReason }: {
           signals={signals}
           disabledReason={disabledReason ?? busyReason}
           onOpenPicker={(r, anchor) => setPicker({ key: slotRowKey(r), anchor })}
-          onUnbind={(r) => persist(removeMappingForRow(persistence.read(), r))}
+          onUnbind={(r) => persist((m) => removeMappingForRow(m, r))}
           onDropSignal={(r, source) => bindRow(r, source)}
         />
       ))}
@@ -355,7 +360,9 @@ export function ComponentSignalSlots({ viewer, signalStore, nodePath, componentT
       }
     }
     for (const row of bySlot.values()) ordered.push(row);
-    return ordered;
+    // plan-2233: a component may flag a slot (`slotIssue`).
+    const c = node?.userData._rvComponentInstance as { slotIssue?(f: string): string | null } | undefined;
+    return ordered.map((r) => { const i = c?.slotIssue?.(r.slot); return i ? { ...r, issue: i } : r; });
   };
 
   return (

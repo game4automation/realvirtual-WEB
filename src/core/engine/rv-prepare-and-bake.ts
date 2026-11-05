@@ -60,27 +60,10 @@ import { applyNamingScan } from './rv-naming-scan';
 import { relativeToRoot } from './rv-reference-resolver';
 import { RV_DRIVE_HOME_KEY, type DriveHomePose } from './rv-pre-bake-keys';
 import { debug } from './rv-debug';
-import { isSensorRuntimeVizName } from './rv-sensor-viz-names';
+import { stripPersistedSensorViz } from './rv-sensor-viz-names';
 import { getDecodeIdentity, type FileIdentity } from './rv-decode-identity';
 
-/**
- * Remove Sensor visualisation that a file saved before the `_sensorRay` export
- * prune carries (rv-sensor-viz-names.ts). It must go BEFORE the bake: a copy
- * that is no keep-mesh any more (`_sensorRay_1`) would otherwise be merged into
- * a chunk and stay on screen as authored geometry. Only extras-free leaves
- * match — a node with components is authored content whatever its name.
- */
-export function stripPersistedSensorViz(root: Object3D): number {
-  const stale: Object3D[] = [];
-  root.traverse((node) => {
-    if (node === root || node.children.length > 0) return;
-    if (node.userData?.realvirtual) return;
-    if (isSensorRuntimeVizName(node.name)) stale.push(node);
-  });
-  for (const node of stale) node.removeFromParent();
-  if (stale.length > 0) debug('loader', `[PreBake] removed ${stale.length} persisted sensor visualisation node(s)`);
-  return stale.length;
-}
+export { stripPersistedSensorViz };
 
 /** Everything the recipe needs beyond the tree — per-source data, never viewer state. */
 export interface PrepareAndBakeContext {
@@ -296,9 +279,9 @@ export async function prepareAndBake(tmp: Object3D, ctx: PrepareAndBakeContext):
   const rootNames = [tmp.name, renamedNodes.get(tmp)];
 
   // ── 1. names → extras (idempotent; the loader may have scanned already).
+  stripPersistedSensorViz(tmp); // before the scan - see the function
   applyNamingScan(tmp);
   applyAuthoredHidden(tmp);
-  stripPersistedSensorViz(tmp);
 
   // The document material index (plan-496), taken before ANYTHING touches the
   // tree: the dedup and uber passes of step 4 replace materials and rename the

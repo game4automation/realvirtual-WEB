@@ -3,43 +3,51 @@
 
 /**
  * rv-collision-manager.ts — viewer-owned collision detection with preset roles
- * (plan-394).
+ * (plan-394), on the plan-756 pick structure since plan-781. Part of the
+ * on-demand feature `collision` (plan-781 F21): only `features/collision.body.ts`
+ * value-imports this module; startup code holds `rv-collision-slot.ts` instead.
  *
  * While the simulation runs, every pair of collision bodies with DIFFERENT
- * roles is checked once per sim tick:
+ * roles is checked once per sim tick — but only when one of its bodies MOVED:
  *
- *   1. **Body bounds** — the world AABB of a body is re-unioned EVERY tick from
- *      `localBox.applyMatrix4(mesh.matrixWorld)` over all its meshes. That is
- *      the only form that stays correct under rotation, non-uniform scale AND
- *      articulation (a robot arm extending). A cached half-size (`AABB.fromNode`)
- *      would freeze the build pose and silently drop real collisions.
- *   2. **Broadphase** — `Box3.intersectsBox` over a pair list precomputed at
- *      rebuild time, so the role filter costs nothing per tick.
- *   3. **Narrowphase** — `bvhcast` with an `intersectsTriangles` callback over
- *      the per-mesh `geometry.boundsTree`. NOT `intersectsRanges`: a `true`
- *      from that callback SKIPS the triangle iteration entirely, which would
- *      silently degrade the whole feature to a finer bounding-box test.
+ *   1. **Bodies** — a body is the role node's segment ranges in every chunk plus
+ *      the kept meshes of its subtree (`rv-collision-bodies.ts`); an MU body is
+ *      its clone meshes or its instance slot. A static role node collides after
+ *      the destructive bake because its triangles are found where the bake put
+ *      them (the plan-394 "meshes under the node" rule found nothing there).
+ *   2. **Fresh poses + motion stamps** — every part's matrix chain is refreshed
+ *      at the head of the check (the render refreshes `matrixWorld` only later,
+ *      F16) and compared with the last seen one (16 floats, F5). Its world box
+ *      is re-derived only when it moved.
+ *   3. **Broadphase** — a pair list precomputed at rebuild (roles differ, not
+ *      nested) and a world-box test; MU × node pairs additionally through the
+ *      transport's MU grid (`queryMUsXZ`, F9).
+ *   4. **Narrowphase** — the exact walk of `rv-collision-narrowphase.ts` over
+ *      the parts' pick structures with the touch-tolerant triangle test
+ *      (`rv-collision-tri-tri.ts`). Touching is no collision (F3).
+ *
+ * Pair states (F6/F7/F17): `Unknown` → first evaluation → `Armed` (apart) or
+ * `Baseline` (overlapping: quiet until the pair has been apart once, then
+ * `Armed`). A Baseline pair whose bodies cannot move and did not move is
+ * `authoredStill` — listed in Problems, never an alarm. `Armed` + hit LATCHES:
+ * card + outline + signals, until the pair's TYPE is ignored, its card is
+ * acknowledged, a `ResetCollisions` edge arrives or the model changes (user
+ * decisions 2026-08-07). States survive a rebuild by `pairKey`.
  *
  * Hard rules:
- * - The merged pick geometries of the batched render pipeline are never touched
- *   (see contract-bake-picking.md) — only per-mesh `boundsTree`s.
- * - The simulation is never stopped or paused. A hit outlines the involved
- *   nodes (OutlinePass status channel — the error-message silhouette) and adds
- *   a card in the right-side messages panel. Both LATCH: they stay after the
- *   geometry separates, until the pair's TYPE is ignored from its card, a
- *   `ResetCollisions` edge arrives, or the model changes (user decisions
- *   2026-08-07; the original acknowledge-modal is gone).
+ * - Collision READS the pick structure and builds none of its own (contract
+ *   bake-picking rule 15 as ruled by Vincent, 2026-11-05; rules 10/11: no index
+ *   rewrite, no dispose). The guard is `rv-collision-no-structure.node.test.ts`.
+ * - The simulation is never stopped or paused.
  * - A body is never checked against a body nested inside it (a robot against
- *   its own gripper always touches at the flange).
- * - No OWN allocation in the hot path. `bvhcast` itself allocates closures per
- *   call upstream; that cost is inside the measured tick budget, not denied.
+ *   its own gripper always touches at the flange, F16).
+ * - Mutations that arrive during a check (`simulation-reset`, MU removal,
+ *   invalidate) are flags or queue entries applied at the next tick head (F18).
+ * - No allocation in the tick.
  */
 
 import { Box3, Matrix4 } from 'three';
-import type { BufferGeometry, Mesh, Object3D } from 'three';
-import { MeshBVH } from 'three-mesh-bvh';
-import type { ExtendedTriangle } from 'three-mesh-bvh';
-import { chunkMetaOf } from './rv-bake-chunk';
+import type { Object3D } from 'three';
 import { NodeRegistry } from './rv-node-registry';
 import type { CollisionRoleName, CollisionRoleRegistrar, StockBoundsSource } from './rv-collision-role';
 import { toCollisionRole } from './rv-collision-role';
@@ -50,7 +58,22 @@ import type { SignalStore } from './rv-signal-store';
 import { createSignalWriter, type SignalWriter } from './rv-signal-store';
 import type { CollisionPairView } from '../hmi/collision-alert-store';
 import { publishCollisionAlert } from '../hmi/collision-alert-store';
+import {
+  COLLISION_AUTHORED_OVERLAP_CODE, COLLISION_START_OVERLAP_CODE, clearCollisionOverlapProblems,
+  reportCollisionOverlaps, type CollisionOverlapPair,
+} from '../hmi/problems-store';
 import { debug } from './rv-debug';
+import {
+  createBodyBuildStats, freshWorldMatrix, partVisible, refreshPartPose, resolveMUParts, resolveNodeParts, stampMotion,
+  updatePartWorldBox, type BodyBuildStats, type BodyPart, type CollisionGeometrySource,
+} from './rv-collision-bodies';
+import {
+  createNarrowCounters, createNarrowWitness, partsOverlap, resetNarrowCounters,
+  type NarrowCounters, type NarrowWitness,
+} from './rv-collision-narrowphase';
+import { touchEpsFor } from './rv-collision-tri-tri';
+
+export type { BodyPart, CollisionGeometrySource } from './rv-collision-bodies';
 
 // ─── Signal names ────────────────────────────────────────────────────────
 
@@ -60,98 +83,69 @@ export const SIGNAL_RESET_COLLISIONS = 'ResetCollisions';
 /** Synthetic path prefix (same idea as the interface layer's `__iface__/`). */
 const SIGNAL_PATH_PREFIX = '__collision__';
 
+/**
+ * Near-miss margin in metres. 0 = contact only (Vincent, 2026-11-05). A module
+ * constant, not a schema field: it becomes a property (mm, number editor) with
+ * the later near-miss plan (contract component-model 3/7).
+ */
+export const MARGIN_M = 0;
 
-// ─── Narrowphase ─────────────────────────────────────────────────────────
+/** MU × node pairs of one node body below this count skip the grid query. */
+const GRID_MIN_PAIRS = 8;
+/** XZ slack of the grid query (m) — the MU grid tracks the transport AABB. */
+const GRID_SLACK_M = 0.05;
 
-/** Module scratch — `meshesIntersect` is called from a single-threaded tick. */
-const _castMat = new Matrix4();
-/** Module scratch for the per-tick stock box (plan-409 F4) — same reasoning. */
+/** Module scratch for the per-tick stock box (plan-409 F4). */
 const _stockBox = new Box3();
-
-/**
- * Triangle-pair callback. Returning `true` ends the cast immediately
- * (MeshBVH.js:530-533) — that early exit is what keeps the narrowphase cheap.
- */
-function trianglesHit(t1: ExtendedTriangle, t2: ExtendedTriangle): boolean {
-  return t1.intersectsTriangle(t2);
-}
-
-/**
- * Callback options built ONCE. A `{ intersectsTriangles }` object literal at
- * the call site would be one allocation per mesh pair per tick.
- *
- * `intersectsTriangles` is mandatory here: `intersectsRanges` returning `true`
- * makes MeshBVH skip `iterateOverDoubleTriangles` (MeshBVH.js:544-557), i.e. it
- * would never compare a single triangle.
- */
-const CAST_OPTS = { intersectsTriangles: trianglesHit } as const;
-
-/**
- * Exact triangle-against-triangle test between two meshes in world space.
- *
- * Meshes without a `boundsTree` (batched-render sources, freshly created
- * geometry) return `true`: the caller only ever gets here after the world boxes
- * already overlapped, and reporting a possible hit beats missing one.
- */
-export function meshesIntersect(a: Mesh, b: Mesh): boolean {
-  const ba = (a.geometry as BufferGeometry).boundsTree as MeshBVH | undefined;
-  const bb = (b.geometry as BufferGeometry).boundsTree as MeshBVH | undefined;
-  if (!ba || !bb) return true;
-  // matrixToLocal maps b's BVH-local frame into a's BVH-local frame — not the
-  // other way round, and not world space. A flipped matrix silently produces
-  // wrong results (guarded by the rotation test in rv-collision-narrowphase).
-  _castMat.copy(a.matrixWorld).invert().multiply(b.matrixWorld);
-  return ba.bvhcast(bb, _castMat, CAST_OPTS);
-}
+const _stockMatrix = new Matrix4();
 
 // ─── Data model ──────────────────────────────────────────────────────────
-
-/** One participating mesh of a body. `localBox` is cached once per rebuild. */
-export interface BodyMesh {
-  readonly mesh: Mesh;
-  /** `geometry.boundingBox`, computed once. Never mutated. */
-  readonly localBox: Box3;
-  /** Ancestor chain up to the scene root — read-only visibility input (F6). */
-  readonly ancestors: readonly Object3D[];
-  /** Per-tick world box. Pre-allocated. */
-  readonly worldBox: Box3;
-  /** Per-tick: does this mesh take part in this tick's check? */
-  visibleThisTick: boolean;
-}
 
 /** An MU accessor plus the per-instance AABB both MU classes carry. */
 export type CollisionMU = IMUAccessor & { readonly aabb: AABB; readonly node: Object3D };
 
+/** Pair states (plan-781 §2.3). Plain numbers — no cross-module const enum. */
+export const PairState = { Unknown: 0, Baseline: 1, Armed: 2 } as const;
+export type PairStateValue = (typeof PairState)[keyof typeof PairState];
+
 export interface CollisionBody {
   /** Node body: the role-carrying node. MU body: the MU's node (shared for
-   *  instanced MUs — never used for bounds, only for the highlight of clones). */
+   *  instanced MUs — used only for the highlight of clones). */
   readonly root: Object3D;
   readonly role: CollisionRoleName;   // never 'None'
   /** Stable identity across rebuilds — node path, or `mu:<id>` for MUs. */
   readonly key: string;
-  /** Display name for the modal. */
+  /** Display name for the card. */
   readonly label: string;
   readonly kind: 'node' | 'mu';
-  /** Only for `kind === 'node'` (and clone MUs, which can use the exact path). */
-  readonly meshes: BodyMesh[];
-  /** Only for `kind === 'mu'`: the per-instance AABB the transport system keeps
-   *  current. An instanced MU shares `node.matrixWorld` with its whole pool, so
-   *  a matrix-derived box would put every instance in the same place (§2.8). */
+  /** The geometric pieces (chunk ranges, keep meshes, MU instance). May be empty. */
+  readonly parts: BodyPart[];
+  /** Only for `kind === 'mu'`. */
   readonly mu: CollisionMU | null;
-  /** Per-tick union box. Pre-allocated. */
+  /** Per-tick union box of the visible parts (and a live stock box). */
   readonly worldBox: Box3;
-  /** True when the check must stop after the box (no usable BVH). Per TICK:
-   *  a stock box standing in for hidden meshes raises it on top of
-   *  {@link baseAabbOnly} and lowers it again when the stock box goes away. */
-  aabbOnly: boolean;
-  /** `aabbOnly` as determined at REBUILD time (missing BVHs, instanced MU).
-   *  The per-tick flag never drops below this. */
-  readonly baseAabbOnly: boolean;
-  /** Live stock-extent providers found in this body's subtree (plan-409 F4).
-   *  Empty for every body without a `MachiningVolume`. */
+  /** Live stock-extent providers found in this body's subtree (plan-409 F4). */
   readonly stockSources: StockBoundsSource[];
   /** Bodies whose subtree contains this body — the F16 skip set. */
   readonly ancestorBodies: Set<CollisionBody>;
+  /** Some part can move on its own (mover chunk, keep mesh under a mover, MU). */
+  readonly mobile: boolean;
+  /** This tick: a part moved, became (in)visible, or the stock box changed. */
+  moved: boolean;
+  /**
+   * This tick: a live stock box stands in for the hidden workpiece (plan-409
+   * F4). A box has no triangles, so a pair with this body stops after the box
+   * test — the one box-only case that remains.
+   */
+  stockActive: boolean;
+  /** @internal Index in `bodies` (swap-and-pop of MU bodies). */
+  _index: number;
+  /** @internal Every pair record this body takes part in. */
+  readonly _pairs: PairRecord[];
+  /** @internal Node bodies: the MU × node pairs, grid-filtered per tick. */
+  readonly _muPairs: PairRecord[];
+  /** @internal Last stock world box (6) + presence in [6]. */
+  readonly _stockPrev: Float64Array;
 }
 
 /** Index pair into a body array. */
@@ -159,19 +153,36 @@ export interface CrossPair {
   readonly i: number;
   readonly j: number;
   /**
-   * Normalized body-pair key, PRECOMPUTED at rebuild (plan-409 F7). The tick
-   * loop must be able to ask "is this pair suppressed?" with a plain `Set.has`
-   * — building the key there would be one string allocation per pair per tick.
-   * Same format as {@link RVCollisionManager.acknowledge}, so the suppression
-   * set and the latched-pair map share one key space.
+   * Normalized body-pair key, PRECOMPUTED at rebuild (plan-409 F7). Same format
+   * as {@link RVCollisionManager.acknowledge}, so the suppression set, the
+   * latched-pair map and the pair state share one key space.
    */
   readonly pairKey: string;
 }
 
-/** A currently intersecting pair: display view + the highlight roots that
- *  belong to it, so the aux set can be re-derived when pairs come and go.
- *  Roots are `null` for instanced MUs (highlighting the pool mesh would light
- *  up every instance). */
+/** A checked pair with its state. Lives in the pair list; never allocated in the tick. */
+interface PairRecord extends CrossPair {
+  i: number;
+  j: number;
+  /** Index in `_pairs`. */
+  slot: number;
+  state: PairStateValue;
+  /** Baseline because two still bodies overlap (F6). */
+  authoredStill: boolean;
+  /** Result of the last evaluation. */
+  lastHit: boolean;
+  /** Evaluate at the next tick even without motion (rebuild, reset, ack, unmute). */
+  retest: boolean;
+  /** MU × node pair: the node body (grid prefilter), else null. */
+  muNode: CollisionBody | null;
+  /** MU × node pair: the MU body. */
+  muBody: CollisionBody | null;
+  readonly witness: NarrowWitness;
+  witnessA: number;
+  witnessB: number;
+}
+
+/** A currently latched pair: display view + the highlight roots that belong to it. */
 interface ActivePair {
   readonly view: CollisionPairView;
   readonly aRoot: Object3D | null;
@@ -188,24 +199,18 @@ export interface PairableBody {
 
 /** Separator of {@link bodyPairKey} — a character no node path can contain. */
 const KEY_SEP = String.fromCharCode(0);
+/** Body key prefix of an MU body (`mu:<id>`). */
+const MU_KEY_PREFIX = 'mu:';
 
-/**
- * Normalized key for a pair of body keys — order-independent, so the tick
- * loop, the latched-pair map, `acknowledge()` and the machining suppression all
- * address the same pair with the same string.
- */
+/** Normalized, order-independent key for a pair of body keys. */
 export function bodyPairKey(aKey: string, bKey: string): string {
   return aKey < bKey ? aKey + KEY_SEP + bKey : bKey + KEY_SEP + aKey;
 }
 
 /**
- * Precompute the checked pairs. TWO conditions, not one:
+ * Precompute the checked pairs. TWO conditions:
  *   - different roles (identical roles never collide, `None` never collides), and
  *   - not related (a body inside another body's subtree — F16).
- *
- * Without the second condition every robot with a gripper reports the
- * design-inherent flange contact from the very first tick, and the plan
- * deliberately has neither a baseline nor exclusion pairs to switch that off.
  */
 export function buildCrossPairs(bodies: readonly PairableBody[]): CrossPair[] {
   const pairs: CrossPair[] = [];
@@ -214,28 +219,25 @@ export function buildCrossPairs(bodies: readonly PairableBody[]): CrossPair[] {
     if (a.role === 'None') continue;
     for (let j = i + 1; j < bodies.length; j++) {
       const b = bodies[j];
-      if (b.role === 'None') continue;
-      if (a.role === b.role) continue;
-      if (a.ancestorBodies?.has(b)) continue;
-      if (b.ancestorBodies?.has(a)) continue;
+      if (!isPairable(a, b)) continue;
       // plan-409 F7: the key is built HERE, once per rebuild, never in the tick.
-      // Bodies without a key (the unit-test shape) fall back to their indices —
-      // stable within one call, which is all those tests need.
       pairs.push({ i, j, pairKey: bodyPairKey(a.key ?? `#${i}`, b.key ?? `#${j}`) });
     }
   }
   return pairs;
 }
 
+function isPairable(a: PairableBody, b: PairableBody): boolean {
+  if (a.role === 'None' || b.role === 'None') return false;
+  if (a.role === b.role) return false;
+  if (a.ancestorBodies?.has(b)) return false;
+  if (b.ancestorBodies?.has(a)) return false;
+  return true;
+}
+
 // ─── Hosts (narrow seams, no hard viewer dependency) ─────────────────────
 
-/**
- * Highlight seam. The production host (wired in RVViewer) drives the
- * OutlinePass STATUS channel via `showStatusOutline` / `hideStatusOutline` —
- * the same pulsing severity silhouette the error-message system uses (user
- * decision 2026-08-07: "highlighted with the same outline like error
- * message"). Tests inject a recording fake.
- */
+/** Highlight seam (OutlinePass STATUS channel in production, a fake in tests). */
 export interface CollisionHighlightHost {
   /** Show the collision outline on `roots` (replaces the previous set). */
   showCollision(roots: readonly Object3D[]): void;
@@ -247,49 +249,26 @@ export interface CollisionHighlightHost {
 export type CollisionSignalHost = Pick<SignalStore, 'register' | 'get' | 'set' | 'subscribe'>
   & Partial<Pick<SignalStore, 'createWriter'>>;
 
-// ─── Deformed-geometry detection (F17) ───────────────────────────────────
-
-/**
- * True for geometry whose cached `localBox` would be a lie: skinned meshes
- * (the viewer builds them for energy chains), morph-target animation, and
- * anything explicitly excluded from the BVH build (`_rvSkipBVH`, i.e. batched
- * render sources). Such meshes are left out of every body — a named blind spot,
- * not a silent wrong answer.
- */
-function isDeformedMesh(mesh: Mesh): boolean {
-  if ((mesh as unknown as { isSkinnedMesh?: boolean }).isSkinnedMesh) return true;
-  if (mesh.userData?._rvSkipBVH) return true;
-  const influences = mesh.morphTargetInfluences;
-  return Array.isArray(influences) && influences.length > 0;
+/** The transport's MU grid query (F9) — `RVTransportManager.queryMUsXZ`. */
+export interface CollisionMUQuery {
+  queryMUsXZ(min: ArrayLike<number>, max: ArrayLike<number>, out: IMUAccessor[]): number;
 }
 
-/**
- * Pipeline helper meshes are not machine geometry and never join a body:
- * pooled highlight overlays (`_highlightOverlay`, BVH-less wrappers).
- *
- * Chunk meshes are NOT helpers — since plan-754 they are the only carrier of
- * the geometry they absorbed, for the main model exactly as for a planner
- * placement. (Until Phase 1c the in-place bake duplicated masked source
- * meshes, and its chunks were excluded here via `_rvBakeInPlace`.)
- * The proxies are the treacherous
- * case: the collision highlight itself parents them into the hit body's
- * subtree, so the next rebuild would collect them and their missing
- * boundsTree drags the body to `aabbOnly` — a box-test feedback loop born
- * from the manager's own alarm.
- *
- * Machined CSG chunks (`_rvMachiningChunk`, plan-409 F3) are the same hazard by
- * a different route: they are created at RUNTIME and the BVH build ran once
- * after load, so not one of them will ever have a `boundsTree`. A single chunk
- * in a body degrades the ENTIRE workpiece body to a box test, for every pair.
- * The container subtree is already cut off in `collect()`; this is the
- * defensive second line for a chunk mesh that ends up somewhere else.
- */
-function isPipelineHelperMesh(mesh: Mesh): boolean {
-  const ud = mesh.userData as Record<string, unknown> | undefined;
-  if (!ud) return false;
-  // NOT `=== true`: the flag carries the chunk INDEX, and index 0 is falsy.
-  if (ud._rvMachiningChunk !== undefined) return true;
-  return ud._highlightOverlay === true;
+/** The viewer events the manager follows (wired per model, dropped by `clear()`). */
+export type CollisionViewerEvent =
+  | 'simulation-reset' | 'node-visibility-changed' | 'placements-materialized' | 'layout-content-added';
+
+/** `viewer.on` in the shape the manager needs: subscribe, get the unsubscribe back. */
+export type CollisionEventSubscriber = (event: CollisionViewerEvent, cb: () => void) => () => void;
+
+/** Work counters (tests, DevTools, the perf gate). Never required. */
+export interface CollisionCounters extends NarrowCounters {
+  /** Pairs that reached the world-box test. */
+  pairsEvaluated: number;
+  /** MU × node pairs skipped because the MU grid did not return the MU. */
+  gridSkipped: number;
+  /** Grid queries run. */
+  gridQueries: number;
 }
 
 /** Normalized role-pair key for the ignore set (order-independent). */
@@ -299,14 +278,7 @@ export function typeKey(roleA: string, roleB: string): string {
 
 // ─── Machining suppression (plan-409) ────────────────────────────────────
 
-/**
- * One (MachiningVolume, MachiningTool) pair as reported by the MachiningManager.
- *
- * `toolRoot`/`volumeRoot` are the COMPONENT nodes, not body roots — a body root
- * is resolved from them at every rebuild (nearest role-carrying ancestor,
- * including the node itself), because the authoring may put the role on the
- * machining node, on any ancestor of it, or not above it at all.
- */
+/** One (MachiningVolume, MachiningTool) pair as reported by the MachiningManager. */
 interface MachiningAssociation {
   readonly toolRoot: Object3D;
   readonly volumeRoot: Object3D;
@@ -314,11 +286,7 @@ interface MachiningAssociation {
   active: boolean;
 }
 
-/**
- * Bridge the MachiningManager holds to report its associations. Declared here
- * (not in the machining module) so the machining side depends on a three-method
- * interface instead of on the collision implementation.
- */
+/** Bridge the MachiningManager holds to report its associations. */
 export interface CollisionMachiningBridge {
   /** (Re-)declare an association and its current spindle state. Idempotent. */
   setMachiningAssociation(
@@ -327,6 +295,25 @@ export interface CollisionMachiningBridge {
   removeMachiningAssociation(assocKey: string): void;
   /** Force a body rebuild (grid attached/torn down changes the bounds source). */
   invalidate(): void;
+}
+
+/** Largest absolute coordinate of two boxes (F20 tolerance input). */
+function maxAbsOf(a: Box3, b: Box3): number {
+  let m = 0;
+  // Unrolled — no array in the tick.
+  let x = Math.abs(a.min.x); if (x > m) m = x;
+  x = Math.abs(a.min.y); if (x > m) m = x;
+  x = Math.abs(a.min.z); if (x > m) m = x;
+  x = Math.abs(a.max.x); if (x > m) m = x;
+  x = Math.abs(a.max.y); if (x > m) m = x;
+  x = Math.abs(a.max.z); if (x > m) m = x;
+  x = Math.abs(b.min.x); if (x > m) m = x;
+  x = Math.abs(b.min.y); if (x > m) m = x;
+  x = Math.abs(b.min.z); if (x > m) m = x;
+  x = Math.abs(b.max.x); if (x > m) m = x;
+  x = Math.abs(b.max.y); if (x > m) m = x;
+  x = Math.abs(b.max.z); if (x > m) m = x;
+  return m;
 }
 
 // ─── Manager ─────────────────────────────────────────────────────────────
@@ -338,43 +325,49 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
   /** Live stock-extent providers (plan-409 F4) — today only MachiningVolume. */
   private readonly _stockSources = new Set<StockBoundsSource>();
 
+  // ── Seams ──
+  private _source: CollisionGeometrySource | null = null;
+  private _muQuery: CollisionMUQuery | null = null;
+  private readonly _unsubs: Array<() => void> = [];
+
   // ── Built state ──
   private _bodies: CollisionBody[] = [];
-  private _pairs: CrossPair[] = [];
+  private _pairs: PairRecord[] = [];
   private _dirty = true;
   /** Body lookup by root node, rebuilt with the bodies (association resolution). */
   private readonly _bodyByRoot = new Map<Object3D, CollisionBody>();
+  private readonly _muBodyOf = new Map<CollisionMU, CollisionBody>();
+  /**
+   * Pair states by key across rebuilds (F17); cleared on model change and
+   * baseline reset. Entries naming an MU that no longer exists are pruned at the
+   * end of every rebuild — an MU id never returns, so its memory would only grow.
+   */
+  private readonly _pairMemory = new Map<string, { state: PairStateValue; authoredStill: boolean; lastHit: boolean }>();
 
-  // ── Active collisions (latched: a pair stays reported after separation,
-  //    until an ignore, a reset edge or a model change — user decision
-  //    2026-08-07: "why is it auto cleared?") ──
+  // ── Deferred mutations (F18) ──
+  private _inTick = false;
+  private _baselinePending = false;
+  private readonly _pendingSpawns = new Map<CollisionMU, CollisionRoleName>();
+  private readonly _pendingRemovals: CollisionMU[] = [];
+
+  // ── Latched collisions ──
   private readonly _active = new Map<string, ActivePair>();
   private readonly _activeRoots: Object3D[] = [];
 
-  /** Ignored collision TYPES (normalized role-pair keys, e.g.
-   *  `Tool|Workpiece`) — "ignore this type for the current run". Survives
-   *  reset(); wiped only on model change (clear()). */
+  /** Ignored collision TYPES (normalized role-pair keys). Survives reset(). */
   private readonly _ignoredTypes = new Set<string>();
 
-  /**
-   * Machining associations (plan-409 F5) — the SECOND, orthogonal muting
-   * system, deliberately not merged with `_ignoredTypes`:
-   *
-   * - `ignoreType` is a ROLE-pair decision the user takes in the UI, global for
-   *   the run: it would silence every cutter in every workpiece.
-   * - An association is a (volume, tool) fact the MachiningManager reports from
-   *   the authored machining configuration. Only the ONE body pair that is
-   *   actually cutting goes quiet, and only while its spindle runs.
-   *
-   * Keyed per association rather than per body pair so that two volumes sharing
-   * one tool (or one volume listing a tool twice) behave like a refcount: the
-   * pair stays muted until the LAST association on it goes inactive.
-   */
+  /** Machining associations (plan-409 F5) — the second, orthogonal muting system. */
   private readonly _assoc = new Map<string, MachiningAssociation>();
   /** Derived from `_assoc` — the tick loop's only suppression input (F7). */
   private _suppressedPairKeys = new Set<string>();
   /** Warn-once for the "role sits on a CHILD of the machining node" case. */
   private _warnedRoleCutoff = false;
+
+  // ── Problems (F6/F7): quiet start overlaps, once per load ──
+  private readonly _authored = new Map<string, CollisionOverlapPair & { nodePath?: string }>();
+  private readonly _start = new Map<string, CollisionOverlapPair & { nodePath?: string }>();
+  private _problemsDirty = false;
 
   // ── Hosts ──
   private _highlight: CollisionHighlightHost | null = null;
@@ -387,8 +380,20 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
   private _lastCount: number | null = null;
 
   // ── Warn-once per model load ──
-  private _warnedNoBVH = false;
   private _warnedDeformed = false;
+  private _warnedDynamic = false;
+  private _warnedInstanced = false;
+
+  // ── Scratch / counters ──
+  private readonly _counters: CollisionCounters = {
+    ...createNarrowCounters(), pairsEvaluated: 0, gridSkipped: 0, gridQueries: 0,
+  };
+  private readonly _gridOut: IMUAccessor[] = [];
+  private readonly _gridMin = new Float64Array(3);
+  private readonly _gridMax = new Float64Array(3);
+  private _gridStamp = 0;
+  private readonly _gridMark = new Map<CollisionBody, number>();
+  private readonly _scratchWitness = createNarrowWitness();
 
   // ─── Registration ──────────────────────────────────────────────────
 
@@ -422,22 +427,58 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
     return this._roles.get(node) ?? 'None';
   }
 
-  /** IMPLEMENTS IMULifecycleHook::onMUSpawned */
+  /**
+   * IMPLEMENTS IMULifecycleHook::onMUSpawned
+   *
+   * Incremental (F9): the MU's body and its pairs are added at the next tick
+   * head — no full rebuild.
+   */
   onMUSpawned(mu: IMUAccessor, role: CollisionRoleName | string | undefined): void {
     const parsed = toCollisionRole(role);
     if (parsed === 'None') return;
-    this._muRoles.set(mu as CollisionMU, parsed);
-    this._dirty = true;
+    const m = mu as CollisionMU;
+    const known = this._muRoles.get(m);
+    this._muRoles.set(m, parsed);
+    if (this._dirty) return;
+    if (known !== undefined && known !== parsed) { this._dirty = true; return; }
+    if (!this._muBodyOf.has(m)) this._pendingSpawns.set(m, parsed);
   }
 
-  /** IMPLEMENTS IMULifecycleHook::onMURemoved */
+  /**
+   * IMPLEMENTS IMULifecycleHook::onMURemoved
+   *
+   * Deferred (F18): the body and its pairs are dropped at the next tick head
+   * (swap-and-pop), never while the pair list is being iterated.
+   */
   onMURemoved(mu: IMUAccessor): void {
-    if (this._muRoles.delete(mu as CollisionMU)) this._dirty = true;
+    const m = mu as CollisionMU;
+    if (!this._muRoles.delete(m)) return;
+    if (this._pendingSpawns.delete(m)) return;
+    if (this._dirty) return;
+    if (this._muBodyOf.has(m)) this._pendingRemovals.push(m);
   }
 
-  /** Force a rebuild at the head of the next tick (F11). */
+  /**
+   * Force a rebuild at the head of the next tick (F11). Pair states survive it
+   * by `pairKey` (F17) — a grip/zone/hold re-parent never re-baselines a real
+   * contact.
+   */
   invalidate(): void {
     this._dirty = true;
+  }
+
+  /** Node visibility changed somewhere: hidden owners are re-split at the next tick head (F12). */
+  invalidateVisibility(): void {
+    this._dirty = true;
+  }
+
+  /**
+   * Take the start baseline again (`simulation-reset`, F7). Applied at the next
+   * tick head (F18): every pair goes back to `Unknown`, the start-overlap
+   * entry is withdrawn and re-derived by the next evaluation.
+   */
+  resetBaseline(): void {
+    this._baselinePending = true;
   }
 
   // ─── Host wiring ───────────────────────────────────────────────────
@@ -447,9 +488,46 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
   }
 
   /**
+   * Install the bake registry the bodies are resolved through (instance
+   * setter, never a module singleton). `null` = an unbaked context: bodies
+   * then consist of real meshes only.
+   */
+  setGeometrySource(source: CollisionGeometrySource | null): void {
+    if (this._source === source) return;
+    this._source = source;
+    this._dirty = true;
+  }
+
+  /** Install the transport's MU grid (F9); `null` = every MU is a candidate. */
+  setMUQuery(query: CollisionMUQuery | null): void {
+    this._muQuery = query;
+  }
+
+  /**
+   * Follow the viewer events of the current model (and the registry's
+   * placement release). All subscriptions are dropped by `clear()` / `dispose()`
+   * (contract plugins 4) — the viewer re-attaches per model.
+   */
+  attachEvents(subscribe: CollisionEventSubscriber | null): void {
+    this._dropSubscriptions();
+    if (subscribe) {
+      this._unsubs.push(subscribe('simulation-reset', () => this.resetBaseline()));
+      this._unsubs.push(subscribe('node-visibility-changed', () => this.invalidateVisibility()));
+      this._unsubs.push(subscribe('placements-materialized', () => this.invalidate()));
+      this._unsubs.push(subscribe('layout-content-added', () => this.invalidate()));
+    }
+    if (this._source) this._unsubs.push(this._source.onRelease(() => this.invalidate()));
+  }
+
+  private _dropSubscriptions(): void {
+    for (const off of this._unsubs.splice(0)) {
+      try { off(); } catch { /* a dead subscription must not break the teardown */ }
+    }
+  }
+
+  /**
    * Attach to a model's SignalStore: register the three signals and subscribe
-   * to the acknowledge edge. Detaches a previous store first, so a model switch
-   * never leaves a listener on a dead store.
+   * to the reset edge. Detaches a previous store first.
    */
   attachSignals(store: CollisionSignalHost | null): void {
     this._unsubReset?.();
@@ -477,7 +555,7 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
     this._writeSignals();
   }
 
-  // ─── Rebuild ───────────────────────────────────────────────────────
+  // ─── Read-outs ─────────────────────────────────────────────────────
 
   /** True when the next `update()` will rebuild first. */
   get isDirty(): boolean { return this._dirty; }
@@ -485,25 +563,58 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
   get bodies(): readonly CollisionBody[] { return this._bodies; }
   get pairs(): readonly CrossPair[] { return this._pairs; }
 
+  /** @internal Number of remembered pair states (F17) — the bounded-memory test reads it. */
+  get pairMemorySize(): number { return this._pairMemory.size; }
+
+  /** Work counters since the last {@link resetCounters}. */
+  get counters(): Readonly<CollisionCounters> { return this._counters; }
+
+  resetCounters(): void {
+    resetNarrowCounters(this._counters);
+    this._counters.pairsEvaluated = 0;
+    this._counters.gridSkipped = 0;
+    this._counters.gridQueries = 0;
+  }
+
+  /** The state of one pair (tests, diagnostics) — `null` when it is not checked. */
+  pairStateOf(aKey: string, bKey: string): { state: 'unknown' | 'baseline' | 'armed'; authoredStill: boolean } | null {
+    const key = bodyPairKey(aKey, bKey);
+    for (const p of this._pairs) {
+      if (p.pairKey !== key) continue;
+      const state = p.state === PairState.Unknown ? 'unknown' : p.state === PairState.Baseline ? 'baseline' : 'armed';
+      return { state, authoredStill: p.authoredStill };
+    }
+    return null;
+  }
+
+  // ─── Rebuild ───────────────────────────────────────────────────────
+
   /**
-   * Rebuild bodies + pair list. Runs at most once per tick, at the head, so a
-   * role change can never race a running check.
+   * Rebuild bodies + pair list. Runs lazily at the head of a tick, so a role
+   * change can never race a running check. Pair states survive by `pairKey`
+   * (F17); only NEW pairs start `Unknown`.
    */
   rebuild(): void {
     this._dirty = false;
-    this._bodies = [];
+    this._pendingSpawns.clear();
+    this._pendingRemovals.length = 0;
 
-    // Body roots first — needed as cut-off markers during the mesh collection.
-    const roots = new Map<Object3D, CollisionRoleName>();
-    for (const [node, role] of this._roles) {
-      if (role !== 'None') roots.set(node, role);
+    // F17: states survive by key — also for a pair that is absent for a while
+    // (a body hidden to zero parts), so its return is never a silent re-baseline.
+    const previous = this._pairMemory;
+    for (const p of this._pairs) {
+      previous.set(p.pairKey, { state: p.state, authoredStill: p.authoredStill, lastHit: p.lastHit });
     }
 
-    let deformedSkipped = 0;
-    let meshesWithoutBVH = 0;
+    this._bodies = [];
+    this._bodyByRoot.clear();
+    this._muBodyOf.clear();
+    const stats = createBodyBuildStats();
 
-    // Stock-extent providers by node, so `collect()` can attach them to the
-    // body that OWNS the volume node (plan-409 F4).
+    const roots: Object3D[] = [];
+    for (const [node, role] of this._roles) if (role !== 'None') roots.push(node);
+    const rootSet = new Set(roots);
+
     const stockByNode = new Map<Object3D, StockBoundsSource[]>();
     for (const src of this._stockSources) {
       const list = stockByNode.get(src.node);
@@ -511,233 +622,276 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
       else stockByNode.set(src.node, [src]);
     }
 
-    for (const [node, role] of roots) {
-      const meshes: BodyMesh[] = [];
-      const stockSources: StockBoundsSource[] = [];
-      let aabbOnly = false;
-      const collect = (obj: Object3D): void => {
-        // Cut-off: a nested node with its own role starts a body of its own —
-        // "the robot counts up to the gripper" (user decision 2026-08-06).
-        if (obj !== node && roots.has(obj)) return;
-        // Cut-off (plan-409 F3): the WHOLE `CsgChunks` container. Its meshes are
-        // created at runtime, long after the one-shot BVH build, so every one of
-        // them would raise `aabbOnly` for the entire workpiece body. Cutting the
-        // container (not just flagged meshes) also catches anything the render
-        // side may nest below it later.
-        if (obj.userData?._rvMachiningChunks === true) return;
-        const stock = stockByNode.get(obj);
-        if (stock) for (const s of stock) stockSources.push(s);
-        const mesh = obj as Mesh;
-        if (mesh.isMesh && mesh.geometry && !isPipelineHelperMesh(mesh)) {
-          if (isDeformedMesh(mesh)) {
-            deformedSkipped++;
-          } else {
-            const bm = this._makeBodyMesh(mesh);
-            if (!this._ensureBoundsTree(mesh)) {
-              meshesWithoutBVH++;
-              aabbOnly = true;
-            }
-            meshes.push(bm);
-          }
+    // Nodes that declared themselves a stock source keep their authored mesh
+    // although their component is `dynamicGeometry` (plan-781 review #1).
+    const stockNodes: ReadonlySet<Object3D> = new Set(stockByNode.keys());
+
+    for (const node of roots) {
+      // Role roots strictly below `node` — "the robot counts up to the gripper".
+      const nested: Object3D[] = [];
+      for (const other of roots) {
+        if (other === node) continue;
+        for (let p = other.parent; p; p = p.parent) {
+          if (p === node) { nested.push(other); break; }
         }
-        for (const child of obj.children) collect(child);
-      };
-      collect(node);
-
-      this._bodies.push({
-        root: node,
-        role,
-        key: NodeRegistry.computeNodePath(node),
-        label: node.name || NodeRegistry.computeNodePath(node),
-        kind: 'node',
-        meshes,
-        mu: null,
-        worldBox: new Box3(),
-        aabbOnly,
-        baseAabbOnly: aabbOnly,
-        stockSources,
-        ancestorBodies: new Set<CollisionBody>(),
-      });
+      }
+      const parts = resolveNodeParts(node, nested, this._source, stats, stockNodes);
+      const stockSources: StockBoundsSource[] = [];
+      if (stockByNode.size > 0) {
+        const walk = (obj: Object3D): void => {
+          if (obj !== node && rootSet.has(obj)) return;
+          if (obj.userData?._rvMachiningChunks === true) return;
+          const stock = stockByNode.get(obj);
+          if (stock) for (const s of stock) stockSources.push(s);
+          for (const child of obj.children) walk(child);
+        };
+        walk(node);
+      }
+      const key = NodeRegistry.computeNodePath(node);
+      const body = this._makeBody(node, this._roles.get(node)!, key, node.name || key, 'node', parts, null, stockSources);
+      this._bodies.push(body);
+      this._bodyByRoot.set(node, body);
     }
 
-    // MU bodies. The world box ALWAYS comes from the MU's own AABB — an
-    // instanced MU's `node` is the pool's shared InstancedMesh (§2.8).
     for (const [mu, role] of this._muRoles) {
-      const meshes: BodyMesh[] = [];
-      let aabbOnly = mu.isInstanced;
-      if (!mu.isInstanced) {
-        mu.node.traverse((obj) => {
-          const mesh = obj as Mesh;
-          if (!mesh.isMesh || !mesh.geometry) return;
-          if (isPipelineHelperMesh(mesh)) return;
-          if (isDeformedMesh(mesh)) { deformedSkipped++; return; }
-          if (!this._ensureBoundsTree(mesh)) {
-            meshesWithoutBVH++;
-            aabbOnly = true;
-          }
-          meshes.push(this._makeBodyMesh(mesh));
-        });
-        if (meshes.length === 0) aabbOnly = true;
+      const body = this._makeMUBody(mu, role, stats);
+      this._bodies.push(body);
+      this._muBodyOf.set(mu, body);
+    }
+
+    // Ancestor relation (F16) — a body inside another body's subtree. Node
+    // bodies only as ancestors; a gripped clone MU hangs under its gripper.
+    for (const body of this._bodies) this._fillAncestors(body);
+
+    this._pairs = [];
+    for (const p of buildCrossPairs(this._bodies)) {
+      const a = this._bodies[p.i];
+      const b = this._bodies[p.j];
+      if (this._ignoredTypes.has(typeKey(a.role, b.role))) continue;
+      if (!this._isPairCandidate(a) || !this._isPairCandidate(b)) continue;
+      const record = this._addPair(p.i, p.j, p.pairKey);
+      const prev = previous.get(p.pairKey);
+      if (prev) {
+        record.state = prev.state;
+        record.authoredStill = prev.authoredStill;
+        record.lastHit = prev.lastHit;
+        // The geometry may differ after a rebuild — evaluate once even without motion.
+        record.retest = true;
       }
-      this._bodies.push({
-        root: mu.node,
-        role,
-        key: `mu:${(mu as unknown as { id: number }).id}`,
-        label: mu.getName(),
-        kind: 'mu',
-        meshes,
-        mu,
-        worldBox: new Box3(),
-        aabbOnly,
-        baseAabbOnly: aabbOnly,
-        // An MU is never a machining stock — `MachiningVolume.tools` are scene
-        // components, never MUs (documented v1 limit).
-        stockSources: [],
-        ancestorBodies: new Set<CollisionBody>(),
-      });
     }
 
-    // Ancestor relation (F16) — a body inside another body's subtree.
-    const byRoot = new Map<Object3D, CollisionBody[]>();
-    for (const body of this._bodies) {
-      if (body.kind !== 'node') continue;
-      const list = byRoot.get(body.root);
-      if (list) list.push(body);
-      else byRoot.set(body.root, [body]);
-    }
-    for (const body of this._bodies) {
-      let p: Object3D | null = body.root.parent;
-      while (p) {
-        const owners = byRoot.get(p);
-        if (owners) for (const o of owners) body.ancestorBodies.add(o);
-        p = p.parent;
-      }
-      // An instanced MU shares its node with the whole pool; the pool mesh is
-      // never a body root, so this loop is a no-op for it.
-    }
-
-    this._pairs = buildCrossPairs(this._bodies).filter((pair) =>
-      !this._ignoredTypes.has(typeKey(this._bodies[pair.i].role, this._bodies[pair.j].role)));
-
-    // Body lookup for the machining-association resolution (plan-409 F5). Node
-    // bodies only — an association always names scene nodes.
-    this._bodyByRoot.clear();
-    for (const body of this._bodies) {
-      if (body.kind === 'node') this._bodyByRoot.set(body.root, body);
-    }
-    // Re-resolve EVERY association against the fresh bodies. The registry is
-    // deliberately independent of the body index, so a suppression reported
-    // before the bodies existed is never lost.
+    this._pruneMemory();
     this._recomputeSuppressedPairs();
-
-    if (meshesWithoutBVH > 0 && !this._warnedNoBVH) {
-      this._warnedNoBVH = true;
-      console.warn(
-        `[CollisionManager] ${meshesWithoutBVH} mesh(es) have no geometry.boundsTree — `
-        + 'those bodies fall back to a pure AABB check (no triangle precision).',
-      );
-    }
-    if (deformedSkipped > 0 && !this._warnedDeformed) {
-      this._warnedDeformed = true;
-      console.warn(
-        `[CollisionManager] ${deformedSkipped} deformed mesh(es) (SkinnedMesh / morph targets / `
-        + '_rvSkipBVH) are excluded from collision checking — their cached local box would be '
-        + 'the undeformed one. Energy chains are a known blind spot.',
-      );
-    }
+    this._warnExcluded(stats);
     debug('sensor', `[collision] rebuild: ${this._bodies.length} bodies, ${this._pairs.length} pairs`);
   }
 
   /**
-   * A `boundsTree` for a body mesh, built on the spot when the load pipeline
-   * left none. Returns whether the mesh now has one.
-   *
-   * Batched loads stopped producing per-mesh trees (the pick path raycasts
-   * merged pick meshes instead), so every role-carrying body fell
-   * to the AABB fallback — and a Workpiece INSIDE a Machine is a permanent
-   * box overlap: /demo showed a standing "Machine ↔ Workpiece" card the moment
-   * the robot loaded the CNC (2026-09-02). Bodies are few and hand-authored,
-   * so a synchronous build at rebuild time is cheap; the budget guards the one
-   * pathological case (a multi-million-triangle body), which then keeps the
-   * documented AABB fallback. Failures are remembered per geometry so a
-   * rebuild loop cannot retry a throwing build every tick.
+   * Drop remembered pair states of MUs that are gone (review #4). A NODE key is
+   * kept even while its body is absent (F17: a role node hidden to zero parts or
+   * re-registered must not come back as a silent re-baseline); the node keys of
+   * one model are bounded and dropped with the model. Rebuild-only — may allocate.
    */
-  private static readonly BVH_BUILD_TRIANGLE_BUDGET = 300_000;
-  private readonly _bvhBuildFailed = new WeakSet<BufferGeometry>();
-
-  private _ensureBoundsTree(mesh: Mesh): boolean {
-    const geo = mesh.geometry as BufferGeometry;
-    if (geo.boundsTree) return true;
-    if (this._bvhBuildFailed.has(geo)) return false;
-    const pos = geo.attributes?.position;
-    if (!pos) return false;
-    const triangles = (geo.index ? geo.index.count : pos.count) / 3;
-    if (triangles > RVCollisionManager.BVH_BUILD_TRIANGLE_BUDGET) {
-      this._bvhBuildFailed.add(geo);
-      return false;
-    }
-    try {
-      // plan-756 §2.4a.10 / R13: the DEFAULT MeshBVH build REORDERS the index in
-      // place. On a baked chunk that would scatter the pick structure's segments
-      // — the one thing nothing may do after the bake. An
-      // `indirect` tree keeps its own triangle order in a side array and leaves
-      // `geometry.index` untouched; the narrowphase only ever sees resolved
-      // `ExtendedTriangle`s (`bvhcast` + `intersectsTriangles`), so it cannot
-      // tell the difference.
-      geo.boundsTree = new MeshBVH(geo, chunkMetaOf.has(geo) ? { indirect: true } : undefined) as BufferGeometry['boundsTree'];
-      return true;
-    } catch {
-      this._bvhBuildFailed.add(geo);
-      return false;
+  private _pruneMemory(): void {
+    const memory = this._pairMemory;
+    if (memory.size === 0) return;
+    const liveMU = new Set<string>();
+    for (const body of this._muBodyOf.values()) liveMU.add(body.key);
+    for (const key of memory.keys()) {
+      const sep = key.indexOf(KEY_SEP);
+      const a = sep < 0 ? key : key.slice(0, sep);
+      const b = sep < 0 ? '' : key.slice(sep + 1);
+      if ((a.startsWith(MU_KEY_PREFIX) && !liveMU.has(a)) || (b.startsWith(MU_KEY_PREFIX) && !liveMU.has(b))) {
+        memory.delete(key);
+      }
     }
   }
 
-  private _makeBodyMesh(mesh: Mesh): BodyMesh {
-    const geo = mesh.geometry as BufferGeometry;
-    if (!geo.boundingBox) geo.computeBoundingBox();
-    const ancestors: Object3D[] = [];
-    let p: Object3D | null = mesh.parent;
-    while (p) { ancestors.push(p); p = p.parent; }
+  private _makeBody(
+    root: Object3D, role: CollisionRoleName, key: string, label: string, kind: 'node' | 'mu',
+    parts: BodyPart[], mu: CollisionMU | null, stockSources: StockBoundsSource[],
+  ): CollisionBody {
+    const worldBox = new Box3();
+    for (const p of parts) worldBox.union(p.worldBox);
     return {
-      mesh,
-      localBox: (geo.boundingBox ?? new Box3()).clone(),
-      ancestors,
-      worldBox: new Box3(),
-      visibleThisTick: true,
+      root, role, key, label, kind, parts, mu,
+      worldBox,
+      stockSources,
+      ancestorBodies: new Set<CollisionBody>(),
+      mobile: kind === 'mu' || parts.some((p) => p.mobile),
+      moved: false,
+      stockActive: false,
+      _index: this._bodies.length,
+      _pairs: [],
+      _muPairs: [],
+      _stockPrev: new Float64Array(7),
     };
+  }
+
+  private _makeMUBody(mu: CollisionMU, role: CollisionRoleName, stats: BodyBuildStats): CollisionBody {
+    const parts = resolveMUParts(mu, stats);
+    // An MU is never a machining stock (MachiningVolume.tools are scene
+    // components, never MUs — documented v1 limit).
+    return this._makeBody(mu.node, role, `${MU_KEY_PREFIX}${(mu as unknown as { id: number }).id}`, mu.getName(), 'mu', parts, mu, []);
+  }
+
+  private _fillAncestors(body: CollisionBody): void {
+    body.ancestorBodies.clear();
+    for (let p: Object3D | null = body.root.parent; p; p = p.parent) {
+      const owner = this._bodyByRoot.get(p);
+      if (owner && owner !== body) body.ancestorBodies.add(owner);
+    }
+  }
+
+  /** A body without parts and without a stock source produces no pairs. */
+  private _isPairCandidate(body: CollisionBody): boolean {
+    return body.parts.length > 0 || body.stockSources.length > 0;
+  }
+
+  private _addPair(i: number, j: number, pairKey: string): PairRecord {
+    const a = this._bodies[i];
+    const b = this._bodies[j];
+    const muNode = a.kind === 'node' && b.kind === 'mu' ? a : b.kind === 'node' && a.kind === 'mu' ? b : null;
+    const record: PairRecord = {
+      i, j, pairKey,
+      slot: this._pairs.length,
+      state: PairState.Unknown,
+      authoredStill: false,
+      lastHit: false,
+      retest: false,
+      muNode,
+      muBody: muNode === null ? null : muNode === a ? b : a,
+      witness: createNarrowWitness(),
+      witnessA: -1,
+      witnessB: -1,
+    };
+    this._pairs.push(record);
+    a._pairs.push(record);
+    b._pairs.push(record);
+    if (muNode) muNode._muPairs.push(record);
+    return record;
+  }
+
+  private _removePair(record: PairRecord): void {
+    const last = this._pairs.pop()!;
+    if (last !== record) {
+      this._pairs[record.slot] = last;
+      last.slot = record.slot;
+    }
+    removeFrom(this._bodies[record.i]._pairs, record);
+    removeFrom(this._bodies[record.j]._pairs, record);
+    if (record.muNode) removeFrom(record.muNode._muPairs, record);
+    this._pairMemory.delete(record.pairKey);
+    if (this._authored.delete(record.pairKey)) this._problemsDirty = true;
+    if (this._start.delete(record.pairKey)) this._problemsDirty = true;
+  }
+
+  // ─── Incremental MU bodies (F9) ────────────────────────────────────
+
+  private _applySpawn(mu: CollisionMU, role: CollisionRoleName): void {
+    if (this._muBodyOf.has(mu)) return;
+    const body = this._makeMUBody(mu, role, createBodyBuildStats());
+    body._index = this._bodies.length;
+    this._bodies.push(body);
+    this._muBodyOf.set(mu, body);
+    this._fillAncestors(body);
+    if (!this._isPairCandidate(body)) return;
+    for (let k = 0; k < body._index; k++) {
+      const other = this._bodies[k];
+      if (!isPairable(other, body)) continue;
+      if (!this._isPairCandidate(other)) continue;
+      if (this._ignoredTypes.has(typeKey(other.role, body.role))) continue;
+      this._addPair(k, body._index, bodyPairKey(other.key, body.key));
+    }
+  }
+
+  private _applyRemoval(mu: CollisionMU): void {
+    const body = this._muBodyOf.get(mu);
+    if (!body) return;
+    this._muBodyOf.delete(mu);
+    while (body._pairs.length > 0) this._removePair(body._pairs[body._pairs.length - 1]);
+    const last = this._bodies.pop()!;
+    if (last !== body) {
+      const from = last._index;
+      const to = body._index;
+      this._bodies[to] = last;
+      last._index = to;
+      for (const p of last._pairs) {
+        if (p.i === from) p.i = to;
+        if (p.j === from) p.j = to;
+      }
+    }
+  }
+
+  private _warnExcluded(stats: BodyBuildStats): void {
+    if (stats.deformed > 0 && !this._warnedDeformed) {
+      this._warnedDeformed = true;
+      console.warn(
+        `[CollisionManager] ${stats.deformed} deformed mesh(es) (SkinnedMesh / morph targets / `
+        + '_rvSkipBVH) are excluded from collision checking — their geometry moves under any '
+        + 'cached structure. Energy chains are a known blind spot.',
+      );
+    }
+    if (stats.dynamic > 0 && !this._warnedDynamic) {
+      this._warnedDynamic = true;
+      console.warn(
+        `[CollisionManager] ${stats.dynamic} mesh(es) with rewritten geometry (dynamicGeometry: `
+        + 'ribbon band, energy chain) are excluded from collision checking.',
+      );
+    }
+    if (stats.instanced > 0 && !this._warnedInstanced) {
+      this._warnedInstanced = true;
+      console.warn(
+        `[CollisionManager] ${stats.instanced} GPU-instanced mesh(es) inside collision bodies are `
+        + 'excluded — one geometry with many poses is not one body part.',
+      );
+    }
   }
 
   // ─── Per-tick ──────────────────────────────────────────────────────
 
   /**
    * One collision tick. Returns true when the visual state changed (new
-   * highlight), so the caller can mark the frame dirty.
+   * latch), so the caller can mark the frame dirty.
    *
    * A collision found here is reported in THIS call — there is deliberately no
    * time budget or round-robin that would push the report past a tick boundary.
    */
   update(_dt: number): boolean {
-    if (this._dirty) this.rebuild();
+    if (this._inTick) return false;
+    this._inTick = true;
+    try {
+      return this._tick();
+    } finally {
+      this._inTick = false;
+    }
+  }
+
+  private _tick(): boolean {
+    this._applyDeferred();
     if (this._pairs.length === 0) {
+      if (this._problemsDirty) this._publishProblems();
       this._writeSignals();
       return false;
     }
 
-    for (const body of this._bodies) this.updateBodyBounds(body);
+    const bodies = this._bodies;
+    for (let i = 0; i < bodies.length; i++) this.updateBodyBounds(bodies[i]);
 
     let added = false;
-    const suppressed = this._suppressedPairKeys;
-    for (const pair of this._pairs) {
-      // plan-409 F5/F7 — legitimate cutting. Pure `Set.has` on a key that was
-      // built at rebuild time: no allocation, no string work in the tick.
-      if (suppressed.size > 0 && suppressed.has(pair.pairKey)) continue;
-      const a = this._bodies[pair.i];
-      const b = this._bodies[pair.j];
-      if (!a.worldBox.intersectsBox(b.worldBox)) continue;
-      if (!this._narrowphase(a, b)) continue;
-      if (this._recordPair(a, b)) added = true;
+    const pairs = this._pairs;
+    for (let k = 0; k < pairs.length; k++) {
+      const p = pairs[k];
+      if (p.muNode !== null) continue;          // evaluated per node body below
+      if (this._evaluate(p, false)) added = true;
+    }
+    for (let i = 0; i < bodies.length; i++) {
+      const n = bodies[i];
+      if (n._muPairs.length === 0) continue;
+      if (this._evaluateMUPairs(n)) added = true;
     }
 
+    if (this._problemsDirty) this._publishProblems();
     if (added) {
       this._rebuildHighlightRoots();
       this._applyHighlight();
@@ -747,94 +901,236 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
     return added;
   }
 
-  /**
-   * Re-union a body's world AABB from the CURRENT world matrices.
-   *
-   * `Box3.copy(localBox).applyMatrix4(matrixWorld)` transforms all eight
-   * corners and is therefore correct under rotation and non-uniform scale, and
-   * the per-mesh union makes it correct under articulation. `Box3.setFromObject`
-   * is deliberately NOT used — it re-runs `updateMatrixWorld` internally.
-   */
-  updateBodyBounds(body: CollisionBody): void {
-    if (body.kind === 'mu' && body.mu) {
-      const a = body.mu.aabb;
-      body.worldBox.min.copy(a.min);
-      body.worldBox.max.copy(a.max);
-      // Mesh boxes still come from the matrices — they are only used as the
-      // narrowphase prefilter for clone MUs, where they are self-consistent
-      // with the bvhcast matrices.
-      for (const bm of body.meshes) {
-        bm.visibleThisTick = this._isEffectivelyVisible(bm);
-        if (!bm.visibleThisTick) continue;
-        bm.worldBox.copy(bm.localBox).applyMatrix4(bm.mesh.matrixWorld);
+  /** Deferred mutations of the last tick (F18), in a fixed order. */
+  private _applyDeferred(): void {
+    if (this._dirty) {
+      this.rebuild();
+    } else {
+      if (this._pendingRemovals.length > 0) {
+        for (const mu of this._pendingRemovals) this._applyRemoval(mu);
+        this._pendingRemovals.length = 0;
       }
-      return;
-    }
-    body.worldBox.makeEmpty();
-
-    // plan-409 F4 — a live stock extent, asked for EVERY tick instead of frozen
-    // at rebuild. `attachGrid()` runs asynchronously, i.e. normally AFTER the
-    // first rebuild: a box installed only during rebuild would simply never
-    // appear, and the workpiece would drop out of collision detection the
-    // moment machining starts (its authored meshes are hidden from then on and
-    // the chunk meshes are cut off by F3).
-    let stockUsed = false;
-    if (body.stockSources.length > 0) {
-      for (const src of body.stockSources) {
-        const local = src.getStockBoundsLocal();
-        if (!local) continue;               // no grid → the meshes speak again
-        _stockBox.copy(local).applyMatrix4(src.node.matrixWorld);
-        body.worldBox.union(_stockBox);
-        stockUsed = true;
+      if (this._pendingSpawns.size > 0) {
+        for (const [mu, role] of this._pendingSpawns) this._applySpawn(mu, role);
+        this._pendingSpawns.clear();
       }
     }
-
-    for (const bm of body.meshes) {
-      bm.visibleThisTick = this._isEffectivelyVisible(bm);
-      if (!bm.visibleThisTick) continue;
-      bm.worldBox.copy(bm.localBox).applyMatrix4(bm.mesh.matrixWorld);
-      body.worldBox.union(bm.worldBox);
+    if (this._baselinePending) {
+      this._baselinePending = false;
+      this._pairMemory.clear();
+      for (const p of this._pairs) {
+        p.state = PairState.Unknown;
+        p.authoredStill = false;
+        p.lastHit = false;
+        p.retest = true;
+        p.witness.valid = false;
+      }
+      if (this._start.size > 0 || this._authored.size > 0) {
+        this._start.clear();
+        this._authored.clear();
+        this._problemsDirty = true;
+      }
     }
+  }
 
-    // A stock box has no triangles to test against, so the check has to stop
-    // after the box. Recomputed per tick, so a torn-down grid restores the
-    // authored triangle precision without any rebuild.
-    body.aabbOnly = body.baseAabbOnly || stockUsed;
+  /** MU × node pairs of node body `n`, prefiltered by the MU grid (F9). */
+  private _evaluateMUPairs(n: CollisionBody): boolean {
+    const list = n._muPairs;
+    const useGrid = this._muQuery !== null && list.length >= GRID_MIN_PAIRS;
+    let stamp = -1;
+    let added = false;
+    for (let k = 0; k < list.length; k++) {
+      const p = list[k];
+      let gridMiss = false;
+      if (useGrid && this._needsEvaluation(p)) {
+        if (stamp < 0) stamp = this._queryGrid(n);
+        gridMiss = this._gridMark.get(p.muBody!) !== stamp;
+      }
+      if (this._evaluate(p, gridMiss)) added = true;
+    }
+    return added;
+  }
+
+  /** Mark every MU body the grid returns for `n`'s world box; returns the stamp. */
+  private _queryGrid(n: CollisionBody): number {
+    const stamp = ++this._gridStamp;
+    this._counters.gridQueries++;
+    const box = n.worldBox;
+    if (box.isEmpty()) return stamp;
+    this._gridMin[0] = box.min.x - GRID_SLACK_M;
+    this._gridMin[1] = box.min.y - GRID_SLACK_M;
+    this._gridMin[2] = box.min.z - GRID_SLACK_M;
+    this._gridMax[0] = box.max.x + GRID_SLACK_M;
+    this._gridMax[1] = box.max.y + GRID_SLACK_M;
+    this._gridMax[2] = box.max.z + GRID_SLACK_M;
+    const out = this._gridOut;
+    const count = this._muQuery!.queryMUsXZ(this._gridMin, this._gridMax, out);
+    for (let i = 0; i < count; i++) {
+      const body = this._muBodyOf.get(out[i] as CollisionMU);
+      if (body) this._gridMark.set(body, stamp);
+    }
+    out.length = 0;
+    return stamp;
+  }
+
+  /** Would {@link _evaluate} run the test for this pair this tick? */
+  private _needsEvaluation(p: PairRecord): boolean {
+    if (this._suppressedPairKeys.size > 0 && this._suppressedPairKeys.has(p.pairKey)) return false;
+    if (this._active.has(p.pairKey)) return false;
+    return p.state === PairState.Unknown || p.retest || this._bodies[p.i].moved || this._bodies[p.j].moved;
   }
 
   /**
-   * Effective visibility (F6) — the same rule the highlight system uses
-   * (`visible` AND `layers.mask !== 0`), extended over the cached ancestor
-   * chain. Batched render sources keep `visible = true` but carry
-   * `layers.mask = 0`; hidden MU templates fail the `visible` chain.
+   * Evaluate one pair: skip rules, the test, the state machine. Returns true
+   * when the pair LATCHED in this call. `gridMiss` = the MU grid proved the
+   * pair apart (the test is skipped, the result is "no hit").
    */
-  private _isEffectivelyVisible(bm: BodyMesh): boolean {
-    const m = bm.mesh;
-    if (!m.visible || m.layers.mask === 0) return false;
-    for (const a of bm.ancestors) {
-      if (!a.visible) return false;
+  private _evaluate(p: PairRecord, gridMiss: boolean): boolean {
+    const key = p.pairKey;
+    // plan-409 F5/F7 — legitimate cutting. A muted pair is never baselined: the
+    // machining configuration is an authoritative statement about it, so it is
+    // armed and alarms the moment the spindle stops inside the material.
+    if (this._suppressedPairKeys.size > 0 && this._suppressedPairKeys.has(key)) {
+      if (p.state === PairState.Unknown) p.state = PairState.Armed;
+      p.retest = true;
+      return false;
     }
-    return true;
+    // F10: an already latched pair needs no narrowphase.
+    if (this._active.has(key)) return false;
+    const a = this._bodies[p.i];
+    const b = this._bodies[p.j];
+    if (!(p.state === PairState.Unknown || p.retest || a.moved || b.moved)) {
+      // Nothing moved and the state is known: the last result stands.
+      if (p.state === PairState.Armed && p.lastHit) return this._recordPair(a, b);
+      return false;
+    }
+    p.retest = false;
+    let hit = false;
+    if (gridMiss) this._counters.gridSkipped++;
+    else hit = this._test(p, a, b);
+    p.lastHit = hit;
+
+    switch (p.state) {
+      case PairState.Unknown:
+        if (!hit) { p.state = PairState.Armed; return false; }
+        p.state = PairState.Baseline;
+        p.authoredStill = !a.mobile && !b.mobile && !a.moved && !b.moved;
+        this._recordOverlap(p, a, b, p.authoredStill);
+        return false;
+      case PairState.Baseline:
+        if (p.authoredStill && (a.moved || b.moved)) {
+          // A still pair whose body moved: still overlapping → a start contact.
+          p.authoredStill = false;
+          if (hit) {
+            this._authored.delete(key);
+            this._recordOverlap(p, a, b, false);
+            return false;
+          }
+        }
+        if (!hit) { p.state = PairState.Armed; p.authoredStill = false; }
+        return false;
+      default:
+        return hit ? this._recordPair(a, b) : false;
+    }
   }
 
-  private _narrowphase(a: CollisionBody, b: CollisionBody): boolean {
-    // A body without usable BVHs already counted its box overlap as a hit.
-    if (a.aabbOnly || b.aabbOnly) return true;
-    for (const ma of a.meshes) {
-      if (!ma.visibleThisTick) continue;
-      for (const mb of b.meshes) {
-        if (!mb.visibleThisTick) continue;
-        // Mesh-level prefilter so a big body does not cast all its meshes
-        // against all of the partner's.
-        if (!ma.worldBox.intersectsBox(mb.worldBox)) continue;
-        if (meshesIntersect(ma.mesh, mb.mesh)) return true;
+  /** Box test, then the exact narrowphase over the visible parts. */
+  private _test(p: PairRecord, a: CollisionBody, b: CollisionBody): boolean {
+    this._counters.pairsEvaluated++;
+    if (!a.worldBox.intersectsBox(b.worldBox)) return false;
+    // A stock box has no triangles: the box overlap IS the answer (plan-409 F4).
+    if (a.stockActive || b.stockActive) return true;
+    const ap = a.parts;
+    const bp = b.parts;
+    // Witness part pair first (temporal coherence).
+    // Only a VALID witness takes its part pair out of the loop below.
+    const useWitness = p.witness.valid && p.witnessA >= 0 && p.witnessB >= 0
+      && p.witnessA < ap.length && p.witnessB < bp.length;
+    const wa = useWitness ? p.witnessA : -1;
+    const wb = useWitness ? p.witnessB : -1;
+    if (useWitness && this._partPair(ap[wa], bp[wb], p.witness)) return true;
+    for (let ia = 0; ia < ap.length; ia++) {
+      const pa = ap[ia];
+      if (!pa.visible) continue;
+      for (let ib = 0; ib < bp.length; ib++) {
+        if (ia === wa && ib === wb) continue;
+        const pb = bp[ib];
+        if (!pb.visible) continue;
+        const w = this._scratchWitness;
+        w.valid = false;
+        if (this._partPair(pa, pb, w)) {
+          p.witness.valid = w.valid;
+          p.witness.aStart = w.aStart; p.witness.aEnd = w.aEnd;
+          p.witness.bStart = w.bStart; p.witness.bEnd = w.bEnd;
+          p.witnessA = ia;
+          p.witnessB = ib;
+          return true;
+        }
       }
     }
     return false;
   }
 
-  /** Marks a pair as hit this tick and adds it to the active set when new.
-   *  Returns true when it was new. */
+  private _partPair(pa: BodyPart, pb: BodyPart, w: NarrowWitness): boolean {
+    if (!pa.visible || !pb.visible) return false;
+    if (!pa.worldBox.intersectsBox(pb.worldBox)) return false;
+    const eps = touchEpsFor(maxAbsOf(pa.worldBox, pb.worldBox));
+    return partsOverlap(pa, pb, MARGIN_M, eps, this._counters, w);
+  }
+
+  /**
+   * Refresh a body for this tick: fresh part poses (F16), motion stamps (F5),
+   * part visibility (F12), the union world box and the live stock box (plan-409
+   * F4). Public for the bounds tests; called for every body at the tick head.
+   */
+  updateBodyBounds(body: CollisionBody): void {
+    body.moved = false;
+    body.worldBox.makeEmpty();
+
+    // plan-409 F4 — a live stock extent, asked for EVERY tick: `attachGrid()`
+    // runs asynchronously, normally AFTER the first rebuild.
+    let stockActive = false;
+    const prev = body._stockPrev;
+    if (body.stockSources.length > 0) {
+      for (const src of body.stockSources) {
+        const local = src.getStockBoundsLocal();
+        if (!local) continue;               // no grid → the meshes speak again
+        _stockBox.copy(local).applyMatrix4(freshWorldMatrix(src.node, _stockMatrix));
+        body.worldBox.union(_stockBox);
+        stockActive = true;
+      }
+      const wb = body.worldBox;
+      if (stockActive !== (prev[6] === 1)
+        || (stockActive && (prev[0] !== wb.min.x || prev[1] !== wb.min.y || prev[2] !== wb.min.z
+          || prev[3] !== wb.max.x || prev[4] !== wb.max.y || prev[5] !== wb.max.z))) {
+        body.moved = true;
+        prev[0] = wb.min.x; prev[1] = wb.min.y; prev[2] = wb.min.z;
+        prev[3] = wb.max.x; prev[4] = wb.max.y; prev[5] = wb.max.z;
+        prev[6] = stockActive ? 1 : 0;
+      }
+    }
+    body.stockActive = stockActive;
+
+    const parts = body.parts;
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      const visible = partVisible(part);
+      if (visible !== part.visible) {
+        part.visible = visible;
+        body.moved = true;
+      }
+      if (!visible) { part.moved = false; continue; }
+      refreshPartPose(part);
+      part.moved = stampMotion(part);
+      if (part.moved) {
+        updatePartWorldBox(part);
+        body.moved = true;
+      }
+      body.worldBox.union(part.worldBox);
+    }
+  }
+
+  /** Marks a pair as hit and adds it to the latched set when new. True when new. */
   private _recordPair(a: CollisionBody, b: CollisionBody): boolean {
     const key = bodyPairKey(a.key, b.key);
     if (this._active.has(key)) return false;
@@ -851,14 +1147,35 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
     return true;
   }
 
+  /** A quiet start overlap, for the Problems panel (once per load, F6/F7). */
+  private _recordOverlap(p: PairRecord, a: CollisionBody, b: CollisionBody, authored: boolean): void {
+    const map = authored ? this._authored : this._start;
+    if (map.has(p.pairKey)) return;
+    // The REAL node path of a node body — never a chunk, partition or `tex:` key
+    // (rules 12/13). An MU has none; then the other body's path, or nothing.
+    const nodePath = a.kind === 'node' ? a.key : b.kind === 'node' ? b.key : undefined;
+    map.set(p.pairKey, { aLabel: a.label, aRole: a.role, bLabel: b.label, bRole: b.role, nodePath });
+    this._problemsDirty = true;
+  }
+
+  private _publishProblems(): void {
+    this._problemsDirty = false;
+    const publish = (code: typeof COLLISION_AUTHORED_OVERLAP_CODE | typeof COLLISION_START_OVERLAP_CODE,
+      map: Map<string, CollisionOverlapPair & { nodePath?: string }>): void => {
+      const list = [...map.values()];
+      reportCollisionOverlaps(code, list, list[0]?.nodePath);
+    };
+    publish(COLLISION_AUTHORED_OVERLAP_CODE, this._authored);
+    publish(COLLISION_START_OVERLAP_CODE, this._start);
+  }
+
   /** Instanced MUs share the pool mesh — highlighting it would light up every
    *  instance in the pool, so they contribute no highlight root. */
   private _highlightRootOf(body: CollisionBody): Object3D | null {
     return body.kind === 'mu' && body.mu?.isInstanced ? null : body.root;
   }
 
-  /** Re-derive the aux highlight roots from the CURRENT active pairs — the
-   *  set shrinks now, so incremental adds are not enough. */
+  /** Re-derive the aux highlight roots from the CURRENT latched pairs. */
   private _rebuildHighlightRoots(): void {
     this._activeRoots.length = 0;
     for (const ap of this._active.values()) {
@@ -897,6 +1214,13 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
     }
   }
 
+  /** Pairs whose latch was dropped: their last result is stale (F10 skipped them). */
+  private _retestUnlatched(keys: Iterable<string>): void {
+    const set = keys instanceof Set ? keys : new Set(keys);
+    if (set.size === 0) return;
+    for (const p of this._pairs) if (set.has(p.pairKey)) p.retest = true;
+  }
+
   // ─── Machining suppression (plan-409) ───────────────────────────────
 
   /** Body-pair keys currently muted by an active machining association. */
@@ -906,9 +1230,7 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
    * IMPLEMENTS CollisionMachiningBridge::setMachiningAssociation
    *
    * STATE-based, not edge-based: the caller reports the association's current
-   * spindle state, including the very first one at scene-ready. That is what
-   * makes "spindle was already on before the first body rebuild" work, and it
-   * makes a missed edge unrecoverable-by-design impossible.
+   * spindle state, including the very first one at scene-ready.
    */
   setMachiningAssociation(
     assocKey: string, toolRoot: Object3D, volumeRoot: Object3D, active: boolean,
@@ -930,14 +1252,10 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
   }
 
   /**
-   * Re-derive `_suppressedPairKeys` from the association registry.
-   *
-   * Runs on every association change AND at the end of every rebuild — never in
-   * the tick. Newly muted pairs are UNLATCHED here (F8): a crash that was
-   * latched while the spindle was off would otherwise keep its card and its
-   * outline standing after the spindle came back on, even though the contact is
-   * legitimate cutting from that moment. Same shape as `ignoreType`, which
-   * drops its matching latches for exactly the same reason.
+   * Re-derive `_suppressedPairKeys` from the association registry — on every
+   * association change AND at the end of every rebuild, never in the tick.
+   * Newly muted pairs are UNLATCHED here (F8); pairs leaving the muted set are
+   * re-tested, because the tick skipped them while muted.
    */
   private _recomputeSuppressedPairs(): void {
     const next = new Set<string>();
@@ -945,19 +1263,19 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
       if (!assoc.active) continue;
       const toolBody = this._resolveBody(assoc.toolRoot);
       const volumeBody = this._resolveBody(assoc.volumeRoot);
-      // Not resolvable yet (bodies not built), or both sides in the SAME body —
-      // then there is no pair to mute in the first place.
       if (!toolBody || !volumeBody || toolBody === volumeBody) continue;
       next.add(bodyPairKey(toolBody.key, volumeBody.key));
     }
 
-    // Unlatch pairs that became muted with this change.
     let removed = false;
     for (const key of next) {
-      if (this._suppressedPairKeys.has(key)) continue;   // already muted
+      if (this._suppressedPairKeys.has(key)) continue;
       if (this._active.delete(key)) removed = true;
     }
+    const unmuted: string[] = [];
+    for (const key of this._suppressedPairKeys) if (!next.has(key)) unmuted.push(key);
     this._suppressedPairKeys = next;
+    this._retestUnlatched(unmuted);
 
     if (removed) {
       this._rebuildHighlightRoots();
@@ -969,14 +1287,8 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
 
   /**
    * Body owning `node`: the NEAREST role-carrying ancestor, `node` itself
-   * included. Deterministic for all three authoring styles — role on the
-   * machining node, role on an ancestor of it (a `Spindle` group), or no role
-   * above it at all.
-   *
-   * The last case is the trap worth naming: if the role sits on a CHILD of the
-   * machining node, that child is a body of its own and the machining node is
-   * NOT inside it, so nothing is muted. Silence there would look like a
-   * collision bug, hence the one-time diagnosis.
+   * included. A role on a CHILD of the machining node mutes nothing — that is
+   * diagnosed once.
    */
   private _resolveBody(node: Object3D): CollisionBody | null {
     let p: Object3D | null = node;
@@ -1016,19 +1328,18 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
   get ignoredTypes(): ReadonlySet<string> { return this._ignoredTypes; }
 
   /**
-   * Ignore a collision TYPE (role pair, e.g. Tool↔Workpiece) for the rest of
-   * the current run: matching latched pairs are dropped immediately and the
-   * pair list stops checking that combination. Survives reset(); wiped on
-   * model change.
+   * Ignore a collision TYPE (role pair) for the rest of the current run:
+   * matching pairs and latches are dropped at once, and the Problems entries are
+   * re-published without that type. Survives reset(); wiped on model change.
    */
   ignoreType(roleA: string, roleB: string): void {
     const key = typeKey(roleA, roleB);
     if (this._ignoredTypes.has(key)) return;
     this._ignoredTypes.add(key);
-    // Stop future checks without waiting for a rebuild.
-    this._pairs = this._pairs.filter((pair) =>
-      typeKey(this._bodies[pair.i].role, this._bodies[pair.j].role) !== key);
-    // Drop matching latched pairs.
+    for (let k = this._pairs.length - 1; k >= 0; k--) {
+      const p = this._pairs[k];
+      if (typeKey(this._bodies[p.i].role, this._bodies[p.j].role) === key) this._removePair(p);
+    }
     let removed = false;
     for (const [k, ap] of this._active) {
       if (typeKey(ap.view.aRole, ap.view.bRole) === key) {
@@ -1036,6 +1347,12 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
         removed = true;
       }
     }
+    for (const map of [this._authored, this._start]) {
+      for (const [k, info] of map) {
+        if (typeKey(info.aRole, info.bRole) === key) { map.delete(k); this._problemsDirty = true; }
+      }
+    }
+    if (this._problemsDirty && !this._inTick) this._publishProblems();
     if (removed) {
       this._rebuildHighlightRoots();
       this._applyHighlight();
@@ -1045,14 +1362,13 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
   }
 
   /**
-   * Acknowledge ONE latched pair (the card's OK): its card and outline share
-   * are dropped. A pair whose geometry still intersects is re-detected on the
-   * very next tick — OK only closes it for good once the contact is over
-   * (same contract as the original modal's OK). Unknown keys are a no-op.
+   * Acknowledge ONE latched pair (the card's OK). A pair whose geometry still
+   * intersects is re-detected on the very next tick. Unknown keys are a no-op.
    */
   acknowledge(aKey: string, bKey: string): void {
     const key = bodyPairKey(aKey, bKey);
     if (!this._active.delete(key)) return;
+    this._retestUnlatched([key]);
     this._rebuildHighlightRoots();
     this._applyHighlight();
     this._publish();
@@ -1069,14 +1385,13 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
   }
 
   /**
-   * Clear the whole reported state (highlights, cards, signals). A pair that
-   * still intersects is re-detected on the very next tick — this exists for
-   * the PLC-side `ResetCollisions` edge and for teardown paths; single cards
-   * are acknowledged via {@link acknowledge}, types muted via
-   * {@link ignoreType}.
-   * Never touches the simulation — it keeps running throughout (user decision).
+   * Clear the reported state (highlights, cards, signals) — the PLC-side
+   * `ResetCollisions` edge and teardown paths. Pair states stay: an Armed pair
+   * that still intersects re-latches on the next tick. Never touches the
+   * simulation.
    */
   reset(): void {
+    this._retestUnlatched([...this._active.keys()]);
     this._active.clear();
     this._activeRoots.length = 0;
     this._highlight?.hideCollision();
@@ -1086,6 +1401,7 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
 
   /** Model change: drop the whole registry and every reported state (F12). */
   clear(): void {
+    this._dropSubscriptions();
     this._roles.clear();
     this._muRoles.clear();
     this._stockSources.clear();
@@ -1094,15 +1410,26 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
     this._assoc.clear();
     this._suppressedPairKeys = new Set<string>();
     this._bodyByRoot.clear();
+    this._muBodyOf.clear();
+    this._gridMark.clear();
+    this._pairMemory.clear();
+    this._pendingSpawns.clear();
+    this._pendingRemovals.length = 0;
+    this._baselinePending = false;
     this._bodies = [];
     this._pairs = [];
     this._dirty = true;
-    this._warnedNoBVH = false;
     this._warnedDeformed = false;
+    this._warnedDynamic = false;
+    this._warnedInstanced = false;
     this._warnedRoleCutoff = false;
     this._active.clear();
     this._activeRoots.length = 0;
     this._ignoredTypes.clear();
+    this._authored.clear();
+    this._start.clear();
+    this._problemsDirty = false;
+    clearCollisionOverlapProblems();
     this._highlight?.hideCollision();
     publishCollisionAlert([]);
     this.attachSignals(null);
@@ -1112,5 +1439,14 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
   dispose(): void {
     this.clear();
     this._highlight = null;
+    this._source = null;
+    this._muQuery = null;
   }
+}
+
+function removeFrom<T>(list: T[], item: T): void {
+  const i = list.indexOf(item);
+  if (i < 0) return;
+  const last = list.pop()!;
+  if (i < list.length) list[i] = last;
 }

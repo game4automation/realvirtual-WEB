@@ -3,7 +3,7 @@
 
 import assert from 'node:assert/strict';
 import { after, before, beforeEach, test } from 'node:test';
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -236,4 +236,226 @@ test('Test_Viewer_EpochZeroDiagnosis_ProducesFailedMotionLog_PublishesNothing', 
   const log = JSON.parse(readFileSync(join(run.dir, temp, 'run.log'), 'utf8'));
   for (const field of ['movedFraction', 'movedFrames', 'longestStillFrames', 'controlMad']) assert.equal(typeof log.motion[field], 'number');
   assert.equal(log.motionMadSequence.length, 39);
+});
+
+test('Test_Viewer_WelcomeShow_ReadyOnWelcomeTitle_StillRecords', LONG, async () => {
+  // plan-2240 (Codex finding 2): `?recording=1` keeps startup dialogs shut, but a storyboard that
+  // asks for the welcome dialog gets `recordingWelcome=1` and can still wait for `#welcome-title`.
+  // Without that exception `ready` would wait forever.
+  const raw = {
+    ...script('welcome-show', { actions: [
+      { type: 'camera', position: [4, 3, 4], target: [0, 0, 0], durationSec: 0.6 },
+      { type: 'wait', ms: 1800 },
+    ] }),
+    welcome: 'show',
+    ready: '#welcome-title',
+  };
+  const run = await runViewer('welcome-show', raw);
+  assert.ifError(run.error);
+  assert.ok(existsSync(join(run.dir, 'events.json')));
+});
+
+// ── plan-2240 (Codex review): the boot's own Projects opening in a real viewer boot ──────────
+// The runner always adds `recording=1`, so these two cases drive the built dist directly.
+
+const MISSING_DOC_TEXT = 'text=That link points at a document that is no longer in this project';
+const DASHBOARD = '[data-testid="projects-tree-column"]';
+
+async function bootMissingDocument(recording) {
+  const { createServer } = await import('node:http');
+  const { extname: ext } = await import('node:path');
+  const { chromium } = await import('playwright');
+  const types = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css',
+    '.json': 'application/json', '.wasm': 'application/wasm', '.glb': 'model/gltf-binary', '.svg': 'image/svg+xml', '.png': 'image/png' };
+  const server = createServer((request, response) => {
+    let path = decodeURIComponent(new URL(request.url ?? '/', 'http://127.0.0.1').pathname);
+    if (path.endsWith('/')) path += 'index.html';
+    let file = join(DIST, path);
+    if (!file.startsWith(DIST) || !existsSync(file) || !statSync(file).isFile()) file = join(DIST, 'index.html');
+    response.writeHead(200, {
+      'content-type': types[ext(file).toLowerCase()] ?? 'application/octet-stream',
+      'cross-origin-opener-policy': 'same-origin', 'cross-origin-embedder-policy': 'require-corp', 'cache-control': 'no-store',
+    });
+    response.end(readFileSync(file));
+  });
+  await new Promise((done) => server.listen(0, '127.0.0.1', done));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const context = await browser.newContext({ viewport: { width: 1920, height: 1080 } });
+    await context.addInitScript(() => {
+      for (const key of ['rv-terms-accepted', 'rv-welcome-dismissed', 'rv-connect-autoconnect-optout', 'rv-auto-quality-applied']) {
+        localStorage.setItem(key, '1');
+      }
+    });
+    const page = await context.newPage();
+    const query = `doc=does-not-exist-2240&consent=decline&mcpPort=1${recording ? '&recording=1' : ''}`;
+    await page.goto(`http://127.0.0.1:${server.address().port}/?${query}`, { waitUntil: 'domcontentloaded' });
+    // The problem is reported first; the boot opens the dashboard in the same turn, if at all.
+    await page.locator(MISSING_DOC_TEXT).first().waitFor({ state: 'visible', timeout: 120_000 });
+    await page.waitForTimeout(1500);
+    const dashboardOpen = await page.locator(DASHBOARD).first().isVisible();
+    let manualOpen = null;
+    if (recording) {
+      await page.locator('button[aria-label^="Projects"]').first().click();
+      manualOpen = await page.locator(DASHBOARD).first().waitFor({ state: 'visible', timeout: 15_000 }).then(() => true, () => false);
+    }
+    return { dashboardOpen, manualOpen };
+  } finally {
+    await browser.close();
+    await new Promise((done) => server.close(() => done()));
+  }
+}
+
+test('Test_Viewer_MissingDocument_WithoutRecording_OpensProjectsDashboard', LONG, async () => {
+  const result = await bootMissingDocument(false);
+  assert.equal(result.dashboardOpen, true, 'without ?recording=1 the boot must open the Projects dashboard');
+});
+
+test('Test_Viewer_MissingDocument_Recording_ReportsWithoutDashboard_ManualOpenWorks', LONG, async () => {
+  const result = await bootMissingDocument(true);
+  assert.equal(result.dashboardOpen, false, 'under ?recording=1 the dashboard must not open itself');
+  assert.equal(result.manualOpen, true, 'the Projects button must still open the dashboard');
+});
+
+// ── plan-2237: time control on the real viewer ───────────────────────────────────────────────
+// Gate C is not the subject of these takes (a pause, a hold in DES step mode, a time-lapse);
+// they run with `--motion-check warn` so a still stretch cannot hide the sim-progress result.
+
+const PALLET_YARD = '/?projectUrl=/demo-realvirtual/&doc=doc_palletyard_hzmdb6&mode=des';
+const direct = (id, args, extra = {}) => ({ type: 'command', id, via: 'direct', ...(args ? { args } : {}), ...extra });
+
+function desScript(id, { setup = [], actions, start = 'running' }) {
+  return {
+    ...script(id, { actions }), url: PALLET_YARD, start,
+    motionRegion: { x: 560, y: 300, w: 800, h: 500 },
+    setup: [{ type: 'waitFor', scene: true, timeoutMs: 180000 }, ...setup],
+  };
+}
+
+test('Test_Viewer_Continuous_1x_5x_Pause_Resume_Over60s_Green', { timeout: 1_200_000 }, async () => {
+  // F1/F3/F4: > 60 s in one take (the old limit was ~16 s): tempo change, pause, resume.
+  const run = await runViewer('clock-continuous', script('clock-continuous', { actions: [
+    { type: 'camera', position: [4, 3, 4], target: [0, 0, 0], durationSec: 0.6 },
+    { type: 'wait', ms: 20_000 },
+    direct('sim.speedOverride', { factor: 5 }),
+    { type: 'wait', ms: 15_000 },
+    direct('sim.playPause', { paused: true }),
+    { type: 'wait', ms: 3_000 },
+    direct('sim.playPause', { paused: false }),
+    { type: 'wait', ms: 25_000 },
+  ] }), { motionCheck: 'warn' });
+  assert.ifError(run.error);
+  const events = readEvents(run);
+  assert.ok(events.video.duration > 60, `take is only ${events.video.duration} s`);
+  assert.equal(events.simProgress.verdict, 'ok');
+  const passed = events.simProgress.segments.filter((segment) => segment.verdict === 'pass');
+  assert.deepEqual([...new Set(passed.map((segment) => `${segment.kind}:${segment.factor}`))], ['run:1', 'run:5', 'hold:5']);
+  assert.ok(passed.every((segment) => segment.i1 <= 1), JSON.stringify(passed));
+});
+
+test('Test_Viewer_DesRunningStart_RenderClockPreflight_Green', LONG, async () => {
+  // F6: a running DES start — the preflight measures the render clock (simTime stays 0 after Play).
+  const run = await runViewer('clock-des-running', desScript('clock-des-running', {
+    setup: [direct('des.setMode', { subMode: 'hybrid', multiplier: 5 }), direct('sim.playPause', { paused: false }, { waitSec: 1 })],
+    actions: [
+      { type: 'camera', position: [4, 3.2, -7.5], target: [12.5, 1.2, 0.5], durationSec: 1 },
+      { type: 'wait', ms: 5000 },
+    ],
+  }), { motionCheck: 'warn' });
+  assert.ifError(run.error);
+  assert.equal(run.result.summary.virtualClockPreflight.verdict, 'ok');
+  const events = readEvents(run);
+  assert.equal(events.simProgress.verdict, 'ok');
+  assert.ok(events.simProgress.segments.some((segment) => segment.verdict === 'pass' && segment.clock === 'renderClock' && segment.factor === 5));
+});
+
+test('Test_Viewer_Des_50x_FastForward_CheckpointLoad_Resume_OneTake_Green', { timeout: 900_000 }, async () => {
+  // F5/F7: tempo 50x -> fast-forward inside the take -> an EARLIER checkpoint (async load, step
+  // mode) -> resume (hold in step) -> 5x again. One take, jumps logged, every segment green.
+  const run = await runViewer('clock-des-jumps', desScript('clock-des-jumps', {
+    // Checkpoint autosave is a setting (off in a fresh profile); the run starts after it is on.
+    setup: [direct('des.checkpoints.set', { intervalSec: 3600 }), direct('sim.reset'), direct('sim.playPause', { paused: false }, { waitSec: 1 })],
+    actions: [
+      { type: 'camera', position: [4, 3.2, -7.5], target: [12.5, 1.2, 0.5], durationSec: 1 },
+      direct('des.setMode', { subMode: 'hybrid', multiplier: 50 }),
+      { type: 'wait', ms: 3000 },
+      direct('des.fastForward', { untilSimTime: '00:03:00:00' }, { maxWaitSec: 120 }),
+      { type: 'wait', ms: 1500 },
+      direct('des.checkpoint.load', { t: 3600 }, { maxWaitSec: 60 }),
+      direct('sim.playPause', { paused: false }),
+      { type: 'wait', ms: 2000 },
+      direct('des.setMode', { subMode: 'hybrid', multiplier: 5 }),
+      { type: 'wait', ms: 3000 },
+    ],
+  }), { motionCheck: 'warn' });
+  assert.ifError(run.error);
+  const events = readEvents(run);
+  assert.equal(events.simProgress.verdict, 'ok');
+  const jumps = events.simJumps.map((jump) => jump.cmd);
+  assert.ok(jumps.includes('des.fastForward'), jumps.join(','));
+  const back = events.simJumps.find((jump) => jump.cmd === 'des.checkpoint.load');
+  assert.ok(back && back.toSim < back.fromSim, `checkpoint load must jump backwards: ${JSON.stringify(back)}`);
+  const passed = events.simProgress.segments.filter((segment) => segment.verdict === 'pass').map((segment) => `${segment.kind}:${segment.factor}`);
+  for (const expected of ['run:50', 'run:5']) assert.ok(passed.includes(expected), passed.join(','));
+});
+
+test('Test_Viewer_ExperimentBatch_Timelapse_DisjointSegments_GatesGreen', { timeout: 900_000 }, async () => {
+  // Phase 2 / F8: a short real experiment batch (Commercial build) recorded as a time-lapse.
+  const run = await runViewer('clock-timelapse', desScript('clock-timelapse', {
+    start: 'paused',
+    setup: [
+      direct('sim.playPause', { paused: true }),
+      direct('experiment.sync'),
+      ...['2 AGVs', '4 AGVs', 'No downtime'].map((column) => direct('experiment.column.set', { column, enabled: false })),
+      direct('experiment.settings.set', { endTime: '01:00:00:00', statResetTime: '00:01:00:00', crn: true }),
+      direct('experiment.column.set', { column: 'Base', enabled: true, replicationCount: 2 }),
+      direct('experiment.window', { open: true }, { waitSec: 1 }),
+    ],
+    actions: [
+      direct('experiment.run', { scope: 'selected' }, { timelapse: { fps: 4, maxWallSec: 90 }, maxWaitSec: 120, waitSec: 0.5 }),
+      direct('sim.playPause', { paused: false }),
+      { type: 'wait', ms: 2000 },
+    ],
+  }), { motionCheck: 'warn' });
+  assert.ifError(run.error);
+  const events = readEvents(run);
+  const own = events.segments.filter((segment) => segment.stepId === 'viewer' && segment.actionIndex === 0);
+  // A direct dispatch has no approach: its empty head segment is dropped.
+  assert.deepEqual(own.map((segment) => segment.kind), ['timelapse', 'command']);
+  const lapse = own[0];
+  assert.ok(lapse.end - lapse.start >= 3, `only ${lapse.end - lapse.start} time-lapse frames`);
+  assert.ok(lapse.end - lapse.start <= Math.ceil(90 * 4));
+  assert.equal(events.frameCheck.verdict, 'ok');
+  assert.equal(events.frameCheck.stampsContiguous, true);
+  assert.equal(events.simProgress.verdict, 'ok');
+  assert.ok(events.simProgress.segments.some((segment) => segment.kind === 'timelapse'));
+});
+
+test('Test_Viewer_ExperimentSnapshotLoad_JumpAsyncRebase_ContinuedRun_Green', { timeout: 900_000 }, async () => {
+  // Review 7: `experiment.snapshot.load` (the registry has no plain `snapshot.load`; searched both
+  // trees 2026-11-04) — a real backwards jump, completed asynchronously, the next segment rebases
+  // and the resumed run is judged green.
+  const run = await runViewer('clock-snapshot', desScript('clock-snapshot', {
+    setup: [direct('des.checkpoints.set', { intervalSec: 3600 }), direct('sim.reset'), direct('sim.playPause', { paused: false }, { waitSec: 1 })],
+    actions: [
+      { type: 'camera', position: [4, 3.2, -7.5], target: [12.5, 1.2, 0.5], durationSec: 1 },
+      direct('des.setMode', { subMode: 'hybrid', multiplier: 50 }),
+      { type: 'wait', ms: 1500 },
+      direct('des.fastForward', { untilSimTime: '00:03:00:00' }, { maxWaitSec: 120 }),
+      { type: 'wait', ms: 1000 },
+      direct('experiment.snapshot.load', { column: 'Base', run: 0, t: 3600 }, { maxWaitSec: 60 }),
+      { type: 'wait', ms: 1000 },
+      direct('des.setMode', { subMode: 'hybrid', multiplier: 5 }),
+      direct('sim.playPause', { paused: false }),
+      { type: 'wait', ms: 3000 },
+    ],
+  }), { motionCheck: 'warn' });
+  assert.ifError(run.error);
+  const events = readEvents(run);
+  assert.equal(events.simProgress.verdict, 'ok', JSON.stringify(events.simProgress.segments));
+  const load = events.simJumps.find((jump) => jump.cmd === 'experiment.snapshot.load');
+  assert.ok(load, `no jump logged for experiment.snapshot.load: ${JSON.stringify(events.simJumps)}`);
+  assert.ok(Math.abs(load.toSim - 3600) < 1e-6 && load.fromSim > load.toSim, JSON.stringify(load));
+  const after = events.simProgress.segments.filter((segment) => segment.startFrame > load.frame && segment.verdict === 'pass');
+  assert.ok(after.some((segment) => segment.kind === 'run' && segment.factor === 5), `no judged 5x run after the load: ${JSON.stringify(after)}`);
 });

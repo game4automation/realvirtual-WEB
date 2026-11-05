@@ -64,8 +64,10 @@ export interface SignalMapping {
    * the address) — nothing is written back (F17).
    */
   componentAddress?: string;
-  /** plan-769 F15 — the address of an INTERNAL source (`sourceKind: 'internal'`); read only until Phase 3, the name in `signal` binds. */
+  /** plan-769 F15 — address of an INTERNAL source; when present it alone binds, `signal` is a cache (doc-node-paths.md § 5.4). */
   sourceAddress?: string;
+  /** In memory only (stripped on save): `sourceAddress` names no signal yet / any more — not bound. */
+  sourceUnresolved?: 'missing' | 'pending';
   /** Component standard-signal slot, e.g. "Forward", "Flow.Run", "IsOccupied". */
   slot: string;
   /**
@@ -401,7 +403,7 @@ export class LayoutStore {
   private _snapshot: LayoutSnapshot;
   /** plan-371 pending placements. Runtime only — see `setPendingPlacements`. */
   private _pendingPlacements: PendingPlacementInfo[] = [];
-  /** Entry ids whose asset is preparing. Runtime only — see `setPreparingEntries`. */
+  /** Entry KEYS (`entryKeyOf`: qualified by library, plan-780 R7) whose asset is preparing. Runtime only — see `setPreparingEntries`. */
   private _preparingEntryIds: string[] = [];
 
   constructor(library?: LibraryStoreClass) {

@@ -214,6 +214,8 @@ export function DESSnapshotMenu({ viewer }: UISlotProps) {
         const text = await file.text();
         const control = ctl();
         if (!control?.restoreJson) return;
+        // An async restore waits for transient snapshot gates (PLC deploy, script load) instead of refusing.
+        await control.whenCycleOwnersReady?.();
         control.restoreJson(text);
         snapshotFeedback.post('Snapshot loaded.', 'success');
       } catch (e) { snapshotFeedback.post(snapshotRefusalText(e), 'warning'); }

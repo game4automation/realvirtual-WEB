@@ -54,6 +54,7 @@ This repository is the **community edition** of realvirtual. It contains the com
 | [Stereo 3D](https://realvirtual.io/doc/web/immersive/stereo-3d/) *(Beta)* | — | Included | Included |
 | [Display walls](https://realvirtual.io/doc/web/immersive/display-wall/) *(Beta)* | — | Included | Included |
 | [Flystick control](https://realvirtual.io/doc/web/immersive/display-wall/#use-flysticks) *(Beta)* | — | Included | Included |
+| [Ray-traced render mode](https://realvirtual.io/doc/web/getting-started/viewer/ray-traced-rendering/) *(Beta)* | — | Included | Included |
 | [Guided maintenance (the machine follows the steps)](https://realvirtual.io/doc/web/hmi/guided-maintenance/) | — | Included | Included |
 | **Simulate** | | | |
 | [Transport simulation (drives, sensors, conveyors, sources/sinks, grippers, LogicSteps)](https://realvirtual.io/doc/web/components/material-flow/) | Included | Included | Included |
@@ -84,7 +85,8 @@ This repository is the **community edition** of realvirtual. It contains the com
 | **Integrate** | | | |
 | [Plugin system and MCP bridge for AI assistants](https://realvirtual.io/doc/web/connect/development/ai-bridge/) | Included | Included | Included |
 | [USD live link to NVIDIA Isaac Sim (incl. Kit extension)](https://realvirtual.io/doc/web/physical-ai/isaac-sim-live-link/) | Included | Included | Included |
-| [USD export](https://realvirtual.io/doc/web/physical-ai/isaac-sim-live-link/) | — | Included | Included |
+| [USD export](https://realvirtual.io/doc/web/physical-ai/usd-export-import/) | — | Included | Included |
+| [USD animation recording](https://realvirtual.io/doc/web/physical-ai/usd-record-animation/) | — | Included | Included |
 
 **Industrial interfaces (realvirtual CONNECT):** \* with a realvirtual CONNECT licence (annual or lifetime) or a licensed realvirtual site. Every tier supports every protocol.
 
@@ -122,6 +124,19 @@ Assemble factory layouts directly in the browser — drag conveyors, robots, fix
 ![Layout Planner — the library panel with conveyors and pallets, placing a snap-connected chain conveyor on the grid](docs/images/screenshot-layout-planner.jpg)
 
 **Try it live:** Open the [public demo](https://web.realvirtual.io/demo) and choose **Layout planning** on the welcome screen.
+
+### Material Flow Simulation (DES)
+Answer planning questions with discrete event simulation directly in the browser: how many AGVs or forklifts a line needs, how large a buffer must be, where the bottleneck is, and what a layout variant changes in throughput. The simulation jumps from event to event, so a simulated day takes seconds; you can still watch it animated at real time or 5x to 50x.
+
+- **Statistics** — utilization and output per hour for every source, conveyor, sink and vehicle, as in-scene badges and in a statistics window, with a warm-up period before measuring.
+- **Repeatable runs** — a fixed random seed gives the same run on every reset; every component draws from its own random stream.
+- **Checkpoints and snapshots** — save the state of a run, load it later and continue event by event.
+- **Scripting** — model scripts for component behaviour and TypeScript project code for larger control logic.
+- **Experiment manager** *(commercial module)* — compare variants side by side with repeated runs, matching random seeds and 95 % confidence intervals.
+
+![DES — the PalletYard example at 50x after a 1 h warm-up: in-scene badges with utilization and output per hour above conveyors and forklifts](docs/images/screenshot-des-palletyard.jpg)
+
+**Try it live:** Open the [PalletYard example](https://web.realvirtual.io/demo/?doc=doc_palletyard_hzmdb6&mode=des) in the public demo, where the experiment manager is fully usable. Documentation: [Discrete event simulation](https://realvirtual.io/doc/web/des/overview/).
 
 ### Virtual Commissioning
 Validate PLC code against the simulated machine instead of on the shop floor. Connect the controller — real hardware or a virtual PLC such as Siemens PLCSIM Advanced — through realvirtual CONNECT and open the model in the **Commissioning** workspace (`?mode=commissioning`): link interface signals to drives and sensors by drag & drop, force and monitor signals, test axes, and run the transport simulation against the live PLC. Because the twin runs in the browser, automation engineers, integrators and customers can commission together from anywhere — no Unity or desktop installation required.

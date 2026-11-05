@@ -22,10 +22,11 @@ const manifest = loadTierManifest(privateRoot);
 
 /** The features whose adapters must reach every commercial customer. */
 // plan-646 F14: `demo-welcome` is restricted too — entitled only by bunny-deploy's DEMO_PROFILE.
-// plan-762: the ray traced render mode is an internal render test (restricted like omniverse).
-const RESTRICTED_FEATURES = ['agents', 'omniverse', 'demo-welcome', 'raytraced-render'];
+// plan-767: the ray traced render mode left the restricted tier for commercial beta (2026-11-04).
+const RESTRICTED_FEATURES = ['agents', 'omniverse', 'demo-welcome'];
 // maintenance-runtime left beta on 2026-11-03 (Thomas).
 // plan-2215: stereo, display-wall and flystick moved to the commercial tier as beta (2026-11-04).
+// plan-767: raytraced-render followed as commercial beta the same day.
 const BETA_FEATURES = ['display-wall', 'flystick', 'ik-solver', 'machining', 'mujoco', 'physics', 'raytraced-render', 'stereo'];
 /**
  * plan-680: DES is part of the AGPL core — no manifest registration any more. Since 92af3545
@@ -89,8 +90,10 @@ describe('feature matrix visibility', () => {
     // 31 since plan-2014 added the motion-trail commercial feature (swept-volume trail).
     // 32 since plan-2211 made the experiment manager commercial.
     // 35 since plan-2215 registered stereo, display-wall and flystick as commercial beta features.
-    expect(Object.keys(manifest.registrations)).toHaveLength(35);
-    expect(matrix).toMatch(/\| raytraced-render \| restricted \| beta \| no \|/);
+    // Still 35 after plan-767: raytraced-render changed tier (restricted -> commercial), no new id.
+    // 36 since usd-record-animation split animated recording from usd-export (commercial).
+    expect(Object.keys(manifest.registrations)).toHaveLength(36);
+    expect(matrix).toMatch(/\| raytraced-render \| commercial \| beta \| yes \|/);
     // The internal report still shows what an unentitled restricted feature costs: a "no".
     expect(matrix).toMatch(/\| agents \| restricted \| stable \| no \|/);
   });

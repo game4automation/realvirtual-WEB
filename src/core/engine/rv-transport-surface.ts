@@ -1388,8 +1388,10 @@ export class RVTransportSurface implements RVComponent {
   private _updateLinearTexture(dt: number): void {
     // speed is mm/s, /MM_TO_METERS converts to m/s (matches Unity's /Scale)
     const speedFactor = this.TextureScale * dt * this.speed / MM_TO_METERS;
-    // Use raw Unity local direction for UV (UV coords are in Unity space)
-    const du = this._uvDirX * speedFactor;
+    // Use raw Unity local direction for UV (UV coords are in Unity space). A belt that runs
+    // along local Y only (CAD frames) scrolls in U: its UVs are authored that way.
+    const alongY = this._uvDirX === 0 && this._uvDirZ === 0;
+    const du = (alongY ? this._uvDirY : this._uvDirX) * speedFactor;
     const dv = this._uvDirZ * speedFactor;
 
     scrollMaps(this._texMaps, du, dv);

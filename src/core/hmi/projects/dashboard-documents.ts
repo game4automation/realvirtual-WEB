@@ -66,7 +66,11 @@ export interface DocumentCardPicture {
  * names its sidecar by pointer.
  */
 export function documentCardPicture(input: DocumentCardRowInput): DocumentCardPicture {
-  if (input.catalogEntry) return { entry: input.catalogEntry, thumbnailPointer: null };
+  // A library project's document brings its pointer (plan-778); a catalog asset its own url.
+  if (input.catalogEntry) {
+    const own = input.catalogEntry.thumbnailUrl ? null : input.catalogEntry.thumbnailPointer ?? null;
+    return { entry: input.catalogEntry, thumbnailPointer: own };
+  }
   // A project document is not a catalog entry and never will be; the card only
   // reads `name`/`thumbnailUrl`/`category` off it, so the honest thing is a
   // minimal stand-in rather than a fake catalog row.
@@ -278,4 +282,17 @@ export function formatDocumentSize(bytes: number | null | undefined): string | n
   if (bytes < 1000 * 1000) return `${(bytes / 1000).toFixed(1)} kB`;
   if (bytes < 1000 * 1000 * 1000) return `${(bytes / (1000 * 1000)).toFixed(1)} MB`;
   return `${(bytes / (1000 * 1000 * 1000)).toFixed(2)} GB`;
+}
+
+/**
+ * The detail pane's subtitle for a document: where it lives (`models/`) and,
+ * for a sample, that it is read-only — `models/ · Read-only`. Null when
+ * neither applies (a document at the project root that may be changed).
+ */
+export function documentSubtitle(
+  doc: { section?: unknown; path?: unknown } | null | undefined,
+  readOnly: boolean,
+): string | null {
+  const parts = [documentRoleBadge(doc), readOnly ? 'Read-only' : ''].filter(Boolean);
+  return parts.length > 0 ? parts.join(' · ') : null;
 }

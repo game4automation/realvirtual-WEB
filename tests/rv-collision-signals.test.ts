@@ -18,14 +18,19 @@ import { __resetCollisionAlertStore, getCollisionAlertSnapshot } from '../src/co
 
 const DT = 1 / 60;
 
-function setupCollidingScene() {
-  const s = twoBodyScene(0.5);          // already overlapping
+/** Baked two-body scene, armed apart for one tick, then pushed into contact
+ *  (a pair overlapping at its first evaluation would be a quiet start baseline). */
+async function setupCollidingScene() {
+  const s = await twoBodyScene(5);
   const store = new SignalStore();
   const manager = new RVCollisionManager();
+  manager.setGeometrySource(s.bakeRegistry);
   manager.setHighlightHost(new FakeHighlightHost());
   manager.attachSignals(store);
   manager.register(s.robot, 'Robot');
   manager.register(s.machine, 'Machine');
+  manager.update(DT);
+  s.machine.position.set(0.5, 0.2, 0.1);
   return { ...s, store, manager };
 }
 
@@ -41,8 +46,8 @@ describe('collision signals', () => {
     expect(store.get(SIGNAL_RESET_COLLISIONS)).toBe(false);
   });
 
-  it('mirrors state into signals and resets on a rising ResetCollisions edge', () => {
-    const { manager, store } = setupCollidingScene();
+  it('mirrors state into signals and resets on a rising ResetCollisions edge', async () => {
+    const { manager, store } = await setupCollidingScene();
     manager.update(DT);
     expect(store.get(SIGNAL_COLLISION_ACTIVE)).toBe(true);
     expect(store.get(SIGNAL_COLLISION_COUNT)).toBe(1);
@@ -53,8 +58,8 @@ describe('collision signals', () => {
     expect(getCollisionAlertSnapshot().pairs).toHaveLength(0);
   });
 
-  it('ignores a falling edge and a repeated true (edge, not level)', () => {
-    const { manager, store } = setupCollidingScene();
+  it('ignores a falling edge and a repeated true (edge, not level)', async () => {
+    const { manager, store } = await setupCollidingScene();
     manager.update(DT);
     store.set(SIGNAL_RESET_COLLISIONS, true);
     manager.update(DT);                                  // reports again
@@ -70,8 +75,8 @@ describe('collision signals', () => {
     expect(store.get(SIGNAL_COLLISION_ACTIVE)).toBe(false);
   });
 
-  it('writes only on change (no per-tick signal traffic)', () => {
-    const { manager, store } = setupCollidingScene();
+  it('writes only on change (no per-tick signal traffic)', async () => {
+    const { manager, store } = await setupCollidingScene();
     const seen: (boolean | number)[] = [];
     store.subscribe(SIGNAL_COLLISION_COUNT, (v) => seen.push(v));
     manager.update(DT);
@@ -80,8 +85,8 @@ describe('collision signals', () => {
     expect(seen).toEqual([1]);
   });
 
-  it('detaches cleanly so a model switch cannot write to a dead store', () => {
-    const { manager, store } = setupCollidingScene();
+  it('detaches cleanly so a model switch cannot write to a dead store', async () => {
+    const { manager, store } = await setupCollidingScene();
     manager.update(DT);
     expect(store.get(SIGNAL_COLLISION_ACTIVE)).toBe(true);
 

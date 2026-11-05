@@ -73,6 +73,12 @@ export function toStoredMapping(
       delete out.componentPath;
     }
   }
+  // In-memory marker — never written.
+  delete out.sourceUnresolved;
+  // A carried address is kept, never re-derived from the name (doc-node-paths.md § 5.4).
+  if (mapping.sourceKind === 'internal' && typeof mapping.sourceAddress === 'string' && mapping.sourceAddress) {
+    return out;
+  }
   if (mapping.sourceKind === 'internal' && store && mapping.signal) {
     const path = store.getPath(mapping.signal);
     const node = path ? registry.getNode(path) : null;
@@ -83,11 +89,32 @@ export function toStoredMapping(
   return out;
 }
 
+/** What an internal source's `sourceAddress` names right now. */
+export type SourceAddressResolution =
+  | { status: 'resolved'; name: string; path: string }
+  | { status: 'pending' }
+  | { status: 'missing' };
+
+/** `sourceAddress` (main document) to the signal name its node carries now; never a stored name. */
+export function resolveSourceAddress(
+  registry: NodeRegistry,
+  store: SignalStore,
+  sourceAddress: string,
+): SourceAddressResolution {
+  const r = registry.resolveRefInOccurrence(ROOT_OCCURRENCE, { address: sourceAddress });
+  if (r.status === 'pending') return { status: 'pending' };
+  if (r.status !== 'resolved') return { status: 'missing' };
+  const path = registry.getPathForNode(r.node);
+  const name = path ? store.exactNameForPath(path) : undefined;
+  return name && path ? { status: 'resolved', name, path } : { status: 'missing' };
+}
+
 /**
  * The in-memory copy of a stored mapping: `componentPath` derived from
  * `componentAddress` when it is missing (a node the address names no more keeps the
  * address only — the binding manager then reports it unresolved), and the signal NAME
- * of an internal source taken from `sourceAddress` when that names a registered signal.
+ * of an internal source taken from `sourceAddress`; a miss marks `sourceUnresolved`
+ * (no name fallback, doc-node-paths.md § 5.4).
  */
 export function fromStoredMapping(
   mapping: SignalMapping,
@@ -96,17 +123,16 @@ export function fromStoredMapping(
   store?: SignalStore | null,
 ): SignalMapping {
   const out: SignalMapping = { ...mapping };
+  delete out.sourceUnresolved;
   if (!bindRoot || !registry) return out;
   if (out.componentPath === undefined && typeof out.componentAddress === 'string' && out.componentAddress) {
     const node = registry.resolveAddressIn(bindRoot, out.componentAddress);
     if (node) out.componentPath = relativeComponentPath(bindRoot, node, registry);
   }
   if (out.sourceKind === 'internal' && typeof out.sourceAddress === 'string' && out.sourceAddress && store) {
-    const root = registry.rootOfOccurrence(ROOT_OCCURRENCE);
-    const node = root ? registry.resolveAddressIn(root, out.sourceAddress) : null;
-    const path = node ? registry.getPathForNode(node) : null;
-    const name = path ? store.exactNameForPath(path) : undefined;
-    if (name) out.signal = name;
+    const r = resolveSourceAddress(registry, store, out.sourceAddress);
+    if (r.status === 'resolved') out.signal = r.name;
+    else out.sourceUnresolved = r.status;
   }
   return out;
 }

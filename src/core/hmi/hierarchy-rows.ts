@@ -668,9 +668,9 @@ export function watchHierarchyFilterValidation(opts: FilterValidationOptions): (
  */
 export function subscribeStructure(
   objects: readonly Object3D[],
-  onChange: () => void,
+  onChange: (child: Object3D, removed: boolean) => void,
 ): () => void {
-  const listener = () => onChange();
+  const listener = (e: { type: string; child?: Object3D }) => onChange(e.child!, e.type === 'childremoved');
   for (const object of objects) {
     object.addEventListener('childadded', listener);
     object.addEventListener('childremoved', listener);
@@ -681,6 +681,14 @@ export function subscribeStructure(
       object.removeEventListener('childremoved', listener);
     }
   };
+}
+
+/** Does this add/remove change the tree? Hidden runtime helpers never do. Call after the frame. */
+export function structureChangeMatters(
+  child: Object3D, removed: boolean, hide: boolean,
+  shown: ReadonlySet<Object3D>, getPath: (o: Object3D) => string | null,
+): boolean {
+  return !hide || (removed ? shown.has(child) : !!child.parent && !isRuntimeNode(child, getPath(child)));
 }
 
 /** The objects a row set must listen on: every rendered row that is expanded

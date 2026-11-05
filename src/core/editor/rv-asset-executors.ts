@@ -42,11 +42,13 @@ import type { Material } from 'three';
 import type { RVViewer } from '../rv-viewer';
 import type { RVDrive } from '../engine/rv-drive';
 import { NodeRegistry } from '../engine/rv-node-registry';
+import { removeSensorsFrom } from '../engine/rv-sensor-registration';
 import { isModelRoot } from '../engine/rv-model-root';
 import {
   writeUserDataField,
   deleteUserDataField,
   reapplySchemaForComponent,
+  syncSignalLinksRuntime,
 } from '../hmi/scene/rv-scene-executors';
 import {
   constructComponentOnNode,
@@ -1211,6 +1213,7 @@ export class AssetExecutorContext {
         this._restoreInstanceOverride(op);
         this._reapplyOrDefer(op.nodePath, op.componentType);
         this._syncSignals(this._node(op.nodePath));
+        this._syncSignalLinks(op);
         this.viewer.markRenderDirty();
         return;
       }
@@ -1219,6 +1222,7 @@ export class AssetExecutorContext {
         this._restoreInstanceOverride(op);
         this._reapplyOrDefer(op.nodePath, op.componentType);
         this._syncSignals(this._node(op.nodePath));
+        this._syncSignalLinks(op);
         this.viewer.markRenderDirty();
         return;
       }
@@ -1962,7 +1966,7 @@ export class AssetExecutorContext {
     if (!tm) return;
     const isRemoved = (c: { node: Object3D }): boolean =>
       removedPaths.has(NodeRegistry.computeNodePath(c.node));
-    tm.sensors = tm.sensors.filter((s) => !isRemoved(s));
+    removeSensorsFrom(tm, isRemoved);
     tm.surfaces = tm.surfaces.filter((s) => !isRemoved(s));
     // Sources hold ghost materials; dispose the ones the sweep above missed.
     for (const s of tm.sources) {
@@ -2840,7 +2844,19 @@ export class AssetExecutorContext {
     }
     this._reapplyOrDefer(op.nodePath, op.componentType);
     this._syncSignals(this._node(op.nodePath));
+    this._syncSignalLinks(op);
     this.viewer.markRenderDirty();
+  }
+
+  /**
+   * plan-2233: a write to `SignalLinks.Mappings` (do, undo, redo) reaches the binding
+   * persistence cache and the runtime bindings, exactly as in the planner's document
+   * (`syncSignalLinksRuntime`) — so a slot bound in the editor is bound, not just stored.
+   */
+  private _syncSignalLinks(op: { nodePath: string; componentType: string; fieldName: string }): void {
+    if (op.componentType !== 'SignalLinks' || op.fieldName !== 'Mappings') return;
+    const live = this._node(op.nodePath)?.userData?.realvirtual as Record<string, Record<string, unknown>> | undefined;
+    syncSignalLinksRuntime(this.viewer, op.nodePath, op.componentType, op.fieldName, live?.SignalLinks?.Mappings);
   }
 
   /**
@@ -2909,6 +2925,7 @@ export class AssetExecutorContext {
     }
     this._reapplyOrDefer(op.nodePath, op.componentType);
     this._syncSignals(this._node(op.nodePath));
+    this._syncSignalLinks(op);
     this.viewer.markRenderDirty();
   }
 
