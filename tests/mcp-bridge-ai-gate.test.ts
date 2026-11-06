@@ -15,7 +15,7 @@
  *
  * §9.2 gate (security):
  * - AI off: `discover.tools` is empty, `viewer_status.ai === false`;
- * - AI off: web_status, web_ping, a bound alias (listed:false) and an unknown
+ * - AI off: web_status, web_ping, a removed tool name and an unknown
  *   name are all refused with `AI_DISABLED:` — the tool body never runs;
  * - AI off: a registered INTERNAL tool still answers;
  * - on → full discover (count = mcpToolCount), off → empty again; a call that
@@ -284,7 +284,7 @@ describe('McpBridgePlugin AI gate (plan-668 §9.2, security)', () => {
   it.each([
     ['web_status'],
     ['web_ping'],
-    ['web_editor_to_ground'], // a bound alias — listed:false, still callable when AI is on
+    ['web_editor_to_ground'], // a removed tool name, also refused with AI off
     ['web_unknown_tool'],
   ])('AI off: %s is refused with AI_DISABLED and the tool body never runs', async (tool) => {
     const plugin = start(CONNECT_SERVED, false);
@@ -317,8 +317,7 @@ describe('McpBridgePlugin AI gate (plan-668 §9.2, security)', () => {
     const on = ofType<DiscoverFrame>(socket, 'discover').at(-1)!;
     expect(on.ai).toBe(true);
     expect(on.tools.length).toBeGreaterThan(0);
-    // plan-2007: the catalog also carries the unlisted tombstones, which have no dispatcher entry.
-    expect(on.tools.filter((t) => !(t as { tombstone?: boolean }).tombstone).length).toBeLessThanOrEqual(plugin.mcpToolCount);
+    expect(on.tools.length).toBeLessThanOrEqual(plugin.mcpToolCount);
     expect(on.instructions.length).toBeGreaterThan(0);
     expect(ofType<{ ai?: boolean }>(socket, 'viewer_status').at(-1)!.ai).toBe(true);
     expect((await call(socket, 10, 'web_status')).error).toBeUndefined();

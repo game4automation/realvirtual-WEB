@@ -82,6 +82,8 @@ interface ActiveWait {
   active: boolean;
   start: number;
   pausedAt: number | null;
+  /** Episode memory: once a foreign blocker is seen, keep it until resume. Missing in older snapshots means self. */
+  pauseReason?: 'self' | 'blocker';
   limit: number;
   handle: ClockHandle | null;
   reported: boolean;
@@ -98,6 +100,8 @@ interface ActiveWait {
 export interface WaitResolver {
   detail(vehicle: string, kind: string, desc: JsonValue): WaitCause | string | undefined;
   valid(vehicle: string, kind: string, desc: JsonValue): boolean;
+  /** Last chance to pause a due wait, without mutating read-only validity / edge queries. */
+  beforeTimeout?(vehicle: string, kind: string, desc: JsonValue): void;
 }
 
 export interface WaitWatchOptions {
@@ -174,13 +178,14 @@ export class WaitWatch implements WaitEdgeSource {
   }
 
   validateState(value: unknown): string[] {
-    const sample = { nextToken: 0, defaultLimit: 0, entries: [{ vehicle: '', kind: '', active: false, start: 0, pausedAt: null,
+    const sample = { nextToken: 0, defaultLimit: 0, entries: [{ vehicle: '', kind: '', active: false, start: 0, pausedAt: null, pauseReason: '',
       limit: 0, handle: null, reported: false, token: 0, desc: null, passive: false, lastTimeout: null }],
       stats: [{ kind: '', count: 0, active: 0, totalSec: 0, maxSec: 0, timeouts: 0 }] };
-    // Normalize only the two encoded number fields for structural validation.
+    // Normalize encoded numbers and optional legacy pause fields for structural validation.
     const raw = value as WaitWatchState | null;
     const normalized = raw && typeof raw === 'object' ? { ...raw, defaultLimit: 0,
-      entries: Array.isArray(raw.entries) ? raw.entries.map(w => w && typeof w === 'object' ? { ...w, pausedAt: w.pausedAt ?? null, limit: 0, desc: null } : w) : raw.entries } : raw;
+      entries: Array.isArray(raw.entries) ? raw.entries.map(w => w && typeof w === 'object' ? { ...w, pausedAt: w.pausedAt ?? null,
+        pauseReason: w.pauseReason === undefined ? 'self' : w.pauseReason, limit: 0, desc: null } : w) : raw.entries } : raw;
     const errors = validateShape(normalized, sample);
     if (!raw || !validNumber(raw.defaultLimit)) errors.push('wait: invalid default limit');
     if (errors.length) return errors;
@@ -191,6 +196,7 @@ export class WaitWatch implements WaitEdgeSource {
       if (!isJson(w.desc) || !validNumber(w.limit) || !w.vehicle || !w.kind || keys.has(key) || !integer(w.token) || w.token > s.nextToken || !validHandle(w.handle)) errors.push('wait: invalid entry');
       // Snapshots written before the failure pause carry no `pausedAt` (= not paused).
       if (w.pausedAt != null && (!Number.isFinite(w.pausedAt) || w.pausedAt < w.start)) errors.push('wait: invalid pause time');
+      if (w.pauseReason !== undefined && w.pauseReason !== 'self' && w.pauseReason !== 'blocker') errors.push('wait: invalid pause reason');
       keys.add(key);
       if (w.lastTimeout !== null) errors.push(...validateShape(w.lastTimeout,
         { id: '', ['code']: '', severity: '', title: '', detail: '' } /* shape template, not a Problems entry */));
@@ -248,6 +254,7 @@ export class WaitWatch implements WaitEdgeSource {
     w.active = true;
     w.start = this.clock.now();
     w.pausedAt = null;
+    delete w.pauseReason;
     w.limit = limitSec ?? this.defaultLimit;
     w.reported = false;
     w.token = ++this.nextToken;
@@ -260,19 +267,21 @@ export class WaitWatch implements WaitEdgeSource {
     }
   }
 
-  /** Pause a deadline during a vehicle failure, preserving the elapsed budget. */
-  setPaused(vehicle: string, kind: string, paused: boolean): void {
+  /** Only a pure self-failure episode preserves elapsed budget; any foreign blocker grants a full limit on resume. */
+  setPaused(vehicle: string, kind: string, paused: boolean, reason: 'self' | 'blocker' = 'self'): void {
     const w = this.waits.get(vehicle)?.get(kind);
     if (!w?.active || w.reported) return;
     if (paused) {
+      w.pauseReason = w.pauseReason === 'blocker' ? 'blocker' : reason;
       if (w.pausedAt !== null) return;
       w.pausedAt = this.clock.now();
       this.clock.cancel(w.handle);
       w.handle = null;
     } else {
       if (w.pausedAt === null) return;
-      w.start += this.clock.now() - w.pausedAt;
+      w.start = w.pauseReason === 'blocker' ? this.clock.now() : w.start + (this.clock.now() - w.pausedAt);
       w.pausedAt = null;
+      delete w.pauseReason;
       if (!w.passive && Number.isFinite(w.limit) && w.limit > 0)
         w.handle = this.clock.scheduleAction(w.start + w.limit, 'fleet.wait.limit', { vehicle, kind, token: w.token });
     }
@@ -374,6 +383,8 @@ export class WaitWatch implements WaitEdgeSource {
 
   private onLimit(w: ActiveWait, token: number): void {
     if (!w.active || w.pausedAt !== null || w.token !== token || w.reported) return;
+    this.resolver?.beforeTimeout?.(w.vehicle, w.kind, w.desc);
+    if (!w.active || w.pausedAt !== null || w.token !== token || w.reported) return;
     w.reported = true;
     this.statsFor(w.kind).timeouts++;
     this.onTimeout?.(w.vehicle, w.kind, w.limit);
@@ -394,6 +405,7 @@ export class WaitWatch implements WaitEdgeSource {
 
   private close(w: ActiveWait): void {
     w.active = false;
+    delete w.pauseReason;
     w.token = ++this.nextToken;
     if (this.cancelOnEnd) this.clock.cancel(w.handle);
     w.handle = null;

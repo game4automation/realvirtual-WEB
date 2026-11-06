@@ -22,6 +22,7 @@
 
 import { addressRuleFor, isProcessImageAddress } from './rv-iface-signal-slots';
 import { schemaDataType } from './rv-fill-addresses';
+import { dataTypeKind } from './rv-signal-reconcile';
 import type { ModelPlcSignal } from './rv-plc-automap';
 import type {
   ConnectConfigOp,
@@ -258,11 +259,9 @@ function cell(row: AddressTableRow, index: number | null): string {
 
 function kindOfDataType(dataType: string | undefined): 'Bool' | 'Int' | 'Float' | 'Text' {
   const d = (dataType ?? '').trim().toUpperCase();
-  if (d === 'BOOL' || d === 'BIT' || d === 'BOOLEAN') return 'Bool';
-  if (d === 'REAL' || d === 'LREAL' || d === 'FLOAT' || d === 'DOUBLE') return 'Float';
   if (/^(TEXT|STRING|W?STRING(\s*[[(]\s*\d+\s*[\])])?)$/.test(d)) return 'Text';
   if (d === '') return 'Float';
-  return 'Int';
+  return dataTypeKind(d) ?? 'Int';
 }
 
 /** The container a row goes to, or the reason it cannot be decided. */

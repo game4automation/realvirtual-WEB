@@ -6,7 +6,6 @@ import { commandRegistry } from '../src/core/hmi/rv-command-registry';
 import { ensureDocumentCommandsRegistered } from '../src/core/hmi/document-commands';
 import { ensureSignalAutomapCommandsRegistered } from '../src/core/hmi/signal-automap-commands';
 import { McpCommandTools } from '../src/plugins/mcp-bridge/rv-mcp-command-tools';
-import { movedToolAnswer, movedToolOf } from '../src/plugins/mcp-bridge/rv-mcp-moved-tools';
 import { resetProjectStore } from '../src/core/project/project-store';
 import { installFakeDocumentProject, type FakeDocumentProject } from './helpers/fake-document-project';
 import { AUTOMAP_CATEGORIES, summariseReport, type AutoMapReport } from '../src/core/import/rv-plc-automap';
@@ -211,6 +210,6 @@ it.each([
   ['web_document_bind', ['document.bind']],
   ['web_import_usd_extras_commit', ['document.usdExtrasCommit']],
   ['web_signal_automap', ['signal.automapApply', 'signal.automapCheck']],
-] as const)('%s answers MOVED with every target', (name, ids) => {
-  expect(JSON.parse(movedToolAnswer(movedToolOf(name)!))).toMatchObject({ error: 'MOVED', movedTo: ids, use: 'web_execute' });
+] as const)('%s is replaced by registered commands', (name, ids) => {
+  for (const id of ids) expect(commandRegistry.get(id), id).toBeDefined();
 });

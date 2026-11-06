@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { useState, useEffect, type ReactNode } from 'react';
+import { useState, useEffect, useSyncExternalStore, type ReactNode } from 'react';
 import { Typography, Box, Button, Switch, TextField } from '@mui/material';
 import { useViewer } from '../../../hooks/use-viewer';
 import { useMcpBridge, useMcpBridgeLog } from '../../../hooks/use-mcp-bridge';
@@ -17,13 +17,13 @@ import { RagStatusSection } from './RagStatusSection';
 import { useAiClicks } from '../ai-click-choreography-store';
 import { useCommandView } from '../rv-command-view';
 import { useFollowAgent, setFollowAgent } from '../follow-agent-store';
+import { FALLBACK_GATEWAY_URL, getConnectSnapshot, subscribeConnectStore } from '../connect-store';
 
 /** The default transport: realvirtual CONNECT hosts the MCP endpoint itself, so any
  *  MCP client registers ONE http entry and needs neither Node nor Vite (plan-327 AP5). */
-const CONNECT_MCP_SNIPPET = `"realvirtual-CONNECT": {
-  "type": "http",
-  "url": "http://localhost:5100/mcp"
-}`;
+function connectMcpSnippet(url: string): string {
+  return `"realvirtual-CONNECT": ${JSON.stringify({ type: 'http', url }, null, 2)}`;
+}
 
 /** Emergency fallback only — see doc-ai-integration.md → "Falling back to the Node bridge". */
 const NODE_FALLBACK_SNIPPET = `"WebViewerMCP": {
@@ -88,6 +88,9 @@ function SetupStep({ n, title, children }: { n: number; title: string; children:
 export function McpTab() {
   const viewer = useViewer();
   const mcp = useMcpBridge();
+  const connect = useSyncExternalStore(subscribeConnectStore, getConnectSnapshot);
+  const connectUrl = (connect.serverUrl.trim() || FALLBACK_GATEWAY_URL).replace(/\/+$/, '');
+  const connectMcpUrl = `${connectUrl}/mcp`;
   const followAgent = useFollowAgent();
   const aiClicks = useAiClicks();
   const aiClicksCommand = useCommandView({ id: 'view.aiClicks', viewer, args: () => ({ on: !aiClicks }) });
@@ -281,17 +284,16 @@ export function McpTab() {
             <SetupStep n={2} title="Register CONNECT with Claude Code">
               <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.65)' }}>
                 Add this to your <code>.mcp.json</code>. Claude Desktop (classic) has no native
-                HTTP client — start it through <code>npx -y mcp-remote http://localhost:5100/mcp
+                HTTP client — start it through <code>npx -y mcp-remote {connectMcpUrl}
                 --allow-http</code> instead.
               </Typography>
-              <CodeBlock text={CONNECT_MCP_SNIPPET} />
+              <CodeBlock text={connectMcpSnippet(connectMcpUrl)} />
             </SetupStep>
             <SetupStep n={3} title="Restart Claude, then turn AI control on (toggle above)">
               <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.65)' }}>
-                Leave the port at <code>5100</code> — that is CONNECT. Running against the Vite dev
-                server works too: open it with <code>?mcpPort=5100</code>, or just leave the
-                default. On a hosted page (web.realvirtual.io) the bridge connects to localhost
-                automatically; confirm once in the tray.
+                Scene access follows the CONNECT address <code>{connectUrl}</code> in hosted and
+                Vite views. A custom bridge port overrides this address. On a hosted page,
+                confirm the connection once in the CONNECT tray.
               </Typography>
             </SetupStep>
             <SetupStep n={4} title="Fallback only — the local Node bridge">

@@ -55,6 +55,14 @@ it('one PalletYard determinism measurement per process', async () => {
   expect(Number.isFinite(simSec) && simSec > 0).toBe(true);
   const y = await loadPalletYardScene();
   const runner = new DESRunner({ subMode: 'fastforward', durationSeconds: simSec });
+  // The shipped demo carries one Downtime per AGV (Downtime_Stapler_k, MTBF 3600 s / MTTR 600 s,
+  // since c89786eb). These runs measure determinism and assert that no wait times out; a vehicle
+  // queued behind a broken one legitimately waits past the 60 s exit / 120 s standstill limits.
+  // Switch the demo breakdowns off; an injected fault (`downtime` below) stays the only one.
+  y.root.traverse((n) => {
+    const d = (n.userData?.realvirtual as { Downtime?: Record<string, unknown> } | undefined)?.Downtime;
+    if (d && n.name.startsWith('Downtime_Stapler')) d.Enabled = false;
+  });
   let cleanup = () => {};
   try {
     for (const id of activeOff ?? []) {

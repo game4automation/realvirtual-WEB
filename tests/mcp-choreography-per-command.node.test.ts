@@ -6,7 +6,7 @@ import type { RVViewer } from '../src/core/rv-viewer';
 import type { ToolCommandBinding } from '../src/core/engine/rv-mcp-tools';
 import { commandRegistry, type CommandImpl } from '../src/core/hmi/rv-command-registry';
 import { commandResultJson } from '../src/core/hmi/rv-command-context';
-import { choreographyToolOf } from '../src/plugins/mcp-bridge/rv-mcp-command-choreography';
+import { choreographyKeyOf } from '../src/plugins/mcp-bridge/rv-mcp-command-choreography';
 import { McpCommandTools, setCommandStepHooks } from '../src/plugins/mcp-bridge/rv-mcp-command-tools';
 import { macroJobs } from '../src/plugins/mcp-bridge/rv-mcp-macro';
 
@@ -44,22 +44,16 @@ afterEach(() => {
 });
 
 describe('per-command choreography', () => {
-  it('resolves only plain bindings, alphabetically before moved entries', () => {
+  it('resolves plain bindings alphabetically and otherwise uses a registered command id', () => {
     const dispatcher = new Map<string, { command?: ToolCommandBinding }>([
       ['web_z', { command: 'test.write' }],
       ['web_a', { command: 'test.write' }],
       ['web_branch', { command: { branches: [{ id: 'test.branch', when: {}, args: (wire) => wire }] } }],
     ]);
-    const moved = [
-      { tool: 'web_moved', movedTo: ['test.moved'], door: 'web_execute' as const, example: '' },
-      { tool: 'web_multi', movedTo: ['test.multi', 'test.other'], door: 'web_execute' as const, example: '' },
-      { tool: 'web_old', movedTo: ['test.write'], door: 'web_execute' as const, example: '' },
-    ];
-    expect(choreographyToolOf('test.write', dispatcher, moved)).toBe('web_a');
-    expect(choreographyToolOf('test.branch', dispatcher, moved)).toBeUndefined();
-    expect(choreographyToolOf('test.moved', dispatcher, moved)).toBe('web_moved');
-    expect(choreographyToolOf('test.multi', dispatcher, moved)).toBeUndefined();
-    expect(choreographyToolOf('unknown', dispatcher, moved)).toBeUndefined();
+    expect(choreographyKeyOf('test.write', dispatcher)).toBe('web_a');
+    expect(choreographyKeyOf('test.branch', dispatcher)).toBeUndefined();
+    expect(choreographyKeyOf('test.read', dispatcher)).toBe('test.read');
+    expect(choreographyKeyOf('unknown', dispatcher)).toBeUndefined();
   });
 
   it('brackets execute once with parsed args, captured context and an opaque token', async () => {

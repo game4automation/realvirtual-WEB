@@ -43,6 +43,8 @@ export interface ContinuationOptions {
   T: number;
   TPrime: number;
   T2: number;
+  /** Test-only fault injection, after either in-place or fresh-world restore. */
+  afterRestore?(world: ContinuationWorld): void | Promise<void>;
 }
 
 /** Sort object keys only. Array order, floats, envelope and fingerprint are exact. */
@@ -107,6 +109,7 @@ export async function assertContinuation(options: ContinuationOptions): Promise<
       world = await buildWorld();
       world.runner.restoreFull(JSON.parse(text));
     }
+    await options.afterRestore?.(world);
     const start = world.trace().length;
     if (end > T) await world.step(end);
     const actual = observe(world, start);

@@ -21,7 +21,7 @@
  * methods ON the plugin and read `this.drives` / `this.signals` and friends.
  *
  * Runtime writes use registry commands through web_execute (plan-2007).
- * The former alias names are tombstones for one release.
+ * The former tool names were removed in 6.7.1; use web_execute / web_query.
  */
 
 import type { RVViewer } from '../../core/rv-viewer';

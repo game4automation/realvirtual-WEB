@@ -16,7 +16,7 @@ import { continuationWorld } from './continuation-world-fixture';
 import { ACTION_INDEX } from '../../src/plugins/des/rv-des-named-actions';
 
 export const SCENES = ['PalletYard', 'DemoRealvirtualWeb', 'LaserWeldingAssemblyStation',
-  'AGVDemo', 'AGVFactory', 'Course', 'Test-DES-Turntable-Loop', 'DemoPlanner'] as const;
+  'AGVDemo', 'AGVFactory', 'Course', 'Test-DES-Turntable-Loop', 'DemoPlanner', 'FanucCRX-10iA-L'] as const;
 export type Scene = typeof SCENES[number];
 export interface SceneOptions {
   failures?: Array<{ desIdMatch: RegExp | string; at: number; until: number }>;
@@ -25,10 +25,13 @@ export interface SceneOptions {
   setup?(v: import('../../src/core/rv-viewer').RVViewer): void;
   /** Awaited after the scene is wired and before DES mode starts (e.g. programs deployed). */
   ready?(v: import('../../src/core/rv-viewer').RVViewer): Promise<void>;
+  /** Applied after the tick crossing each boundary, including after a restore. */
+  step?(v: import('../../src/core/rv-viewer').RVViewer, before: number, next: number): void;
 }
 
 const bytes = new Map<Scene, Promise<ArrayBuffer>>();
-const urlOf = (scene: Scene) => scene === 'Course' ? '/demo-realvirtual/library/Custom/Course.glb' : `/demo-realvirtual/${scene}.glb`;
+const urlOf = (scene: Scene) => scene === 'FanucCRX-10iA-L' ? '/library/Robots/FanucCRX-10iA-L.glb'
+  : scene === 'Course' ? '/demo-realvirtual/library/Custom/Course.glb' : `/demo-realvirtual/${scene}.glb`;
 function sceneBytes(scene: Scene): Promise<ArrayBuffer> {
   let pending = bytes.get(scene);
   if (!pending) {
@@ -134,6 +137,7 @@ export async function sceneWorld(scene: Scene, opts: SceneOptions = {}) {
           const before = runner.renderClock;
           const next = Math.min((Math.floor(before * 4) + 1) / 4, toT);
           tickTo(next);
+          opts.step?.(v, before, next);
           for (const f of failures) {
             const candidates = runner.liveInstances.filter(i => matches(f.desIdMatch, i.desId!, i.def.type));
             if (before < f.at && next === f.at) {

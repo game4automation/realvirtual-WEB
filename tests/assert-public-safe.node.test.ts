@@ -74,6 +74,19 @@ describe('publish guard', () => {
     expect(output).toContain('scripts/onboard-customer.mjs');
   }, PROCESS_HEAVY);
 
+  it.each([
+    'scripts/library-zone-setup.mjs',
+    'scripts/library-publish.mjs',
+    'perf-results/reference.json',
+    'teams-app/manifest.json',
+    'teams-manifest/manifest.json',
+  ])('blocks internal tooling, data or Teams package path %s', (path) => {
+    const root = repoWith({ [path]: '{}\n' });
+    const { status, output } = runGuard(root);
+    expect(status).toBe(1);
+    expect(output).toContain(path);
+  }, PROCESS_HEAVY);
+
   it('blocks an internal marker in a file that is not on the path list', () => {
     const root = repoWith({ 'scripts/something-new.mjs': `const token = process.env.${INTERNAL_TOKEN_MARKER};\n` });
     const { status, output } = runGuard(root);

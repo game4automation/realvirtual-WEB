@@ -3101,26 +3101,21 @@ routines). "Not yet migrated" is not a reason. Two tests enforce it:
   five plan-729 path tools and the two plan-501 trajectory writes are allow-listed with their
   reasons, and plan-773's seven IK authoring writes are views of `ik.*`).
 
-  The allow-list is meant to **shrink** with every migration. A binding buys three things, and
-  the third is the one that is easy to miss: the enablement rule can no longer drift from a
-  button's tooltip, every model change stays reachable through the one command vocabulary — and
-  a bound tool leaves `tools/list` (`listed: false`, rendered as `alias (web_execute)`), so the
-  surface an agent has to read gets smaller instead of larger. That holds even for a command
-  with no UI counterpart at all, which is why plan-773's IK authoring tools are bound rather
-  than allow-listed.
-- `rv-command-bindings-execution.test.ts` (execution gate): every bound tool dispatches exactly ONE
-  `execute` with the expected id/args (`EXPECTED_DISPATCH`), serialises the pre-migration result
-  shape, and answers a refusal as `{error: reason, ...details}`.
+  The allow-list is meant to **shrink** with every migration. Modelling and simulation
+  capabilities are registry commands reached through `web_execute`; domain reads use `web_query`.
+  The old per-domain tool names were removed in 6.7.1 and are now unknown tools.
+- `rv-command-bindings-execution.test.ts` (execution gate): former tool operations execute their
+  registered command with the expected id/args (`EXPECTED_DISPATCH`) through `web_execute`;
+  refusals preserve the command's reason and details.
 
-Adding a write tool therefore means: bind it (`command:` + an `EXPECTED_DISPATCH` row) or add it
-to the allow-list with its reason — and bump the counts.
+Add a modelling capability as a command; `web_commands` lists its id and argument schema.
 
 ### The generic MCP door and macros (plan-641)
 
-Agents reach EVERY registered command through three generic tools in
-`plugins/mcp-bridge/rv-mcp-command-tools.ts`: `web_commands` (list), `web_execute` (one) and
-`web_batch` (several). A new modelling capability is therefore a new **command**, not a new tool.
-All three — and every bound alias — run through ONE wrapper, `runCommandStep()`, which captures the
+Agents reach EVERY registered command through the generic tools in
+`plugins/mcp-bridge/rv-mcp-command-tools.ts`: `web_commands` (list), `web_execute` (one write),
+`web_batch` (several) and `web_query` (one read). A new modelling capability is therefore a new **command**, not a new tool.
+Command execution runs through ONE wrapper, `runCommandStep()`, which captures the
 context synchronously, executes via `commandRegistry.execute(…, { origin: 'mcp', context })` and
 classifies the outcome (`classifyCommandOutcome`: `ok` | `partial` | `noop` | `failed` |
 `requires-commercial`).

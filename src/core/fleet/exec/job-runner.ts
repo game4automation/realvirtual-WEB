@@ -348,6 +348,7 @@ export class FleetJobRunner {
   private jobHead = 0;
   private jobCount = 0;
   private readonly vehicles = new Map<string, Vehicle>();
+  private readonly sortedVehicleIds: string[];
   private readonly fleet: AgvFleet;
   private readonly docks: PathDockRegistry;
   private readonly zones: ZoneRegistry;
@@ -393,6 +394,7 @@ export class FleetJobRunner {
       this.later('pickBooked', { v: wait.v, station, h: wait.h, hj: wait.hj });
     });
     for (const v of site.vehicles) this.startPaths.set(v.id, v.startPathId);
+    this.sortedVehicleIds = [...this.startPaths.keys()].sort();
     this.fleet = opts.fleet ?? getDefaultAgvFleet();
     this.docks = opts.docks ?? getDefaultPathDockRegistry();
     this.zones = opts.zones ?? getDefaultZoneRegistry();
@@ -409,8 +411,11 @@ export class FleetJobRunner {
       cancelOnEnd: false, onTimeout: (vehicle, kind, limit) => this.onWaitTimeout(vehicle, kind, limit),
     });
     const failureAuthority = getDefaultMovementAuthority(this.adapters.kind);
-    this.disposers.push(failureAuthority.onFrozenChanged((id, frozen) => this.waits.setPaused(id, 'exit', frozen)));
+    this.disposers.push(failureAuthority.onFrozenChanged(() => this.reevaluateFrozenPauses()));
     this.waits.setResolver({
+      beforeTimeout: (vehicle, kind) => {
+        if (kind === 'exit' || kind === 'standstill') this.reevaluateFrozenPause(vehicle, kind);
+      },
       valid: (vehicle, kind) => {
         if (kind !== 'standstill') return true;
         const v = this.vehicles.get(vehicle);
@@ -424,7 +429,7 @@ export class FleetJobRunner {
         if (kind === 'exit') { const zone = d.zone!; return {
       waiterId: v.id, resourceId: zone, ownerIds: this.zones.holdersOf(zone).filter(id => id !== v.id),
       order: this.orderText(v), waitingFor: `stich zone ${zone} to be released`,
-      heldBy: this.zones.holdersOf(zone).join(', ') || 'no current holder',
+      heldBy: this.frozenBlockerText(v) ?? (this.zones.holdersOf(zone).filter(id => id !== v.id).join(', ') || 'no current holder'),
       extra: `fork stays at ${this.lift.position(v.id).toFixed(0)} mm until the stich zone is released.`,
     }; }
         if (kind === 'fork') { const a = { station: d.station!, heightMm: d.heightMm! }; return {
@@ -718,6 +723,70 @@ export class FleetJobRunner {
     return `${job.kind} ${v.at}>${job.kind === 'charge' ? job.charger : this.site.waitPointPathId}`;
   }
 
+  /** Read only: follow explicit leaders, zone holders and FIFO predecessors; visit each vehicle at most once. */
+  private blockedByFrozen(v: Vehicle): string | null {
+    const authority = getDefaultMovementAuthority(this.adapters.kind);
+    const pending = [v.id], seen = new Set(pending);
+    for (let i = 0; i < pending.length && i < this.vehicles.size; i++) {
+      const id = pending[i];
+      if (authority.isFrozen(id)) return id;
+      const plan = authority.planOf(id);
+      if (plan?.stopCause === 'leader' || plan?.stopCause === 'field') {
+        const leader = plan.stopLeaderId;
+        if (leader && !seen.has(leader)) { seen.add(leader); pending.push(leader); }
+      } else if (plan?.stopCause === 'zone' || plan?.stopCause === 'zonePending') {
+        // These are the authority's actual awaited zones, including manoeuvre companions;
+        // the waiter's own stich zone is not necessarily the blocking zone.
+        const awaitedZones = new Set((authority.describeZoneHolds(id)?.waits ?? []).map(wait => wait.zone));
+        if (plan.stopCause === 'zonePending') {
+          // Before the claim window the authority has no waiter entry yet. Its
+          // first unheld zone ahead is the pending claim (planZones stops there).
+          const entry = plan.route.find(e => e.x0 + e.path.length > plan.profile.x0
+            && e.path.zoneId && !this.zones.isHolder(e.path.zoneId, id));
+          const last = plan.route[plan.route.length - 1]?.path;
+          const overhang = !entry && last
+            ? (plan.dir === 1 ? last.successors : last.predecessors).find(p => p.zoneId && p.zoneId !== last.zoneId)
+            : undefined;
+          const zone = entry?.path.zoneId ?? overhang?.zoneId;
+          if (zone) awaitedZones.add(zone);
+        }
+        const blockers = new Set<string>();
+        for (const zone of [...awaitedZones].sort()) {
+          for (const holder of this.zones.holdersOf(zone)) if (holder !== id) blockers.add(holder);
+          // A frozen FIFO predecessor can block a free zone with stop cause
+          // 'hold'; zoneWaitEdges deliberately omits that vehicle as a node.
+          for (const waiter of authority.waitersAhead(zone, id)) blockers.add(waiter);
+        }
+        for (const blocker of [...blockers].sort()) {
+          if (!seen.has(blocker)) { seen.add(blocker); pending.push(blocker); }
+        }
+      }
+    }
+    return null;
+  }
+
+  private frozenBlockerText(v: Vehicle): string | undefined {
+    const blocker = this.blockedByFrozen(v);
+    if (blocker === null) return undefined;
+    return blocker === v.id ? 'vehicle breakdown, repair pending' : `${blocker} (breakdown, repair pending)`;
+  }
+
+  private reevaluateFrozenPause(vehicle: string, kind: 'exit' | 'standstill'): void {
+    const v = this.vehicles.get(vehicle);
+    if (v && this.waits.isWaiting(vehicle, kind)) {
+      const blocker = this.blockedByFrozen(v);
+      this.waits.setPaused(vehicle, kind, blocker !== null, blocker === vehicle ? 'self' : 'blocker');
+    }
+  }
+
+  /** Freeze notifications can affect every follower; stable id order also fixes resumed event order. */
+  private reevaluateFrozenPauses(): void {
+    for (const id of this.sortedVehicleIds) {
+      this.reevaluateFrozenPause(id, 'exit');
+      this.reevaluateFrozenPause(id, 'standstill');
+    }
+  }
+
   private waitCause(v: Vehicle, kind: 'target' | 'charge' | 'standstill', station = v.waitingAt!): WaitCause {
     const order = this.orderText(v);
     if (kind === 'target') {
@@ -741,7 +810,7 @@ export class FleetJobRunner {
     const blocked = h?.signalStatus ? (h.signalStatus(this.signalScratch), `, blocked: ${this.signalScratch.blocked}`) : '';
     return { waiterId: v.id, resourceId: zone ?? v.standPath, ownerIds: holders,
       nodePath: v.standPath, order, waitingFor: `motion on path ${v.standPath} at s ${v.standS} m`,
-      heldBy: holders.length ? `${holders.join(', ')} (zone ${zone})` : `motion field: ${field}${blocked}`,
+      heldBy: this.frozenBlockerText(v) ?? (holders.length ? `${holders.join(', ')} (zone ${zone})` : `motion field: ${field}${blocked}`),
       extra: holders.length ? `Motion field: ${field}${blocked}` : undefined };
   }
 
@@ -757,6 +826,7 @@ export class FleetJobRunner {
     if (!this.standing(v) || this.waits.isWaiting(v.id, 'standstill')) return;
     v.standPath = this.locScratch.pathId; v.standS = this.locScratch.s; v.standTask = v.taskSeq;
     this.waits.begin(v.id, 'standstill', this.limits.standstill, {}, { passive: true });
+    this.reevaluateFrozenPause(v.id, 'standstill');
   }
 
   /** Detached diagnostics snapshot; no clock events or simulation mutations. */
@@ -1214,7 +1284,7 @@ export class FleetJobRunner {
     // Already out (no claim held — defensive): exit as an own event.
     if (!this.zones.isHolder(zone, v.id)) { this.later('endExit', { v: v.id, x: x.id }); return; }
     this.waits.begin(v.id, 'exit', this.limits.exit, { zone });
-    this.waits.setPaused(v.id, 'exit', getDefaultMovementAuthority(this.adapters.kind).isFrozen(v.id));
+    this.reevaluateFrozenPause(v.id, 'exit');
   }
 
   /** Zone availability (ZoneRegistry): a released stich zone ends the exit of the vehicle that left it. */

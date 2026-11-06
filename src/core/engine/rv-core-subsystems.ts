@@ -181,6 +181,7 @@ export interface CoreSubsystemsHost {
 
 export class CoreSubsystems {
   private readonly host: CoreSubsystemsHost;
+  ikSnapshotReason: (() => string | null) | null = null;
   /** Last-seen MU count for the spawn/despawn dirty diff (was RVViewer._prevMuCount). */
   private _prevMuCount = 0;
   get desHost(): CoreSubsystemsHost { return this.host; }
@@ -195,7 +196,7 @@ export class CoreSubsystems {
     this.offSnapshotBlocker = host.snapshotBlockers?.register('core', () => {
       const h = this.host;
       const reasons = [h.logicEngine?.snapshotBlockerReason?.(),
-        h.ikPaths.some(p => p.PathIsActive) ? 'active IK path' : null,
+        this.ikSnapshotReason ? this.ikSnapshotReason() : h.ikPaths.some(p => p.PathIsActive) ? 'active IK path' : null,
         h.playback?.isPlaying ? 'playback playing' : null,
         h.replayRecordings.some(r => r.isActive) ? 'active replay recording' : null].filter(Boolean);
       return reasons.length ? reasons.join('; ') : null;

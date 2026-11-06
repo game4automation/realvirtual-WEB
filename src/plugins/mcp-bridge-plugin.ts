@@ -19,11 +19,12 @@ import { readLocalStorage, readSessionStorage, writeLocalStorage, writeSessionSt
  *
  * The target is resolved by {@link resolveMcpBridgeTarget}: when the HMI is
  * served BY CONNECT (same-origin, not the Vite dev server, no explicit port),
- * it is derived from window.location (`ws(s)://<host>/webviewer`); otherwise it
- * is `ws://localhost:<port>/webviewer` — realvirtual CONNECT on the default port
+ * it is derived from window.location (`ws(s)://<host>/webviewer`); otherwise an
+ * unpinned target follows the last connected CONNECT address. With no valid address,
+ * it is `ws://localhost:<port>/webviewer` — realvirtual CONNECT on the default port
  * 5100, or the Node bridge when its port is pinned. Either way the configured
  * auth token travels as `?apikey=` (plan-327 AP5). A hosted page (not served by
- * CONNECT, not loopback — e.g. web.realvirtual.io) always targets localhost; its
+ * CONNECT, not loopback — e.g. web.realvirtual.io) follows the last connected CONNECT address; its
  * origin is paired once in the CONNECT tray (plan-541).
  *
  * "Connected" means READY: the server's first `status` frame arrived. CONNECT's
@@ -49,7 +50,7 @@ import { lastBakeSurvivalCounts } from '../core/engine/rv-bake-survival';
 import { normalizeUserPathArgs } from './mcp-bridge/rv-mcp-user-paths';
 import { checkToolArgs } from './mcp-bridge/rv-mcp-arg-check';
 import { getProblems } from '../core/hmi/problems-store';
-import { handleConnectConfigPush, requestConnectConfigRefresh } from '../core/hmi/connect-store';
+import { getConnectSnapshot, handleConnectConfigPush, requestConnectConfigRefresh, subscribeConnectStore } from '../core/hmi/connect-store';
 import { onGatewayLicensed } from '../core/hmi/license-store';
 import { getCacheOutcomes, getCacheStorageEstimate, CACHE_OUTCOME_CAP } from '../core/engine/rv-asset-cache-outcomes';
 import { RVBehavior } from '../core/rv-behavior';
@@ -63,9 +64,8 @@ import {
   type ToolCommandBinding,
 } from '../core/engine/rv-mcp-tools';
 import { createMcpDelegates } from './mcp-bridge/rv-mcp-instances';
-import { CALL_CONTEXT_TOOLS, aliasesListed, boundAliasToolNames, macroCapableToolNames, setAliasDescriptions, setGatewayCommandClassesState, withAliasListing, withMacroMetaParams } from './mcp-bridge/rv-mcp-command-tools';
+import { CALL_CONTEXT_TOOLS, macroCapableToolNames, setGatewayCommandClassesState, withMacroMetaParams } from './mcp-bridge/rv-mcp-command-tools';
 import { commandIdsOfCall } from './mcp-bridge/rv-mcp-tool-class';
-import { MOVED_TOOLS, movedToolAnswer, movedToolOf, movedToolSchemas } from './mcp-bridge/rv-mcp-moved-tools';
 import { splitMacroMeta } from './mcp-bridge/rv-mcp-macro';
 import {
   installMcpDialogPolicy,
@@ -87,7 +87,7 @@ import { setAiActivity } from '../core/hmi/ai-activity-store';
 import { commandRegistry } from '../core/hmi/rv-command-registry';
 import { buildCallContext, commandResultJson } from '../core/hmi/rv-command-context';
 import { setCommandStepHooks } from './mcp-bridge/rv-mcp-command-tools';
-import { choreographyToolOf } from './mcp-bridge/rv-mcp-command-choreography';
+import { choreographyKeyOf } from './mcp-bridge/rv-mcp-command-choreography';
 import { dialogPolicyApplies } from './mcp-bridge/rv-mcp-command-dialog-policy';
 export { dialogPolicyApplies } from './mcp-bridge/rv-mcp-command-dialog-policy';
 import { ensureEditorCommandsRegistered } from '../core/hmi/editor-command-descriptors';
@@ -443,6 +443,8 @@ export interface McpBridgeTargetContext {
   /** Target port for the explicit localhost case: CONNECT (5100, the default) or
    *  the Node bridge (18714 / 18715) when its port is pinned. */
   bridgePort: string;
+  /** Last connected CONNECT REST address; used when no port is pinned or embedded. */
+  connectServerUrl?: string;
   /** Auth token appended as `?apikey=` — same source the WS Realtime interface
    *  uses (`loadInterfaceSettings().wsAuthToken`). Empty/undefined = no query. */
   authToken?: string;
@@ -460,13 +462,16 @@ export interface McpBridgeTargetContext {
  * origin at `/webviewer`, so derive host + port + scheme from `window.location`
  * (`wss` under https, else `ws`) instead of hard-coding `ws://localhost:<port>`.
  *
- * Explicit / dev case — `ws://localhost:<bridgePort>/webviewer`. That is CONNECT
+ * Explicit port case — `ws://localhost:<bridgePort>/webviewer`. That is CONNECT
  * on the default port 5100, or the Node bridge when 18714 / 18715 is pinned.
  * Since plan-363 a dev session is normally served THROUGH CONNECT's proxy: such a
  * dev page (its same-origin `/health` answers with CONNECT's signature) takes the
  * embedded branch and talks to the CONNECT that serves it — a worktree CONNECT on
- * another port included, without `?mcpPort=`. Only a bare Vite page (no CONNECT
- * behind its origin) aims at the gateway on the default port.
+ * another port included, without `?mcpPort=`. A non-embedded page without an
+ * explicit port follows the last connected CONNECT address, supplied as a valid
+ * http(s) `connectServerUrl`: scheme becomes ws(s),
+ * host and port are preserved, and `/webviewer` replaces any path prefix, just
+ * like CONNECT's `/ws` stream. An empty or invalid address keeps the localhost fallback.
  *
  * The auth token is **transport-independent** (plan-327 AP5): it must be able to
  * travel on BOTH branches, mirroring `websocket-realtime-interface.ts::buildUrl`.
@@ -489,8 +494,8 @@ export interface McpBridgeTargetContext {
  * Hosted case (plan-541) — a page CONNECT did not serve, on a non-loopback
  * origin and not the dev server (the demo on web.realvirtual.io, a customer
  * site): its own origin has no `/webviewer`, so it targets
- * `ws://localhost:<bridgePort>/webviewer` like the explicit case, and the port
- * field always applies there. `explicitPort` only steers the embedded derivation.
+ * the last connected CONNECT address unless a bridge port is explicitly pinned.
+ * Without a valid CONNECT address it uses `ws://localhost:<bridgePort>/webviewer`.
  *
  * Note that this is auth only. The AP2 Origin gate is a separate, server-side
  * check: `localhost:5173 → localhost:5100` passes it because loopback origins are
@@ -501,11 +506,20 @@ export function resolveMcpBridgeTarget(ctx: McpBridgeTargetContext): string {
   const hosted = !ctx.isDevServer && !ctx.servedByConnect && !ctx.isLoopbackPage;
   // A dev page counts as embedded only when CONNECT is shown to serve it (its same-origin `/health`):
   // a worktree CONNECT on 5200 must get the frames of the tab it serves, not the canonical one on 5100
-  // (SolidCraft autostart fix 2026-10-22). A bare Vite page keeps the localhost:<port> target.
+  // (SolidCraft autostart fix 2026-10-22). A bare Vite page follows its last connected CONNECT address.
   const embedded = !hosted && !ctx.explicitPort && (!ctx.isDevServer || ctx.servedByConnect);
-  const base = embedded
+  let base = embedded
     ? `${ctx.protocol === 'https:' ? 'wss' : 'ws'}://${ctx.host}/webviewer`
     : `ws://localhost:${ctx.bridgePort}/webviewer`;
+  if (!embedded && !ctx.explicitPort && ctx.connectServerUrl) {
+    try {
+      const url = new URL(ctx.connectServerUrl);
+      if (url.protocol === 'http:' || url.protocol === 'https:') {
+        // Like CONNECT's /ws stream, /webviewer is rooted at the gateway host.
+        base = `${url.protocol === 'https:' ? 'wss' : 'ws'}://${url.host}/webviewer`;
+      }
+    } catch { /* Keep the existing localhost target for an invalid address. */ }
+  }
   if (!ctx.authToken) return base;
   if (embedded && ctx.preferCookieAuth !== false) return base;
   return `${base}?apikey=${encodeURIComponent(ctx.authToken)}`;
@@ -582,7 +596,6 @@ export class McpBridgePlugin extends RVBehavior {
   // into the URL for the rest of this session (plan-366 Phase 3).
   private _cookieAuthFailed = false;
   private _dispatcher: Map<string, { instance: object; methodKey: string; paramNames: string[]; command?: ToolCommandBinding }> | null = null;
-  private readonly _warnedMovedToolCollisions = new Set<string>();
   private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private _reconnectDelay = 1000;
   private _maxReconnectDelay = 30000;
@@ -646,6 +659,9 @@ export class McpBridgePlugin extends RVBehavior {
   private _visibilityListener: (() => void) | null = null;
   /** plan-2044: the one license-store subscription (unlicensed -> licensed edge); null when none. */
   private _licenseUnsubscribe: (() => void) | null = null;
+  private _connectUnsubscribe: (() => void) | null = null;
+  /** Last CONNECT address that reached connected; retained across store connection failures. */
+  private _connectedServerUrl = '';
   /** plan-621: internal tools — answer `call`, never in `discover`. */
   private readonly _internalTools = new Map<string, InternalBridgeToolHandler>();
 
@@ -944,6 +960,7 @@ export class McpBridgePlugin extends RVBehavior {
     this._aiEnabled = saved.enabled;
     this._aiSolidCraft = saved.aiSolidCraft;
     this._destroyed = false;
+    this._subscribeConnectTarget();
     this._updateChannel();
     this._emitChanged();
   }
@@ -962,6 +979,8 @@ export class McpBridgePlugin extends RVBehavior {
    * diagnostic action, not a change of the user's bridge preference.
    */
   onDeactivate(): void {
+    this._connectUnsubscribe?.();
+    this._connectUnsubscribe = null;
     this._reconnectOnActivate = !this._destroyed;
     if (this._destroyed) return;
     this._destroyed = true;
@@ -978,6 +997,7 @@ export class McpBridgePlugin extends RVBehavior {
     if (!this._reconnectOnActivate || !this._destroyed) return;
     this._reconnectOnActivate = false;
     this._destroyed = false;
+    this._subscribeConnectTarget();
     this._updateChannel();
     this._emitChanged();
   }
@@ -997,6 +1017,8 @@ export class McpBridgePlugin extends RVBehavior {
   }
 
   protected onDestroy(): void {
+    this._connectUnsubscribe?.();
+    this._connectUnsubscribe = null;
     this._licenseUnsubscribe?.();
     this._licenseUnsubscribe = null;
     this._destroyed = true;
@@ -1071,8 +1093,8 @@ export class McpBridgePlugin extends RVBehavior {
 
   /** Resolve the WebSocket target for the current environment (plan-286 Phase 4,
    *  plan-327 AP5, plan-541). Embedded (CONNECT same-origin) → derived from
-   *  window.location; a hosted page (not served by CONNECT, not loopback) and the
-   *  explicit/dev cases → `localhost:<port>` — CONNECT on 5100 by default, the
+   *  window.location; otherwise an unpinned target follows the last connected
+   *  CONNECT address, with `localhost:<port>` as fallback — CONNECT on 5100 by default, the
    *  Node bridge when its port is pinned. The token comes from the same store the
    *  WS Realtime interface uses (`wsAuthToken`); embedded it stays out of the URL
    *  and rides on CONNECT's session cookie until that is shown not to work
@@ -1087,8 +1109,23 @@ export class McpBridgePlugin extends RVBehavior {
       isLoopbackPage: page.isLoopbackPage,
       explicitPort: this._explicitPort,
       bridgePort: this._currentPort,
+      connectServerUrl: this._connectedServerUrl.trim() || undefined,
       authToken: loadInterfaceSettings().wsAuthToken || undefined,
       preferCookieAuth: !this._cookieAuthFailed,
+    });
+  }
+
+  private _subscribeConnectTarget(): void {
+    this._connectUnsubscribe?.();
+    const snapshot = getConnectSnapshot();
+    if (snapshot.state === 'connected') this._connectedServerUrl = snapshot.serverUrl;
+    this._connectUnsubscribe = subscribeConnectStore(() => {
+      const next = getConnectSnapshot();
+      if (next.state !== 'connected' || next.serverUrl === this._connectedServerUrl) return;
+      const previousTarget = this._resolveTarget();
+      this._connectedServerUrl = next.serverUrl;
+      if (previousTarget === this._resolveTarget() || this._destroyed || !this._wantsChannel()) return;
+      this.reconnect();
     });
   }
 
@@ -1360,19 +1397,6 @@ export class McpBridgePlugin extends RVBehavior {
       ensureViewCommandsRegistered();
       ensureSimCommandsRegistered();
       schemas = withMacroMetaParams(schemas, macroCapableToolNames(this._dispatcher, commandRegistry));
-      // plan-641 Nachtrag 2026-10-21: bound aliases stay callable but leave tools/list.
-      setAliasDescriptions(this._dispatcher, schemas);
-      schemas = withAliasListing(schemas, boundAliasToolNames(this._dispatcher), aliasesListed());
-      for (const schema of movedToolSchemas()) {
-        if (this._dispatcher.has(schema.name)) {
-          if (!this._warnedMovedToolCollisions.has(schema.name)) {
-            this._warnedMovedToolCollisions.add(schema.name);
-            console.warn(`MCP moved tool ${schema.name} still has a decorator; the decorated tool wins`);
-          }
-        } else {
-          schemas.push(schema);
-        }
-      }
     } catch (e) {
       // R9 — both builders throw on a duplicate tool name, and this runs inside
       // `ws.onopen`. Unguarded, one collision took down the ENTIRE catalogue,
@@ -1500,12 +1524,8 @@ export class McpBridgePlugin extends RVBehavior {
         const viewer = this.viewer;
         const callId = this._commandCallId;
         if (!viewer || !this._dispatcher || callId === undefined) return undefined;
-        // plan-2007 F11/Phase 6: a 1:1 key reuses the old tool's probe + feedback (identical args);
-        // a command behind a multiplexer tombstone (web_editor_pivot, _rotate90, …) still gets the
-        // editor choreography and afterglow, but no delta probe (its args are post-transform).
-        const exact = choreographyToolOf(id, this._dispatcher);
-        const key = exact ?? MOVED_TOOLS.find((m) => m.movedTo.length > 1 && m.movedTo.includes(id)
-          && m.tool.startsWith('web_editor_'))?.tool;
+        // Command policies use command ids; live bound tools retain their own keys.
+        const key = choreographyKeyOf(id, this._dispatcher);
         await commandRegistry.preload([id]);
         if (commandRegistry.enabled(id, args, viewer, captured) !== true) return undefined;
         const buttonKey = commandRegistry.get(id)?.buttonKey?.(args);
@@ -1517,7 +1537,7 @@ export class McpBridgePlugin extends RVBehavior {
           await prepareCommandChoreography(buttonKey);
         }
         if (!key) return undefined;
-        const probe = exact ? DELTA_PROBES[exact] : undefined;
+        const probe = DELTA_PROBES[key];
         const pctx = { viewer, tool: key, callId };
         const snap = probe ? safeProbe(() => probe.before(pctx, args)) : undefined;
         return { key, followDecision, probe, pctx, snap } satisfies Token;
@@ -1543,10 +1563,10 @@ export class McpBridgePlugin extends RVBehavior {
     if (!v) return undefined;
     try {
       const m = await import('./mcp-bridge/rv-mcp-editor-feedback');
-      // web_editor_* plus the scene tools listed in the feedback table
+      // Commands and live tools listed in the feedback table
       // (web_execute("component.setFields", …): open the inspector and press the field row).
       // plan-520: the pre-follow verdict is returned for the post phase.
-      if (tool.startsWith('web_editor_') || m.EDITOR_FEEDBACK[tool]) {
+      if (m.EDITOR_FEEDBACK[tool]) {
         return await m.prepareEditorChoreography(v, tool, args ?? {}, buttonKey);
       } else if (buttonKey) {
         // plan-499 Phase 3: a bound planner / sim / runtime tool presses its
@@ -1570,7 +1590,7 @@ export class McpBridgePlugin extends RVBehavior {
     if (!v) return;
     void import('./mcp-bridge/rv-mcp-editor-feedback')
       .then((m) => {
-        if (tool.startsWith('web_editor_') || m.EDITOR_FEEDBACK[tool]) m.applyEditorFeedback(v, tool, args ?? {}, result, preDecision);
+        if (m.EDITOR_FEEDBACK[tool]) m.applyEditorFeedback(v, tool, args ?? {}, result, preDecision);
       })
       .catch(() => { /* feedback must never break the call */ });
   }
@@ -1602,11 +1622,6 @@ export class McpBridgePlugin extends RVBehavior {
     if (!this._commandHooksInstalled) this._installCommandStepHooks();
     const entry = this._dispatcher.get(tool);
     if (!entry) {
-      const moved = movedToolOf(tool);
-      if (moved) {
-        this._sendResult(id, undefined, movedToolAnswer(moved));
-        return;
-      }
       this._sendResult(id, undefined, `Unknown tool: ${tool}`);
       return;
     }
@@ -1681,7 +1696,7 @@ export class McpBridgePlugin extends RVBehavior {
     // answers the safe ones and reports what it answered; see
     // rv-mcp-dialog-policy.ts for the per-dialog reasoning.
     const commandDoor = tool === 'web_execute' || tool === 'web_batch';
-    const releaseDialogs = dialogPolicyApplies(tool, args, this._dispatcher)
+    const releaseDialogs = dialogPolicyApplies(tool, args)
       ? await installMcpDialogPolicy()
       : NO_DIALOG_POLICY;
     try {

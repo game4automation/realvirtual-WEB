@@ -75,6 +75,7 @@ import {
 } from '@mui/icons-material';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useViewer } from '../../hooks/use-viewer';
+import { collectModelPlcSignals } from '../import/rv-plc-automap';
 import { SignalUsageButton } from './rv-signal-usage-list';
 import { ConnectAutoMapSection } from './ConnectAutoMapSection';
 import { SewUdpImportDialog } from './connect-sew-udp-import';
@@ -5295,6 +5296,7 @@ export function signalBudgetGate(
 
 /** Floating window showing discovery results; selected signals can be added to the interface. */
 function BrowseWindow({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const viewer = useViewer();
   const snap = useSyncExternalStore(subscribeConnectStore, getConnectSnapshot);
   const licenseSnap = useSyncExternalStore(subscribeLicenseStore, getLicenseSnapshot);
   const iface = snap.interfaces.find(i => i.id === snap.activeInterfaceId) ?? null;
@@ -5319,7 +5321,8 @@ function BrowseWindow({ open, onClose }: { open: boolean; onClose: () => void })
     if (!snap.activeInterfaceId || selectedCount === 0) return;
     setAddError(null);
     try {
-      await bindSelectedSignals(snap.activeInterfaceId);
+      // A same-named model signal's type is binding for the new coupling (direction + kind).
+      await bindSelectedSignals(snap.activeInterfaceId, collectModelPlcSignals(viewer));
     } catch (err) {
       // Without this the rejection surfaced only as an uncaught promise in the console and the
       // window sat there looking like nothing had happened.
@@ -5327,7 +5330,7 @@ function BrowseWindow({ open, onClose }: { open: boolean; onClose: () => void })
       return;
     }
     onClose();
-  }, [snap.activeInterfaceId, selectedCount, onClose]);
+  }, [snap.activeInterfaceId, selectedCount, onClose, viewer]);
 
   return (
     <FloatingPanel

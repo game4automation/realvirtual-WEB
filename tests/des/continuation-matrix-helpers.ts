@@ -22,6 +22,7 @@ const CUTS: Record<Scene, readonly Cut[]> = {
   Course: DEFAULT_CUTS,
   'Test-DES-Turntable-Loop': DEFAULT_CUTS,
   DemoPlanner: DEFAULT_CUTS,
+  'FanucCRX-10iA-L': DEFAULT_CUTS,
 };
 const counts = (s: DESSnapshotV4) => ({ parts: s.parts.length, queue: s.eventQueue.length, mus: s.muIds.length });
 

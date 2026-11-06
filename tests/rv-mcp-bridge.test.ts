@@ -645,7 +645,7 @@ describe('McpBridgePlugin - verified effect delta (plan-707)', () => {
   it('a probe that throws does not damage the call', async () => {
     const { plugin } = setupPlugin();
     const { handleMessage, sent } = createMessageHandler(plugin);
-    const probe = DELTA_PROBES['web_signal_set_bool'];
+    const probe = DELTA_PROBES['signal.setBool'];
     const originalBefore = probe.before;
     const originalAfter = probe.after;
     probe.before = () => { throw new Error('before exploded'); };

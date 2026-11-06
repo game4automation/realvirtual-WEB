@@ -3,13 +3,12 @@
 
 /**
  * Phase 6A: every former shortcut case runs its command through web_execute.
- * The old shortcut name is a tombstone listing all branch targets.
+ * The old shortcut name was removed; branch commands remain available.
  */
 
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { McpCommandTools } from '../src/plugins/mcp-bridge/rv-mcp-command-tools';
-import { movedToolOf, movedToolAnswer } from '../src/plugins/mcp-bridge/rv-mcp-moved-tools';
 import { SHORTCUT_BRANCHES } from '../src/core/hmi/editor-command-descriptors';
 import { commandRegistry } from '../src/core/hmi/rv-command-registry';
 import { ensureEditorCommandsRegistered } from '../src/core/hmi/editor-command-descriptors';
@@ -82,13 +81,5 @@ describe('web_editor_shortcut over commands', () => {
     vi.spyOn(commandRegistry, 'execute').mockResolvedValue({ ok: false, kind: 'disabled', reason: 'Nothing selected — select first (web_select)' });
     expect(JSON.parse(await tools.webExecute('editor.hide', JSON.stringify({ paths: null }))))
       .toMatchObject({ error: 'Nothing selected — select first (web_select)' });
-  });
-
-  it('the retired shortcut answers MOVED with all branches and never dispatches', () => {
-    const spy = vi.spyOn(commandRegistry, 'execute');
-    expect(JSON.parse(movedToolAnswer(movedToolOf('web_editor_shortcut')!))).toMatchObject({
-      error: 'MOVED', movedTo: SHORTCUT_BRANCHES.map((b) => b.id),
-    });
-    expect(spy).not.toHaveBeenCalled();
   });
 });

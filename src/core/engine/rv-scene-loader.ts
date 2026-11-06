@@ -1334,7 +1334,7 @@ export interface TraverseResult {
   kinematicNodes: KinematicNodeEntry[];
   recordingData: CompactRecording | null;
   recorderSettings: RecorderSettings | null;
-  replayRecordingConfigs: { sequence: string; startOnSignal: ComponentRef | null; isReplayingSignal: ComponentRef | null; activeOnly: ActiveOnly }[];
+  replayRecordingConfigs: { node?: Object3D; sequence: string; startOnSignal: ComponentRef | null; isReplayingSignal: ComponentRef | null; activeOnly: ActiveOnly }[];
   pipelineNodes: { pipes: Object3D[]; tanks: Object3D[]; pumps: Object3D[]; processingUnits: Object3D[] };
   /** Load-time metadata cost stats (DevTools): nodes carrying RuntimeMetadata
    *  extras (counted BEFORE the dev kill-switch strips them), and the number /
@@ -1607,7 +1607,7 @@ export function traverseAndRegister(
         const startOnSignal = (rrData['StartOnSignal'] as ComponentRef) ?? null;
         const isReplayingSignal = (rrData['IsReplayingSignal'] as ComponentRef) ?? null;
         const rrActiveOnly = parseActiveOnly(rrData);
-        replayRecordingConfigs.push({ sequence, startOnSignal, isReplayingSignal, activeOnly: rrActiveOnly });
+        replayRecordingConfigs.push({ node, sequence, startOnSignal, isReplayingSignal, activeOnly: rrActiveOnly });
       }
     }
   });
@@ -2983,8 +2983,8 @@ export function buildReplayRecordings(
 
   const replayRecordings: RVReplayRecording[] = [];
   for (const cfg of configs) {
-    const startAddr = registry.resolve(cfg.startOnSignal).signalAddress ?? null;
-    const replayAddr = registry.resolve(cfg.isReplayingSignal).signalAddress ?? null;
+    const startAddr = registry.resolve(cfg.startOnSignal, null, cfg.node ?? null).signalAddress ?? null;
+    const replayAddr = registry.resolve(cfg.isReplayingSignal, null, cfg.node ?? null).signalAddress ?? null;
     const rr = new RVReplayRecording(cfg.sequence, startAddr, replayAddr, playback, signalStore);
     rr.activeOnly = cfg.activeOnly;
     replayRecordings.push(rr);

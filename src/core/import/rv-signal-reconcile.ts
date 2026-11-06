@@ -118,14 +118,16 @@ function valueKind(type: string): 'Bool' | 'Int' | 'Float' | 'Text' | null {
  * about whether two declared types agree.
  */
 const DATA_TYPE_KIND = new Map<string, 'Bool' | 'Int' | 'Float' | 'Text'>();
-for (const t of ['BOOL', 'BIT', 'X']) DATA_TYPE_KIND.set(t, 'Bool');
+// IEC names, the OPC UA built-in names a CODESYS / OPC UA browse reports (`Boolean`, `SByte`,
+// `Int16`, `Double`, ...) and the CONNECT value kinds themselves (`Bool`, `Int`, `Float`, `Text`).
+for (const t of ['BOOL', 'BIT', 'X', 'BOOLEAN']) DATA_TYPE_KIND.set(t, 'Bool');
 for (const t of [
   'INT', 'DINT', 'UDINT', 'UINT', 'SINT', 'USINT', 'LINT', 'ULINT',
-  'BYTE', 'WORD', 'DWORD', 'LWORD', 'SHORT', 'LONG',
-  'INT16', 'INT32', 'INT64', 'UINT16', 'UINT32', 'UINT64',
+  'BYTE', 'SBYTE', 'WORD', 'DWORD', 'LWORD', 'SHORT', 'USHORT', 'LONG', 'ULONG',
+  'INT8', 'INT16', 'INT32', 'INT64', 'UINT8', 'UINT16', 'UINT32', 'UINT64', 'INTEGER',
 ]) DATA_TYPE_KIND.set(t, 'Int');
 for (const t of ['REAL', 'LREAL', 'FLOAT', 'DOUBLE', 'SINGLE']) DATA_TYPE_KIND.set(t, 'Float');
-for (const t of ['STRING', 'WSTRING', 'CHAR', 'WCHAR']) DATA_TYPE_KIND.set(t, 'Text');
+for (const t of ['STRING', 'WSTRING', 'CHAR', 'WCHAR', 'TEXT']) DATA_TYPE_KIND.set(t, 'Text');
 
 /**
  * Resolved kinds per RAW spelling (`'DINT'`, `'dint'`, `' Int '`), so the normalisation runs once

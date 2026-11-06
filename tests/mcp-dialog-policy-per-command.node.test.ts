@@ -19,11 +19,6 @@ vi.mock('../src/core/hmi/rv-command-registry', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/core/hmi/rv-command-registry')>();
   return { ...actual, commandRegistry: new actual.CommandRegistry() };
 });
-vi.mock('../src/plugins/mcp-bridge/rv-mcp-moved-tools', () => ({
-  MOVED_TOOLS: [{ tool: 'web_old', movedTo: ['test.write'], door: 'web_execute', example: '' }],
-  movedToolOf: (name: string) => ['web_old', 'web_editor_delete'].includes(name) ? { tool: name } : undefined,
-}));
-
 const cleanups: Array<() => void> = [];
 beforeEach(() => {
   policy.install.mockReset().mockResolvedValue(policy.release);
@@ -51,14 +46,10 @@ describe('dialog policy per executed command', () => {
     ['web_batch', { steps: 'invalid' }, true],
     ['web_batch', { steps: [] }, true],
     ['web_prompt_list', undefined, false],
-    ['web_editor_delete', undefined, false],
-    ['web_old', undefined, false],
+    ['web_editor_delete', undefined, true],
+    ['web_old', undefined, true],
   ] as const)('%s with %j → %s', (tool, args, expected) => {
     expect(dialogPolicyApplies(tool, args)).toBe(expected);
-  });
-
-  it('does not treat a still-dispatched tool as a tombstone', () => {
-    expect(dialogPolicyApplies('web_old', {}, new Map([['web_old', {}]]))).toBe(true);
   });
 
   it('does not even import the responder for read-only and prompt ids', async () => {

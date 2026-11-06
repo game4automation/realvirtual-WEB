@@ -12,7 +12,6 @@
  * of each, by tool, from the state alone.
  */
 
-import { movedToolOf } from '../src/plugins/mcp-bridge/rv-mcp-moved-tools';
 import { describe, it, expect, vi } from 'vitest';
 import {
   McpDescribeTool,
@@ -190,9 +189,8 @@ describe('web_describe — blocked families', () => {
     const r = await describeWith({ mode: 'hmi' });
     const layout = r.blocked.find((b) => b.family === 'web_layout_*');
     const editor = r.blocked.find((b) => b.family === 'web_editor_*');
-    // The retained describe tool keeps its hint; the old name now directs callers to the command.
+    // The describe hint directs callers to the command.
     expect(layout?.reason).toContain('web_execute("workspace.setMode", {mode:"planner"})');
-    expect(movedToolOf('web_mode_set')).toMatchObject({ movedTo: ['workspace.setMode'], door: 'web_execute' });
     expect(editor?.reason).toContain('web_editor_open');
   });
 

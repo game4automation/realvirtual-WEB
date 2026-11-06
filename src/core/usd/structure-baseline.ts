@@ -40,7 +40,7 @@ const HELPER_FLAGS = [
   '_isSourceGhost', '_isGhostOverlay', '_isSourcePreview', '_isSourceMarker',
   '_highlightOverlay', '_rvGizmo', '_rvGizmoOverlay', '_rvWebLabel', '_rvLabelSprite',
   '_rvLabelPlate', '_agentEyeOverlay', '_tankFillViz', '_pipeFlowViz', '_puHighlightViz',
-  '_isSplat', '_muPool', '_rvGroundPlane', '_rvGroundReflector',
+  '_isSplat', '_muPool', '_rvGroundPlane', '_rvGroundReflector', '_rvRuntimeVisual',
 ] as const;
 
 /** True for runtime helpers that never belong in the sync stage. */

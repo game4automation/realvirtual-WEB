@@ -12,7 +12,6 @@ import { ensureSignalBindCommandsRegistered } from '../src/plugins/mcp-bridge/rv
 import { ensureDesPlcCommandsRegistered } from '../src/core/hmi/des-plc-commands';
 import { ensureDiagnoseCommandsRegistered } from '../src/core/diagnostics/diagnose-command-descriptors';
 import { McpCommandTools } from '../src/plugins/mcp-bridge/rv-mcp-command-tools';
-import { MOVED_TOOLS } from '../src/plugins/mcp-bridge/rv-mcp-moved-tools';
 import { commandClassOf } from '../src/plugins/mcp-bridge/rv-mcp-tool-class';
 import { registerPlcControl, registerPlcRuntime } from '../src/core/plc-control';
 import { queryCommand } from './helpers/query-command';
@@ -147,7 +146,7 @@ afterEach(() => commandRegistry.attachViewer(undefined));
 // The first web_query of a family lazy-loads its impl module (planner, library, signal);
 // under a parallel suite that import alone can exceed vitest's 5 s default.
 describe('plan-2007 Phase 4B query parity', { timeout: 30_000 }, () => {
-  it.each(CASES)('%s has one query tombstone and the original argument names', (old, id, keys) => {
+  it.each(CASES)('%s retains the original argument names and read class', (old, id, keys) => {
     const registry = new CommandRegistry();
     register(registry);
     const count = registry.list().length;
@@ -159,10 +158,6 @@ describe('plan-2007 Phase 4B query parity', { timeout: 30_000 }, () => {
     expect(d.undoLabel).toBeUndefined();
     expect(commandClassOf(d)).toBe('read');
     expect(Object.keys(d.argsSchema ?? {})).toEqual(keys);
-    const moved = MOVED_TOOLS.filter((m) => m.tool === old);
-    expect(moved).toHaveLength(1);
-    expect(moved[0]).toMatchObject({ movedTo: [id], door: 'web_query' });
-    expect(moved[0].example).toContain(`web_query("${id}",`);
   });
 
   it.each(CASES)('%s runs through web_query with the original empty-scene result', async (_old, id) => {
@@ -259,7 +254,6 @@ describe('plan-2007 Phase 4B query parity', { timeout: 30_000 }, () => {
   });
 
   it('keeps the timing tool because clear=true mutates its buffers', () => {
-    expect(MOVED_TOOLS.some((m) => m.tool === 'web_layout_timings')).toBe(false);
     expect(commandRegistry.get('layout.timings')).toBeUndefined();
   });
 });

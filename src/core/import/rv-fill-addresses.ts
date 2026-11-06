@@ -45,6 +45,11 @@ export type FillRowStatus =
   | 'not-found'
   /** The controller reports the symbol but no address for it (not directly bindable). */
   | 'no-address'
+  /**
+   * The configured CONNECT signal has another wire type (direction or value kind) than the model
+   * signal — the model is binding, the coupling is retyped to the model type (Thomas 2026-11-05).
+   */
+  | 'retype'
   /** The controller symbol has the other direction than the model signal. */
   | 'direction-conflict'
   /** Two controller symbols with this exact key, or the name lives in more than one container. */
@@ -53,12 +58,12 @@ export type FillRowStatus =
   | 'bound-elsewhere';
 
 export const FILL_ROW_STATUSES: readonly FillRowStatus[] = [
-  'fill', 'create', 'already', 'kept', 'name-variant', 'not-found', 'no-address',
+  'fill', 'create', 'retype', 'already', 'kept', 'name-variant', 'not-found', 'no-address',
   'direction-conflict', 'ambiguous', 'bound-elsewhere',
 ];
 
 /** Statuses a fill writes. Everything else is information. */
-export const FILL_WRITE_STATUSES: ReadonlySet<FillRowStatus> = new Set<FillRowStatus>(['fill', 'create']);
+export const FILL_WRITE_STATUSES: ReadonlySet<FillRowStatus> = new Set<FillRowStatus>(['fill', 'create', 'retype']);
 
 /** One row of the preview. */
 export interface FillRow {
@@ -248,13 +253,15 @@ export function planFillAddresses(input: FillAddressInput): FillAddressPlan {
       continue;
     }
     const topic = place.topic !== undefined ? { topic: place.topic } : {};
-    // The configured CONNECT signal has the other direction: a fill would hand a PLC input's address
-    // to an output (or vice versa) — fillEmpty keeps the configured type, so this is never written.
-    if (place.type && directionOfType(place.type) !== directionOfType(m.type)) {
+    // The configured CONNECT signal has another wire type than the model signal (an OPC UA browse
+    // cannot tell the direction, a `Boolean` once bound as Float): the MODEL is binding, so the
+    // coupling is retyped to the model type. Only the controller's own stated direction (above) is
+    // hard evidence that blocks — this one is CONNECT's guess.
+    if (place.type && place.type !== m.type) {
       push({
-        status: 'direction-conflict', protocolAddress: address, ...topic,
-        ...(place.address ? { existingAddress: place.address } : {}),
-        reason: `The CONNECT signal is configured as ${place.type}, the model signal is ${m.type}`,
+        status: 'retype', protocolAddress: address, ...topic,
+        ...(place.address && place.address !== address ? { existingAddress: place.address } : {}),
+        reason: `Configured as ${place.type}, retyped to the model type ${m.type}`,
       });
       continue;
     }
@@ -270,8 +277,8 @@ export function planFillAddresses(input: FillAddressInput): FillAddressPlan {
 
 /**
  * The ONE batch a fill writes: a `signal.upsert` with `addressMode: fillEmpty` per `fill` / `create`
- * row. Create rows carry the model's wire type (and the protocol data type when known); fill rows
- * carry nothing but the address, so `record`, `comment`, type and OPC UA fields stay as configured.
+ * row. Create rows carry the model's wire type (and the protocol data type when known), retype rows
+ * the model's wire type only; fill rows carry nothing but the address, so `record`, `comment`, type and OPC UA fields stay as configured.
  */
 export function fillAddressOps(plan: FillAddressPlan): ConnectConfigOp[] {
   const ops: ConnectConfigOp[] = [];
@@ -286,7 +293,7 @@ export function fillAddressOps(plan: FillAddressPlan): ConnectConfigOp[] {
       addressMode: 'fillEmpty',
       ...(row.status === 'create'
         ? { type: row.modelType, record: false, ...(row.dataType ? { dataType: row.dataType } : {}) }
-        : {}),
+        : row.status === 'retype' ? { type: row.modelType } : {}),
     });
   }
   return ops;

@@ -22,15 +22,14 @@ Long commands with `timeoutMs > 120000` (120 s), including `editor.importCad` an
 `mechanism.trajectoryRun`, automatically return a `jobId`. Follow it with
 `web_macro_status` or request cancellation with `web_macro_cancel`; imports are
 not cancellable and return `kind:"not-cancellable"` while continuing to completion.
-For one release, an old tool name returns
-`{"error":"MOVED", movedTo, use, example, removedAfter:"6.8.0"}` with its replacement;
-it is absent from `tools/list`.
+The old per-domain tool names were removed in 6.7.1 and are now unknown tools; use
+`web_execute` / `web_query` (`web_commands` lists command ids).
 
 CONNECT classifies `web_execute` and `web_batch` by the strictest named command in
 `McpCommandClassAllowlist.cs`; unparsable calls are `destructive`, and `web_query`
 is `read`. `web_macro_replay` uses the strictest class of all macro-enabled commands.
-An outdated CONNECT without `capabilities.commandClasses` refuses moved sim/signal/file
-commands (and other moved targets stricter than edit) with `kind:'gateway-outdated'`.
+An outdated CONNECT without `capabilities.commandClasses` refuses sim/signal/file
+commands (and other commands stricter than edit) with `kind:'gateway-outdated'`.
 
 **realvirtual CONNECT is the default transport.** It hosts the MCP endpoint itself, so
 nothing extra has to be installed. The local **Node bridge** remains fully supported as the
@@ -489,9 +488,8 @@ The `web_*` tools fall into these groups (full reference in
 [`webviewer.mcp.md`](webviewer.mcp.md)):
 
 Dotted names (`drive.jog`, `editor.setField`, `layout.place`, …) are registry commands, run with
-`web_execute` / `web_batch`. Their command-bound alias tools (`web_drive_jog`, …) still answer
-`tools/call` but are not in tools/list since 2026-10-21 (plan-641); emergency switch: viewer URL
-`?mcpAliases=1` or `localStorage['rv-mcp-list-aliases']='1'`, Node bridge `RV_MCP_LIST_ALIASES=1`.
+`web_execute` / `web_batch`; read-only commands use `web_query`. `web_commands` lists their ids.
+The old per-domain tool names were removed in 6.7.1 and are now unknown tools.
 
 - **Inspect** — `web_status`, `web_query("drive.list", {})`, `web_signal_list`, `web_query("sensor.list", {})`,
   `web_query("transport.status", {})`, `web_query("logic.flow", {})`, `web_node_find`, `web_node_tree`,

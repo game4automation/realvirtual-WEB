@@ -557,8 +557,8 @@ const REDESCRIBED_SINCE_BASELINE: Record<string, string> = {
   // `web_des_status` and `web_drive_speed_override` were declared here on
   // 2026-10-27 and removed again the same day, by plan-2007 Phase 4A/4B rather
   // than by a second thought: both tools now live BEHIND a door
-  // (`des.status` behind `web_query`, `sim.speedOverride` behind `web_execute`,
-  // `rv-mcp-moved-tools.ts`), so neither is announced in `allSchemas()` any more.
+  // (`des.status` behind `web_query`, `sim.speedOverride` behind `web_execute`),
+  // so neither is announced in `allSchemas()` any more.
   // A re-description exempts the prose of an ANNOUNCED tool from the frozen
   // comparison; for a tool that has no announcement left it points at nothing, and
   // the guard says so (`is declared re-described but is not announced`). Both are

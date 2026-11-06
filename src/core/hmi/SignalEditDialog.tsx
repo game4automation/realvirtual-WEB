@@ -68,6 +68,7 @@ import {
   subscribeConnectConfigNotice,
 } from './connect-store';
 import { addressRuleFor, isProcessImageAddress } from '../import/rv-iface-signal-slots';
+import { dataTypeKind } from '../import/rv-signal-reconcile';
 
 /** plan-590 — why the name is read-only in this dialog, and where the rename lives instead. */
 export const SIGNAL_NAME_HERE_READONLY =
@@ -83,11 +84,9 @@ type SignalDirection = 'input' | 'output';
  * KindFromDataType, plus the text types `Text` / `WSTRING` / `STRING[n]`, which must never read as Int).
  */
 function kindFromDataType(dataType: string): 'Bool' | 'Int' | 'Float' | 'Text' {
-  const d = dataType.trim().toUpperCase();
-  if (d === 'BOOL' || d === 'BIT') return 'Bool';
-  if (d === 'REAL' || d === 'LREAL' || d === 'FLOAT') return 'Float';
-  if (isTextDataType(d)) return 'Text';
-  return 'Int';
+  if (isTextDataType(dataType)) return 'Text';
+  // Shared table: IEC names AND the OPC UA names a browse stores (`Boolean`, `Double`, `Int16`).
+  return dataTypeKind(dataType) ?? 'Int';
 }
 
 /** Direction encoded in an rv wire type ("PLCInputBool" → 'input'), or null when absent. */

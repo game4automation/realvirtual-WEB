@@ -3437,6 +3437,26 @@ export class MovementAuthority {
     return out.sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0));
   }
 
+  /**
+   * Read-only FIFO predecessors, regardless of their stop cause: earlier active
+   * wait start, then smaller id. Passive (NaN) entries have no FIFO edges.
+   * A pending claim without an entry competes at the vehicle's current sim time,
+   * as in isHeadWaiter. Returns a copy in FIFO order; never wakes or re-plans.
+   */
+  waitersAhead(zone: string, id: string): string[] {
+    const waiters = this.waiters.get(zone);
+    if (!waiters) return [];
+    const since = waiters.get(id) ?? this.vehicles.get(id)?.host.now();
+    if (since === undefined || Number.isNaN(since)) return [];
+    const ahead: Array<[string, number]> = [];
+    for (const [wid, t] of waiters) {
+      if (wid === id || Number.isNaN(t)) continue;
+      if (t < since || (t === since && wid < id)) ahead.push([wid, t]);
+    }
+    ahead.sort((a, b) => a[1] - b[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    return ahead.map(([wid]) => wid);
+  }
+
   /** Held zones (with run-end key) and awaited zones of a vehicle — diagnostics (plan-686); null when unknown. */
   describeZoneHolds(id: string): ZoneHoldReport | null {
     const v = this.vehicles.get(id);

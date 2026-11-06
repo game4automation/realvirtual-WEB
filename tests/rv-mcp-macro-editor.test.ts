@@ -47,7 +47,7 @@ interface Env {
   root: Group;
   box: Object3D;
   call: (tool: string, args: Record<string, unknown>) => Promise<Record<string, unknown>>;
-  callError: (tool: string, args: Record<string, unknown>) => Promise<Record<string, unknown>>;
+  callError: (tool: string, args: Record<string, unknown>) => Promise<string>;
   select: (paths: string[]) => void;
 }
 
@@ -111,11 +111,11 @@ function makeEnv(): Env {
     expect(frame.error, `transport error: ${frame.error}`).toBeUndefined();
     return JSON.parse(frame.result);
   };
-  const callError = async (tool: string, args: Record<string, unknown>): Promise<Record<string, unknown>> => {
+  const callError = async (tool: string, args: Record<string, unknown>): Promise<string> => {
     const frame = await callFrame(tool, args);
     expect(frame.result).toBeUndefined();
     expect(frame.error).toBeTypeOf('string');
-    return JSON.parse(frame.error);
+    return frame.error;
   };
   return { viewer, doc, root, box, call, callError, select: (p) => { selectedPaths = [...p]; } };
 }
@@ -150,9 +150,9 @@ afterEach(() => {
 const SET = { path: 'Asset/Box', componentType: 'Drive', fieldName: 'TargetSpeed', valueJson: '250' };
 
 describe.runIf(__RV_HAS_PRIVATE__)('plan-641 — editor commands through the bridge (private)', () => {
-  it('the old alias answers MOVED without writing; web_execute writes the field', async () => {
+  it('the old alias is unknown without writing; web_execute writes the field', async () => {
     const count = env.doc.document.ops.length;
-    expect(await env.callError('web_editor_set_field', SET)).toMatchObject({ error: 'MOVED', movedTo: ['editor.setField'] });
+    expect(await env.callError('web_editor_set_field', SET)).toBe('Unknown tool: web_editor_set_field');
     expect(env.doc.document.ops.length).toBe(count);
     expect(speedOf(env)).toBe(100);
     expect(await env.call('web_execute', { command: 'editor.setField', args: JSON.stringify(SET) })).toMatchObject({ ok: true, status: 'ok' });

@@ -32,15 +32,14 @@ Long commands with `timeoutMs > 120000` (120 s), including `editor.importCad` an
 `mechanism.trajectoryRun`, automatically return a `jobId`. Follow it with
 `web_macro_status` or request cancellation with `web_macro_cancel`; imports are
 not cancellable and return `kind:"not-cancellable"` while continuing to completion.
-For one release, an old tool name returns
-`{"error":"MOVED", movedTo, use, example, removedAfter:"6.8.0"}` with its replacement;
-it is absent from `tools/list`.
+The old per-domain tool names were removed in 6.7.1 and are now unknown tools; use
+`web_execute` / `web_query` (`web_commands` lists command ids).
 
 CONNECT classifies `web_execute` and `web_batch` by the strictest named command in
 `McpCommandClassAllowlist.cs`; unparsable calls are `destructive`, and `web_query`
 is `read`. `web_macro_replay` uses the strictest class of all macro-enabled commands.
-An outdated CONNECT without `capabilities.commandClasses` refuses moved sim/signal/file
-commands (and other moved targets stricter than edit) with `kind:'gateway-outdated'`.
+An outdated CONNECT without `capabilities.commandClasses` refuses sim/signal/file
+commands (and other commands stricter than edit) with `kind:'gateway-outdated'`.
 
 ## Diagnosis and filtered reads
 
@@ -60,14 +59,14 @@ spelling; alias conflicts fail. `_`-prefixed metadata is allowed except `__proto
 
 ## Tool domains
 
-Read-only domain queries run through `web_query("<id>", args)`, model/simulation changes through `web_execute`; `web_commands(query)` lists ids with their `door`; an old tool name answers `MOVED` with its replacement.
+Read-only domain queries run through `web_query("<id>", args)`, model/simulation changes through `web_execute`; `web_commands(query)` lists ids with their `door`.
 
 Names follow `web_<domain>_<action>`:
 
 | Domain | Tools | Purpose |
 |--------|-------|---------|
 | (root) | `web_status`, `web_logs`, `web_errors`, `web_help`, `web_describe`, `web_measure`, `web_ping` | Orientation, console logs, alarms, guides; `web_status` is lean by default (connection, model, mode, counts, `sim`, `problems`, `placements`) — `detail:"render"` adds render / bake / cache / features; `web_logs` returns info and above unless `level` asks for debug, filtered by `category` (comma list) and `since` (seconds back); `web_measure` = distances/gaps BETWEEN parts; `web_ping` is the timer-free liveness probe to reach for when other tools time out |
-| (root, commands) | `web_commands`, `web_query`, `web_execute`, `web_batch` | **The reduced command interface (plan-641).** `web_commands` lists every command of the registry (id, argsSchema, readOnly, door, `macro`, available); `web_execute` runs one by id, `web_batch` several in order — the same rule, refusal and undo step as the editor button. New modelling capabilities arrive as commands here, not as new tools; old alias names answer `MOVED` for one release |
+| (root, commands) | `web_commands`, `web_query`, `web_execute`, `web_batch` | **The reduced command interface (plan-641).** `web_commands` lists every command of the registry (id, argsSchema, readOnly, door, `macro`, available); `web_execute` runs one by id, `web_batch` several in order — the same rule, refusal and undo step as the editor button. New modelling capabilities arrive as commands here, not as new tools |
 | `macro` | `web_macro_record_start/_stop/_list/_get/_annotate/_save/_import/_assert/_replay/_status/_cancel` | Record your model changes (with `_reason` / `_source` / `_confidence`) as a macro that rides inside the GLB and replays in any session; replay is a job (`jobId` → `_status`, `_cancel`). `_assert` adds a geometry assertion line (`gap` / `contact` + expectation) that every replay measures. `_import` takes a macro from the project folder or inline JSON into another document. See *Commands and macros* below and `web_help(commands)` |
 | `check` | `web_check_gap`, `web_check_contact` | Mesh-exact minimum gap in mm between two nodes (not AABB), optionally in a POSE of drive positions (`{"Cell/Cylinder": 5}`) that is set and restored around the measurement without touching any drive state. Answers `gapMm`, `contact` (≤ `toleranceMm`, default 0.1), `overlap`, `contained`; a pose needs the runtime tree (`pose-requires-runtime` in the editor), couplings other than `Drive_Gear` must be posed explicitly (`pose-dependency-unsupported`), more than 200 000 triangles → `too-complex` |
 | `part` | `web_query("part.lookup", {"name":"DFM-6-5"})` | The shipped part library (`knowledge/parts.json`, generic rules from public type codes): family, size and stroke from the type number, motion kind, moving / fixed sub-part name patterns (`(K)` / `(Z)`), reference-point hint and a `source` to cite as `_source`. No match = empty list — never a guess |
@@ -289,7 +288,7 @@ range, which is a real change to the model, not a camera move.
   pressed button glows for ~3 s with an "AI" marker so the user sees what you touched, and the
   status pill names the action. Choose a pivot command directly, such as `web_execute("editor.pivotToObjectCenter", {path, targetPath})`.
   Keyboard actions likewise have command ids, such as `editor.hide` or `select.identical`;
-  the retired multiplexer names answer `MOVED` with all their targets. Camera and selection gestures remain tools. Millimetre anchors use
+  use `web_commands` to find their ids. Camera and selection gestures remain tools. Millimetre anchors use
   `web_execute("mechanism.setAnchor", …)`; paths and trajectories also use registry commands.
 
 ## Core workflows (details via web_help)

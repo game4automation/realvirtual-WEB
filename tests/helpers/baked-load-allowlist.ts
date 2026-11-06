@@ -83,6 +83,7 @@ export const AUTHORING_LOADS: ReadonlyArray<AllowedUnbakedLoad> = [
   'path/path-block-loaded-edit.test.ts',
   'phase1-persists-no-id.test.ts',
   'placement-any-document.test.ts',
+  'replay-recording-web-save-refs.test.ts',
   'resolve-ref-scope.test.ts',
   'ribbon-demo-glb.test.ts',
   'ribbon-line-stop.test.ts',

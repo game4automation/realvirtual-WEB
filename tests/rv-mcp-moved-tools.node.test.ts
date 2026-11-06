@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 
-import { readFileSync } from 'node:fs';
-import { beforeAll, describe, expect, it } from 'vitest';
-import { listToolEntries } from '../src/core/engine/rv-mcp-tools';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import type { ToolSchema } from '../src/core/engine/rv-mcp-tools';
 import { commandRegistry } from '../src/core/hmi/rv-command-registry';
 import { commandClassOf } from '../src/plugins/mcp-bridge/rv-mcp-tool-class';
 import { ensureEditorCommandsRegistered } from '../src/core/hmi/editor-command-descriptors';
@@ -19,10 +21,20 @@ import { ensureQueryCommandsRegistered } from '../src/core/hmi/query-commands';
 import { ensureDocumentCommandsRegistered } from '../src/core/hmi/document-commands';
 import { ensureSignalAutomapCommandsRegistered } from '../src/core/hmi/signal-automap-commands';
 import { ensureDesPlcCommandsRegistered } from '../src/core/hmi/des-plc-commands';
-import { withAliasListing } from '../src/plugins/mcp-bridge/rv-mcp-command-tools';
-import { MOVED_TOOLS, MOVED_TOOLS_REMOVE_AT, movedToolAnswer, movedToolOf, movedToolSchemas, semverGte, type MovedTool } from '../src/plugins/mcp-bridge/rv-mcp-moved-tools';
-
-let decorated: Set<string>;
+import { setCommandStepHooks } from '../src/plugins/mcp-bridge/rv-mcp-command-tools';
+import { ToolRegistry } from '../mcp-bridge/src/tool-registry';
+import type { ToolSchema as BridgeToolSchema } from '../mcp-bridge/src/protocol';
+type Bridge = {
+  _aiEnabled: boolean;
+  _emitChanged: () => void;
+  _ws: { readyState: number; send: (raw: string) => void };
+  _sendDiscover: () => void;
+  _handleMessage: (raw: string) => Promise<void>;
+};
+let bridge: Bridge;
+let schemas: ToolSchema[];
+const frames: Array<{ type: string; id?: number; tools?: ToolSchema[]; result?: string; error?: string }> = [];
+afterAll(() => setCommandStepHooks(null));
 beforeAll(async () => {
   ensureEditorCommandsRegistered();
   ensurePlannerCommandsRegistered();
@@ -38,15 +50,15 @@ beforeAll(async () => {
   ensureSignalAutomapCommandsRegistered();
   ensureDesPlcCommandsRegistered();
   const { McpBridgePlugin } = await import('../src/plugins/mcp-bridge-plugin');
-  decorated = new Set(new McpBridgePlugin().mcpToolInstances.flatMap((i) => listToolEntries(i).map((e) => e.name)));
+  bridge = new McpBridgePlugin() as unknown as Bridge;
+  bridge._aiEnabled = true;
+  bridge._emitChanged = () => {};
+  bridge._ws = { readyState: 1, send: (raw) => frames.push(JSON.parse(raw)) };
+  bridge._sendDiscover();
+  schemas = frames.find((frame) => frame.type === 'discover')!.tools!;
 }, 240_000);
 
-const synthetic: MovedTool = {
-  tool: 'web_old', movedTo: ['test.inspect', 'test.list'], door: 'web_query',
-  example: 'web_query("test.inspect")',
-};
-
-describe('plan-2007 moved tools', () => {
+describe('MCP retired tool removal', () => {
   it.each([
     ['component.setFields', 'edit', undefined],
     ['editor.kinematize', 'edit', 60_000],
@@ -61,58 +73,38 @@ describe('plan-2007 moved tools', () => {
     expect(d.scope).toBe(id === 'component.setFields' ? 'none' : 'editor');
     expect(d.undoLabel).toBeTruthy();
   });
-  it('has exactly one tombstone per name and concrete examples with real argument names', () => {
-    expect(new Set(MOVED_TOOLS.map((m) => m.tool)).size).toBe(MOVED_TOOLS.length);
-    for (const m of MOVED_TOOLS) {
-      expect(m.example).not.toContain('\n');
-      const call = /^(web_execute|web_query)\("([^"]+)", (.*)\)$/.exec(m.example);
-      expect(call, m.tool).not.toBeNull();
-      expect(call![1]).toBe(m.door);
-      expect(m.movedTo).toContain(call![2]);
-      const args = JSON.parse(call![3]);
-      const desc = commandRegistry.get(call![2])!;
-      for (const key of Object.keys(args)) expect(key in desc.argsSchema, `${m.tool}: ${key}`).toBe(true);
+  it('leaves no tombstones in discovery or the client tool list', () => {
+    expect(existsSync(new URL('../src/plugins/mcp-bridge/rv-mcp-moved-tools.ts', import.meta.url))).toBe(false);
+    const registry = new ToolRegistry();
+    registry.replace(schemas as BridgeToolSchema[]);
+    expect(schemas.length).toBeGreaterThan(0);
+    for (const schema of [...schemas, ...registry.list()]) {
+      expect(schema).not.toHaveProperty('tombstone');
+      expect(schema.description).not.toMatch(/^MOVED/);
     }
   });
 
-  it('has registered targets, the matching door, and no remaining decorator', () => {
-    for (const m of MOVED_TOOLS) {
-      expect(m.movedTo.length, m.tool).toBeGreaterThan(0);
-      for (const id of m.movedTo) expect(commandRegistry.get(id), id).toBeDefined();
-      expect(m.door === 'web_query', m.tool).toBe(m.movedTo.every((id) => commandRegistry.get(id)?.readOnly === true));
-      expect(decorated.has(m.tool), m.tool).toBe(false);
+  it('contains no source references to the removed mechanism', () => {
+    function sources(directory: string): string[] {
+      return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+        const path = join(directory, entry.name);
+        return entry.isDirectory() ? sources(path) : /\.(?:[cm]?[jt]sx?)$/.test(entry.name) ? [path] : [];
+      });
+    }
+    for (const root of ['../src/', '../mcp-bridge/src/']) {
+      for (const path of sources(fileURLToPath(new URL(root, import.meta.url)))) {
+        expect(readFileSync(path, 'utf8'), path).not.toMatch(/MOVED_TOOLS|movedToolAnswer|mcpAliases|RV_MCP_LIST_ALIASES/);
+      }
     }
   });
 
-  it('answers with the replacement commands, door, example and deadline', () => {
-    expect(movedToolOf('web_old', [synthetic])).toBe(synthetic);
-    expect(movedToolOf('web_missing', [synthetic])).toBeUndefined();
-    expect(JSON.parse(movedToolAnswer(synthetic))).toEqual({
-      error: 'MOVED', message: 'web_old moved to command test.inspect, test.list — use web_query',
-      movedTo: ['test.inspect', 'test.list'], use: 'web_query', example: synthetic.example, removedAfter: '6.8.0',
-    });
-  });
-
-  it('keeps tombstones unlisted even with the alias switch', () => {
-    const schemas = movedToolSchemas([synthetic]);
-    expect(schemas[0]).toMatchObject({
-      name: 'web_old', listed: false, tombstone: true, annotations: { readOnlyHint: true },
-      inputSchema: { type: 'object', properties: {}, additionalProperties: true },
-    });
-    expect(withAliasListing(schemas, new Set(), true)[0].listed).toBe(false);
-    expect(withAliasListing([{ ...schemas[0], listed: true }], new Set(), true)[0].listed).toBe(false);
-  });
-
-  it('requires tombstone removal by the release deadline', () => {
-    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-    expect(semverGte(pkg.version, MOVED_TOOLS_REMOVE_AT), 'remove tombstones (plan-2007 §2.3c)').toBe(false);
-  });
-
-  it.each([
-    ['6.5.0', '6.7.0', false], ['6.7.0', '6.7.0', true], ['6.7.1', '6.7.0', true],
-    ['6.10.0', '6.7.9', true], ['7.0.0', '6.99.99', true], ['6.7.0-rc.1', '6.7.0', true],
-    ['6.6.99', '6.7.0-rc.2', false], ['6.7.1', '6.7.2', false],
-  ])('compares %s >= %s as %s', (a, b, expected) => {
-    expect(semverGte(a, b)).toBe(expected);
-  });
+  it.each(['web_component_set', 'web_editor_set_field', 'web_signal_set_bool', 'web_unknown_242'])(
+    '%s receives the ordinary unknown-tool answer', async (tool) => {
+      await bridge._handleMessage(JSON.stringify({ type: 'call', id: 242, tool, arguments: {} }));
+      const frame = frames.at(-1)!;
+      expect(frame).toMatchObject({ type: 'result', id: 242, error: `Unknown tool: ${tool}` });
+      expect(frame.result).toBeUndefined();
+      expect(frame.error).not.toContain('MOVED');
+    },
+  );
 });

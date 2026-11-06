@@ -373,7 +373,7 @@ describe('multiplexer binding through _handleCall', () => {
     expect(phases.every((p) => p === 'hover' || p === 'pressed')).toBe(true);
   });
 
-  it('the pivot tombstone lists all four commands even for an unknown mode, without dispatch', async () => {
+  it('the removed pivot tool is unknown and never dispatches', async () => {
     const spy = vi.spyOn(commandRegistry, 'execute');
     const n = env.sent.length;
     await (env.plugin as unknown as { _handleMessage: (raw: string) => Promise<void> })._handleMessage(JSON.stringify({
@@ -382,9 +382,7 @@ describe('multiplexer binding through _handleCall', () => {
     const frame = JSON.parse(env.sent[n]);
     expect(frame.result).toBeUndefined();
     expect(frame.error).toBeTypeOf('string');
-    expect(JSON.parse(frame.error)).toMatchObject({
-      error: 'MOVED', movedTo: ['editor.pivotToBottom', 'editor.pivotToObjectCenter', 'editor.centerKinematicToGroup', 'editor.alignYUp'],
-    });
+    expect(frame.error).toBe('Unknown tool: web_editor_pivot');
     expect(spy).not.toHaveBeenCalled();
   });
 });

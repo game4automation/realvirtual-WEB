@@ -30,6 +30,10 @@ import { execFileSync } from 'node:child_process';
 //! Paths that must never exist in the published tree. Matched against the full
 //! repo-relative path; a trailing '/' marks a directory prefix.
 const DENIED_PATHS = [
+  // Interne Messdaten/Teams-Paket, gehoeren ins Private-Repo.
+  'perf-results/',
+  'teams-app/',
+  'teams-manifest/',
   'scripts/onboard-customer.mjs',
   'scripts/onboard-customer.d.mts',
   'scripts/get-connect.mjs',
@@ -37,6 +41,8 @@ const DENIED_PATHS = [
   'scripts/provision-influx.mjs',
   'scripts/provision-influx.d.mts',
   'scripts/inspect-door.mjs',
+  'scripts/library-zone-setup.mjs',
+  'scripts/library-publish.mjs',
   'tests/onboard-customer.node.test.ts',
   'tests/get-connect.node.test.ts',
   'tests/provision-influx.node.test.ts',

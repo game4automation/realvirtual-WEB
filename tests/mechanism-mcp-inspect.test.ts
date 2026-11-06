@@ -49,7 +49,6 @@ import {
   type MechanismUiBridge,
   type MechanismView,
 } from '../src/core/engine/rv-kinematic-registry';
-import { movedToolOf } from '../src/plugins/mcp-bridge/rv-mcp-moved-tools';
 import { allSchemas } from './helpers/mcp-schemas';
 import { commandRegistry } from '../src/core/hmi/rv-command-registry';
 import { ERR_EDITOR_UNAVAILABLE } from '../src/core/editor/rv-editor-guard-core';
@@ -457,7 +456,7 @@ describe('T2 — without the private bundle every mechanism tool refuses', () =>
   it('all 11 former mechanism bindings are commands, with no decorated mechanism tools', () => {
     expect(mechanismTools.length).toBe(11);
     expect(allSchemas().filter((s) => s.name.includes('mechanism'))).toEqual([]);
-    for (const name of mechanismTools) expect(movedToolOf(name)?.movedTo).toHaveLength(1);
+    for (const id of MECHANISM_COMMAND_IDS) expect(commandRegistry.get(id), id).toBeDefined();
   });
 
   it('each returns an error, names the alternative, and appends NO op', async () => {

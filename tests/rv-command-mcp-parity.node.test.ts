@@ -24,7 +24,6 @@
  * `ik.*` commands, 67 of 144.
  */
 
-import { movedToolOf } from '../src/plugins/mcp-bridge/rv-mcp-moved-tools';
 import { beforeAll, describe, expect, it } from 'vitest';
 import {
   listToolEntries,
@@ -457,7 +456,6 @@ describe('parity gate (metadata)', () => {
   it('every former binding has exactly its command targets and no decorated alias', () => {
     for (const [name, ids] of Object.entries(FORMER_BINDINGS)) {
       expect(entries.some((e) => e.name === name), name).toBe(false);
-      expect(movedToolOf(name)?.movedTo, name).toEqual(ids);
       for (const id of ids) expect(registry.get(id), id).toBeDefined();
     }
   });
@@ -579,12 +577,6 @@ describe('parity gate (metadata)', () => {
   });
 
   it('plan-621: the three SolidCraft tools are 1:1 views of solidcraft.* — editor scope, no undo label of their own', () => {
-    const sc = Object.keys(FORMER_BINDINGS).filter((name) => name.startsWith('web_editor_solidcraft_')).map((name) => ({ name, command: movedToolOf(name)!.movedTo[0] }));
-    expect(Object.fromEntries(sc.map((e) => [e.name, e.command]))).toEqual({
-      web_editor_solidcraft_connect: 'solidcraft.connect',
-      web_editor_solidcraft_resync: 'solidcraft.resync',
-      web_editor_solidcraft_disconnect: 'solidcraft.disconnect',
-    });
     for (const id of ['solidcraft.connect', 'solidcraft.resync', 'solidcraft.disconnect']) {
       const d = registry.get(id)!;
       expect(d.scope, id).toBe('editor');
@@ -608,7 +600,7 @@ describe('parity gate (metadata)', () => {
     };
     const mech = entries.filter((e) => e.name.startsWith('web_editor_mechanism_') && e.readOnly === false);
     expect(mech).toEqual([]);
-    for (const [name, id] of Object.entries(expected)) expect(movedToolOf(name)?.movedTo).toEqual([id]);
+    for (const id of Object.values(expected)) expect(registry.get(id), id).toBeDefined();
     expect(mech.find((e) => e.name === 'web_editor_mechanism_set_anchor')).toBeUndefined();
     // Eleven bindings, the UI-only batch, and eight migrated commands.
     const ids = registry.list().map((d) => d.id).filter((id) => id.startsWith('mechanism.'));

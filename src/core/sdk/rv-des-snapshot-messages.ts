@@ -20,7 +20,7 @@ export const SNAPSHOT_MESSAGES = {
   },
   "des-snapshot-unsupported-component": {
     "title": "Cannot be saved yet",
-    "text": "A PLC program, IK path, replay, playback, smooth-motion drive, unsupported logic step or a gripped part is active. Stop it, or continue without saving."
+    "text": "A replay, playback, smooth-motion drive, unsupported logic step, gripped part, IK path paused by another axis owner, or a PLC program that is in error, differs from its saved code or was started by hand is active. Stop it, or continue without saving."
   },
   "des-snapshot-scripts-pending": {
     "title": "Run still starting",

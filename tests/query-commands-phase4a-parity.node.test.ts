@@ -8,7 +8,6 @@ import { ensureQueryCommandsRegistered } from '../src/core/hmi/query-commands';
 import { createMechanismCommandDescriptors, ensureMechanismCommandsRegistered, MECHANISM_UNAVAILABLE } from '../src/core/hmi/mechanism-command-descriptors';
 import { ensureIkCommandsRegistered } from '../src/plugins/mcp-bridge/rv-mcp-robot-tools';
 import { McpCommandTools } from '../src/plugins/mcp-bridge/rv-mcp-command-tools';
-import { MOVED_TOOLS } from '../src/plugins/mcp-bridge/rv-mcp-moved-tools';
 import { commandClassOf } from '../src/plugins/mcp-bridge/rv-mcp-tool-class';
 import { setMechanismUiBridge, type MechanismUiBridge } from '../src/core/engine/rv-kinematic-registry';
 import { ERR_EDITOR_UNAVAILABLE, ERR_NOT_EDITOR } from '../src/core/editor/rv-editor-guard-core';
@@ -50,7 +49,7 @@ beforeAll(() => {
 afterEach(() => { setMechanismUiBridge(null); commandRegistry.attachViewer(undefined); });
 
 describe('plan-2007 Phase 4A query parity', { timeout: 30_000 }, () => {
-  it.each(CASES)('%s registers the old argument names, read class and one query tombstone', (id, keys) => {
+  it.each(CASES)('%s registers the original argument names and read class', (id, keys) => {
     const d = commandRegistry.get(id)!;
     expect(d, id).toBeDefined();
     expect(d.readOnly).toBe(true);
@@ -58,10 +57,6 @@ describe('plan-2007 Phase 4A query parity', { timeout: 30_000 }, () => {
     expect(d.undoLabel).toBeUndefined();
     expect(commandClassOf(d)).toBe('read');
     expect(Object.keys(d.argsSchema ?? {})).toEqual(keys);
-    const moved = MOVED_TOOLS.filter((m) => m.movedTo.includes(id));
-    expect(moved).toHaveLength(1);
-    expect(moved[0].door).toBe('web_query');
-    expect(moved[0].example).toContain(`web_query("${id}",`);
   });
 
   it.each(CASES)('%s runs through web_query and retains the old no-model refusal value', async (id) => {

@@ -173,8 +173,8 @@ describe('legacy adopt stays as it was (S7 / PLCSIM), now as fillEmpty ops', () 
   });
 });
 
-describe('plan-2025 P7 review fix 7 — direction of the configured CONNECT signal', () => {
-  it('an existing CONNECT signal of the other direction is a non-writable conflict, even with an empty address', () => {
+describe('the model signal is binding for the coupling (Thomas 2026-11-05, supersedes plan-2025 P7 fix 7)', () => {
+  it('an existing CONNECT signal of another direction is retyped to the model type, even with an empty address', () => {
     const plan = planFillAddresses({
       iface: iface({
         signals: [
@@ -186,9 +186,23 @@ describe('plan-2025 P7 review fix 7 — direction of the configured CONNECT sign
       discovered: [disc('MAIN.bStart', 'MAIN.bStart', 'unknown'), disc('MAIN.bOk', 'MAIN.bOk', 'unknown')],
       schema: schema(),
     });
-    expect(plan.rows.map(r => [r.name, r.status])).toEqual([['MAIN.bStart', 'direction-conflict'], ['MAIN.bOk', 'fill']]);
-    expect(plan.rows[0].reason).toMatch(/configured as PLCInputBool, the model signal is PLCOutputBool/);
-    expect(fillAddressOps(plan).map(o => o.name)).toEqual(['MAIN.bOk']);
+    expect(plan.rows.map(r => [r.name, r.status])).toEqual([['MAIN.bStart', 'retype'], ['MAIN.bOk', 'fill']]);
+    expect(plan.rows[0].reason).toMatch(/Configured as PLCInputBool, retyped to the model type PLCOutputBool/);
+    expect(fillAddressOps(plan)).toEqual([
+      { op: 'signal.upsert', interfaceId: 'if1', name: 'MAIN.bStart', protocolAddress: 'MAIN.bStart', addressMode: 'fillEmpty', type: 'PLCOutputBool' },
+      { op: 'signal.upsert', interfaceId: 'if1', name: 'MAIN.bOk', protocolAddress: 'MAIN.bOk', addressMode: 'fillEmpty' },
+    ]);
+  });
+
+  it('a wrong value kind (an OPC UA Boolean once bound as Float) is retyped as well', () => {
+    const plan = planFillAddresses({
+      iface: iface({ type: 'OpcUa', signals: [{ name: 'din_start', protocolAddress: 'ns=4;s=GVL.din_start', type: 'PLCOutputFloat', record: false }] }),
+      model: [model('din_start', 'PLCInputBool')],
+      discovered: [disc('din_start', 'ns=4;s=GVL.din_start', 'unknown', 'Boolean')],
+      schema: schema(),
+    });
+    expect(plan.rows[0]).toMatchObject({ status: 'retype' });
+    expect(fillAddressOps(plan)[0]).toMatchObject({ type: 'PLCInputBool' });
   });
 
   it('also inside an MQTT topic', () => {
@@ -201,7 +215,17 @@ describe('plan-2025 P7 review fix 7 — direction of the configured CONNECT sign
       discovered: [disc('X', '%IW2', 'unknown')],
       schema: schema(),
     });
-    expect(plan.rows[0]).toMatchObject({ status: 'direction-conflict', topic: 't' });
+    expect(plan.rows[0]).toMatchObject({ status: 'retype', topic: 't' });
+    expect(fillAddressOps(plan)[0]).toMatchObject({ topic: 't', type: 'PLCInputInt' });
+  });
+
+  it('a direction the CONTROLLER states (read-only / write-only node) still blocks', () => {
+    const plan = planFillAddresses({
+      iface: iface({}),
+      model: [model('In', 'PLCInputBool')],
+      discovered: [disc('In', 'GVL.In', 'output')],
+    });
+    expect(plan.rows[0].status).toBe('direction-conflict');
     expect(fillAddressOps(plan)).toEqual([]);
   });
 });

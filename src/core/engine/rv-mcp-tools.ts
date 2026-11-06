@@ -92,12 +92,10 @@ export interface ToolSchema {
   /** Per-call timeout hint for the bridge; stripped before the MCP client sees the tool list. */
   timeoutMs?: number;
   /**
-   * plan-641 Nachtrag 2026-10-21: `false` marks a command-bound alias — the bridges keep it
-   * callable but leave it out of `tools/list` (see `withAliasListing`). Absent = listed.
+   * `false` hides an announced tool from the client list; the bridges keep it
+   * callable but leave it out of `tools/list`. Absent = listed.
    */
   listed?: boolean;
-  /** Retired tool redirect: always hidden, including when aliases are listed. */
-  tombstone?: boolean;
 }
 
 // ── Metadata storage ──

@@ -113,7 +113,7 @@ export function fleetRunnerParticipant(runner: FleetJobRunner, jobKinds: Readonl
     services: ['adapters', 'site', 'dispatcher', 'params', 'orders', 'clock', 'handover', 'lift', 'lamps', 'fleetName',
       'fleet', 'docks', 'zones', 'routes', 'waits', 'limits', 'socKey', 'decel', 'authority', 'signalScratch',
       'statusInput', 'locScratch', 'motionScratch', 'stationByPath', 'pickIds', 'dropIds', 'takt', 'pauses',
-      'disposers', 'startPaths', 'ownerToken', 'disposed', 'dockReleases', 'orderKpis'],
+      'disposers', 'startPaths', 'sortedVehicleIds', 'ownerToken', 'disposed', 'dockReleases', 'orderKpis'],
     capture: () => runner.exportState(),
     // The dispatcher still has its old jobs during prepare; it commits before the runner.
     validate: json => [...runner.validateState(json, false), ...linkErrors(json)],

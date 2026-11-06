@@ -32,11 +32,10 @@
 import { describe, expect, it } from 'vitest';
 import { allSchemas, delegateCensus } from './helpers/mcp-schemas';
 import { getTypesWithCapability, getFieldDescriptor } from '../src/core/engine/rv-component-registry';
-import { resolveToolClass } from '../src/plugins/mcp-bridge/rv-mcp-tool-class';
+import { commandClassOf } from '../src/plugins/mcp-bridge/rv-mcp-tool-class';
 import { IK_PROBLEM_CODES } from '../src/core/hmi/problems-store';
 import { commandRegistry } from '../src/core/hmi/rv-command-registry';
 import { ensureIkCommandsRegistered } from '../src/plugins/mcp-bridge/rv-mcp-robot-tools';
-import { MOVED_TOOLS } from '../src/plugins/mcp-bridge/rv-mcp-moved-tools';
 
 ensureIkCommandsRegistered();
 const READ_COMMANDS = ['ik.robot.list', 'ik.robot.chain', 'ik.robot.state', 'ik.robot.verifyFk', 'ik.robot.rigDiagnose', 'ik.path.inspect'];
@@ -48,34 +47,30 @@ const READ_TOOLS = [
   // no extras, no document op), which is what lets it run on a model nobody
   // wants changed. It is the family's only bound read tool (`ik.program.export`,
   // shared with the IKPath inspector's Export button).
-  'web_robot_program_export',
+  'ik.program.export',
 ] as const;
 const WRITE_TOOLS = [
-  'web_robot_rig_from_library',
+  'ik.robot.rig',
   // Phase 3 — authoring a robot program: the path, its waypoints, their order
   // and the solve that moves the robot onto one.
-  'web_robot_path_create',
-  'web_robot_target_add',
-  'web_robot_target_set',
-  'web_robot_target_remove',
-  'web_robot_target_reorder',
-  'web_robot_solve_target',
+  'ik.path.create',
+  'ik.target.add',
+  'ik.target.set',
+  'ik.target.remove',
+  'ik.target.reorder',
+  'ik.target.solve',
 ] as const;
 
-describe('plan-773 — the web_robot_* family is announced', () => {
+describe('plan-773 — the robot command family', () => {
   const schemas = allSchemas();
-  const byName = new Map(schemas.map((s) => [s.name, s]));
 
-  it('keeps all fourteen former tools as tombstones backed by commands', () => {
+  it('keeps all fourteen robot operations as commands', () => {
+    expect(schemas.some((schema) => schema.name.startsWith('web_robot_'))).toBe(false);
     for (const id of READ_COMMANDS) {
       expect(commandRegistry.get(id)?.readOnly, id).toBe(true);
-      const moved = MOVED_TOOLS.find((m) => m.movedTo.includes(id))!;
-      expect(moved.door).toBe('web_query');
-      expect(byName.has(moved.tool)).toBe(false);
     }
     for (const name of [...READ_TOOLS, ...WRITE_TOOLS]) {
-      expect(byName.has(name), `${name} is retired`).toBe(false);
-      expect(MOVED_TOOLS.find((m) => m.tool === name)).toBeDefined();
+      expect(commandRegistry.get(name), name).toBeDefined();
     }
   });
 
@@ -86,22 +81,22 @@ describe('plan-773 — the web_robot_* family is announced', () => {
 
   it('marks every reading tool read-only and the rigging tool not', () => {
     for (const name of READ_TOOLS) {
-      expect(commandRegistry.get(MOVED_TOOLS.find((m) => m.tool === name)!.movedTo[0])!.readOnly, `${name} must be readOnly`).toBe(true);
+      expect(commandRegistry.get(name)!.readOnly, `${name} must be readOnly`).toBe(true);
     }
     for (const name of WRITE_TOOLS) {
       // plan-2007 Phase 6: the rigging/authoring tools are commands now; their command writes.
-      expect(commandRegistry.get(MOVED_TOOLS.find((m) => m.tool === name)!.movedTo[0])!.readOnly, `${name} writes a component`).toBe(false);
+      expect(commandRegistry.get(name)!.readOnly, `${name} writes a component`).toBe(false);
     }
   });
 
   it('resolves to the tool classes the call policy needs', () => {
     for (const name of READ_TOOLS) {
-      expect(resolveToolClass({ name, readOnly: true })).toBe('read');
+      expect(commandClassOf(commandRegistry.get(name)!)).toBe('read');
     }
     // A rig and a waypoint are model edits — the class the chat policy runs
     // without asking. None of them is `destructive`: each names what it touches.
     for (const name of WRITE_TOOLS) {
-      expect(resolveToolClass({ name, readOnly: false }), name).toBe('edit');
+      expect(commandClassOf(commandRegistry.get(name)!), name).toBe('edit');
     }
   });
 
@@ -113,13 +108,13 @@ describe('plan-773 — the web_robot_* family is announced', () => {
     expect(reorder.required ?? []).toEqual(expect.arrayContaining(['fromIndex', 'toIndex']));
     expect(reorder.required ?? []).not.toContain('pathPath');
     // A target is always named explicitly — there is no "the only waypoint".
-    for (const name of ['web_robot_target_set', 'web_robot_solve_target']) {
-      expect(commandRegistry.get(MOVED_TOOLS.find((m) => m.tool === name)!.movedTo[0])!.mcp!.params.filter((p) => p.required).map((p) => p.name), name).toContain('targetPath');
+    for (const name of ['ik.target.set', 'ik.target.solve']) {
+      expect(commandRegistry.get(name)!.mcp!.params.filter((p) => p.required).map((p) => p.name), name).toContain('targetPath');
     }
     // plan-2214: a delete names the waypoint either by {targetPath} or by the raw
     // reference {pathPath, index} (the inspector's delete of a broken reference) —
     // both explicit; the command refuses a call that gives neither or both.
-    const remove = commandRegistry.get(MOVED_TOOLS.find((m) => m.tool === 'web_robot_target_remove')!.movedTo[0])!.mcp!.params.map((p) => p.name);
+    const remove = commandRegistry.get('ik.target.remove')!.mcp!.params.map((p) => p.name);
     expect(remove).toEqual(expect.arrayContaining(['targetPath', 'pathPath', 'index']));
   });
 

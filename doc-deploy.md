@@ -1591,6 +1591,8 @@ sibling repository under `../realvirtual-WebViewer-Private~/scripts/`:
 | `get-connect.mjs` | Fetches the pinned CONNECT build (proprietary product) |
 | `provision-influx.mjs` | Provisions project-scoped InfluxDB resources for the CONNECT historian |
 | `inspect-door.mjs` | One-off diagnostic against a customer GLB |
+| `library-zone-setup.mjs` | Idempotent setup of the hosted library storage and CDN zone |
+| `library-publish.mjs` | Publishes hosted library projects and probes CDN delivery |
 
 Their tests live in the same repository under `tests/`; `vitest.node.config.ts` includes that
 directory when it is present, so `npm run test:node` covers them locally and simply matches nothing

@@ -1554,11 +1554,7 @@ The harness measures PalletYard FastForward without rendering and a separate syn
 
 `wallMs` is computation wall time, `simSeconds` the simulated duration, `totalEventsProcessed` the event count, `eventsPerSecond` the event rate, and `simHoursPerWallHour` the simulated-time/wall-time ratio. `componentCount`, `vehicles`, `stations`, `muCount` and `liveMuCount` describe the loaded model. `heapPeakBytes` uses `performance.memory.usedJSHeapSize` before the run and after each tick (`heapSamples`): it is a sampled peak, not an allocation high-water mark. `heapAfterGcBytes` uses CDP `HeapProfiler.collectGarbage` followed by `Runtime.getHeapUsage`. `snapshotMs`, `snapshotBytes` and `restoreMs` exist only where supported; inspect `snapshot.supported` and `restore.supported` rather than interpreting missing values as zero.
 
-Reference reports: `perf-results/plan-2063/`, specifically:
-
-- `perf-results/plan-2063/2026-11-01-Coder-main-sizes1-8-8h.json`
-- `perf-results/plan-2063/2026-11-01-Coder-size16-8h.json`
-- `perf-results/plan-2063/2026-11-01-Coder-size8-80h.json`
+Reference measurements live in the private repository `realvirtual-WebViewer-Private~`, under `perf-results/plan-2063/` (same folder name).
 
 | n | Sim-h | Wall ms | Events total | Events/s | Sim-h/wall-h | Heap peak MB | Heap after GC MB |
 |---|---|---|---|---|---|---|---|

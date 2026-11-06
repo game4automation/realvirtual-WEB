@@ -5,7 +5,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { commandRegistry, type CapturedContext, type CommandDescriptor, type CommandImpl } from '../src/core/hmi/rv-command-registry';
 import { gatewayOutdatedRefusal, McpCommandTools, setGatewayCommandClassesState } from '../src/plugins/mcp-bridge/rv-mcp-command-tools';
-import { MOVED_TOOLS } from '../src/plugins/mcp-bridge/rv-mcp-moved-tools';
 import { macroBookOf, macroJobs, RV_MACRO_SCHEMA, type RvMacroCommandStep } from '../src/plugins/mcp-bridge/rv-mcp-macro';
 import { McpMacroTools } from '../src/plugins/mcp-bridge/rv-mcp-macro-tools';
 
@@ -13,15 +12,6 @@ vi.mock('../src/core/hmi/rv-command-registry', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/core/hmi/rv-command-registry')>();
   return { ...actual, commandRegistry: new actual.CommandRegistry() };
 });
-
-// Inject a synthetic moved table through the module mock, without a production test hook.
-vi.mock('../src/plugins/mcp-bridge/rv-mcp-moved-tools', () => ({
-  MOVED_TOOLS: [
-    { tool: 'web_test_plc', movedTo: ['plc.testDeploy'], door: 'web_execute', example: '' },
-    { tool: 'web_test_editor', movedTo: ['editor.testEdit'], door: 'web_execute', example: '' },
-    { tool: 'web_test_read', movedTo: ['plc.testRead'], door: 'web_query', example: '' },
-  ],
-}));
 
 vi.mock('../src/plugins/mcp-bridge/rv-mcp-dialog-policy', () => ({
   installMcpDialogPolicy: vi.fn(async () => () => []),
@@ -47,7 +37,7 @@ beforeEach(() => {
   register('plc.testDeploy', deploy, { timeoutMs: 600_000 });
   register('editor.testEdit', edit);
   register('plc.testRead', () => ({ read: true }), { readOnly: true });
-  register('plc.existing', () => ({ existing: true }));
+  register('editor.existing', () => ({ existing: true }));
   setGatewayCommandClassesState('connect-without-classes');
 });
 
@@ -66,14 +56,13 @@ async function finished(id: string) {
 }
 
 describe('plan-2007 F15 gateway compatibility', () => {
-  it('gates only moved targets stricter than edit', () => {
-    expect(gatewayOutdatedRefusal('plc.testDeploy', commandRegistry, MOVED_TOOLS)).toMatchObject({
+  it('gates commands stricter than edit when CONNECT cannot classify commands', () => {
+    expect(gatewayOutdatedRefusal('plc.testDeploy', commandRegistry)).toMatchObject({
       ok: false, command: 'plc.testDeploy', status: 'failed', kind: 'gateway-outdated',
     });
-    expect(gatewayOutdatedRefusal('editor.testEdit', commandRegistry, MOVED_TOOLS)).toBeNull();
-    expect(gatewayOutdatedRefusal('plc.testRead', commandRegistry, MOVED_TOOLS)).toBeNull();
-    expect(gatewayOutdatedRefusal('plc.existing', commandRegistry, MOVED_TOOLS)).toBeNull();
-    expect(gatewayOutdatedRefusal('plc.testDeploy', commandRegistry, [])).toBeNull();
+    expect(gatewayOutdatedRefusal('editor.testEdit', commandRegistry)).toBeNull();
+    expect(gatewayOutdatedRefusal('plc.testRead', commandRegistry)).toBeNull();
+    expect(gatewayOutdatedRefusal('editor.existing', commandRegistry)).toBeNull();
   });
 
   it('refuses execute before auto-job or explicit background creation; edit and existing commands run', async () => {
@@ -82,7 +71,7 @@ describe('plan-2007 F15 gateway compatibility', () => {
     expect(macroJobs.list()).toHaveLength(0);
     expect(deploy).not.toHaveBeenCalled();
     expect(await parse(tools.webExecute('editor.testEdit'))).toMatchObject({ ok: true });
-    expect(await parse(tools.webExecute('plc.existing'))).toMatchObject({ ok: true });
+    expect(await parse(tools.webExecute('editor.existing'))).toMatchObject({ ok: true });
     expect(edit).toHaveBeenCalledOnce();
   });
 

@@ -200,3 +200,45 @@ describe('resolveMcpBridgeTarget — hosted page', () => {
       .toBe('ws://localhost:18714/webviewer');
   });
 });
+
+describe('resolveMcpBridgeTarget — configured CONNECT address', () => {
+  const external = ctx({ servedByConnect: false, connectServerUrl: 'http://localhost:51001' });
+
+  it.each([false, true])('follows CONNECT on a hosted or Vite page (dev=%s)', (isDevServer) => {
+    expect(resolveMcpBridgeTarget({ ...external, isDevServer })).toBe('ws://localhost:51001/webviewer');
+  });
+
+  it('uses wss for an https CONNECT address', () => {
+    expect(resolveMcpBridgeTarget({ ...external, connectServerUrl: 'https://plant:8443' }))
+      .toBe('wss://plant:8443/webviewer');
+  });
+
+  it.each([
+    ['http://plant:51001/prefix/path?ignored=1#section', 'ws://plant:51001/webviewer'],
+    ['https://plant/prefix/', 'wss://plant/webviewer'],
+    ['http://plant/', 'ws://plant/webviewer'],
+    ['http://[::1]:51001/prefix', 'ws://[::1]:51001/webviewer'],
+  ])('uses the gateway root and scheme port for %s', (connectServerUrl, expected) => {
+    expect(resolveMcpBridgeTarget({ ...external, connectServerUrl })).toBe(expected);
+  });
+
+  it('an explicit bridge port wins over CONNECT', () => {
+    expect(resolveMcpBridgeTarget({ ...external, explicitPort: true, bridgePort: NODE_FALLBACK_PORT }))
+      .toBe('ws://localhost:18714/webviewer');
+  });
+
+  it.each([false, true])('keeps the embedded page host (dev=%s)', (isDevServer) => {
+    expect(resolveMcpBridgeTarget({ ...external, servedByConnect: true, isDevServer }))
+      .toBe('ws://plant.example.com:8443/webviewer');
+  });
+
+  it.each([undefined, '', ' ', 'invalid', 'ftp://plant:51001', 'ws://plant:51001'])
+    ('keeps the localhost fallback for an absent or invalid address: %s', (connectServerUrl) => {
+      expect(resolveMcpBridgeTarget({ ...external, connectServerUrl })).toBe('ws://localhost:5100/webviewer');
+    });
+
+  it('carries the key in the cross-origin URL even with cookie preference', () => {
+    expect(resolveMcpBridgeTarget({ ...external, authToken: 'key /1', preferCookieAuth: true }))
+      .toBe('ws://localhost:51001/webviewer?apikey=key%20%2F1');
+  });
+});

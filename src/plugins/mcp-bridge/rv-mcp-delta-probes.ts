@@ -713,43 +713,43 @@ const layoutProbe: DeltaProbe = {
 // ─── The policy table ───────────────────────────────────────────────────
 
 /**
- * Tool name → probe. Absence is a DECISION, not an omission:
+ * Command id or live tool name → probe. Absence is a DECISION, not an omission:
  *
  *  - `web_camera_*`, `web_view_*`, `web_select*`, `web_node_bounds` are
  *    classified as writes because a watching operator sees the view jump — they
  *    persist nothing, so a before/after over a camera matrix would be pure
  *    noise charged against the token budget.
- *  - `web_editor_verify_drive` and `web_editor_mechanism_jog` are transient by
+ *  - `web_editor_verify_drive` and `mechanism.jog` are transient by
  *    design (no ops, no undo entry); reporting `noop` on them would be
  *    technically true and actively misleading.
  *  - read-only tools have nothing to verify.
  */
 export const DELTA_PROBES: Record<string, DeltaProbe> = {
   // Signals
-  web_signal_set_bool: signalProbe,
-  web_signal_set_float: signalProbe,
+  'signal.setBool': signalProbe,
+  'signal.setFloat': signalProbe,
 
   // Drives
-  web_drive_jog: driveProbe,
-  web_drive_stop: driveProbe,
-  web_drive_speed_override: speedOverrideProbe,
+  'drive.jog': driveProbe,
+  'drive.stop': driveProbe,
+  'sim.speedOverride': speedOverrideProbe,
 
   // Simulation
-  web_sim_play_pause: simProbe,
-  web_sim_reset: simProbe,
+  'sim.playPause': simProbe,
+  'sim.reset': simProbe,
 
   // Workpiece carriers (plan-567)
-  web_mu_delete: muProbe,
-  web_mu_move: muProbe,
+  'mu.delete': muProbe,
+  'mu.move': muProbe,
 
   // Workspace
-  web_mode_set: modeProbe,
+  'workspace.setMode': modeProbe,
 
   // Layout
-  web_layout_place: layoutProbe,
-  web_layout_move: layoutProbe,
-  web_layout_remove: layoutProbe,
-  web_layout_snap_attach: layoutProbe,
+  'layout.place': layoutProbe,
+  'layout.move': layoutProbe,
+  'layout.remove': layoutProbe,
+  'layout.snapAttach': layoutProbe,
 
   // Asset editor — lifecycle
   web_editor_open: editorLifecycleProbe,
@@ -757,47 +757,46 @@ export const DELTA_PROBES: Record<string, DeltaProbe> = {
   web_editor_save: editorSaveProbe,
 
   // Asset editor — everything that appends ops
-  web_editor_undo: editorOpProbe,
-  web_editor_redo: editorOpProbe,
-  web_editor_transform: editorOpProbe,
-  web_editor_zero_position: editorOpProbe,
-  web_editor_rotate90: editorOpProbe,
-  web_editor_to_ground: editorOpProbe,
-  web_editor_pivot: editorOpProbe,
-  web_editor_rename: editorOpProbe,
-  web_editor_delete: editorOpProbe,
-  web_editor_set_visible: editorOpProbe,
-  web_editor_create_empty: editorOpProbe,
-  web_editor_reparent: editorOpProbe,
-  web_editor_add_component: editorOpProbe,
-  web_editor_remove_component: editorOpProbe,
-  web_editor_set_field: editorOpProbe,
-  web_editor_create_kinematic: editorOpProbe,
-  web_editor_assign_to_kinematic: editorOpProbe,
-  web_editor_kinematize: editorOpProbe,
-  web_editor_add_signal: editorOpProbe,
-  web_editor_convert_signal: editorOpProbe,
-  web_editor_toggle_signal_direction: editorOpProbe,
-  web_editor_add_logic_step: editorOpProbe,
-  web_editor_assign_material: editorOpProbe,
-  web_editor_materialize: editorOpProbe,
-  web_editor_import_glb: editorOpProbe,
-  web_editor_import_cad: editorOpProbe,
-  web_editor_mechanism_create: editorOpProbe,
-  web_editor_mechanism_add_joint: editorOpProbe,
-  web_editor_mechanism_set_anchor: editorOpProbe,
-  web_editor_mechanism_assign_drive: editorOpProbe,
+  'editor.undo': editorOpProbe,
+  'editor.redo': editorOpProbe,
+  'editor.transform': editorOpProbe,
+  'editor.zeroPosition': editorOpProbe,
+  'editor.rotate90': editorOpProbe,
+  'editor.toGround': editorOpProbe,
+
+  'editor.rename': editorOpProbe,
+  'editor.delete': editorOpProbe,
+  'editor.setVisible': editorOpProbe,
+  'editor.createEmpty': editorOpProbe,
+  'editor.reparent': editorOpProbe,
+  'editor.addComponent': editorOpProbe,
+  'editor.removeComponent': editorOpProbe,
+  'editor.setField': editorOpProbe,
+  'editor.createKinematic': editorOpProbe,
+  'editor.assignToKinematic': editorOpProbe,
+  'editor.kinematize': editorOpProbe,
+  'editor.addSignal': editorOpProbe,
+  'editor.convertSignal': editorOpProbe,
+  'editor.toggleSignalDirection': editorOpProbe,
+  'editor.addLogicStep': editorOpProbe,
+  'editor.assignMaterial': editorOpProbe,
+  'editor.materialize': editorOpProbe,
+  'editor.importGlb': editorOpProbe,
+  'editor.importCad': editorOpProbe,
+  'mechanism.create': editorOpProbe,
+  'mechanism.addJoint': editorOpProbe,
+  'mechanism.setAnchor': editorOpProbe,
+  'mechanism.assignDrive': editorOpProbe,
   // plan-706: the rest of the mechanism authoring surface. All six go through
   // the same `_mechCommit` → `runMechanismPlan` → ONE `withTransaction`, so the
   // op-count probe reports them exactly like every other composite — no new
   // probe, no logic in the tool bodies. `_statics`, `_test_start` and
   // `_test_stop` are deliberately absent: they are transient by design (no ops,
   // no undo entry), and a `noop` on them would be true and misleading at once.
-  web_editor_mechanism_set_anchor_snap: editorOpProbe,
-  web_editor_mechanism_set_axis: editorOpProbe,
-  web_editor_mechanism_add_body: editorOpProbe,
-  web_editor_mechanism_set_mass: editorOpProbe,
-  web_editor_mechanism_set_limits: editorOpProbe,
-  web_editor_mechanism_fix: editorOpProbe,
-  web_editor_shortcut: editorOpProbe,
+  'mechanism.setAnchorSnap': editorOpProbe,
+  'mechanism.setAxis': editorOpProbe,
+  'mechanism.addBody': editorOpProbe,
+  'mechanism.setMass': editorOpProbe,
+  'mechanism.setLimits': editorOpProbe,
+  'mechanism.fix': editorOpProbe,
 };

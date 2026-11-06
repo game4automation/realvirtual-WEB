@@ -21,6 +21,14 @@ import { aiBridgeTitle } from '../src/core/hmi/ActivityBar';
 // Neighbours of the bridge section that talk to CONNECT on their own — not under test here.
 vi.mock('../src/core/hmi/settings/RagStatusSection', () => ({ RagStatusSection: () => null }));
 vi.mock('../src/core/hmi/ConnectPanel', () => ({ ConnectDownloadLinks: () => null }));
+vi.mock('../src/core/hmi/connect-store', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/hmi/connect-store')>();
+  const connectSnapshot = { ...actual.getConnectSnapshot(), serverUrl: 'http://localhost:51001' };
+  return {
+    ...actual,
+    getConnectSnapshot: () => connectSnapshot,
+  };
+});
 
 const TARGET = 'ws://localhost:5100/webviewer';
 
@@ -121,8 +129,20 @@ describe('McpTab — target and failure cause (plan-541)', () => {
 
   it('setup step 3 explains the hosted case', () => {
     renderTab(snapshot({}));
-    expect(screen.getByText(/On a hosted page \(web\.realvirtual\.io\) the bridge connects to localhost/))
+    expect(screen.getByText(/Scene access follows the CONNECT address/))
       .toBeInTheDocument();
+  });
+
+  it('uses the configured CONNECT address in the MCP snippet and setup command', () => {
+    renderTab(snapshot({}));
+    expect(screen.getByText(/"url": "http:\/\/localhost:51001\/mcp"/)).toBeInTheDocument();
+    expect(screen.getByText(/npx -y mcp-remote http:\/\/localhost:51001\/mcp/)).toBeInTheDocument();
+  });
+
+  it('uses the actual target address and scheme in failure hints and links', () => {
+    renderTab(snapshot({ failure: 'unreachable', target: 'wss://plant:8443/webviewer' }));
+    expect(screen.getByTestId('mcp-failure-hint')).toHaveTextContent('Safari: open https://plant:8443.');
+    expect(screen.getByRole('link', { name: 'https://plant:8443' })).toHaveAttribute('href', 'https://plant:8443');
   });
 });
 

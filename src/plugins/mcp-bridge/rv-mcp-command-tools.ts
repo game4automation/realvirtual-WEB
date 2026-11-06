@@ -2,7 +2,6 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { whenDocumentSettled } from '../../core/hmi/rv-bind-queue';
-import { getLocalStorage } from '../../core/rv-safe-storage';
 
 /**
  * rv-mcp-command-tools — the reduced command interface of plan-641 (Phase 0)
@@ -15,8 +14,7 @@ import { getLocalStorage } from '../../core/rv-safe-storage';
  *  - `web_batch(steps, stopOnError?, stopOnPartial?, background?)` — several.
  *
  * New modelling capabilities arrive as COMMANDS in the registry, never as new
- * tools. The bound `web_editor_*` tools stay as aliases and dispatch through
- * {@link runCommandStep} as well (via `dispatchBoundCommand`).
+ * tools. Command execution goes through {@link runCommandStep}.
  *
  * ## runCommandStep (M1/M3/M4/M9)
  *
@@ -41,7 +39,6 @@ import {
 } from '../../core/hmi/rv-command-registry';
 import { getActiveAssetContext } from '../../core/editor/active-asset-store';
 import { CLASS_RANK, commandClassOf } from './rv-mcp-tool-class';
-import { MOVED_TOOLS, movedToolOf } from './rv-mcp-moved-tools';
 import { commandsSkipDialogPolicy } from './rv-mcp-command-dialog-policy';
 import {
   classifyCommandOutcome,
@@ -67,9 +64,9 @@ export function setGatewayCommandClassesState(state: typeof gatewayState): void 
   gatewayState = state;
 }
 
-/** Only migrated commands acquire a new restriction through an older CONNECT. */
-export function gatewayOutdatedRefusal(id: string, registry = commandRegistry, moved = MOVED_TOOLS): Record<string, unknown> | null {
-  if (gatewayState !== 'connect-without-classes' || !moved.some((m) => m.movedTo.includes(id))) return null;
+/** Older CONNECT versions cannot safely classify commands stricter than edit. */
+export function gatewayOutdatedRefusal(id: string, registry = commandRegistry): Record<string, unknown> | null {
+  if (gatewayState !== 'connect-without-classes') return null;
   const desc = registry.get(id);
   if (!desc) return null;
   const cls = commandClassOf(desc);
@@ -313,30 +310,6 @@ export function withMacroMetaParams(schemas: readonly ToolSchema[], names: Reado
   });
 }
 
-// ── plan-641 Nachtrag 2026-10-21: aliases out of tools/list ──
-
-/** localStorage key of the emergency switch that lists the bound aliases again. */
-export const LIST_ALIASES_STORAGE_KEY = 'rv-mcp-list-aliases';
-
-/**
- * Whether the command-bound alias tools are listed in `tools/list`. Default false
- * (hidden, still callable). Emergency switch: URL `?mcpAliases=1` or
- * `localStorage['rv-mcp-list-aliases'] = '1'` (reconnect / reload); on the Node
- * bridge additionally `RV_MCP_LIST_ALIASES=1`.
- */
-export function aliasesListed(
-  search: string | undefined = typeof location !== 'undefined' ? location.search : undefined,
-  storage: Pick<Storage, 'getItem'> | undefined = getLocalStorage() ?? undefined,
-): boolean {
-  try {
-    const q = new URLSearchParams(search ?? '').get('mcpAliases');
-    if (q !== null) return q === '1' || q === 'true';
-  } catch { /* no URL */ }
-  try {
-    return storage?.getItem(LIST_ALIASES_STORAGE_KEY) === '1';
-  } catch { return false; }
-}
-
 /** Names of all tools bound to one or more registry commands (the aliases). */
 export function boundAliasToolNames(
   dispatcher: ReadonlyMap<string, { command?: ToolCommandBinding }>,
@@ -344,33 +317,6 @@ export function boundAliasToolNames(
   const out = new Set<string>();
   for (const [name, entry] of dispatcher) if (bindingIds(entry.command).length > 0) out.add(name);
   return out;
-}
-
-/** Mark the named aliases `listed: false` unless `listAll` (the emergency switch). */
-export function withAliasListing(schemas: readonly ToolSchema[], aliases: ReadonlySet<string>, listAll: boolean): ToolSchema[] {
-  return schemas.map((s) => (s.tombstone === true || (!listAll && aliases.has(s.name)) ? { ...s, listed: false } : s));
-}
-
-/** command id -> description of its alias tool, so `web_commands` explains commands without the aliases. */
-const aliasDescriptions = new Map<string, { tool: string; description: string }>();
-
-/** Rebuilt on every discover from the dispatcher bindings and the tool schemas. */
-export function setAliasDescriptions(
-  dispatcher: ReadonlyMap<string, { command?: ToolCommandBinding }>,
-  schemas: readonly ToolSchema[],
-): void {
-  aliasDescriptions.clear();
-  const byName = new Map(schemas.map((s) => [s.name, s.description]));
-  for (const [name, entry] of dispatcher) {
-    const d = byName.get(name);
-    if (!d) continue;
-    for (const id of bindingIds(entry.command)) if (!aliasDescriptions.has(id)) aliasDescriptions.set(id, { tool: name, description: d });
-  }
-}
-
-/** The alias description of a command, if a bound tool exists. */
-export function aliasDescriptionOf(id: string): { tool: string; description: string } | undefined {
-  return aliasDescriptions.get(id);
 }
 
 /**
@@ -473,9 +419,9 @@ export class McpCommandTools {
 
   private get viewer(): RVViewer | undefined { return this.getViewer(); }
 
-  @McpTool('List the command registry — the vocabulary of model changes: id, label, argsSchema, readOnly, macro (recorded via MCP), available, alias tool. Run one with web_execute, several with web_batch. Guide: web_help(commands).', { readOnly: true })
+  @McpTool('List the command registry — the vocabulary of model changes: id, label, argsSchema, readOnly, macro (recorded via MCP), available, door. Run one with web_execute, several with web_batch. Guide: web_help(commands).', { readOnly: true })
   async webCommands(
-    @McpParam('query', 'Substring of id, label or tool.', 'string', false) query?: string,
+    @McpParam('query', 'Substring of id or label.', 'string', false) query?: string,
   ): Promise<string> {
     const q = (query ?? '').trim().toLowerCase();
     const rows = commandRegistry.list()
@@ -490,12 +436,9 @@ export class McpCommandTools {
           ...(d.available ? {} : { unavailableReason: d.unavailableReason }),
           scope: d.scope,
           ...(d.shortcut ? { shortcut: d.shortcut } : {}),
-          ...(d.mcp && !movedToolOf(d.mcp.tool) ? { tool: d.mcp.tool } : aliasDescriptionOf(d.id) ? { tool: aliasDescriptionOf(d.id)!.tool } : {}),
-          ...(aliasDescriptionOf(d.id) ? { description: aliasDescriptionOf(d.id)!.description } : {}),
         };
       })
-      .filter((r) => !q || r.id.toLowerCase().includes(q) || r.label.toLowerCase().includes(q)
-        || (r.tool ?? '').toLowerCase().includes(q))
+      .filter((r) => !q || r.id.toLowerCase().includes(q) || r.label.toLowerCase().includes(q))
       .sort((a, b) => a.id.localeCompare(b.id));
     return JSON.stringify({ count: rows.length, commands: rows });
   }

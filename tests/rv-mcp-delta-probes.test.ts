@@ -18,8 +18,8 @@
  * reporting a boolean.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { choreographyToolOf } from '../src/plugins/mcp-bridge/rv-mcp-command-choreography';
+import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
+import { choreographyKeyOf } from '../src/plugins/mcp-bridge/rv-mcp-command-choreography';
 import {
   DELTA_PROBES,
   DELTA_MAX_ENTRIES,
@@ -34,8 +34,19 @@ import {
   type DeltaProbe,
   type ProbeContext,
 } from '../src/plugins/mcp-bridge/rv-mcp-delta-probes';
+import { commandRegistry } from '../src/core/hmi/rv-command-registry';
+import { ensureSessionOverlayCommandsRegistered } from '../src/core/hmi/session-overlay-commands';
+import { ensureViewCommandsRegistered } from '../src/core/hmi/view-commands';
+import { ensureSimCommandsRegistered } from '../src/plugins/sim-controller/sim-commands';
+import { ensurePlannerCommandsRegistered } from '../src/plugins/layout-planner/planner-commands';
 import { allSchemas } from './helpers/mcp-schemas';
-import { MOVED_TOOLS } from '../src/plugins/mcp-bridge/rv-mcp-moved-tools';
+
+beforeAll(() => {
+  ensureSessionOverlayCommandsRegistered();
+  ensureViewCommandsRegistered();
+  ensureSimCommandsRegistered();
+  ensurePlannerCommandsRegistered();
+});
 
 beforeEach(() => {
   _resetInFlightForTest();
@@ -135,8 +146,8 @@ describe('T1 — a throwing probe is swallowed', () => {
   });
 
   it('a probe that throws in `before` leaves `after` with no snapshot, and after copes', () => {
-    const probe = DELTA_PROBES['web_editor_set_field'];
-    const ctx = ctxFor('web_editor_set_field');
+    const probe = DELTA_PROBES['editor.setField'];
+    const ctx = ctxFor('editor.setField');
     const snap = safeProbe(() => probe.before(ctx, {})); // no document → undefined
     expect(() => probe.after(ctx, {}, snap, null)).not.toThrow();
     expect(probe.after(ctx, {}, undefined, null)).toBeNull();
@@ -144,26 +155,26 @@ describe('T1 — a throwing probe is swallowed', () => {
 });
 
 describe('T1 — the policy table is a decision, not an accident', () => {
-  it('preserves the moved command choreography keys', () => {
+  it('uses command ids for command choreography', () => {
     const dispatcher = new Map();
-    expect(choreographyToolOf('workspace.setMode', dispatcher)).toBe('web_mode_set');
-    expect(DELTA_PROBES[choreographyToolOf('workspace.setMode', dispatcher)!]).toBe(DELTA_PROBES.web_mode_set);
+    expect(choreographyKeyOf('workspace.setMode', dispatcher)).toBe('workspace.setMode');
+    expect(DELTA_PROBES[choreographyKeyOf('workspace.setMode', dispatcher)!]).toBe(DELTA_PROBES['workspace.setMode']);
     for (const id of ['view.isolate', 'view.sourceMarkers']) {
-      const key = choreographyToolOf(id, dispatcher);
+      const key = choreographyKeyOf(id, dispatcher);
       expect(key).toBeDefined();
       expect(DELTA_PROBES[key!]).toBeUndefined();
     }
   });
   it('viewport-transient writes carry no probe', () => {
     for (const t of ['web_camera_set', 'web_camera_focus', 'web_camera_orbit',
-      'web_camera_projection', 'web_view_isolate',
-      'web_select', 'web_select_similar', 'web_view_source_markers', 'web_node_bounds',
+      'web_camera_projection', 'view.isolate',
+      'web_select', 'web_select_similar', 'view.sourceMarkers', 'web_node_bounds',
       // plan-761: a view setting (localStorage, like the source markers) — it
       // writes no op into a document, so there is no delta to verify.
-      'web_view_render_mode',
+      'view.renderMode',
       // plan-591: the quality preset is the same class of write — visual
       // settings in localStorage plus renderer state, never a document op.
-      'web_view_visual_preset']) {
+      'view.visualPreset']) {
       expect(DELTA_PROBES[t], `${t} persists nothing and must have no probe`).toBeUndefined();
     }
   });
@@ -171,19 +182,16 @@ describe('T1 — the policy table is a decision, not an accident', () => {
   it('the transient editor tools carry no probe either', () => {
     // They append no op by design; reporting `noop` would be true and misleading.
     expect(DELTA_PROBES['web_editor_verify_drive']).toBeUndefined();
-    expect(DELTA_PROBES['web_editor_mechanism_jog']).toBeUndefined();
+    expect(DELTA_PROBES['mechanism.jog']).toBeUndefined();
   });
 
-  it('every probe key is a REAL tool name', () => {
+  it('every probe key is a registered command or an announced tool', () => {
     // The table is keyed by string. A typo does not fail anything — it just
     // silently means that tool never gets verified, which is precisely the
     // class of quiet nothing-happened this whole feature exists to expose.
     const announced = new Set(allSchemas().map((s) => s.name));
-    // plan-2007: a 1:1 tombstone keeps its probe — `choreographyToolOf` reaches it per command.
-    // Multiplexer probe keys are kept until the tombstones are removed (plan §2.3c).
-    const tombstoneKeys = new Set(MOVED_TOOLS.map((m) => m.tool));
-    const unknown = Object.keys(DELTA_PROBES).filter((k) => !announced.has(k) && !tombstoneKeys.has(k));
-    expect(unknown, `DELTA_PROBES keys matching no announced tool: ${unknown.join(', ')}`)
+    const unknown = Object.keys(DELTA_PROBES).filter((key) => !announced.has(key) && !commandRegistry.get(key));
+    expect(unknown, `DELTA_PROBES keys matching no command or announced tool: ${unknown.join(', ')}`)
       .toEqual([]);
   });
 
@@ -192,14 +200,14 @@ describe('T1 — the policy table is a decision, not an accident', () => {
     const readOnly = new Set(
       allSchemas().filter((s) => s.annotations?.readOnlyHint === true).map((s) => s.name),
     );
-    const wrong = Object.keys(DELTA_PROBES).filter((k) => readOnly.has(k));
+    const wrong = Object.keys(DELTA_PROBES).filter((k) => readOnly.has(k) || commandRegistry.get(k)?.readOnly);
     expect(wrong, `read-only tools must not be probed: ${wrong.join(', ')}`).toEqual([]);
   });
 
   it('the persisting families all carry one', () => {
-    for (const t of ['web_signal_set_bool', 'web_signal_set_float', 'web_drive_jog',
-      'web_sim_reset', 'web_mode_set', 'web_layout_place', 'web_editor_open',
-      'web_editor_save', 'web_editor_assign_to_kinematic', 'web_editor_reparent']) {
+    for (const t of ['signal.setBool', 'signal.setFloat', 'drive.jog',
+      'sim.reset', 'workspace.setMode', 'layout.place', 'web_editor_open',
+      'web_editor_save', 'editor.assignToKinematic', 'editor.reparent']) {
       expect(DELTA_PROBES[t], `${t} persists state and must have a probe`).toBeTruthy();
     }
   });
@@ -212,7 +220,7 @@ describe('T1 — the signal probe reads one signal, not the store', () => {
     const values = new Map<string, unknown>([['Sig1', true]]);
     const viewer = { signalStore: { get: (n: string) => values.get(n) } };
     const delta = runProbe(
-      DELTA_PROBES['web_signal_set_bool'], 'web_signal_set_bool', { name: 'Sig1' },
+      DELTA_PROBES['signal.setBool'], 'signal.setBool', { name: 'Sig1' },
       () => values.set('Sig1', false), 1, viewer,
     );
     expect(delta!.changed).toEqual(['Sig1.value: true→false']);
@@ -223,7 +231,7 @@ describe('T1 — the signal probe reads one signal, not the store', () => {
     const values = new Map<string, unknown>([['Sig1', true]]);
     const viewer = { signalStore: { get: (n: string) => values.get(n) } };
     const delta = runProbe(
-      DELTA_PROBES['web_signal_set_bool'], 'web_signal_set_bool', { name: 'Sig1' },
+      DELTA_PROBES['signal.setBool'], 'signal.setBool', { name: 'Sig1' },
       () => { /* the tool "succeeded" and wrote nothing */ }, 1, viewer,
     );
     expect(delta!.noop).toBe(true);
@@ -238,7 +246,7 @@ describe('T1 — the signal probe reads one signal, not the store', () => {
     const getAll = vi.fn(() => values);
     const viewer = { signalStore: { get, getAll, size: values.size } };
     runProbe(
-      DELTA_PROBES['web_signal_set_bool'], 'web_signal_set_bool', { name: 'S42' },
+      DELTA_PROBES['signal.setBool'], 'signal.setBool', { name: 'S42' },
       () => values.set('S42', true), 1, viewer,
     );
     expect(get).toHaveBeenCalledTimes(2);
@@ -251,7 +259,7 @@ describe('T1 — the drive probe reads command fields, not position', () => {
     const drive = { name: 'D1', jogForward: false, jogBackward: false, targetSpeed: 100, currentPosition: 0 };
     const viewer = { drives: [drive] };
     const delta = runProbe(
-      DELTA_PROBES['web_drive_jog'], 'web_drive_jog', { name: 'D1' },
+      DELTA_PROBES['drive.jog'], 'drive.jog', { name: 'D1' },
       () => { drive.jogForward = true; drive.currentPosition = 12.5; }, 1, viewer,
     );
     expect(delta!.changed).toContain('D1.jogForward: false→true');
@@ -268,7 +276,7 @@ describe('T3 — op-log probe: what was appended', () => {
     const doc = fakeDoc();
     _setActiveDocForTest(() => doc as never);
     const delta = runProbe(
-      DELTA_PROBES['web_editor_kinematize'], 'web_editor_kinematize', {},
+      DELTA_PROBES['editor.kinematize'], 'editor.kinematize', {},
       () => doc.append({
         kind: 'composite',
         ops: [
@@ -287,7 +295,7 @@ describe('T3 — op-log probe: what was appended', () => {
     const doc = fakeDoc([{ kind: 'setField' }]);
     _setActiveDocForTest(() => doc as never);
     const delta = runProbe(
-      DELTA_PROBES['web_editor_assign_to_kinematic'], 'web_editor_assign_to_kinematic', {},
+      DELTA_PROBES['editor.assignToKinematic'], 'editor.assignToKinematic', {},
       () => { /* the tool answered { ok: true } and appended nothing */ },
     );
     expect(delta!.noop).toBe(true);
@@ -300,7 +308,7 @@ describe('T3 — op-log probe: what was appended', () => {
     const doc = fakeDoc();
     _setActiveDocForTest(() => doc as never);
     const named = runProbe(
-      DELTA_PROBES['web_editor_assign_to_kinematic'], 'web_editor_assign_to_kinematic', {},
+      DELTA_PROBES['editor.assignToKinematic'], 'editor.assignToKinematic', {},
       () => doc.append({ kind: 'setField' }),
     );
     expect(named!.changed).toEqual(['setField×1']);
@@ -308,7 +316,7 @@ describe('T3 — op-log probe: what was appended', () => {
 
     // Reparenting the members is what actually makes the axis carry them.
     const moved = runProbe(
-      DELTA_PROBES['web_editor_reparent'], 'web_editor_reparent', {},
+      DELTA_PROBES['editor.reparent'], 'editor.reparent', {},
       () => doc.append({ kind: 'composite', ops: [{ kind: 'reparentNode' }, { kind: 'reparentNode' }] }),
       2,
     );
@@ -325,8 +333,8 @@ describe('T3 — op-log probe: what was appended', () => {
       opsSince: doc.opsSince,
     };
     _setActiveDocForTest(() => spied as never);
-    const ctx = ctxFor('web_editor_set_field');
-    DELTA_PROBES['web_editor_set_field'].before(ctx, {});
+    const ctx = ctxFor('editor.setField');
+    DELTA_PROBES['editor.setField'].before(ctx, {});
     expect(opsReads).toBe(0);
   });
 
@@ -340,8 +348,8 @@ describe('T3 — op-log probe: what was appended', () => {
     const viewer = {
       currentModelRoot: { traverse: () => { traversals++; } },
     };
-    DELTA_PROBES['web_editor_set_field']
-      .before(ctxFor('web_editor_set_field', 600, viewer), {});
+    DELTA_PROBES['editor.setField']
+      .before(ctxFor('editor.setField', 600, viewer), {});
     expect(traversals).toBe(0);
   });
 
@@ -349,7 +357,7 @@ describe('T3 — op-log probe: what was appended', () => {
     const doc = fakeDoc(Array.from({ length: 1200 }, () => ({ kind: 'setField' })));
     _setActiveDocForTest(() => doc as never);
     runProbe(
-      DELTA_PROBES['web_editor_set_field'], 'web_editor_set_field', {},
+      DELTA_PROBES['editor.setField'], 'editor.setField', {},
       () => doc.append({ kind: 'transformNode' }, { kind: 'transformNode' }),
     );
     expect(doc.opsSince).toHaveBeenCalledTimes(1);
@@ -364,9 +372,9 @@ describe('T1 — overlapping calls are reported, not attributed (R13)', () => {
   it('two writes on the SAME document: the overlap is admitted', () => {
     const doc = fakeDoc();
     _setActiveDocForTest(() => doc as never);
-    const probe = DELTA_PROBES['web_editor_set_field'];
-    const ctxA = ctxFor('web_editor_set_field', 101);
-    const ctxB = ctxFor('web_editor_set_field', 102);
+    const probe = DELTA_PROBES['editor.setField'];
+    const ctxA = ctxFor('editor.setField', 101);
+    const ctxB = ctxFor('editor.setField', 102);
 
     // A opens its window, B opens and closes inside it, then A closes.
     const snapA = probe.before(ctxA, {});
@@ -385,9 +393,9 @@ describe('T1 — overlapping calls are reported, not attributed (R13)', () => {
   it('`noop` survives an overlap — "nothing happened" needs no attribution', () => {
     const doc = fakeDoc();
     _setActiveDocForTest(() => doc as never);
-    const probe = DELTA_PROBES['web_editor_set_field'];
-    const ctxA = ctxFor('web_editor_set_field', 201);
-    const ctxB = ctxFor('web_editor_set_field', 202);
+    const probe = DELTA_PROBES['editor.setField'];
+    const ctxA = ctxFor('editor.setField', 201);
+    const ctxB = ctxFor('editor.setField', 202);
 
     const snapA = probe.before(ctxA, {});
     const snapB = probe.before(ctxB, {});
@@ -403,9 +411,9 @@ describe('T1 — overlapping calls are reported, not attributed (R13)', () => {
   it('different scopes never interfere — two signals stay unambiguous', () => {
     const values = new Map<string, unknown>([['A', false], ['B', false]]);
     const viewer = { signalStore: { get: (n: string) => values.get(n) } };
-    const probe = DELTA_PROBES['web_signal_set_bool'];
-    const ctxA = ctxFor('web_signal_set_bool', 301, viewer);
-    const ctxB = ctxFor('web_signal_set_bool', 302, viewer);
+    const probe = DELTA_PROBES['signal.setBool'];
+    const ctxA = ctxFor('signal.setBool', 301, viewer);
+    const ctxB = ctxFor('signal.setBool', 302, viewer);
 
     const snapA = probe.before(ctxA, { name: 'A' });
     const snapB = probe.before(ctxB, { name: 'B' });
@@ -426,16 +434,16 @@ describe('T1 — overlapping calls are reported, not attributed (R13)', () => {
     // in its scope forever and poison every later delta there.
     const doc = fakeDoc();
     _setActiveDocForTest(() => doc as never);
-    const probe = DELTA_PROBES['web_editor_set_field'];
+    const probe = DELTA_PROBES['editor.setField'];
 
-    probe.before(ctxFor('web_editor_set_field', 500), {});   // never completes
+    probe.before(ctxFor('editor.setField', 500), {});   // never completes
     expect(_inFlightCountForTest()).toBe(1);
     releaseCall(500);
     expect(_inFlightCountForTest()).toBe(0);
 
     // The next call must be clean, not tainted by the abandoned one.
     const delta = runProbe(
-      probe, 'web_editor_set_field', {},
+      probe, 'editor.setField', {},
       () => doc.append({ kind: 'setField' }), 501,
     );
     expect(delta!.ambiguous).toBeUndefined();
@@ -450,10 +458,10 @@ describe('T1 — overlapping calls are reported, not attributed (R13)', () => {
   it('the registry does not leak: sequential calls stay unambiguous', () => {
     const doc = fakeDoc();
     _setActiveDocForTest(() => doc as never);
-    const probe = DELTA_PROBES['web_editor_set_field'];
+    const probe = DELTA_PROBES['editor.setField'];
     for (let i = 0; i < 3; i++) {
       const delta = runProbe(
-        probe, 'web_editor_set_field', {},
+        probe, 'editor.setField', {},
         () => doc.append({ kind: 'setField' }), 400 + i,
       );
       expect(delta!.ambiguous, `call ${400 + i} must be unambiguous`).toBeUndefined();

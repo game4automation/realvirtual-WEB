@@ -117,6 +117,7 @@ import type { RVLogicStep } from '../../core/engine/rv-logic-step';
 import { logicEventParticipant, type LogicEventParticipant } from './rv-des-logic';
 import { logicSnapshotParticipant } from './rv-des-logic-snapshot';
 import { gripSnapshotParticipant, gripSnapshotBlockerReason, resetGripOwners, type GripSnapshotHost } from './rv-des-grip-snapshot';
+import { ikSnapshotParticipant, ikSnapshotBlockerReason } from './rv-des-ik-snapshot';
 import { watchDesZeroTimePulses } from './rv-des-pulse-watch';
 import { logicDesFindings, logicSnapshotBlockerReason } from './rv-des-logic-check';
 import type { SimEventFacade, EventParticipant, CycleParticipant, SnapshotGate } from '../../core/sim-event-facade';
@@ -714,6 +715,8 @@ export class DESRunner implements SimulationExecutor {
   private offPulseWatch: (() => void) | null = null;
   private offGripBlocker: (() => void) | null = null;
   private gripSnapshot: ReturnType<typeof gripSnapshotParticipant> | null = null;
+  private ikSnapshot: ReturnType<typeof ikSnapshotParticipant> | null = null;
+  private ikSnapshotReason: (() => string | null) | null = null;
   private buttons: import('../../core/engine/rv-scene-button-manager').SceneButtonManager | null = null;
   private offRenderWrites: (() => void) | null = null;
   private renderPhase = false;
@@ -732,6 +735,7 @@ export class DESRunner implements SimulationExecutor {
 
   private _syncCycleOwners(): void {
     this._syncGripOwner();
+    this._syncIkOwner();
     this._syncLogicOwner();
     this._clearTickOwnership();
     const own = this._desOwnDrives();
@@ -797,6 +801,7 @@ export class DESRunner implements SimulationExecutor {
   private _bindEventOwners(): void {
     this.settle.bindStore(this.resolveSignalStore() ?? undefined);
     this._syncGripOwner();
+    this._syncIkOwner();
     this._syncLogicOwner();
     this._detachUnsuitableProblems();
     this._syncUnsuitableProblems();
@@ -869,6 +874,27 @@ export class DESRunner implements SimulationExecutor {
       this.offGripBlocker = (this._topology?.host as { snapshotBlockers?: DesSnapshotBlockers } | undefined)
         ?.snapshotBlockers?.register('core.grip', () => gripSnapshotBlockerReason(host, addressOf), () => []) ?? null;
     }
+  }
+
+  private _syncIkOwner(): void {
+    if (!this._started) return;
+    if (!this.core?.desHost.ikPaths.length) {
+      this._detachIkOwner();
+    } else {
+      if (!this.ikSnapshot) {
+        const host = { paths: () => this.core!.desHost.ikPaths as readonly import('../../core/engine/rv-ik-path').RVIKPath[] };
+        const addressOf = (node: Object3D) => this._driveAddress(node);
+        this.ikSnapshot = ikSnapshotParticipant(host, addressOf);
+        this.ikSnapshotReason = () => ikSnapshotBlockerReason(host.paths(), addressOf);
+      }
+      this.core.ikSnapshotReason = this.ikSnapshotReason;
+    }
+  }
+
+  private _detachIkOwner(): void {
+    if (this.core && this.core.ikSnapshotReason === this.ikSnapshotReason) this.core.ikSnapshotReason = null;
+    this.ikSnapshotReason = null;
+    this.ikSnapshot = null;
   }
 
   private _detachUnsuitableProblems(): void {
@@ -2168,6 +2194,7 @@ export class DESRunner implements SimulationExecutor {
         ...(this.logicOwner ? [logicSnapshotParticipant(this.logicOwner.engine, this.logicOwner.participant,
           node => this._driveAddress(node))] : []),
         ...(this.gripSnapshot ? [this.gripSnapshot] : []),
+        ...(this.ikSnapshot ? [this.ikSnapshot] : []),
       ];
       for (const part of coreParts) {
         frame.registry.register(part); frame.queueContext.participants.add(part.key);
@@ -2199,6 +2226,7 @@ export class DESRunner implements SimulationExecutor {
 
   private _checkSnapshotBlockers(): void {
     this._syncGripOwner();
+    this._syncIkOwner();
     const reasons = (this._topology?.host as { snapshotBlockers?: DesSnapshotBlockers } | undefined)?.snapshotBlockers?.reasons() ?? [];
     const driveReasons = this._driveSnapshotBlockerReasons();
     if (reasons.length || driveReasons.length) this._snapshotFailure('des-snapshot-unsupported-component', [...new Set([...reasons, ...driveReasons])].join('; '));
@@ -3252,6 +3280,7 @@ export class DESRunner implements SimulationExecutor {
     this.offButtonBlocker?.(); this.offButtonBlocker = null;
     this.offPulseWatch?.(); this.offPulseWatch = null;
     this.offGripBlocker?.(); this.offGripBlocker = null; this.gripSnapshot = null;
+    this._detachIkOwner();
     this.buttons?.setEventClock(null); this.buttons = null;
     this.offRenderWrites?.(); this.offRenderWrites = null;
     for (const entry of this.eventOwners.values()) { entry.off?.(); entry.off = undefined; }
@@ -3515,6 +3544,7 @@ export class DESRunner implements SimulationExecutor {
         this.offButtonBlocker?.(); this.offButtonBlocker = null;
         this.offPulseWatch?.(); this.offPulseWatch = null;
         this.offGripBlocker?.(); this.offGripBlocker = null; this.gripSnapshot = null;
+        this._detachIkOwner();
         this.buttons?.setEventClock(null); this.buttons = null;
         this.offRenderWrites?.(); this.offRenderWrites = null;
       });

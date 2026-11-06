@@ -36,7 +36,7 @@ import {
   type SewSymbolRow,
   type UdpImportSignal,
 } from '../import/sew-symbol-table';
-import { reconcileSignals, type ReconcileReport } from '../import/rv-signal-reconcile';
+import { dataTypeKind, reconcileSignals, type ReconcileReport } from '../import/rv-signal-reconcile';
 import { fillAddressOps, planFillAddresses, type FillAddressPlan } from '../import/rv-fill-addresses';
 import {
   addressImportOps,
@@ -3544,26 +3544,48 @@ export function isTextDataType(dataType: string | null | undefined): boolean {
 }
 
 /**
- * Wire type a discovered signal binds as: direction from the browse, value kind from its data type
- * (`Bool`, `Int`, text types → `Text`, everything else `Float` as before).
+ * Wire type a discovered signal binds as.
+ *
+ * When the loaded model has a signal of the same name, its wire type is binding — direction AND
+ * value kind (Thomas 2026-11-05): an OPC UA browse cannot tell which side writes a read/write node,
+ * the model can. Otherwise: direction from the browse (`unknown` → PLCOutput), value kind from the
+ * data type through the shared table ({@link dataTypeKind}: IEC, OPC UA `Boolean`/`Int16`/`Double`,
+ * CONNECT kinds), text types → `Text`, an unknown name → `Float` as before.
  */
-export function discoveredSignalWireType(direction: DiscoveredSignal['direction'], dataType: string): string {
-  const kind = dataType === 'Bool' ? 'Bool'
-    : dataType === 'Int' ? 'Int'
-      : isTextDataType(dataType) ? 'Text'
-        : 'Float';
+export function discoveredSignalWireType(
+  direction: DiscoveredSignal['direction'],
+  dataType: string,
+  modelType?: string | null,
+): string {
+  if (modelType) return modelType;
+  const kind = isTextDataType(dataType) ? 'Text' : dataTypeKind(dataType) ?? 'Float';
   return `PLC${direction === 'input' ? 'Input' : 'Output'}${kind}`;
 }
 
-/** Bind selected discovered signals to the active interface. */
-export async function bindSelectedSignals(interfaceId: string): Promise<void> {
+/** Model signal types by name — the exact runtime name first, then the asset-local one. */
+function modelTypeIndex(modelSignals: readonly ModelPlcSignal[]): Map<string, string> {
+  const byName = new Map<string, string>();
+  for (const s of modelSignals) if (s.localName && !byName.has(s.localName)) byName.set(s.localName, s.type);
+  for (const s of modelSignals) if (s.name) byName.set(s.name, s.type);
+  return byName;
+}
+
+/**
+ * Bind selected discovered signals to the active interface. `modelSignals` (the loaded model's PLC
+ * signals) make a same-named model signal's wire type binding for the new coupling.
+ */
+export async function bindSelectedSignals(
+  interfaceId: string,
+  modelSignals: readonly ModelPlcSignal[] = [],
+): Promise<void> {
   const selected = _store.getSnapshot().discoveredSignals.filter(s => s.selected);
   if (selected.length === 0) return;
 
+  const modelTypes = modelTypeIndex(modelSignals);
   const bindings = selected.map(s => ({
     protocolAddress: s.protocolAddress,
     signalName: discoveredSignalName(s.displayName),
-    type: discoveredSignalWireType(s.direction, s.dataType),
+    type: discoveredSignalWireType(s.direction, s.dataType, modelTypes.get(discoveredSignalName(s.displayName))),
     // Persist the discovered data type (plan-352 F9). Without it the gateway stores `""` and a
     // later direction change in the signal dialog has no type left to preserve.
     ...(s.dataType ? { dataType: s.dataType } : {}),

@@ -5188,11 +5188,9 @@ realvirtual WEB runs natively inside Microsoft Teams as an interactive app — n
 
 **Setup:**
 
-1. Build the Teams app package:
-   ```bash
-   cd teams-app
-   powershell.exe Compress-Archive -Path manifest.json,color.png,outline.png -DestinationPath realvirtual-web-teams.zip
-   ```
+The Teams app package lives in the private repository `realvirtual-WebViewer-Private~`, under `teams-app/` (same folder name). Community users create their own manifest following Microsoft Teams requirements.
+
+1. From your app package directory, ZIP `manifest.json`, `color.png` (192x192), and `outline.png` (32x32).
 
 2. Install in Teams:
    - **Personal**: Teams → Apps → Manage your apps → Upload a custom app → select the zip
@@ -5208,7 +5206,7 @@ realvirtual WEB runs natively inside Microsoft Teams as an interactive app — n
 - External participants (outside your org) can interact with the shared 3D viewer
 - The app loads from `https://web.realvirtual.io/demo/` — public URL, no VPN required
 - Teams SDK initialization is automatic when `?teams=1` is in the URL
-- The `teams-app/` directory contains `manifest.json`, `color.png` (192x192), and `outline.png` (32x32)
+- The private repository `realvirtual-WebViewer-Private~` contains the reference package in `teams-app/`.
 
 **Configurable tabs** allow per-channel model selection. The config page (`teams-config.html`) lets users set a custom model URL when adding the tab to a channel.
 

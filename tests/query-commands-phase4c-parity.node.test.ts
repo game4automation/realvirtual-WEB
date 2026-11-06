@@ -11,7 +11,6 @@ import { ensureDocumentCommandsRegistered } from '../src/core/hmi/document-comma
 import { ensureKnowledgeCommandsRegistered } from '../src/plugins/mcp-bridge/rv-mcp-knowledge-tools';
 import { ensureDocumentInfoCommandsRegistered } from '../src/plugins/mcp-bridge/rv-mcp-document-info-tools';
 import { McpCommandTools } from '../src/plugins/mcp-bridge/rv-mcp-command-tools';
-import { MOVED_TOOLS, movedToolAnswer } from '../src/plugins/mcp-bridge/rv-mcp-moved-tools';
 import { commandClassOf } from '../src/plugins/mcp-bridge/rv-mcp-tool-class';
 import { getSensorDataStore } from '../src/core/engine/rv-sensor-data-store';
 
@@ -70,7 +69,7 @@ beforeAll(() => register());
 afterEach(() => { commandRegistry.attachViewer(undefined); getSensorDataStore().clear(); });
 
 describe('plan-2007 Phase 4C query parity', { timeout: 30_000 }, () => {
-  it.each(CASES)('%s has one tombstone, the original parameters and a read-only command', (old, id, schema) => {
+  it.each(CASES)('%s retains the original parameters and a read-only command', (old, id, schema) => {
     const registry = new CommandRegistry();
     register(registry);
     const count = registry.list().length;
@@ -82,12 +81,6 @@ describe('plan-2007 Phase 4C query parity', { timeout: 30_000 }, () => {
     expect(d.macro).toBeUndefined();
     expect(d.undoLabel).toBeUndefined();
     expect(commandClassOf(d)).toBe('read');
-    const moved = MOVED_TOOLS.filter((m) => m.tool === old);
-    expect(moved).toHaveLength(1);
-    expect(moved[0]).toMatchObject({ movedTo: [id], door: 'web_query' });
-    expect(JSON.parse(movedToolAnswer(moved[0]))).toMatchObject({
-      error: 'MOVED', movedTo: [id], use: 'web_query',
-    });
   });
 
   it.each(CASES)('%s runs through web_query and preserves the empty-scene value', async (_old, id) => {

@@ -26,7 +26,7 @@ changed) | `failed` (`error` + `kind`: `disabled`, `unknown` — with `similar` 
 containing commas — `{"paths": "[\"Asset/LINK,PLATE\"]"}` is ONE path, `"A,B"` is two. A
 string starting with `[` must be valid JSON; it is never split.
 
-Old alias names answer `MOVED` with their replacement command ids for one release.
+The old per-domain tool names were removed in 6.7.1 and are now unknown tools; use `web_execute` / `web_query` (`web_commands` lists ids).
 Run edits through `web_execute` / `web_batch`; use `web_commands(query=…)` to find commands by id or label.
 
 For robot rigging, paths, checks, motion jobs and export, read `web_help("robot")`.

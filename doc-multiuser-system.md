@@ -564,7 +564,9 @@ In Teams context, the user's principal name (email prefix, e.g., `thomas` from `
 
 ### Deployment
 
-1. Edit `teams-app/manifest.json` with your domain and app ID
+The Teams app package lives in the private repository `realvirtual-WebViewer-Private~`, under `teams-app/` (same folder name). Community users create their own manifest following Microsoft Teams requirements.
+
+1. Set your domain and app ID in your `manifest.json`
 2. Create `color.png` (192x192) and `outline.png` (32x32) icons
 3. ZIP the manifest directory
 4. Upload to Teams (sideload or admin center)
@@ -674,7 +676,7 @@ The relay server lives in its own repository (not in this realvirtual WEB repo).
 | File | Purpose |
 |------|---------|
 | `public/teams-config.html` | Tab configuration page |
-| `teams-app/manifest.json` | Teams app manifest |
+| `teams-app/manifest.json` in private repository `realvirtual-WebViewer-Private~` | Teams app manifest; community users create their own following Microsoft Teams requirements |
 | `src/main.ts` | Teams SDK init, user name extraction |
 
 ### Tests

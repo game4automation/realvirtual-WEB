@@ -2,12 +2,11 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * Phase 6 execution parity: former aliases are tombstones.
- * Retired editor aliases answer MOVED; every former command case runs through
+ * Phase 6 execution parity: former aliases have been removed.
+ * Retired editor aliases are unknown tools; every former command case runs through
  * web_execute, including pivot branches and real-registry refusal cases.
  */
 
-import { movedToolOf, movedToolAnswer } from '../src/plugins/mcp-bridge/rv-mcp-moved-tools';
 import { executeValue } from './helpers/execute-value';
 import { McpCommandTools } from '../src/plugins/mcp-bridge/rv-mcp-command-tools';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -622,23 +621,22 @@ describe('plan-2031 button bindings', () => {
 // ─── Tests ──────────────────────────────────────────────────────────────
 
 describe('parity gate (execution)', () => {
-  it('the former alias cases are all tombstones and no bound tools remain', () => {
+  it('the former alias cases have no decorated tools and no bound tools remain', () => {
     expect(bound).toEqual([]);
-    for (const name of Object.keys(EXPECTED_DISPATCH)) expect(movedToolOf(name), name).toBeDefined();
+    const names = new Set(Object.values(createMcpDelegates(() => viewer))
+      .flatMap((instance) => listToolEntries(instance).map((entry) => entry.name)));
+    for (const name of Object.keys(EXPECTED_DISPATCH)) expect(names.has(name), name).toBe(false);
   });
 
-  it('former aliases answer MOVED without execution; their commands run through web_execute', async () => {
-    for (const [name, exp] of Object.entries(EXPECTED_DISPATCH).filter(([name]) => movedToolOf(name))) {
-      const moved = movedToolOf(name)!;
+  it('former alias commands run through web_execute', async () => {
+    for (const [name, exp] of Object.entries(EXPECTED_DISPATCH)) {
       const spy = vi.spyOn(commandRegistry, 'execute').mockResolvedValue({ ok: true, value: exp.value });
-      expect(JSON.parse(movedToolAnswer(moved))).toMatchObject({ error: 'MOVED', movedTo: moved.movedTo, use: moved.door });
-      expect(moved.movedTo, name).toContain(exp.id);
       expect(spy).not.toHaveBeenCalled();
       const res = JSON.parse(await new McpCommandTools(() => viewer).webExecute(exp.id, JSON.stringify(exp.args)));
       expect(spy, name).toHaveBeenCalledTimes(1);
       expect(spy.mock.calls[0].slice(0, 2), name).toEqual([exp.id, exp.args]);
       expect(res, name).toMatchObject({ ok: true, value: exp.value });
-      if (moved.door === 'web_query') {
+      if (commandRegistry.get(exp.id)?.readOnly) {
         const query = JSON.parse(await new McpCommandTools(() => viewer).webQuery(exp.id, JSON.stringify(exp.args)));
         expect(query, name).toMatchObject({ ok: true, value: exp.value });
       }
@@ -710,7 +708,7 @@ describe('parity gate (execution)', () => {
     }
   });
 
-  it('pivot: every former branch executes through web_execute; old modes answer MOVED', async () => {
+  it('pivot: every former branch executes through web_execute', async () => {
     for (const c of PIVOT_CASES) {
       const spy = vi.spyOn(commandRegistry, 'execute').mockResolvedValue({ ok: true, value: { path: 'A', pivotWorld: null } });
       await new McpCommandTools(() => viewer).webExecute(c.id, JSON.stringify(c.args));
@@ -718,9 +716,6 @@ describe('parity gate (execution)', () => {
       expect(spy.mock.calls[0].slice(0, 2)).toEqual([c.id, c.args]);
       spy.mockRestore();
     }
-    expect(JSON.parse(movedToolAnswer(movedToolOf('web_editor_pivot')!))).toMatchObject({
-      error: 'MOVED', movedTo: PIVOT_CASES.map((c) => c.id),
-    });
   });
 
   it('editor.pivotToCircle (UI-only): a degenerate circle or a meshed node is refused, nothing is written', async () => {

@@ -6,6 +6,33 @@ Maintained by `/release-web`; the contract is described in `Documentation/web/RE
 
 ## Unreleased
 
+## 6.7.1 — 2026-11-06
+
+**New**
+- DES snapshots: running robot IK paths (point-to-point, linear and waiting segments) are saved and continue exactly after loading.
+
+**Improved**
+- **MCP** – the old tool names that answered `MOVED` for one release are gone and are now unknown tools; use `web_execute` / `web_query` (`web_commands` lists the commands).
+
+**Fixed**
+- Replay recordings keep their start and status signals after a model is saved in the browser and reopened.
+- Fleet: an AGV waiting behind a broken-down AGV no longer reports a wait timeout; the wait names the broken vehicle.
+- AI scene access now follows the configured CONNECT address and port instead of always using port 5100.
+- Animated USD export and Isaac Sim live sync no longer write sensor beams and detection boxes or the
+  runtime screen of a camera display into the USD stage; showing or hiding them no longer restarts the
+  live sync.
+- CONNECT signals: OPC UA variables of type `Boolean` (for example from a CODESYS controller) now
+  bind as Bool instead of Float, so edge-triggered logic such as a gripper release works again.
+  When a controller signal is bound or mapped onto a model signal, the model signal's type and
+  direction apply; **Fill addresses** offers **Retype to model** for a CONNECT signal configured
+  differently.
+
+**Internal**
+- Hosted libraries: internal tooling sets up the CDN storage and pull zone for
+  hosted libraries idempotently (`--dry-run` only reads), and publishes a
+  library project to it. Binaries go under content-hash paths and `project.json` last; the script
+  checks the project identity, never deletes and ends with a CORS and cache smoke test.
+
 ## 6.7.0 — 2026-11-05
 
 **New**

@@ -145,12 +145,12 @@ describe('web_plc_* tools — PLC not available (no registered control)', () => 
   });
 
   it.each([['web_plc_deploy', 'plc.deploy'], ['web_plc_run', 'plc.run'], ['web_plc_stop', 'plc.stop']])(
-    '%s is a tombstone pointing at %s (plan-2007)',
+    '%s is unknown; use command %s',
     async (tool, command) => {
       const { callRaw } = setupPlugin();
       const frame = await callRaw(tool);
-      const moved = JSON.parse(frame.error);
-      expect(moved).toMatchObject({ error: 'MOVED', movedTo: [command], use: 'web_execute' });
+      expect(frame.error).toBe(`Unknown tool: ${tool}`);
+      expect(frame.result).toBeUndefined();
     },
   );
 });

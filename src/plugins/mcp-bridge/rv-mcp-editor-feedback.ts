@@ -175,40 +175,43 @@ export const EDITOR_FEEDBACK: Record<string, FeedbackSpec> = {
   // Transform / pivot — frame when offscreen.
   // `follow` (plan-520): node writes follow with the camera; web_editor_delete
   // (the target is gone) and web_editor_set_visible (it may be hidden) do not.
-  web_editor_transform: { frame: true, panel: 'kinematics', follow: 'pre' },
-  web_editor_zero_position: { frame: true, panel: 'kinematics', follow: 'pre' },
-  web_editor_rotate90: { frame: true, panel: 'kinematics', follow: 'pre' },
-  web_editor_to_ground: { frame: true, panel: 'kinematics', follow: 'pre' },
-  web_editor_pivot: { frame: true, panel: 'kinematics', follow: 'pre' },
+  'editor.transform': { frame: true, panel: 'kinematics', follow: 'pre' },
+  'editor.zeroPosition': { frame: true, panel: 'kinematics', follow: 'pre' },
+  'editor.rotate90': { frame: true, panel: 'kinematics', follow: 'pre' },
+  'editor.toGround': { frame: true, panel: 'kinematics', follow: 'pre' },
+  'editor.pivotToBottom': { frame: true, panel: 'kinematics', follow: 'pre' },
+  'editor.pivotToObjectCenter': { frame: true, panel: 'kinematics', follow: 'pre' },
+  'editor.centerKinematicToGroup': { frame: true, panel: 'kinematics', follow: 'pre' },
+  'editor.alignYUp': { frame: true, panel: 'kinematics', follow: 'pre' },
 
   // Structure
-  web_editor_rename: { paths: resultPath, panel: 'kinematics', follow: 'post' },
-  web_editor_delete: { clearSelection: true, panel: 'kinematics' },
-  web_editor_set_visible: { panel: 'kinematics' },
-  web_editor_create_empty: { paths: resultPath, panel: 'kinematics', follow: 'post' },
-  web_editor_reparent: { frame: true, panel: 'kinematics', follow: 'pre' },
+  'editor.rename': { paths: resultPath, panel: 'kinematics', follow: 'post' },
+  'editor.delete': { clearSelection: true, panel: 'kinematics' },
+  'editor.setVisible': { panel: 'kinematics' },
+  'editor.createEmpty': { paths: resultPath, panel: 'kinematics', follow: 'post' },
+  'editor.reparent': { frame: true, panel: 'kinematics', follow: 'pre' },
 
   // Components / kinematics
-  web_editor_add_component: { panel: 'kinematics', follow: 'pre' },
-  web_editor_remove_component: { panel: 'kinematics', follow: 'pre' },
+  'editor.addComponent': { panel: 'kinematics', follow: 'pre' },
+  'editor.removeComponent': { panel: 'kinematics', follow: 'pre' },
   // Field writes act in the Property Inspector (no Quick Edit panel — opening
   // a right-dock panel would close the hierarchy the docked inspector needs).
-  web_editor_set_field: { field: setFieldTarget, follow: 'pre' },
-  web_editor_create_kinematic: { paths: resultKinematicPath, frame: true, panel: 'kinematics', follow: 'post' },
-  web_editor_assign_to_kinematic: { paths: resultKinematicPath, frame: true, panel: 'kinematics', follow: 'post' },
-  web_editor_kinematize: { paths: resultKinematicPath, frame: true, panel: 'kinematics', follow: 'post' },
+  'editor.setField': { field: setFieldTarget, follow: 'pre' },
+  'editor.createKinematic': { paths: resultKinematicPath, frame: true, panel: 'kinematics', follow: 'post' },
+  'editor.assignToKinematic': { paths: resultKinematicPath, frame: true, panel: 'kinematics', follow: 'post' },
+  'editor.kinematize': { paths: resultKinematicPath, frame: true, panel: 'kinematics', follow: 'post' },
 
   // Signals / logic — the create actions select the new node themselves.
-  web_editor_add_signal: { paths: resultPath, panel: 'kinematics' },
-  web_editor_convert_signal: { panel: 'kinematics' },
-  web_editor_toggle_signal_direction: { panel: 'kinematics' },
-  web_editor_add_logic_step: { paths: resultPath, panel: 'kinematics' },
+  'editor.addSignal': { paths: resultPath, panel: 'kinematics' },
+  'editor.convertSignal': { panel: 'kinematics' },
+  'editor.toggleSignalDirection': { panel: 'kinematics' },
+  'editor.addLogicStep': { paths: resultPath, panel: 'kinematics' },
 
   // Materials
-  web_editor_material_presets: { select: false, panel: 'materials' },
-  web_editor_material_stats: { select: false, panel: 'materials' },
-  web_editor_assign_material: { paths: materialPaths, panel: 'materials', follow: 'pre' },
-  web_editor_materialize: { paths: materializeSamplePaths, select: false, panel: 'materials' },
+  'editor.materialPresets': { select: false, panel: 'materials' },
+  'editor.materialStats': { select: false, panel: 'materials' },
+  'editor.assignMaterial': { paths: materialPaths, panel: 'materials', follow: 'pre' },
+  'editor.materialize': { paths: materializeSamplePaths, select: false, panel: 'materials' },
 
   // Rigid-body mechanisms (plan-504) — the 11 tools that are views of the
   // `mechanism.*` commands. PRE selects the addressed node, POST frames it when
@@ -217,21 +220,21 @@ export const EDITOR_FEEDBACK: Record<string, FeedbackSpec> = {
   // section starts collapsed and its rows render their buttons only expanded.
   // The two controls (density select, jog slider) carry no `data-rv-button-id`,
   // so they get no hover/press — only the afterglow.
-  web_editor_mechanism_create: { frame: true, panel: 'kinematics', follow: 'pre' },
-  web_editor_mechanism_add_joint: { frame: true, panel: 'kinematics', follow: 'pre' },
-  web_editor_mechanism_assign_drive: { frame: true, panel: 'kinematics', follow: 'pre' },
-  web_editor_mechanism_jog: { panel: 'kinematics', follow: 'pre' },
-  web_editor_mechanism_set_anchor_snap: { frame: true, panel: 'kinematics', follow: 'pre' },
-  web_editor_mechanism_set_axis: { frame: true, panel: 'kinematics', follow: 'pre' },
-  web_editor_mechanism_add_body: { frame: true, panel: 'kinematics', follow: 'pre' },
-  web_editor_mechanism_set_mass: { frame: true, panel: 'kinematics', follow: 'pre' },
-  web_editor_mechanism_set_limits: { frame: true, panel: 'kinematics', follow: 'pre' },
-  web_editor_mechanism_statics: { paths: mechanismPathArg, frame: true, panel: 'kinematics', follow: 'pre' },
-  web_editor_mechanism_fix: { frame: true, panel: 'kinematics', follow: 'pre' },
+  'mechanism.create': { frame: true, panel: 'kinematics', follow: 'pre' },
+  'mechanism.addJoint': { frame: true, panel: 'kinematics', follow: 'pre' },
+  'mechanism.assignDrive': { frame: true, panel: 'kinematics', follow: 'pre' },
+  'mechanism.jog': { panel: 'kinematics', follow: 'pre' },
+  'mechanism.setAnchorSnap': { frame: true, panel: 'kinematics', follow: 'pre' },
+  'mechanism.setAxis': { frame: true, panel: 'kinematics', follow: 'pre' },
+  'mechanism.addBody': { frame: true, panel: 'kinematics', follow: 'pre' },
+  'mechanism.setMass': { frame: true, panel: 'kinematics', follow: 'pre' },
+  'mechanism.setLimits': { frame: true, panel: 'kinematics', follow: 'pre' },
+  'mechanism.statics': { paths: mechanismPathArg, frame: true, panel: 'kinematics', follow: 'pre' },
+  'mechanism.fix': { frame: true, panel: 'kinematics', follow: 'pre' },
 
   // Imports
-  web_editor_import_glb: { paths: importRootPaths, frame: true, panel: 'kinematics', follow: 'post' },
-  web_editor_import_cad: { paths: importRootPaths, frame: true, panel: 'kinematics', follow: 'post' },
+  'editor.importGlb': { paths: importRootPaths, frame: true, panel: 'kinematics', follow: 'post' },
+  'editor.importCad': { paths: importRootPaths, frame: true, panel: 'kinematics', follow: 'post' },
 
   // ─── Scene domains (plan-713 Phase 3) ────────────────────────────────
   //
@@ -252,13 +255,13 @@ export const EDITOR_FEEDBACK: Record<string, FeedbackSpec> = {
   // resolution the planner does not currently expose; adding a half-working
   // extractor that silently returns nothing would look like feedback and be
   // none.
-  web_component_set: { field: componentSetTarget, follow: 'pre' },
+  'component.setFields': { field: componentSetTarget, follow: 'pre' },
 
   // Runtime drives (plan-520): the bound `drive.jog` / `drive.stop` tools select
   // the drive and follow it. No `panel` (the right dock is the asset editor's);
   // the button press stays the bound command's `buttonKey`.
-  web_drive_jog: { paths: drivePaths, follow: 'pre' },
-  web_drive_stop: { paths: drivePaths, follow: 'pre' },
+  'drive.jog': { paths: drivePaths, follow: 'pre' },
+  'drive.stop': { paths: drivePaths, follow: 'pre' },
 
   // Deliberately absent: web_editor_verify_drive (own choreography),
   // open/close/status/save/undo/redo/shortcut/list_kinematics (no spatial target
@@ -416,13 +419,13 @@ export async function prepareEditorChoreography(
     // plan-504: a mechanism button lives inside a collapsible section and a
     // collapsible mechanism row — open both BEFORE the beat below, so the
     // button the press targets is rendered by the time it is looked up.
-    if (tool.startsWith('web_editor_mechanism_')) {
+    if (tool.startsWith('mechanism.')) {
       const target = (spec.paths ?? defaultPaths)(args, {}, viewer)[0];
       if (target) expandMechanismRow(target);
     }
 
     // Field writes: open the inspector on the field. component.setFields has
-    // no buttonKey and presses the first field's row through its tombstone key.
+    // no buttonKey and presses the first field's row through its command policy.
     let id = buttonKey;
     if (spec.field) {
       const target = spec.field(args);
@@ -505,8 +508,8 @@ export function applyEditorFeedback(
     ensurePanelOpen(viewer, spec);
 
     // editor.setField gets its afterglow from the command listener;
-    // component.setFields glows every applied field through its tombstone key.
-    if (spec.field && tool === 'web_component_set') {
+    // component.setFields glows every applied field through its command policy.
+    if (spec.field && tool === 'component.setFields') {
       const target = spec.field(args);
       const applied = result['applied'];
       if (target && applied && typeof applied === 'object') {

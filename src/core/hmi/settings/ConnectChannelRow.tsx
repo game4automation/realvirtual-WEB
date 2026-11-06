@@ -46,7 +46,7 @@ export const MCP_FAILURE_TEXT: Readonly<Record<Exclude<McpBridgeFailure, 'none'>
   },
   'origin-not-pairable': {
     status: 'Origin not allowed',
-    hint: 'Use https or open the viewer via http://localhost:5100.',
+    hint: 'Use https or open the viewer via {connectUrl}.',
     localLink: true,
   },
   'bridge-disabled': {
@@ -59,7 +59,7 @@ export const MCP_FAILURE_TEXT: Readonly<Record<Exclude<McpBridgeFailure, 'none'>
   },
   unreachable: {
     status: 'CONNECT not reachable',
-    hint: 'Is CONNECT running? Allow local network access in the browser. Safari: open http://localhost:5100.',
+    hint: 'Is CONNECT running? Allow local network access in the browser. Safari: open {connectUrl}.',
     localLink: true,
     extra: [
       "If CONNECT restricts AllowedOrigins, add this page's origin.",
@@ -68,13 +68,13 @@ export const MCP_FAILURE_TEXT: Readonly<Record<Exclude<McpBridgeFailure, 'none'>
   },
   'browser-blocked': {
     status: 'Blocked by the browser',
-    hint: 'This browser does not allow the connection. Use Chrome/Edge or open http://localhost:5100.',
+    hint: 'This browser does not allow the connection. Use Chrome/Edge or open {connectUrl}.',
     localLink: true,
   },
   starting: { status: 'CONNECT is starting', hint: 'Connects automatically.' },
   refused: {
     status: 'Connection refused',
-    hint: "Check API key, licence and the browser's local-network permission. Safari: open http://localhost:5100.",
+    hint: "Check API key, licence and the browser's local-network permission. Safari: open {connectUrl}.",
     localLink: true,
   },
   'pairing-busy': { status: 'CONNECT is busy', hint: 'Too many approval requests — try again later.' },
@@ -116,9 +116,15 @@ export function channelState(mcp: McpBridgeSnapshot): { label: string; color: st
 }
 
 /** Cause block under the status rows: what failed and what to do about it. */
-export function FailureHint({ failure, port }: { failure: Exclude<McpBridgeFailure, 'none'>; port: string }) {
+export function FailureHint({ failure, port, target }: { failure: Exclude<McpBridgeFailure, 'none'>; port: string; target?: string }) {
   const text = MCP_FAILURE_TEXT[failure];
-  const localUrl = `http://localhost:${port}`;
+  let localUrl = `http://localhost:${port || '5100'}`;
+  try {
+    const url = new URL(target ?? '');
+    if (url.protocol === 'ws:' || url.protocol === 'wss:') {
+      localUrl = `${url.protocol === 'wss:' ? 'https:' : 'http:'}//${url.host}`;
+    }
+  } catch { /* Use the configured port when a target is not available yet. */ }
   const captionSx = { color: INK_MID, fontSize: FS.label } as const;
   return (
     <Box data-testid="mcp-failure-hint" sx={{
@@ -131,7 +137,7 @@ export function FailureHint({ failure, port }: { failure: Exclude<McpBridgeFailu
           connects automatically.
         </Typography>
       ) : null}
-      <Typography variant="caption" sx={captionSx}>{text.hint}</Typography>
+      <Typography variant="caption" sx={captionSx}>{text.hint.replace('{connectUrl}', localUrl)}</Typography>
       {text.extra?.map((line) => (
         <Typography key={line} variant="caption" sx={captionSx}>{line}</Typography>
       ))}
@@ -166,7 +172,7 @@ export function ConnectChannelRow() {
           </Typography>
         )}
       </Box>
-      {state.failure && <FailureHint failure={state.failure} port={mcp.port} />}
+      {state.failure && <FailureHint failure={state.failure} port={mcp.port} target={mcp.target} />}
       {channelWanted(mcp) && !mcp.connected && (
         <Button size="small" variant="outlined" onClick={() => plugin?.reconnect()}
           sx={{ alignSelf: 'flex-start', textTransform: 'none' }}>

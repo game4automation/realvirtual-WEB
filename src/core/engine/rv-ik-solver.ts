@@ -197,6 +197,7 @@ class IKSolverRegistry {
     return this.tier !== 'none' && (this.liveSolveClaims.has(key) || this.liveSolveClaims.size < this.maxRobots);
   }
   hasLiveSolveClaim(key: string): boolean { return this.liveSolveClaims.has(key); }
+  liveSolveClaimKeys(): string[] { return [...this.liveSolveClaims].sort(); }
 
   /** Release a single robot's live-solve claim (e.g. robot removed from scene). */
   releaseLiveSolve(robotKey: string): void {

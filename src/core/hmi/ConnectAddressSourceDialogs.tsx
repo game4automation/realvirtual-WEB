@@ -94,6 +94,7 @@ const headSx = { ...cellSx, fontFamily: 'inherit', fontWeight: 600, color: 'rgba
 const FILL_LABEL: Record<FillRowStatus, string> = {
   fill: 'Fill',
   create: 'Create',
+  retype: 'Retype to model',
   already: 'Already set',
   kept: 'Kept (different address)',
   'name-variant': 'Name variant (not coupled)',

@@ -267,6 +267,13 @@ describe('text signal binding (plan-552 Phase 7)', () => {
     expect(discoveredSignalWireType('output', 'Float')).toBe('PLCOutputFloat');
     expect(discoveredSignalWireType('unknown', 'Double')).toBe('PLCOutputFloat');
     expect(discoveredSignalWireType('output', '')).toBe('PLCOutputFloat');
+    // OPC UA built-in names (a CODESYS browse reports `Boolean`).
+    expect(discoveredSignalWireType('unknown', 'Boolean')).toBe('PLCOutputBool');
+    expect(discoveredSignalWireType('input', 'Int16')).toBe('PLCInputInt');
+    expect(discoveredSignalWireType('output', 'SByte')).toBe('PLCOutputInt');
+    // A same-named model signal is binding: direction AND kind.
+    expect(discoveredSignalWireType('unknown', 'Boolean', 'PLCInputBool')).toBe('PLCInputBool');
+    expect(discoveredSignalWireType('output', 'Double', 'PLCInputFloat')).toBe('PLCInputFloat');
   });
 
   it('binds discovered Text / String / STRING signals as PLCOutputText through the bind route', async () => {
