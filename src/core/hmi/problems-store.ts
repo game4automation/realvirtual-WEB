@@ -1815,6 +1815,37 @@ export function clearBakeFailedProblems(): void {
   clearProblemsOfCode('bake-failed');
 }
 
+// ─── Editor test run could not restore the authoring scene (2026-11-06) ──
+
+/** Problem code: a stopped editor test run could not put the authoring scene back. */
+export const EDITOR_TEST_RESTORE_FAILED_CODE = 'editor-test-restore-failed';
+
+/**
+ * Report that the editor is still showing the TEST COPY of a document.
+ *
+ * Without this the failure was a console line and a toast: the editor kept
+ * running on the copy, whose paths and names differ from the document, and
+ * every later measurement, edit and save worked on the wrong scene without a
+ * visible reason. Retired by the next load (`clearModel`) — reloading the
+ * original document is exactly the remedy the entry names.
+ */
+export function reportEditorTestRestoreFailed(documentName: string, message: string): void {
+  reportProblem({
+    id: `${EDITOR_TEST_RESTORE_FAILED_CODE}:${documentName}`,
+    severity: 'error',
+    code: EDITOR_TEST_RESTORE_FAILED_CODE,
+    title: 'Editor is still on the test copy - reload the original',
+    detail: `Stopping the test run of "${documentName}" could not restore the editor: ${message || 'unknown error'}. `
+      + 'The scene on screen is the test copy, not the document. Reload the original document before you edit, '
+      + 'measure or save; your authored changes are kept in the document draft.',
+  });
+}
+
+/** Drop the entry — the next load replaced the scene. */
+export function clearEditorTestRestoreProblems(): void {
+  clearProblemsOfCode(EDITOR_TEST_RESTORE_FAILED_CODE);
+}
+
 // ─── References lost by a save (plan-765 F5) ────────────────────────────
 
 /** Problem code of the save guard: the written file resolves fewer references than the document it came from. */

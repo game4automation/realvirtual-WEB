@@ -282,7 +282,7 @@ import {
 } from './engine/rv-structural-derived';
 import { buildInitContext, type InitContextBase, type InitSubsystems } from './engine/rv-init-context';
 import {
-  clearBakeFailedProblems, clearLogicGatedProblems, clearNestedReferenceProblems, clearOverrideOrphanedProblems,
+  clearBakeFailedProblems, clearEditorTestRestoreProblems, clearLogicGatedProblems, clearNestedReferenceProblems, clearOverrideOrphanedProblems,
   clearPluginClaimProblems, clearReferenceAuditProblems, reportReferenceAudit, setProblemsDocument,
   reportKinematicMembersInPlacedContent,
   clearReferenceMigrationProblems, clearIkProblems,
@@ -6603,6 +6603,8 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // plan-757 Phase 3 commit A: a failed bake is a load error of the document
     // that failed; the next load starts with a clean slate.
     clearBakeFailedProblems();
+    // A test copy the editor could not leave is replaced by whatever loads next.
+    clearEditorTestRestoreProblems();
     // plan-610 F9: the reference audit is about the document being dropped.
     this._cancelReferenceAudit();
     clearReferenceAuditProblems();

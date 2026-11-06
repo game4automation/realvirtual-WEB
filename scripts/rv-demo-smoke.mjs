@@ -56,13 +56,14 @@ export const DEFAULT_POLL_INTERVAL_MS = 2_000;
 const PARTIAL_LOG_CHARS = 20_000;
 
 /**
- * Test identities of the two journeys (F14: basename(file) › describe… › title).
+ * Test identities of the journeys (F14: basename(file) › describe… › title).
  * Mirrored from e2e/prod-demo/*.spec.ts; tests/playwright-config-prod-demo.node.test.ts
  * fails when they drift apart.
  */
 export const JOURNEY_TITLES = Object.freeze([
   'hmi-journey.spec.ts › demo runs by itself and the HMI chrome is usable',
   'planner-journey.spec.ts › drag moves the placement and reload follows the measured contract',
+  'editor-test-run-journey.spec.ts › editor test run of a display-named demo restores the original and keeps the drive forces',
 ]);
 
 /** Test identity of one boot test of demo-smoke.spec.ts (it iterates the `demos` keys). */

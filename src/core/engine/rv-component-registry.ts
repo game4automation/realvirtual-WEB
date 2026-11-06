@@ -1213,11 +1213,24 @@ export function pickModeOf(typeOrNode: string | Object3D): PickMode {
 export const RV_BAKE_ROLE_KEY = 'BakeRole';
 
 /**
+ * `userData` key carrying the bake role a RUNTIME CLONE's template declared
+ * (a Source-spawned MU, a Chain element). The clone strip
+ * (`stripRuntimeCloneExtras`, rv-runtime-clone.ts) removes the rv extras so no
+ * later pass builds live components on the clone — the role the template's
+ * components declared survives here, like the other facts that strip keeps
+ * (`_rvLayer`, `_rvIsMU`, `_rvColliders`). Plain data, copied by `clone()`.
+ */
+export const RV_CLONE_BAKE_ROLE_KEY = '_rvBakeRole';
+
+/**
  * Bake role of a node (plan-753 §2.3):
  *   1. an authored `rv.BakeRole` extras value wins,
  *   2. otherwise the STRONGEST role across the node's REGISTERED components
  *      (`keep` > `chunk` > `merge`),
- *   3. `undefined` when the node carries no registered component — the bake
+ *   3. a runtime clone without rv extras answers with the role its template
+ *      declared ({@link RV_CLONE_BAKE_ROLE_KEY}) — still the component's own
+ *      declaration, carried across the strip, never a type list,
+ *   4. `undefined` when the node carries no registered component — the bake
  *      then inherits the enclosing node's role (Phase 2).
  *
  * `skip(type, config)` lets a caller ignore one component instance — the
@@ -1229,7 +1242,10 @@ export function bakeRoleOf(
   skip?: (type: string, config: unknown) => boolean,
 ): BakeRole | undefined {
   const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
-  if (!rv) return undefined;
+  if (!rv) {
+    const kept = node.userData?.[RV_CLONE_BAKE_ROLE_KEY];
+    return isBakeRole(kept) ? kept : undefined;
+  }
   const override = rv[RV_BAKE_ROLE_KEY];
   if (isBakeRole(override)) return override;
   let best: BakeRole | undefined;

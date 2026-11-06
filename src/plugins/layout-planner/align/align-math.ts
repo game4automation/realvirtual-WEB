@@ -58,20 +58,20 @@ function finiteOr0(v: number): number {
 }
 
 /**
- * World delta in metres that brings corner A onto corner B plus the offset,
+ * World delta in metres that brings corner A onto corner B plus the offset (metres),
  * on the active axes only (inactive axes: 0). Non-finite components become 0.
  */
 export function computeAlignDelta(
   cornerAWorld: Vec3Like,
   cornerBWorld: Vec3Like,
   axes: AlignAxes,
-  offsetMm: Vec3Like,
+  offsetM: Vec3Like,
   out: Vector3,
 ): Vector3 {
   out.set(
-    axes.x ? finiteOr0(cornerBWorld.x + finiteOr0(offsetMm.x) / 1000 - cornerAWorld.x) : 0,
-    axes.y ? finiteOr0(cornerBWorld.y + finiteOr0(offsetMm.y) / 1000 - cornerAWorld.y) : 0,
-    axes.z ? finiteOr0(cornerBWorld.z + finiteOr0(offsetMm.z) / 1000 - cornerAWorld.z) : 0,
+    axes.x ? finiteOr0(cornerBWorld.x + finiteOr0(offsetM.x) - cornerAWorld.x) : 0,
+    axes.y ? finiteOr0(cornerBWorld.y + finiteOr0(offsetM.y) - cornerAWorld.y) : 0,
+    axes.z ? finiteOr0(cornerBWorld.z + finiteOr0(offsetM.z) - cornerAWorld.z) : 0,
   );
   return out;
 }

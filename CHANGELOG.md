@@ -6,6 +6,21 @@ Maintained by `/release-web`; the contract is described in `Documentation/web/RE
 
 ## Unreleased
 
+## 6.7.2 — 2026-11-06
+
+**New**
+- **Layout Planner** – **Align** tool in the planner toolbar: pick a corner on a placement and a corner on any other geometry, including the main model, and the placement moves so the corners meet. Per-axis switches (height stays by default), an offset in metres, a preview line, one Undo step; snap-connected chains move along in chain mode.
+- **Stats window** – parts can be coloured by watertightness, and a **Random** colour mode gives every part its own hue.
+
+**Fixed**
+- **Asset editor** – the in-place test run works for documents whose display name differs from the model root name, and forces recorded during the test run are kept after **Stop**. If restoring the document after a test run fails, the Problems panel says so.
+- **Chains** – chain elements created at runtime move with their chain again (the drive ran, but the chain stood still).
+
+**Internal**
+- STEP import: experimental `test` tessellation preset (0.6 mm / 1.05 rad); CONNECT imports CAD without Draco compression.
+- Architecture contracts: node-identity rule 13 (display names are never identity), bake-picking rule 15 (`pickDetailed` as the one documented gate-order exception).
+- New Problems code `editor-test-restore-failed`; prod demo smoke gained an editor test-run journey.
+
 ## 6.7.1 — 2026-11-06
 
 **New**

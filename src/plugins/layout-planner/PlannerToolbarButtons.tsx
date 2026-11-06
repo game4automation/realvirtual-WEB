@@ -27,13 +27,14 @@ import {
   IconButton,
   Popover,
   Stack,
+  SvgIcon,
+  type SvgIconProps,
   Switch,
   Tooltip,
   Typography,
 } from '@mui/material';
 import {
   Adjust,
-  AlignHorizontalLeft,
   AutoDelete,
   BorderOuter,
   DeleteOutline,
@@ -474,6 +475,19 @@ export function PlannerVanishMUsButton() {
 
 // ─── Align tool button (plan-779) ────────────────────────────────────────
 
+/** Corner-to-corner icon: dashed box A, arrow from its corner onto the dotted corner of box B. */
+function AlignCornerIcon(props: SvgIconProps) {
+  return (
+    <SvgIcon {...props} viewBox="0 0 24 24">
+      <rect x="2.5" y="2.5" width="7" height="7" fill="none" stroke="currentColor" strokeWidth="1.6" strokeDasharray="2 1.6" />
+      <rect x="12.5" y="12.5" width="9" height="9" fill="none" stroke="currentColor" strokeWidth="1.8" />
+      <path d="M9.5 9.5 L11.6 11.6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+      <path d="M12.6 9.6 L12.6 12.6 L9.6 12.6" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx="12.5" cy="12.5" r="1.9" fill="currentColor" />
+    </SvgIcon>
+  );
+}
+
 /**
  * Toolbar button — opens / closes the Align tool (corner of placement A onto
  * a corner of any geometry B). The tool's runtime and panel load on the first
@@ -500,7 +514,7 @@ export function PlannerAlignButton() {
         aria-label="Toggle Align tool"
         aria-pressed={open}
       >
-        <AlignHorizontalLeft sx={{ fontSize: 18 }} />
+        <AlignCornerIcon sx={{ fontSize: 18 }} />
       </IconButton>
     </Tooltip>
   );

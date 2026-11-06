@@ -21,6 +21,7 @@ import { Object3D, Mesh } from 'three';
 // TransportSurface, Grip, MU, SceneButtonMoveable, Kinematic, PlacementMeta).
 import '../src/core/engine/rv-scene-loader';
 import { freezeStaticMatrices } from '../src/core/engine/rv-freeze-static';
+import { stripRuntimeCloneExtras } from '../src/core/engine/rv-runtime-clone';
 
 /** Tag a node with an rv_extras component (truthy value = present). */
 function withComponent<T extends Object3D>(node: T, key: string): T {
@@ -147,6 +148,33 @@ describe('freezeStaticMatrices', () => {
     freezeStaticMatrices(root);
 
     expect(cap.matrixWorldAutoUpdate).toBe(true);
+  });
+
+  it('keeps a stripped runtime clone the mover its template declares (contract-bake-picking rule 6)', () => {
+    // RVChain clones its elements in onSceneReady() — before this pass — through
+    // the shared runtime-clone strip, which removes the extras. The role the
+    // template's ChainElement declares (`chunk`) must survive the strip; without
+    // it the clone was a plain descendant of the `keep` Chain node, got
+    // matrixAutoUpdate forced off, and every per-tick pose write was lost.
+    const root = named('root');
+    const chain = withComponent(named('Chain'), 'Chain');
+    const template = withComponent(named('ChainElement'), 'ChainElement');
+    template.add(named('link', true));
+    const clone = template.clone();
+    stripRuntimeCloneExtras(clone);
+    const link = clone.children[0];
+    root.add(chain); chain.add(clone);
+
+    expect(clone.userData.realvirtual).toBeUndefined();   // no live component on the clone
+
+    freezeStaticMatrices(root);
+
+    expect(clone.matrixAutoUpdate).toBe(true);
+    expect(clone.matrixWorldAutoUpdate).toBe(true);
+    // The pose write now reaches the world matrix.
+    clone.position.set(0, 0, 0.25);
+    root.updateMatrixWorld();
+    expect(link.matrixWorld.elements[14]).toBeCloseTo(0.25);
   });
 
   it('freezes a SceneButtonBase-only subtree (not every scene-button key is a mover)', () => {

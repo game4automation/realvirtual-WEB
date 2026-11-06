@@ -106,7 +106,7 @@ describe('playwright.config.ts — prod-demo contract (plan-503 §9.4)', () => {
 
   it('EXPECTED_TITLES in rv-demo-smoke.mjs equal the test identities (F14) found in e2e/prod-demo/*.spec.ts', () => {
     const specs = readdirSync(PROD_DEMO_DIR).filter((f) => f.endsWith('.spec.ts')).sort();
-    expect(specs).toEqual(['demo-smoke.spec.ts', 'hmi-journey.spec.ts', 'planner-journey.spec.ts']);
+    expect(specs).toEqual(['demo-smoke.spec.ts', 'editor-test-run-journey.spec.ts', 'hmi-journey.spec.ts', 'planner-journey.spec.ts']);
     const declared: string[] = [];
     for (const file of specs) {
       const source = readFileSync(join(PROD_DEMO_DIR, file), 'utf8');

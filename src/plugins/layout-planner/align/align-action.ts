@@ -93,7 +93,7 @@ export function evaluateAlign(viewer: RVViewer): AlignEvaluation {
   let target: Vector3 | null = null;
   let members: Object3D[] = [];
   if (cornerA && cornerB) {
-    computeAlignDelta(cornerA, cornerB, s.axes, s.offsetMm, delta);
+    computeAlignDelta(cornerA, cornerB, s.axes, s.offsetM, delta);
     target = cornerA.clone().add(delta);
   }
   if (aAlive && s.a?.root) {

@@ -6,11 +6,15 @@
  * Loaded lazily by AlignPanelHost on the first open.
  */
 
-import { useState, useSyncExternalStore } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { Box, Button, ToggleButton, ToggleButtonGroup, Typography } from '@mui/material';
 import { FloatingPanel } from '../../../core/hmi/FloatingPanel';
+import { setPanelGeometry } from '../../../core/hmi/floating-panel-store';
+import { ACTIVITY_BAR_WIDTH } from '../../../core/hmi/layout-constants';
+import { clientToCSS, getCSSViewportSize } from '../../../core/hmi/panel-anchor-store';
+import { useLeftWindowWidth } from '../../../hooks/use-left-window-width';
 import { Vector3Editor } from '../../../core/hmi/rv-field-editors';
-import { INK_HIGH, INK_LOW, INK_MID } from '../../../core/hmi/shared-sx';
+import { INK_HIGH, INK_LOW, INK_MID, SECONDARY } from '../../../core/hmi/shared-sx';
 import { useViewer } from '../../../hooks/use-viewer';
 import { evaluateAlign, runAlign } from './align-action';
 import {
@@ -19,15 +23,27 @@ import {
   getAlignSnapshot,
   isSlotAlive,
   setAlignAxes,
-  setAlignOffsetMm,
+  setAlignOffsetM,
   subscribeAlign,
   type AlignSlot,
   type AlignSlotId,
 } from './align-state';
 
 const PANEL_WIDTH = 290;
-const COLOR_A = '#ffa726';
-const COLOR_B = '#42a5f5';
+const PANEL_ID = 'layout-align';
+/** First-frame height guess; the real height is measured right after mount. */
+const PANEL_HEIGHT_ESTIMATE = 220;
+/** Same gap the floating tool column keeps to the 3D view's edges (ButtonPanel). */
+const VIEW_GAP = 8;
+/** Gap (CSS px) between the window's bottom edge and the viewport bottom: the space
+ *  below the 3D canvas (if any) plus the tool column's own gap. Measured per open. */
+function bottomInsetOf(canvas: HTMLElement): number {
+  const below = getCSSViewportSize().h - clientToCSS(canvas.getBoundingClientRect().bottom);
+  return Math.max(0, below) + VIEW_GAP;
+}
+// Same pink as the 3D markers (align-overlay).
+const COLOR_A = SECONDARY;
+const COLOR_B = SECONDARY;
 
 function SlotRow({ id, slot, armed, color }: { id: AlignSlotId; slot: AlignSlot | null; armed: boolean; color: string }) {
   const alive = isSlotAlive(slot);
@@ -63,23 +79,46 @@ export function AlignPanel() {
   const viewer = useViewer();
   const snap = useSyncExternalStore(subscribeAlign, getAlignSnapshot);
   const [busy, setBusy] = useState(false);
+  // Every open docks the window to the 3D view's lower-left corner with the
+  // tool column's own margin: left edge = the toolbar's left (ButtonPanel's
+  // formula: activity bar + open left window + 8), bottom = 8 px above the
+  // 3D canvas's bottom edge. No remembered geometry, no click anchoring. The host unmounts
+  // this panel on close, so this runs once per open.
+  const leftWindowWidth = useLeftWindowWidth();
+  const left = ACTIVITY_BAR_WIDTH + (leftWindowWidth > 0 ? leftWindowWidth + VIEW_GAP : VIEW_GAP);
+  const [bottomInset] = useState(() => bottomInsetOf(viewer.renderer.domElement));
+  const [openPos] = useState(() => ({ x: left, y: getCSSViewportSize().h - bottomInset - PANEL_HEIGHT_ESTIMATE }));
+  const contentRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    // Runs after FloatingPanel's own open placement (child effects first):
+    // re-place with the measured height so the bottom edge sits exactly.
+    const el = contentRef.current?.closest('[data-ui-panel]') as HTMLElement | null;
+    const h = el?.offsetHeight ?? 0;
+    if (h > 0) setPanelGeometry(PANEL_ID, [left, getCSSViewportSize().h - bottomInset - h, PANEL_WIDTH, h]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const ev = evaluateAlign(viewer);
   const axesValue = (['x', 'y', 'z'] as const).filter((k) => snap.axes[k]);
   const fmt = (k: 'x' | 'y' | 'z'): string =>
-    snap.axes[k] && ev.cornerA && ev.cornerB ? (ev.delta[k] * 1000).toFixed(1) : '—';
+    snap.axes[k] && ev.cornerA && ev.cornerB ? ev.delta[k].toFixed(3) : '—';
 
   return (
     <FloatingPanel
       open={snap.open}
       onClose={alignClose}
       title="Align"
-      panelId="layout-align"
+      panelId={PANEL_ID}
       fixedWidth={PANEL_WIDTH}
       minWidth={PANEL_WIDTH}
+      defaultHeight={PANEL_HEIGHT_ESTIMATE}
       autoHeight
       resizable={false}
+      persistGeometry={false}
+      anchorToClick={false}
+      defaultPosition={openPos}
+      edgeInsets={{ left, bottom: bottomInset }}
     >
-      <Box sx={{ px: 1.5, py: 1 }}>
+      <Box ref={contentRef} sx={{ px: 1.5, py: 1 }}>
         <SlotRow id="A" slot={snap.a} armed={snap.armed === 'A'} color={COLOR_A} />
         <SlotRow id="B" slot={snap.b} armed={snap.armed === 'B'} color={COLOR_B} />
 
@@ -106,12 +145,12 @@ export function AlignPanel() {
         </Box>
 
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mt: 1 }}>
-          <Typography sx={{ fontSize: 11, color: INK_LOW, width: 64, flex: 'none' }}>Offset mm</Typography>
-          <Vector3Editor value={snap.offsetMm} onChange={(v) => setAlignOffsetMm(v)} />
+          <Typography sx={{ fontSize: 11, color: INK_LOW, width: 64, flex: 'none' }}>Offset m</Typography>
+          <Vector3Editor value={snap.offsetM} onChange={(v) => setAlignOffsetM(v)} />
         </Box>
 
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mt: 1 }}>
-          <Typography sx={{ fontSize: 11, color: INK_LOW, width: 64, flex: 'none' }}>Move mm</Typography>
+          <Typography sx={{ fontSize: 11, color: INK_LOW, width: 64, flex: 'none' }}>Move m</Typography>
           {(['x', 'y', 'z'] as const).map((k) => (
             <Typography
               key={k}

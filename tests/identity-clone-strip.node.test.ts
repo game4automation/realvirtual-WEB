@@ -64,8 +64,11 @@ describe('plan-769 Phase 1b — clone identity (Inventory C)', () => {
 
   it('the runtime clone sites strip the identity', () => {
     const sites: Array<[string, RegExp]> = [
-      ['src/core/engine/rv-source.ts', /function stripComponentMetadata[\s\S]{0,400}stripIdentity\(obj\)/],
-      ['src/core/engine/rv-chain.ts', /template\.clone\(\);[\s\S]{0,600}stripIdentity\(clone\)/],
+      // The shared runtime-clone strip (rv-runtime-clone.ts) owns the identity
+      // strip; the Source and Chain clone sites go through it.
+      ['src/core/engine/rv-runtime-clone.ts', /export function stripRuntimeCloneExtras[\s\S]{0,400}stripIdentity\(obj\)/],
+      ['src/core/engine/rv-source.ts', /stripRuntimeCloneExtras\(ghost\)[\s\S]*stripRuntimeCloneExtras\(clone\)[\s\S]*stripRuntimeCloneExtras\(inst\)/],
+      ['src/core/engine/rv-chain.ts', /template\.clone\(\);[\s\S]{0,800}stripRuntimeCloneExtras\(clone\)/],
       ['src/plugins/multiuser-plugin.ts', /template\.clone\(\);\s*\r?\n\s*\/\/[^\n]*\r?\n\s*stripIdentity\(clone\)/],
     ];
     for (const [file, re] of sites) expect(readFileSync(join(root, file), 'utf8'), file).toMatch(re);

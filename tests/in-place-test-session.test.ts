@@ -29,6 +29,9 @@ import { __clearDraftStoresForTests } from '../src/core/ops/rv-document-drafts';
 import { InPlaceTestSession, PENDING_REPLAY_REFUSAL } from '@rv-private/plugins/asset-editor/in-place-test-session';
 import { saveAssetAs } from '@rv-private/plugins/asset-editor/save-flow';
 import { _resetSceneTransition } from '../src/core/hmi/scene-transition-store';
+import {
+  EDITOR_TEST_RESTORE_FAILED_CODE, clearEditorTestRestoreProblems, getProblems, resetProblemsForTests,
+} from '../src/core/hmi/problems-store';
 import { projectDocumentBase } from '../src/core/editor/active-asset-store';
 import type { RvOp } from '../src/core/ops/rv-unified-ops';
 
@@ -36,14 +39,19 @@ const hooks = vi.hoisted(() => ({
   /** Replaced per test to control WHEN the export resolves. */
   exportImpl: async (): Promise<ArrayBuffer> => new ArrayBuffer(16),
   order: [] as string[],
+  /** The scene name each export was asked to write (the loader names the root after it). */
+  exportNames: [] as (string | undefined)[],
 }));
 
 vi.mock('../src/core/editor/rv-asset-glb-export', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/core/editor/rv-asset-glb-export')>();
   return {
     ...actual,
-    exportAssetGlb: async () => {
+    // The name the real exporter would write: `sceneName` verbatim, else the
+    // caller's name (the mock has no root to read an own name from).
+    exportAssetGlb: async (_root: unknown, assetName?: string, _s?: unknown, _c?: unknown, opts?: { sceneName?: string }) => {
       hooks.order.push('export');
+      hooks.exportNames.push(opts?.sceneName || assetName);
       return hooks.exportImpl();
     },
   };
@@ -160,6 +168,7 @@ let createSpy: ReturnType<typeof vi.spyOn>;
 
 beforeEach(async () => {
   hooks.order.length = 0;
+  hooks.exportNames.length = 0;
   hooks.exportImpl = async () => new ArrayBuffer(16);
   _resetSceneTransition();
   await __clearDraftStoresForTests();
@@ -493,6 +502,40 @@ describe('InPlaceTestSession — stop restores the authoring state', () => {
     doc.dispose();
   });
 
+  it('a document named unlike its root keeps the root name: the restore finds its paths and ends idle', async () => {
+    // The loader names the model root after the scene name the export wrote,
+    // and rebuilds the registry from that tree — as the real viewer does.
+    const env = makeEnv({ loadImpl: async () => {
+      const name = hooks.exportNames[hooks.exportNames.length - 1];
+      env.model.name = (name ?? 'Asset').replace(/\s/g, '_');
+      const registry = env.viewer.registry!;
+      registry.clear();
+      env.model.traverse((n) => registry.registerNode(NodeRegistry.computeNodePath(n), n));
+      registry.setGltfNodeIndices(new Map([[env.model, 0], [env.box, 1]]), [env.model.name, 'Box']);
+    } });
+    const registry = env.viewer.registry!;
+    registry.setGltfNodeIndices(new Map([[env.model, 0], [env.box, 1]]), ['Asset', 'Box']);
+    // A display name like the delivered demos carry ("… (Kinematics)").
+    const doc = scratchAssetDocument(env.viewer, 'Delta Robot (Kinematics)');
+    expect(doc.name).not.toBe(env.model.name);
+    const { session, errors } = makeSession(env, doc);
+
+    for (let run = 0; run < 2; run++) {
+      await session.start();
+      expect(session.state).toBe('running');
+      // The test scene answers to the same paths as the authoring scene.
+      expect(env.model.name).toBe('Asset');
+      expect(registry.getNode(env.boxPath)).toBe(env.box);
+      await session.stop();
+      expect(errors).toEqual([]);
+      expect(session.state).toBe('idle');
+      expect(env.model.name).toBe('Asset');
+      expect(registry.getGltfNodeIndex(env.boxPath)).toBe(1);
+    }
+    expect(hooks.exportNames).toEqual(['Asset', 'Asset']);
+    doc.dispose();
+  });
+
   it('stop without a run is a no-op', async () => {
     const env = makeEnv();
     const doc = scratchAssetDocument(env.viewer);
@@ -603,6 +646,41 @@ describe('InPlaceTestSession — failure paths', () => {
     // plan-727: the restore returns to the authoring view, which never mutates
     // the hierarchy.
     expect(env.loads[1].options?.preserveAuthoringHierarchy).toBe(true);
+    error.mockRestore();
+    doc.dispose();
+  });
+
+  it('a failing RESTORE is a Problems entry "still on the test copy", gone with the next load', async () => {
+    // The 6.7.1 Autonox case: the run started, the restore after Stop threw.
+    // A toast scrolled away and the editor went on working on the test copy.
+    let load = 0;
+    const env = makeEnv({
+      loadImpl: async () => {
+        load++;
+        if (load === 2) throw new Error('Cannot restore model source mapping: missing "Asset/Box".');
+      },
+    });
+    const doc = scratchAssetDocument(env.viewer, 'Delta Robot (Kinematics)');
+    const { session, errors } = makeSession(env, doc);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    resetProblemsForTests();
+
+    await session.start();
+    expect(session.state).toBe('running');
+    await session.stop();
+
+    expect(session.state).toBe('failed');
+    expect(errors).toHaveLength(1);
+    const entries = getProblems().filter((p) => p.code === EDITOR_TEST_RESTORE_FAILED_CODE);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].severity).toBe('error');
+    expect(entries[0].title).toBe('Editor is still on the test copy - reload the original');
+    expect(entries[0].detail).toContain('Delta Robot (Kinematics)');
+    expect(entries[0].detail).toContain('missing "Asset/Box"');
+
+    // Reloading the original is the remedy; every load starts with clearModel.
+    clearEditorTestRestoreProblems();
+    expect(getProblems().filter((p) => p.code === EDITOR_TEST_RESTORE_FAILED_CODE)).toHaveLength(0);
     error.mockRestore();
     doc.dispose();
   });

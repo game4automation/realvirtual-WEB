@@ -675,7 +675,7 @@ export class RaycastManager {
    * RAW GEOMETRY pick (plan-779, planner Align tool): the nearest visible
    * triangle under the pointer — mesh, triangle index and its three vertex
    * indices — WITHOUT the allow filter, the ancestor overrides and pick
-   * ownership. A documented exception to doc-bake-picking-internals § 2.4 contract 4:
+   * ownership. A documented exception to doc-bake-picking-internals § 2.3 contract 3 (rule 15):
    * a tool that snaps to geometry needs the triangle, not the selectable node,
    * and must reach the main model while the planner's allow filter only admits
    * placements. Still honoured: exclude filters, on-top / aux gizmo hulls,

@@ -60,6 +60,8 @@ class FakeSession {
 
   async start(): Promise<void> { this._set('running'); }
   async stop(): Promise<void> { this._set('idle'); }
+  /** The real stop's middle state: the authoring scene is being re-loaded. */
+  beginRestore(): void { this._set('restoring'); }
 
   private _set(next: TestSessionState): void {
     this.state = next;
@@ -376,6 +378,34 @@ describe('T9 — an MCP-started test session records forces with NO panel', () =
     await session.start();                // the store transition arrives second
     expect(plugin.recorder.recording).toBe(true);
     expect(plugin.recorder.elapsed, 'the open window must not be wiped').toBe(elapsed);
+  });
+
+  it('Stop keeps the recorded run: the restore reload is not a model switch, a later switch is', async () => {
+    // The real Stop goes running -> restoring -> (authoring scene re-loaded:
+    // model-cleared + model-loaded) -> idle. Clearing on that reload emptied
+    // the chart on every Stop, so a run could never be read after it ended.
+    setMechanismUiBridge(new FakeBridge());
+    const plugin = ensureForceRecorder(env.viewer);
+    const session = new FakeSession();
+    setActiveTestSession(session as unknown as InPlaceTestSession);
+    await session.start();
+    for (let i = 0; i < 20; i++) plugin.onFixedUpdatePost(0.1);
+    const samples = plugin.recorder.timeBuffer.count;
+    expect(samples).toBeGreaterThan(0);
+
+    session.beginRestore();
+    expect(plugin.recorder.recording).toBe(false);
+    plugin.onModelCleared();
+    plugin.onModelLoaded({} as never, env.viewer);
+    await session.stop();
+    expect(plugin.recorder.timeBuffer.count, 'the stopped run stays readable').toBe(samples);
+    expect(plugin.recorder.seriesFor('Mech').length).toBeGreaterThan(0);
+    expect(plugin.recorder.metrics('Mech|dof0').sampleCount).toBe(samples);
+
+    // A model loaded outside a restore is a different model: cleared as before.
+    plugin.onModelLoaded({} as never, env.viewer);
+    expect(plugin.recorder.timeBuffer.count).toBe(0);
+    expect(plugin.recorder.series.length).toBe(0);
   });
 
   it('staying `running` does not restart the window', async () => {

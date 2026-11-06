@@ -389,6 +389,14 @@ export interface FloatingPanelProps {
    *  `false` uses `defaultPosition` instead — for a trigger the panel must not cover. */
   anchorToClick?: boolean;
   zIndex?: number;
+  /** Remember position/size across opens (localStorage under `panelId`). Default `true`.
+   *  `false`: every open places the panel afresh (anchor / `defaultPosition`) — for a
+   *  tool window that belongs at a fixed spot, e.g. the planner Align tool (plan-779). */
+  persistGeometry?: boolean;
+  /** Desktop clamp insets in CSS px, overriding the defaults (left: 72 = button column
+   *  + gutter; bottom: bottom bar + 12). For a tool window that docks to the 3D view's
+   *  corner with the toolbar's own margin (planner Align tool, plan-779). */
+  edgeInsets?: { left?: number; bottom?: number };
   /** Stable key for localStorage geometry persistence. Defaults to title. */
   panelId?: string;
   /** Toolbar content rendered between title and expand/close buttons */
@@ -417,11 +425,16 @@ export function FloatingPanel({
   minHeight = MIN_H,
   defaultPosition,
   anchorToClick = true,
+  persistGeometry = true,
+  edgeInsets,
   zIndex = 1500,
   panelId,
   toolbar,
   children,
 }: FloatingPanelProps) {
+  // Primitives, so an inline `edgeInsets` object does not re-create the clamp each render.
+  const insetLeft = edgeInsets?.left;
+  const insetBottom = edgeInsets?.bottom;
   // Moving from the inline fallback into the shell portal replaces the DOM
   // handles. Rebind native drag/resize listeners to the new elements.
   const portalRoot = getFloatingPanelRoot();
@@ -517,8 +530,8 @@ export function FloatingPanel({
       x: posRef.current.x, y: posRef.current.y,
       w: sizeRef.current.w, h: sizeRef.current.h,
     };
-    if (!closable) savePanelGeometry(stableId, lastNormalRect.current);
-  }, [closable, isMobile, stableId]);
+    if (!closable && persistGeometry) savePanelGeometry(stableId, lastNormalRect.current);
+  }, [closable, isMobile, stableId, persistGeometry]);
 
   useDrag(dragRef, pos, setPos, effectiveOpen, noteGeometryEnd, portalRoot);
   // West/north edges move the origin. They start from the position actually
@@ -562,8 +575,9 @@ export function FloatingPanel({
    *  coord system as panel state. */
   const clampToViewport = useCallback((x: number, y: number, w: number, h: number) => {
     const vp = getCSSViewportSize();
-    const minX = isMobile ? 4 : 72; // 64px button column + 8 gutter
+    const minX = isMobile ? 4 : (insetLeft ?? 72); // 64px button column + 8 gutter
     const minY = 8;
+    const bottomMargin = isMobile ? BOTTOM_MARGIN : (insetBottom ?? BOTTOM_MARGIN);
     // A panel BIGGER than the viewport used to collapse its own travel to a
     // single value: `Math.max(minY, vp.h - h - BOTTOM_MARGIN)` returns `minY`
     // once `h` exceeds the screen, so min and max met and the window became
@@ -575,14 +589,14 @@ export function FloatingPanel({
     // not, the panel keeps a real range and travels until its title bar is
     // about to leave — never past it, or there would be nothing left to grab.
     const fitX = vp.w - w - 8;
-    const fitY = vp.h - h - BOTTOM_MARGIN;
+    const fitY = vp.h - h - bottomMargin;
     const maxX = fitX >= minX ? fitX : Math.max(minX, vp.w - EDGE_KEEP);
     const maxY = fitY >= minY ? fitY : Math.max(minY, vp.h - TITLE_BAR_KEEP);
     return {
       x: Math.max(minX, Math.min(x, maxX)),
       y: Math.max(minY, Math.min(y, maxY)),
     };
-  }, [isMobile]);
+  }, [isMobile, insetLeft, insetBottom]);
 
   // ── On open: restore saved geometry or anchor near the user's click ──
   // If a saved geometry exists in localStorage, restore it. Otherwise
@@ -594,7 +608,7 @@ export function FloatingPanel({
     wasOpen.current = effectiveOpen;
     if (!effectiveOpen) {
       // Persist the normal geometry on close — never the maximized/collapsed one.
-      if (closing && lastNormalRect.current) savePanelGeometry(stableId, lastNormalRect.current);
+      if (closing && lastNormalRect.current && persistGeometry) savePanelGeometry(stableId, lastNormalRect.current);
       setExpanded(false);
       preExpandPos.current = null;
       preExpandSize.current = null;
@@ -604,7 +618,7 @@ export function FloatingPanel({
     const vp = getCSSViewportSize();
 
     // Try restoring saved geometry first
-    const saved = !isMobile ? loadPanelGeometry(stableId) : null;
+    const saved = !isMobile && persistGeometry ? loadPanelGeometry(stableId) : null;
     if (saved) {
       const w = Math.max(minW, Math.min(saved.w, vp.w - 16));
       const h = Math.max(minHeight, Math.min(saved.h, vp.h - BOTTOM_MARGIN - 8));
@@ -644,8 +658,8 @@ export function FloatingPanel({
   // reopens at its default place. Bound to the panel identity only: a breakpoint change is
   // not an unmount, and the saved rectangle is the normal one whatever layout is current.
   useEffect(() => () => {
-    if (wasOpen.current && lastNormalRect.current) savePanelGeometry(stableId, lastNormalRect.current);
-  }, [stableId]);
+    if (wasOpen.current && lastNormalRect.current && persistGeometry) savePanelGeometry(stableId, lastNormalRect.current);
+  }, [stableId, persistGeometry]);
 
   // A panel opened in the mobile layout has no normal desktop rectangle yet. When it enters the
   // desktop layout, its current normal geometry becomes that rectangle, so closing it there

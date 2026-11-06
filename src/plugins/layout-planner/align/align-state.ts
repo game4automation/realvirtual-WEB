@@ -28,7 +28,7 @@ export interface AlignSlot {
 }
 
 export interface AlignAxesState { x: boolean; y: boolean; z: boolean }
-export interface AlignOffsetMm { x: number; y: number; z: number }
+export interface AlignOffsetM { x: number; y: number; z: number }
 
 export interface AlignSnapshot {
   open: boolean;
@@ -36,7 +36,7 @@ export interface AlignSnapshot {
   a: AlignSlot | null;
   b: AlignSlot | null;
   axes: AlignAxesState;
-  offsetMm: AlignOffsetMm;
+  offsetM: AlignOffsetM;
   /** Bumped whenever something outside the store may have changed liveness/preview. */
   revision: number;
 }
@@ -45,7 +45,7 @@ export interface AlignSnapshot {
 export type AlignLiveness = (slot: AlignSlot) => boolean;
 
 const DEFAULT_AXES: AlignAxesState = { x: true, y: false, z: true };
-const DEFAULT_OFFSET: AlignOffsetMm = { x: 0, y: 0, z: 0 };
+const DEFAULT_OFFSET: AlignOffsetM = { x: 0, y: 0, z: 0 };
 
 let _snap: AlignSnapshot = {
   open: false,
@@ -53,7 +53,7 @@ let _snap: AlignSnapshot = {
   a: null,
   b: null,
   axes: { ...DEFAULT_AXES },
-  offsetMm: { ...DEFAULT_OFFSET },
+  offsetM: { ...DEFAULT_OFFSET },
   revision: 0,
 };
 const _listeners = new Set<() => void>();
@@ -137,9 +137,9 @@ export function setAlignAxes(axes: Partial<AlignAxesState>): void {
   emit({ axes: { ..._snap.axes, ...axes } });
 }
 
-export function setAlignOffsetMm(offset: Partial<AlignOffsetMm>): void {
-  const o = { ..._snap.offsetMm, ...offset };
-  emit({ offsetMm: { x: finite(o.x), y: finite(o.y), z: finite(o.z) } });
+export function setAlignOffsetM(offset: Partial<AlignOffsetM>): void {
+  const o = { ..._snap.offsetM, ...offset };
+  emit({ offsetM: { x: finite(o.x), y: finite(o.y), z: finite(o.z) } });
 }
 
 /** Signal an outside change (move, undo, removal) so subscribers re-evaluate. */
@@ -151,7 +151,7 @@ export function bumpAlignRevision(): void {
 export function _resetAlignStateForTests(): void {
   _snap = {
     open: false, armed: null, a: null, b: null,
-    axes: { ...DEFAULT_AXES }, offsetMm: { ...DEFAULT_OFFSET }, revision: 0,
+    axes: { ...DEFAULT_AXES }, offsetM: { ...DEFAULT_OFFSET }, revision: 0,
   };
   _liveness = null;
   _onOpen = null;

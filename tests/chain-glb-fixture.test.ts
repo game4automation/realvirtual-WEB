@@ -329,6 +329,35 @@ describe('Chain Unity GLB fixture — closed horizontal loop', () => {
     });
   }, 60_000);
 
+  it('moves the elements in WORLD space after the load-time static freeze', async (ctx) => {
+    // The pose tests above read the LOCAL `position`, which RVChain writes either
+    // way. The loader's freezeStaticMatrices() pass runs after the clones are
+    // built and used to force their matrixAutoUpdate off — the pose then never
+    // reached matrix/matrixWorld and nothing moved on screen (2026-11-06).
+    // Assert on what the renderer actually draws.
+    if (!await assetExists(HORIZONTAL_GLB)) { ctx.skip('fixture missing'); return; }
+    const { chain, drive, node } = await loadChain(HORIZONTAL_GLB);
+    const scene = handle.viewer.scene;
+    const worldOf = (o: Object3D) => new Vector3().setFromMatrixPosition(o.matrixWorld);
+
+    driveTo(chain, drive, 0);
+    scene.updateMatrixWorld();
+    const before = worldOf(chain.elements[0]);
+
+    driveTo(chain, drive, PITCH_MM);
+    scene.updateMatrixWorld();
+    const element = chain.elements[0];
+    expect(element.matrixAutoUpdate).toBe(true);
+    const after = worldOf(element);
+    // The world matrix follows the pose: one pitch further along the loop …
+    expect(after.distanceTo(before)).toBeGreaterThan(0.1);
+    // … exactly where the chain node puts the element's local position.
+    const expected = node.localToWorld(element.position.clone());
+    expect(after.x).toBeCloseTo(expected.x, 4);
+    expect(after.y).toBeCloseTo(expected.y, 4);
+    expect(after.z).toBeCloseTo(expected.z, 4);
+  }, 60_000);
+
   it('wraps by modulo on the loop — forwards and backwards by one pitch', async (ctx) => {
     if (!await assetExists(HORIZONTAL_GLB)) { ctx.skip('fixture missing'); return; }
     const { chain, drive } = await loadChain(HORIZONTAL_GLB);

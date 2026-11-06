@@ -58,6 +58,7 @@ export const PROBLEM_CODE_CLASSIFICATION: Readonly<Record<string, ProblemCodeCla
   'reference-target-baked-away': { retire: 'clear-model', retiredBy: 'clearReferenceAuditProblems() + retire-then-report per audit (plan-774 F7)' },
   'kinematic-member-in-placed-content': { retire: 'clear-model', retiredBy: 'clearReferenceAuditProblems() + retire-then-report per audit (plan-774 F7)' },
   'bake-failed': { retire: 'clear-model', retiredBy: 'clearBakeFailedProblems()' },
+  'editor-test-restore-failed': { retire: 'clear-model', retiredBy: 'clearEditorTestRestoreProblems() — reloading the original is the remedy the entry names (2026-11-06)' },
   'reference-unresolved': { retire: 'clear-model', retiredBy: 'clearReferenceAuditProblems()' },
   'reference-rescued': { retire: 'clear-model', retiredBy: 'clearReferenceAuditProblems()' },
   'reference-ambiguous': { retire: 'clear-model', retiredBy: 'clearReferenceMigrationProblems() (plan-769 1a)' },

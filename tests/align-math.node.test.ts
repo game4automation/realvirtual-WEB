@@ -88,8 +88,8 @@ describe('computeAlignDelta', () => {
     expect(d.z).toBeCloseTo(-3);
   });
 
-  it('applies the mm offset only on active axes', () => {
-    const d = computeAlignDelta(a, b, { x: true, y: false, z: false }, { x: 250, y: 999, z: 999 }, new Vector3());
+  it('applies the offset (metres) only on active axes', () => {
+    const d = computeAlignDelta(a, b, { x: true, y: false, z: false }, { x: 0.25, y: 9, z: 9 }, new Vector3());
     expect(d.x).toBeCloseTo(3.25);
     expect(d.y).toBe(0);
     expect(d.z).toBe(0);

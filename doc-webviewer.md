@@ -3175,6 +3175,17 @@ The dialog makes the target explicit ("Import as"):
 
 Providers report availability reactively (`ready` / `needs-setup` / `connecting`); a provider that needs a login or credentials shows a setup hint instead of its form. Errors and partial results (e.g. 3 of 5 files converted) are listed in the dialog — nothing fails silently. See `doc-extending-webviewer.md` §21 for writing your own provider.
 
+**No Draco at import (2026-11-06).** No import path writes `KHR_draco_mesh_compression`: the STEP
+route through CONNECT passes `--no-draco` to `rv-step-convert` (whose own default is still Draco on),
+JT and SimReady/USD converters have no Draco output, and the browser routes build plain geometry.
+Draco quantises positions on each primitive's own bounding box, so the primitives of one part (split
+by face colour) land on different grids and their shared seams crack (measured up to 0.019 mm on a
+330 mm part, growing with part size). That loss is saved into the project, while the size gain ends
+at the loopback hop — saved documents carry no Draco anyway — and `weldImportedGlb` skips Draco
+primitives. Compression belongs to delivery/export (meshopt, or one shared quantisation grid), never
+to import. Reading Draco GLBs (`DRACOLoader` in `rv-glb-parse.ts`) stays supported. Details and the
+measurement: `realvirtual-Connect~/doc-connect.md` § *Why no Draco*.
+
 ### DXF (plan-741)
 
 The DXF tab exists for one job above all others: putting a **factory hall floor plan** on the

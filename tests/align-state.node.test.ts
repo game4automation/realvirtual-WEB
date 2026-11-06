@@ -20,7 +20,7 @@ import {
   isSlotAlive,
   setAlignHooks,
   setAlignLiveness,
-  setAlignOffsetMm,
+  setAlignOffsetM,
   setAlignSlot,
   type AlignSlot,
 } from '../src/plugins/layout-planner/align/align-state';
@@ -80,9 +80,9 @@ describe('align-state slot flow', () => {
   it('defaults: axes X/Z on, Y off; offset 0; non-finite offsets become 0', () => {
     const s = getAlignSnapshot();
     expect(s.axes).toEqual({ x: true, y: false, z: true });
-    expect(s.offsetMm).toEqual({ x: 0, y: 0, z: 0 });
-    setAlignOffsetMm({ x: NaN, y: Infinity, z: 12 });
-    expect(getAlignSnapshot().offsetMm).toEqual({ x: 0, y: 0, z: 12 });
+    expect(s.offsetM).toEqual({ x: 0, y: 0, z: 0 });
+    setAlignOffsetM({ x: NaN, y: Infinity, z: 12 });
+    expect(getAlignSnapshot().offsetM).toEqual({ x: 0, y: 0, z: 12 });
   });
 
   it('liveness callback decides whether a slot is alive', () => {

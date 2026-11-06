@@ -429,6 +429,13 @@ export interface ExportAssetGlbOptions {
   registry?: NodeRegistry | null;
   /** plan-769 Phase 3 — what the id / reference writer did (tests, the save flow). */
   onIdentityReport?: (report: ExportIdentityReport) => void;
+  /**
+   * The scene name, written verbatim. For an export that is loaded straight back
+   * as the SAME scene (the editor's in-place test run): pass the
+   * live root's name, so the reloaded root — and every path below it — is the
+   * one the caller captured before the export, wrapper-shaped names included.
+   */
+  sceneName?: string;
 }
 
 /** plan-769 Phase 3: what {@link exportAssetGlb} did to the ids and references of one file. */
@@ -591,7 +598,11 @@ function pairClone(live: Object3D, clone: Object3D, liveOf: Map<Object3D, Object
  * holding exactly the authored children, which re-exports identically.
  *
  * `assetName` should be the document name; without it the content root's own
- * name is used (and a wrapper-shaped name falls back to `Asset`).
+ * name is used (and a wrapper-shaped name falls back to `Asset`). The scene
+ * name is a LABEL (the planner shows it on a placement), never identity
+ * (contract-node-identity rule 13): an export that is loaded straight back as
+ * the same scene passes `options.sceneName` = the live root's name, so the
+ * reloaded root and every path below it stay what the caller captured.
  *
  * ## `shareMeta` — the `rv_share` stamp (plan-386 §2.4, F6/R7)
  *
@@ -683,7 +694,8 @@ export async function exportAssetGlb(
 
   const scene = new Scene();
   const fallback = isGltfWrapperName(content.name) ? 'Asset' : content.name;
-  scene.name = assetName?.trim() || fallback || 'Asset';
+  // `sceneName` first: a round trip of the same scene keeps its root verbatim.
+  scene.name = options?.sceneName || assetName?.trim() || fallback || 'Asset';
   // glTF scene `extras` round-trip through `assignExtrasToUserData` on load,
   // so the asset root's authored extras survive the flattening.
   //

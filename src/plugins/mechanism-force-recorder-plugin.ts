@@ -26,7 +26,8 @@
  * node paths, and a path that means a different joint in a different model would
  * silently continue somebody else's curve. A `stop()` does NOT clear — the last
  * cycle stays on screen until the next run, which is the whole point of
- * recording it (§3.3).
+ * recording it (§3.3). That includes the reload with which a stopped test run
+ * restores the authoring scene: it is the same document, not a model switch.
  *
  * ── Recording follows the TEST SESSION, and it does so HERE (plan-706 F13) ───
  * That coupling used to live in a React `useEffect` inside
@@ -358,12 +359,12 @@ export class MechanismForceRecorderPlugin implements RVViewerPlugin {
     // A new model means new nodes behind the same paths. Nothing recorded from
     // the old one may survive into the new one's chart.
     this._disarm();
-    this.recorder.clear();
+    if (!this._isRestoringAfterRun()) this.recorder.clear();
   }
 
   onModelCleared(): void {
     this._disarm();
-    this.recorder.clear();
+    if (!this._isRestoringAfterRun()) this.recorder.clear();
   }
 
   onFixedUpdatePost(dt: number): void {
@@ -417,6 +418,16 @@ export class MechanismForceRecorderPlugin implements RVViewerPlugin {
     this._unsubSession = null;
     this._disarm();
     this.recorder.clear();
+  }
+
+  /**
+   * True while a stopped test run puts the authoring scene of the SAME document
+   * back. That reload is not a model switch: the run just recorded is exactly
+   * what the user stopped it to read, and clearing it here emptied the chart on
+   * every Stop. The next run's `start()` clears as before.
+   */
+  private _isRestoringAfterRun(): boolean {
+    return getTestSessionState() === 'restoring';
   }
 
   private _disarm(): void {

@@ -71,8 +71,10 @@ describe.skipIf(!hasDist)('bundle chunking (plan-271 9.8)', () => {
  */
 const TRACER_MARKERS = ['PathtracerBVHComputeData', 'bvh_materials'];
 
-/** Chunk-file prefixes only a private build emits (the private feature adapters). */
-const PRIVATE_CHUNK_RE = /^(rv-cinematic-renderer|cinematic-render\.register|raytraced-render\.register|rv-raytraced-backend)-/;
+/** Chunk-file prefixes only a private build emits (the private feature adapters and
+ *  `rv-cinematic-scene`, the shared async chunk of the cinematic renderer and the ray
+ *  traced backend that carries the tracer data). */
+const PRIVATE_CHUNK_RE = /^(rv-cinematic-renderer|rv-cinematic-scene|cinematic-render\.register|raytraced-render\.register|rv-raytraced-backend)-/;
 
 const privateDist = hasDist && readdirSync(assetsDir).some((f) => PRIVATE_CHUNK_RE.test(f));
 

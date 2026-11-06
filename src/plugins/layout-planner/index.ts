@@ -1470,6 +1470,8 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
           else this._endEditPause();
         }
         if (dragging) {
+          // Multi-select: members join the pivot only for the drag.
+          if (this._multiSelectPivot?.isActive) this._multiSelectPivot.parkMembers();
           // Arm magnetic bbox snap — captures the moving root's AABB and
           // freezes every other placed object's AABB. Cheap one-time cost
           // (~1 ms for typical layouts). Disarm fires below at drag-end.

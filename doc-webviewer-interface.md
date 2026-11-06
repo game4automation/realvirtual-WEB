@@ -848,6 +848,18 @@ Two viewer-side APIs that HMI code and interfaces reading the 3D view can use
   (`out.blocked = true`), transparent segments and hidden nodes pass. Writes into a
   caller-owned `SurfaceHit` (`point`, `distance`, `blocked`, `path`, optional `ray`);
   `false` = background. Changes no hover state.
+- `viewer.raycastManager.pickDetailed({ clientX, clientY })` (plan-779) — the RAW
+  triangle under the pointer for tools that snap to geometry:
+  `{ mesh, faceIndex, face: { a, b, c }, point }` or `null`. It uses the same backend and
+  ray as every pick, but deliberately skips the resolution pipeline: no allow filter, no
+  ancestor overrides, no pick ownership, so it reaches the main model while the planner
+  admits only placements. Still honoured: the pick block of a render strategy, exclude
+  filters, on-top / aux gizmo hulls, `userData._isAlignOverlay`, hidden segments and
+  effective visibility, the isolation gate for non-chunk meshes. Instanced and skinned
+  meshes are skipped (no usable corner). Read-only on the chunk index, changes no hover
+  state, independent of `setEnabled`. Its one consumer today is the planner Align tool
+  (`doc-layout-planner.md` § 5). A new consumer that wants a SELECTABLE node must use
+  `raycastForRVNodeDetailed` instead (bake-picking contract, rule 15).
 - `viewer.sceneScale.get()` — the one source of the content bounds (`center`,
   `radius` ≥ 0.5 mm, `maxDim`, `empty`), recomputed after content events and, while the
   simulation runs, grow-only for moving content every 500 ms; `onChange(cb)` notifies

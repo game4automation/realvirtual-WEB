@@ -63,6 +63,7 @@ export const AUTHORING_LOADS: ReadonlyArray<AllowedUnbakedLoad> = [
   'bypath-to-address-migration.test.ts',
   'compose-missing-references.test.ts',
   'descend-override-suppression.test.ts',
+  'display-name-not-identity.test.ts',
   'document-classification.test.ts',
   'editor-save-authored-names.test.ts',
   'editor-setfield-reference-shape.test.ts',

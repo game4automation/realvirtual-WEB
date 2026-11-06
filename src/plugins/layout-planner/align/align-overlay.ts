@@ -25,17 +25,19 @@ import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import { markAsOverlay } from '../../../core/engine/rv-group-registry';
+import { SECONDARY } from '../../../core/hmi/shared-sx';
 import type { RVViewer } from '../../../core/rv-viewer';
 
-const COLOR_HOVER = '#ffffff';
-const COLOR_A = '#ffa726';
-const COLOR_B = '#42a5f5';
-const COLOR_LINE = 0xffffff;
+// realvirtual signature pink (theme `secondary`) for every marker and the line.
+const COLOR_HOVER = SECONDARY;
+const COLOR_A = SECONDARY;
+const COLOR_B = SECONDARY;
+const COLOR_LINE = SECONDARY;
 /** Ring diameters and stroke in CSS pixels — constant on screen. */
 const DOT_PX = 14;
 const HOVER_PX = 16;
 const STROKE_PX = 2;
-const MARKER_OPACITY = 0.8;
+const MARKER_OPACITY = 1;
 const TEX_PX = 64;
 
 export interface AlignOverlay {

@@ -104,8 +104,11 @@ describe('MultiSelectPivot', () => {
 
     // Build pivot
     pivot.syncToSelection([objA, objB], false, 500, 15);
+    // Selection alone keeps members under their own parent (hierarchy rows stay)
+    expect(objA.parent).toBe(mocks.scene);
 
-    // Simulate a drag: move the pivot group 2m on X
+    // Simulate a drag: drag start parks members, then move the pivot 2m on X
+    pivot.parkMembers();
     const pivotGroup = mocks.tc.attach.mock.calls[0][0] as Group;
     pivotGroup.position.x += 2;
     pivotGroup.updateMatrixWorld(true);

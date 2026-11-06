@@ -92,12 +92,13 @@ export class MultiSelectPivot {
       pivot.position.copy(centroid);
       this.deps.scene.add(pivot);
 
+      // Members stay under their own parents while merely selected, so the
+      // hierarchy keeps showing them in place; they are parked under the pivot
+      // only for the duration of a gizmo drag (parkMembers / drag end).
       for (const o of objs) {
         const originalParent = o.parent;
         if (!originalParent) continue;
         this._members.push({ obj: o, originalParent });
-        pivot.attach(o); // preserves world transform
-        this._relink(o);
       }
       this._pivot = pivot;
       tc.attach(pivot);
@@ -134,7 +135,10 @@ export class MultiSelectPivot {
 
     // Step 1+2: detach to original parents, write transforms.
     for (const m of this._members) {
-      m.originalParent.attach(m.obj);
+      if (m.obj.parent !== m.originalParent) {
+        m.originalParent.attach(m.obj);
+        this._relink(m.obj);
+      }
       const id = this.deps.idByObject.get(m.obj);
       if (id) this._writeMember(id, m.obj);
     }
@@ -150,10 +154,21 @@ export class MultiSelectPivot {
     pivot.quaternion.identity();
     pivot.scale.set(1, 1, 1);
     pivot.updateMatrixWorld(true);
+    // Members stay under their original parents until the next drag starts.
+  }
 
-    // Step 4: re-attach members to the pivot (preserves world transforms).
+  /**
+   * Park every member under the pivot (world transform preserved) so a gizmo
+   * drag moves them rigidly. Called at drag start; drag end restores them.
+   */
+  parkMembers(): void {
+    const pivot = this._pivot;
+    if (!pivot) return;
+    pivot.updateMatrixWorld(true);
     for (const m of this._members) {
+      if (m.obj.parent === pivot) continue;
       pivot.attach(m.obj);
+      this._relink(m.obj);
     }
   }
 
@@ -206,6 +221,7 @@ export class MultiSelectPivot {
   tearDown(): void {
     if (!this._pivot) return;
     for (const { obj, originalParent } of this._members) {
+      if (obj.parent === originalParent) continue;
       originalParent.attach(obj);
       this._relink(obj);
     }

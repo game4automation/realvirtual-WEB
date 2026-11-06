@@ -272,6 +272,71 @@ A standard Three.js `TransformControls`-based gizmo, with `select` /
 — which is exactly the pivot computed in §3. Choosing the right pivot at
 authoring time means the gizmo is always where the user expects.
 
+### Align tool (plan-779)
+
+Corner-on-corner alignment for the case the other tools leave open: bbox snap
+only knows the outer hull, the gizmo rotates, snap points exist only on
+conveying equipment. Align translates placement **A** so that a picked
+triangle corner of A lands on a picked triangle corner of **B**. It never
+rotates. Code: [`src/plugins/layout-planner/align/`](src/plugins/layout-planner/align/),
+public (AGPL), no private imports.
+
+| File | Role |
+|---|---|
+| `align-state.ts` | Tiny external store: `open`, armed slot, slots A/B, axes, `offsetM`, revision. Static. |
+| `AlignPanelHost.tsx` | Overlay slot (order 101), renders `null` until open, then lazy-loads the panel. |
+| `align-math.ts` | Pure functions with module scratch: `pickNearestCorner` (≤ `CORNER_SNAP_PX` = 12 px), `computeAlignDelta`, `translateInParentFrame`. |
+| `align-pick.ts` | Runtime loaded on first open: pointer capture, hover candidate, slot rules, liveness, overlay. |
+| `align-action.ts` | `evaluateAlign` (corners, target, delta, chain members, `canAlign`) and `runAlign`. |
+| `align-overlay.ts` | Pink rings (screen-constant size) and the dashed line A → target, `userData._isAlignOverlay`. |
+| `AlignPanel.tsx` | The window: slots, axis toggles, offset and move rows in **metres**, Align button. |
+
+The toolbar button (`PlannerAlignButton`, `AlignCornerIcon`) sits in the
+`model` tool group (order 290) and is visible only while planner authoring is
+live.
+
+**Picking.** While a slot is armed, `align-pick` installs a window-capture
+listener that swallows LEFT-button `pointerdown`/`up` (and the `dblclick`
+right after a pick) on the canvas. Left does not navigate in this viewer, so
+the camera is untouched, and every planner canvas listener (floor gizmo,
+direct drag, marquee, path handles, click-select) is shielded at once. Touch
+passes through. Hover asks `RaycastManager.pickDetailed()` at most once per
+animation frame and only after the pointer moved. It returns the raw triangle
+(mesh, face, vertex indices), and `pickNearestCorner` projects its three
+corners to screen space. Slot rules: A = the outermost record
+(`recordRootOf`) of an unlocked placement; B = any visible geometry including
+the main model, but not A and not inside A. A click that breaks a rule does
+nothing. There are no error texts. Re-picking A re-checks B.
+
+**Slots store the corner in the mesh's LOCAL frame.** `evaluateAlign`
+therefore recomputes the world corners from the current scene each time, and
+Align is idempotent: a second press with a changed offset gives the absolute
+result, not an increment. A slot whose mesh left the scene or became hidden
+reports *object gone* (liveness check), and Align is disabled.
+
+**Moving.** `cornerA_world := cornerB_world + offset` on the enabled world
+axes (default X and Z, Y off = keep the height); disabled axes keep A's value.
+A delta below `ALIGN_EPSILON_M` (1e-6 m) books nothing. `runAlign` moves every
+member through the existing `layout.move` command, inside ONE scene-store
+transaction: one undo step, no new command, op or save format. Chain mode
+mirrors the gizmo. On: every member of A's snap chain
+(`snapPoint.chainRootsFor`) moves by the same world delta. Off: only A moves,
+and `snapPoint.detachAssetConnections` releases its connections. A locked
+member disables Align.
+
+**Lifecycle and cost.** A closed window costs nothing: no listeners, no
+overlay in the scene graph, and the runtime is not loaded. `alignClose()`
+empties both slots, stops picking and removes the overlay. It runs on the
+close button, the toolbar toggle, leaving planner mode, plugin deactivation
+and `model-cleared`. Every open docks the window to the 3D view's lower-left
+corner (`FloatingPanel` `persistGeometry={false}` and `edgeInsets`), so it
+never remembers a position.
+
+Tests: `tests/align-math.node.test.ts`, `tests/align-state.node.test.ts`,
+`tests/layout-planner-authoring-modes.test.ts` (button only in authoring).
+`pickDetailed` is the documented exception to the pick resolution pipeline,
+see `doc-webviewer-interface.md` and the bake-picking contract, rule 15.
+
 ### How a committed placement renders and picks (plan-745 → plan-753)
 
 > **Since plan-753 Phase 3 a GLB placement is an instance of a BAKED asset.**

@@ -54,7 +54,7 @@ import { applyShadowFlags } from './rv-mesh-classifier';
 // The marker lives in the marker module, not here: the asset exporter's prune
 // pass needs it and must not import a component module (see rv-traverse-utils.ts).
 import { RV_CHAIN_ELEMENT } from './rv-traverse-utils';
-import { stripIdentity } from './rv-decode-identity';
+import { stripRuntimeCloneExtras } from './rv-runtime-clone';
 
 export { RV_CHAIN_ELEMENT };
 
@@ -276,18 +276,11 @@ export class RVChain implements RVComponent {
 
       // `Object3D.clone()` JSON-round-trips userData, so the clone inherits the
       // template's rv_extras and would be turned into a live component by a later
-      // `processExtras`. Same fix as the MU clone path in rv-source.ts.
+      // `processExtras` — the shared runtime-clone strip (same as the MU path)
+      // removes them and keeps the `chunk` role the ChainElement declares, so the
+      // load-time static freeze, which runs AFTER this, keeps the clone a mover.
       // plan-769 Inventory C: a chain element is no node of any file — no identity.
-      stripIdentity(clone);
-      clone.traverse((child) => {
-        const ud = child.userData;
-        if (!ud) return;
-        delete ud.realvirtual;
-        delete ud._layoutObject;
-        delete ud._layoutId;
-        delete ud._layoutNestedOf;
-        delete ud._layoutNestedId;
-      });
+      stripRuntimeCloneExtras(clone);
       // The runtime marker: `pruneRuntimeHelpers()` drops anything carrying it
       // before an editor save.
       clone.userData[RV_CHAIN_ELEMENT] = true;

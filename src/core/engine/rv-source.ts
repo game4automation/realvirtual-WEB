@@ -2,7 +2,6 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { RV_INACTIVE_KEY } from './rv-authored-inactive';
-import { groupLabelsOf, RV_GROUP_LABELS_KEY } from './rv-mu-group-labels';
 import {
   Object3D, Mesh, Vector3, Box3, Quaternion, MeshBasicMaterial,
   LineSegments, EdgesGeometry, LineBasicMaterial,
@@ -17,7 +16,7 @@ import type { ComponentSchema, ComponentContext, RVComponent } from './rv-compon
 import { registerComponent, loadSchemaFromSpec } from './rv-component-registry';
 import type { CollisionRoleName } from './rv-collision-role';
 import { NodeRegistry } from './rv-node-registry';
-import { stripIdentity } from './rv-decode-identity';
+import { stripRuntimeCloneExtras } from './rv-runtime-clone';
 import { debug } from './rv-debug';
 import { findByNameInSubtree } from './rv-traverse-utils';
 import { MM_TO_METERS } from './rv-constants';
@@ -27,12 +26,11 @@ import { applyShadowFlags } from './rv-mesh-classifier';
 import type { RVTransportManager } from './rv-transport-manager';
 import { RVTransportSurface } from './rv-transport-surface';
 import { AABB } from './rv-aabb';
-import { RV_LAYER_KEY, layerOfNode } from './rv-layers';
+import { layerOfNode } from './rv-layers';
 import { wireBoolSignal } from './rv-signal-wiring';
 import { slotBound } from './rv-slot-io';
 import { readMUColliderTemplate } from './rv-mu-collider-template';
 import { computeMUDetectionFrameBox, type DetectPartObb } from './rv-mu-collider-bounds';
-import { getColliderExtras, RV_COLLIDERS_KEY, RV_IS_MU_KEY, RV_OWN_OBJECT_KEY } from './rv-collider-extras';
 import { readLoadSeatDepth } from './rv-mu-load';
 import { templateSizeOf } from '../../behaviors/_shared/mu-reference';
 import type { EventEmitter } from '../rv-events';
@@ -181,37 +179,6 @@ function cloneCounterpart(template: Object3D, clone: Object3D, node: Object3D): 
   return c && c.name === node.name ? c : null;
 }
 
-function stripComponentMetadata(obj: Object3D): void {
-  // plan-769 F10 / Inventory C: a ghost / spawned MU is no node of any file — its
-  // copied identity (decode seed + authored NodeId) goes with the extras.
-  stripIdentity(obj);
-  obj.traverse((child) => {
-    const ud = child.userData;
-    if (!ud) return;
-    // plan-2016 S5: the group labels outlive the extras — MUSwitcher switches
-    // a spawned MU's variant groups by them (resolved bake labels preferred).
-    const labels = groupLabelsOf(child);
-    if (labels.length > 0) ud[RV_GROUP_LABELS_KEY] = [...labels];
-    // plan-2016 S5: the parsed colliders too — sensors detect a clone's ACTIVE
-    // colliders, and a MUSwitcher changes which ones are active.
-    const colliders = getColliderExtras(child);
-    if (colliders.length > 0) ud[RV_COLLIDERS_KEY] = JSON.parse(JSON.stringify(colliders));
-    // ...and the two structural facts the collider walks read from the extras:
-    // own object (primitive assignment of MeshColliders) and MU root (walk stop).
-    const rv = ud.realvirtual as Record<string, unknown> | undefined;
-    if (rv && typeof rv === 'object') {
-      ud[RV_OWN_OBJECT_KEY] = true;
-      if (rv['MU']) ud[RV_IS_MU_KEY] = true;
-      // plan-2016 S6c: the Unity layer too — raycast sensors filter by it.
-      if (typeof rv['layer'] === 'number') ud[RV_LAYER_KEY] = rv['layer'];
-    }
-    delete ud.realvirtual;
-    delete ud._layoutObject;
-    delete ud._layoutId;
-    delete ud._layoutNestedOf;
-    delete ud._layoutNestedId;
-  });
-}
 
 // Transparent-source look: the real source fill is hidden (no colour/depth
 // write → full x-ray, never occludes the scene behind it) and replaced by a
@@ -348,7 +315,7 @@ export class RVSource implements RVComponent {
    *  (`reapplyConfig`) resolves it again (plan-2016 S1 review fix). */
   private _destinationRegistry: NodeRegistry | null = null;
   /** Collision role handed to every MU this source spawns (plan-394). It cannot
-   *  live on the MU itself: `stripComponentMetadata()` deletes the clone's
+   *  live on the MU itself: `stripRuntimeCloneExtras()` deletes the clone's
    *  rv_extras, so the role travels via the transport manager's spawn hook. */
   CollisionRoleForMUs: CollisionRoleName = 'None';
 
@@ -816,7 +783,7 @@ export class RVSource implements RVComponent {
     // The clone inherited the template's rv-extras / layout metadata via
     // Object3D.clone(); strip them so the ghost is a pure visual and never
     // becomes a live (recursively-spawning) Source when the subtree is rescanned.
-    stripComponentMetadata(ghost);
+    stripRuntimeCloneExtras(ghost);
     ghost.name = `${template.name}_ghost`;
     // Reset transform — the clone inherits the template's world position,
     // but we want it anchored at the source's local origin (transform-wise
@@ -1391,7 +1358,7 @@ export class RVSource implements RVComponent {
     this._applyDetectionBox(mu);
     mu.destinationParent = this.destination;
     _sourceByMu.set(mu, this);
-    // The clone lost its rv-extras (stripComponentMetadata) — hand the
+    // The clone lost its rv-extras (stripRuntimeCloneExtras) — hand the
     // template's seat depth over explicitly (plan-577 F2).
     mu.loadSeatDepth = readLoadSeatDepth(this.muTemplate);
     if (this.unityControls) mu.physicsMassKg = this.Mass;
@@ -1420,7 +1387,7 @@ export class RVSource implements RVComponent {
     } catch (err) {
       console.warn(`[source] MU "${clone.name}": authored collider template unusable`, err);
     } finally {
-      stripComponentMetadata(clone);
+      stripRuntimeCloneExtras(clone);
     }
   }
 
@@ -1497,7 +1464,7 @@ export class RVSource implements RVComponent {
   private _ensurePreview(): void {
     if (this._previewInstance || !this.muTemplate) return;
     const inst = this._buildRealClone();
-    stripComponentMetadata(inst);
+    stripRuntimeCloneExtras(inst);
     inst.name = `${this.muTemplate.name}_preview`;
     inst.userData._isSourcePreview = true;
     inst.position.set(0, 0, 0);
